@@ -1,0 +1,20 @@
+[package]
+name = "paperboy"
+version = "0.1.1"
+edition = "2024"
+description = "A Rust TUI API tester"
+readme = "README.md"
+repository = "https://github.com/jhobern/paperboy"
+license = "MIT"
+
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hurl = "~8.0"
+hurl_core = "~8.0"
+base64 = "0.22"
+ratatui = "0.30.2"
+clap = { version = "4.6.1", features = ["derive"] }
+ratatui-explorer = "0.3.0"
+uuid = { version = "1", features = ["v4"] }

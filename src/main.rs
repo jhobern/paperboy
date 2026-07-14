@@ -1,0 +1,79 @@
+//! PaperBoy — a Rust-native API client (Postman alternative). Two front-ends
+//! over one core: a terminal UI (default), and a headless CLI runner
+//! (`-c collection.hurl [-e environment.vars]`).
+
+mod cli;
+mod collection;
+mod environment;
+mod git_remote;
+mod http;
+mod hurl;
+mod i18n;
+mod persistence;
+mod postman;
+mod request;
+mod shared_utils;
+mod tree;
+mod tui;
+mod workspace;
+
+use clap::Parser;
+
+/// PaperBoy — a Rust API client with a terminal UI and a headless runner.
+#[derive(Parser)]
+#[command(
+    name = "paperboy",
+    version,
+    about = "PaperBoy — a Rust-native API client (a Postman alternative).",
+    long_about = "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
+Runs in one of three modes:\n\
+\x20 TUI  (default)          a terminal user interface\n\
+\x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit",
+    after_help = "Examples:\n\
+\x20 paperboy                            Launch the terminal UI (default)\n\
+\x20 paperboy -c collection.hurl         Run a collection headlessly\n\
+\x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
+\x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\n\
+Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
+{{ ... }} provider reference resolved when the environment is loaded:\n\
+\x20 Literal value       USERNAME=demo\n\
+\x20 Process env var     BASE_URL={{ env:DEMO_BASE_URL }}\n\
+\x20 1Password (op CLI)  API_TOKEN={{ op://Vault/Item/field }}\n\
+\x20 AWS SSM parameter   DB_PASSWORD={{ ssm:/path/to/param }}\n\n\
+Collections are Hurl files (.hurl) or Postman collection exports (.json);\n\
+Postman JSON is imported automatically."
+)]
+struct Cli {
+    /// Run the given collection (Hurl `.hurl` or Postman `.json`) headlessly and print the results.
+    #[arg(short = 'c', long, value_name = "FILE")]
+    collection: Option<String>,
+
+    /// Optional environment (.vars) file supplying `{{ VAR }}` values.
+    #[arg(short = 'e', long, value_name = "FILE")]
+    env: Option<String>,
+
+    /// Run every request as a single batch instead of streaming each result
+    /// as soon as it finishes. Slower to show any output, but preserves
+    /// Hurl's automatic cookie jar (cookies remembered from `Set-Cookie`
+    /// response headers) across every request in the collection — the
+    /// default streaming mode does not carry cookies between requests (an
+    /// explicit `[Cookies]` section on a request is unaffected either way).
+    #[arg(short = 'b', long)]
+    batch: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // Headless CLI mode (explicit "run and exit").
+    if let Some(collection) = cli.collection {
+        std::process::exit(cli::run(collection, cli.env, cli.batch));
+    }
+
+    // Terminal UI (the default).
+    if let Err(e) = tui::run() {
+        eprintln!("tui error: {e}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}

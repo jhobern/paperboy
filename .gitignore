@@ -1,0 +1,4 @@
+# Ignore any file of the form .env* in any directory
+**/.env*
+**/target/
+.vscode

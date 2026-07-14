@@ -1,0 +1,263 @@
+//! Headless CLI runner: `paperboy -c collection.hurl [-e env.vars] [--batch]`.
+//!
+//! Parsing, HTTP and `[Captures]`/`[Asserts]` evaluation are all delegated to
+//! the Hurl runner (via [`crate::hurl::run_hurl`] / [`crate::hurl::run_hurl_streaming`]);
+//! this module only handles file I/O, environment loading and formatting the
+//! results.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::IsTerminal;
+
+use ratatui::crossterm::style::Stylize;
+
+use crate::environment::{looks_like_env, parse_vars};
+use crate::hurl::{EntryOutcome, collection_to_hurl, run_hurl, run_hurl_streaming};
+use crate::postman::{looks_like_postman, parse_collection};
+use crate::shared_utils::stem;
+
+/// Run all requests in the collection. Returns an OS exit code (0 = all passed).
+/// By default each request's result is printed as soon as it finishes
+/// (`batch: false`); `batch: true` waits for the whole collection to run
+/// (the original behaviour), which is the only mode that preserves Hurl's
+/// automatic cookie jar across every request — see [`run_hurl_streaming`]'s
+/// docs for why streaming mode can't do that too.
+pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i32 {
+    let col_content = match fs::read_to_string(&collection_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot read collection file '{collection_path}': {e}");
+            return 1;
+        }
+    };
+
+    let col_name = stem(&collection_path, "collection");
+    // Parsed once for the display metadata (titles); the runner re-parses + runs.
+    // A Postman JSON export is imported to `HurlEntry`s and then serialized to
+    // Hurl text so the runner (which only speaks Hurl) can execute it.
+    let entries = parse_collection(&col_content);
+    if entries.is_empty() {
+        eprintln!("warning: no requests found in '{collection_path}'");
+        return 0;
+    }
+    let run_content = if looks_like_postman(&col_content) {
+        collection_to_hurl(&entries)
+    } else {
+        col_content
+    };
+
+    // Substitution variables come from the environment file (if any); captures
+    // are chained by the runner itself. `BASE_URL` must be provided by the env
+    // file, so `-e` is required for collections that use `{{ BASE_URL }}`.
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut env_name: Option<String> = None;
+    if let Some(env_path) = &env_path {
+        let env_content = match fs::read_to_string(env_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: cannot read environment file '{env_path}': {e}");
+                return 1;
+            }
+        };
+        if !looks_like_env(&env_content) {
+            eprintln!(
+                "error: '{env_path}' is not a valid environment file (expected KEY=value lines)"
+            );
+            return 1;
+        }
+        let name = stem(env_path, "env");
+        env_name = Some(name.clone());
+        for v in &parse_vars(name, &env_content).vars {
+            vars.insert(v.key.clone(), v.value.clone());
+        }
+    }
+
+    let color = color_enabled();
+    println!();
+    println!(
+        "{}",
+        paint(
+            color,
+            Hue::Bold,
+            &format!("🦀 PaperBoy — running collection \"{col_name}\"")
+        )
+    );
+    if let Some(name) = &env_name {
+        println!("   Environment : {name}");
+    }
+    println!("   Requests    : {}", entries.len());
+    if !batch {
+        println!(
+            "{}",
+            paint(
+                color,
+                Hue::Dim,
+                "   (streaming results as they finish; cookies set by one request are not \
+                 automatically carried to the next — pass --batch if your collection relies on \
+                 that. An explicit [Cookies] section on a request is unaffected either way.)"
+            )
+        );
+    }
+    println!("{}", "─".repeat(60));
+
+    let total = entries.len();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+    let file_root = std::path::Path::new(&collection_path).parent();
+
+    let out = if batch {
+        let out = run_hurl(&run_content, &vars, file_root);
+        for (idx, eo) in out.entries.iter().enumerate() {
+            print_entry(color, idx, total, titles.get(idx).copied(), eo);
+            if eo.ok { passed += 1 } else { failed += 1 }
+        }
+        out
+    } else {
+        let mut idx = 0usize;
+        run_hurl_streaming(&run_content, &vars, file_root, |eo| {
+            print_entry(color, idx, total, titles.get(idx).copied(), eo);
+            if eo.ok {
+                passed += 1
+            } else {
+                failed += 1
+            }
+            idx += 1;
+        })
+    };
+
+    if out.entries.is_empty() {
+        if let Some(e) = &out.error {
+            eprintln!("\nerror: {e}");
+        }
+        return 1;
+    }
+
+    println!();
+    println!("{}", "─".repeat(60));
+    let summary = format!("  Passed: {passed}  Failed: {failed}  Total: {total}");
+    println!(
+        "{}",
+        paint(
+            color,
+            if failed > 0 { Hue::Red } else { Hue::Green },
+            &summary
+        )
+    );
+    println!();
+
+    if failed > 0 { 1 } else { 0 }
+}
+
+/// Print one request's result to stdout, coloured if `color` is enabled.
+fn print_entry(color: bool, idx: usize, total: usize, title: Option<&str>, eo: &EntryOutcome) {
+    println!();
+    println!(
+        "{}",
+        paint(
+            color,
+            Hue::Cyan,
+            &format!("[{}/{}] {} {}", idx + 1, total, eo.method, eo.url)
+        )
+    );
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
+        println!("         {title}");
+    }
+
+    let status_hue = if eo.ok { Hue::Green } else { Hue::Red };
+    let icon = if eo.ok { "✓" } else { "✗" };
+    println!(
+        "  {}",
+        paint(
+            color,
+            status_hue,
+            &format!("{icon} {} {}", eo.status, eo.status_text)
+        )
+    );
+    if let Some(err) = &eo.error {
+        println!("  {}", paint(color, Hue::Red, &format!("! {err}")));
+    }
+
+    if !eo.body.is_empty() {
+        for line in eo.body.lines().take(40) {
+            println!("    {line}");
+        }
+        let n = eo.body.lines().count();
+        if n > 40 {
+            println!(
+                "{}",
+                paint(color, Hue::Dim, &format!("    … ({} more lines)", n - 40))
+            );
+        }
+    }
+
+    if !eo.asserts.is_empty() {
+        let n_ok = eo.asserts.iter().filter(|a| a.passed).count();
+        let all_ok = n_ok == eo.asserts.len();
+        let badge = if all_ok { "✓" } else { "✗" };
+        println!(
+            "  {}",
+            paint(
+                color,
+                if all_ok { Hue::Green } else { Hue::Red },
+                &format!("[Asserts] {badge} {n_ok}/{}", eo.asserts.len())
+            )
+        );
+        for a in &eo.asserts {
+            if a.passed {
+                println!(
+                    "      {}",
+                    paint(color, Hue::Green, &format!("✓ {}", a.expr))
+                );
+            } else if a.detail.is_empty() {
+                println!("      {}", paint(color, Hue::Red, &format!("✗ {}", a.expr)));
+            } else {
+                println!(
+                    "      {}",
+                    paint(color, Hue::Red, &format!("✗ {}  ({})", a.expr, a.detail))
+                );
+            }
+        }
+    }
+
+    for (name, value) in &eo.captures {
+        println!(
+            "  {}",
+            paint(color, Hue::Yellow, &format!("→ captured {name} = {value}"))
+        );
+    }
+}
+
+/// Whether ANSI colour should be emitted: only when stdout is a real terminal
+/// (not piped/redirected) and the user hasn't opted out via `NO_COLOR`
+/// (https://no-color.org), the conventional way to disable colour output.
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// A small, fixed palette for CLI output; kept separate from the TUI's
+/// `Theme` since this is plain ANSI text, not a `ratatui` widget.
+#[derive(Clone, Copy)]
+enum Hue {
+    Green,
+    Red,
+    Yellow,
+    Cyan,
+    Dim,
+    Bold,
+}
+
+/// Style `s` with `hue` when `on`, otherwise return it unchanged.
+fn paint(on: bool, hue: Hue, s: &str) -> String {
+    if !on {
+        return s.to_string();
+    }
+    match hue {
+        Hue::Green => s.green().to_string(),
+        Hue::Red => s.red().to_string(),
+        Hue::Yellow => s.yellow().to_string(),
+        Hue::Cyan => s.cyan().to_string(),
+        Hue::Dim => s.dark_grey().to_string(),
+        Hue::Bold => s.bold().to_string(),
+    }
+}
