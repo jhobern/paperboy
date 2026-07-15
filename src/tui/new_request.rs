@@ -1428,6 +1428,31 @@ impl NewReq {
         }
     }
 
+    /// Whether the currently focused field is a free-text editor cell (as
+    /// opposed to a selector, checkbox, dropdown, or "+ Add …" row). Used to
+    /// decide whether `[` / `]` should type into the field or act as
+    /// tab-cycling shortcuts.
+    pub(crate) fn focus_is_text_entry(&self) -> bool {
+        match self.focus {
+            NewField::Name | NewField::Url | NewField::Body => true,
+            NewField::Assert(_) | NewField::Capture(..) => true,
+            NewField::Header(_, col) | NewField::Cookie(_, col) => {
+                matches!(col, HdrCol::Key | HdrCol::Value | HdrCol::Desc)
+            }
+            NewField::FormField(_, col) => matches!(
+                col,
+                FormCol::Key | FormCol::Value | FormCol::Ctype | FormCol::Desc
+            ),
+            NewField::Method
+            | NewField::Target
+            | NewField::AddHeader
+            | NewField::AddCookie
+            | NewField::AddFormField
+            | NewField::AddAssert
+            | NewField::AddCapture => false,
+        }
+    }
+
     /// PageUp/PageDown: cycle the active section-view tab, wrapping around
     /// `self.tab_order` (which the user may have reordered). When landing on
     /// a section tab (anything but `All`), focus jumps to that section's

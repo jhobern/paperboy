@@ -115,8 +115,11 @@ cargo build --release
   `Body` also grows a left-hand scrollbar once it overflows.
 - **Per-section wizard tabs**: the request wizard has a tab bar (`All │
   Headers │ Cookies │ Form │ Body │ Asserts │ Captures`), switched with
-  `PageUp`/`PageDown` and reordered with `Ctrl+Shift+←`/`→` (just like
-  collection tabs). Picking a section tab gives that section almost the
+  `[`/`]` or `PageUp`/`PageDown` and reordered with `Ctrl+Shift+←`/`→`
+  (just like collection tabs). `[`/`]` only cycle tabs when focus is on a
+  non-text field (Method, Target, or a "+ Add …" row), so they can still be
+  typed into URLs, bodies, and other text cells; `PageUp`/`PageDown` always
+  switch tabs. Picking a section tab gives that section almost the
   whole dialog to itself — handy for editing long Headers or Form-field
   lists — while `All` keeps the combined, everything-at-once layout. Every
   tab is just a different view of the same request, so edits made on one
@@ -408,6 +411,7 @@ up-to-date list. Highlights:
 | `<` / `>` | Grow / shrink the left column |
 | `Ctrl+↑`/`↓` (in wizard) | Jump to the previous/next section (Headers/Cookies/Form/Body/Asserts/Captures) |
 | `Alt+1`-`6` (in wizard) | Jump directly to a section (1=Headers, 2=Cookies, 3=Form, 4=Body, 5=Asserts, 6=Captures) — `Alt`, not `Ctrl`, since most terminals can't report `Ctrl`+digit without special keyboard-protocol support |
+| `[` / `]` (in wizard) | Switch the wizard's section-view tab, same as `PageUp`/`PageDown` — only when focus is on a non-text field (Method, Target, or a "+ Add …" row), so brackets can still be typed into URLs/bodies/values |
 | `PageUp`/`PageDown` (in wizard) | Switch the wizard's section-view tab (`All`/Headers/Cookies/Form/Body/Asserts/Captures); switching to a section tab focuses its first entry |
 | `Ctrl+Shift+←`/`→` (in wizard) | Reorder the wizard's section-view tabs |
 | `Ctrl+D` (on a Header/Cookie/Form/Assert/Capture row) | Delete that row |

@@ -9353,6 +9353,43 @@ fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
 }
 
 #[test]
+fn brackets_cycle_wizard_section_tabs_on_non_text_fields() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    // Name is a text field, so `]` types into it rather than cycling.
+    assert_eq!(new_focus(&app), NewField::Name);
+    press(&mut app, KeyCode::Char(']'));
+    assert_eq!(form_ref(&app).view_tab, WizardTab::All, "`]` typed into Name");
+    assert_eq!(form_ref(&app).name.text(), "]");
+
+    // Move to Method (a selector, not a text field): `]` / `[` cycle tabs.
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    assert_eq!(new_focus(&app), NewField::Method);
+    press(&mut app, KeyCode::Char(']')); // forward -> Headers
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+    press(&mut app, KeyCode::Char(']')); // forward -> Cookies
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Cookies);
+    press(&mut app, KeyCode::Char('[')); // back -> Headers
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+}
+
+#[test]
+fn brackets_are_typed_into_wizard_text_fields() {
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app); // -> Header(0, Key), a text field
+    for ch in "a[0]".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    assert_eq!(
+        form_ref(&app).view_tab,
+        WizardTab::All,
+        "brackets must not cycle tabs while a text cell is focused"
+    );
+    assert_eq!(form_ref(&app).headers[0].key.text(), "a[0]");
+}
+
+#[test]
 fn page_up_page_down_cycle_collection_tabs_in_the_main_view() {
     let mut app = TuiApp::default();
     app.collections.push(Collection::new("api".into(), vec![]));

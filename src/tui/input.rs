@@ -1481,6 +1481,17 @@ impl TuiApp {
                     form.cycle_view_tab(true);
                 } else if key.code == KeyCode::PageUp {
                     form.cycle_view_tab(false);
+                } else if !ctrl
+                    && !alt
+                    && matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
+                    && !form.focus_is_text_entry()
+                {
+                    // `[` / `]` cycle the section-view tab too, mirroring the
+                    // main view's tab keys (an easier-to-reach alias for
+                    // PageUp/PageDown). Only active when focus isn't on a
+                    // text-entry cell, so the brackets can still be typed into
+                    // URLs, JSON bodies, header/cookie/form values, etc.
+                    form.cycle_view_tab(key.code == KeyCode::Char(']'));
                 } else if ctrl && key.code == KeyCode::Char('d') {
                     // Delete the focused Header/Cookie/Form/Assert/Capture row;
                     // focus moves to the row sliding into its place, or the
