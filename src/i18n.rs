@@ -100,7 +100,7 @@ strings! {
     file_not_collection => "Not a valid collection file (no requests found).", "Fichier de collection invalide (aucune requête trouvée).", "Ikke en gyldig samlingsfil (ingen anmodninger fundet).";
     file_not_environment => "Not a valid environment file (expected KEY=value lines).", "Fichier d'environnement invalide (lignes CLÉ=valeur attendues).", "Ikke en gyldig miljøfil (forventede NØGLE=værdi-linjer).";
     open_workspace => "Choose Workspace Folder…", "Choisir le dossier Workspace…", "Vælg Workspace-mappe…";
-    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · Esc annuller";
+    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · ^r nulstil · Esc annuller";
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
     foot_workspace => "browse workspace", "parcourir workspace", "gennemse workspace";
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
@@ -214,7 +214,7 @@ strings! {
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
-    browser_hint_workspace_save => "Enter open folder · Space choose as destination · ← parent · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme destination · ← dossier parent · Échap annuler", "Enter åbn mappe · Mellemrum vælg som destination · ← overordnet · Esc annuller";
+    browser_hint_workspace_save => "Enter open folder · Space choose as destination · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme destination · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som destination · ← overordnet · ^r nulstil · Esc annuller";
     workspace_save_name_prompt => "Workspace name", "Nom du Workspace", "Workspace-navn";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
@@ -308,6 +308,7 @@ strings! {
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
+    help_browser_reset => "reset the file browser to the folder it opened in", "réinitialiser l'explorateur de fichiers au dossier d'ouverture", "nulstil filvælgeren til den mappe, den åbnede i";
     help_prev_next_tab => "previous / next tab", "onglet précédent / suivant", "forrige / næste fane";
     help_rename_close => "rename tab (F2) · delete request / close collection tab", "renommer l'onglet (F2) · supprimer la requête / fermer l'onglet", "omdøb fane (F2) · slet anmodning / luk samlingsfane";
     help_reload_var => "reload a failed environment entry (env var / 1Password / SSM)", "recharger une entrée d'environnement en échec (var d'env / 1Password / SSM)", "genindlæs en mislykket miljøvariabel (miljøvariabel / 1Password / SSM)";
@@ -345,7 +346,7 @@ strings! {
     prompt_save_hint_sl => "Enter save · Esc cancel", "Entrée enregistrer · Échap annuler", "Enter gem · Esc annuller";
     prompt_reset_hint => "^R reset", "^R réinitialiser", "^R nulstil";
     browser_select_file => "Select file", "Sélectionner un fichier", "Vælg fil";
-    browser_hint => "Enter open · ← parent · ^h hidden · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · Esc annuller";
+    browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
 }

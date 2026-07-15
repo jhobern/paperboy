@@ -1569,6 +1569,37 @@ fn env_picker_prefers_the_last_environment_folder() {
 }
 
 #[test]
+fn ctrl_r_resets_the_browser_to_the_folder_it_opened_in() {
+    let dir = temp_dir("resetorigin");
+    let sub = dir.join("nested");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens in `dir`
+    assert_eq!(app.browser_origin_dir.as_ref(), Some(&dir));
+
+    // Wander up into the parent folder.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_ne!(ex.cwd(), &dir, "navigated off the opening folder")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Ctrl+r snaps back to where the browser opened.
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &dir, "reset to the opening folder"),
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn selecting_an_env_file_updates_the_env_folder() {
     let dir = temp_dir("selectenv");
     std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();

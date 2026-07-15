@@ -639,6 +639,11 @@ pub struct TuiApp {
     /// dragged around by loads of unrelated file types.
     pub(crate) last_env_dir: Option<PathBuf>,
 
+    /// Directory the file browser started in the last time it was opened, so
+    /// `^r` can snap it back there after wandering up/down the tree. Set by
+    /// [`TuiApp::open_browser`]; only meaningful while a browser overlay is up.
+    pub(crate) browser_origin_dir: Option<PathBuf>,
+
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
@@ -740,6 +745,7 @@ impl Default for TuiApp {
             pending_batch_runs: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            browser_origin_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             default_request_view: request::RequestView::default(),

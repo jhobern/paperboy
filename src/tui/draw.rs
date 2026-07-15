@@ -1781,7 +1781,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     ),
                     (
                         s.help_group_menus,
-                        &[("f / s", s.help_menus), ("w", s.help_workspace_browse)],
+                        &[
+                            ("f / s", s.help_menus),
+                            ("w", s.help_workspace_browse),
+                            ("^r (File browser)", s.help_browser_reset),
+                        ],
                     ),
                     (
                         s.help_group_environments,

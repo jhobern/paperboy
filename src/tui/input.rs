@@ -1119,6 +1119,16 @@ impl TuiApp {
                     self.last_browse_dir = Some(dir.clone());
                     self.workspace_save_pick_folder(dir);
                 }
+                KeyCode::Char('r') if ctrl => {
+                    // Snap back to the folder the browser first opened in —
+                    // handy after wandering far up/down the tree.
+                    if let Some(origin) = self.browser_origin_dir.clone()
+                        && origin.is_dir()
+                    {
+                        let _ = ex.set_cwd(&origin);
+                    }
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
                 _ => {
                     // Navigation (j/k, h/←, Home/End, Ctrl+h toggle hidden, …).
                     let _ = ex.handle(&Event::Key(key));
@@ -3281,6 +3291,9 @@ impl TuiApp {
                 {
                     let _ = ex.set_cwd(dir);
                 }
+                // Remember where the browser actually started so `^r` can jump
+                // back here after the user navigates away.
+                self.browser_origin_dir = Some(ex.cwd().clone());
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
             Err(e) => self.status = Some(Status::Error(e.to_string())),
