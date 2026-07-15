@@ -281,6 +281,8 @@ impl PersistedTab {
             self.workspace_git_origin
         };
         c.sync_folder_to_selected();
+        c.set_workspace_browse_from_path();
+        c.sync_ws_cursor();
         (c, pending_reload)
     }
 }
@@ -304,12 +306,20 @@ pub struct PersistedState {
     /// reopen there next time.
     #[serde(default)]
     pub last_browse_dir: Option<String>,
+    /// Last folder an *environment* file was loaded from, so the environment
+    /// picker can reopen there independently of other file loads.
+    #[serde(default)]
+    pub last_env_dir: Option<String>,
     /// Ask for confirmation before quitting the app.
     #[serde(default = "yes")]
     pub confirm_on_exit: bool,
     /// Ask for confirmation before closing all collections.
     #[serde(default = "yes")]
     pub confirm_on_clear: bool,
+    /// When set, auto-pick "Save" on a Save/Discard/Cancel unsaved-changes
+    /// prompt (Workspace collection switch or git push) instead of showing it.
+    #[serde(default)]
+    pub always_save_when_prompted: bool,
     /// Width (in columns) of the left column (Requests/Environment panels),
     /// user-adjustable with `<`/`>`.
     #[serde(default = "default_list_width")]
@@ -357,8 +367,10 @@ impl Default for PersistedState {
             tabs: Vec::new(),
             active_tab: 0,
             last_browse_dir: None,
+            last_env_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            always_save_when_prompted: false,
             list_width: default_list_width(),
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),

@@ -12,6 +12,7 @@
 //! reuses the same blobless-fetch + `read-tree` plumbing the load wizard
 //! uses, touching only the file(s) actually being written.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -28,7 +29,26 @@ use crate::i18n::Strings;
 
 use super::draw::*;
 use super::editor::*;
+use super::remote::{WorkspaceGitFilter, WorkspaceGitOrigin};
 use super::theme::*;
+
+/// What the "save to git" wizard is pushing: a single collection (+ optional
+/// environment), or an entire git-loaded Workspace folder.
+pub(crate) enum GitSaveSource {
+    /// The active collection tab (the original flow). Uses the ChoosePaths
+    /// step and pushes `collection.to_hurl()` (plus an optional `.vars`).
+    Collection,
+    /// A whole Workspace previously downloaded from git — pushes every file
+    /// currently on disk under `root` (see
+    /// [`crate::workspace::collect_files_for_commit`]), skips the ChoosePaths
+    /// step entirely, and repins `workspace_git_origin` on success. `filter`
+    /// is carried through so the repinned origin keeps the same download
+    /// filter.
+    Workspace {
+        root: PathBuf,
+        filter: WorkspaceGitFilter,
+    },
+}
 
 /// Whether the user is targeting a branch or a tag.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,7 +89,9 @@ pub(crate) enum GitSaveError {
 /// Result messages from the background refs-check / push, polled each frame.
 pub(crate) enum GitSaveMsg {
     Refs(Result<RemoteRefs, String>),
-    Pushed(Result<(), GitSaveError>),
+    /// A completed push; `Ok` carries the new commit sha so a Workspace save
+    /// can repin its `workspace_git_origin` to the exact commit just pushed.
+    Pushed(Result<String, GitSaveError>),
 }
 
 /// Which step of the "save to git" wizard is on screen.
@@ -129,6 +151,9 @@ pub(crate) struct GitSaveWizard {
     /// loaded from — the base commit for a brand-new branch/tag, refetched
     /// fresh at push time (never reused from load time).
     pub(crate) origin_gitref: String,
+    /// Whether this wizard is saving a single collection or a whole
+    /// git-loaded Workspace folder.
+    pub(crate) source: GitSaveSource,
     pub(crate) stage: GitSaveStage,
     pub(crate) rx: Option<Receiver<GitSaveMsg>>,
 }
@@ -177,6 +202,56 @@ impl GitSaveWizard {
             target_intent: TargetIntent::ExistingBranch,
             commit_msg: Editor::new(&format!("Update {} via PaperBoy", col.name), false),
             origin_gitref: origin.gitref(),
+            source: GitSaveSource::Collection,
+            stage: GitSaveStage::Connect { field: 0 },
+            rx: None,
+        }
+    }
+
+    /// Build a wizard for saving a whole git-loaded Workspace tab `ci` back to
+    /// the repo it came from, seeded from its remembered
+    /// [`WorkspaceGitOrigin`]. Unlike [`Self::new`] there is no environment
+    /// and no per-file path to choose (the whole tree at `root` is pushed as
+    /// it sits on disk), so the ChoosePaths step is skipped. `root` is the
+    /// tab's `workspace_root`.
+    pub(crate) fn new_workspace(ci: usize, col: &Collection, origin: &WorkspaceGitOrigin) -> Self {
+        let root = col
+            .workspace_root
+            .clone()
+            .expect("workspace git-save requires a workspace_root");
+        let (target_kind, origin_gitref) = match origin.ref_kind {
+            RefKind::Branch => (
+                GitSaveTarget::Branch,
+                git_remote::branch_ref(&origin.ref_name),
+            ),
+            RefKind::Tag => (GitSaveTarget::Tag, git_remote::tag_ref(&origin.ref_name)),
+        };
+        let target_name = match origin.ref_kind {
+            RefKind::Branch => origin.ref_name.clone(),
+            RefKind::Tag => String::new(),
+        };
+        let target_intent = match origin.ref_kind {
+            RefKind::Branch => TargetIntent::ExistingBranch,
+            RefKind::Tag => TargetIntent::NewRef,
+        };
+        Self {
+            ci,
+            url: Editor::new(&origin.repo_url, false),
+            token: Editor::blank(),
+            has_env: false,
+            env: None,
+            include_env: false,
+            collection_path: Editor::blank(),
+            env_path: Editor::blank(),
+            target_kind,
+            target_name: Editor::new(&target_name, false),
+            target_intent,
+            commit_msg: Editor::new(&format!("Update {} via PaperBoy", col.name), false),
+            origin_gitref,
+            source: GitSaveSource::Workspace {
+                root,
+                filter: origin.filter,
+            },
             stage: GitSaveStage::Connect { field: 0 },
             rx: None,
         }
@@ -217,7 +292,7 @@ pub(crate) fn spawn_git_save_push(
 ) -> Receiver<GitSaveMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = (|| -> Result<(), GitSaveError> {
+        let result = (|| -> Result<String, GitSaveError> {
             let fresh =
                 git_remote::refs_fresh(&url, token.as_deref()).map_err(GitSaveError::Other)?;
             if target_kind == GitSaveTarget::Tag && fresh.tags.iter().any(|t| t == &target_name) {
@@ -239,7 +314,7 @@ pub(crate) fn spawn_git_save_push(
             let (repo, base_sha) = git_remote::fetch_base(&url, token.as_deref(), &base_gitref)
                 .map_err(GitSaveError::Other)?;
             let (author_name, author_email) = git_remote::author_identity();
-            let push_result = (|| {
+            let push_result = (|| -> Result<String, String> {
                 let commit_sha = git_remote::commit_files(
                     &repo,
                     &base_sha,
@@ -252,7 +327,8 @@ pub(crate) fn spawn_git_save_push(
                     GitSaveTarget::Branch => git_remote::branch_ref(&target_name),
                     GitSaveTarget::Tag => git_remote::tag_ref(&target_name),
                 };
-                git_remote::push_commit(&url, token.as_deref(), &repo, &commit_sha, &target_ref)
+                git_remote::push_commit(&url, token.as_deref(), &repo, &commit_sha, &target_ref)?;
+                Ok(commit_sha)
             })();
             git_remote::cleanup(&repo);
             push_result.map_err(GitSaveError::Other)

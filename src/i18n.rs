@@ -57,6 +57,7 @@ strings! {
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
     confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
+    always_save_when_prompted => "Always save unsaved changes when prompted", "Toujours enregistrer les modifications non enregistrées lorsque demandé", "Gem altid ugemte ændringer, når du bliver spurgt";
     view_json_label => "JSON", "JSON", "JSON";
     view_hurl_label => "Hurl", "Hurl", "Hurl";
     confirm_exit_q => "Quit PaperBoy?", "Quitter PaperBoy\u{a0}?", "Afslut PaperBoy?";
@@ -72,19 +73,21 @@ strings! {
     file_menu_item_save => "(S)ave", "(E)nregistrer", "(G)em";
     file_load_menu => "Load", "Charger", "Indlæs";
     file_save_menu => "Save", "Enregistrer", "Gem";
+    file_kind_collection => "Collection", "Collection", "Samling";
+    file_kind_environment => "Environment", "Environnement", "Miljø";
+    file_kind_workspace => "Workspace", "Workspace", "Workspace";
+    file_source_local => "(L)ocal file…", "Fichier (l)ocal…", "(L)okal fil…";
+    file_source_git => "From (G)it…", "Depuis (G)it…", "Fra (G)it…";
+    file_dest_save => "(S)ave", "(E)nregistrer", "(G)em";
+    file_dest_save_as => "Save (A)s…", "Enregistrer s(o)us…", "Gem s(o)m…";
+    file_dest_git => "To (G)it…", "Vers (G)it…", "Til Gi(t)…";
     file_load_item_request => "(R)equest…", "(R)equête…", "(A)nmodning…";
     file_load_item_collection => "(C)ollection…", "(C)ollection…", "(S)amling…";
-    file_load_item_collection_git => "Collection from (G)it…", "Collection depuis (G)it…", "Samling fra (G)it…";
     file_load_item_environment => "(E)nvironment…", "(E)nvironnement…", "(M)iljø…";
-    file_load_item_environment_git => "En(v)ironment from Git…", "En(v)ironnement depuis Git…", "Miljø fra Gi(t)…";
     file_load_item_workspace => "(W)orkspace…", "(W)orkspace…", "(W)orkspace…";
-    file_load_item_workspace_git => "Work(s)pace from Git…", "Work(s)pace depuis Git…", "Works(p)ace fra Git…";
     file_save_item_request => "(R)equest…", "(R)equête…", "(A)nmodning…";
     file_save_item_collection => "(C)ollection…", "(C)ollection…", "(S)amling…";
-    file_save_item_collection_as => "Collection (A)s…", "Collection s(o)us…", "Samling s(o)m…";
-    file_save_item_collection_git => "Save Collection to (G)it…", "Enregistrer la collection sur (G)it…", "Gem samling til (G)it…";
     file_save_item_environment => "(E)nvironment…", "(E)nvironnement…", "(M)iljø…";
-    file_save_item_environment_as => "En(v)ironment As…", "En(v)ironnement sous…", "Miljø - n(y)t navn…";
     file_save_item_workspace => "(W)orkspace…", "(W)orkspace…", "(W)orkspace…";
     file_save_item_response => "Res(p)onse…", "Ré(p)onse…", "S(v)ar…";
     save_request => "Save Request…", "Enregistrer la requête…", "Gem anmodning…";
@@ -100,11 +103,15 @@ strings! {
     file_not_collection => "Not a valid collection file (no requests found).", "Fichier de collection invalide (aucune requête trouvée).", "Ikke en gyldig samlingsfil (ingen anmodninger fundet).";
     file_not_environment => "Not a valid environment file (expected KEY=value lines).", "Fichier d'environnement invalide (lignes CLÉ=valeur attendues).", "Ikke en gyldig miljøfil (forventede NØGLE=værdi-linjer).";
     open_workspace => "Choose Workspace Folder…", "Choisir le dossier Workspace…", "Vælg Workspace-mappe…";
-    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · Esc annuller";
+    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · ^r nulstil · Esc annuller";
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
     foot_workspace => "browse workspace", "parcourir workspace", "gennemse workspace";
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
-    workspace_picker_hint => "Enter open · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint => "Enter open · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
+    workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
+    new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
     workspace_filter_on => "Filter: .hurl/.json", "Filtre : .hurl/.json", "Filter: .hurl/.json";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
     workspace_no_files => "No matching files in this folder.", "Aucun fichier correspondant dans ce dossier.", "Ingen matchende filer i denne mappe.";
@@ -195,8 +202,6 @@ strings! {
     git_branches => "Branches", "Branches", "Grene";
     git_tags => "Tags", "Étiquettes", "Tags";
     git_filter_label => "filter: ", "filtre\u{a0}: ", "filter: ";
-    git_ask_load_env_q => "Also load an environment from this ref?", "Charger aussi un environnement depuis cette référence\u{a0}?", "Indlæs også et miljø fra denne reference?";
-    git_pick_env_file_title => "Select an environment file", "Sélectionnez un fichier d'environnement", "Vælg en miljøfil";
     git_pick_workspace_filter_title => "Choose which files to download", "Choisissez les fichiers à télécharger", "Vælg hvilke filer der skal hentes";
     git_workspace_filter_hint => "↑↓ move · Enter select · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
     git_ws_filter_hurl_json => ".hurl and .json files (recommended)", "Fichiers .hurl et .json (recommandé)", ".hurl- og .json-filer (anbefalet)";
@@ -216,7 +221,7 @@ strings! {
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
-    browser_hint_workspace_save => "Enter open folder · Space choose as destination · ← parent · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme destination · ← dossier parent · Échap annuler", "Enter åbn mappe · Mellemrum vælg som destination · ← overordnet · Esc annuller";
+    browser_hint_workspace_save => "Enter open folder · Space choose as destination · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme destination · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som destination · ← overordnet · ^r nulstil · Esc annuller";
     workspace_save_name_prompt => "Workspace name", "Nom du Workspace", "Workspace-navn";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
@@ -225,6 +230,15 @@ strings! {
     git_workspace_storage_choose => "Choose a folder…", "Choisir un dossier…", "Vælg en mappe…";
     git_no_origin => "This collection wasn't loaded from Git.", "Cette collection n'a pas été chargée depuis Git.", "Denne samling blev ikke indlæst fra Git.";
     git_save_title => "Save to Git", "Enregistrer sur Git", "Gem til Git";
+    git_save_workspace_empty => "The workspace has no files to save.", "Le workspace n'a aucun fichier à enregistrer.", "Dette workspace har ingen filer at gemme.";
+    git_save_ws_unsaved_q => "The current file has unsaved changes. A Git push commits the files as they are on disk, so those changes won't be included unless you save them first.\n\nWhat would you like to do?", "Le fichier actuel a des modifications non enregistrées. Un envoi vers Git valide les fichiers tels qu'ils sont sur le disque, donc ces modifications ne seront pas incluses si vous ne les enregistrez pas d'abord.\n\nQue souhaitez-vous faire ?", "Den aktuelle fil har ugemte ændringer. En Git-push committer filerne, som de er på disken, så disse ændringer medtages ikke, medmindre du gemmer dem først.\n\nHvad vil du gøre?";
+    git_save_ws_unsaved_save => "Save changes, then push", "Enregistrer les modifications, puis envoyer", "Gem ændringer, og push derefter";
+    git_save_ws_unsaved_ignore => "Push the saved version (discard unsaved changes)", "Envoyer la version enregistrée (ignorer les modifications non enregistrées)", "Push den gemte version (kassér ugemte ændringer)";
+    git_save_ws_unsaved_cancel => "Cancel", "Annuler", "Annuller";
+    ws_switch_unsaved_q => "The current collection has unsaved changes. Opening a different collection replaces them in memory, so they will be lost unless you save them first.\n\nWhat would you like to do?", "La collection actuelle a des modifications non enregistrées. Ouvrir une autre collection les remplace en mémoire, elles seront donc perdues si vous ne les enregistrez pas d'abord.\n\nQue souhaitez-vous faire ?", "Den aktuelle samling har ugemte ændringer. Hvis du åbner en anden samling, erstattes de i hukommelsen, så de går tabt, medmindre du gemmer dem først.\n\nHvad vil du gøre?";
+    ws_switch_unsaved_save => "Save changes, then switch", "Enregistrer les modifications, puis changer", "Gem ændringer, og skift derefter";
+    ws_switch_unsaved_discard => "Discard changes and switch", "Ignorer les modifications et changer", "Kassér ændringer og skift";
+    ws_switch_unsaved_cancel => "Cancel", "Annuler", "Annuller";
     git_save_include_env_label => "Also save the environment", "Enregistrer aussi l'environnement", "Gem også miljøet";
     git_save_collection_path_label => "Collection path in repo", "Chemin de la collection dans le dépôt", "Samlingens sti i repoet";
     git_save_env_path_label => "Environment path in repo", "Chemin de l'environnement dans le dépôt", "Miljøets sti i repoet";
@@ -310,6 +324,9 @@ strings! {
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
+    help_workspace_open => "open the highlighted workspace folder / collection (→ or Enter)", "ouvrir le dossier / la collection du workspace en surbrillance (→ ou Entrée)", "åbn den fremhævede workspace-mappe / -samling (→ eller Enter)";
+    help_menu_submenu_nav => "enter / leave a File-menu submenu", "entrer / quitter un sous-menu du menu Fichier", "gå ind i / ud af en Fil-menu-undermenu";
+    help_browser_reset => "reset the file browser to the folder it opened in", "réinitialiser l'explorateur de fichiers au dossier d'ouverture", "nulstil filvælgeren til den mappe, den åbnede i";
     help_prev_next_tab => "previous / next tab", "onglet précédent / suivant", "forrige / næste fane";
     help_rename_close => "rename tab (F2) · delete request / close collection tab", "renommer l'onglet (F2) · supprimer la requête / fermer l'onglet", "omdøb fane (F2) · slet anmodning / luk samlingsfane";
     help_reload_var => "reload a failed environment entry (env var / 1Password / SSM)", "recharger une entrée d'environnement en échec (var d'env / 1Password / SSM)", "genindlæs en mislykket miljøvariabel (miljøvariabel / 1Password / SSM)";
@@ -317,7 +334,7 @@ strings! {
     help_env_delete => "delete the selected Global Environment (unlinks any collections using it)", "supprimer l'environnement global sélectionné (délie les collections qui l'utilisent)", "slet det valgte globale miljø (fjerner link fra samlinger, der bruger det)";
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
-    help_env_rename => "rename the open Global Environment", "renommer l'environnement global ouvert", "omdøb det åbne globale miljø";
+    help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
     help_resize_width => "grow / shrink left column", "agrandir / réduire la colonne de gauche", "forøg / formindsk venstre kolonne";
     help_tab_manage => "close / reopen collection or workspace tab", "fermer / rouvrir un onglet de collection ou d'espace de travail", "luk / genåbn samlings- eller workspace-fane";
@@ -347,7 +364,7 @@ strings! {
     prompt_save_hint_sl => "Enter save · Esc cancel", "Entrée enregistrer · Échap annuler", "Enter gem · Esc annuller";
     prompt_reset_hint => "^R reset", "^R réinitialiser", "^R nulstil";
     browser_select_file => "Select file", "Sélectionner un fichier", "Vælg fil";
-    browser_hint => "Enter open · ← parent · ^h hidden · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · Esc annuller";
+    browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
 }
@@ -411,6 +428,15 @@ pub enum Status {
     /// detail (a filesystem error, or the chosen destination already
     /// existing / overlapping the source).
     WorkspaceSaveFailed(String),
+    /// A brand-new (in-memory, not yet written) collection was created inside
+    /// a Workspace — names the relative file path so the user knows where the
+    /// just-added request landed and that it still needs saving.
+    WorkspaceCollectionCreated(String),
+    /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
+    /// URL, which is the one field a request can't be saved without — the
+    /// wizard is kept open (focused on the URL field) instead of silently
+    /// discarding everything the user typed.
+    NewRequestUrlRequired,
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
 }
@@ -472,6 +498,10 @@ impl Status {
             Status::NotWorkspace => s.file_not_workspace.to_string(),
             Status::WorkspaceSaved => s.workspace_save_success.to_string(),
             Status::WorkspaceSaveFailed(e) => s.workspace_save_failed.replace("{e}", e),
+            Status::WorkspaceCollectionCreated(name) => {
+                s.workspace_collection_created.replace("{name}", name)
+            }
+            Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::CollectionRunSummary {
                 passed,
                 failed,

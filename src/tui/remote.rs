@@ -142,14 +142,6 @@ pub(crate) enum RemoteStage {
         filter: String,
         sel: usize,
     },
-    /// After successfully loading a collection from git: ask whether to also
-    /// load its environment from the same ref (reusing the already-fetched
-    /// file list in [`RemoteWizard::files`] — no second network fetch). `sel`
-    /// selects Yes (0) or No (1).
-    AskLoadEnvToo { sel: usize },
-    /// Choose the environment file from `RemoteWizard::files` (filtered by
-    /// `filter`) — the combined collection+environment load's second pick.
-    PickEnvFile { filter: String, sel: usize },
     /// Workspace load only: choose which files to actually download (see
     /// [`WorkspaceGitFilter`]) before checking anything out.
     PickWorkspaceFilter { sel: usize },
@@ -188,16 +180,9 @@ pub(crate) struct RemoteWizard {
     /// recorded once the file finishes loading.
     pub(crate) chosen_ref: Option<RefChoice>,
     /// The file listing from `list_files`, kept around (instead of only
-    /// living inside the `PickFile` stage) so the combined collection+
-    /// environment load's second pick (`PickEnvFile`) can reuse it without a
-    /// second network fetch.
+    /// living inside the `PickFile` stage) so the Workspace filter step can
+    /// reuse it without a second network fetch.
     pub(crate) files: Vec<String>,
-    /// `true` once the wizard has moved on to fetching the *environment*
-    /// file in a combined collection+environment load, so `apply_git_msg`
-    /// routes the next `GitMsg::Content` to `load_environment_text` (and sets
-    /// `env_git_origin`) instead of treating it as the primary (collection)
-    /// pick.
-    pub(crate) second_pick: bool,
     /// The [`WorkspaceGitFilter`] chosen in `PickWorkspaceFilter`, kept
     /// around so it can be baked into the [`WorkspaceGitOrigin`] recorded
     /// once the download finishes.
@@ -223,7 +208,6 @@ impl RemoteWizard {
             recent,
             chosen_ref: None,
             files: Vec::new(),
-            second_pick: false,
             chosen_workspace_filter: None,
             chosen_sha: None,
         }
@@ -243,6 +227,36 @@ pub(crate) fn filter_indices<'a>(items: impl Iterator<Item = &'a str>, filter: &
         .filter(|(_, s)| f.is_empty() || s.to_lowercase().contains(&f))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Narrow a git file listing to the paths worth showing in a single-file
+/// picker, so loading from a big repo isn't buried under unrelated files:
+///   * a Collection load shows only `.hurl` / `.json` files;
+///   * an Environment load shows only `.vars` / `.env` files (including
+///     `.env`-style dotfiles like `.env` and `.env.dev-au`).
+///
+/// If nothing matches (an unusually named repo), the full list is returned
+/// unchanged rather than leaving the user staring at an empty picker.
+pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> {
+    let keep = |path: &String| -> bool {
+        let p = std::path::Path::new(path);
+        let ext = p.extension().and_then(|e| e.to_str());
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        match kind {
+            RemoteKind::Collection => {
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
+            }
+            RemoteKind::Environment => {
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
+                    || name.eq_ignore_ascii_case(".env")
+                    || name.to_ascii_lowercase().starts_with(".env.")
+            }
+            // A Workspace load uses the file-type filter step, not this picker.
+            RemoteKind::Workspace => true,
+        }
+    };
+    let filtered: Vec<String> = files.iter().filter(|p| keep(p)).cloned().collect();
+    if filtered.is_empty() { files.to_vec() } else { filtered }
 }
 
 /// Build the flat, filterable branch+tag choice list (branches first).
@@ -302,6 +316,11 @@ pub(crate) fn spawn_git_checkout_workspace(repo: PathBuf, paths: Vec<String>) ->
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let res = git_remote::checkout_files(&repo, &paths).map(|_| repo.clone());
+        // The temp repo becomes the persisted `workspace_root`, so drop its
+        // `origin` remote to keep the access token out of its `.git/config`.
+        if res.is_ok() {
+            git_remote::scrub_remote(&repo);
+        }
         // If the wizard was cancelled the receiver is gone; clean up the temp
         // repo (which now holds the downloaded workspace files) so it doesn't
         // linger on disk.
@@ -576,18 +595,6 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
         RemoteStage::PickFile { files, filter, sel } => {
             draw_filter_list(f, s, s.git_pick_file_title, filter, files, *sel, th);
         }
-        RemoteStage::AskLoadEnvToo { sel } => {
-            draw_confirm_popup(
-                f,
-                s.git_ask_load_env_q,
-                &[s.confirm_yes, s.confirm_no],
-                *sel,
-                th,
-            );
-        }
-        RemoteStage::PickEnvFile { filter, sel } => {
-            draw_filter_list(f, s, s.git_pick_env_file_title, filter, &w.files, *sel, th);
-        }
         RemoteStage::PickWorkspaceFilter { sel } => {
             let labels: Vec<&str> = WorkspaceGitFilter::ALL.iter().map(|f| f.label(s)).collect();
             draw_choice_popup(
@@ -618,5 +625,47 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
                 rows[1],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files() -> Vec<String> {
+        [
+            "api/health.hurl",
+            "postman/orders.json",
+            "envs/dev.vars",
+            ".env",
+            ".env.dev-au",
+            "README.md",
+            "src/main.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn relevant_files_for_a_collection_keeps_only_hurl_and_json() {
+        let out = relevant_files(RemoteKind::Collection, &files());
+        assert_eq!(out, vec!["api/health.hurl", "postman/orders.json"]);
+    }
+
+    #[test]
+    fn relevant_files_for_an_environment_keeps_vars_and_dotenv_style_files() {
+        let out = relevant_files(RemoteKind::Environment, &files());
+        assert_eq!(out, vec!["envs/dev.vars", ".env", ".env.dev-au"]);
+    }
+
+    #[test]
+    fn relevant_files_falls_back_to_everything_when_nothing_matches() {
+        let noise: Vec<String> = ["a.md", "b.rs", "c.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Never strand the user with an empty picker on an oddly-named repo.
+        assert_eq!(relevant_files(RemoteKind::Collection, &noise), noise);
     }
 }

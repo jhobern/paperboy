@@ -78,6 +78,12 @@ pub(crate) enum PromptKind {
     /// workspace's own (sub)folder name within it. Defaults to the tab's
     /// current name.
     WorkspaceSaveName,
+    /// Naming a brand-new collection file being created inside a Workspace
+    /// tab (the `usize` is the workspace collection index). The typed text is
+    /// a path relative to the workspace root; subfolders are allowed and a
+    /// `.hurl` extension is defaulted. Reached via `n` in the workspace
+    /// destination picker.
+    NewWorkspaceCollection(usize),
 }
 
 impl PromptKind {
@@ -87,6 +93,7 @@ impl PromptKind {
         match self {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
+            PromptKind::NewWorkspaceCollection(_) => ".hurl",
             _ => "",
         }
     }
@@ -188,6 +195,11 @@ pub(crate) struct WorkspacePickerState {
     /// grouping), or `entries.len()` if there are no files at all to select.
     pub(crate) selected: usize,
     pub(crate) scroll: u16,
+    /// `true` when this picker was opened to choose the destination for a
+    /// brand-new request that's parked in `TuiApp::pending_workspace_request`
+    /// (rather than just browsing to load a file). Changes the Enter action
+    /// (load-then-append instead of load-only) and the on-screen hint.
+    pub(crate) adding_request: bool,
 }
 
 impl WorkspacePickerState {
@@ -208,6 +220,7 @@ impl WorkspacePickerState {
             entries,
             selected,
             scroll: 0,
+            adding_request: false,
         }
     }
 
@@ -250,14 +263,25 @@ pub(crate) enum Overlay {
     /// grouped submenu (see `FileLoadMenu`/`FileSaveMenu`) — replaces the old
     /// flat 12-item list that had grown hard to scan.
     FileMenu(usize),
-    /// The "Load" submenu of the File menu (Request / Collection / Collection
-    /// from Git / Environment / Environment from Git). Esc/q returns to
-    /// `FileMenu(0)`.
+    /// The "Load" submenu of the File menu: just the *kinds* (Request /
+    /// Collection / Environment / Workspace). Picking a kind that can come
+    /// from more than one place opens `FileLoadSource` to choose local vs
+    /// git; Request (local-only) goes straight to its path prompt. Esc/q
+    /// returns to `FileMenu(0)`.
     FileLoadMenu(usize),
-    /// The "Save" submenu of the File menu (Request / Collection / Collection
-    /// As / Collection to Git / Environment / Environment As / Response).
-    /// Esc/q returns to `FileMenu(1)`.
+    /// The "Save" submenu of the File menu: just the *kinds* (Request /
+    /// Collection / Environment / Workspace / Response). Picking a kind with
+    /// more than one destination opens `FileSaveDest`; Request/Response go
+    /// straight to their path prompt. Esc/q returns to `FileMenu(1)`.
     FileSaveMenu(usize),
+    /// Second step of "Load": where should this `FileKind` come from —
+    /// `(L)ocal file…` or `From (G)it…`. Esc/q returns to `FileLoadMenu` with
+    /// the kind re-highlighted.
+    FileLoadSource(FileKind, usize),
+    /// Second step of "Save": where should this `FileKind` go — `(S)ave` /
+    /// `Save (A)s…` / `To (G)it…` (the exact set depends on the kind). Esc/q
+    /// returns to `FileSaveMenu` with the kind re-highlighted.
+    FileSaveDest(FileKind, usize),
     /// The "Settings" menu (Language / Preferences / Clear all collections) —
     /// opened with `s`. Not to be confused with `Preferences`, the submenu one
     /// level down that holds the actual toggle-able preferences.
@@ -355,6 +379,29 @@ pub(crate) enum Overlay {
         origin: Option<WorkspaceGitOrigin>,
         sel: usize,
     },
+    /// Shown before "Save Workspace to Git" when the currently-loaded file in
+    /// the Workspace tab has unsaved in-memory edits: a git push commits the
+    /// files as they sit on disk, so those edits would be left out unless
+    /// saved first (switching files within a Workspace discards in-memory
+    /// edits, so only the current file can ever hold them). `ci` is the
+    /// Workspace tab. `sel`: 0 = save the edits to disk then push, 1 = push
+    /// the on-disk version as-is (leaving the edits only in memory), 2 =
+    /// cancel.
+    WorkspaceGitSaveUnsaved {
+        ci: usize,
+        sel: usize,
+    },
+    /// Shown when the user opens a *different* collection in a Workspace tab
+    /// while the currently-loaded one has unsaved in-memory edits: loading a
+    /// file replaces the tab's entries wholesale, so those edits would be
+    /// silently discarded. `ci` is the Workspace tab, `target` the collection
+    /// file to switch to. `sel`: 0 = save the edits first then switch, 1 =
+    /// discard the edits and switch, 2 = cancel (stay).
+    WorkspaceSwitchUnsaved {
+        ci: usize,
+        target: PathBuf,
+        sel: usize,
+    },
 }
 
 /// Which action a confirmation popup is guarding.
@@ -401,31 +448,83 @@ pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
     [s.file_menu_item_load, s.file_menu_item_save]
 }
 
-/// The 7 items of the File menu's "Load" submenu.
-pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 7] {
+/// The kinds of thing the File menu can load or save. Chosen in the first
+/// step of Load/Save; the local-vs-git (or Save/Save As/Git) choice is a
+/// second step (see [`Overlay::FileLoadSource`] / [`Overlay::FileSaveDest`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum FileKind {
+    Collection,
+    Environment,
+    Workspace,
+}
+
+impl FileKind {
+    /// The plain (mnemonic-free) name shown in a second-step popup title.
+    pub(crate) fn name(self, s: &Strings) -> &'static str {
+        match self {
+            FileKind::Collection => s.file_kind_collection,
+            FileKind::Environment => s.file_kind_environment,
+            FileKind::Workspace => s.file_kind_workspace,
+        }
+    }
+}
+
+/// The row this kind occupies in the "Load" kind list (see
+/// [`file_load_items`]), used to re-highlight it when Esc steps back.
+pub(crate) fn file_load_kind_index(kind: FileKind) -> usize {
+    match kind {
+        FileKind::Collection => 1,
+        FileKind::Environment => 2,
+        FileKind::Workspace => 3,
+    }
+}
+
+/// The row this kind occupies in the "Save" kind list (see
+/// [`file_save_items`]), used to re-highlight it when Esc steps back.
+pub(crate) fn file_save_kind_index(kind: FileKind) -> usize {
+    match kind {
+        FileKind::Collection => 1,
+        FileKind::Environment => 2,
+        FileKind::Workspace => 3,
+    }
+}
+
+/// The 4 kinds of the File menu's "Load" submenu.
+pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 4] {
     [
         s.file_load_item_request,
         s.file_load_item_collection,
-        s.file_load_item_collection_git,
         s.file_load_item_environment,
-        s.file_load_item_environment_git,
         s.file_load_item_workspace,
-        s.file_load_item_workspace_git,
     ]
 }
 
-/// The 8 items of the File menu's "Save" submenu.
-pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 8] {
+/// The 5 kinds of the File menu's "Save" submenu.
+pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 5] {
     [
         s.file_save_item_request,
         s.file_save_item_collection,
-        s.file_save_item_collection_as,
-        s.file_save_item_collection_git,
         s.file_save_item_environment,
-        s.file_save_item_environment_as,
         s.file_save_item_workspace,
         s.file_save_item_response,
     ]
+}
+
+/// The two "Load" source choices: a local file or a git remote.
+pub(crate) fn file_load_source_items(s: &Strings) -> [&'static str; 2] {
+    [s.file_source_local, s.file_source_git]
+}
+
+/// The "Save" destination choices for `kind`. Collections can be saved to
+/// their file, to a new file, or to git; environments to their file or a new
+/// file (no git save); a workspace is a folder, so only "save as a copy" or
+/// git apply.
+pub(crate) fn file_save_dest_items(kind: FileKind, s: &Strings) -> Vec<&'static str> {
+    match kind {
+        FileKind::Collection => vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git],
+        FileKind::Environment => vec![s.file_dest_save, s.file_dest_save_as],
+        FileKind::Workspace => vec![s.file_dest_save_as, s.file_dest_git],
+    }
 }
 
 /// Extracts the mnemonic letter embedded in a menu label using the "(X)"
@@ -634,9 +733,32 @@ pub struct TuiApp {
     /// Folder the file browser last selected a file from; it reopens here.
     pub(crate) last_browse_dir: Option<PathBuf>,
 
+    /// Folder the last *environment* file was loaded from; the environment
+    /// picker reopens here (falling back to `last_browse_dir`), so it isn't
+    /// dragged around by loads of unrelated file types.
+    pub(crate) last_env_dir: Option<PathBuf>,
+
+    /// Directory the file browser started in the last time it was opened, so
+    /// `^r` can snap it back there after wandering up/down the tree. Set by
+    /// [`TuiApp::open_browser`]; only meaningful while a browser overlay is up.
+    pub(crate) browser_origin_dir: Option<PathBuf>,
+
+    /// Deepest folder the file browser was in before the user started walking
+    /// *up* the tree with Left, i.e. the trail to retrace on the way back down.
+    /// Each Left keeps it; each Right that follows the trail re-selects the next
+    /// folder down it, so pressing Left N times then Right N times returns to
+    /// exactly where you started. Descending into any *other* folder (a genuine
+    /// new navigation) clears it. Only meaningful while a browser overlay is up.
+    pub(crate) browser_forward_path: Option<PathBuf>,
+
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
+    /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
+    /// for unsaved in-memory edits (switching collections in a Workspace, or
+    /// pushing one to git) is skipped and the "Save" action taken
+    /// automatically. Off by default, so the prompt is shown.
+    pub(crate) always_save_when_prompted: bool,
     /// Preferences (persisted): which of JSON / Hurl text the Main (Request)
     /// panel shows by default, for every request. Changed from the
     /// Preferences submenu (Settings → Preferences → Default Request View).
@@ -649,6 +771,15 @@ pub struct TuiApp {
 
     /// Target path for a pending "Save As" overwrite confirmation.
     pub(crate) pending_save_path: Option<PathBuf>,
+
+    /// A brand-new request awaiting a destination inside a Workspace tab. Set
+    /// when a "New Request" form targets a Workspace (whose entries belong to
+    /// whichever file is loaded, so there's no single obvious destination);
+    /// the workspace destination picker then either appends it to the file
+    /// the user opens or seeds a new collection created with `n`. Taken (set
+    /// back to `None`) as soon as it lands somewhere or the picker is
+    /// cancelled, so an aborted flow never leaks state.
+    pub(crate) pending_workspace_request: Option<HurlEntry>,
 
     /// Git URLs the user has loaded a collection/environment from, most recent
     /// first. Offered as a pickable list in the "Load from Git" wizard and
@@ -734,11 +865,16 @@ impl Default for TuiApp {
             pending_captures: Vec::new(),
             pending_batch_runs: Vec::new(),
             last_browse_dir: None,
+            last_env_dir: None,
+            browser_origin_dir: None,
+            browser_forward_path: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
             enhanced_keys: false,
             pending_save_path: None,
+            pending_workspace_request: None,
             recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
@@ -1134,6 +1270,9 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::WorkspaceSaveName => self.finish_workspace_save(text),
+            PromptKind::NewWorkspaceCollection(ci) => {
+                self.create_workspace_collection(ci, text)
+            }
         }
     }
 
@@ -1255,7 +1394,7 @@ impl TuiApp {
             }
             FileAction::OpenCollection => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = file_stem(path, "collection");
+                    let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
@@ -1263,6 +1402,11 @@ impl TuiApp {
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
                 let text = self.collections[ci].to_hurl();
+                if let Some(parent) = PathBuf::from(path).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 match std::fs::write(path, text) {
                     Ok(()) => {
                         self.collections[ci].path = Some(PathBuf::from(path));
@@ -1277,7 +1421,7 @@ impl TuiApp {
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = file_stem(path, "environment");
+                    let name = env_name_from_path(path, "environment");
                     self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
                 }
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
@@ -1598,6 +1742,8 @@ impl TuiApp {
                     col.workspace_filter_hurl_json = filter;
                     col.invalidate_request_json();
                     col.sync_folder_to_selected();
+                    col.set_workspace_browse_from_path();
+                    col.sync_ws_cursor();
                 }
                 self.active_tab = collection_idx;
                 self.focus = Pane::List;
@@ -1625,7 +1771,141 @@ impl TuiApp {
         )));
     }
 
-    /// Called once per frame (see `draw`): if the active tab is Workspace-
+    /// Open the Workspace file-tree popup for tab `ci` in "choose a
+    /// destination for the pending new request" mode (see
+    /// [`TuiApp::pending_workspace_request`]). Identical to
+    /// `open_workspace_picker_for_active_tab` except it also focuses the tab
+    /// and flags the picker so Enter *appends* the parked request to whatever
+    /// file is opened (rather than merely loading it), and the hint reflects
+    /// that. A no-op if `ci` isn't a Workspace-bound tab (the request is left
+    /// parked; callers guard on this).
+    pub(crate) fn open_workspace_dest_picker(&mut self, ci: usize) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let filter = col.workspace_filter_hurl_json;
+        self.active_tab = ci;
+        let mut picker = WorkspacePickerState::new(ci, root, filter);
+        picker.adding_request = self.pending_workspace_request.is_some();
+        self.overlay = Some(Overlay::WorkspacePicker(picker));
+    }
+
+    /// Append the parked [`TuiApp::pending_workspace_request`], if any, to
+    /// the collection currently loaded in Workspace tab `ci`, marking it as a
+    /// user-added, unsaved edit and selecting it so it's immediately visible.
+    /// Meant to be called right after `load_workspace_file` succeeded. The
+    /// request is only taken once it's been placed; on a missing tab it's
+    /// left parked for the caller to handle.
+    pub(crate) fn append_pending_request_to_loaded(&mut self, ci: usize) {
+        let Some(mut entry) = self.pending_workspace_request.take() else {
+            return;
+        };
+        let Some(col) = self.collections.get_mut(ci) else {
+            self.pending_workspace_request = Some(entry);
+            return;
+        };
+        entry.user_added = true;
+        entry.modified = true;
+        col.entries.push(entry);
+        col.selected_entry = col.entries.len() - 1;
+        col.invalidate_request_json();
+        col.sync_folder_to_selected();
+        col.sync_ws_cursor();
+        self.active_tab = ci;
+        self.focus = Pane::Main;
+        self.status = None;
+        self.save_state();
+    }
+
+    /// Open the "name a new collection" prompt for Workspace tab `ci` (see
+    /// [`PromptKind::NewWorkspaceCollection`]). The typed text is a path
+    /// relative to the workspace root; `.hurl` is ghosted as the default
+    /// extension.
+    pub(crate) fn open_new_workspace_collection_prompt(&mut self, ci: usize) {
+        if self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::NewWorkspaceCollection(ci),
+            editor: Editor::blank(),
+            title: s.workspace_new_collection_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Create a brand-new (in-memory, not-yet-written) collection file inside
+    /// Workspace tab `ci`'s root at the relative path `rel`. Subfolders are
+    /// allowed; a missing extension defaults to `.hurl`. The parked
+    /// [`TuiApp::pending_workspace_request`], if any, becomes the collection's
+    /// sole (user-added) entry so the just-created request is visible. The
+    /// tab now shows this new file (unsaved — Ctrl+S writes it, creating any
+    /// parent folders). Paths that are absolute or try to escape the root via
+    /// `..` are rejected.
+    pub(crate) fn create_workspace_collection(&mut self, ci: usize, rel: String) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let filter = col.workspace_filter_hurl_json;
+        let rel = rel.trim();
+        if rel.is_empty() {
+            return;
+        }
+        let mut rel_path = PathBuf::from(rel);
+        if rel_path.extension().is_none() {
+            rel_path.set_extension("hurl");
+        }
+        // Reject absolute paths or any `..`/root component that would let the
+        // new file escape the workspace root.
+        let safe = rel_path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if !safe {
+            self.status = Some(Status::Error(rel_path.display().to_string()));
+            return;
+        }
+        let full_path = root.join(&rel_path);
+        let mut entries = Vec::new();
+        if let Some(mut entry) = self.pending_workspace_request.take() {
+            entry.user_added = true;
+            entry.modified = true;
+            entries.push(entry);
+        }
+        let has_entry = !entries.is_empty();
+        if let Some(col) = self.collections.get_mut(ci) {
+            col.entries = entries;
+            col.selected_entry = 0;
+            col.path = Some(full_path);
+            col.workspace_root = Some(root);
+            col.workspace_filter_hurl_json = filter;
+            col.invalidate_request_json();
+            col.sync_folder_to_selected();
+        }
+        self.active_tab = ci;
+        self.focus = if has_entry { Pane::Main } else { Pane::List };
+        self.status = Some(Status::WorkspaceCollectionCreated(
+            rel_path.display().to_string(),
+        ));
+        self.save_state();
+    }
+
     /// bound but has no collection file chosen yet (a freshly-created tab,
     /// or one whose last file vanished on restore) — and the user hasn't
     /// already cancelled this same prompt — pop the file picker open
@@ -1934,7 +2214,9 @@ impl TuiApp {
             .active_env_id
             .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
         match (linked, active) {
-            (Some(linked), Some(active)) => linked
+            // A collection linked to the very environment that's also active
+            // shadows nothing — the same value would be substituted either way.
+            (Some(linked), Some(active)) if linked.id != active.id => linked
                 .vars
                 .iter()
                 .filter(|lv| active.vars.iter().any(|av| av.key == lv.key))
@@ -2027,6 +2309,77 @@ impl TuiApp {
             &self.collections[ci],
             env,
         ))));
+    }
+
+    /// Open the "Save Workspace to Git…" wizard for the active tab, or show
+    /// [`Status::NoGitOrigin`] if it isn't a git-loaded Workspace (this action
+    /// is only ever offered for a tab that was downloaded from git and still
+    /// has its files on disk). If the currently-loaded file has unsaved
+    /// in-memory edits, a warning is shown first (see
+    /// [`Overlay::WorkspaceGitSaveUnsaved`]) so those edits aren't silently
+    /// omitted from the pushed on-disk tree.
+    pub(crate) fn open_git_workspace_save_wizard(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        let is_git_workspace = col.workspace_git_origin.is_some() && col.workspace_root.is_some();
+        if !is_git_workspace {
+            self.status = Some(Status::NoGitOrigin);
+            return;
+        }
+        // The push commits the tree as it sits on disk; warn if the loaded
+        // file has edits that only live in memory (and thus a place on disk
+        // to save them to) so the user can choose whether to include them.
+        if col.path.is_some() && self.changed_request_count(ci) > 0 {
+            // With "always save" on, auto-pick Save (push only if the write
+            // succeeded); otherwise ask.
+            if self.always_save_when_prompted {
+                if self.save_workspace_current_file(ci) {
+                    self.start_git_workspace_save_wizard(ci);
+                }
+                return;
+            }
+            self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel: 0 });
+            return;
+        }
+        self.start_git_workspace_save_wizard(ci);
+    }
+
+    /// Open the workspace git-save wizard for tab `ci` (assumes it is a
+    /// git-loaded Workspace). Factored out so the unsaved-changes warning's
+    /// "proceed" choices can reach it after deciding what to do with the
+    /// in-memory edits.
+    pub(crate) fn start_git_workspace_save_wizard(&mut self, ci: usize) {
+        let Some(origin) = self.collections[ci].workspace_git_origin.clone() else {
+            self.status = Some(Status::NoGitOrigin);
+            return;
+        };
+        self.overlay = Some(Overlay::GitSave(Box::new(GitSaveWizard::new_workspace(
+            ci,
+            &self.collections[ci],
+            &origin,
+        ))));
+    }
+
+    /// Write Workspace tab `ci`'s currently-loaded file back to its path on
+    /// disk and clear its "new"/"modified" markers, so a following git push
+    /// includes the edits. Returns `false` (setting [`Status::Error`]) if the
+    /// file has no path or the write fails, so the caller can abort the push.
+    pub(crate) fn save_workspace_current_file(&mut self, ci: usize) -> bool {
+        let Some(path) = self.collections[ci].path.clone() else {
+            return false;
+        };
+        let text = self.collections[ci].to_hurl();
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.mark_collection_saved(ci);
+                self.save_state();
+                true
+            }
+            Err(e) => {
+                self.status = Some(Status::Error(e.to_string()));
+                false
+            }
+        }
     }
 
     /// Record `url` as the most-recently-used git URL: moved to the front,
@@ -2177,63 +2530,6 @@ impl TuiApp {
                     _ => {}
                 }
             }
-            RemoteStage::AskLoadEnvToo { sel } => match key.code {
-                KeyCode::Esc => return self.close_remote(w),
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Tab
-                | KeyCode::BackTab => {
-                    *sel = 1 - *sel;
-                }
-                KeyCode::Enter => {
-                    if *sel == 0 {
-                        w.stage = RemoteStage::PickEnvFile {
-                            filter: String::new(),
-                            sel: 0,
-                        };
-                    } else {
-                        return self.close_remote(w);
-                    }
-                }
-                KeyCode::Char('y') => {
-                    w.stage = RemoteStage::PickEnvFile {
-                        filter: String::new(),
-                        sel: 0,
-                    }
-                }
-                KeyCode::Char('n') => return self.close_remote(w),
-                _ => {}
-            },
-            RemoteStage::PickEnvFile { filter, sel } => {
-                let vis = filter_indices(w.files.iter().map(|s| s.as_str()), filter);
-                match key.code {
-                    KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
-                    KeyCode::Enter => {
-                        if let (Some(&fi), Some(repo)) = (vis.get(*sel), w.repo.clone()) {
-                            let path = w.files[fi].clone();
-                            w.selected_path = Some(path.clone());
-                            w.second_pick = true;
-                            w.rx = Some(spawn_git_checkout(repo, path));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::File,
-                            };
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
-                    }
-                    _ => {}
-                }
-            }
             RemoteStage::PickWorkspaceFilter { sel } => match key.code {
                 KeyCode::Esc => return self.close_remote(w),
                 KeyCode::Up => *sel = sel.saturating_sub(1),
@@ -2314,8 +2610,10 @@ impl TuiApp {
                 w.stage = if w.kind == RemoteKind::Workspace {
                     RemoteStage::PickWorkspaceFilter { sel: 0 }
                 } else {
+                    // Only show files worth loading for this kind (a big repo
+                    // otherwise buries the one `.hurl`/`.vars` under noise).
                     RemoteStage::PickFile {
-                        files,
+                        files: relevant_files(w.kind, &files),
                         filter: String::new(),
                         sel: 0,
                     }
@@ -2343,38 +2641,20 @@ impl TuiApp {
                 false
             }
             GitMsg::Content(Ok(text)) => {
-                let name = w
-                    .selected_path
-                    .as_deref()
-                    .map(|p| file_stem(p, "remote"))
-                    .unwrap_or_else(|| "remote".to_string());
+                let path = w.selected_path.clone().unwrap_or_default();
                 self.remember_git_url(&w.url.text());
                 let origin = self.build_git_origin(w);
-                if w.second_pick {
-                    // Combined load's second step: the environment file, for
-                    // the collection just loaded in the previous step — link
-                    // it to that collection automatically for convenience.
-                    if let Some(id) = self.load_environment_text(name, &text, None, origin) {
-                        let ci = self.active_tab;
-                        self.collections[ci].linked_env_id = Some(id);
-                        self.collections[ci].invalidate_request_json();
-                    }
-                    return false;
-                }
                 match w.kind {
                     RemoteKind::Collection => {
+                        let name = collection_name_from_path(&path, "remote");
                         if self.load_collection_text(name, &text, None) {
                             let ci = self.active_tab;
                             self.collections[ci].git_origin = origin;
-                            // Offer to also load the environment from the same
-                            // ref, reusing the file listing already fetched —
-                            // no second network round-trip.
-                            w.stage = RemoteStage::AskLoadEnvToo { sel: 0 };
-                            return true;
                         }
                         false
                     }
                     RemoteKind::Environment => {
+                        let name = env_name_from_path(&path, "remote");
                         self.load_environment_text(name, &text, None, origin);
                         false
                     }
@@ -2395,10 +2675,9 @@ impl TuiApp {
     }
 
     /// Build the [`GitOrigin`] for the file the wizard just checked out, from
-    /// the ref chosen in `PickRef` and the path chosen in `PickFile`/
-    /// `PickEnvFile`. `None` if either piece of information is missing
-    /// (shouldn't happen in practice — both are set before a checkout is
-    /// ever spawned).
+    /// the ref chosen in `PickRef` and the path chosen in `PickFile`. `None` if
+    /// either piece of information is missing (shouldn't happen in practice —
+    /// both are set before a checkout is ever spawned).
     fn build_git_origin(&self, w: &RemoteWizard) -> Option<GitOrigin> {
         let choice = w.chosen_ref.as_ref()?;
         let path = w.selected_path.clone()?;
@@ -2450,6 +2729,18 @@ impl TuiApp {
                     if w.url.text().trim().is_empty() {
                         let s = Strings::for_language(&self.language);
                         w.stage = GitSaveStage::Error(s.git_url_required.to_string());
+                    } else if matches!(w.source, GitSaveSource::Workspace { .. }) {
+                        // A Workspace push has no per-file path to choose (the
+                        // whole tree is committed as-is), so skip ChoosePaths
+                        // and go straight to picking the branch/tag, spawning
+                        // the refs fetch as ChoosePaths would have.
+                        let url = w.url.text();
+                        let token = w.token_opt();
+                        w.rx = Some(spawn_git_save_refs(url, token));
+                        w.stage = GitSaveStage::ChooseTarget {
+                            sel: None,
+                            refs: None,
+                        };
                     } else {
                         w.stage = GitSaveStage::ChoosePaths { field: 0 };
                     }
@@ -2589,13 +2880,36 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if !w.commit_msg.text().trim().is_empty() {
                         let ci = w.ci;
-                        let col = &self.collections[ci];
-                        let mut files = vec![(w.collection_path.text(), col.to_hurl())];
-                        if w.include_env
-                            && let Some(env) = w.env.as_ref()
-                        {
-                            files.push((w.env_path.text(), env.to_vars_text()));
-                        }
+                        let files = match &w.source {
+                            GitSaveSource::Workspace { root, .. } => {
+                                match crate::workspace::collect_files_for_commit(root) {
+                                    Ok(files) if !files.is_empty() => files,
+                                    Ok(_) => {
+                                        let s = Strings::for_language(&self.language);
+                                        w.stage = GitSaveStage::Error(
+                                            s.git_save_workspace_empty.to_string(),
+                                        );
+                                        self.overlay = Some(Overlay::GitSave(w));
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        w.stage = GitSaveStage::Error(e.to_string());
+                                        self.overlay = Some(Overlay::GitSave(w));
+                                        return;
+                                    }
+                                }
+                            }
+                            GitSaveSource::Collection => {
+                                let col = &self.collections[ci];
+                                let mut files = vec![(w.collection_path.text(), col.to_hurl())];
+                                if w.include_env
+                                    && let Some(env) = w.env.as_ref()
+                                {
+                                    files.push((w.env_path.text(), env.to_vars_text()));
+                                }
+                                files
+                            }
+                        };
                         w.rx = Some(spawn_git_save_push(
                             w.url.text(),
                             w.token_opt(),
@@ -2667,8 +2981,8 @@ impl TuiApp {
                 w.stage = GitSaveStage::Error(e);
                 true
             }
-            GitSaveMsg::Pushed(Ok(())) => {
-                self.finish_git_save(w);
+            GitSaveMsg::Pushed(Ok(new_sha)) => {
+                self.finish_git_save(w, &new_sha);
                 w.stage = GitSaveStage::Done;
                 true
             }
@@ -2689,8 +3003,29 @@ impl TuiApp {
     /// collection's (and, if included, the environment's) new git origin. A
     /// tag-target save clears the markers too but leaves the remembered
     /// branch origin untouched, per spec.
-    fn finish_git_save(&mut self, w: &GitSaveWizard) {
+    fn finish_git_save(&mut self, w: &GitSaveWizard, new_sha: &str) {
         let ci = w.ci;
+        if let GitSaveSource::Workspace { filter, .. } = &w.source {
+            // A Workspace push commits the on-disk tree, not the in-memory
+            // collection, so there are no per-request "modified" markers to
+            // clear. For a branch target, repin the remembered origin to the
+            // exact commit just pushed so a later redownload fetches it (and
+            // follows the same branch); a tag target leaves the origin
+            // untouched, mirroring the collection flow.
+            if w.target_kind == GitSaveTarget::Branch {
+                self.collections[ci].workspace_git_origin = Some(WorkspaceGitOrigin {
+                    repo_url: w.url.text(),
+                    commit_sha: new_sha.to_string(),
+                    ref_kind: RefKind::Branch,
+                    ref_name: w.target_name.text(),
+                    filter: *filter,
+                });
+            }
+            self.remember_git_url(&w.url.text());
+            self.save_state();
+            self.status = Some(Status::GitSaved);
+            return;
+        }
         self.mark_collection_saved(ci);
         if w.include_env
             && let Some(env_id) = w.env.as_ref().map(|e| e.id)
@@ -2727,4 +3062,29 @@ pub(crate) fn file_stem(path: &str, fallback: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Display name for an environment file. Like [`file_stem`], but a leading-dot
+/// filename keeps its full name (so `.env.dev-au` stays `.env.dev-au` rather
+/// than being truncated to `.env`, since the part after the dot is a
+/// meaningful suffix here, not a throwaway extension).
+pub(crate) fn env_name_from_path(path: &str, fallback: &str) -> String {
+    match std::path::Path::new(path).file_name() {
+        Some(name) if name.to_string_lossy().starts_with('.') => name.to_string_lossy().into_owned(),
+        _ => file_stem(path, fallback),
+    }
+}
+
+/// Display name for a collection file. Only the known collection extensions
+/// (`.hurl`/`.json`) are hidden; any other suffix is kept verbatim (so a file
+/// like `env.dev-au` shows in full rather than losing its `.dev-au`).
+pub(crate) fn collection_name_from_path(path: &str, fallback: &str) -> String {
+    let p = std::path::Path::new(path);
+    match p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) {
+        Some(ext) if ext == "hurl" || ext == "json" => file_stem(path, fallback),
+        _ => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fallback.to_string()),
+    }
 }

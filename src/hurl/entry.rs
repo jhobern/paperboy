@@ -24,6 +24,27 @@ pub struct FormField {
     pub content_type: Option<String>,
 }
 
+/// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
+/// as a real filesystem path (spaces and other characters unescaped, as the
+/// file picker produces), but Hurl's filename grammar requires a backslash
+/// before spaces and a few other characters. `{`/`}` are deliberately left
+/// alone so `{{var}}` placeholders in a path still substitute at run time.
+fn escape_form_file_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            ' ' | '#' | ';' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Outcome of the most recent "Run All" (Alt+F5) pass over this entry's
 /// collection. Purely a runtime display marker for the Requests list — never
 /// persisted, and reset to `Running` for every entry the instant a new batch
@@ -184,12 +205,15 @@ impl HurlEntry {
             for f in &self.form_fields {
                 match f.kind {
                     FormFieldKind::Text => out.push_str(&format!("{}: {}\n", f.key, f.value)),
-                    FormFieldKind::File => match f.content_type.as_deref().map(str::trim) {
-                        Some(ct) if !ct.is_empty() => {
-                            out.push_str(&format!("{}: file,{}; {}\n", f.key, f.value, ct));
+                    FormFieldKind::File => {
+                        let path = escape_form_file_path(&f.value);
+                        match f.content_type.as_deref().map(str::trim) {
+                            Some(ct) if !ct.is_empty() => {
+                                out.push_str(&format!("{}: file,{}; {}\n", f.key, path, ct));
+                            }
+                            _ => out.push_str(&format!("{}: file,{};\n", f.key, path)),
                         }
-                        _ => out.push_str(&format!("{}: file,{};\n", f.key, f.value)),
-                    },
+                    }
                 }
             }
         }

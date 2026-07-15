@@ -204,6 +204,40 @@ fn shadowed_env_keys_is_empty_without_both_a_linked_and_an_active_environment() 
 }
 
 #[test]
+fn f2_on_the_environments_panel_renames_the_selected_environment() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("staging".into(), "TOKEN=v");
+    let env_id = add_global_env(&mut app, env);
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, editor, .. }) => {
+            assert!(
+                matches!(kind, PromptKind::RenameEnv(id) if *id == env_id),
+                "F2 on the env panel opens the environment rename prompt, not the tab rename"
+            );
+            assert_eq!(editor.text(), "staging", "prefilled with the current name");
+        }
+        _ => panic!("F2 did not open a rename prompt"),
+    }
+}
+
+#[test]
+fn shadowed_env_keys_is_empty_when_linked_env_is_also_the_active_env() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("shared".into(), "TOKEN=v\nOTHER=w");
+    let id = add_global_env(&mut app, env);
+    // The collection is linked to the very environment that's also active —
+    // the same value is substituted either way, so nothing is shadowed.
+    app.active_env_id = Some(id);
+    app.collections[0].linked_env_id = Some(id);
+    assert!(app.shadowed_env_keys(0).is_empty());
+}
+
+#[test]
 fn creating_a_request_adds_it_to_the_request_tab() {
     let mut app = TuiApp::default();
     assert!(
@@ -1513,6 +1547,250 @@ fn last_browse_dir_survives_persistence() {
 }
 
 #[test]
+fn env_picker_prefers_the_last_environment_folder() {
+    let env_dir = temp_dir("envfolder");
+    let other_dir = temp_dir("otherfolder");
+    let mut app = TuiApp {
+        // A more-recent load of some other file type moved last_browse_dir…
+        last_browse_dir: Some(other_dir.clone()),
+        // …but the environment picker should still reopen where the last
+        // environment file came from.
+        last_env_dir: Some(env_dir.clone()),
+        ..Default::default()
+    };
+
+    app.open_browser(FileAction::LoadEnv);
+    match app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &env_dir),
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&env_dir).ok();
+    std::fs::remove_dir_all(&other_dir).ok();
+}
+
+#[test]
+fn going_up_highlights_the_folder_just_left_so_right_returns() {
+    let dir = temp_dir("upreturn");
+    let sub = dir.join("nested");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(sub.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside `nested`
+
+    // Left goes up to `dir`, and the folder we came from stays highlighted…
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "moved up one level");
+            assert_eq!(ex.current().path, sub, "the folder we left is highlighted");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // …so an instinctive Right re-enters it instead of climbing another level.
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &sub, "Right returns into the folder we left")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn many_lefts_then_many_rights_return_to_the_starting_folder() {
+    // a/b/c/d — start deep, walk all the way up, then walk all the way back.
+    let a = temp_dir("trail");
+    let b = a.join("b");
+    let c = b.join("c");
+    let d = c.join("d");
+    std::fs::create_dir_all(&d).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(d.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside d
+
+    // Three Lefts climb d → c → b → a.
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &a, "climbed to the top of the trail");
+            assert_eq!(ex.current().path, b, "the trail's next step is highlighted");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Three Rights retrace the trail back down to exactly where we started.
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &d, "retraced all the way back to the start")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    // Fully retraced — the trail is spent.
+    assert!(app.browser_forward_path.is_none());
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
+fn descending_into_a_different_folder_clears_the_retrace_trail() {
+    // a contains b (with child c) and a sibling z.
+    let a = temp_dir("clearsibling");
+    let c = a.join("b").join("c");
+    let z = a.join("z");
+    std::fs::create_dir_all(&c).unwrap();
+    std::fs::create_dir_all(&z).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(a.join("b")),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside a/b
+    press(&mut app, KeyCode::Left); // up to a, trail anchored at a/b
+    assert!(app.browser_forward_path.is_some());
+
+    // Highlight the sibling `z` and descend into it — a fresh navigation.
+    let idx = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            ex.files().iter().position(|f| f.path == z).expect("z is listed")
+        }
+        _ => panic!("browser overlay not open"),
+    };
+    match &mut app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex.set_selected_idx(idx),
+        _ => unreachable!(),
+    }
+    press(&mut app, KeyCode::Right);
+
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &z, "descended into the sibling"),
+        _ => panic!("browser overlay not open"),
+    }
+    assert!(
+        app.browser_forward_path.is_none(),
+        "a new navigation clears the retrace trail"
+    );
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
+fn right_does_not_ascend_through_the_parent_row_but_enter_still_does() {
+    let a = temp_dir("parentrow");
+    let b = a.join("b");
+    std::fs::create_dir_all(&b).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(b.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside b, highlight "../"
+
+    // The "../" row is highlighted (index 0). Right must NOT ascend through it,
+    // otherwise a run of Rights would bounce back up the tree.
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.current().path, a, "the '../' row points at the parent")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &b, "Right on '../' is a no-op — stays put")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Enter, however, still honours "../" as a way up (the usual idiom).
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &a, "Enter on '../' ascends");
+            assert_eq!(ex.current().path, b, "and highlights the folder we left");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
+fn ctrl_r_resets_the_browser_to_the_folder_it_opened_in() {
+    let dir = temp_dir("resetorigin");
+    let sub = dir.join("nested");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens in `dir`
+    assert_eq!(app.browser_origin_dir.as_ref(), Some(&dir));
+
+    // Wander up into the parent folder.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_ne!(ex.cwd(), &dir, "navigated off the opening folder")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Ctrl+r snaps back to where the browser opened.
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &dir, "reset to the opening folder"),
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn selecting_an_env_file_updates_the_env_folder() {
+    let dir = temp_dir("selectenv");
+    std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::LoadEnv);
+    press(&mut app, KeyCode::Down); // highlight staging.vars
+    press(&mut app, KeyCode::Enter); // select it
+
+    assert_eq!(
+        app.last_env_dir.as_ref(),
+        Some(&dir),
+        "loading an environment records its folder for the env picker"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn last_env_dir_survives_persistence() {
+    let app = TuiApp {
+        last_env_dir: Some(PathBuf::from("/env/dir")),
+        ..Default::default()
+    };
+    let snapshot = app.to_persisted();
+    assert_eq!(snapshot.last_env_dir.as_deref(), Some("/env/dir"));
+
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.last_env_dir, Some(PathBuf::from("/env/dir")));
+}
+
+#[test]
 fn loading_an_env_file_as_a_collection_is_rejected() {
     let dir = temp_dir("wrongcol");
     let env = dir.join("staging.vars");
@@ -1618,11 +1896,19 @@ fn file_menu_mnemonic_keys_jump_straight_into_a_submenu() {
 fn file_load_submenu_mnemonic_activates_the_item_immediately() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    press(&mut app, KeyCode::Char('g')); // "Collection from (G)it…"
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Char('c')); // "(C)ollection…" -> source step
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::FileLoadSource(FileKind::Collection, 0))
+        ),
+        "picking a kind opens the local-vs-git source step"
+    );
+    press(&mut app, KeyCode::Char('g')); // "From (G)it…"
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
-        "mnemonic both selects and activates the item, without needing Enter"
+        "the git source both selects and activates without needing Enter"
     );
 }
 
@@ -1633,9 +1919,53 @@ fn file_save_submenu_mnemonic_activates_the_item_immediately() {
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down); // -> "(S)ave"
     press(&mut app, KeyCode::Enter);
-    press(&mut app, KeyCode::Char('g')); // "Save Collection to (G)it…"
+    press(&mut app, KeyCode::Char('c')); // "(C)ollection…" -> destination step
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::FileSaveDest(FileKind::Collection, 0))
+        ),
+        "picking a kind opens the save-destination step"
+    );
+    press(&mut app, KeyCode::Char('g')); // "To (G)it…"
     assert!(app.overlay.is_none(), "no wizard for a non-git collection");
     assert!(matches!(app.status, Some(Status::NoGitOrigin)));
+}
+
+#[test]
+fn file_menu_left_and_right_arrows_enter_and_exit_submenus() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f')); // top File menu, "(L)oad"
+    press(&mut app, KeyCode::Right); // Right descends into Load
+    assert!(matches!(app.overlay, Some(Overlay::FileLoadMenu(0))));
+
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Right); // Right descends into its source step
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileLoadSource(FileKind::Collection, 0))
+    ));
+
+    press(&mut app, KeyCode::Left); // Left backs out to the kind list, kind relit
+    assert!(matches!(app.overlay, Some(Overlay::FileLoadMenu(1))));
+
+    press(&mut app, KeyCode::Left); // Left backs out to the top File menu
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(0))));
+
+    // Same round-trip on the Save side (Save = row 1).
+    press(&mut app, KeyCode::Down); // -> "(S)ave"
+    press(&mut app, KeyCode::Right); // descend into Save
+    assert!(matches!(app.overlay, Some(Overlay::FileSaveMenu(0))));
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Right); // descend into its destination step
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileSaveDest(FileKind::Collection, 0))
+    ));
+    press(&mut app, KeyCode::Left); // back to the Save kind list
+    assert!(matches!(app.overlay, Some(Overlay::FileSaveMenu(1))));
+    press(&mut app, KeyCode::Left); // back to the top File menu (Save row)
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(1))));
 }
 
 #[test]
@@ -1670,6 +2000,10 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             file_menu_items(&s).to_vec(),
             file_load_items(&s).to_vec(),
             file_save_items(&s).to_vec(),
+            file_load_source_items(&s).to_vec(),
+            file_save_dest_items(FileKind::Collection, &s),
+            file_save_dest_items(FileKind::Environment, &s),
+            file_save_dest_items(FileKind::Workspace, &s),
         ] {
             let mnemonics: Vec<char> = items
                 .iter()
@@ -1694,9 +2028,10 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
 fn file_menu_opens_the_remote_git_wizards() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    press(&mut app, KeyCode::Down); // -> Collection...
-    press(&mut app, KeyCode::Down); // -> Collection from Git...
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Down); // -> Collection
+    press(&mut app, KeyCode::Enter); // -> source step (Local / From Git)
+    press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
@@ -1705,10 +2040,11 @@ fn file_menu_opens_the_remote_git_wizards() {
 
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // -> Environment from Git...
-    }
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Down); // -> Collection
+    press(&mut app, KeyCode::Down); // -> Environment
+    press(&mut app, KeyCode::Enter); // -> source step
+    press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Environment),
@@ -1788,10 +2124,9 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
 
     assert!(
-        keep_open,
-        "a collection load offers to also load an environment before closing"
+        !keep_open,
+        "a collection load closes the wizard once the tab is added"
     );
-    assert!(matches!(w.stage, RemoteStage::AskLoadEnvToo { sel: 0 }));
     assert_eq!(
         app.collections.len(),
         before + 1,
@@ -1805,48 +2140,7 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
 }
 
 #[test]
-fn ask_load_env_too_yes_moves_to_pick_env_file_reusing_the_fetched_list() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::AskLoadEnvToo { sel: 0 };
-    w.files = vec![
-        "api/health.hurl".to_string(),
-        "envs/staging.vars".to_string(),
-    ];
-    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
-
-    press(&mut app, KeyCode::Enter);
-
-    match &app.overlay {
-        Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(&w.stage, RemoteStage::PickEnvFile { .. }),
-                "Yes moves to the env-file picker"
-            );
-            assert_eq!(
-                w.files.len(),
-                2,
-                "no second fetch — the same file list is reused"
-            );
-        }
-        _ => panic!("expected the wizard to stay open on PickEnvFile"),
-    }
-}
-
-#[test]
-fn ask_load_env_too_no_closes_the_wizard() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::AskLoadEnvToo { sel: 1 };
-    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
-
-    press(&mut app, KeyCode::Enter);
-
-    assert!(app.overlay.is_none(), "declining closes the wizard");
-}
-
-#[test]
-fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
+fn fetched_collection_from_git_records_its_git_origin() {
     use super::editor::Editor;
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
@@ -1859,7 +2153,7 @@ fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
 
     let hurl = "GET http://127.0.0.1:8080/health\nHTTP 200\n";
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
-    assert!(keep_open, "offers to also load an environment");
+    assert!(!keep_open, "a collection load closes the wizard");
 
     let ci = app.active_tab;
     let col_origin = app.collections[ci]
@@ -1872,37 +2166,11 @@ fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
     assert_eq!(col_origin.ref_name, "main");
     assert!(
         app.collections[ci].linked_env_id.is_none(),
-        "no environment linked yet"
+        "loading a collection no longer also loads/links an environment"
     );
-    assert!(app.global_envs.is_empty(), "no environment loaded yet");
-
-    // Second pick: the environment file, from the same ref/repo — no
-    // second fetch of branches/tags/files, just another checkout.
-    w.second_pick = true;
-    w.selected_path = Some("envs/staging.vars".to_string());
-    let vars = "BASE_URL=http://127.0.0.1:8080\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(vars.to_string())));
-
     assert!(
-        !keep_open,
-        "the combined load closes after the environment step"
-    );
-    let env_id = app.collections[ci]
-        .linked_env_id
-        .expect("the environment is linked to the same tab");
-    let env_origin = app
-        .global_envs
-        .iter()
-        .find(|e| e.id == env_id)
-        .and_then(|e| e.git_origin.clone())
-        .expect("env git_origin is set");
-    assert_eq!(env_origin.repo_url, "https://example.test/repo.git");
-    assert_eq!(env_origin.path, "envs/staging.vars");
-    assert_eq!(env_origin.ref_name, "main");
-    // The collection's own origin is untouched by the env step.
-    assert_eq!(
-        app.collections[ci].git_origin.as_ref().unwrap().path,
-        "api/health.hurl"
+        app.global_envs.is_empty(),
+        "no environment is loaded alongside the collection"
     );
 }
 
@@ -2060,22 +2328,58 @@ fn a_workspace_download_failure_is_shown_as_an_error() {
 }
 
 #[test]
-fn file_menu_offers_a_load_workspace_from_git_item_alongside_the_local_folder_picker() {
+fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
-    let items = file_load_items(&s);
-    assert_eq!(items.len(), 7);
-    assert_eq!(
-        mnemonic_index(&items, 's'),
-        Some(6),
-        "the new item's mnemonic activates it"
-    );
 
+    // The Load kind list is now just the four kinds (no per-kind git twin).
+    let items = file_load_items(&s);
+    assert_eq!(items.len(), 4);
+    assert_eq!(file_load_kind_index(FileKind::Workspace), 3);
+
+    // Picking Workspace opens the local-vs-git source step…
     let mut app = TuiApp::default();
-    app.activate_file_load_item(6);
+    app.activate_file_load_item(3);
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileLoadSource(FileKind::Workspace, 0))
+    ));
+
+    // …and "From Git" (sel 1) opens the wizard in Workspace mode.
+    app.activate_file_load_source(FileKind::Workspace, 1);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Workspace),
-        "the Workspace-from-git item opens the wizard in Workspace mode"
+        "the git source opens the wizard in Workspace mode"
+    );
+}
+
+#[test]
+fn the_load_source_step_esc_returns_to_the_kind_list_with_the_kind_relit() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 1));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileLoadMenu(2))),
+        "Esc steps back to the kind list with Environment (row 2) highlighted"
+    );
+}
+
+#[test]
+fn the_save_destination_step_lists_the_right_choices_per_kind() {
+    use crate::i18n::Strings;
+    let s = Strings::for_language(&Language::English);
+    // Collection can Save / Save As / To Git; Environment has no git save;
+    // a Workspace is a folder, so only Save As / To Git.
+    assert_eq!(file_save_dest_items(FileKind::Collection, &s).len(), 3);
+    assert_eq!(file_save_dest_items(FileKind::Environment, &s).len(), 2);
+    assert_eq!(file_save_dest_items(FileKind::Workspace, &s).len(), 2);
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileSaveMenu(3))),
+        "Esc steps back to the Save kind list with Workspace (row 3) highlighted"
     );
 }
 
@@ -3453,8 +3757,10 @@ fn save_to_git_menu_item_is_refused_without_a_remembered_git_origin() {
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down); // -> "(S)ave" submenu
     press(&mut app, KeyCode::Enter);
-    for _ in 0..3 {
-        press(&mut app, KeyCode::Down); // Save menu item 3 = "Save Collection to Git…"
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Enter); // -> destination step
+    for _ in 0..2 {
+        press(&mut app, KeyCode::Down); // dest item 2 = "To Git…"
     }
     press(&mut app, KeyCode::Enter);
 
@@ -3779,6 +4085,312 @@ fn saving_to_git_appends_a_commit_and_updates_the_remembered_origin_and_markers(
     );
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() {
+    use crate::i18n::Status;
+    use std::process::Command;
+
+    fn git(args: &[&str], cwd: &std::path::Path) {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "paperboy-ws-git-save-test-{}-{nanos}",
+        std::process::id()
+    ));
+    let bare = base.join("bare.git");
+    let seed = base.join("seed");
+    let ws = base.join("ws"); // the tab's on-disk workspace_root
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::create_dir_all(ws.join("api")).unwrap();
+
+    // Seed the "remote" with an existing tree on `main`.
+    git(&["init", "--bare", "-q", "."], &bare);
+    git(&["init", "-q"], &seed);
+    git(&["checkout", "-q", "-b", "main"], &seed);
+    git(&["config", "user.name", "Seed"], &seed);
+    git(&["config", "user.email", "seed@test"], &seed);
+    std::fs::create_dir_all(seed.join("api")).unwrap();
+    std::fs::write(seed.join("api/health.hurl"), "GET https://old\n").unwrap();
+    git(&["add", "-A"], &seed);
+    git(&["commit", "-q", "-m", "seed"], &seed);
+    git(&["remote", "add", "origin", bare.to_str().unwrap()], &seed);
+    git(&["push", "-q", "origin", "main"], &seed);
+    let bare_url = bare.to_str().unwrap().to_string();
+
+    // The local workspace holds an edited file plus a new one, and a `.git`
+    // folder that must be excluded from the commit.
+    std::fs::write(ws.join("api/health.hurl"), "GET https://new\n").unwrap();
+    std::fs::write(ws.join("api/orders.hurl"), "GET https://orders\n").unwrap();
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::write(ws.join(".git/config"), "secret\n").unwrap();
+
+    let origin = WorkspaceGitOrigin {
+        repo_url: bare_url.clone(),
+        commit_sha: "0000000000000000000000000000000000000000".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+        filter: WorkspaceGitFilter::HurlAndJson,
+    };
+    let mut col = Collection::new("api-workspace".into(), Vec::new());
+    col.workspace_root = Some(ws.clone());
+    col.workspace_downloaded_from_git = true;
+    col.workspace_git_origin = Some(origin);
+
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    app.open_git_workspace_save_wizard();
+    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
+        panic!("the workspace git-save wizard should open")
+    };
+    // `new_workspace` seeds the branch/target from the origin; jump straight
+    // to the commit message (target/branch key handling is shared with the
+    // collection flow, already covered above).
+    assert!(
+        matches!(w.stage, GitSaveStage::Connect { .. }),
+        "opens on the Connect step"
+    );
+    assert_eq!(w.target_name.text(), "main");
+    w.stage = GitSaveStage::CommitMessage;
+    app.overlay = Some(Overlay::GitSave(w));
+
+    press(&mut app, KeyCode::Enter); // enumerate the tree + push
+
+    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
+        panic!("wizard should still be open (Pushing)")
+    };
+    assert!(
+        matches!(w.stage, GitSaveStage::Pushing),
+        "a workspace with files pushes immediately"
+    );
+    let rx = w.rx.take().expect("the push should have been spawned");
+    let msg = rx.recv().expect("the push thread should send a result");
+    let keep_open = app.apply_git_save_msg(&mut w, msg);
+    assert!(keep_open);
+    assert!(
+        matches!(w.stage, GitSaveStage::Done),
+        "a successful workspace push moves to Done"
+    );
+    assert!(matches!(app.status, Some(Status::GitSaved)));
+
+    // The remembered origin is repinned to the freshly-pushed commit (no
+    // longer the placeholder sha) while keeping the branch and filter.
+    let repinned = app.collections[ci].workspace_git_origin.as_ref().unwrap();
+    assert_ne!(
+        repinned.commit_sha, "0000000000000000000000000000000000000000",
+        "the origin sha is repinned to the new commit"
+    );
+    assert_eq!(repinned.ref_name, "main");
+    assert!(matches!(repinned.filter, WorkspaceGitFilter::HurlAndJson));
+
+    // The pushed commit carries the edited + new files (and never the `.git`).
+    git(&["fetch", "-q", "origin", "main"], &seed);
+    let show = Command::new("git")
+        .current_dir(&seed)
+        .args(["show", "origin/main:api/health.hurl"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&show.stdout), "GET https://new\n");
+    let orders = Command::new("git")
+        .current_dir(&seed)
+        .args(["show", "origin/main:api/orders.hurl"])
+        .output()
+        .unwrap();
+    assert!(orders.status.success(), "the new file was committed too");
+    let tree = Command::new("git")
+        .current_dir(&seed)
+        .args(["ls-tree", "-r", "--name-only", "origin/main"])
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        !names.contains(".git"),
+        "the workspace's internal .git folder is never committed"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn saving_a_workspace_to_git_is_rejected_when_the_tab_was_not_git_loaded() {
+    use crate::i18n::Status;
+    let mut app = TuiApp::default();
+    let col = Collection::new("plain".into(), Vec::new());
+    app.collections.push(col);
+    app.active_tab = app.collections.len() - 1;
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(app.overlay.is_none(), "no wizard opens without a git origin");
+    assert!(matches!(app.status, Some(Status::NoGitOrigin)));
+}
+
+/// Build an app with a single git-loaded Workspace tab whose currently-loaded
+/// file (`current.hurl` under a fresh temp root) has one unsaved, modified
+/// request in memory. Returns the app, the tab index, and the on-disk path of
+/// the loaded file (seeded with placeholder content that differs from the
+/// in-memory collection, so a "save" is observable). Caller cleans up the dir.
+fn workspace_tab_with_unsaved_edit() -> (TuiApp, usize, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "paperboy-ws-unsaved-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("current.hurl");
+    std::fs::write(&file, "GET https://on-disk-placeholder\n").unwrap();
+
+    let mut entry = HurlEntry {
+        method: "GET".into(),
+        url: "https://edited-in-memory".into(),
+        ..Default::default()
+    };
+    entry.modified = true;
+    let mut col = Collection::new("api-workspace".into(), vec![entry]);
+    col.workspace_root = Some(root.clone());
+    col.workspace_downloaded_from_git = true;
+    col.path = Some(file.clone());
+    col.workspace_git_origin = Some(WorkspaceGitOrigin {
+        repo_url: "https://example.test/repo.git".into(),
+        commit_sha: "abc123".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+        filter: WorkspaceGitFilter::HurlAndJson,
+    });
+
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    (app, ci, file)
+}
+
+#[test]
+fn saving_a_workspace_to_git_warns_first_when_the_loaded_file_has_unsaved_edits() {
+    let (mut app, ci, _file) = workspace_tab_with_unsaved_edit();
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::WorkspaceGitSaveUnsaved { ci: c, sel: 0 }) if *c == ci
+        ),
+        "unsaved in-memory edits raise the warning instead of opening the wizard"
+    );
+}
+
+#[test]
+fn workspace_unsaved_warning_save_choice_writes_the_file_then_opens_the_wizard() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    let expected = app.collections[ci].to_hurl();
+
+    app.open_git_workspace_save_wizard();
+    // sel starts on "Save changes, then push".
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "after saving, the git-save wizard opens"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        expected,
+        "the in-memory edits were written to disk"
+    );
+    assert!(
+        !app.collections[ci].entries[0].modified,
+        "the modified marker is cleared once saved"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn workspace_unsaved_warning_discard_choice_pushes_disk_version_and_keeps_edits_in_memory() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    let on_disk_before = std::fs::read_to_string(&file).unwrap();
+
+    app.open_git_workspace_save_wizard();
+    press(&mut app, KeyCode::Down); // move to "Push the saved version"
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "discarding opens the wizard directly (pushes the on-disk tree)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        on_disk_before,
+        "the on-disk file is left untouched"
+    );
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "the in-memory edits remain (only left out of this push)"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn workspace_unsaved_warning_cancel_choice_closes_without_opening_the_wizard() {
+    let (mut app, _ci, file) = workspace_tab_with_unsaved_edit();
+
+    app.open_git_workspace_save_wizard();
+    press(&mut app, KeyCode::Up); // wrap up to "Cancel"
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none(), "cancel closes the warning");
+
+    // Esc also cancels.
+    app.open_git_workspace_save_wizard();
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::WorkspaceGitSaveUnsaved { .. })
+    ));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "Esc dismisses the warning");
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn saving_a_workspace_to_git_skips_the_warning_when_there_are_no_unsaved_edits() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    // Mark the loaded file as clean (no in-memory edits pending).
+    app.collections[ci].entries[0].modified = false;
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "with nothing unsaved the wizard opens straight away"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
 }
 
 #[test]
@@ -4442,6 +5054,69 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
     assert!(
         !app.collections[0].entries[0].user_added,
         "scratch-space requests are not marked"
+    );
+}
+
+#[test]
+fn f2_with_an_empty_url_keeps_the_wizard_open_and_warns_instead_of_discarding() {
+    let mut app = TuiApp::default();
+    app.focus = Pane::List;
+
+    // Open the New Request wizard and type only a Name (no URL).
+    press(&mut app, KeyCode::Char('n'));
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.name = super::editor::Editor::new("draft", false);
+    } else {
+        panic!("wizard did not open");
+    }
+
+    // F2 must NOT close the wizard or discard the typed fields when the URL
+    // is empty — the request can't be saved without one.
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::NewRequest(form)) => {
+            assert_eq!(form.focus, NewField::Url, "focus jumps to the URL field");
+            assert_eq!(form.name.text(), "draft", "typed fields are preserved");
+        }
+        _ => panic!("the wizard must stay open on an empty-URL submit"),
+    }
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::NewRequestUrlRequired)),
+        "a status hint explains why saving was blocked"
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "nothing was saved to any collection"
+    );
+
+    // Once a URL is filled in, F2 saves normally.
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.url = super::editor::Editor::new("http://h/ok", false);
+    }
+    press(&mut app, KeyCode::F(2));
+    assert!(app.overlay.is_none(), "the wizard closes once the URL is valid");
+    assert_eq!(app.collections[0].entries.len(), 1);
+    assert_eq!(app.collections[0].entries[0].url, "http://h/ok");
+}
+
+#[test]
+fn an_untitled_request_stays_at_the_root_instead_of_a_url_named_folder() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new("api".into(), vec![]));
+
+    // No name typed → the URL (which contains slashes) must NOT become the
+    // title, or `tree::entry_path` would file it under a phantom "http:/"
+    // folder away from its siblings.
+    let mut form = NewReq::new(String::new(), vec!["Scratch".into(), "api".into()], 1, None);
+    form.url = super::editor::Editor::new("http://host/path/x", false);
+    app.submit_new_request(form);
+
+    let entry = &app.collections[1].entries[0];
+    assert_eq!(entry.title, "", "an untitled request keeps an empty title");
+    assert!(
+        crate::tree::folder_of(&app.collections[1].entries, 0).is_empty(),
+        "it lives at the root of the folder tree, not in a URL-named folder"
     );
 }
 
@@ -6656,11 +7331,13 @@ fn save_collection_to_original_confirms_then_saves() {
     app.active_tab = 1;
 
     // f -> File menu; Down -> "(S)ave" submenu; Enter opens it; Down x1
-    // lands on "Collection"; Enter.
+    // lands on "Collection"; Enter opens its destination step; Enter again
+    // picks "Save" (write back to the original file).
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(
@@ -9745,10 +10422,7 @@ fn completing_a_git_load_remembers_the_url_most_recent_first() {
     w.selected_path = Some("api.hurl".into());
 
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok("GET http://h/x\n".into())));
-    assert!(
-        keep_open,
-        "a collection load offers to also load an environment before closing"
-    );
+    assert!(!keep_open, "a collection load closes the wizard");
     assert_eq!(
         app.recent_git_urls,
         vec![
@@ -10645,6 +11319,182 @@ fn enter_on_a_file_row_loads_it_and_closes_the_picker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Build a `NewReq` form targeting tab `ci` with the given URL. The
+/// `target_names` vector is padded so `NewReq::new`'s internal
+/// `target_idx.min(len-1)` clamp keeps `ci` intact.
+fn new_request_form_for_tab(ci: usize, url: &str) -> NewReq {
+    let names: Vec<String> = (0..=ci).map(|i| format!("tab{i}")).collect();
+    let mut form = NewReq::new(String::new(), names, ci, None);
+    form.url = super::editor::Editor::new(url, false);
+    form
+}
+
+#[test]
+fn new_request_targeting_a_workspace_opens_the_destination_picker() {
+    let dir = workspace_temp_dir("newreq_opens_picker");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    assert!(
+        app.collections[ci].entries.is_empty(),
+        "the request is NOT silently pushed onto the loaded file"
+    );
+    assert!(
+        app.pending_workspace_request.is_some(),
+        "the request is parked awaiting a destination"
+    );
+    match &app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.collection_idx, ci);
+            assert!(p.adding_request, "picker is in add-request mode");
+        }
+        _ => panic!("expected the workspace destination picker to open"),
+    }
+    assert_eq!(app.active_tab, ci, "focus moved to the workspace tab");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn picking_a_file_in_add_mode_appends_the_request_and_shows_it() {
+    let dir = workspace_temp_dir("newreq_append");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    // Highlight alpha.hurl in the just-opened destination picker.
+    if let Some(Overlay::WorkspacePicker(picker)) = &mut app.overlay {
+        picker.selected = picker
+            .entries
+            .iter()
+            .position(|e| e.display_name == "alpha.hurl")
+            .unwrap();
+    } else {
+        panic!("expected the destination picker");
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none(), "the picker closes after landing");
+    assert!(
+        app.pending_workspace_request.is_none(),
+        "the parked request has been placed"
+    );
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    // The file's own request plus the appended new one.
+    assert_eq!(app.collections[ci].entries.len(), 2);
+    let added = app.collections[ci].entries.last().unwrap();
+    assert_eq!(added.url, "http://h/new");
+    assert!(added.user_added && added.modified, "marked as an unsaved add");
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "the new request is selected so it's visible"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn n_in_the_picker_creates_a_new_collection_holding_the_request() {
+    let dir = workspace_temp_dir("newreq_new_collection");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    // `n` in the destination picker → the "name a new collection" prompt.
+    press(&mut app, KeyCode::Char('n'));
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, .. }) => {
+            assert!(matches!(kind, PromptKind::NewWorkspaceCollection(idx) if *idx == ci));
+        }
+        _ => panic!("expected the new-collection name prompt"),
+    }
+
+    // A relative subfolder path with no extension → `.hurl` is defaulted and
+    // the folder is only created on save.
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new("api/orders", false);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none());
+    assert!(app.pending_workspace_request.is_none());
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("api").join("orders.hurl")),
+        "extension defaulted to .hurl and rooted under the workspace"
+    );
+    assert_eq!(app.collections[ci].entries.len(), 1);
+    let added = &app.collections[ci].entries[0];
+    assert_eq!(added.url, "http://h/new");
+    assert!(added.user_added && added.modified);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceCollectionCreated(_))
+    ));
+
+    // Saving writes the file, creating the missing `api/` parent folder.
+    app.active_tab = ci;
+    app.do_file_action(
+        FileAction::SaveCollection,
+        dir.join("api").join("orders.hurl").to_str().unwrap(),
+    );
+    assert!(dir.join("api").join("orders.hurl").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn escaping_the_destination_picker_clears_the_parked_request() {
+    let dir = workspace_temp_dir("newreq_cancel");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+    assert!(app.pending_workspace_request.is_some());
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert!(
+        app.pending_workspace_request.is_none(),
+        "an aborted flow must not leak the parked request"
+    );
+    assert!(app.collections[ci].entries.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_workspace_collection_rejects_paths_escaping_the_root() {
+    let dir = workspace_temp_dir("newreq_escape");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.create_workspace_collection(ci, "../evil".to_string());
+
+    assert_eq!(
+        app.collections[ci].path, None,
+        "a `..` path is rejected, not created"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn renaming_a_workspace_tab_survives_loading_a_different_collection_within_it() {
     // Regression test: `load_workspace_file` used to overwrite `name`
@@ -10928,10 +11778,15 @@ fn workspace_bound_list_title_hints_the_w_shortcut_when_there_is_room_but_not_on
 }
 
 #[test]
-fn a_workspace_tab_with_no_collection_chosen_shows_the_empty_state_hint_instead_of_a_blank_list() {
+fn a_workspace_tab_with_no_collections_at_all_shows_the_empty_state_hint_instead_of_a_blank_list() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
-    let dir = workspace_temp_dir("empty_hint");
+    // A genuinely empty workspace root (no folders or collections to browse):
+    // the file-tree has nothing to show, so the friendly empty-state hint
+    // stands in for the blank list.
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_empty_hint_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let s = Strings::for_language(&Language::English);
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -10949,6 +11804,341 @@ fn a_workspace_tab_with_no_collection_chosen_shows_the_empty_state_hint_instead_
         "the empty-state hint replaces the blank list"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_workspace_tab_with_no_file_loaded_still_shows_the_browsable_file_tree() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("browse_no_file");
+    let mut col = Collection::new("my-ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    col.workspace_auto_prompt_dismissed = true;
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    app.active_tab = app.collections.len() - 1;
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains("alpha.hurl"),
+        "the root's collection files are listed even before one is opened"
+    );
+    assert!(
+        text.contains("sub"),
+        "subfolders are listed too, so the user can browse into them"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a Workspace tab bound to `dir` and return the app plus its index.
+fn workspace_app(dir: &std::path::Path) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.to_path_buf());
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    (app, ci)
+}
+
+#[test]
+fn workspace_rows_list_folders_and_collections_and_inline_the_open_collections_requests() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_rows");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+
+    let rows = app.collections[ci].ws_rows();
+    // Root: the `sub/` folder, then `alpha.hurl` (open, so its one request is
+    // inlined right beneath it). No `../` at the root.
+    assert!(matches!(&rows[0], WsRow::Folder(n) if n == "sub"));
+    assert!(matches!(&rows[1], WsRow::Collection { name, open: true, .. } if name == "alpha.hurl"));
+    assert!(matches!(rows[2], WsRow::Request(0)));
+    assert_eq!(rows.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn entering_a_workspace_subfolder_and_then_up_navigates_the_breadcrumb() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_breadcrumb");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Enter on the `sub/` folder row (index 0 at the root) descends into it.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    assert_eq!(app.collections[ci].workspace_browse, vec!["sub".to_string()]);
+    let rows = app.collections[ci].ws_rows();
+    assert!(matches!(rows[0], WsRow::Up));
+    assert!(matches!(&rows[1], WsRow::Collection { name, open: false, .. } if name == "beta.json"));
+
+    // Enter on the `../` row (index 0) climbs back to the root.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    assert!(app.collections[ci].workspace_browse.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_accordion");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // The `alpha.hurl` collection row sits at index 1 (after `sub/`).
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+    assert!(app.collections[ci].workspace_collapsed);
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        !rows.iter().any(|r| matches!(r, WsRow::Request(_))),
+        "a collapsed collection hides its request rows"
+    );
+    assert!(matches!(&rows[1], WsRow::Collection { open: false, .. }));
+
+    // Enter again on the same row re-expands it.
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+    assert!(!app.collections[ci].workspace_collapsed);
+    assert!(
+        app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Request(0)))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn opening_a_different_collection_with_unsaved_edits_warns_before_switching() {
+    let dir = workspace_temp_dir("ws_switch_warn");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    // An unsaved in-memory edit on the loaded collection.
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+
+    // Browse into `sub/` and try to open `beta.json`.
+    app.collections[ci].list_cursor = 0; // sub/
+    app.on_enter();
+    app.collections[ci].list_cursor = 1; // beta.json
+    app.on_enter();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::WorkspaceSwitchUnsaved { ci: c, .. }) if c == ci),
+        "switching with unsaved edits raises the warning first"
+    );
+    // The file has NOT changed yet — still on alpha.hurl.
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn discarding_at_the_workspace_switch_warning_loads_the_new_collection() {
+    let dir = workspace_temp_dir("ws_switch_discard");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+    app.collections[ci].list_cursor = 0;
+    app.on_enter(); // into sub/
+    app.collections[ci].list_cursor = 1;
+    app.on_enter(); // warning
+
+    // Move the selection to "Discard changes and switch" (sel 1) and confirm.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "the new collection was loaded, discarding the edit"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cancelling_the_workspace_switch_warning_keeps_the_current_collection_and_edits() {
+    let dir = workspace_temp_dir("ws_switch_cancel");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    app.collections[ci].list_cursor = 1;
+    app.on_enter(); // warning
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "the unsaved edit is preserved when the switch is cancelled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enter_on_a_workspace_request_row_opens_the_edit_wizard() {
+    let dir = workspace_temp_dir("ws_edit_request");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // The single request is inlined at index 2 (after `sub/` and `alpha.hurl`).
+    app.collections[ci].list_cursor = 2;
+    app.on_enter();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "Enter on a request row opens the edit wizard"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn right_arrow_descends_into_a_highlighted_workspace_folder() {
+    let dir = workspace_temp_dir("ws_right");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Highlight the `sub/` folder row (index 0) and press Right.
+    app.collections[ci].list_cursor = 0;
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        app.collections[ci].workspace_browse,
+        vec!["sub".to_string()],
+        "Right on a folder row descends into it, like Enter"
+    );
+
+    // Right on a request row must NOT navigate — it still scrolls the URL.
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+    let request_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request(_)))
+        .unwrap();
+    app.collections[ci].list_cursor = request_row;
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.collections[ci].workspace_browse.is_empty(),
+        "Right on a request row does not navigate the tree"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_right_collection");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Collapse the open `alpha.hurl` (row index 1), then Right re-expands it.
+    app.collections[ci].workspace_collapsed = true;
+    let alpha_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Collection { open: false, .. }))
+        .unwrap();
+    app.collections[ci].list_cursor = alpha_row;
+    press(&mut app, KeyCode::Right);
+    assert!(
+        !app.collections[ci].workspace_collapsed,
+        "Right on the collapsed loaded collection expands it"
+    );
+    assert!(
+        app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Request(0))),
+        "its requests are visible again"
+    );
+
+    // Browse into `sub/` and open `beta.json` with Right (a different file).
+    app.collections[ci].list_cursor = 0; // sub/
+    press(&mut app, KeyCode::Right);
+    let beta_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Collection { .. }))
+        .unwrap();
+    app.collections[ci].list_cursor = beta_row;
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "Right on a collapsed, unloaded collection opens it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn always_save_preference_auto_saves_instead_of_prompting_on_a_workspace_switch() {
+    let dir = workspace_temp_dir("ws_always_save");
+    let (mut app, ci) = workspace_app(&dir);
+    app.always_save_when_prompted = true;
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    // Edit the request so the collection has an unsaved in-memory change.
+    app.collections[ci].entries[0].url = "https://example.com/edited".to_string();
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+
+    // Browse into `sub/` and open `beta.json` — no prompt should appear.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+
+    assert!(
+        app.overlay.is_none(),
+        "with always-save on, no Save/Discard/Cancel prompt is shown"
+    );
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "the switch went through"
+    );
+    let saved = std::fs::read_to_string(dir.join("alpha.hurl")).unwrap();
+    assert!(
+        saved.contains("https://example.com/edited"),
+        "the edit was auto-saved to disk before switching"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_default() {
+    let mut app = TuiApp::default();
+    assert!(
+        !app.always_save_when_prompted,
+        "the preference is off by default"
+    );
+
+    app.overlay = Some(Overlay::Preferences(3));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.always_save_when_prompted, "Enter toggles it on");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        "the highlight stays on the toggle row"
+    );
+
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        !app.always_save_when_prompted,
+        "Space toggles it back off"
+    );
 }
 
 #[test]
@@ -11738,4 +12928,21 @@ fn an_empty_name_at_the_save_prompt_also_falls_back_to_keeping_the_workspace_tem
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&dest_parent);
+}
+
+#[test]
+fn env_name_keeps_dotted_suffix_but_still_drops_a_real_extension() {
+    assert_eq!(env_name_from_path("/x/.env.dev-au", "environment"), ".env.dev-au");
+    assert_eq!(env_name_from_path("/x/.env", "environment"), ".env");
+    assert_eq!(env_name_from_path("/x/prod.vars", "environment"), "prod");
+    assert_eq!(env_name_from_path("", "environment"), "environment");
+}
+
+#[test]
+fn collection_name_hides_only_known_extensions() {
+    assert_eq!(collection_name_from_path("/x/api.hurl", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/api.json", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/api.HURL", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/env.dev-au", "collection"), "env.dev-au");
+    assert_eq!(collection_name_from_path("/x/notes.txt", "collection"), "notes.txt");
 }

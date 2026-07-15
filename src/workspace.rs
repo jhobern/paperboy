@@ -110,6 +110,62 @@ fn scan_dir(dir: &Path, depth: usize, filter_hurl_json: bool, out: &mut Vec<WsEn
     }
 }
 
+/// Non-recursive scan of a single directory's immediate children: its
+/// subfolders (alphabetical) followed by its `.hurl`/`.json` collection files
+/// (alphabetical), used by the Workspace tab's file-tree request list to
+/// browse one folder at a time. Unlike [`scan_workspace`] this does not
+/// recurse into the returned subfolders (their `depth` is always 0), but when
+/// `filter_hurl_json` is true a subfolder is still only listed if its subtree
+/// contains at least one collection file — so empty or unrelated folders
+/// don't clutter the browse view. Hidden dot-prefixed entries are always
+/// skipped; an unreadable directory yields an empty list.
+pub fn list_dir(dir: &Path, filter_hurl_json: bool) -> Vec<WsEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if filter_hurl_json {
+                let mut sub = Vec::new();
+                scan_dir(&path, 1, true, &mut sub);
+                if sub.is_empty() {
+                    continue;
+                }
+            }
+            dirs.push(path);
+        } else if is_matching_file(&path, filter_hurl_json) {
+            files.push(path);
+        }
+    }
+    dirs.sort();
+    files.sort();
+    let to_entry = |path: PathBuf, is_dir: bool| WsEntry {
+        display_name: path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        path,
+        depth: 0,
+        is_dir,
+    };
+    let mut out = Vec::with_capacity(dirs.len() + files.len());
+    out.extend(dirs.into_iter().map(|d| to_entry(d, true)));
+    out.extend(files.into_iter().map(|f| to_entry(f, false)));
+    out
+}
+
 /// Whether `path`'s extension matches the collection-file filter (case
 /// insensitive `.hurl`/`.json`) — always `true` when the filter is off.
 fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
@@ -159,6 +215,59 @@ fn copy_dir_all_inner(src: &Path, dst: &Path, depth: usize) -> std::io::Result<(
     Ok(())
 }
 
+/// Walk `root`'s visible tree and collect every non-hidden file as a
+/// `(repo-relative path, UTF-8 contents)` pair, ready to hand to
+/// [`crate::git_remote::commit_files`] for "Save Workspace to Git". Paths use
+/// `/` separators (git's on-wire form) regardless of platform. Hidden
+/// (dot-prefixed) entries — notably a git download's internal `.git` folder —
+/// are skipped exactly like [`copy_dir_all`], and any file that isn't valid
+/// UTF-8 is skipped defensively (the git commit plumbing only writes text
+/// blobs; a workspace is expected to hold `.hurl`/`.json`/`.vars` text). The
+/// result is sorted by path for a deterministic commit.
+pub fn collect_files_for_commit(root: &Path) -> std::io::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    collect_files_inner(root, root, 0, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn collect_files_inner(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(String, String)>,
+) -> std::io::Result<()> {
+    if depth >= MAX_DEPTH {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files_inner(root, &path, depth + 1, out)?;
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            // Skip anything that isn't valid UTF-8 text rather than failing
+            // the whole commit.
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                let repo_path = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((repo_path, contents));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +298,41 @@ mod tests {
         assert!(entries[0].is_dir);
         assert_eq!(entries[1].depth, 1);
         assert!(!entries[1].is_dir);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_files_for_commit_gathers_the_whole_visible_tree_with_slash_paths() {
+        let root = tmp_dir("collect_commit");
+        fs::write(root.join("a.hurl"), "GET a\n").unwrap();
+        fs::create_dir_all(root.join("api")).unwrap();
+        fs::write(root.join("api/b.hurl"), "GET b\n").unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "secret\n").unwrap();
+
+        let mut files = collect_files_for_commit(&root).unwrap();
+        files.sort();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["a.hurl", "api/b.hurl"]);
+        assert_eq!(files[1].1, "GET b\n");
+        assert!(
+            !paths.iter().any(|p| p.contains(".git")),
+            "dot-prefixed entries are never collected"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_files_for_commit_skips_non_utf8_files_rather_than_failing() {
+        let root = tmp_dir("collect_binary");
+        fs::write(root.join("ok.hurl"), "GET ok\n").unwrap();
+        fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let files = collect_files_for_commit(&root).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["ok.hurl"], "the binary file is skipped");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -7,7 +7,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
-use ratatui_explorer::{FileExplorerBuilder, Theme as ExplorerTheme};
+use ratatui_explorer::{FileExplorer, FileExplorerBuilder, Theme as ExplorerTheme};
 
 use crate::collection::Collection;
 use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
@@ -587,6 +587,84 @@ impl TuiApp {
                 },
                 _ => self.overlay = Some(Overlay::CloseGitWorkspace { idx, path, sel }),
             },
+            Overlay::WorkspaceGitSaveUnsaved { ci, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Left => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Right => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Enter => match sel {
+                    // Save the in-memory edits to disk first, then push — but
+                    // only proceed if the save actually succeeded.
+                    0 => {
+                        self.overlay = None;
+                        if self.save_workspace_current_file(ci) {
+                            self.start_git_workspace_save_wizard(ci);
+                        }
+                    }
+                    // Push the on-disk version, leaving the edits in memory.
+                    1 => {
+                        self.overlay = None;
+                        self.start_git_workspace_save_wizard(ci);
+                    }
+                    _ => self.overlay = None,
+                },
+                _ => self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel }),
+            },
+            Overlay::WorkspaceSwitchUnsaved { ci, target, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                    self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+                        ci,
+                        target,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                    self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+                        ci,
+                        target,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Enter => match sel {
+                    // Save the in-memory edits to disk first, then switch —
+                    // but only if the save actually succeeded.
+                    0 => {
+                        self.overlay = None;
+                        if self.save_workspace_current_file(ci) {
+                            self.load_workspace_file(ci, target);
+                        }
+                    }
+                    // Discard the edits and switch.
+                    1 => {
+                        self.overlay = None;
+                        self.load_workspace_file(ci, target);
+                    }
+                    _ => self.overlay = None,
+                },
+                _ => self.overlay = Some(Overlay::WorkspaceSwitchUnsaved { ci, target, sel }),
+            },
             Overlay::WorkspaceReloadConfirm { idx, reload, sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     // Declined: same outcome as any other Workspace whose
@@ -685,7 +763,7 @@ impl TuiApp {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.overlay = Some(Overlay::FileMenu((sel + 1).min(1)));
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Right => {
                     self.overlay = Some(if sel == 0 {
                         Overlay::FileLoadMenu(0)
                     } else {
@@ -706,14 +784,18 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_load_items(&s);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::FileMenu(0)),
+                    // Left/Esc backs out to the top File menu; Right/Enter
+                    // descends into this kind's source (or activates it).
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileMenu(0))
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.overlay = Some(Overlay::FileLoadMenu(sel.saturating_sub(1)));
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.overlay = Some(Overlay::FileLoadMenu((sel + 1).min(items.len() - 1)));
                     }
-                    KeyCode::Enter => self.activate_file_load_item(sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_load_item(sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_load_item(i),
                         None => self.overlay = Some(Overlay::FileLoadMenu(sel)),
@@ -725,19 +807,66 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_save_items(&s);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::FileMenu(1)),
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileMenu(1))
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.overlay = Some(Overlay::FileSaveMenu(sel.saturating_sub(1)));
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.overlay = Some(Overlay::FileSaveMenu((sel + 1).min(items.len() - 1)));
                     }
-                    KeyCode::Enter => self.activate_file_save_item(sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_save_item(sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_save_item(i),
                         None => self.overlay = Some(Overlay::FileSaveMenu(sel)),
                     },
                     _ => self.overlay = Some(Overlay::FileSaveMenu(sel)),
+                }
+            }
+            Overlay::FileLoadSource(kind, sel) => {
+                let s = Strings::for_language(&self.language);
+                let items = file_load_source_items(&s);
+                match key.code {
+                    // Left/Esc steps back to the kind list with this kind lit.
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileLoadMenu(file_load_kind_index(kind)));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Some(Overlay::FileLoadSource(kind, sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = items.len() - 1;
+                        self.overlay = Some(Overlay::FileLoadSource(kind, (sel + 1).min(n)));
+                    }
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_load_source(kind, sel),
+                    KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                        Some(i) => self.activate_file_load_source(kind, i),
+                        None => self.overlay = Some(Overlay::FileLoadSource(kind, sel)),
+                    },
+                    _ => self.overlay = Some(Overlay::FileLoadSource(kind, sel)),
+                }
+            }
+            Overlay::FileSaveDest(kind, sel) => {
+                let s = Strings::for_language(&self.language);
+                let items = file_save_dest_items(kind, &s);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileSaveMenu(file_save_kind_index(kind)));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Some(Overlay::FileSaveDest(kind, sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = items.len() - 1;
+                        self.overlay = Some(Overlay::FileSaveDest(kind, (sel + 1).min(n)));
+                    }
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_save_dest(kind, sel),
+                    KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                        Some(i) => self.activate_file_save_dest(kind, i),
+                        None => self.overlay = Some(Overlay::FileSaveDest(kind, sel)),
+                    },
+                    _ => self.overlay = Some(Overlay::FileSaveDest(kind, sel)),
                 }
             }
             Overlay::Options(sel) => match key.code {
@@ -780,7 +909,7 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Preferences((sel + 1).min(2)));
+                    self.overlay = Some(Overlay::Preferences((sel + 1).min(3)));
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     match sel {
@@ -794,7 +923,7 @@ impl TuiApp {
                             self.save_state();
                             self.overlay = Some(Overlay::Preferences(sel));
                         }
-                        _ => {
+                        2 => {
                             // Open the Default Request View submenu,
                             // preselecting the current view.
                             let cur = match self.default_request_view {
@@ -802,6 +931,11 @@ impl TuiApp {
                                 request::RequestView::Hurl => 1,
                             };
                             self.overlay = Some(Overlay::RequestViewMenu(cur));
+                        }
+                        _ => {
+                            self.always_save_when_prompted = !self.always_save_when_prompted;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
                         }
                     }
                 }
@@ -1024,6 +1158,12 @@ impl TuiApp {
                             self.overlay = Some(Overlay::EnvPopup(popup));
                         } else if matches!(kind, PromptKind::WorkspaceSaveName) {
                             self.cancel_workspace_save();
+                        } else if let PromptKind::NewWorkspaceCollection(ci) = kind {
+                            // Cancelling the name prompt drops back to the
+                            // workspace destination picker (still parked
+                            // request, if any), rather than silently aborting
+                            // the whole "add request" flow.
+                            self.open_workspace_dest_picker(ci);
                         }
                     }
                     Act::Edit => {
@@ -1076,9 +1216,41 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    if ex.current().is_dir {
+                    let on_parent_row =
+                        ex.cwd().parent() == Some(ex.current().path.as_path());
+                    if ex.current().is_dir && on_parent_row {
+                        // The "../" row goes UP, which isn't a descent. Enter
+                        // still honours it (the common file-picker idiom), but
+                        // the arrow keys stay strictly directional: Right / l
+                        // only ever go deeper, so a run of Rights can't bounce
+                        // back up once a retrace lands on "../". Use Left (or
+                        // Enter) to ascend.
+                        if key.code == KeyCode::Enter {
+                            self.browser_ascend(&mut ex);
+                        }
+                        self.overlay = Some(Overlay::Browser(action, ex));
+                    } else if ex.current().is_dir {
                         // Descend into the directory (handled by the explorer).
+                        let target = ex.current().path.clone();
                         let _ = ex.handle(&Event::Key(key));
+                        // If this descent retraces the upward trail, re-select
+                        // the next folder down it so a run of Rights unwinds a
+                        // run of Lefts exactly. Stepping into any other folder
+                        // is a fresh navigation and clears the trail.
+                        match self
+                            .browser_forward_path
+                            .as_ref()
+                            .and_then(|trail| child_towards(&target, trail))
+                        {
+                            Some(next) => {
+                                if let Some(idx) =
+                                    ex.files().iter().position(|f| f.path == next)
+                                {
+                                    ex.set_selected_idx(idx);
+                                }
+                            }
+                            None => self.browser_forward_path = None,
+                        }
                         self.overlay = Some(Overlay::Browser(action, ex));
                     } else if matches!(
                         action,
@@ -1092,6 +1264,10 @@ impl TuiApp {
                         // A file is selected — remember its folder so the browser
                         // reopens here next time, then perform the load.
                         self.last_browse_dir = Some(ex.cwd().clone());
+                        if action == FileAction::LoadEnv {
+                            // Environment picker tracks its own last folder.
+                            self.last_env_dir = Some(ex.cwd().clone());
+                        }
                         let path = ex.current().path.to_string_lossy().into_owned();
                         self.do_file_action(action, &path);
                         self.save_state();
@@ -1115,8 +1291,27 @@ impl TuiApp {
                     self.last_browse_dir = Some(dir.clone());
                     self.workspace_save_pick_folder(dir);
                 }
+                KeyCode::Char('r') if ctrl => {
+                    // Snap back to the folder the browser first opened in —
+                    // handy after wandering far up/down the tree.
+                    if let Some(origin) = self.browser_origin_dir.clone()
+                        && origin.is_dir()
+                    {
+                        let _ = ex.set_cwd(&origin);
+                    }
+                    self.browser_forward_path = None;
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
+                KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if !ctrl => {
+                    // Going up a level highlights the folder we just left
+                    // (rather than "../"), so an accidental Left is undone by
+                    // Right — instead of descending back into "../" and
+                    // climbing another level.
+                    self.browser_ascend(&mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
                 _ => {
-                    // Navigation (j/k, h/←, Home/End, Ctrl+h toggle hidden, …).
+                    // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …).
                     let _ = ex.handle(&Event::Key(key));
                     self.overlay = Some(Overlay::Browser(action, ex));
                 }
@@ -1186,8 +1381,22 @@ impl TuiApp {
                         keep = false; // cancel the whole form
                     }
                 } else if submit {
-                    do_submit = true;
-                    keep = false;
+                    // A request can't be saved without a URL — that's the one
+                    // field `submit_new_request` bails on (silently discarding
+                    // everything else the user typed). Every other section
+                    // (headers/cookies/form fields/asserts/captures/body) is
+                    // either dropped-if-empty or stored as-is and only checked
+                    // at run time, so the URL is the sole save-time blocker.
+                    // Keep the wizard open, jump focus to the URL field, and
+                    // say why instead of closing on an empty URL.
+                    if form.url.text().trim().is_empty() {
+                        self.status = Some(Status::NewRequestUrlRequired);
+                        form.focus = NewField::Url;
+                        form.view_tab = WizardTab::All;
+                    } else {
+                        do_submit = true;
+                        keep = false;
+                    }
                 } else if reveal_key_dropdown || reveal_kind_dropdown || reveal_ctype_dropdown {
                     // The dropdown was just revealed above; stay put so the
                     // user can browse it with Down/Up instead of also
@@ -1942,6 +2151,15 @@ impl TuiApp {
             // a completely separate key-handling path from this one.
             KeyCode::Left if ctrl => self.cycle_tab(false),
             KeyCode::Right if ctrl => self.cycle_tab(true),
+            // F2 on the environments panel renames the selected Global
+            // Environment; elsewhere it renames the active tab. The panel arm
+            // is listed first so it wins when that panel is focused (otherwise
+            // the tab-rename shortcut would shadow it).
+            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
+                if let Some(env_id) = self.global_envs.get(self.global_env_idx).map(|e| e.id) {
+                    self.open_prompt_rename_env(env_id);
+                }
+            }
             // F2 renames the active tab (matches the common OS convention).
             KeyCode::F(2) if self.active_tab != 0 => self.open_prompt_rename(),
             KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
@@ -2070,7 +2288,25 @@ impl TuiApp {
                 self.scroll_list_h(-4)
             }
             KeyCode::Right | KeyCode::Char('l') if self.focus == Pane::List => {
-                self.scroll_list_h(4)
+                // In a Workspace tab's file-tree, Right opens whatever is
+                // highlighted (descend into a folder, or open/expand a
+                // collection), matching a file browser; otherwise it
+                // horizontally scrolls the selected request's URL.
+                let ci = self.active_tab;
+                let col = &self.collections[ci];
+                let row = col
+                    .is_workspace()
+                    .then(|| col.ws_rows().into_iter().nth(col.list_cursor))
+                    .flatten();
+                match row {
+                    Some(crate::collection::WsRow::Folder(name)) => {
+                        self.workspace_folder_down(ci, name)
+                    }
+                    Some(crate::collection::WsRow::Collection {
+                        path, open: false, ..
+                    }) => self.activate_workspace_collection(ci, path),
+                    _ => self.scroll_list_h(4),
+                }
             }
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::GlobalEnv => {
                 self.scroll_env_h(-4)
@@ -2311,6 +2547,86 @@ impl TuiApp {
         col.list_cursor = 0;
     }
 
+    /// Handle Enter on a Workspace tab's file-tree list row. `../` and
+    /// subfolders navigate the filesystem breadcrumb; a collection file row
+    /// opens/collapses it (switching files warns first if the current one has
+    /// unsaved edits); a request row edits it.
+    fn on_enter_workspace_list(&mut self, ci: usize) {
+        let cursor = self.collections[ci].list_cursor;
+        let Some(row) = self.collections[ci].ws_rows().into_iter().nth(cursor) else {
+            self.focus = Pane::Main;
+            return;
+        };
+        match row {
+            crate::collection::WsRow::Up => {
+                let col = &mut self.collections[ci];
+                col.workspace_browse.pop();
+                col.list_cursor = 0;
+            }
+            crate::collection::WsRow::Folder(name) => {
+                self.workspace_folder_down(ci, name);
+            }
+            crate::collection::WsRow::Collection { path, open, .. } => {
+                if open {
+                    // The open collection's own row collapses it.
+                    self.collections[ci].workspace_collapsed = true;
+                } else {
+                    self.activate_workspace_collection(ci, path);
+                }
+            }
+            crate::collection::WsRow::Request(_) => {
+                self.focus = Pane::Main;
+                self.open_edit_request_wizard(ci);
+            }
+        }
+    }
+
+    /// Descend into a subfolder in a Workspace tab's file-tree list (Enter or
+    /// Right on a folder row): push it onto the browse breadcrumb and reset
+    /// the highlight to the top of the new folder.
+    fn workspace_folder_down(&mut self, ci: usize, name: String) {
+        let col = &mut self.collections[ci];
+        col.workspace_browse.push(name);
+        col.list_cursor = 0;
+    }
+
+    /// "Open" a *collapsed* collection file row in a Workspace tab (Enter or
+    /// Right on it): re-expand it if it's the already-loaded file, otherwise
+    /// load it (which warns first if the current file has unsaved edits, since
+    /// loading replaces its entries wholesale).
+    fn activate_workspace_collection(&mut self, ci: usize, path: PathBuf) {
+        if self.collections[ci].path.as_deref() == Some(path.as_path()) {
+            self.collections[ci].workspace_collapsed = false;
+            self.collections[ci].sync_ws_cursor();
+        } else {
+            self.open_workspace_collection(ci, path);
+        }
+    }
+
+    /// Load collection `path` into Workspace tab `ci`, first warning (via
+    /// [`Overlay::WorkspaceSwitchUnsaved`]) if the currently-loaded file has
+    /// unsaved in-memory edits that switching would discard.
+    fn open_workspace_collection(&mut self, ci: usize, path: PathBuf) {
+        if self.changed_request_count(ci) == 0 || self.collections[ci].path.is_none() {
+            self.load_workspace_file(ci, path);
+            return;
+        }
+        // Unsaved in-memory edits would be replaced by loading another file.
+        // With "always save" on, auto-pick Save (switch only if the write
+        // succeeded); otherwise ask.
+        if self.always_save_when_prompted {
+            if self.save_workspace_current_file(ci) {
+                self.load_workspace_file(ci, path);
+            }
+            return;
+        }
+        self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+            ci,
+            target: path,
+            sel: 0,
+        });
+    }
+
     pub(crate) fn nav(&mut self, delta: i32) {
         let step = |cur: usize, len: usize, d: i32| -> usize {
             if len == 0 {
@@ -2323,17 +2639,26 @@ impl TuiApp {
         match self.focus {
             Pane::Tabs => {}
             Pane::List => {
-                // Move within the current folder's rows (Up/Folder/Entry —
-                // see `crate::tree`), keeping `selected_entry` pointed at
-                // whichever request is highlighted so every other action
-                // (run, edit, delete, raw mode) keeps acting on it.
-                let rows = self.collections[ci].rows();
-                let len = rows.len();
+                // Move within the current folder's rows, keeping
+                // `selected_entry` pointed at whichever request is highlighted
+                // so every other action (run, edit, delete, raw mode) keeps
+                // acting on it. Workspace tabs use the filesystem file-tree
+                // (`ws_rows`), ordinary tabs the title-folder tree (`rows`).
                 let cur = self.collections[ci].list_cursor;
-                let next = step(cur, len, delta);
-                self.collections[ci].list_cursor = next;
-                if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
-                    self.collections[ci].selected_entry = *idx;
+                if self.collections[ci].is_workspace() {
+                    let rows = self.collections[ci].ws_rows();
+                    let next = step(cur, rows.len(), delta);
+                    self.collections[ci].list_cursor = next;
+                    if let Some(crate::collection::WsRow::Request(idx)) = rows.get(next) {
+                        self.collections[ci].selected_entry = *idx;
+                    }
+                } else {
+                    let rows = self.collections[ci].rows();
+                    let next = step(cur, rows.len(), delta);
+                    self.collections[ci].list_cursor = next;
+                    if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
+                        self.collections[ci].selected_entry = *idx;
+                    }
                 }
                 self.main_scroll = 0;
                 // Reset horizontal scroll so each newly selected name starts unscrolled.
@@ -2376,10 +2701,17 @@ impl TuiApp {
                 }
             }
             Pane::List => {
-                // Enter's meaning depends on what's highlighted: a folder row
-                // descends into it, the "up" row ascends to the parent
-                // folder, and a request row jumps straight into editing it
-                // (same as pressing Enter again once focused on the panel).
+                // Enter's meaning depends on what's highlighted. Workspace
+                // tabs use the filesystem file-tree (`ws_rows`); ordinary
+                // tabs the title-folder tree (`rows`).
+                if self.collections[ci].is_workspace() {
+                    self.on_enter_workspace_list(ci);
+                    return;
+                }
+                // A folder row descends into it, the "up" row ascends to the
+                // parent folder, and a request row jumps straight into
+                // editing it (same as pressing Enter again once focused on
+                // the panel).
                 match self.collections[ci]
                     .rows()
                     .get(self.collections[ci].list_cursor)
@@ -2496,8 +2828,14 @@ impl TuiApp {
         if url.is_empty() {
             return; // nothing to create/save
         }
+        // An untitled request keeps an empty title so it lives at the root of
+        // the folder tree (see `tree::entry_path`). Defaulting the title to
+        // the URL used to be convenient, but a URL like `http://h/x` contains
+        // slashes, so `entry_path` split it into phantom folders (`http:/…`),
+        // filing the new request away in a nested section apart from its
+        // siblings. The list already shows the URL for every row, so an empty
+        // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let name = if name.is_empty() { url.clone() } else { name };
         let headers: Vec<(String, String)> = form
             .headers
             .iter()
@@ -2617,6 +2955,18 @@ impl TuiApp {
         // Requests added to a real collection (not the Scratch Space, tab 0) are
         // marked so they're distinguishable from those loaded from the file.
         entry.user_added = target != 0;
+
+        // A Workspace tab's entries belong to whichever file it currently has
+        // loaded, so there's no single obvious destination — park the request
+        // and let the user pick (or create) a collection in the workspace
+        // tree instead of silently pushing it onto (or losing it against) the
+        // loaded file.
+        if self.collections[target].workspace_root.is_some() {
+            self.pending_workspace_request = Some(entry);
+            self.open_workspace_dest_picker(target);
+            return;
+        }
+
         self.active_tab = target;
         let col = &mut self.collections[target];
         col.entries.push(entry);
@@ -2710,8 +3060,13 @@ impl TuiApp {
             .last_browse_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        self.last_env_dir = state
+            .last_env_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
+        self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;
         self.recent_git_urls = state.recent_git_urls;
@@ -2739,8 +3094,13 @@ impl TuiApp {
                 .last_browse_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            last_env_dir: self
+                .last_env_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
+            always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,
             recent_git_urls: self.recent_git_urls.clone(),
@@ -2990,19 +3350,8 @@ impl TuiApp {
                 self.reload_selected_env_var();
             }
             KeyCode::F(2) => {
-                if let Some(env) = self.global_envs.iter().find(|e| e.id == popup.env_id) {
-                    let name = env.name.clone();
-                    let env_id = popup.env_id;
-                    let s = Strings::for_language(&self.language);
-                    self.overlay = Some(Overlay::Prompt {
-                        kind: PromptKind::RenameEnv(env_id),
-                        editor: Editor::new(&name, false),
-                        title: s.env_rename_title.to_string(),
-                        mask: false,
-                        reset_to: None,
-                        secret_intact: false,
-                        secret_checkbox: None,
-                    });
+                if self.global_envs.iter().any(|e| e.id == popup.env_id) {
+                    self.open_prompt_rename_env(popup.env_id);
                 } else {
                     self.overlay = Some(Overlay::EnvPopup(popup));
                 }
@@ -3106,6 +3455,9 @@ impl TuiApp {
                 {
                     col.workspace_auto_prompt_dismissed = true;
                 }
+                // Abandon any parked new request so an aborted "add to
+                // workspace" flow doesn't leak state into the next one.
+                self.pending_workspace_request = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.nav(-1);
@@ -3123,10 +3475,31 @@ impl TuiApp {
                 }
                 self.overlay = Some(Overlay::WorkspacePicker(picker));
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                // Create a brand-new collection in this workspace (the parked
+                // request, if any, seeds it) instead of loading an existing
+                // file — see `open_new_workspace_collection_prompt`.
+                self.open_new_workspace_collection_prompt(picker.collection_idx);
+            }
             KeyCode::Enter => match picker.entries.get(picker.selected) {
                 Some(entry) if !entry.is_dir => {
                     let path = entry.path.clone();
-                    self.load_workspace_file(picker.collection_idx, path);
+                    let ci = picker.collection_idx;
+                    let adding = picker.adding_request;
+                    self.load_workspace_file(ci, path.clone());
+                    if adding {
+                        // Only append if the load actually took effect; on a
+                        // read error `load_workspace_file` leaves the tab
+                        // untouched, so keep the request parked.
+                        let loaded_ok = self
+                            .collections
+                            .get(ci)
+                            .and_then(|c| c.path.as_deref())
+                            == Some(path.as_path());
+                        if loaded_ok {
+                            self.append_pending_request_to_loaded(ci);
+                        }
+                    }
                 }
                 _ => self.overlay = Some(Overlay::WorkspacePicker(picker)),
             },
@@ -3152,33 +3525,85 @@ impl TuiApp {
         });
     }
 
+    /// Open the rename prompt for the Global Environment with `env_id`, if it
+    /// still exists. Used both from the environments panel (F2) and the open
+    /// environment-entries popup (F2).
+    pub(crate) fn open_prompt_rename_env(&mut self, env_id: u64) {
+        let Some(env) = self.global_envs.iter().find(|e| e.id == env_id) else {
+            return;
+        };
+        let name = env.name.clone();
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::RenameEnv(env_id),
+            editor: Editor::new(&name, false),
+            title: s.env_rename_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
     pub(crate) fn activate_file_load_item(&mut self, sel: usize) {
         let s = Strings::for_language(&self.language);
         match sel {
+            // Request is local-only, so it skips the source step entirely.
             0 => self.open_path_prompt(FileAction::LoadRequest, s.load_request, ""),
-            1 => self.open_browser(FileAction::OpenCollection),
-            2 => self.open_remote_wizard(RemoteKind::Collection),
-            3 => self.open_browser(FileAction::LoadEnv),
-            4 => self.open_remote_wizard(RemoteKind::Environment),
-            5 => self.open_browser(FileAction::OpenWorkspace),
-            _ => self.open_remote_wizard(RemoteKind::Workspace),
+            1 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Collection, 0)),
+            2 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 0)),
+            _ => self.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 0)),
+        }
+    }
+
+    /// Second step of Load: `sel` is `0` for a local file, `1` for git.
+    pub(crate) fn activate_file_load_source(&mut self, kind: FileKind, sel: usize) {
+        let local = sel == 0;
+        match (kind, local) {
+            (FileKind::Collection, true) => self.open_browser(FileAction::OpenCollection),
+            (FileKind::Collection, false) => self.open_remote_wizard(RemoteKind::Collection),
+            (FileKind::Environment, true) => self.open_browser(FileAction::LoadEnv),
+            (FileKind::Environment, false) => self.open_remote_wizard(RemoteKind::Environment),
+            (FileKind::Workspace, true) => self.open_browser(FileAction::OpenWorkspace),
+            (FileKind::Workspace, false) => self.open_remote_wizard(RemoteKind::Workspace),
         }
     }
 
     pub(crate) fn activate_file_save_item(&mut self, sel: usize) {
         let s = Strings::for_language(&self.language);
         match sel {
-            // "Save …" writes back to the original file (confirming only
-            // when there are changes); "Save … As" always prompts for a
-            // name (confirming an overwrite of an existing).
+            // Request and Response are single-destination path prompts, so
+            // they skip the destination step entirely.
             0 => self.open_path_prompt(FileAction::SaveRequest, s.save_request, "request.json"),
-            1 => self.begin_save(FileAction::SaveCollection),
-            2 => self.begin_save_as(FileAction::SaveCollection),
-            3 => self.open_git_save_wizard(),
-            4 => self.begin_save(FileAction::SaveEnv),
-            5 => self.begin_save_as(FileAction::SaveEnv),
-            6 => self.begin_save_workspace_as(),
+            1 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Collection, 0)),
+            2 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Environment, 0)),
+            3 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
             _ => self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json"),
+        }
+    }
+
+    /// Second step of Save: routes the destination `sel` for `kind`. The item
+    /// list (and therefore `sel`) varies per kind — see
+    /// [`crate::tui::app::file_save_dest_items`]:
+    /// Collection = Save / Save As / To Git; Environment = Save / Save As;
+    /// Workspace = Save As / To Git.
+    pub(crate) fn activate_file_save_dest(&mut self, kind: FileKind, sel: usize) {
+        match kind {
+            // "Save …" writes back to the original file (confirming only when
+            // there are changes); "Save … As" always prompts for a name.
+            FileKind::Collection => match sel {
+                0 => self.begin_save(FileAction::SaveCollection),
+                1 => self.begin_save_as(FileAction::SaveCollection),
+                _ => self.open_git_save_wizard(),
+            },
+            FileKind::Environment => match sel {
+                0 => self.begin_save(FileAction::SaveEnv),
+                _ => self.begin_save_as(FileAction::SaveEnv),
+            },
+            FileKind::Workspace => match sel {
+                0 => self.begin_save_workspace_as(),
+                _ => self.open_git_workspace_save_wizard(),
+            },
         }
     }
 
@@ -3193,6 +3618,22 @@ impl TuiApp {
             secret_intact: false,
             secret_checkbox: None,
         });
+    }
+
+    /// Walk the file browser up one level, re-selecting the folder we just
+    /// left (so an accidental step up is undone by stepping straight back in)
+    /// and anchoring the retrace trail on the first step of an upward walk.
+    /// No-op at the filesystem root, where there is nowhere further up to go.
+    fn browser_ascend(&mut self, ex: &mut FileExplorer) {
+        let here = ex.cwd().clone();
+        if here.parent().is_some() {
+            // The first step of a walk anchors the deepest folder as the trail
+            // to retrace; later steps keep it (we're still climbing the chain).
+            if self.browser_forward_path.is_none() {
+                self.browser_forward_path = Some(here.clone());
+            }
+            let _ = ex.set_working_file(&here);
+        }
     }
 
     pub(crate) fn open_browser(&mut self, action: FileAction) {
@@ -3239,17 +3680,37 @@ impl TuiApp {
 
         match FileExplorerBuilder::build_with_theme(ex_theme) {
             Ok(mut ex) => {
-                // Reopen in the last-used folder when it still exists.
-                if let Some(dir) = &self.last_browse_dir
+                // Reopen in the last-used folder when it still exists. The
+                // environment picker prefers the folder its own last file came
+                // from, falling back to the shared last-browsed folder.
+                let reopen = match action {
+                    FileAction::LoadEnv => self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref()),
+                    _ => self.last_browse_dir.as_ref(),
+                };
+                if let Some(dir) = reopen
                     && dir.is_dir()
                 {
                     let _ = ex.set_cwd(dir);
                 }
+                // Remember where the browser actually started so `^r` can jump
+                // back here after the user navigates away.
+                self.browser_origin_dir = Some(ex.cwd().clone());
+                self.browser_forward_path = None;
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
             Err(e) => self.status = Some(Status::Error(e.to_string())),
         }
     }
+}
+
+/// The direct child of `ancestor` that lies on the path down to `descendant`,
+/// or `None` when `ancestor` is not a strict prefix of `descendant` (including
+/// when they are equal). Used by the file browser to retrace an upward walk:
+/// e.g. `child_towards("/a/b", "/a/b/c/d")` is `Some("/a/b/c")`.
+fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
+    let rest = descendant.strip_prefix(ancestor).ok()?;
+    let first = rest.components().next()?;
+    Some(ancestor.join(first))
 }
 
 /// Apply a horizontal-scroll `delta` to `current`, clamped to `[0, max]` where
