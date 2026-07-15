@@ -1866,6 +1866,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+J", s.help_raw_json),
                             ("b", s.help_base_url),
                             ("u (List pane)", s.help_restore_request),
+                            ("m (workspace, List pane)", s.help_move_request),
+                            ("c (workspace, List pane)", s.help_copy_request),
                         ],
                     ),
                     (
@@ -2420,10 +2422,11 @@ pub(crate) fn draw_workspace_picker(
     st.select(Some(picker.selected));
     f.render_stateful_widget(list, rows[0], &mut st);
     let hint = Paragraph::new(Line::styled(
-        if picker.adding_request {
-            s.workspace_picker_hint_add
-        } else {
-            s.workspace_picker_hint
+        match picker.mode {
+            WsPickerMode::AddRequest => s.workspace_picker_hint_add,
+            WsPickerMode::MoveRequest => s.workspace_picker_hint_move,
+            WsPickerMode::CopyRequest => s.workspace_picker_hint_copy,
+            WsPickerMode::Browse => s.workspace_picker_hint,
         },
         Style::default().fg(th.dim),
     ));

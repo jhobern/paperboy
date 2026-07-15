@@ -109,6 +109,12 @@ strings! {
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
     workspace_picker_hint => "Enter open · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
     workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint_move => "Enter move request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée déplacer la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter flyt forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
+    request_deleted => "{m} request deleted. Press (u) to restore request.", "Requête {m} supprimée. Appuyez sur (u) pour la restaurer.", "{m}-forespørgsel slettet. Tryk (u) for at gendanne.";
+    tab_closed => "Collection closed. Press (u) to reopen tab.", "Collection fermée. Appuyez sur (u) pour rouvrir l'onglet.", "Samling lukket. Tryk (u) for at genåbne fanen.";
+    request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
+    request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
@@ -340,6 +346,8 @@ strings! {
     help_tab_manage => "close / reopen collection or workspace tab", "fermer / rouvrir un onglet de collection ou d'espace de travail", "luk / genåbn samlings- eller workspace-fane";
     help_tab_reorder => "reorder tabs", "réorganiser les onglets", "omarranger faner";
     help_restore_request => "restore deleted request (List pane)", "restaurer la requête supprimée (volet Liste)", "gendan slettet anmodning (Liste-rude)";
+    help_move_request => "move request to another collection (workspace, List pane)", "déplacer la requête vers une autre collection (espace de travail, volet Liste)", "flyt anmodning til en anden samling (arbejdsområde, Liste-rude)";
+    help_copy_request => "copy request to another collection (workspace, List pane)", "copier la requête vers une autre collection (espace de travail, volet Liste)", "kopiér anmodning til en anden samling (arbejdsområde, Liste-rude)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
@@ -437,6 +445,19 @@ pub enum Status {
     /// wizard is kept open (focused on the URL field) instead of silently
     /// discarding everything the user typed.
     NewRequestUrlRequired,
+    /// A request was deleted from a collection (`x` / delete). Holds the HTTP
+    /// method so the message can name it, and always pairs with the "press u
+    /// to restore" hint since deletions are easy to trigger by accident.
+    RequestDeleted(String),
+    /// A collection tab was closed (`x` / Ctrl+W). Pairs with the "press u to
+    /// reopen" hint, mirroring [`Status::RequestDeleted`].
+    TabClosed,
+    /// A request was moved to another collection file in the workspace. Holds
+    /// the HTTP method and the destination file's display name.
+    RequestMoved(String, String),
+    /// A request was copied to another collection file in the workspace (as
+    /// [`Status::RequestMoved`], but the original is left in place).
+    RequestCopied(String, String),
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
 }
@@ -457,6 +478,8 @@ impl Status {
                     | Status::EnvDeactivated(_)
                     | Status::WorkspaceReloaded
                     | Status::WorkspaceSaved
+                    | Status::RequestMoved(_, _)
+                    | Status::RequestCopied(_, _)
             ),
         }
     }
@@ -502,6 +525,14 @@ impl Status {
                 s.workspace_collection_created.replace("{name}", name)
             }
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
+            Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
+            Status::TabClosed => s.tab_closed.to_string(),
+            Status::RequestMoved(method, dest) => {
+                s.request_moved.replace("{m}", method).replace("{dest}", dest)
+            }
+            Status::RequestCopied(method, dest) => {
+                s.request_copied.replace("{m}", method).replace("{dest}", dest)
+            }
             Status::CollectionRunSummary {
                 passed,
                 failed,

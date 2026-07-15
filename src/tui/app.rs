@@ -195,11 +195,45 @@ pub(crate) struct WorkspacePickerState {
     /// grouping), or `entries.len()` if there are no files at all to select.
     pub(crate) selected: usize,
     pub(crate) scroll: u16,
-    /// `true` when this picker was opened to choose the destination for a
-    /// brand-new request that's parked in `TuiApp::pending_workspace_request`
-    /// (rather than just browsing to load a file). Changes the Enter action
-    /// (load-then-append instead of load-only) and the on-screen hint.
-    pub(crate) adding_request: bool,
+    /// What this picker is for — plain browsing, choosing where a brand-new
+    /// request lands, or choosing where an existing request is moved/copied.
+    /// Changes the Enter action and the on-screen hint.
+    pub(crate) mode: WsPickerMode,
+}
+
+/// Why a [`WorkspacePickerState`] is open, driving its Enter action and hint.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum WsPickerMode {
+    /// Browse the workspace and load the chosen collection file (the `w` key
+    /// and the auto-open-on-empty-tab flow).
+    Browse,
+    /// Choose the file to append the parked
+    /// [`TuiApp::pending_workspace_request`] to (load-then-append).
+    AddRequest,
+    /// Choose the file to move the parked
+    /// [`TuiApp::pending_workspace_transfer`] into (written to disk, then
+    /// removed from its source collection).
+    MoveRequest,
+    /// Choose the file to copy the parked
+    /// [`TuiApp::pending_workspace_transfer`] into (written to disk; the
+    /// original stays put).
+    CopyRequest,
+}
+
+/// An existing workspace request parked for a move/copy, awaiting a destination
+/// collection chosen through the workspace picker. See
+/// [`TuiApp::pending_workspace_transfer`].
+#[derive(Clone)]
+pub(crate) struct PendingTransfer {
+    /// The request being moved/copied (a clone of the source entry).
+    pub(crate) entry: HurlEntry,
+    /// `collections` index of the Workspace tab the request came from.
+    pub(crate) source_ci: usize,
+    /// Index of the request within the source collection's loaded `entries`.
+    pub(crate) source_idx: usize,
+    /// `true` for a move (remove from source after writing the destination),
+    /// `false` for a copy (leave the source untouched).
+    pub(crate) is_move: bool,
 }
 
 impl WorkspacePickerState {
@@ -220,7 +254,7 @@ impl WorkspacePickerState {
             entries,
             selected,
             scroll: 0,
-            adding_request: false,
+            mode: WsPickerMode::Browse,
         }
     }
 
@@ -781,6 +815,15 @@ pub struct TuiApp {
     /// cancelled, so an aborted flow never leaks state.
     pub(crate) pending_workspace_request: Option<HurlEntry>,
 
+    /// An existing workspace request awaiting a move/copy destination. Set when
+    /// the user presses `m` (move) or `c` (copy) on a request row of a
+    /// Workspace tab; the workspace destination picker then writes the entry
+    /// into whichever collection file the user opens (and, for a move, removes
+    /// it from its source). Taken (set back to `None`) as soon as the transfer
+    /// commits or the picker is cancelled, so an aborted flow never leaks
+    /// state.
+    pub(crate) pending_workspace_transfer: Option<PendingTransfer>,
+
     /// Git URLs the user has loaded a collection/environment from, most recent
     /// first. Offered as a pickable list in the "Load from Git" wizard and
     /// persisted across restarts.
@@ -875,6 +918,7 @@ impl Default for TuiApp {
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
+            pending_workspace_transfer: None,
             recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
@@ -1787,8 +1831,153 @@ impl TuiApp {
         let filter = col.workspace_filter_hurl_json;
         self.active_tab = ci;
         let mut picker = WorkspacePickerState::new(ci, root, filter);
-        picker.adding_request = self.pending_workspace_request.is_some();
+        picker.mode = if self.pending_workspace_request.is_some() {
+            WsPickerMode::AddRequest
+        } else {
+            WsPickerMode::Browse
+        };
         self.overlay = Some(Overlay::WorkspacePicker(picker));
+    }
+
+    /// Open the Workspace file-tree popup for tab `ci` to choose a destination
+    /// collection for a request being moved (`is_move == true`) or copied
+    /// (`is_move == false`). The request itself must already be parked in
+    /// [`TuiApp::pending_workspace_transfer`]. On Enter, the picker calls
+    /// [`TuiApp::commit_workspace_transfer`] with the chosen file — writing it
+    /// straight to disk — rather than loading it. A no-op if `ci` isn't a
+    /// Workspace-bound tab.
+    pub(crate) fn open_workspace_transfer_picker(&mut self, ci: usize, is_move: bool) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let filter = col.workspace_filter_hurl_json;
+        self.active_tab = ci;
+        let mut picker = WorkspacePickerState::new(ci, root, filter);
+        picker.mode = if is_move {
+            WsPickerMode::MoveRequest
+        } else {
+            WsPickerMode::CopyRequest
+        };
+        self.overlay = Some(Overlay::WorkspacePicker(picker));
+    }
+
+    /// Commit the parked [`TuiApp::pending_workspace_transfer`] into the
+    /// collection file at `dest_path`, writing straight to disk (no separate
+    /// Save). For a copy the source is left untouched; for a move the request
+    /// is also removed from its source collection (in memory and on disk).
+    /// Moving/copying a request onto its own source file is handled specially:
+    /// a move is a no-op, a copy duplicates the entry within the file. Returns
+    /// after setting an appropriate status (success or error).
+    pub(crate) fn commit_workspace_transfer(&mut self, dest_path: PathBuf) {
+        let Some(transfer) = self.pending_workspace_transfer.take() else {
+            return;
+        };
+        let PendingTransfer {
+            entry,
+            source_ci,
+            source_idx,
+            is_move,
+        } = transfer;
+        let method = entry.method.clone();
+        let dest_name = dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dest_path.display().to_string());
+
+        // Is the destination the same file currently loaded in the source tab?
+        let same_file = self
+            .collections
+            .get(source_ci)
+            .and_then(|c| c.path.as_ref())
+            .map(|p| p == &dest_path)
+            .unwrap_or(false);
+
+        if same_file {
+            if is_move {
+                // Moving within the same file is a no-op.
+                self.status = Some(Status::RequestMoved(method, dest_name));
+                return;
+            }
+            // Copy within the loaded file: duplicate in memory, then persist.
+            let Some(col) = self.collections.get_mut(source_ci) else {
+                return;
+            };
+            let mut clone = entry;
+            clone.user_added = true;
+            clone.modified = true;
+            col.entries.push(clone);
+            let text = crate::hurl::collection_to_hurl(&col.entries);
+            if let Err(e) = std::fs::write(&dest_path, text) {
+                self.status = Some(Status::Error(e.to_string()));
+                return;
+            }
+            self.mark_collection_saved(source_ci);
+            if let Some(col) = self.collections.get_mut(source_ci) {
+                col.invalidate_request_json();
+                col.sync_ws_cursor();
+            }
+            self.save_state();
+            self.status = Some(Status::RequestCopied(method, dest_name));
+            return;
+        }
+
+        // Destination is a different file on disk. Read it, append, write back.
+        let mut dest_entries: Vec<HurlEntry> = match std::fs::read_to_string(&dest_path) {
+            Ok(text) => crate::postman::parse_collection(&text),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                self.status = Some(Status::Error(e.to_string()));
+                return;
+            }
+        };
+        let mut appended = entry.clone();
+        appended.user_added = true;
+        appended.modified = true;
+        dest_entries.push(appended);
+        if let Some(parent) = dest_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.status = Some(Status::Error(e.to_string()));
+            return;
+        }
+        let dest_text = crate::hurl::collection_to_hurl(&dest_entries);
+        if let Err(e) = std::fs::write(&dest_path, dest_text) {
+            self.status = Some(Status::Error(e.to_string()));
+            return;
+        }
+
+        if is_move {
+            // Remove from the source collection (in memory + on disk).
+            if let Some(col) = self.collections.get_mut(source_ci)
+                && source_idx < col.entries.len()
+            {
+                col.entries.remove(source_idx);
+                if col.selected_entry >= col.entries.len() {
+                    col.selected_entry = col.entries.len().saturating_sub(1);
+                }
+                if let Some(path) = col.path.clone() {
+                    let text = crate::hurl::collection_to_hurl(&col.entries);
+                    if let Err(e) = std::fs::write(&path, text) {
+                        self.status = Some(Status::Error(e.to_string()));
+                        return;
+                    }
+                }
+                self.mark_collection_saved(source_ci);
+                if let Some(col) = self.collections.get_mut(source_ci) {
+                    col.invalidate_request_json();
+                    col.sync_folder_to_selected();
+                    col.sync_ws_cursor();
+                }
+            }
+            self.save_state();
+            self.status = Some(Status::RequestMoved(method, dest_name));
+        } else {
+            self.save_state();
+            self.status = Some(Status::RequestCopied(method, dest_name));
+        }
     }
 
     /// Append the parked [`TuiApp::pending_workspace_request`], if any, to
@@ -3062,16 +3251,28 @@ pub(crate) fn file_stem(path: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/// Display name for an environment file. Like [`file_stem`], but a leading-dot
-/// filename keeps its full name (so `.env.dev-au` stays `.env.dev-au` rather
-/// than being truncated to `.env`, since the part after the dot is a
-/// meaningful suffix here, not a throwaway extension).
+/// Display name for an environment file. A leading-dot filename keeps its full
+/// name (so `.env.dev-au` stays `.env.dev-au`), and only the known environment
+/// extensions (`.env`/`.vars`) are hidden — any other suffix is kept verbatim,
+/// so a file like `environment.env.dev-au` shows in full rather than losing its
+/// `.dev-au` (the part after the dot is a meaningful suffix here, not a
+/// throwaway extension).
 pub(crate) fn env_name_from_path(path: &str, fallback: &str) -> String {
-    match std::path::Path::new(path).file_name() {
-        Some(name) if name.to_string_lossy().starts_with('.') => {
-            name.to_string_lossy().into_owned()
-        }
-        _ => file_stem(path, fallback),
+    let p = std::path::Path::new(path);
+    if let Some(name) = p.file_name()
+        && name.to_string_lossy().starts_with('.')
+    {
+        return name.to_string_lossy().into_owned();
+    }
+    match p
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    {
+        Some(ext) if ext == "env" || ext == "vars" => file_stem(path, fallback),
+        _ => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fallback.to_string()),
     }
 }
 

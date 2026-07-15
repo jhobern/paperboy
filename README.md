@@ -153,7 +153,13 @@ cargo build --release
   list deletes the selected request; `u` on that same pane brings back the
   most recently deleted one (last-deleted-first, one collection's stack
   per collection) — the exact parallel of reopening a closed tab, just
-  scoped to individual requests instead of whole collections.
+  scoped to individual requests instead of whole collections. Closing a tab
+  or deleting a request also shows a status-bar message naming the `u` undo
+  key, so an accidental deletion is easy to reverse.
+- **Move or copy requests between workspace collections.** In a workspace
+  tab, `m` moves and `c` copies the selected request into another collection
+  file — a picker chooses the destination and the change is written straight
+  to disk (no separate Save).
 - The app remembers your window layout, active tab/request, language, and
   recently-used git URLs across restarts.
 - English, French and Danish UI languages (Options → Language).
@@ -396,6 +402,7 @@ up-to-date list. Highlights:
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
+| `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
 | `+` / `-` | Grow / shrink the response pane |
 | `<` / `>` | Grow / shrink the left column |

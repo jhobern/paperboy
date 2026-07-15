@@ -11359,7 +11359,10 @@ fn new_request_targeting_a_workspace_opens_the_destination_picker() {
     match &app.overlay {
         Some(Overlay::WorkspacePicker(p)) => {
             assert_eq!(p.collection_idx, ci);
-            assert!(p.adding_request, "picker is in add-request mode");
+            assert!(
+                p.mode == crate::tui::app::WsPickerMode::AddRequest,
+                "picker is in add-request mode"
+            );
         }
         _ => panic!("expected the workspace destination picker to open"),
     }
@@ -11504,6 +11507,204 @@ fn create_workspace_collection_rejects_paths_escaping_the_root() {
         "a `..` path is rejected, not created"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Load `alpha.hurl` into a fresh Workspace tab so a request row is
+/// highlighted, ready for a move/copy. Returns the app and the tab index.
+fn workspace_tab_with_alpha_loaded(tag: &str) -> (TuiApp, usize, std::path::PathBuf) {
+    let dir = workspace_temp_dir(tag);
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+    // Highlight the request row (alpha.hurl holds a single request).
+    let cursor = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request(_)))
+        .expect("alpha.hurl's request row");
+    app.collections[ci].list_cursor = cursor;
+    (app, ci, dir)
+}
+
+#[test]
+fn m_moves_the_highlighted_request_to_another_collection_file() {
+    let (mut app, ci, dir) = workspace_tab_with_alpha_loaded("move_across");
+
+    // `m` parks the request and opens the transfer picker in move mode.
+    press(&mut app, KeyCode::Char('m'));
+    assert!(app.pending_workspace_transfer.is_some());
+    match &mut app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.mode, crate::tui::app::WsPickerMode::MoveRequest);
+            p.selected = p
+                .entries
+                .iter()
+                .position(|e| e.display_name == "beta.json")
+                .unwrap();
+        }
+        _ => panic!("expected the transfer picker"),
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none());
+    assert!(app.pending_workspace_transfer.is_none(), "transfer committed");
+    // The destination file now holds the moved request...
+    let dest = std::fs::read_to_string(dir.join("sub").join("beta.json")).unwrap();
+    assert!(dest.contains("https://example.com/alpha"));
+    // ...and the source file no longer does (moved, not copied).
+    let src = std::fs::read_to_string(dir.join("alpha.hurl")).unwrap();
+    assert!(!src.contains("https://example.com/alpha"));
+    assert!(
+        app.collections[ci].entries.is_empty(),
+        "the request left the in-memory source too"
+    );
+    assert!(matches!(app.status, Some(crate::i18n::Status::RequestMoved(..))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn c_copies_the_highlighted_request_leaving_the_source_intact() {
+    let (mut app, ci, dir) = workspace_tab_with_alpha_loaded("copy_across");
+
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.pending_workspace_transfer.is_some());
+    match &mut app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.mode, crate::tui::app::WsPickerMode::CopyRequest);
+            p.selected = p
+                .entries
+                .iter()
+                .position(|e| e.display_name == "beta.json")
+                .unwrap();
+        }
+        _ => panic!("expected the transfer picker"),
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    // Destination gains the request; the source keeps it.
+    let dest = std::fs::read_to_string(dir.join("sub").join("beta.json")).unwrap();
+    assert!(dest.contains("https://example.com/alpha"));
+    let src = std::fs::read_to_string(dir.join("alpha.hurl")).unwrap();
+    assert!(src.contains("https://example.com/alpha"));
+    assert_eq!(
+        app.collections[ci].entries.len(),
+        1,
+        "a copy leaves the in-memory source untouched"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::RequestCopied(..))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn moving_a_request_onto_its_own_source_file_is_a_no_op() {
+    let (mut app, ci, dir) = workspace_tab_with_alpha_loaded("move_same");
+
+    press(&mut app, KeyCode::Char('m'));
+    match &mut app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            p.selected = p
+                .entries
+                .iter()
+                .position(|e| e.display_name == "alpha.hurl")
+                .unwrap();
+        }
+        _ => panic!("expected the transfer picker"),
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(
+        app.collections[ci].entries.len(),
+        1,
+        "moving onto the same file changes nothing"
+    );
+    assert!(matches!(app.status, Some(crate::i18n::Status::RequestMoved(..))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn m_and_c_are_no_ops_on_a_non_workspace_tab() {
+    let mut app = TuiApp::default();
+    let mut col = Collection::new("plain".to_string(), Vec::new());
+    col.entries
+        .push(crate::hurl::HurlEntry::from_fields("x", "GET", "http://h/x", Vec::new(), ""));
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('m'));
+    assert!(app.pending_workspace_transfer.is_none());
+    assert!(app.overlay.is_none());
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.pending_workspace_transfer.is_none());
+}
+
+#[test]
+fn deleting_a_request_reports_the_undo_hint_in_the_status_bar() {
+    let mut app = TuiApp::default();
+    let mut col = Collection::new("plain".to_string(), Vec::new());
+    col.entries
+        .push(crate::hurl::HurlEntry::from_fields("x", "POST", "http://h/x", Vec::new(), ""));
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    app.collections[ci].sync_folder_to_selected();
+
+    press(&mut app, KeyCode::Char('x'));
+
+    match &app.status {
+        Some(crate::i18n::Status::RequestDeleted(m)) => assert_eq!(m, "POST"),
+        other => panic!("expected RequestDeleted status, got {other:?}"),
+    }
+    let s = crate::i18n::Strings::for_language(&app.language);
+    assert!(
+        app.status.as_ref().unwrap().text(&s).contains("(u)"),
+        "the message names the undo key"
+    );
+}
+
+#[test]
+fn closing_a_tab_reports_the_reopen_hint_in_the_status_bar() {
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("gone".to_string(), Vec::new()));
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    app.finish_close_tab(ci, false);
+
+    assert!(matches!(app.status, Some(crate::i18n::Status::TabClosed)));
+    let s = crate::i18n::Strings::for_language(&app.language);
+    assert!(app.status.as_ref().unwrap().text(&s).contains("(u)"));
+}
+
+#[test]
+fn deleting_a_git_workspace_folder_gives_no_reopen_hint() {
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("ws".to_string(), Vec::new()));
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // delete_folder = true → the folder is gone and can't be reopened.
+    app.finish_close_tab(ci, true);
+
+    assert!(
+        app.status.is_none(),
+        "a deleted git workspace can't be reopened, so no undo hint"
+    );
 }
 
 #[test]
@@ -12949,6 +13150,13 @@ fn env_name_keeps_dotted_suffix_but_still_drops_a_real_extension() {
     );
     assert_eq!(env_name_from_path("/x/.env", "environment"), ".env");
     assert_eq!(env_name_from_path("/x/prod.vars", "environment"), "prod");
+    assert_eq!(env_name_from_path("/x/dev.env", "environment"), "dev");
+    // A multi-dot name whose trailing suffix isn't a known env extension keeps
+    // its full name (regression: it used to be truncated to `environment.env`).
+    assert_eq!(
+        env_name_from_path("/x/environment.env.dev-au", "environment"),
+        "environment.env.dev-au"
+    );
     assert_eq!(env_name_from_path("", "environment"), "environment");
 }
 

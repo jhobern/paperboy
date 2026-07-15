@@ -2169,6 +2169,12 @@ impl TuiApp {
                 });
             }
             KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
+            // 'm' / 'c' move / copy the highlighted request in a Workspace tab
+            // to another collection file in the same workspace (a no-op unless
+            // a request row of a workspace tab is highlighted). The workspace
+            // picker then chooses the destination and writes it to disk.
+            KeyCode::Char('m') if self.focus == Pane::List => self.start_workspace_transfer(true),
+            KeyCode::Char('c') if self.focus == Pane::List => self.start_workspace_transfer(false),
             // 'a' toggles activation of the selected Global Environment (at
             // most one may be active — activating one deactivates any other).
             KeyCode::Char('a') if self.focus == Pane::GlobalEnv => {
@@ -2447,6 +2453,12 @@ impl TuiApp {
         }
         self.active_tab = idx - 1;
         self.focus = Pane::Tabs;
+        // Closing a real tab is reversible via `u` (reopen_closed_tab); flag
+        // the undo path in the status bar since it's easy to close by accident.
+        // A deleted git-workspace folder can't be reopened, so no hint there.
+        if !delete_folder {
+            self.status = Some(Status::TabClosed);
+        }
         self.save_state();
     }
 
@@ -2479,6 +2491,36 @@ impl TuiApp {
         self.save_state();
     }
 
+    /// Begin moving (`is_move == true`) or copying (`is_move == false`) the
+    /// currently highlighted request of the active tab into another collection
+    /// file in the same workspace. Parks a clone of the request in
+    /// [`TuiApp::pending_workspace_transfer`] and opens the workspace picker to
+    /// choose a destination. A no-op unless the active tab is a Workspace tab
+    /// with a request row (`WsRow::Request`) highlighted — so plain `m`/`c`
+    /// never act on non-workspace tabs or folder/collection rows.
+    pub(crate) fn start_workspace_transfer(&mut self, is_move: bool) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        if !col.is_workspace() || col.workspace_root.is_none() {
+            return;
+        }
+        let Some(crate::collection::WsRow::Request(idx)) =
+            col.ws_rows().into_iter().nth(col.list_cursor)
+        else {
+            return;
+        };
+        let Some(entry) = col.entries.get(idx).cloned() else {
+            return;
+        };
+        self.pending_workspace_transfer = Some(PendingTransfer {
+            entry,
+            source_ci: ci,
+            source_idx: idx,
+            is_move,
+        });
+        self.open_workspace_transfer_picker(ci, is_move);
+    }
+
     /// Delete the selected request from the active collection (works in any
     /// collection, including the Scratch Space). No-op when it is empty, or
     /// when the Requests list is currently browsing a folder/up row rather
@@ -2498,6 +2540,7 @@ impl TuiApp {
         let col = &mut self.collections[ci];
         let idx = col.selected_entry.min(col.entries.len() - 1);
         let removed = col.entries.remove(idx);
+        let method = removed.method.clone();
         col.deleted_entries.push((idx, removed));
         if col.deleted_entries.len() > 20 {
             col.deleted_entries.remove(0);
@@ -2506,7 +2549,7 @@ impl TuiApp {
         col.sync_folder_to_selected();
         self.list_hscroll = 0;
         self.collections[ci].invalidate_request_json();
-        self.status = None;
+        self.status = Some(Status::RequestDeleted(method));
         self.save_state();
     }
 
@@ -3452,9 +3495,10 @@ impl TuiApp {
                 {
                     col.workspace_auto_prompt_dismissed = true;
                 }
-                // Abandon any parked new request so an aborted "add to
-                // workspace" flow doesn't leak state into the next one.
+                // Abandon any parked new request or transfer so an aborted
+                // "add/move/copy to workspace" flow doesn't leak state.
                 self.pending_workspace_request = None;
+                self.pending_workspace_transfer = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.nav(-1);
@@ -3482,16 +3526,28 @@ impl TuiApp {
                 Some(entry) if !entry.is_dir => {
                     let path = entry.path.clone();
                     let ci = picker.collection_idx;
-                    let adding = picker.adding_request;
-                    self.load_workspace_file(ci, path.clone());
-                    if adding {
-                        // Only append if the load actually took effect; on a
-                        // read error `load_workspace_file` leaves the tab
-                        // untouched, so keep the request parked.
-                        let loaded_ok = self.collections.get(ci).and_then(|c| c.path.as_deref())
-                            == Some(path.as_path());
-                        if loaded_ok {
-                            self.append_pending_request_to_loaded(ci);
+                    match picker.mode {
+                        WsPickerMode::MoveRequest | WsPickerMode::CopyRequest => {
+                            // Transfer picks write straight to disk and don't
+                            // switch the loaded file — the user stays put.
+                            self.commit_workspace_transfer(path);
+                        }
+                        WsPickerMode::AddRequest => {
+                            self.load_workspace_file(ci, path.clone());
+                            // Only append if the load actually took effect; on
+                            // a read error `load_workspace_file` leaves the tab
+                            // untouched, so keep the request parked.
+                            let loaded_ok = self
+                                .collections
+                                .get(ci)
+                                .and_then(|c| c.path.as_deref())
+                                == Some(path.as_path());
+                            if loaded_ok {
+                                self.append_pending_request_to_loaded(ci);
+                            }
+                        }
+                        WsPickerMode::Browse => {
+                            self.load_workspace_file(ci, path);
                         }
                     }
                 }
