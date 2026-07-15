@@ -1466,6 +1466,7 @@ dependencies = [
  "hurl_core",
  "ratatui",
  "ratatui-explorer",
+ "regex",
  "serde",
  "serde_json",
  "uuid",

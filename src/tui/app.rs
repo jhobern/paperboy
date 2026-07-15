@@ -107,8 +107,8 @@ impl EnvVarForm {
     pub(crate) fn new(env_id: u64) -> Self {
         Self {
             env_id,
-            key: Editor::new("", false),
-            value: Editor::new("", false),
+            key: Editor::blank(),
+            value: Editor::blank(),
             on_value: false,
         }
     }
@@ -1994,7 +1994,7 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 self.overlay = Some(Overlay::Prompt {
                     kind: PromptKind::RenameNewEnv,
-                    editor: Editor::new("", false),
+                    editor: Editor::blank(),
                     title: s.env_rename_title.to_string(),
                     mask: false,
                     reset_to: None,

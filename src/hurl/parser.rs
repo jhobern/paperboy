@@ -176,30 +176,20 @@ fn capture_pair(c: &Capture, lines: &[&str]) -> Option<(String, String)> {
 /// the method line (depending on how `hurl_core` attaches inter-entry
 /// comments), so we first locate the method line, then scan back for its block.
 fn title_from_span(start_line: usize, lines: &[&str]) -> String {
-    // Locate the method line: first non-comment, non-blank line from the start.
-    let mut method = start_line.saturating_sub(1); // 0-based
-    while method < lines.len() {
-        let l = lines[method].trim();
-        if l.is_empty() || l.starts_with('#') {
-            method += 1;
-        } else {
-            break;
-        }
-    }
-    // Scan back over the contiguous comment block directly above it.
-    let mut block: Vec<&str> = Vec::new();
-    let mut idx = method;
-    while idx > 0 {
-        idx -= 1;
-        let l = lines[idx].trim();
-        if l.starts_with('#') {
-            block.push(l);
-        } else {
-            break; // a blank line or content ends the immediate comment block
-        }
-    }
-    block.reverse();
-    block
+    // The method line: first non-comment, non-blank line at/after the start.
+    let method = (start_line.saturating_sub(1)..lines.len())
+        .find(|&i| {
+            let l = lines[i].trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+        .unwrap_or(lines.len());
+    // The contiguous comment block directly above it (bounded below by the
+    // last blank or content line, which ends the block).
+    let block_start = lines[..method]
+        .iter()
+        .rposition(|l| !l.trim().starts_with('#'))
+        .map_or(0, |i| i + 1);
+    lines[block_start..method]
         .iter()
         .map(|l| {
             l.trim_start_matches('#')

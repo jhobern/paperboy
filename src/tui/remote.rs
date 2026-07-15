@@ -211,8 +211,8 @@ impl RemoteWizard {
     pub(crate) fn new(kind: RemoteKind, recent: Vec<String>) -> Self {
         Self {
             kind,
-            url: Editor::new("", false),
-            token: Editor::new("", false),
+            url: Editor::blank(),
+            token: Editor::blank(),
             stage: RemoteStage::Connect {
                 field: 0,
                 recent_sel: None,

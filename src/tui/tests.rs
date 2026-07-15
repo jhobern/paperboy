@@ -339,6 +339,45 @@ fn form_ref(app: &TuiApp) -> &NewReq {
     }
 }
 
+/// Step the wizard focus ring directly (bypassing key handling) and return
+/// the new focus.
+fn form_step(app: &mut TuiApp, forward: bool) -> NewField {
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => {
+            f.focus_next(forward);
+            f.focus
+        }
+        _ => panic!("New Request overlay not open"),
+    }
+}
+
+/// The focus ring must be a true ring: walking it forward all the way round
+/// returns to the start, and Shift+Tab retraces exactly the same stops in
+/// reverse. This is the invariant the old hand-written forward/backward
+/// state machines could (and did) violate.
+#[test]
+fn tab_ring_backward_exactly_reverses_forward() {
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app);
+    press(&mut app, KeyCode::Char('X')); // header row now non-blank
+
+    let start = new_focus(&app);
+    let mut fwd = vec![start];
+    loop {
+        let f = form_step(&mut app, true);
+        if f == start {
+            break;
+        }
+        fwd.push(f);
+        assert!(fwd.len() < 200, "forward ring never returned to start");
+    }
+    // Focus is back at `start`; stepping backward retraces `fwd` in reverse.
+    for &expected in fwd.iter().skip(1).rev() {
+        assert_eq!(form_step(&mut app, false), expected);
+    }
+    assert_eq!(form_step(&mut app, false), start);
+}
+
 #[test]
 fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     let mut app = TuiApp::default();
@@ -3552,7 +3591,7 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
 fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
-    w.target_name = super::editor::Editor::new("", false);
+    w.target_name = super::editor::Editor::blank();
     w.stage = GitSaveStage::ChooseTarget {
         sel: None,
         refs: Some(RemoteRefs {

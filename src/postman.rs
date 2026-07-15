@@ -1,18 +1,134 @@
 //! Best-effort import of a Postman collection (v2.1 JSON export) into our
 //! [`HurlEntry`] model. The Hurl format doesn't cover every Postman feature
-//! (multipart file uploads, pre-request scripts, …), but the request line,
-//! headers, query, body and basic/bearer auth are mapped. Postman `{{var}}`
-//! placeholders happen to use the same syntax as Hurl, so they carry over.
-//!
-//! Parsing uses `serde_json` (a `Value` tree) rather than a bespoke parser, and
-//! tolerates schema variations by probing fields defensively.
+//! (pre-request scripts, …), but the request line, headers, query, body and
+//! basic/bearer auth are mapped; Postman `{{var}}` placeholders share Hurl's
+//! syntax so they carry over. The schema subset we care about is deserialized
+//! into the typed structs below, every field optional/defaulted so partial
+//! exports still import and anything unmodelled is ignored.
 
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, parse_hurl};
 
-/// `true` when `content` looks like a Postman collection export (an `info` block
-/// and an `item` array), as opposed to Hurl text.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Collection {
+    item: Vec<Item>,
+}
+
+/// A folder (nested `item`s) or a leaf holding a `request`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Item {
+    name: String,
+    item: Option<Vec<Item>>,
+    request: Option<Request>,
+}
+
+#[derive(Deserialize)]
+struct Request {
+    #[serde(default = "get_method")]
+    method: String,
+    #[serde(default, deserialize_with = "de_url")]
+    url: String,
+    #[serde(default)]
+    header: Vec<Param>,
+    auth: Option<Auth>,
+    body: Option<Body>,
+}
+
+fn get_method() -> String {
+    "GET".to_string()
+}
+
+/// A Postman URL is a bare string or an object with a `raw` field; anything
+/// else imports as an empty URL rather than failing the whole collection.
+fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Object(m) => m.get("raw").and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => String::new(),
+    })
+}
+
+/// Only `basic` (→ `basic_auth`) and `bearer` (→ a `Bearer` header) are mapped;
+/// credentials live in `key/value` lists keyed by `username`/`password`/`token`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Auth {
+    #[serde(rename = "type")]
+    kind: String,
+    basic: Vec<Param>,
+    bearer: Vec<Param>,
+}
+
+impl Auth {
+    fn field(list: &[Param], name: &str) -> String {
+        list.iter()
+            .find(|p| p.key == name)
+            .map(|p| p.value.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Only `raw`, `urlencoded` and `formdata` modes are mapped.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Body {
+    mode: String,
+    raw: String,
+    urlencoded: Vec<Param>,
+    formdata: Vec<Param>,
+}
+
+/// A `{key, value, …}` entry shared by headers, auth and body params; the extra
+/// fields only matter for form-data files (`src`/`type`/`contentType`).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Param {
+    key: String,
+    value: String,
+    disabled: bool,
+    #[serde(rename = "type")]
+    kind: String,
+    src: String,
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+}
+
+impl Param {
+    /// A `{key, value}` pair, unless the entry is disabled or keyless.
+    fn enabled_kv(&self) -> Option<(String, String)> {
+        (!self.disabled && !self.key.is_empty()).then(|| (self.key.clone(), self.value.clone()))
+    }
+
+    /// A form field — text, or a `File` using `src` as its path — unless the
+    /// entry is disabled or keyless.
+    fn form_field(&self) -> Option<FormField> {
+        if self.disabled || self.key.is_empty() {
+            return None;
+        }
+        Some(if self.kind == "file" {
+            FormField {
+                key: self.key.clone(),
+                value: self.src.clone(),
+                kind: FormFieldKind::File,
+                content_type: self.content_type.clone(),
+            }
+        } else {
+            FormField {
+                key: self.key.clone(),
+                value: self.value.clone(),
+                kind: FormFieldKind::Text,
+                content_type: None,
+            }
+        })
+    }
+}
+
+/// `true` when `content` looks like a Postman collection export (an `info`
+/// block and an `item` array), as opposed to Hurl text.
 pub fn looks_like_postman(content: &str) -> bool {
     serde_json::from_str::<Value>(content)
         .map(|v| v.get("info").is_some() && v.get("item").is_some())
@@ -30,73 +146,57 @@ pub fn parse_collection(content: &str) -> Vec<HurlEntry> {
 }
 
 /// Convert a Postman collection JSON into `HurlEntry` values. Folders are
-/// preserved by prefixing each request's title with its folder path, joined
-/// by `/` (e.g. a request named "Login" inside folder "Auth" becomes
-/// "Auth/Login", and further nesting works the same way, e.g.
-/// "Auth/Tokens/Refresh") — the same convention used to represent folders in
-/// plain Hurl collections (see [`crate::tree`]), so both import paths feed
-/// the same folder-aware UI. Returns an empty vec if the JSON isn't a
+/// preserved by prefixing each request's title with its `/`-joined folder path
+/// (e.g. "Auth/Tokens/Refresh") — the same convention plain Hurl collections
+/// use (see [`crate::tree`]). Returns an empty vec if the JSON isn't a
 /// recognizable collection.
 pub fn import_postman(content: &str) -> Vec<HurlEntry> {
-    let Ok(root) = serde_json::from_str::<Value>(content) else {
+    let Ok(root) = serde_json::from_str::<Collection>(content) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Some(items) = root.get("item").and_then(Value::as_array) {
-        let mut path: Vec<String> = Vec::new();
-        walk_items(items, &mut path, &mut out);
-    }
+    walk_items(&root.item, &mut Vec::new(), &mut out);
     out
 }
 
-/// Recursively collect requests, descending into folders (items with a nested
-/// `item` array instead of a `request`) and building up `path` as the current
-/// folder breadcrumb so each request's title can be prefixed with it.
-fn walk_items(items: &[Value], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) {
+/// Recursively collect requests, descending into folders (nodes carrying a
+/// nested `item` array) and building up `path` as the folder breadcrumb so
+/// each request's title can be prefixed with it. Folders take precedence when
+/// a node unusually carries both `item` and `request`.
+fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) {
     for it in items {
-        let name = it.get("name").and_then(Value::as_str).unwrap_or("");
-        if let Some(sub) = it.get("item").and_then(Value::as_array) {
-            path.push(name.to_string());
+        if let Some(sub) = &it.item {
+            path.push(it.name.clone());
             walk_items(sub, path, out);
             path.pop();
-        } else if let Some(req) = it.get("request") {
+        } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
-                name.to_string()
+                it.name.clone()
             } else {
-                format!("{}/{name}", path.join("/"))
+                format!("{}/{}", path.join("/"), it.name)
             };
             out.push(map_request(&title, req));
         }
     }
 }
 
-fn map_request(name: &str, req: &Value) -> HurlEntry {
-    let method = req
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("GET")
-        .to_string();
-    let url = req.get("url").map(url_raw).unwrap_or_default();
+fn map_request(name: &str, req: &Request) -> HurlEntry {
+    let mut headers: Vec<(String, String)> =
+        req.header.iter().filter_map(Param::enabled_kv).collect();
 
-    let mut headers: Vec<(String, String)> = req
-        .get("header")
-        .and_then(Value::as_array)
-        .map(|hs| hs.iter().filter_map(enabled_kv).collect())
-        .unwrap_or_default();
-
-    // Auth → basic_auth, or an Authorization header for bearer tokens.
+    // Auth → basic_auth, or a `Bearer` Authorization header for bearer tokens.
     let mut basic_auth = None;
-    if let Some(auth) = req.get("auth") {
-        match auth.get("type").and_then(Value::as_str) {
-            Some("basic") => {
-                let u = auth_field(auth, "basic", "username");
-                let p = auth_field(auth, "basic", "password");
+    if let Some(auth) = &req.auth {
+        match auth.kind.as_str() {
+            "basic" => {
+                let u = Auth::field(&auth.basic, "username");
+                let p = Auth::field(&auth.basic, "password");
                 if !u.is_empty() || !p.is_empty() {
                     basic_auth = Some((u, p));
                 }
             }
-            Some("bearer") => {
-                let t = auth_field(auth, "bearer", "token");
+            "bearer" => {
+                let t = Auth::field(&auth.bearer, "token");
                 if !t.is_empty() {
                     headers.push(("Authorization".to_string(), format!("Bearer {t}")));
                 }
@@ -106,107 +206,22 @@ fn map_request(name: &str, req: &Value) -> HurlEntry {
     }
 
     // Body: a raw body is kept verbatim; url-encoded / form-data fields become
-    // form fields (file-type form-data fields become `File` fields, using
-    // Postman's `src` as the path).
+    // form fields (file-type form-data fields become `File` fields).
     let mut form_fields = Vec::new();
     let mut body = String::new();
-    if let Some(b) = req.get("body") {
-        match b.get("mode").and_then(Value::as_str) {
-            Some("raw") => {
-                body = b
-                    .get("raw")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string()
-            }
-            Some("urlencoded") => form_fields = form_fields_array(b.get("urlencoded")),
-            Some("formdata") => form_fields = form_fields_array(b.get("formdata")),
+    if let Some(b) = &req.body {
+        match b.mode.as_str() {
+            "raw" => body = b.raw.clone(),
+            "urlencoded" => form_fields = b.urlencoded.iter().filter_map(Param::form_field).collect(),
+            "formdata" => form_fields = b.formdata.iter().filter_map(Param::form_field).collect(),
             _ => {}
         }
     }
 
-    let mut entry = HurlEntry::from_fields(name, &method, &url, headers, &body);
+    let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
     entry
-}
-
-/// A Postman URL is either a bare string or `{ "raw": "…", … }`.
-fn url_raw(url: &Value) -> String {
-    match url {
-        Value::String(s) => s.clone(),
-        _ => url
-            .get("raw")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-    }
-}
-
-/// A `{key, value, disabled?}` entry, unless disabled or keyless.
-fn enabled_kv(e: &Value) -> Option<(String, String)> {
-    if e.get("disabled").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    let key = e.get("key").and_then(Value::as_str)?;
-    if key.is_empty() {
-        return None;
-    }
-    let value = e.get("value").and_then(Value::as_str).unwrap_or("");
-    Some((key.to_string(), value.to_string()))
-}
-
-/// Collect enabled `{key, value}` text fields, or `{key, src, type:"file"}`
-/// file fields, from a body param array (Postman formdata/urlencoded).
-fn form_fields_array(v: Option<&Value>) -> Vec<FormField> {
-    v.and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(form_field_entry).collect())
-        .unwrap_or_default()
-}
-
-/// One `{key, value|src, type?, disabled?}` body-param entry, unless disabled
-/// or keyless.
-fn form_field_entry(e: &Value) -> Option<FormField> {
-    if e.get("disabled").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    let key = e.get("key").and_then(Value::as_str)?;
-    if key.is_empty() {
-        return None;
-    }
-    if e.get("type").and_then(Value::as_str) == Some("file") {
-        let src = e.get("src").and_then(Value::as_str).unwrap_or("");
-        Some(FormField {
-            key: key.to_string(),
-            value: src.to_string(),
-            kind: FormFieldKind::File,
-            content_type: e
-                .get("contentType")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        })
-    } else {
-        let value = e.get("value").and_then(Value::as_str).unwrap_or("");
-        Some(FormField {
-            key: key.to_string(),
-            value: value.to_string(),
-            kind: FormFieldKind::Text,
-            content_type: None,
-        })
-    }
-}
-
-/// Look up an auth field, e.g. `auth.basic[key==username].value`.
-fn auth_field(auth: &Value, kind: &str, field: &str) -> String {
-    auth.get(kind)
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter()
-                .find(|e| e.get("key").and_then(Value::as_str) == Some(field))
-                .and_then(|e| e.get("value").and_then(Value::as_str))
-        })
-        .unwrap_or("")
-        .to_string()
 }
 
 #[cfg(test)]

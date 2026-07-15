@@ -950,51 +950,31 @@ impl TuiApp {
                     // Shift+Arrow extends (or starts) a text selection instead of
                     // just moving the cursor; a plain arrow move clears it.
                     KeyCode::Left if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.left();
                         Act::Edit
                     }
                     KeyCode::Tab if complete_ghost => {
                         editor.clear_selection();
-                        for ch in ghost.chars() {
-                            editor.insert(ch);
-                        }
+                        editor.insert_str(ghost);
                         Act::Edit
                     }
                     KeyCode::Right if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         if complete_ghost && at_end {
-                            for ch in ghost.chars() {
-                                editor.insert(ch);
-                            }
+                            editor.insert_str(ghost);
                         } else {
                             editor.right();
                         }
                         Act::Edit
                     }
                     KeyCode::Up if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.up();
                         Act::Edit
                     }
                     KeyCode::Down if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.down();
                         Act::Edit
                     }
@@ -1296,78 +1276,16 @@ impl TuiApp {
                 } else if key.code == KeyCode::PageUp {
                     form.cycle_view_tab(false);
                 } else if ctrl && key.code == KeyCode::Char('d') {
-                    if let NewField::Header(i, _) = form.focus
-                        && i < form.headers.len()
-                    {
-                        form.headers.remove(i);
-                        // Unlike before, deleting the last header row leaves
-                        // the section genuinely empty (just the "+ Add
-                        // Header" row to bring it back), matching
-                        // Asserts/Captures.
-                        form.focus = if form.headers.is_empty() {
-                            NewField::AddHeader
-                        } else {
-                            NewField::Header(i.min(form.headers.len() - 1), HdrCol::Key)
-                        };
-                    } else if let NewField::Cookie(i, _) = form.focus
-                        && i < form.cookies.len()
-                    {
-                        form.cookies.remove(i);
-                        form.focus = if form.cookies.is_empty() {
-                            NewField::AddCookie
-                        } else {
-                            NewField::Cookie(i.min(form.cookies.len() - 1), HdrCol::Key)
-                        };
-                    } else if let NewField::FormField(i, _) = form.focus
-                        && i < form.form_fields.len()
-                    {
-                        form.form_fields.remove(i);
-                        form.focus = if form.form_fields.is_empty() {
-                            NewField::AddFormField
-                        } else {
-                            NewField::FormField(i.min(form.form_fields.len() - 1), FormCol::Key)
-                        };
-                    } else if let NewField::Assert(i) = form.focus
-                        && i < form.asserts.len()
-                    {
-                        form.asserts.remove(i);
-                        // Unlike Headers/Cookies/Form, Asserts/Captures don't
-                        // seed a placeholder blank row any more — deleting
-                        // the last one leaves the section genuinely empty,
-                        // with just the "+ Add Assert" row to bring it back.
-                        form.focus = if form.asserts.is_empty() {
-                            NewField::AddAssert
-                        } else {
-                            NewField::Assert(i.min(form.asserts.len() - 1))
-                        };
-                    } else if let NewField::Capture(i, _) = form.focus
-                        && i < form.captures.len()
-                    {
-                        form.captures.remove(i);
-                        form.focus = if form.captures.is_empty() {
-                            NewField::AddCapture
-                        } else {
-                            NewField::Capture(i.min(form.captures.len() - 1), CapCol::Name)
-                        };
-                    }
+                    // Delete the focused Header/Cookie/Form/Assert/Capture row;
+                    // focus moves to the row sliding into its place, or the
+                    // section's "+ Add …" row once it's empty.
+                    form.delete_focused_row();
                 } else if ctrl && key.code == KeyCode::Char('e') {
                     // Toggle the focused row's enabled flag in place — focus
                     // stays on whichever cell the user was editing instead
                     // of jumping to the checkbox, so this can be pressed
                     // mid-edit without derailing where they were typing.
-                    if let NewField::Header(i, _) = form.focus
-                        && let Some(row) = form.headers.get_mut(i)
-                    {
-                        row.enabled = !row.enabled;
-                    } else if let NewField::Cookie(i, _) = form.focus
-                        && let Some(row) = form.cookies.get_mut(i)
-                    {
-                        row.enabled = !row.enabled;
-                    } else if let NewField::FormField(i, _) = form.focus
-                        && let Some(row) = form.form_fields.get_mut(i)
-                    {
-                        row.enabled = !row.enabled;
-                    }
+                    form.toggle_focused_enabled();
                 } else if ctrl && matches!(key.code, KeyCode::Up | KeyCode::Down) {
                     // Ctrl+Arrow jumps straight to the next/previous section,
                     // skipping the rest of the current section's rows/columns.
