@@ -166,7 +166,7 @@ impl GitSaveWizard {
         Self {
             ci,
             url: Editor::new(&origin.repo_url, false),
-            token: Editor::new("", false),
+            token: Editor::blank(),
             has_env,
             env,
             include_env: has_env,

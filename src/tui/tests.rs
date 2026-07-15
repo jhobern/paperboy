@@ -3591,7 +3591,7 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
 fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
-    w.target_name = super::editor::Editor::new("", false);
+    w.target_name = super::editor::Editor::blank();
     w.stage = GitSaveStage::ChooseTarget {
         sel: None,
         refs: Some(RemoteRefs {

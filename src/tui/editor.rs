@@ -38,6 +38,11 @@ impl Editor {
         }
     }
 
+    /// An empty single-line editor — the common case for form cells.
+    pub(crate) fn blank() -> Self {
+        Self::new("", false)
+    }
+
     pub(crate) fn text(&self) -> String {
         self.lines.join("\n")
     }

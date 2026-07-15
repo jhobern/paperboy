@@ -182,9 +182,9 @@ pub(crate) struct HeaderRow {
 impl HeaderRow {
     pub(crate) fn new() -> Self {
         Self {
-            key: Editor::new("", false),
-            value: Editor::new("", false),
-            desc: Editor::new("", false),
+            key: Editor::blank(),
+            value: Editor::blank(),
+            desc: Editor::blank(),
             enabled: true,
         }
     }
@@ -238,10 +238,10 @@ pub(crate) struct FormRow {
 impl FormRow {
     pub(crate) fn new() -> Self {
         Self {
-            key: Editor::new("", false),
-            value: Editor::new("", false),
-            ctype: Editor::new("", false),
-            desc: Editor::new("", false),
+            key: Editor::blank(),
+            value: Editor::blank(),
+            ctype: Editor::blank(),
+            desc: Editor::blank(),
             enabled: true,
             kind: FormFieldKind::Text,
         }
@@ -283,8 +283,8 @@ pub(crate) struct CaptureRow {
 impl CaptureRow {
     pub(crate) fn new() -> Self {
         Self {
-            name: Editor::new("", false),
-            expr: Editor::new("", false),
+            name: Editor::blank(),
+            expr: Editor::blank(),
         }
     }
 
@@ -310,7 +310,7 @@ pub(crate) struct AssertRow {
 impl AssertRow {
     pub(crate) fn new() -> Self {
         Self {
-            expr: Editor::new("", false),
+            expr: Editor::blank(),
         }
     }
 
@@ -524,8 +524,8 @@ impl NewReq {
         file_root: Option<PathBuf>,
     ) -> Self {
         Self {
-            name: Editor::new("", false),
-            url: Editor::new("", false),
+            name: Editor::blank(),
+            url: Editor::blank(),
             headers: Vec::new(),
             cookies: Vec::new(),
             form_fields: Vec::new(),
@@ -954,6 +954,72 @@ impl NewReq {
     pub(crate) fn headers_blank(&self) -> bool {
         self.headers.iter().all(HeaderRow::is_blank)
     }
+
+    /// Delete the currently focused Header/Cookie/Form/Assert/Capture row,
+    /// moving focus to the row that slides into its place (same column), or to
+    /// the section's "+ Add …" row when it becomes empty. A no-op when focus
+    /// isn't on a deletable row.
+    pub(crate) fn delete_focused_row(&mut self) {
+        self.focus = match self.focus {
+            NewField::Header(i, _) if i < self.headers.len() => {
+                self.headers.remove(i);
+                if self.headers.is_empty() {
+                    NewField::AddHeader
+                } else {
+                    NewField::Header(i.min(self.headers.len() - 1), HdrCol::Key)
+                }
+            }
+            NewField::Cookie(i, _) if i < self.cookies.len() => {
+                self.cookies.remove(i);
+                if self.cookies.is_empty() {
+                    NewField::AddCookie
+                } else {
+                    NewField::Cookie(i.min(self.cookies.len() - 1), HdrCol::Key)
+                }
+            }
+            NewField::FormField(i, _) if i < self.form_fields.len() => {
+                self.form_fields.remove(i);
+                if self.form_fields.is_empty() {
+                    NewField::AddFormField
+                } else {
+                    NewField::FormField(i.min(self.form_fields.len() - 1), FormCol::Key)
+                }
+            }
+            NewField::Assert(i) if i < self.asserts.len() => {
+                self.asserts.remove(i);
+                if self.asserts.is_empty() {
+                    NewField::AddAssert
+                } else {
+                    NewField::Assert(i.min(self.asserts.len() - 1))
+                }
+            }
+            NewField::Capture(i, _) if i < self.captures.len() => {
+                self.captures.remove(i);
+                if self.captures.is_empty() {
+                    NewField::AddCapture
+                } else {
+                    NewField::Capture(i.min(self.captures.len() - 1), CapCol::Name)
+                }
+            }
+            other => other,
+        };
+    }
+
+    /// Toggle the enabled flag of the focused Header/Cookie/Form row in place,
+    /// leaving focus untouched so it can be pressed mid-edit. A no-op on fields
+    /// without an enabled flag (everything else, including Asserts/Captures).
+    pub(crate) fn toggle_focused_enabled(&mut self) {
+        let row = match self.focus {
+            NewField::Header(i, _) => self.headers.get_mut(i).map(|r| &mut r.enabled),
+            NewField::Cookie(i, _) => self.cookies.get_mut(i).map(|r| &mut r.enabled),
+            NewField::FormField(i, _) => self.form_fields.get_mut(i).map(|r| &mut r.enabled),
+            _ => None,
+        };
+        if let Some(enabled) = row {
+            *enabled = !*enabled;
+        }
+    }
+
 
     /// True when every cookie row is blank — the section is then skipped when
     /// tabbing between Headers and Form.
