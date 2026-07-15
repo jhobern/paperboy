@@ -937,7 +937,10 @@ mod tests {
             "form_fields": [ { "key": "k", "value": "v", "type": "weird" } ]
         }"#;
         let entry = apply_request_json(&base, text).unwrap();
-        assert_eq!(entry.headers, vec![("X-Count".to_string(), "5".to_string())]);
+        assert_eq!(
+            entry.headers,
+            vec![("X-Count".to_string(), "5".to_string())]
+        );
         assert_eq!(entry.form_fields[0].kind, FormFieldKind::Text);
     }
 

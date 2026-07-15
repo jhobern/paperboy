@@ -1662,9 +1662,11 @@ fn descending_into_a_different_folder_clears_the_retrace_trail() {
 
     // Highlight the sibling `z` and descend into it — a fresh navigation.
     let idx = match &app.overlay {
-        Some(Overlay::Browser(_, ex)) => {
-            ex.files().iter().position(|f| f.path == z).expect("z is listed")
-        }
+        Some(Overlay::Browser(_, ex)) => ex
+            .files()
+            .iter()
+            .position(|f| f.path == z)
+            .expect("z is listed"),
         _ => panic!("browser overlay not open"),
     };
     match &mut app.overlay {
@@ -4241,7 +4243,10 @@ fn saving_a_workspace_to_git_is_rejected_when_the_tab_was_not_git_loaded() {
 
     app.open_git_workspace_save_wizard();
 
-    assert!(app.overlay.is_none(), "no wizard opens without a git origin");
+    assert!(
+        app.overlay.is_none(),
+        "no wizard opens without a git origin"
+    );
     assert!(matches!(app.status, Some(Status::NoGitOrigin)));
 }
 
@@ -5095,7 +5100,10 @@ fn f2_with_an_empty_url_keeps_the_wizard_open_and_warns_instead_of_discarding() 
         form.url = super::editor::Editor::new("http://h/ok", false);
     }
     press(&mut app, KeyCode::F(2));
-    assert!(app.overlay.is_none(), "the wizard closes once the URL is valid");
+    assert!(
+        app.overlay.is_none(),
+        "the wizard closes once the URL is valid"
+    );
     assert_eq!(app.collections[0].entries.len(), 1);
     assert_eq!(app.collections[0].entries[0].url, "http://h/ok");
 }
@@ -11393,7 +11401,10 @@ fn picking_a_file_in_add_mode_appends_the_request_and_shows_it() {
     assert_eq!(app.collections[ci].entries.len(), 2);
     let added = app.collections[ci].entries.last().unwrap();
     assert_eq!(added.url, "http://h/new");
-    assert!(added.user_added && added.modified, "marked as an unsaved add");
+    assert!(
+        added.user_added && added.modified,
+        "marked as an unsaved add"
+    );
     assert_eq!(
         app.collections[ci].selected_entry, 1,
         "the new request is selected so it's visible"
@@ -11870,7 +11881,10 @@ fn entering_a_workspace_subfolder_and_then_up_navigates_the_breadcrumb() {
     // Enter on the `sub/` folder row (index 0 at the root) descends into it.
     app.collections[ci].list_cursor = 0;
     app.on_enter();
-    assert_eq!(app.collections[ci].workspace_browse, vec!["sub".to_string()]);
+    assert_eq!(
+        app.collections[ci].workspace_browse,
+        vec!["sub".to_string()]
+    );
     let rows = app.collections[ci].ws_rows();
     assert!(matches!(rows[0], WsRow::Up));
     assert!(matches!(&rows[1], WsRow::Collection { name, open: false, .. } if name == "beta.json"));
@@ -12135,10 +12149,7 @@ fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_de
     );
 
     press(&mut app, KeyCode::Char(' '));
-    assert!(
-        !app.always_save_when_prompted,
-        "Space toggles it back off"
-    );
+    assert!(!app.always_save_when_prompted, "Space toggles it back off");
 }
 
 #[test]
@@ -12932,7 +12943,10 @@ fn an_empty_name_at_the_save_prompt_also_falls_back_to_keeping_the_workspace_tem
 
 #[test]
 fn env_name_keeps_dotted_suffix_but_still_drops_a_real_extension() {
-    assert_eq!(env_name_from_path("/x/.env.dev-au", "environment"), ".env.dev-au");
+    assert_eq!(
+        env_name_from_path("/x/.env.dev-au", "environment"),
+        ".env.dev-au"
+    );
     assert_eq!(env_name_from_path("/x/.env", "environment"), ".env");
     assert_eq!(env_name_from_path("/x/prod.vars", "environment"), "prod");
     assert_eq!(env_name_from_path("", "environment"), "environment");
@@ -12940,9 +12954,24 @@ fn env_name_keeps_dotted_suffix_but_still_drops_a_real_extension() {
 
 #[test]
 fn collection_name_hides_only_known_extensions() {
-    assert_eq!(collection_name_from_path("/x/api.hurl", "collection"), "api");
-    assert_eq!(collection_name_from_path("/x/api.json", "collection"), "api");
-    assert_eq!(collection_name_from_path("/x/api.HURL", "collection"), "api");
-    assert_eq!(collection_name_from_path("/x/env.dev-au", "collection"), "env.dev-au");
-    assert_eq!(collection_name_from_path("/x/notes.txt", "collection"), "notes.txt");
+    assert_eq!(
+        collection_name_from_path("/x/api.hurl", "collection"),
+        "api"
+    );
+    assert_eq!(
+        collection_name_from_path("/x/api.json", "collection"),
+        "api"
+    );
+    assert_eq!(
+        collection_name_from_path("/x/api.HURL", "collection"),
+        "api"
+    );
+    assert_eq!(
+        collection_name_from_path("/x/env.dev-au", "collection"),
+        "env.dev-au"
+    );
+    assert_eq!(
+        collection_name_from_path("/x/notes.txt", "collection"),
+        "notes.txt"
+    );
 }

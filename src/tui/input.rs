@@ -1216,8 +1216,7 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    let on_parent_row =
-                        ex.cwd().parent() == Some(ex.current().path.as_path());
+                    let on_parent_row = ex.cwd().parent() == Some(ex.current().path.as_path());
                     if ex.current().is_dir && on_parent_row {
                         // The "../" row goes UP, which isn't a descent. Enter
                         // still honours it (the common file-picker idiom), but
@@ -1243,9 +1242,7 @@ impl TuiApp {
                             .and_then(|trail| child_towards(&target, trail))
                         {
                             Some(next) => {
-                                if let Some(idx) =
-                                    ex.files().iter().position(|f| f.path == next)
-                                {
+                                if let Some(idx) = ex.files().iter().position(|f| f.path == next) {
                                     ex.set_selected_idx(idx);
                                 }
                             }
@@ -3491,10 +3488,7 @@ impl TuiApp {
                         // Only append if the load actually took effect; on a
                         // read error `load_workspace_file` leaves the tab
                         // untouched, so keep the request parked.
-                        let loaded_ok = self
-                            .collections
-                            .get(ci)
-                            .and_then(|c| c.path.as_deref())
+                        let loaded_ok = self.collections.get(ci).and_then(|c| c.path.as_deref())
                             == Some(path.as_path());
                         if loaded_ok {
                             self.append_pending_request_to_loaded(ci);
@@ -3684,7 +3678,9 @@ impl TuiApp {
                 // environment picker prefers the folder its own last file came
                 // from, falling back to the shared last-browsed folder.
                 let reopen = match action {
-                    FileAction::LoadEnv => self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref()),
+                    FileAction::LoadEnv => {
+                        self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref())
+                    }
                     _ => self.last_browse_dir.as_ref(),
                 };
                 if let Some(dir) = reopen

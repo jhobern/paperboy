@@ -1270,9 +1270,7 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::WorkspaceSaveName => self.finish_workspace_save(text),
-            PromptKind::NewWorkspaceCollection(ci) => {
-                self.create_workspace_collection(ci, text)
-            }
+            PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
         }
     }
 
@@ -3070,7 +3068,9 @@ pub(crate) fn file_stem(path: &str, fallback: &str) -> String {
 /// meaningful suffix here, not a throwaway extension).
 pub(crate) fn env_name_from_path(path: &str, fallback: &str) -> String {
     match std::path::Path::new(path).file_name() {
-        Some(name) if name.to_string_lossy().starts_with('.') => name.to_string_lossy().into_owned(),
+        Some(name) if name.to_string_lossy().starts_with('.') => {
+            name.to_string_lossy().into_owned()
+        }
         _ => file_stem(path, fallback),
     }
 }
@@ -3080,7 +3080,10 @@ pub(crate) fn env_name_from_path(path: &str, fallback: &str) -> String {
 /// like `env.dev-au` shows in full rather than losing its `.dev-au`).
 pub(crate) fn collection_name_from_path(path: &str, fallback: &str) -> String {
     let p = std::path::Path::new(path);
-    match p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) {
+    match p
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    {
         Some(ext) if ext == "hurl" || ext == "json" => file_stem(path, fallback),
         _ => p
             .file_name()
