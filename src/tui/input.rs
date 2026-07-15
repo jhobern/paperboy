@@ -1092,6 +1092,10 @@ impl TuiApp {
                         // A file is selected — remember its folder so the browser
                         // reopens here next time, then perform the load.
                         self.last_browse_dir = Some(ex.cwd().clone());
+                        if action == FileAction::LoadEnv {
+                            // Environment picker tracks its own last folder.
+                            self.last_env_dir = Some(ex.cwd().clone());
+                        }
                         let path = ex.current().path.to_string_lossy().into_owned();
                         self.do_file_action(action, &path);
                         self.save_state();
@@ -1942,6 +1946,15 @@ impl TuiApp {
             // a completely separate key-handling path from this one.
             KeyCode::Left if ctrl => self.cycle_tab(false),
             KeyCode::Right if ctrl => self.cycle_tab(true),
+            // F2 on the environments panel renames the selected Global
+            // Environment; elsewhere it renames the active tab. The panel arm
+            // is listed first so it wins when that panel is focused (otherwise
+            // the tab-rename shortcut would shadow it).
+            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
+                if let Some(env_id) = self.global_envs.get(self.global_env_idx).map(|e| e.id) {
+                    self.open_prompt_rename_env(env_id);
+                }
+            }
             // F2 renames the active tab (matches the common OS convention).
             KeyCode::F(2) if self.active_tab != 0 => self.open_prompt_rename(),
             KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
@@ -2710,6 +2723,10 @@ impl TuiApp {
             .last_browse_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        self.last_env_dir = state
+            .last_env_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
         self.list_width = state.list_width;
@@ -2737,6 +2754,10 @@ impl TuiApp {
             active_tab: self.active_tab,
             last_browse_dir: self
                 .last_browse_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            last_env_dir: self
+                .last_env_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
@@ -2990,19 +3011,8 @@ impl TuiApp {
                 self.reload_selected_env_var();
             }
             KeyCode::F(2) => {
-                if let Some(env) = self.global_envs.iter().find(|e| e.id == popup.env_id) {
-                    let name = env.name.clone();
-                    let env_id = popup.env_id;
-                    let s = Strings::for_language(&self.language);
-                    self.overlay = Some(Overlay::Prompt {
-                        kind: PromptKind::RenameEnv(env_id),
-                        editor: Editor::new(&name, false),
-                        title: s.env_rename_title.to_string(),
-                        mask: false,
-                        reset_to: None,
-                        secret_intact: false,
-                        secret_checkbox: None,
-                    });
+                if self.global_envs.iter().any(|e| e.id == popup.env_id) {
+                    self.open_prompt_rename_env(popup.env_id);
                 } else {
                     self.overlay = Some(Overlay::EnvPopup(popup));
                 }
@@ -3152,6 +3162,26 @@ impl TuiApp {
         });
     }
 
+    /// Open the rename prompt for the Global Environment with `env_id`, if it
+    /// still exists. Used both from the environments panel (F2) and the open
+    /// environment-entries popup (F2).
+    pub(crate) fn open_prompt_rename_env(&mut self, env_id: u64) {
+        let Some(env) = self.global_envs.iter().find(|e| e.id == env_id) else {
+            return;
+        };
+        let name = env.name.clone();
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::RenameEnv(env_id),
+            editor: Editor::new(&name, false),
+            title: s.env_rename_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
     pub(crate) fn activate_file_load_item(&mut self, sel: usize) {
         let s = Strings::for_language(&self.language);
         match sel {
@@ -3239,8 +3269,14 @@ impl TuiApp {
 
         match FileExplorerBuilder::build_with_theme(ex_theme) {
             Ok(mut ex) => {
-                // Reopen in the last-used folder when it still exists.
-                if let Some(dir) = &self.last_browse_dir
+                // Reopen in the last-used folder when it still exists. The
+                // environment picker prefers the folder its own last file came
+                // from, falling back to the shared last-browsed folder.
+                let reopen = match action {
+                    FileAction::LoadEnv => self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref()),
+                    _ => self.last_browse_dir.as_ref(),
+                };
+                if let Some(dir) = reopen
                     && dir.is_dir()
                 {
                     let _ = ex.set_cwd(dir);

@@ -395,7 +395,7 @@ pub(crate) fn draw_collection_left(
         let display_name = if col.workspace_root.is_some() {
             col.path
                 .as_deref()
-                .map(|p| file_stem(&p.to_string_lossy(), &col.name))
+                .map(|p| collection_name_from_path(&p.to_string_lossy(), &col.name))
                 .unwrap_or_else(|| col.name.clone())
         } else {
             col.name.clone()
@@ -1787,7 +1787,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_environments,
                         &[
                             ("r (Env popup)", s.help_reload_var),
-                            ("F2 (Env popup)", s.help_env_rename),
+                            ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
                             ("x", s.help_env_delete),
                             ("p (List pane)", s.help_env_link),

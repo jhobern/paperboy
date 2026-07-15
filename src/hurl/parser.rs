@@ -128,7 +128,11 @@ fn multipart_field(p: &MultipartParam) -> FormField {
         }
         MultipartParam::FilenameParam(fp) => FormField {
             key: fp.key.to_source().to_string(),
-            value: fp.value.filename.to_source().to_string(),
+            // The decoded filename (spaces and other escapes resolved), so it
+            // matches a real filesystem path — the same form the file picker
+            // stores. Re-escaping happens on the way back out (see
+            // `entry.rs`'s `escape_form_file_path`).
+            value: fp.value.filename.to_string(),
             kind: FormFieldKind::File,
             content_type: fp
                 .value
@@ -387,5 +391,40 @@ mod tests {
         let reparsed = parse_hurl(&text);
         assert_eq!(reparsed.len(), 1);
         assert_eq!(reparsed[0].form_fields, entry.form_fields);
+    }
+
+    #[test]
+    fn file_form_field_path_with_spaces_round_trips_as_a_real_path() {
+        let mut entry = HurlEntry::from_fields("Upload", "POST", "{{ BASE_URL }}/upload", vec![], "");
+        entry.form_fields = vec![FormField {
+            key: "doc".to_string(),
+            // A real filesystem path containing spaces (as the file picker
+            // would store it) — no backslash escaping in the model.
+            value: "/tmp/my report final.pdf".to_string(),
+            kind: FormFieldKind::File,
+            content_type: None,
+        }];
+
+        let text = entry.to_hurl();
+        assert!(
+            text.contains(r"file,/tmp/my\ report\ final.pdf;"),
+            "the emitted Hurl escapes spaces in the path:\n{text}"
+        );
+        let reparsed = parse_hurl(&text);
+        assert_eq!(
+            reparsed[0].form_fields, entry.form_fields,
+            "and it parses back to the same unescaped real path"
+        );
+    }
+
+    #[test]
+    fn loading_a_multipart_file_with_escaped_spaces_yields_a_real_path() {
+        let src = "POST http://x/upload\n[Multipart]\ndoc: file,my\\ report.pdf;\n";
+        let parsed = parse_hurl(src);
+        assert_eq!(parsed[0].form_fields.len(), 1);
+        assert_eq!(
+            parsed[0].form_fields[0].value, "my report.pdf",
+            "the stored path is the decoded real path, not the escaped source"
+        );
     }
 }

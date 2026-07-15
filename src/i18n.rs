@@ -195,8 +195,6 @@ strings! {
     git_branches => "Branches", "Branches", "Grene";
     git_tags => "Tags", "Étiquettes", "Tags";
     git_filter_label => "filter: ", "filtre\u{a0}: ", "filter: ";
-    git_ask_load_env_q => "Also load an environment from this ref?", "Charger aussi un environnement depuis cette référence\u{a0}?", "Indlæs også et miljø fra denne reference?";
-    git_pick_env_file_title => "Select an environment file", "Sélectionnez un fichier d'environnement", "Vælg en miljøfil";
     git_pick_workspace_filter_title => "Choose which files to download", "Choisissez les fichiers à télécharger", "Vælg hvilke filer der skal hentes";
     git_workspace_filter_hint => "↑↓ move · Enter select · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
     git_ws_filter_hurl_json => ".hurl and .json files (recommended)", "Fichiers .hurl et .json (recommandé)", ".hurl- og .json-filer (anbefalet)";
@@ -317,7 +315,7 @@ strings! {
     help_env_delete => "delete the selected Global Environment (unlinks any collections using it)", "supprimer l'environnement global sélectionné (délie les collections qui l'utilisent)", "slet det valgte globale miljø (fjerner link fra samlinger, der bruger det)";
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
-    help_env_rename => "rename the open Global Environment", "renommer l'environnement global ouvert", "omdøb det åbne globale miljø";
+    help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
     help_resize_width => "grow / shrink left column", "agrandir / réduire la colonne de gauche", "forøg / formindsk venstre kolonne";
     help_tab_manage => "close / reopen collection or workspace tab", "fermer / rouvrir un onglet de collection ou d'espace de travail", "luk / genåbn samlings- eller workspace-fane";

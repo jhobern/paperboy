@@ -304,6 +304,10 @@ pub struct PersistedState {
     /// reopen there next time.
     #[serde(default)]
     pub last_browse_dir: Option<String>,
+    /// Last folder an *environment* file was loaded from, so the environment
+    /// picker can reopen there independently of other file loads.
+    #[serde(default)]
+    pub last_env_dir: Option<String>,
     /// Ask for confirmation before quitting the app.
     #[serde(default = "yes")]
     pub confirm_on_exit: bool,
@@ -357,6 +361,7 @@ impl Default for PersistedState {
             tabs: Vec::new(),
             active_tab: 0,
             last_browse_dir: None,
+            last_env_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             list_width: default_list_width(),

@@ -634,6 +634,11 @@ pub struct TuiApp {
     /// Folder the file browser last selected a file from; it reopens here.
     pub(crate) last_browse_dir: Option<PathBuf>,
 
+    /// Folder the last *environment* file was loaded from; the environment
+    /// picker reopens here (falling back to `last_browse_dir`), so it isn't
+    /// dragged around by loads of unrelated file types.
+    pub(crate) last_env_dir: Option<PathBuf>,
+
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
@@ -734,6 +739,7 @@ impl Default for TuiApp {
             pending_captures: Vec::new(),
             pending_batch_runs: Vec::new(),
             last_browse_dir: None,
+            last_env_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             default_request_view: request::RequestView::default(),
@@ -1255,7 +1261,7 @@ impl TuiApp {
             }
             FileAction::OpenCollection => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = file_stem(path, "collection");
+                    let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
@@ -1277,7 +1283,7 @@ impl TuiApp {
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = file_stem(path, "environment");
+                    let name = env_name_from_path(path, "environment");
                     self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
                 }
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
@@ -1934,7 +1940,9 @@ impl TuiApp {
             .active_env_id
             .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
         match (linked, active) {
-            (Some(linked), Some(active)) => linked
+            // A collection linked to the very environment that's also active
+            // shadows nothing — the same value would be substituted either way.
+            (Some(linked), Some(active)) if linked.id != active.id => linked
                 .vars
                 .iter()
                 .filter(|lv| active.vars.iter().any(|av| av.key == lv.key))
@@ -2177,63 +2185,6 @@ impl TuiApp {
                     _ => {}
                 }
             }
-            RemoteStage::AskLoadEnvToo { sel } => match key.code {
-                KeyCode::Esc => return self.close_remote(w),
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Tab
-                | KeyCode::BackTab => {
-                    *sel = 1 - *sel;
-                }
-                KeyCode::Enter => {
-                    if *sel == 0 {
-                        w.stage = RemoteStage::PickEnvFile {
-                            filter: String::new(),
-                            sel: 0,
-                        };
-                    } else {
-                        return self.close_remote(w);
-                    }
-                }
-                KeyCode::Char('y') => {
-                    w.stage = RemoteStage::PickEnvFile {
-                        filter: String::new(),
-                        sel: 0,
-                    }
-                }
-                KeyCode::Char('n') => return self.close_remote(w),
-                _ => {}
-            },
-            RemoteStage::PickEnvFile { filter, sel } => {
-                let vis = filter_indices(w.files.iter().map(|s| s.as_str()), filter);
-                match key.code {
-                    KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
-                    KeyCode::Enter => {
-                        if let (Some(&fi), Some(repo)) = (vis.get(*sel), w.repo.clone()) {
-                            let path = w.files[fi].clone();
-                            w.selected_path = Some(path.clone());
-                            w.second_pick = true;
-                            w.rx = Some(spawn_git_checkout(repo, path));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::File,
-                            };
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
-                    }
-                    _ => {}
-                }
-            }
             RemoteStage::PickWorkspaceFilter { sel } => match key.code {
                 KeyCode::Esc => return self.close_remote(w),
                 KeyCode::Up => *sel = sel.saturating_sub(1),
@@ -2343,38 +2294,20 @@ impl TuiApp {
                 false
             }
             GitMsg::Content(Ok(text)) => {
-                let name = w
-                    .selected_path
-                    .as_deref()
-                    .map(|p| file_stem(p, "remote"))
-                    .unwrap_or_else(|| "remote".to_string());
+                let path = w.selected_path.clone().unwrap_or_default();
                 self.remember_git_url(&w.url.text());
                 let origin = self.build_git_origin(w);
-                if w.second_pick {
-                    // Combined load's second step: the environment file, for
-                    // the collection just loaded in the previous step — link
-                    // it to that collection automatically for convenience.
-                    if let Some(id) = self.load_environment_text(name, &text, None, origin) {
-                        let ci = self.active_tab;
-                        self.collections[ci].linked_env_id = Some(id);
-                        self.collections[ci].invalidate_request_json();
-                    }
-                    return false;
-                }
                 match w.kind {
                     RemoteKind::Collection => {
+                        let name = collection_name_from_path(&path, "remote");
                         if self.load_collection_text(name, &text, None) {
                             let ci = self.active_tab;
                             self.collections[ci].git_origin = origin;
-                            // Offer to also load the environment from the same
-                            // ref, reusing the file listing already fetched —
-                            // no second network round-trip.
-                            w.stage = RemoteStage::AskLoadEnvToo { sel: 0 };
-                            return true;
                         }
                         false
                     }
                     RemoteKind::Environment => {
+                        let name = env_name_from_path(&path, "remote");
                         self.load_environment_text(name, &text, None, origin);
                         false
                     }
@@ -2395,10 +2328,9 @@ impl TuiApp {
     }
 
     /// Build the [`GitOrigin`] for the file the wizard just checked out, from
-    /// the ref chosen in `PickRef` and the path chosen in `PickFile`/
-    /// `PickEnvFile`. `None` if either piece of information is missing
-    /// (shouldn't happen in practice — both are set before a checkout is
-    /// ever spawned).
+    /// the ref chosen in `PickRef` and the path chosen in `PickFile`. `None` if
+    /// either piece of information is missing (shouldn't happen in practice —
+    /// both are set before a checkout is ever spawned).
     fn build_git_origin(&self, w: &RemoteWizard) -> Option<GitOrigin> {
         let choice = w.chosen_ref.as_ref()?;
         let path = w.selected_path.clone()?;
@@ -2727,4 +2659,29 @@ pub(crate) fn file_stem(path: &str, fallback: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Display name for an environment file. Like [`file_stem`], but a leading-dot
+/// filename keeps its full name (so `.env.dev-au` stays `.env.dev-au` rather
+/// than being truncated to `.env`, since the part after the dot is a
+/// meaningful suffix here, not a throwaway extension).
+pub(crate) fn env_name_from_path(path: &str, fallback: &str) -> String {
+    match std::path::Path::new(path).file_name() {
+        Some(name) if name.to_string_lossy().starts_with('.') => name.to_string_lossy().into_owned(),
+        _ => file_stem(path, fallback),
+    }
+}
+
+/// Display name for a collection file. Only the known collection extensions
+/// (`.hurl`/`.json`) are hidden; any other suffix is kept verbatim (so a file
+/// like `env.dev-au` shows in full rather than losing its `.dev-au`).
+pub(crate) fn collection_name_from_path(path: &str, fallback: &str) -> String {
+    let p = std::path::Path::new(path);
+    match p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) {
+        Some(ext) if ext == "hurl" || ext == "json" => file_stem(path, fallback),
+        _ => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fallback.to_string()),
+    }
 }

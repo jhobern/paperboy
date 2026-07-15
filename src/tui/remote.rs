@@ -142,14 +142,6 @@ pub(crate) enum RemoteStage {
         filter: String,
         sel: usize,
     },
-    /// After successfully loading a collection from git: ask whether to also
-    /// load its environment from the same ref (reusing the already-fetched
-    /// file list in [`RemoteWizard::files`] — no second network fetch). `sel`
-    /// selects Yes (0) or No (1).
-    AskLoadEnvToo { sel: usize },
-    /// Choose the environment file from `RemoteWizard::files` (filtered by
-    /// `filter`) — the combined collection+environment load's second pick.
-    PickEnvFile { filter: String, sel: usize },
     /// Workspace load only: choose which files to actually download (see
     /// [`WorkspaceGitFilter`]) before checking anything out.
     PickWorkspaceFilter { sel: usize },
@@ -188,16 +180,9 @@ pub(crate) struct RemoteWizard {
     /// recorded once the file finishes loading.
     pub(crate) chosen_ref: Option<RefChoice>,
     /// The file listing from `list_files`, kept around (instead of only
-    /// living inside the `PickFile` stage) so the combined collection+
-    /// environment load's second pick (`PickEnvFile`) can reuse it without a
-    /// second network fetch.
+    /// living inside the `PickFile` stage) so the Workspace filter step can
+    /// reuse it without a second network fetch.
     pub(crate) files: Vec<String>,
-    /// `true` once the wizard has moved on to fetching the *environment*
-    /// file in a combined collection+environment load, so `apply_git_msg`
-    /// routes the next `GitMsg::Content` to `load_environment_text` (and sets
-    /// `env_git_origin`) instead of treating it as the primary (collection)
-    /// pick.
-    pub(crate) second_pick: bool,
     /// The [`WorkspaceGitFilter`] chosen in `PickWorkspaceFilter`, kept
     /// around so it can be baked into the [`WorkspaceGitOrigin`] recorded
     /// once the download finishes.
@@ -223,7 +208,6 @@ impl RemoteWizard {
             recent,
             chosen_ref: None,
             files: Vec::new(),
-            second_pick: false,
             chosen_workspace_filter: None,
             chosen_sha: None,
         }
@@ -575,18 +559,6 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
         }
         RemoteStage::PickFile { files, filter, sel } => {
             draw_filter_list(f, s, s.git_pick_file_title, filter, files, *sel, th);
-        }
-        RemoteStage::AskLoadEnvToo { sel } => {
-            draw_confirm_popup(
-                f,
-                s.git_ask_load_env_q,
-                &[s.confirm_yes, s.confirm_no],
-                *sel,
-                th,
-            );
-        }
-        RemoteStage::PickEnvFile { filter, sel } => {
-            draw_filter_list(f, s, s.git_pick_env_file_title, filter, &w.files, *sel, th);
         }
         RemoteStage::PickWorkspaceFilter { sel } => {
             let labels: Vec<&str> = WorkspaceGitFilter::ALL.iter().map(|f| f.label(s)).collect();

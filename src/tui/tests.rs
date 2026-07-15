@@ -204,6 +204,40 @@ fn shadowed_env_keys_is_empty_without_both_a_linked_and_an_active_environment() 
 }
 
 #[test]
+fn f2_on_the_environments_panel_renames_the_selected_environment() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("staging".into(), "TOKEN=v");
+    let env_id = add_global_env(&mut app, env);
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, editor, .. }) => {
+            assert!(
+                matches!(kind, PromptKind::RenameEnv(id) if *id == env_id),
+                "F2 on the env panel opens the environment rename prompt, not the tab rename"
+            );
+            assert_eq!(editor.text(), "staging", "prefilled with the current name");
+        }
+        _ => panic!("F2 did not open a rename prompt"),
+    }
+}
+
+#[test]
+fn shadowed_env_keys_is_empty_when_linked_env_is_also_the_active_env() {
+    let mut app = TuiApp::default();
+    let (env, _) = crate::environment::parse_vars_pending("shared".into(), "TOKEN=v\nOTHER=w");
+    let id = add_global_env(&mut app, env);
+    // The collection is linked to the very environment that's also active —
+    // the same value is substituted either way, so nothing is shadowed.
+    app.active_env_id = Some(id);
+    app.collections[0].linked_env_id = Some(id);
+    assert!(app.shadowed_env_keys(0).is_empty());
+}
+
+#[test]
 fn creating_a_request_adds_it_to_the_request_tab() {
     let mut app = TuiApp::default();
     assert!(
@@ -1513,6 +1547,63 @@ fn last_browse_dir_survives_persistence() {
 }
 
 #[test]
+fn env_picker_prefers_the_last_environment_folder() {
+    let env_dir = temp_dir("envfolder");
+    let other_dir = temp_dir("otherfolder");
+    let mut app = TuiApp {
+        // A more-recent load of some other file type moved last_browse_dir…
+        last_browse_dir: Some(other_dir.clone()),
+        // …but the environment picker should still reopen where the last
+        // environment file came from.
+        last_env_dir: Some(env_dir.clone()),
+        ..Default::default()
+    };
+
+    app.open_browser(FileAction::LoadEnv);
+    match app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &env_dir),
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&env_dir).ok();
+    std::fs::remove_dir_all(&other_dir).ok();
+}
+
+#[test]
+fn selecting_an_env_file_updates_the_env_folder() {
+    let dir = temp_dir("selectenv");
+    std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::LoadEnv);
+    press(&mut app, KeyCode::Down); // highlight staging.vars
+    press(&mut app, KeyCode::Enter); // select it
+
+    assert_eq!(
+        app.last_env_dir.as_ref(),
+        Some(&dir),
+        "loading an environment records its folder for the env picker"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn last_env_dir_survives_persistence() {
+    let app = TuiApp {
+        last_env_dir: Some(PathBuf::from("/env/dir")),
+        ..Default::default()
+    };
+    let snapshot = app.to_persisted();
+    assert_eq!(snapshot.last_env_dir.as_deref(), Some("/env/dir"));
+
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.last_env_dir, Some(PathBuf::from("/env/dir")));
+}
+
+#[test]
 fn loading_an_env_file_as_a_collection_is_rejected() {
     let dir = temp_dir("wrongcol");
     let env = dir.join("staging.vars");
@@ -1788,10 +1879,9 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
 
     assert!(
-        keep_open,
-        "a collection load offers to also load an environment before closing"
+        !keep_open,
+        "a collection load closes the wizard once the tab is added"
     );
-    assert!(matches!(w.stage, RemoteStage::AskLoadEnvToo { sel: 0 }));
     assert_eq!(
         app.collections.len(),
         before + 1,
@@ -1805,48 +1895,7 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
 }
 
 #[test]
-fn ask_load_env_too_yes_moves_to_pick_env_file_reusing_the_fetched_list() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::AskLoadEnvToo { sel: 0 };
-    w.files = vec![
-        "api/health.hurl".to_string(),
-        "envs/staging.vars".to_string(),
-    ];
-    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
-
-    press(&mut app, KeyCode::Enter);
-
-    match &app.overlay {
-        Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(&w.stage, RemoteStage::PickEnvFile { .. }),
-                "Yes moves to the env-file picker"
-            );
-            assert_eq!(
-                w.files.len(),
-                2,
-                "no second fetch — the same file list is reused"
-            );
-        }
-        _ => panic!("expected the wizard to stay open on PickEnvFile"),
-    }
-}
-
-#[test]
-fn ask_load_env_too_no_closes_the_wizard() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::AskLoadEnvToo { sel: 1 };
-    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
-
-    press(&mut app, KeyCode::Enter);
-
-    assert!(app.overlay.is_none(), "declining closes the wizard");
-}
-
-#[test]
-fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
+fn fetched_collection_from_git_records_its_git_origin() {
     use super::editor::Editor;
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
@@ -1859,7 +1908,7 @@ fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
 
     let hurl = "GET http://127.0.0.1:8080/health\nHTTP 200\n";
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
-    assert!(keep_open, "offers to also load an environment");
+    assert!(!keep_open, "a collection load closes the wizard");
 
     let ci = app.active_tab;
     let col_origin = app.collections[ci]
@@ -1872,37 +1921,11 @@ fn combined_load_sets_git_origin_on_collection_and_environment_independently() {
     assert_eq!(col_origin.ref_name, "main");
     assert!(
         app.collections[ci].linked_env_id.is_none(),
-        "no environment linked yet"
+        "loading a collection no longer also loads/links an environment"
     );
-    assert!(app.global_envs.is_empty(), "no environment loaded yet");
-
-    // Second pick: the environment file, from the same ref/repo — no
-    // second fetch of branches/tags/files, just another checkout.
-    w.second_pick = true;
-    w.selected_path = Some("envs/staging.vars".to_string());
-    let vars = "BASE_URL=http://127.0.0.1:8080\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(vars.to_string())));
-
     assert!(
-        !keep_open,
-        "the combined load closes after the environment step"
-    );
-    let env_id = app.collections[ci]
-        .linked_env_id
-        .expect("the environment is linked to the same tab");
-    let env_origin = app
-        .global_envs
-        .iter()
-        .find(|e| e.id == env_id)
-        .and_then(|e| e.git_origin.clone())
-        .expect("env git_origin is set");
-    assert_eq!(env_origin.repo_url, "https://example.test/repo.git");
-    assert_eq!(env_origin.path, "envs/staging.vars");
-    assert_eq!(env_origin.ref_name, "main");
-    // The collection's own origin is untouched by the env step.
-    assert_eq!(
-        app.collections[ci].git_origin.as_ref().unwrap().path,
-        "api/health.hurl"
+        app.global_envs.is_empty(),
+        "no environment is loaded alongside the collection"
     );
 }
 
@@ -9745,10 +9768,7 @@ fn completing_a_git_load_remembers_the_url_most_recent_first() {
     w.selected_path = Some("api.hurl".into());
 
     let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok("GET http://h/x\n".into())));
-    assert!(
-        keep_open,
-        "a collection load offers to also load an environment before closing"
-    );
+    assert!(!keep_open, "a collection load closes the wizard");
     assert_eq!(
         app.recent_git_urls,
         vec![
@@ -11738,4 +11758,21 @@ fn an_empty_name_at_the_save_prompt_also_falls_back_to_keeping_the_workspace_tem
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&dest_parent);
+}
+
+#[test]
+fn env_name_keeps_dotted_suffix_but_still_drops_a_real_extension() {
+    assert_eq!(env_name_from_path("/x/.env.dev-au", "environment"), ".env.dev-au");
+    assert_eq!(env_name_from_path("/x/.env", "environment"), ".env");
+    assert_eq!(env_name_from_path("/x/prod.vars", "environment"), "prod");
+    assert_eq!(env_name_from_path("", "environment"), "environment");
+}
+
+#[test]
+fn collection_name_hides_only_known_extensions() {
+    assert_eq!(collection_name_from_path("/x/api.hurl", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/api.json", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/api.HURL", "collection"), "api");
+    assert_eq!(collection_name_from_path("/x/env.dev-au", "collection"), "env.dev-au");
+    assert_eq!(collection_name_from_path("/x/notes.txt", "collection"), "notes.txt");
 }
