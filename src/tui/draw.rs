@@ -91,7 +91,6 @@ impl LeftRow {
     }
 }
 
-
 pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> {
     let border = if focused { th.accent } else { th.dim };
     Block::default()
@@ -1725,8 +1724,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 request::RequestView::Hurl => "Hurl",
             };
             let view_item = format!("{}: {view_label}", s.default_request_view_label);
-            let always_save_item =
-                format!("{} {}", mark(app.always_save_when_prompted), s.always_save_when_prompted);
+            let always_save_item = format!(
+                "{} {}",
+                mark(app.always_save_when_prompted),
+                s.always_save_when_prompted
+            );
             let items = [
                 exit_item.as_str(),
                 clear_item.as_str(),

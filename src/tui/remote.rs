@@ -256,7 +256,11 @@ pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> 
         }
     };
     let filtered: Vec<String> = files.iter().filter(|p| keep(p)).cloned().collect();
-    if filtered.is_empty() { files.to_vec() } else { filtered }
+    if filtered.is_empty() {
+        files.to_vec()
+    } else {
+        filtered
+    }
 }
 
 /// Build the flat, filterable branch+tag choice list (branches first).

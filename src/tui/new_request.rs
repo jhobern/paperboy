@@ -1020,7 +1020,6 @@ impl NewReq {
         }
     }
 
-
     /// True when every cookie row is blank — the section is then skipped when
     /// tabbing between Headers and Form.
     pub(crate) fn cookies_blank(&self) -> bool {

@@ -395,7 +395,8 @@ mod tests {
 
     #[test]
     fn file_form_field_path_with_spaces_round_trips_as_a_real_path() {
-        let mut entry = HurlEntry::from_fields("Upload", "POST", "{{ BASE_URL }}/upload", vec![], "");
+        let mut entry =
+            HurlEntry::from_fields("Upload", "POST", "{{ BASE_URL }}/upload", vec![], "");
         entry.form_fields = vec![FormField {
             key: "doc".to_string(),
             // A real filesystem path containing spaces (as the file picker

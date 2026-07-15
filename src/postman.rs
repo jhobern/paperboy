@@ -47,7 +47,11 @@ fn get_method() -> String {
 fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::String(s) => s,
-        Value::Object(m) => m.get("raw").and_then(Value::as_str).unwrap_or("").to_string(),
+        Value::Object(m) => m
+            .get("raw")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     })
 }
@@ -212,7 +216,9 @@ fn map_request(name: &str, req: &Request) -> HurlEntry {
     if let Some(b) = &req.body {
         match b.mode.as_str() {
             "raw" => body = b.raw.clone(),
-            "urlencoded" => form_fields = b.urlencoded.iter().filter_map(Param::form_field).collect(),
+            "urlencoded" => {
+                form_fields = b.urlencoded.iter().filter_map(Param::form_field).collect()
+            }
             "formdata" => form_fields = b.formdata.iter().filter_map(Param::form_field).collect(),
             _ => {}
         }

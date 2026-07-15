@@ -207,7 +207,6 @@ pub fn scrub_remote(repo: &Path) {
     let _ = run_git(&["remote", "remove", "origin"], Some(repo), None);
 }
 
-
 /// Blobless-fetch the given ref into a throwaway repo and list every file path
 /// at that ref. Returns the paths, the resolved commit sha (so a later
 /// redownload can pin the exact same commit rather than "whatever the branch
