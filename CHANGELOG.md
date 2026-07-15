@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
+## [0.1.3] - 2026-07-15
+
+### Added
+
+- **Move / copy requests between workspace collections** — `m` moves and `c`
+  copies the selected request into another collection file in the workspace
+  (chosen through a picker); the change is written straight to disk.
+- **Undo hints in the status bar** — closing a tab or deleting a request now
+  shows a message naming the `u` key to reverse it.
+
+### Fixed
+
+- Environment files whose name carries an extra suffix (e.g.
+  `environment.env.dev-au`) now show their full name in the Environments panel
+  instead of being truncated to `environment.env`. Only the known environment
+  extensions (`.env` / `.vars`) are hidden; any other suffix is kept verbatim.
+
 ## [0.1.2] - 2026-07-15
 
 ### Added
@@ -25,6 +42,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   that has edits, so in-memory changes are no longer lost silently.
 - **File browser reset shortcut** (`Ctrl+R`) — jump straight back to the folder
   the picker originally opened in after navigating away.
+- **Move / copy requests between workspace collections** — `m` moves and `c`
+  copies the selected request into another collection file in the workspace
+  (chosen through a picker); the change is written straight to disk.
+- **Undo hints in the status bar** — closing a tab or deleting a request now
+  shows a message naming the `u` key to reverse it.
 
 ### Changed
 
