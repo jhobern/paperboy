@@ -2,13 +2,14 @@
 //! app-level default variables (`AppVars`) and the Hurl-collection request
 //! building / running, so both front-ends behave identically.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
@@ -169,89 +170,26 @@ pub fn subst_display(text: &str, map: &HashMap<String, SubstInfo>) -> String {
     out
 }
 
-/// Pretty-printed JSON of the request in its RAW, editable form: `{{ VAR }}`
-/// placeholders are kept intact (never substituted) so the user edits the
-/// original template, and basic auth is shown as a readable `basic_auth` object
-/// rather than an encoded `Authorization` header. A JSON body is inlined as a
-/// value; otherwise it is kept as a string. This is the text shown in the
-/// editor and the source for the substituted preview; the wire request is
-/// re-derived (substituted + encoded) from the entry by [`resolve_request`].
-pub fn build_request_json(entry: &HurlEntry) -> String {
-    let mut headers_map: Map<String, Value> = Map::new();
-    for (k, v) in &entry.headers {
-        headers_map.insert(k.clone(), json!(v));
-    }
+/// A header/cookie/query-param/basic-auth value. Serializes as a JSON string;
+/// on parse it tolerantly coerces any hand-edited scalar (number, bool, null)
+/// to text.
+#[derive(Clone, Default)]
+struct TextValue(String);
 
-    let query_params: Map<String, Value> = entry
-        .query_params
-        .iter()
-        .map(|(k, v)| (k.clone(), json!(v)))
-        .collect();
-
-    let cookies_map: Map<String, Value> = entry
-        .cookies
-        .iter()
-        .map(|(k, v)| (k.clone(), json!(v)))
-        .collect();
-
-    let form_fields: Vec<Value> = entry
-        .form_fields
-        .iter()
-        .map(|f| {
-            let mut o = Map::new();
-            o.insert("key".into(), json!(f.key));
-            o.insert("value".into(), json!(f.value));
-            o.insert(
-                "type".into(),
-                json!(match f.kind {
-                    crate::hurl::FormFieldKind::Text => "text",
-                    crate::hurl::FormFieldKind::File => "file",
-                }),
-            );
-            if let Some(ct) = &f.content_type {
-                o.insert("content_type".into(), json!(ct));
-            }
-            Value::Object(o)
-        })
-        .collect();
-
-    let body_value: Value = match &entry.body {
-        None => Value::Null,
-        Some(raw) => serde_json::from_str(raw).unwrap_or(json!(raw)),
-    };
-
-    let mut obj: Map<String, Value> = Map::new();
-    obj.insert("method".into(), json!(entry.method));
-    obj.insert("url".into(), json!(entry.url));
-    if let Some((user, pass)) = &entry.basic_auth {
-        let mut ba = Map::new();
-        ba.insert("user".into(), json!(user));
-        ba.insert("pass".into(), json!(pass));
-        obj.insert("basic_auth".into(), Value::Object(ba));
+impl serde::Serialize for TextValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
     }
-    if !headers_map.is_empty() {
-        obj.insert("headers".into(), Value::Object(headers_map));
-    }
-    if !cookies_map.is_empty() {
-        obj.insert("cookies".into(), Value::Object(cookies_map));
-    }
-    if !query_params.is_empty() {
-        obj.insert("query_params".into(), Value::Object(query_params));
-    }
-    if !form_fields.is_empty() {
-        obj.insert("form_fields".into(), Value::Array(form_fields));
-    }
-    if !body_value.is_null() {
-        obj.insert("body".into(), body_value);
-    }
-
-    serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_else(|_| "{}".into())
 }
 
-/// A JSON scalar rendered as plain text for a header/cookie/query-param value:
-/// a string is used as-is, `null` becomes empty, anything else (a number,
-/// bool, etc. — not something [`build_request_json`] itself ever emits, but
-/// tolerated on a hand-edited round trip) is rendered via its own JSON text.
+impl<'de> serde::Deserialize<'de> for TextValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(TextValue(value_as_text(&Value::deserialize(d)?)))
+    }
+}
+
+/// A JSON scalar as plain text: strings as-is, `null` as empty, anything else
+/// via its JSON text.
 fn value_as_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -260,88 +198,154 @@ fn value_as_text(v: &Value) -> String {
     }
 }
 
-/// Parse the JSON text produced by [`build_request_json`] back into a
-/// [`HurlEntry`], carrying over everything that view intentionally doesn't
-/// expose (`title`, `expected_status`, `captures`, `asserts`, `user_added`)
-/// unchanged from `base` — exactly like the Edit Request wizard already does
-/// for the fields *it* doesn't expose. Used by the Main panel's Raw JSON Mode
-/// editor (Shift+J), the JSON-text counterpart to Raw Mode's Hurl-text editor.
-/// Errs with a short, human-readable reason on anything that isn't a JSON
-/// object with at least a `method` and a `url`.
-pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, String> {
-    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| "expected a JSON object".to_string())?;
+/// Form field `type`, lower-cased. Unknown or missing values parse as `Text`.
+#[derive(Serialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum FormKind {
+    #[default]
+    Text,
+    File,
+}
 
-    let method = obj
-        .get("method")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\"method\" must be a string".to_string())?
-        .to_string();
-    let url = obj
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "\"url\" must be a string".to_string())?
-        .to_string();
+impl<'de> serde::Deserialize<'de> for FormKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Value::deserialize(d)?;
+        Ok(if v.as_str() == Some("file") {
+            FormKind::File
+        } else {
+            FormKind::Text
+        })
+    }
+}
 
-    let basic_auth = match obj.get("basic_auth") {
-        Some(Value::Object(ba)) => Some((
-            ba.get("user").map(value_as_text).unwrap_or_default(),
-            ba.get("pass").map(value_as_text).unwrap_or_default(),
-        )),
-        _ => None,
-    };
+/// One `form_fields` entry (fields alphabetical, matching [`RequestJson`]).
+#[derive(Serialize, Deserialize)]
+struct FormFieldJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(default)]
+    key: TextValue,
+    #[serde(rename = "type", default)]
+    kind: FormKind,
+    #[serde(default)]
+    value: TextValue,
+}
 
-    let as_pairs = |key: &str| -> Vec<(String, String)> {
-        match obj.get(key) {
-            Some(Value::Object(m)) => m
-                .iter()
-                .map(|(k, v)| (k.clone(), value_as_text(v)))
-                .collect(),
-            _ => Vec::new(),
+impl From<&FormField> for FormFieldJson {
+    fn from(f: &FormField) -> Self {
+        Self {
+            content_type: f.content_type.clone(),
+            key: TextValue(f.key.clone()),
+            kind: match f.kind {
+                crate::hurl::FormFieldKind::File => FormKind::File,
+                crate::hurl::FormFieldKind::Text => FormKind::Text,
+            },
+            value: TextValue(f.value.clone()),
         }
-    };
-    let headers = as_pairs("headers");
-    let cookies = as_pairs("cookies");
-    let query_params = as_pairs("query_params");
+    }
+}
 
-    let form_fields: Vec<FormField> = match obj.get("form_fields") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| {
-                let o = item.as_object()?;
-                Some(FormField {
-                    key: o.get("key").map(value_as_text).unwrap_or_default(),
-                    value: o.get("value").map(value_as_text).unwrap_or_default(),
-                    kind: match o.get("type").and_then(Value::as_str) {
-                        Some("file") => crate::hurl::FormFieldKind::File,
-                        _ => crate::hurl::FormFieldKind::Text,
-                    },
-                    content_type: o
-                        .get("content_type")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+impl From<FormFieldJson> for FormField {
+    fn from(f: FormFieldJson) -> Self {
+        Self {
+            key: f.key.0,
+            value: f.value.0,
+            kind: match f.kind {
+                FormKind::File => crate::hurl::FormFieldKind::File,
+                FormKind::Text => crate::hurl::FormFieldKind::Text,
+            },
+            content_type: f.content_type,
+        }
+    }
+}
 
-    let body = match obj.get("body") {
+/// `basic_auth` object; both fields default so a hand-edit dropping one still
+/// parses.
+#[derive(Serialize, Deserialize, Default)]
+struct BasicAuthJson {
+    #[serde(default)]
+    pass: TextValue,
+    #[serde(default)]
+    user: TextValue,
+}
+
+/// Serde mirror of the Raw JSON editor's request shape. Fields are alphabetical
+/// so the pretty output stays byte-identical to serde_json's default
+/// `BTreeMap` ordering; header/cookie/param maps dedupe+sort keys; `body` is a
+/// raw JSON value so JSON bodies inline while anything else stays a string.
+#[derive(Serialize, Deserialize)]
+struct RequestJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basic_auth: Option<BasicAuthJson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cookies: BTreeMap<String, TextValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    form_fields: Vec<FormFieldJson>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, TextValue>,
+    method: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query_params: BTreeMap<String, TextValue>,
+    url: String,
+}
+
+fn pairs_to_map(pairs: &[(String, String)]) -> BTreeMap<String, TextValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.clone(), TextValue(v.clone())))
+        .collect()
+}
+
+fn map_to_pairs(map: BTreeMap<String, TextValue>) -> Vec<(String, String)> {
+    map.into_iter().map(|(k, v)| (k, v.0)).collect()
+}
+
+/// Pretty-printed JSON of the request in its RAW, editable form: `{{ VAR }}`
+/// placeholders are kept intact and basic auth is shown as a readable
+/// `basic_auth` object (not an encoded header). The wire request is re-derived
+/// (substituted + encoded) from the entry by [`resolve_request`].
+pub fn build_request_json(entry: &HurlEntry) -> String {
+    let dto = RequestJson {
+        basic_auth: entry.basic_auth.as_ref().map(|(user, pass)| BasicAuthJson {
+            pass: TextValue(pass.clone()),
+            user: TextValue(user.clone()),
+        }),
+        body: entry.body.as_deref().map(|raw| {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+        }),
+        cookies: pairs_to_map(&entry.cookies),
+        form_fields: entry.form_fields.iter().map(FormFieldJson::from).collect(),
+        headers: pairs_to_map(&entry.headers),
+        method: entry.method.clone(),
+        query_params: pairs_to_map(&entry.query_params),
+        url: entry.url.clone(),
+    };
+    serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".into())
+}
+
+/// Parse the JSON from [`build_request_json`] back into a [`HurlEntry`],
+/// carrying over the fields this view doesn't expose (`title`,
+/// `expected_status`, `captures`, `asserts`, `user_added`) unchanged from
+/// `base`. Errs on anything that isn't an object with a `method` and `url`.
+pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, String> {
+    let dto: RequestJson = serde_json::from_str(text).map_err(|e| e.to_string())?;
+
+    let body = match dto.body {
         None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(v) => Some(serde_json::to_string_pretty(v).unwrap_or_default()),
+        Some(Value::String(s)) => Some(s),
+        Some(v) => Some(serde_json::to_string_pretty(&v).unwrap_or_default()),
     };
 
     let mut entry = base.clone();
-    entry.method = method;
-    entry.url = url;
-    entry.basic_auth = basic_auth;
-    entry.headers = headers;
-    entry.cookies = cookies;
-    entry.query_params = query_params;
-    entry.form_fields = form_fields;
+    entry.method = dto.method;
+    entry.url = dto.url;
+    entry.basic_auth = dto.basic_auth.map(|ba| (ba.user.0, ba.pass.0));
+    entry.headers = map_to_pairs(dto.headers);
+    entry.cookies = map_to_pairs(dto.cookies);
+    entry.query_params = map_to_pairs(dto.query_params);
+    entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
     entry.body = body;
     Ok(entry)
 }
@@ -835,7 +839,114 @@ mod tests {
     use super::*;
     use crate::collection::Collection;
     use crate::environment::{EnvVar, Environment, ValueSource};
-    use crate::hurl::HurlEntry;
+    use crate::hurl::{FormField, FormFieldKind, HurlEntry};
+
+    #[test]
+    fn request_json_is_alphabetically_ordered_and_round_trips() {
+        let entry = HurlEntry {
+            method: "POST".into(),
+            url: "http://example.com/api".into(),
+            // Deliberately out of order to prove keys come out sorted.
+            headers: vec![
+                ("X-Zed".into(), "z".into()),
+                ("Authorization".into(), "Bearer t".into()),
+            ],
+            cookies: vec![("session".into(), "abc".into())],
+            query_params: vec![("page".into(), "2".into())],
+            basic_auth: Some(("alice".into(), "secret".into())),
+            form_fields: vec![
+                FormField {
+                    key: "name".into(),
+                    value: "widget".into(),
+                    kind: FormFieldKind::Text,
+                    content_type: None,
+                },
+                FormField {
+                    key: "file".into(),
+                    value: "./a.bin".into(),
+                    kind: FormFieldKind::File,
+                    content_type: Some("application/octet-stream".into()),
+                },
+            ],
+            body: Some(r#"{"a":1}"#.into()),
+            ..Default::default()
+        };
+
+        let json = build_request_json(&entry);
+        let expected = r#"{
+  "basic_auth": {
+    "pass": "secret",
+    "user": "alice"
+  },
+  "body": {
+    "a": 1
+  },
+  "cookies": {
+    "session": "abc"
+  },
+  "form_fields": [
+    {
+      "key": "name",
+      "type": "text",
+      "value": "widget"
+    },
+    {
+      "content_type": "application/octet-stream",
+      "key": "file",
+      "type": "file",
+      "value": "./a.bin"
+    }
+  ],
+  "headers": {
+    "Authorization": "Bearer t",
+    "X-Zed": "z"
+  },
+  "method": "POST",
+  "query_params": {
+    "page": "2"
+  },
+  "url": "http://example.com/api"
+}"#;
+        assert_eq!(json, expected);
+
+        // Re-parsing yields the same request fields (headers/cookies/params are
+        // sorted by key on the round trip, matching the serialized object).
+        let back = apply_request_json(&HurlEntry::default(), &json).unwrap();
+        assert_eq!(back.method, "POST");
+        assert_eq!(back.url, "http://example.com/api");
+        assert_eq!(back.basic_auth, Some(("alice".into(), "secret".into())));
+        assert_eq!(
+            back.headers,
+            vec![
+                ("Authorization".to_string(), "Bearer t".to_string()),
+                ("X-Zed".to_string(), "z".to_string()),
+            ]
+        );
+        assert_eq!(back.form_fields.len(), 2);
+        assert_eq!(back.form_fields[1].kind, FormFieldKind::File);
+        assert_eq!(back.body.as_deref(), Some("{\n  \"a\": 1\n}"));
+    }
+
+    #[test]
+    fn apply_request_json_tolerates_non_string_scalars_and_unknown_form_type() {
+        let base = HurlEntry::default();
+        let text = r#"{
+            "method": "GET",
+            "url": "http://x",
+            "headers": { "X-Count": 5 },
+            "form_fields": [ { "key": "k", "value": "v", "type": "weird" } ]
+        }"#;
+        let entry = apply_request_json(&base, text).unwrap();
+        assert_eq!(entry.headers, vec![("X-Count".to_string(), "5".to_string())]);
+        assert_eq!(entry.form_fields[0].kind, FormFieldKind::Text);
+    }
+
+    #[test]
+    fn apply_request_json_rejects_input_without_method_or_url() {
+        let base = HurlEntry::default();
+        assert!(apply_request_json(&base, "[]").is_err());
+        assert!(apply_request_json(&base, r#"{"url":"http://x"}"#).is_err());
+    }
 
     fn me_entry() -> HurlEntry {
         HurlEntry {

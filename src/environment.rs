@@ -10,9 +10,17 @@
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+
+use regex::{Captures, Regex};
+
+/// A `{{ KEY }}` placeholder (inner whitespace ignored). Shared by
+/// [`referenced_keys`] and [`substitute`] so both agree on what a placeholder is.
+static PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
 
 /// The source/provider for a variable's value.
 #[derive(Debug, Clone, PartialEq)]
@@ -771,30 +779,28 @@ pub fn looks_like_env(content: &str) -> bool {
     })
 }
 
-/// The distinct `{{ KEY }}` / `{{KEY}}` variable names referenced in `text`.
+/// The distinct `{{ KEY }}` variable names referenced in `text`, in first-seen
+/// order (inner whitespace ignored).
 pub fn referenced_keys(text: &str) -> Vec<String> {
     let mut keys = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("{{") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else { break };
-        let key = after[..end].trim().to_string();
-        if !key.is_empty() && !keys.contains(&key) {
+    for caps in PLACEHOLDER.captures_iter(text) {
+        let key = caps[1].to_string();
+        if !keys.contains(&key) {
             keys.push(key);
         }
-        rest = &after[end + 2..];
     }
     keys
 }
 
-/// Replace all `{{ KEY }}` and `{{KEY}}` occurrences in `text`; unknown keys are left as-is.
+/// Replace each `{{ KEY }}` in `text` with its value from `vars`; unknown keys
+/// are left verbatim. Single-pass, so an inserted value is never re-expanded.
 pub fn substitute(text: &str, vars: &HashMap<String, String>) -> String {
-    let mut result = text.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{{ {key} }}}}"), value);
-        result = result.replace(&format!("{{{{{key}}}}}"), value);
-    }
-    result
+    PLACEHOLDER
+        .replace_all(text, |caps: &Captures| match vars.get(&caps[1]) {
+            Some(value) => value.clone(),
+            None => caps[0].to_string(),
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -1133,6 +1139,30 @@ mod tests {
         let keys = referenced_keys("{{ BASE_URL }}/x/{{TOKEN}} plain {{ BASE_URL }}");
         assert_eq!(keys, vec!["BASE_URL".to_string(), "TOKEN".to_string()]);
         assert!(referenced_keys("no placeholders here").is_empty());
+    }
+
+    #[test]
+    fn substitute_replaces_known_keys_regardless_of_inner_spacing() {
+        let vars = HashMap::from([("TOKEN".to_string(), "secret".to_string())]);
+        // Tight, single-space and multi-space spellings must all resolve to the
+        // same variable (multi-space was silently left unsubstituted before).
+        assert_eq!(substitute("{{TOKEN}}", &vars), "secret");
+        assert_eq!(substitute("{{ TOKEN }}", &vars), "secret");
+        assert_eq!(substitute("a {{   TOKEN   }} b", &vars), "a secret b");
+    }
+
+    #[test]
+    fn substitute_keeps_unknown_placeholders_verbatim() {
+        let vars = HashMap::new();
+        assert_eq!(substitute("{{ MISSING }}", &vars), "{{ MISSING }}");
+    }
+
+    #[test]
+    fn substitute_does_not_re_expand_inserted_values() {
+        // A value that itself looks like a placeholder must be inserted as-is,
+        // never re-scanned for further substitution.
+        let vars = HashMap::from([("A".to_string(), "{{ B }}".to_string())]);
+        assert_eq!(substitute("{{ A }}", &vars), "{{ B }}");
     }
 
     #[test]
