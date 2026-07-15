@@ -325,6 +325,7 @@ strings! {
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
     help_workspace_open => "open the highlighted workspace folder / collection (→ or Enter)", "ouvrir le dossier / la collection du workspace en surbrillance (→ ou Entrée)", "åbn den fremhævede workspace-mappe / -samling (→ eller Enter)";
+    help_menu_submenu_nav => "enter / leave a File-menu submenu", "entrer / quitter un sous-menu du menu Fichier", "gå ind i / ud af en Fil-menu-undermenu";
     help_browser_reset => "reset the file browser to the folder it opened in", "réinitialiser l'explorateur de fichiers au dossier d'ouverture", "nulstil filvælgeren til den mappe, den åbnede i";
     help_prev_next_tab => "previous / next tab", "onglet précédent / suivant", "forrige / næste fane";
     help_rename_close => "rename tab (F2) · delete request / close collection tab", "renommer l'onglet (F2) · supprimer la requête / fermer l'onglet", "omdøb fane (F2) · slet anmodning / luk samlingsfane";

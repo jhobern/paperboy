@@ -23,6 +23,7 @@ It ships as a single binary with two front-ends:
 - [Secrets & environment variables](#secrets--environment-variables)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Headless CLI mode](#headless-cli-mode)
+- [Changelog](CHANGELOG.md)
 
 ## Installing & running
 
@@ -184,8 +185,9 @@ destination, so git and local options no longer clutter one long list:
 
 Every step is keyboard-driven: each item has a bracketed mnemonic (e.g.
 **(L)ocal file…**, **From (G)it…**, **(S)ave**), and pressing that letter both
-selects *and* activates the item — no extra Enter needed. `Esc` steps back to
-the previous step (with the kind you picked still highlighted).
+selects *and* activates the item — no extra Enter needed. `→` (or `Enter`)
+steps into the next level and `←` (or `Esc`) steps back, with the kind you
+picked still highlighted.
 
 - **To Git…** is only meaningful for a collection/workspace that was itself
   loaded from git; on anything else it just reports that there's no remembered
@@ -376,7 +378,7 @@ up-to-date list. Highlights:
 |---|---|
 | `Tab` / `Shift+Tab` | Move focus between panes |
 | `↑`/`↓`, `j`/`k` | Move selection |
-| `←`/`→`, `h`/`l` | Switch tabs / scroll list-panel text horizontally |
+| `←`/`→`, `h`/`l` | Switch tabs / scroll list-panel text horizontally (in the File menu: `←`/`→` leave / enter a submenu) |
 | `Enter` | Open the Edit Request wizard for the selected request (or, on a folder row in the Requests list, descend into that folder; on the "‹ .." row, go back up) |
 | `→` / `l` (Workspace list) | Open the highlighted workspace folder or collection (same as `Enter`); `Enter` on an already-open collection collapses it |
 | `w` (Workspace tab) | Pop up the full workspace file-tree picker to jump to any collection |

@@ -1933,6 +1933,42 @@ fn file_save_submenu_mnemonic_activates_the_item_immediately() {
 }
 
 #[test]
+fn file_menu_left_and_right_arrows_enter_and_exit_submenus() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f')); // top File menu, "(L)oad"
+    press(&mut app, KeyCode::Right); // Right descends into Load
+    assert!(matches!(app.overlay, Some(Overlay::FileLoadMenu(0))));
+
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Right); // Right descends into its source step
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileLoadSource(FileKind::Collection, 0))
+    ));
+
+    press(&mut app, KeyCode::Left); // Left backs out to the kind list, kind relit
+    assert!(matches!(app.overlay, Some(Overlay::FileLoadMenu(1))));
+
+    press(&mut app, KeyCode::Left); // Left backs out to the top File menu
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(0))));
+
+    // Same round-trip on the Save side (Save = row 1).
+    press(&mut app, KeyCode::Down); // -> "(S)ave"
+    press(&mut app, KeyCode::Right); // descend into Save
+    assert!(matches!(app.overlay, Some(Overlay::FileSaveMenu(0))));
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Right); // descend into its destination step
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileSaveDest(FileKind::Collection, 0))
+    ));
+    press(&mut app, KeyCode::Left); // back to the Save kind list
+    assert!(matches!(app.overlay, Some(Overlay::FileSaveMenu(1))));
+    press(&mut app, KeyCode::Left); // back to the top File menu (Save row)
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(1))));
+}
+
+#[test]
 fn file_submenu_esc_returns_to_the_parent_file_menu() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));

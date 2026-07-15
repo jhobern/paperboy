@@ -763,7 +763,7 @@ impl TuiApp {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.overlay = Some(Overlay::FileMenu((sel + 1).min(1)));
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Right => {
                     self.overlay = Some(if sel == 0 {
                         Overlay::FileLoadMenu(0)
                     } else {
@@ -784,14 +784,18 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_load_items(&s);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::FileMenu(0)),
+                    // Left/Esc backs out to the top File menu; Right/Enter
+                    // descends into this kind's source (or activates it).
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileMenu(0))
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.overlay = Some(Overlay::FileLoadMenu(sel.saturating_sub(1)));
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.overlay = Some(Overlay::FileLoadMenu((sel + 1).min(items.len() - 1)));
                     }
-                    KeyCode::Enter => self.activate_file_load_item(sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_load_item(sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_load_item(i),
                         None => self.overlay = Some(Overlay::FileLoadMenu(sel)),
@@ -803,14 +807,16 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_save_items(&s);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::FileMenu(1)),
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                        self.overlay = Some(Overlay::FileMenu(1))
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.overlay = Some(Overlay::FileSaveMenu(sel.saturating_sub(1)));
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         self.overlay = Some(Overlay::FileSaveMenu((sel + 1).min(items.len() - 1)));
                     }
-                    KeyCode::Enter => self.activate_file_save_item(sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_save_item(sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_save_item(i),
                         None => self.overlay = Some(Overlay::FileSaveMenu(sel)),
@@ -822,8 +828,8 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_load_source_items(&s);
                 match key.code {
-                    // Esc steps back to the kind list with this kind still lit.
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    // Left/Esc steps back to the kind list with this kind lit.
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                         self.overlay = Some(Overlay::FileLoadMenu(file_load_kind_index(kind)));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -833,7 +839,7 @@ impl TuiApp {
                         let n = items.len() - 1;
                         self.overlay = Some(Overlay::FileLoadSource(kind, (sel + 1).min(n)));
                     }
-                    KeyCode::Enter => self.activate_file_load_source(kind, sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_load_source(kind, sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_load_source(kind, i),
                         None => self.overlay = Some(Overlay::FileLoadSource(kind, sel)),
@@ -845,7 +851,7 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 let items = file_save_dest_items(kind, &s);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                         self.overlay = Some(Overlay::FileSaveMenu(file_save_kind_index(kind)));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -855,7 +861,7 @@ impl TuiApp {
                         let n = items.len() - 1;
                         self.overlay = Some(Overlay::FileSaveDest(kind, (sel + 1).min(n)));
                     }
-                    KeyCode::Enter => self.activate_file_save_dest(kind, sel),
+                    KeyCode::Enter | KeyCode::Right => self.activate_file_save_dest(kind, sel),
                     KeyCode::Char(c) => match mnemonic_index(&items, c) {
                         Some(i) => self.activate_file_save_dest(kind, i),
                         None => self.overlay = Some(Overlay::FileSaveDest(kind, sel)),

@@ -1870,6 +1870,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_menus,
                         &[
                             ("f / s", s.help_menus),
+                            ("\u{2190} / \u{2192} (File menu)", s.help_menu_submenu_nav),
                             ("w", s.help_workspace_browse),
                             ("\u{2192} / Enter (Workspace)", s.help_workspace_open),
                             ("^r (File browser)", s.help_browser_reset),
