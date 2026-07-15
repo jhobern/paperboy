@@ -59,6 +59,14 @@ impl Editor {
         self.col += 1;
     }
 
+    /// Insert every character of `s` at the cursor, in order (used to
+    /// autocomplete a ghost suffix). `s` is expected to be single-line.
+    pub(crate) fn insert_str(&mut self, s: &str) {
+        for ch in s.chars() {
+            self.insert(ch);
+        }
+    }
+
     pub(crate) fn newline(&mut self) {
         if !self.multiline {
             return;
@@ -130,6 +138,16 @@ impl Editor {
     pub(crate) fn begin_selection_if_needed(&mut self) {
         if self.sel_anchor.is_none() {
             self.sel_anchor = Some((self.row, self.col));
+        }
+    }
+
+    /// Prepare for a cursor move: when `extend` (Shift held) start/keep a
+    /// selection, otherwise drop any existing one. Call right before the move.
+    pub(crate) fn set_selecting(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_needed();
+        } else {
+            self.clear_selection();
         }
     }
 

@@ -950,51 +950,31 @@ impl TuiApp {
                     // Shift+Arrow extends (or starts) a text selection instead of
                     // just moving the cursor; a plain arrow move clears it.
                     KeyCode::Left if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.left();
                         Act::Edit
                     }
                     KeyCode::Tab if complete_ghost => {
                         editor.clear_selection();
-                        for ch in ghost.chars() {
-                            editor.insert(ch);
-                        }
+                        editor.insert_str(ghost);
                         Act::Edit
                     }
                     KeyCode::Right if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         if complete_ghost && at_end {
-                            for ch in ghost.chars() {
-                                editor.insert(ch);
-                            }
+                            editor.insert_str(ghost);
                         } else {
                             editor.right();
                         }
                         Act::Edit
                     }
                     KeyCode::Up if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.up();
                         Act::Edit
                     }
                     KeyCode::Down if !secret_intact => {
-                        if shift {
-                            editor.begin_selection_if_needed();
-                        } else {
-                            editor.clear_selection();
-                        }
+                        editor.set_selecting(shift);
                         editor.down();
                         Act::Edit
                     }
