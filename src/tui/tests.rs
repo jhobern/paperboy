@@ -1569,6 +1569,162 @@ fn env_picker_prefers_the_last_environment_folder() {
 }
 
 #[test]
+fn going_up_highlights_the_folder_just_left_so_right_returns() {
+    let dir = temp_dir("upreturn");
+    let sub = dir.join("nested");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(sub.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside `nested`
+
+    // Left goes up to `dir`, and the folder we came from stays highlighted…
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "moved up one level");
+            assert_eq!(ex.current().path, sub, "the folder we left is highlighted");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // …so an instinctive Right re-enters it instead of climbing another level.
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &sub, "Right returns into the folder we left")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn many_lefts_then_many_rights_return_to_the_starting_folder() {
+    // a/b/c/d — start deep, walk all the way up, then walk all the way back.
+    let a = temp_dir("trail");
+    let b = a.join("b");
+    let c = b.join("c");
+    let d = c.join("d");
+    std::fs::create_dir_all(&d).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(d.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside d
+
+    // Three Lefts climb d → c → b → a.
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &a, "climbed to the top of the trail");
+            assert_eq!(ex.current().path, b, "the trail's next step is highlighted");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Three Rights retrace the trail back down to exactly where we started.
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &d, "retraced all the way back to the start")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    // Fully retraced — the trail is spent.
+    assert!(app.browser_forward_path.is_none());
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
+fn descending_into_a_different_folder_clears_the_retrace_trail() {
+    // a contains b (with child c) and a sibling z.
+    let a = temp_dir("clearsibling");
+    let c = a.join("b").join("c");
+    let z = a.join("z");
+    std::fs::create_dir_all(&c).unwrap();
+    std::fs::create_dir_all(&z).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(a.join("b")),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside a/b
+    press(&mut app, KeyCode::Left); // up to a, trail anchored at a/b
+    assert!(app.browser_forward_path.is_some());
+
+    // Highlight the sibling `z` and descend into it — a fresh navigation.
+    let idx = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            ex.files().iter().position(|f| f.path == z).expect("z is listed")
+        }
+        _ => panic!("browser overlay not open"),
+    };
+    match &mut app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex.set_selected_idx(idx),
+        _ => unreachable!(),
+    }
+    press(&mut app, KeyCode::Right);
+
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => assert_eq!(ex.cwd(), &z, "descended into the sibling"),
+        _ => panic!("browser overlay not open"),
+    }
+    assert!(
+        app.browser_forward_path.is_none(),
+        "a new navigation clears the retrace trail"
+    );
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
+fn right_does_not_ascend_through_the_parent_row_but_enter_still_does() {
+    let a = temp_dir("parentrow");
+    let b = a.join("b");
+    std::fs::create_dir_all(&b).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(b.clone()),
+        ..Default::default()
+    };
+    app.open_browser(FileAction::OpenCollection); // opens inside b, highlight "../"
+
+    // The "../" row is highlighted (index 0). Right must NOT ascend through it,
+    // otherwise a run of Rights would bounce back up the tree.
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.current().path, a, "the '../' row points at the parent")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    press(&mut app, KeyCode::Right);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &b, "Right on '../' is a no-op — stays put")
+        }
+        _ => panic!("browser overlay not open"),
+    }
+
+    // Enter, however, still honours "../" as a way up (the usual idiom).
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &a, "Enter on '../' ascends");
+            assert_eq!(ex.current().path, b, "and highlights the folder we left");
+        }
+        _ => panic!("browser overlay not open"),
+    }
+    std::fs::remove_dir_all(&a).ok();
+}
+
+#[test]
 fn ctrl_r_resets_the_browser_to_the_folder_it_opened_in() {
     let dir = temp_dir("resetorigin");
     let sub = dir.join("nested");

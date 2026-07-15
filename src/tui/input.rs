@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -7,7 +7,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
-use ratatui_explorer::{FileExplorerBuilder, Theme as ExplorerTheme};
+use ratatui_explorer::{FileExplorer, FileExplorerBuilder, Theme as ExplorerTheme};
 
 use crate::collection::Collection;
 use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
@@ -1076,9 +1076,41 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    if ex.current().is_dir {
+                    let on_parent_row =
+                        ex.cwd().parent() == Some(ex.current().path.as_path());
+                    if ex.current().is_dir && on_parent_row {
+                        // The "../" row goes UP, which isn't a descent. Enter
+                        // still honours it (the common file-picker idiom), but
+                        // the arrow keys stay strictly directional: Right / l
+                        // only ever go deeper, so a run of Rights can't bounce
+                        // back up once a retrace lands on "../". Use Left (or
+                        // Enter) to ascend.
+                        if key.code == KeyCode::Enter {
+                            self.browser_ascend(&mut ex);
+                        }
+                        self.overlay = Some(Overlay::Browser(action, ex));
+                    } else if ex.current().is_dir {
                         // Descend into the directory (handled by the explorer).
+                        let target = ex.current().path.clone();
                         let _ = ex.handle(&Event::Key(key));
+                        // If this descent retraces the upward trail, re-select
+                        // the next folder down it so a run of Rights unwinds a
+                        // run of Lefts exactly. Stepping into any other folder
+                        // is a fresh navigation and clears the trail.
+                        match self
+                            .browser_forward_path
+                            .as_ref()
+                            .and_then(|trail| child_towards(&target, trail))
+                        {
+                            Some(next) => {
+                                if let Some(idx) =
+                                    ex.files().iter().position(|f| f.path == next)
+                                {
+                                    ex.set_selected_idx(idx);
+                                }
+                            }
+                            None => self.browser_forward_path = None,
+                        }
                         self.overlay = Some(Overlay::Browser(action, ex));
                     } else if matches!(
                         action,
@@ -1127,10 +1159,19 @@ impl TuiApp {
                     {
                         let _ = ex.set_cwd(&origin);
                     }
+                    self.browser_forward_path = None;
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
+                KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') if !ctrl => {
+                    // Going up a level highlights the folder we just left
+                    // (rather than "../"), so an accidental Left is undone by
+                    // Right — instead of descending back into "../" and
+                    // climbing another level.
+                    self.browser_ascend(&mut ex);
                     self.overlay = Some(Overlay::Browser(action, ex));
                 }
                 _ => {
-                    // Navigation (j/k, h/←, Home/End, Ctrl+h toggle hidden, …).
+                    // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …).
                     let _ = ex.handle(&Event::Key(key));
                     self.overlay = Some(Overlay::Browser(action, ex));
                 }
@@ -3235,6 +3276,22 @@ impl TuiApp {
         });
     }
 
+    /// Walk the file browser up one level, re-selecting the folder we just
+    /// left (so an accidental step up is undone by stepping straight back in)
+    /// and anchoring the retrace trail on the first step of an upward walk.
+    /// No-op at the filesystem root, where there is nowhere further up to go.
+    fn browser_ascend(&mut self, ex: &mut FileExplorer) {
+        let here = ex.cwd().clone();
+        if here.parent().is_some() {
+            // The first step of a walk anchors the deepest folder as the trail
+            // to retrace; later steps keep it (we're still climbing the chain).
+            if self.browser_forward_path.is_none() {
+                self.browser_forward_path = Some(here.clone());
+            }
+            let _ = ex.set_working_file(&here);
+        }
+    }
+
     pub(crate) fn open_browser(&mut self, action: FileAction) {
         let th = theme(&self.language);
         let s = Strings::for_language(&self.language);
@@ -3294,11 +3351,22 @@ impl TuiApp {
                 // Remember where the browser actually started so `^r` can jump
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
+                self.browser_forward_path = None;
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
             Err(e) => self.status = Some(Status::Error(e.to_string())),
         }
     }
+}
+
+/// The direct child of `ancestor` that lies on the path down to `descendant`,
+/// or `None` when `ancestor` is not a strict prefix of `descendant` (including
+/// when they are equal). Used by the file browser to retrace an upward walk:
+/// e.g. `child_towards("/a/b", "/a/b/c/d")` is `Some("/a/b/c")`.
+fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
+    let rest = descendant.strip_prefix(ancestor).ok()?;
+    let first = rest.components().next()?;
+    Some(ancestor.join(first))
 }
 
 /// Apply a horizontal-scroll `delta` to `current`, clamped to `[0, max]` where

@@ -644,6 +644,14 @@ pub struct TuiApp {
     /// [`TuiApp::open_browser`]; only meaningful while a browser overlay is up.
     pub(crate) browser_origin_dir: Option<PathBuf>,
 
+    /// Deepest folder the file browser was in before the user started walking
+    /// *up* the tree with Left, i.e. the trail to retrace on the way back down.
+    /// Each Left keeps it; each Right that follows the trail re-selects the next
+    /// folder down it, so pressing Left N times then Right N times returns to
+    /// exactly where you started. Descending into any *other* folder (a genuine
+    /// new navigation) clears it. Only meaningful while a browser overlay is up.
+    pub(crate) browser_forward_path: Option<PathBuf>,
+
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
@@ -746,6 +754,7 @@ impl Default for TuiApp {
             last_browse_dir: None,
             last_env_dir: None,
             browser_origin_dir: None,
+            browser_forward_path: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             default_request_view: request::RequestView::default(),
