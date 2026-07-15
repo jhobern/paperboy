@@ -1178,248 +1178,137 @@ impl NewReq {
         };
     }
 
+    /// A total ordering over every focusable field, used to walk the Tab
+    /// ring. The tuple is `(section, row, column)`; `Enabled` sorts after a
+    /// row's real Tab columns (so Tab off it lands on the next row) and each
+    /// "+ Add …" row sorts after all of its section's rows.
+    fn field_key(f: NewField) -> (u8, usize, u8) {
+        fn hdr(c: HdrCol) -> u8 {
+            match c {
+                HdrCol::Key => 0,
+                HdrCol::Value => 1,
+                HdrCol::Desc => 2,
+                HdrCol::Enabled => 3,
+            }
+        }
+        fn form(c: FormCol) -> u8 {
+            match c {
+                FormCol::Key => 0,
+                FormCol::Kind => 1,
+                FormCol::Value => 2,
+                FormCol::Ctype => 3,
+                FormCol::Desc => 4,
+                FormCol::Enabled => 5,
+            }
+        }
+        match f {
+            NewField::Name => (0, 0, 0),
+            NewField::Target => (1, 0, 0),
+            NewField::Method => (2, 0, 0),
+            NewField::Url => (3, 0, 0),
+            NewField::Header(i, c) => (4, i, hdr(c)),
+            NewField::AddHeader => (4, usize::MAX, 0),
+            NewField::Cookie(i, c) => (5, i, hdr(c)),
+            NewField::AddCookie => (5, usize::MAX, 0),
+            NewField::FormField(i, c) => (6, i, form(c)),
+            NewField::AddFormField => (6, usize::MAX, 0),
+            NewField::Body => (7, 0, 0),
+            NewField::Assert(i) => (8, i, 0),
+            NewField::AddAssert => (8, usize::MAX, 0),
+            NewField::Capture(i, c) => (9, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddCapture => (9, usize::MAX, 0),
+        }
+    }
+
+    /// The ordered list of fields Tab / Shift+Tab visits, in visual order,
+    /// given the current form state. A section that is entirely blank
+    /// contributes a single "entry" stop (its first row, or its "+ Add …"
+    /// row when it has none) and is otherwise skipped; a non-blank section
+    /// contributes each row's Tab columns followed by its Add row. Because
+    /// `next_forward`/`next_backward` are just steps along this one list,
+    /// they can never disagree about ordering or empty-section skipping.
+    fn tab_stops(&self) -> Vec<NewField> {
+        let mut v = vec![
+            NewField::Name,
+            NewField::Target,
+            NewField::Method,
+            NewField::Url,
+        ];
+        if self.headers_blank() {
+            v.push(self.header_entry());
+        } else {
+            let cells = self.tab_cells();
+            for i in 0..self.headers.len() {
+                v.extend(cells.iter().map(|&c| NewField::Header(i, c)));
+            }
+            v.push(NewField::AddHeader);
+        }
+        if self.cookies_blank() {
+            v.push(self.cookie_entry());
+        } else {
+            let cells = self.cookie_tab_cells();
+            for i in 0..self.cookies.len() {
+                v.extend(cells.iter().map(|&c| NewField::Cookie(i, c)));
+            }
+            v.push(NewField::AddCookie);
+        }
+        if self.form_fields_blank() {
+            v.push(self.form_entry());
+        } else {
+            let cells = self.form_tab_cells();
+            for i in 0..self.form_fields.len() {
+                v.extend(cells.iter().map(|&c| NewField::FormField(i, c)));
+            }
+            v.push(NewField::AddFormField);
+        }
+        v.push(NewField::Body);
+        if self.asserts_blank() {
+            v.push(self.assert_entry());
+        } else {
+            v.extend((0..self.asserts.len()).map(NewField::Assert));
+            v.push(NewField::AddAssert);
+        }
+        if self.captures_blank() {
+            v.push(self.capture_entry());
+        } else {
+            for i in 0..self.captures.len() {
+                v.push(NewField::Capture(i, CapCol::Name));
+                v.push(NewField::Capture(i, CapCol::Expr));
+            }
+            v.push(NewField::AddCapture);
+        }
+        v
+    }
+
+    /// Step one stop forward or backward around the Tab ring, wrapping at
+    /// the ends. Works even when `self.focus` isn't itself a stop (e.g. an
+    /// `Enabled` checkbox reached with the arrow keys): its ordering key
+    /// still places it between the appropriate stops.
+    fn step(&self, forward: bool) -> NewField {
+        let stops = self.tab_stops();
+        let here = Self::field_key(self.focus);
+        if forward {
+            stops
+                .iter()
+                .copied()
+                .find(|&s| Self::field_key(s) > here)
+                .unwrap_or(stops[0])
+        } else {
+            stops
+                .iter()
+                .rev()
+                .copied()
+                .find(|&s| Self::field_key(s) < here)
+                .unwrap_or(stops[stops.len() - 1])
+        }
+    }
+
     pub(crate) fn next_forward(&self) -> NewField {
-        let tab = self.tab_cells();
-        match self.focus {
-            NewField::Name => NewField::Target,
-            NewField::Target => NewField::Method,
-            NewField::Method => NewField::Url,
-            NewField::Url => self.header_entry(),
-            NewField::Header(i, col) => {
-                if self.headers_blank() {
-                    return self.cookie_entry(); // skip the empty header section
-                }
-                // Enabled is not in the tab order, so it counts as the row end.
-                let next_in_row = tab
-                    .iter()
-                    .position(|c| *c == col)
-                    .and_then(|idx| tab.get(idx + 1).copied());
-                if let Some(nc) = next_in_row {
-                    NewField::Header(i, nc)
-                } else if i + 1 < self.headers.len() {
-                    NewField::Header(i + 1, tab[0])
-                } else {
-                    NewField::AddHeader
-                }
-            }
-            NewField::AddHeader => self.cookie_entry(),
-            NewField::Cookie(i, col) => {
-                if self.cookies_blank() {
-                    return self.form_entry(); // skip the empty cookie section
-                }
-                let ctab = self.cookie_tab_cells();
-                let next_in_row = ctab
-                    .iter()
-                    .position(|c| *c == col)
-                    .and_then(|idx| ctab.get(idx + 1).copied());
-                if let Some(nc) = next_in_row {
-                    NewField::Cookie(i, nc)
-                } else if i + 1 < self.cookies.len() {
-                    NewField::Cookie(i + 1, ctab[0])
-                } else {
-                    NewField::AddCookie
-                }
-            }
-            NewField::AddCookie => self.form_entry(),
-            NewField::FormField(i, col) => {
-                if self.form_fields_blank() {
-                    return NewField::Body; // skip the empty form-fields section
-                }
-                let ftab = self.form_tab_cells();
-                let next_in_row = ftab
-                    .iter()
-                    .position(|c| *c == col)
-                    .and_then(|idx| ftab.get(idx + 1).copied());
-                if let Some(nc) = next_in_row {
-                    NewField::FormField(i, nc)
-                } else if i + 1 < self.form_fields.len() {
-                    NewField::FormField(i + 1, ftab[0])
-                } else {
-                    NewField::AddFormField
-                }
-            }
-            NewField::AddFormField => NewField::Body,
-            NewField::Body => self.assert_entry(),
-            NewField::Assert(i) => {
-                if self.asserts_blank() {
-                    return self.capture_entry(); // skip the empty assert section
-                }
-                if i + 1 < self.asserts.len() {
-                    NewField::Assert(i + 1)
-                } else {
-                    NewField::AddAssert
-                }
-            }
-            NewField::AddAssert => self.capture_entry(),
-            NewField::Capture(i, col) => {
-                if self.captures_blank() {
-                    return NewField::Name; // skip the empty capture section, wrap to top
-                }
-                let next_in_row = self.next_cap_col(col);
-                if let Some(nc) = next_in_row {
-                    NewField::Capture(i, nc)
-                } else if i + 1 < self.captures.len() {
-                    NewField::Capture(i + 1, CapCol::Name)
-                } else {
-                    NewField::AddCapture
-                }
-            }
-            NewField::AddCapture => NewField::Name,
-        }
+        self.step(true)
     }
 
-    /// Forward-entry into the Cookies section from Headers: unconditionally
-    /// its first row (row 0), or straight through to Form if there are no
     pub(crate) fn next_backward(&self) -> NewField {
-        let tab = self.tab_cells();
-        match self.focus {
-            NewField::Name => {
-                if self.captures.is_empty() || self.captures_blank() {
-                    if self.asserts.is_empty() || self.asserts_blank() {
-                        NewField::Body
-                    } else {
-                        NewField::Assert(self.asserts.len() - 1)
-                    }
-                } else {
-                    NewField::AddCapture
-                }
-            }
-            NewField::Target => NewField::Name,
-            NewField::Method => NewField::Target,
-            NewField::Url => NewField::Method,
-            NewField::Header(i, col) => {
-                // Enabled is not in the tab order; Shift+Tab off it lands on the
-                // last tab cell of the same row.
-                let prev_in_row = match tab.iter().position(|c| *c == col) {
-                    Some(idx) => idx.checked_sub(1).map(|p| tab[p]),
-                    None => tab.last().copied(),
-                };
-                if let Some(pc) = prev_in_row {
-                    NewField::Header(i, pc)
-                } else if i > 0 {
-                    NewField::Header(i - 1, *tab.last().unwrap())
-                } else {
-                    NewField::Url
-                }
-            }
-            NewField::AddHeader => {
-                if self.headers_blank() || self.headers.is_empty() {
-                    NewField::Url
-                } else {
-                    NewField::Header(self.headers.len() - 1, *tab.last().unwrap())
-                }
-            }
-            NewField::Cookie(i, col) => {
-                let ctab = self.cookie_tab_cells();
-                let prev_in_row = match ctab.iter().position(|c| *c == col) {
-                    Some(idx) => idx.checked_sub(1).map(|p| ctab[p]),
-                    None => ctab.last().copied(),
-                };
-                if let Some(pc) = prev_in_row {
-                    NewField::Cookie(i, pc)
-                } else if i > 0 {
-                    NewField::Cookie(i - 1, *ctab.last().unwrap())
-                } else {
-                    self.leave_headers_backward()
-                }
-            }
-            NewField::AddCookie => {
-                if self.cookies_blank() || self.cookies.is_empty() {
-                    self.leave_headers_backward()
-                } else {
-                    let ctab = self.cookie_tab_cells();
-                    NewField::Cookie(self.cookies.len() - 1, *ctab.last().unwrap())
-                }
-            }
-            NewField::FormField(i, col) => {
-                let ftab = self.form_tab_cells();
-                let prev_in_row = match ftab.iter().position(|c| *c == col) {
-                    Some(idx) => idx.checked_sub(1).map(|p| ftab[p]),
-                    None => ftab.last().copied(),
-                };
-                if let Some(pc) = prev_in_row {
-                    NewField::FormField(i, pc)
-                } else if i > 0 {
-                    NewField::FormField(i - 1, *ftab.last().unwrap())
-                } else {
-                    self.leave_cookies_backward()
-                }
-            }
-            NewField::AddFormField => {
-                if self.form_fields_blank() || self.form_fields.is_empty() {
-                    self.leave_cookies_backward()
-                } else {
-                    let ftab = self.form_tab_cells();
-                    NewField::FormField(self.form_fields.len() - 1, *ftab.last().unwrap())
-                }
-            }
-            NewField::Body => self.leave_form_backward(),
-            NewField::Assert(i) => {
-                if i > 0 {
-                    NewField::Assert(i - 1)
-                } else {
-                    NewField::Body
-                }
-            }
-            NewField::AddAssert => {
-                if self.asserts.is_empty() || self.asserts_blank() {
-                    NewField::Body
-                } else {
-                    NewField::Assert(self.asserts.len() - 1)
-                }
-            }
-            NewField::Capture(i, col) => match self.prev_cap_col(col) {
-                Some(pc) => NewField::Capture(i, pc),
-                None if i > 0 => NewField::Capture(i - 1, CapCol::Expr),
-                None => {
-                    if self.asserts.is_empty() || self.asserts_blank() {
-                        NewField::Body
-                    } else {
-                        NewField::Assert(self.asserts.len() - 1)
-                    }
-                }
-            },
-            NewField::AddCapture => {
-                if self.captures.is_empty() || self.captures_blank() {
-                    if self.asserts.is_empty() || self.asserts_blank() {
-                        NewField::Body
-                    } else {
-                        NewField::Assert(self.asserts.len() - 1)
-                    }
-                } else {
-                    NewField::Capture(self.captures.len() - 1, CapCol::Expr)
-                }
-            }
-        }
-    }
-
-    /// Backward step from Body into the (possibly blank/empty) Form section:
-    /// mirrors Header's existing "step into a blank section rather than skip
-    /// it" backward behaviour, so Shift+Tab from Body always dips one field
-    /// back before jumping further. When the section is genuinely empty
-    /// (no rows at all), the only field there is its "+ Add …" row.
-    fn leave_form_backward(&self) -> NewField {
-        if !self.form_fields.is_empty() && self.form_fields_blank() {
-            NewField::FormField(0, self.form_tab_cells()[0])
-        } else {
-            NewField::AddFormField
-        }
-    }
-
-    fn leave_cookies_backward(&self) -> NewField {
-        if !self.cookies.is_empty() && self.cookies_blank() {
-            NewField::Cookie(0, HdrCol::Key)
-        } else {
-            NewField::AddCookie
-        }
-    }
-
-    fn leave_headers_backward(&self) -> NewField {
-        if !self.headers.is_empty() && self.headers_blank() {
-            NewField::Header(0, HdrCol::Key)
-        } else {
-            NewField::AddHeader
-        }
+        self.step(false)
     }
 
     /// Ctrl+Down: jump straight to the first field of the next section
