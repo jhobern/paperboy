@@ -355,6 +355,18 @@ pub(crate) enum Overlay {
         origin: Option<WorkspaceGitOrigin>,
         sel: usize,
     },
+    /// Shown before "Save Workspace to Git" when the currently-loaded file in
+    /// the Workspace tab has unsaved in-memory edits: a git push commits the
+    /// files as they sit on disk, so those edits would be left out unless
+    /// saved first (switching files within a Workspace discards in-memory
+    /// edits, so only the current file can ever hold them). `ci` is the
+    /// Workspace tab. `sel`: 0 = save the edits to disk then push, 1 = push
+    /// the on-disk version as-is (leaving the edits only in memory), 2 =
+    /// cancel.
+    WorkspaceGitSaveUnsaved {
+        ci: usize,
+        sel: usize,
+    },
 }
 
 /// Which action a confirmation popup is guarding.
@@ -415,7 +427,7 @@ pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 7] {
 }
 
 /// The 8 items of the File menu's "Save" submenu.
-pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 8] {
+pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 9] {
     [
         s.file_save_item_request,
         s.file_save_item_collection,
@@ -424,6 +436,7 @@ pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 8] {
         s.file_save_item_environment,
         s.file_save_item_environment_as,
         s.file_save_item_workspace,
+        s.file_save_item_workspace_git,
         s.file_save_item_response,
     ]
 }
@@ -2052,6 +2065,69 @@ impl TuiApp {
         ))));
     }
 
+    /// Open the "Save Workspace to Git…" wizard for the active tab, or show
+    /// [`Status::NoGitOrigin`] if it isn't a git-loaded Workspace (this action
+    /// is only ever offered for a tab that was downloaded from git and still
+    /// has its files on disk). If the currently-loaded file has unsaved
+    /// in-memory edits, a warning is shown first (see
+    /// [`Overlay::WorkspaceGitSaveUnsaved`]) so those edits aren't silently
+    /// omitted from the pushed on-disk tree.
+    pub(crate) fn open_git_workspace_save_wizard(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        let is_git_workspace = col.workspace_git_origin.is_some() && col.workspace_root.is_some();
+        if !is_git_workspace {
+            self.status = Some(Status::NoGitOrigin);
+            return;
+        }
+        // The push commits the tree as it sits on disk; warn if the loaded
+        // file has edits that only live in memory (and thus a place on disk
+        // to save them to) so the user can choose whether to include them.
+        if col.path.is_some() && self.changed_request_count(ci) > 0 {
+            self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel: 0 });
+            return;
+        }
+        self.start_git_workspace_save_wizard(ci);
+    }
+
+    /// Open the workspace git-save wizard for tab `ci` (assumes it is a
+    /// git-loaded Workspace). Factored out so the unsaved-changes warning's
+    /// "proceed" choices can reach it after deciding what to do with the
+    /// in-memory edits.
+    pub(crate) fn start_git_workspace_save_wizard(&mut self, ci: usize) {
+        let Some(origin) = self.collections[ci].workspace_git_origin.clone() else {
+            self.status = Some(Status::NoGitOrigin);
+            return;
+        };
+        self.overlay = Some(Overlay::GitSave(Box::new(GitSaveWizard::new_workspace(
+            ci,
+            &self.collections[ci],
+            &origin,
+        ))));
+    }
+
+    /// Write Workspace tab `ci`'s currently-loaded file back to its path on
+    /// disk and clear its "new"/"modified" markers, so a following git push
+    /// includes the edits. Returns `false` (setting [`Status::Error`]) if the
+    /// file has no path or the write fails, so the caller can abort the push.
+    pub(crate) fn save_workspace_current_file(&mut self, ci: usize) -> bool {
+        let Some(path) = self.collections[ci].path.clone() else {
+            return false;
+        };
+        let text = self.collections[ci].to_hurl();
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.mark_collection_saved(ci);
+                self.save_state();
+                true
+            }
+            Err(e) => {
+                self.status = Some(Status::Error(e.to_string()));
+                false
+            }
+        }
+    }
+
     /// Record `url` as the most-recently-used git URL: moved to the front,
     /// deduplicated, and capped to the 10 most recent. Persisted immediately so
     /// it is offered in the "Load from Git" dropdown next time.
@@ -2280,8 +2356,10 @@ impl TuiApp {
                 w.stage = if w.kind == RemoteKind::Workspace {
                     RemoteStage::PickWorkspaceFilter { sel: 0 }
                 } else {
+                    // Only show files worth loading for this kind (a big repo
+                    // otherwise buries the one `.hurl`/`.vars` under noise).
                     RemoteStage::PickFile {
-                        files,
+                        files: relevant_files(w.kind, &files),
                         filter: String::new(),
                         sel: 0,
                     }
@@ -2397,6 +2475,18 @@ impl TuiApp {
                     if w.url.text().trim().is_empty() {
                         let s = Strings::for_language(&self.language);
                         w.stage = GitSaveStage::Error(s.git_url_required.to_string());
+                    } else if matches!(w.source, GitSaveSource::Workspace { .. }) {
+                        // A Workspace push has no per-file path to choose (the
+                        // whole tree is committed as-is), so skip ChoosePaths
+                        // and go straight to picking the branch/tag, spawning
+                        // the refs fetch as ChoosePaths would have.
+                        let url = w.url.text();
+                        let token = w.token_opt();
+                        w.rx = Some(spawn_git_save_refs(url, token));
+                        w.stage = GitSaveStage::ChooseTarget {
+                            sel: None,
+                            refs: None,
+                        };
                     } else {
                         w.stage = GitSaveStage::ChoosePaths { field: 0 };
                     }
@@ -2536,13 +2626,36 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if !w.commit_msg.text().trim().is_empty() {
                         let ci = w.ci;
-                        let col = &self.collections[ci];
-                        let mut files = vec![(w.collection_path.text(), col.to_hurl())];
-                        if w.include_env
-                            && let Some(env) = w.env.as_ref()
-                        {
-                            files.push((w.env_path.text(), env.to_vars_text()));
-                        }
+                        let files = match &w.source {
+                            GitSaveSource::Workspace { root, .. } => {
+                                match crate::workspace::collect_files_for_commit(root) {
+                                    Ok(files) if !files.is_empty() => files,
+                                    Ok(_) => {
+                                        let s = Strings::for_language(&self.language);
+                                        w.stage = GitSaveStage::Error(
+                                            s.git_save_workspace_empty.to_string(),
+                                        );
+                                        self.overlay = Some(Overlay::GitSave(w));
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        w.stage = GitSaveStage::Error(e.to_string());
+                                        self.overlay = Some(Overlay::GitSave(w));
+                                        return;
+                                    }
+                                }
+                            }
+                            GitSaveSource::Collection => {
+                                let col = &self.collections[ci];
+                                let mut files = vec![(w.collection_path.text(), col.to_hurl())];
+                                if w.include_env
+                                    && let Some(env) = w.env.as_ref()
+                                {
+                                    files.push((w.env_path.text(), env.to_vars_text()));
+                                }
+                                files
+                            }
+                        };
                         w.rx = Some(spawn_git_save_push(
                             w.url.text(),
                             w.token_opt(),
@@ -2614,8 +2727,8 @@ impl TuiApp {
                 w.stage = GitSaveStage::Error(e);
                 true
             }
-            GitSaveMsg::Pushed(Ok(())) => {
-                self.finish_git_save(w);
+            GitSaveMsg::Pushed(Ok(new_sha)) => {
+                self.finish_git_save(w, &new_sha);
                 w.stage = GitSaveStage::Done;
                 true
             }
@@ -2636,8 +2749,29 @@ impl TuiApp {
     /// collection's (and, if included, the environment's) new git origin. A
     /// tag-target save clears the markers too but leaves the remembered
     /// branch origin untouched, per spec.
-    fn finish_git_save(&mut self, w: &GitSaveWizard) {
+    fn finish_git_save(&mut self, w: &GitSaveWizard, new_sha: &str) {
         let ci = w.ci;
+        if let GitSaveSource::Workspace { filter, .. } = &w.source {
+            // A Workspace push commits the on-disk tree, not the in-memory
+            // collection, so there are no per-request "modified" markers to
+            // clear. For a branch target, repin the remembered origin to the
+            // exact commit just pushed so a later redownload fetches it (and
+            // follows the same branch); a tag target leaves the origin
+            // untouched, mirroring the collection flow.
+            if w.target_kind == GitSaveTarget::Branch {
+                self.collections[ci].workspace_git_origin = Some(WorkspaceGitOrigin {
+                    repo_url: w.url.text(),
+                    commit_sha: new_sha.to_string(),
+                    ref_kind: RefKind::Branch,
+                    ref_name: w.target_name.text(),
+                    filter: *filter,
+                });
+            }
+            self.remember_git_url(&w.url.text());
+            self.save_state();
+            self.status = Some(Status::GitSaved);
+            return;
+        }
         self.mark_collection_saved(ci);
         if w.include_env
             && let Some(env_id) = w.env.as_ref().map(|e| e.id)

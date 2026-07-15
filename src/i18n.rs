@@ -86,6 +86,7 @@ strings! {
     file_save_item_environment => "(E)nvironment…", "(E)nvironnement…", "(M)iljø…";
     file_save_item_environment_as => "En(v)ironment As…", "En(v)ironnement sous…", "Miljø - n(y)t navn…";
     file_save_item_workspace => "(W)orkspace…", "(W)orkspace…", "(W)orkspace…";
+    file_save_item_workspace_git => "Save Work(s)pace to Git…", "Enregistrer le work(s)pace sur Git…", "Gem workspace til Gi(t)…";
     file_save_item_response => "Res(p)onse…", "Ré(p)onse…", "S(v)ar…";
     save_request => "Save Request…", "Enregistrer la requête…", "Gem anmodning…";
     load_request => "Load Request…", "Charger une requête…", "Indlæs anmodning…";
@@ -223,6 +224,11 @@ strings! {
     git_workspace_storage_choose => "Choose a folder…", "Choisir un dossier…", "Vælg en mappe…";
     git_no_origin => "This collection wasn't loaded from Git.", "Cette collection n'a pas été chargée depuis Git.", "Denne samling blev ikke indlæst fra Git.";
     git_save_title => "Save to Git", "Enregistrer sur Git", "Gem til Git";
+    git_save_workspace_empty => "The workspace has no files to save.", "Le workspace n'a aucun fichier à enregistrer.", "Dette workspace har ingen filer at gemme.";
+    git_save_ws_unsaved_q => "The current file has unsaved changes. A Git push commits the files as they are on disk, so those changes won't be included unless you save them first.\n\nWhat would you like to do?", "Le fichier actuel a des modifications non enregistrées. Un envoi vers Git valide les fichiers tels qu'ils sont sur le disque, donc ces modifications ne seront pas incluses si vous ne les enregistrez pas d'abord.\n\nQue souhaitez-vous faire ?", "Den aktuelle fil har ugemte ændringer. En Git-push committer filerne, som de er på disken, så disse ændringer medtages ikke, medmindre du gemmer dem først.\n\nHvad vil du gøre?";
+    git_save_ws_unsaved_save => "Save changes, then push", "Enregistrer les modifications, puis envoyer", "Gem ændringer, og push derefter";
+    git_save_ws_unsaved_ignore => "Push the saved version (discard unsaved changes)", "Envoyer la version enregistrée (ignorer les modifications non enregistrées)", "Push den gemte version (kassér ugemte ændringer)";
+    git_save_ws_unsaved_cancel => "Cancel", "Annuler", "Annuller";
     git_save_include_env_label => "Also save the environment", "Enregistrer aussi l'environnement", "Gem også miljøet";
     git_save_collection_path_label => "Collection path in repo", "Chemin de la collection dans le dépôt", "Samlingens sti i repoet";
     git_save_env_path_label => "Environment path in repo", "Chemin de l'environnement dans le dépôt", "Miljøets sti i repoet";

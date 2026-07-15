@@ -197,6 +197,17 @@ pub fn cleanup(repo: &Path) {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+/// Best-effort removal of the `origin` remote from `repo` so its `.git/config`
+/// no longer stores the authed fetch URL (which embeds the access token). Used
+/// when a temp repo outlives the load — a git-loaded workspace keeps its temp
+/// repo as the persisted `workspace_root`, so the token must not linger there.
+/// Downloads are complete by the time this runs, so dropping the remote is
+/// harmless. Errors are ignored: at worst the config is left as-is.
+pub fn scrub_remote(repo: &Path) {
+    let _ = run_git(&["remote", "remove", "origin"], Some(repo), None);
+}
+
+
 /// Blobless-fetch the given ref into a throwaway repo and list every file path
 /// at that ref. Returns the paths, the resolved commit sha (so a later
 /// redownload can pin the exact same commit rather than "whatever the branch
@@ -575,6 +586,38 @@ def456\trefs/heads/dev
 
         cleanup(&repo);
         cleanup(bare.parent().unwrap());
+    }
+
+    #[test]
+    fn scrub_remote_removes_the_origin_so_no_token_is_left_in_the_config() {
+        // A token-authed https load writes the authed URL (token embedded)
+        // into the temp repo's origin remote; a persisted workspace keeps
+        // that repo, so the token would linger in `.git/config` without
+        // scrubbing.
+        let repo = make_temp_repo().unwrap();
+        git(&["init", "-q"], &repo);
+        let authed = authed_url("https://github.com/o/r.git", Some("SECRET"));
+        git(&["remote", "add", "origin", &authed], &repo);
+
+        let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        assert!(
+            config.contains("SECRET"),
+            "sanity: the authed URL (with the token) is initially in the config"
+        );
+
+        scrub_remote(&repo);
+
+        let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        assert!(
+            !config.contains("SECRET"),
+            "scrub_remote drops the origin remote so the token no longer sits on disk"
+        );
+        assert!(
+            !config.contains("origin"),
+            "the origin remote is gone entirely"
+        );
+
+        cleanup(&repo);
     }
 
     #[test]

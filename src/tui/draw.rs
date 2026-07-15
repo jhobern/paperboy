@@ -2168,6 +2168,14 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let choices = [s.git_workspace_storage_temp, s.git_workspace_storage_choose];
             draw_confirm_popup(f, s.git_workspace_storage_q, &choices, *sel, th);
         }
+        Overlay::WorkspaceGitSaveUnsaved { sel, .. } => {
+            let choices = [
+                s.git_save_ws_unsaved_save,
+                s.git_save_ws_unsaved_ignore,
+                s.git_save_ws_unsaved_cancel,
+            ];
+            draw_confirm_popup(f, s.git_save_ws_unsaved_q, &choices, *sel, th);
+        }
     }
 }
 

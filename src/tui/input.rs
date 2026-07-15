@@ -587,6 +587,50 @@ impl TuiApp {
                 },
                 _ => self.overlay = Some(Overlay::CloseGitWorkspace { idx, path, sel }),
             },
+            Overlay::WorkspaceGitSaveUnsaved { ci, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Left => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Right => {
+                    self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
+                        ci,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Enter => match sel {
+                    // Save the in-memory edits to disk first, then push — but
+                    // only proceed if the save actually succeeded.
+                    0 => {
+                        self.overlay = None;
+                        if self.save_workspace_current_file(ci) {
+                            self.start_git_workspace_save_wizard(ci);
+                        }
+                    }
+                    // Push the on-disk version, leaving the edits in memory.
+                    1 => {
+                        self.overlay = None;
+                        self.start_git_workspace_save_wizard(ci);
+                    }
+                    _ => self.overlay = None,
+                },
+                _ => self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel }),
+            },
             Overlay::WorkspaceReloadConfirm { idx, reload, sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     // Declined: same outcome as any other Workspace whose
@@ -3259,6 +3303,7 @@ impl TuiApp {
             4 => self.begin_save(FileAction::SaveEnv),
             5 => self.begin_save_as(FileAction::SaveEnv),
             6 => self.begin_save_workspace_as(),
+            7 => self.open_git_workspace_save_wizard(),
             _ => self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json"),
         }
     }

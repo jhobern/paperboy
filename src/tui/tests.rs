@@ -3992,6 +3992,312 @@ fn saving_to_git_appends_a_commit_and_updates_the_remembered_origin_and_markers(
 }
 
 #[test]
+fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() {
+    use crate::i18n::Status;
+    use std::process::Command;
+
+    fn git(args: &[&str], cwd: &std::path::Path) {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "paperboy-ws-git-save-test-{}-{nanos}",
+        std::process::id()
+    ));
+    let bare = base.join("bare.git");
+    let seed = base.join("seed");
+    let ws = base.join("ws"); // the tab's on-disk workspace_root
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::create_dir_all(ws.join("api")).unwrap();
+
+    // Seed the "remote" with an existing tree on `main`.
+    git(&["init", "--bare", "-q", "."], &bare);
+    git(&["init", "-q"], &seed);
+    git(&["checkout", "-q", "-b", "main"], &seed);
+    git(&["config", "user.name", "Seed"], &seed);
+    git(&["config", "user.email", "seed@test"], &seed);
+    std::fs::create_dir_all(seed.join("api")).unwrap();
+    std::fs::write(seed.join("api/health.hurl"), "GET https://old\n").unwrap();
+    git(&["add", "-A"], &seed);
+    git(&["commit", "-q", "-m", "seed"], &seed);
+    git(&["remote", "add", "origin", bare.to_str().unwrap()], &seed);
+    git(&["push", "-q", "origin", "main"], &seed);
+    let bare_url = bare.to_str().unwrap().to_string();
+
+    // The local workspace holds an edited file plus a new one, and a `.git`
+    // folder that must be excluded from the commit.
+    std::fs::write(ws.join("api/health.hurl"), "GET https://new\n").unwrap();
+    std::fs::write(ws.join("api/orders.hurl"), "GET https://orders\n").unwrap();
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::write(ws.join(".git/config"), "secret\n").unwrap();
+
+    let origin = WorkspaceGitOrigin {
+        repo_url: bare_url.clone(),
+        commit_sha: "0000000000000000000000000000000000000000".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+        filter: WorkspaceGitFilter::HurlAndJson,
+    };
+    let mut col = Collection::new("api-workspace".into(), Vec::new());
+    col.workspace_root = Some(ws.clone());
+    col.workspace_downloaded_from_git = true;
+    col.workspace_git_origin = Some(origin);
+
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    app.open_git_workspace_save_wizard();
+    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
+        panic!("the workspace git-save wizard should open")
+    };
+    // `new_workspace` seeds the branch/target from the origin; jump straight
+    // to the commit message (target/branch key handling is shared with the
+    // collection flow, already covered above).
+    assert!(
+        matches!(w.stage, GitSaveStage::Connect { .. }),
+        "opens on the Connect step"
+    );
+    assert_eq!(w.target_name.text(), "main");
+    w.stage = GitSaveStage::CommitMessage;
+    app.overlay = Some(Overlay::GitSave(w));
+
+    press(&mut app, KeyCode::Enter); // enumerate the tree + push
+
+    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
+        panic!("wizard should still be open (Pushing)")
+    };
+    assert!(
+        matches!(w.stage, GitSaveStage::Pushing),
+        "a workspace with files pushes immediately"
+    );
+    let rx = w.rx.take().expect("the push should have been spawned");
+    let msg = rx.recv().expect("the push thread should send a result");
+    let keep_open = app.apply_git_save_msg(&mut w, msg);
+    assert!(keep_open);
+    assert!(
+        matches!(w.stage, GitSaveStage::Done),
+        "a successful workspace push moves to Done"
+    );
+    assert!(matches!(app.status, Some(Status::GitSaved)));
+
+    // The remembered origin is repinned to the freshly-pushed commit (no
+    // longer the placeholder sha) while keeping the branch and filter.
+    let repinned = app.collections[ci].workspace_git_origin.as_ref().unwrap();
+    assert_ne!(
+        repinned.commit_sha, "0000000000000000000000000000000000000000",
+        "the origin sha is repinned to the new commit"
+    );
+    assert_eq!(repinned.ref_name, "main");
+    assert!(matches!(repinned.filter, WorkspaceGitFilter::HurlAndJson));
+
+    // The pushed commit carries the edited + new files (and never the `.git`).
+    git(&["fetch", "-q", "origin", "main"], &seed);
+    let show = Command::new("git")
+        .current_dir(&seed)
+        .args(["show", "origin/main:api/health.hurl"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&show.stdout), "GET https://new\n");
+    let orders = Command::new("git")
+        .current_dir(&seed)
+        .args(["show", "origin/main:api/orders.hurl"])
+        .output()
+        .unwrap();
+    assert!(orders.status.success(), "the new file was committed too");
+    let tree = Command::new("git")
+        .current_dir(&seed)
+        .args(["ls-tree", "-r", "--name-only", "origin/main"])
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        !names.contains(".git"),
+        "the workspace's internal .git folder is never committed"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn saving_a_workspace_to_git_is_rejected_when_the_tab_was_not_git_loaded() {
+    use crate::i18n::Status;
+    let mut app = TuiApp::default();
+    let col = Collection::new("plain".into(), Vec::new());
+    app.collections.push(col);
+    app.active_tab = app.collections.len() - 1;
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(app.overlay.is_none(), "no wizard opens without a git origin");
+    assert!(matches!(app.status, Some(Status::NoGitOrigin)));
+}
+
+/// Build an app with a single git-loaded Workspace tab whose currently-loaded
+/// file (`current.hurl` under a fresh temp root) has one unsaved, modified
+/// request in memory. Returns the app, the tab index, and the on-disk path of
+/// the loaded file (seeded with placeholder content that differs from the
+/// in-memory collection, so a "save" is observable). Caller cleans up the dir.
+fn workspace_tab_with_unsaved_edit() -> (TuiApp, usize, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "paperboy-ws-unsaved-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("current.hurl");
+    std::fs::write(&file, "GET https://on-disk-placeholder\n").unwrap();
+
+    let mut entry = HurlEntry {
+        method: "GET".into(),
+        url: "https://edited-in-memory".into(),
+        ..Default::default()
+    };
+    entry.modified = true;
+    let mut col = Collection::new("api-workspace".into(), vec![entry]);
+    col.workspace_root = Some(root.clone());
+    col.workspace_downloaded_from_git = true;
+    col.path = Some(file.clone());
+    col.workspace_git_origin = Some(WorkspaceGitOrigin {
+        repo_url: "https://example.test/repo.git".into(),
+        commit_sha: "abc123".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+        filter: WorkspaceGitFilter::HurlAndJson,
+    });
+
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    (app, ci, file)
+}
+
+#[test]
+fn saving_a_workspace_to_git_warns_first_when_the_loaded_file_has_unsaved_edits() {
+    let (mut app, ci, _file) = workspace_tab_with_unsaved_edit();
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::WorkspaceGitSaveUnsaved { ci: c, sel: 0 }) if *c == ci
+        ),
+        "unsaved in-memory edits raise the warning instead of opening the wizard"
+    );
+}
+
+#[test]
+fn workspace_unsaved_warning_save_choice_writes_the_file_then_opens_the_wizard() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    let expected = app.collections[ci].to_hurl();
+
+    app.open_git_workspace_save_wizard();
+    // sel starts on "Save changes, then push".
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "after saving, the git-save wizard opens"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        expected,
+        "the in-memory edits were written to disk"
+    );
+    assert!(
+        !app.collections[ci].entries[0].modified,
+        "the modified marker is cleared once saved"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn workspace_unsaved_warning_discard_choice_pushes_disk_version_and_keeps_edits_in_memory() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    let on_disk_before = std::fs::read_to_string(&file).unwrap();
+
+    app.open_git_workspace_save_wizard();
+    press(&mut app, KeyCode::Down); // move to "Push the saved version"
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "discarding opens the wizard directly (pushes the on-disk tree)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        on_disk_before,
+        "the on-disk file is left untouched"
+    );
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "the in-memory edits remain (only left out of this push)"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn workspace_unsaved_warning_cancel_choice_closes_without_opening_the_wizard() {
+    let (mut app, _ci, file) = workspace_tab_with_unsaved_edit();
+
+    app.open_git_workspace_save_wizard();
+    press(&mut app, KeyCode::Up); // wrap up to "Cancel"
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none(), "cancel closes the warning");
+
+    // Esc also cancels.
+    app.open_git_workspace_save_wizard();
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::WorkspaceGitSaveUnsaved { .. })
+    ));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "Esc dismisses the warning");
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
+fn saving_a_workspace_to_git_skips_the_warning_when_there_are_no_unsaved_edits() {
+    let (mut app, ci, file) = workspace_tab_with_unsaved_edit();
+    // Mark the loaded file as clean (no in-memory edits pending).
+    app.collections[ci].entries[0].modified = false;
+
+    app.open_git_workspace_save_wizard();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::GitSave(_))),
+        "with nothing unsaved the wizard opens straight away"
+    );
+
+    let _ = std::fs::remove_dir_all(file.parent().unwrap());
+}
+
+#[test]
 fn saving_to_a_tag_that_already_exists_is_rejected_and_never_overwritten() {
     use crate::git_remote::{GitOrigin, RefKind};
     use std::process::Command;
