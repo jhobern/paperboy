@@ -1896,11 +1896,19 @@ fn file_menu_mnemonic_keys_jump_straight_into_a_submenu() {
 fn file_load_submenu_mnemonic_activates_the_item_immediately() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    press(&mut app, KeyCode::Char('g')); // "Collection from (G)it…"
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Char('c')); // "(C)ollection…" -> source step
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::FileLoadSource(FileKind::Collection, 0))
+        ),
+        "picking a kind opens the local-vs-git source step"
+    );
+    press(&mut app, KeyCode::Char('g')); // "From (G)it…"
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
-        "mnemonic both selects and activates the item, without needing Enter"
+        "the git source both selects and activates without needing Enter"
     );
 }
 
@@ -1911,7 +1919,15 @@ fn file_save_submenu_mnemonic_activates_the_item_immediately() {
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down); // -> "(S)ave"
     press(&mut app, KeyCode::Enter);
-    press(&mut app, KeyCode::Char('g')); // "Save Collection to (G)it…"
+    press(&mut app, KeyCode::Char('c')); // "(C)ollection…" -> destination step
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::FileSaveDest(FileKind::Collection, 0))
+        ),
+        "picking a kind opens the save-destination step"
+    );
+    press(&mut app, KeyCode::Char('g')); // "To (G)it…"
     assert!(app.overlay.is_none(), "no wizard for a non-git collection");
     assert!(matches!(app.status, Some(Status::NoGitOrigin)));
 }
@@ -1948,6 +1964,10 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             file_menu_items(&s).to_vec(),
             file_load_items(&s).to_vec(),
             file_save_items(&s).to_vec(),
+            file_load_source_items(&s).to_vec(),
+            file_save_dest_items(FileKind::Collection, &s),
+            file_save_dest_items(FileKind::Environment, &s),
+            file_save_dest_items(FileKind::Workspace, &s),
         ] {
             let mnemonics: Vec<char> = items
                 .iter()
@@ -1972,9 +1992,10 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
 fn file_menu_opens_the_remote_git_wizards() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    press(&mut app, KeyCode::Down); // -> Collection...
-    press(&mut app, KeyCode::Down); // -> Collection from Git...
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Down); // -> Collection
+    press(&mut app, KeyCode::Enter); // -> source step (Local / From Git)
+    press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
@@ -1983,10 +2004,11 @@ fn file_menu_opens_the_remote_git_wizards() {
 
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Enter); // -> Load submenu
-    for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // -> Environment from Git...
-    }
+    press(&mut app, KeyCode::Enter); // -> Load kind list
+    press(&mut app, KeyCode::Down); // -> Collection
+    press(&mut app, KeyCode::Down); // -> Environment
+    press(&mut app, KeyCode::Enter); // -> source step
+    press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Environment),
@@ -2270,22 +2292,58 @@ fn a_workspace_download_failure_is_shown_as_an_error() {
 }
 
 #[test]
-fn file_menu_offers_a_load_workspace_from_git_item_alongside_the_local_folder_picker() {
+fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
-    let items = file_load_items(&s);
-    assert_eq!(items.len(), 7);
-    assert_eq!(
-        mnemonic_index(&items, 's'),
-        Some(6),
-        "the new item's mnemonic activates it"
-    );
 
+    // The Load kind list is now just the four kinds (no per-kind git twin).
+    let items = file_load_items(&s);
+    assert_eq!(items.len(), 4);
+    assert_eq!(file_load_kind_index(FileKind::Workspace), 3);
+
+    // Picking Workspace opens the local-vs-git source step…
     let mut app = TuiApp::default();
-    app.activate_file_load_item(6);
+    app.activate_file_load_item(3);
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::FileLoadSource(FileKind::Workspace, 0))
+    ));
+
+    // …and "From Git" (sel 1) opens the wizard in Workspace mode.
+    app.activate_file_load_source(FileKind::Workspace, 1);
     assert!(
         matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Workspace),
-        "the Workspace-from-git item opens the wizard in Workspace mode"
+        "the git source opens the wizard in Workspace mode"
+    );
+}
+
+#[test]
+fn the_load_source_step_esc_returns_to_the_kind_list_with_the_kind_relit() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 1));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileLoadMenu(2))),
+        "Esc steps back to the kind list with Environment (row 2) highlighted"
+    );
+}
+
+#[test]
+fn the_save_destination_step_lists_the_right_choices_per_kind() {
+    use crate::i18n::Strings;
+    let s = Strings::for_language(&Language::English);
+    // Collection can Save / Save As / To Git; Environment has no git save;
+    // a Workspace is a folder, so only Save As / To Git.
+    assert_eq!(file_save_dest_items(FileKind::Collection, &s).len(), 3);
+    assert_eq!(file_save_dest_items(FileKind::Environment, &s).len(), 2);
+    assert_eq!(file_save_dest_items(FileKind::Workspace, &s).len(), 2);
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileSaveMenu(3))),
+        "Esc steps back to the Save kind list with Workspace (row 3) highlighted"
     );
 }
 
@@ -3663,8 +3721,10 @@ fn save_to_git_menu_item_is_refused_without_a_remembered_git_origin() {
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down); // -> "(S)ave" submenu
     press(&mut app, KeyCode::Enter);
-    for _ in 0..3 {
-        press(&mut app, KeyCode::Down); // Save menu item 3 = "Save Collection to Git…"
+    press(&mut app, KeyCode::Down); // -> Collection kind
+    press(&mut app, KeyCode::Enter); // -> destination step
+    for _ in 0..2 {
+        press(&mut app, KeyCode::Down); // dest item 2 = "To Git…"
     }
     press(&mut app, KeyCode::Enter);
 
@@ -7235,11 +7295,13 @@ fn save_collection_to_original_confirms_then_saves() {
     app.active_tab = 1;
 
     // f -> File menu; Down -> "(S)ave" submenu; Enter opens it; Down x1
-    // lands on "Collection"; Enter.
+    // lands on "Collection"; Enter opens its destination step; Enter again
+    // picks "Save" (write back to the original file).
     press(&mut app, KeyCode::Char('f'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(

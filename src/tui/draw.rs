@@ -1702,6 +1702,16 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let items = file_save_items(s);
             draw_menu_popup(f, s.file_save_menu, &items, *sel, th);
         }
+        Overlay::FileLoadSource(kind, sel) => {
+            let items = file_load_source_items(s);
+            let title = format!("{} {}", s.file_load_menu, kind.name(s));
+            draw_menu_popup(f, &title, &items, *sel, th);
+        }
+        Overlay::FileSaveDest(kind, sel) => {
+            let items = file_save_dest_items(*kind, s);
+            let title = format!("{} {}", s.file_save_menu, kind.name(s));
+            draw_menu_popup(f, &title, &items, *sel, th);
+        }
         Overlay::Options(sel) => {
             let items = [s.language_label, s.preferences_menu, s.clear_all];
             draw_menu_popup(f, s.options_menu, &items, *sel, th);
@@ -1861,6 +1871,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("f / s", s.help_menus),
                             ("w", s.help_workspace_browse),
+                            ("\u{2192} / Enter (Workspace)", s.help_workspace_open),
                             ("^r (File browser)", s.help_browser_reset),
                         ],
                     ),

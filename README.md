@@ -140,8 +140,8 @@ cargo build --release
   git remote (see below) — no local clone required. A collection or
   environment loaded from git shows a small ⎇ icon in its tab title /
   Environment heading, and can be pushed back to a new branch or tag with
-  **Save Collection to Git…**.
-- A **recently-used git URLs** dropdown in the "Load from Git" wizard, most
+  **Save → Collection → To Git…**.
+- A **recently-used git URLs** dropdown in the "from Git" wizard, most
   recent first.
 - Resizable panes: the left column width and the response pane height are
   both adjustable and persisted across restarts.
@@ -168,26 +168,32 @@ cargo build --release
 
 ## Working with collections & environments
 
-Open the **File menu** with `f`. Load and save actions are grouped together:
+Open the **File menu** with `f`, then pick **(L)oad** or **(S)ave**. Each
+opens a short list of *what* you want to load or save (Request, Collection,
+Environment, Workspace, Response). Choosing a kind that can come from — or go
+to — more than one place opens a second step to pick the source or
+destination, so git and local options no longer clutter one long list:
 
-| Action | What it does |
-|---|---|
-| Load Request | Load a single saved request-JSON snippet into the Scratch Space |
-| Open Collection | Open a `.hurl` or Postman `.json` file from disk as a new tab |
-| Load from Git… | Open a collection file (optionally with its environment) from a remote git repo (see below) |
-| Load Environment | Open a `.vars` file from disk into the active tab |
-| Load Environment from Git… | Open an environment file from a remote git repo |
-| Save Request | Save the current request's JSON to disk |
-| Save Collection | Write the active collection back to its original file |
-| Save Collection As… | Write the active collection to a new/chosen file |
-| Save Collection to Git… | Push the active collection (and, optionally, its environment) back to the git repo it was loaded from (see below) — only offered for a collection that was itself loaded from git |
-| Save Environment | Write the active environment back to its original file |
-| Save Environment As… | Write the active environment to a new/chosen file |
-| Save Response | Save the last response body to disk |
+| Kind | Load sources | Save destinations |
+|---|---|---|
+| Request | Local file only (goes straight to a path prompt) | Local file only |
+| Collection | **Local file…** / **From Git…** | **Save** (original file) / **Save As…** / **To Git…** |
+| Environment | **Local file…** / **From Git…** | **Save** (original file) / **Save As…** |
+| Workspace | **Local file…** / **From Git…** | **Save As…** (copy the folder) / **To Git…** |
+| Response | — | Local file only |
+
+Every step is keyboard-driven: each item has a bracketed mnemonic (e.g.
+**(L)ocal file…**, **From (G)it…**, **(S)ave**), and pressing that letter both
+selects *and* activates the item — no extra Enter needed. `Esc` steps back to
+the previous step (with the kind you picked still highlighted).
+
+- **To Git…** is only meaningful for a collection/workspace that was itself
+  loaded from git; on anything else it just reports that there's no remembered
+  git origin.
 
 Notes on saving:
 
-- **Save Collection** / **Save Environment** write back to the file the tab
+- **Save** (Collection / Environment) writes back to the file the tab
   was originally loaded from. If there are no new or modified entries, saving
   is a no-op and no confirmation is shown (there's nothing to warn about).
   If there *are* unsaved changes, you'll get a confirmation naming how many
@@ -199,9 +205,22 @@ Notes on saving:
   exists you'll be asked to confirm the overwrite (Yes/No) before anything is
   written.
 - The Scratch Space (tab 0) can be saved like any other collection — pick
-  **Save Collection As…** to give it a file for the first time.
+  Collection → **Save As…** to give it a file for the first time.
 - A modified request shows a pencil icon next to it in the Requests list
   until it's saved.
+
+### Settings & preferences
+
+Open the **Settings** menu with `s` and choose **Preferences** for a few
+toggles that persist across restarts:
+
+- **Confirm on exit** / **Confirm on clear** — ask before quitting or before
+  clearing all collections.
+- **Always save when prompted** (off by default) — whenever an action would
+  otherwise pop up a **Save / Discard / Cancel** choice (e.g. switching away
+  from a Workspace collection with unsaved changes), automatically pick
+  **Save** without asking. Leave it off to keep being prompted each time.
+- **Default Request view** — whether the Request panel opens in JSON or Hurl.
 
 ## Loading & saving via git
 
@@ -211,8 +230,8 @@ without cloning it: it lists the repo's branches/tags, fetches just enough
 git history to read the file tree for the ref you pick, and checks out only
 the one file you select. No other file in the repo ever touches your disk.
 
-1. Press `f` to open the File menu, then choose **Load from Git…** (for a
-   collection) or **Load Environment from Git…**.
+1. Press `f` to open the File menu, choose **(L)oad**, then pick the kind
+   (**Collection** or **Environment**) and choose **From (G)it…**.
 2. **Connect** — type the repository URL (`https://…` or `git@…`). If the
    repo needs an access token, Tab to the token field and enter it (only used
    for this fetch — the wizard supports GitHub-style
@@ -230,7 +249,7 @@ the one file you select. No other file in the repo ever touches your disk.
    environment — answering Yes reuses the same file listing already fetched
    in step 4 (no second network round-trip) and lets you pick the `.vars`
    file to pair with it. Answering No (or loading an environment on its own
-   via **Load Environment from Git…**) leaves it as-is.
+   via Environment → **From Git…**) leaves it as-is.
 
 Loading a directory of files, or importing a whole repo, is not supported
 this way — for that, see **Loading a Workspace from git** below.
@@ -243,7 +262,8 @@ Workspace tab to reopen its file-tree picker at any time). Workspaces can
 also be loaded straight from a remote repository, instead of only from a
 local folder:
 
-1. Press `f` to open the File menu, then choose **Work(s)pace from Git…**.
+1. Press `f` to open the File menu, choose **(L)oad**, then pick
+   **(W)orkspace** and choose **From (G)it…**.
 2. **Connect** and **pick a ref**, exactly as for a single collection/
    environment above.
 3. **Choose which files to download** — a repo can hold plenty of large,
@@ -271,19 +291,19 @@ different ones and keep them all temporary, these folders will accumulate
 under your system's temp directory and you may want to clear them out
 yourself from time to time — or avoid the problem entirely by choosing
 **save it to a permanent location** when asked, or later via **File → Save
-→ (W)orkspace…** (available for any Workspace tab, local or from git; it
-copies the whole folder to a destination and name you choose, and stops
-tracking it as a temporary git download). Saving a Workspace-loaded
-collection back to git is also not currently supported — use **Save
-Collection As…** into your own local clone instead.
+→ (W)orkspace → Save (A)s…** (available for any Workspace tab, local or from
+git; it copies the whole folder to a destination and name you choose, and
+stops tracking it as a temporary git download). Saving a Workspace-loaded
+collection back to git is also not currently supported — use **Save →
+Collection → Save As…** into your own local clone instead.
 
 ### Saving to git
 
 A collection that was itself loaded from git (shown by the ⎇ icon in its tab
-title) gains a **Save Collection to Git…** File menu item, which pushes a new
-commit straight to the remote — no local clone, staging area, or manual `git`
-commands needed. Like loading, this never performs a full checkout: only the
-file(s) you're actually writing are ever fetched or touched, no matter how
+title) can be saved back with **Save → Collection → To (G)it…**, which pushes
+a new commit straight to the remote — no local clone, staging area, or manual
+`git` commands needed. Like loading, this never performs a full checkout: only
+the file(s) you're actually writing are ever fetched or touched, no matter how
 large the repository is.
 
 1. **Connect** — the repository URL is pre-filled with the one this
@@ -316,10 +336,10 @@ large the repository is.
    working branch.
 
 For a collection that *wasn't* loaded from git (or when you'd rather manage
-git yourself), the old workflow still works exactly as before: use **Save
-Collection As…** / **Save Environment As…** and choose a path inside your own
-local clone of the repository, then commit and push with your normal git
-tooling outside the app.
+git yourself), the local workflow still works exactly as before: use **Save →
+Collection → Save As…** / **Save → Environment → Save As…** and choose a path
+inside your own local clone of the repository, then commit and push with your
+normal git tooling outside the app.
 
 ## Secrets & environment variables
 
@@ -358,13 +378,15 @@ up-to-date list. Highlights:
 | `↑`/`↓`, `j`/`k` | Move selection |
 | `←`/`→`, `h`/`l` | Switch tabs / scroll list-panel text horizontally |
 | `Enter` | Open the Edit Request wizard for the selected request (or, on a folder row in the Requests list, descend into that folder; on the "‹ .." row, go back up) |
+| `→` / `l` (Workspace list) | Open the highlighted workspace folder or collection (same as `Enter`); `Enter` on an already-open collection collapses it |
+| `w` (Workspace tab) | Pop up the full workspace file-tree picker to jump to any collection |
 | `Backspace` (Requests list) | Go up a folder, from anywhere in the current folder |
 | `Shift+R` | Edit the selected request in Raw Mode (Hurl text) |
 | `F5`, `Ctrl+Enter` | Run the current request |
 | `Alt+F5` | Run every request in the collection in order, in one Hurl execution (like the CLI's batch mode) — pass/fail markers appear in the Requests list and a Passed/Failed/Total summary on the status bar |
 | `n` | New request (List/Response/Tabs panes) — or add environment variable (Env pane) |
 | `b` | Set the base URL |
-| `f` / `o` | File menu / Options menu |
+| `f` / `s` | File menu / Settings menu |
 | `[` / `]`, `Ctrl+←`/`→` | Previous / next tab |
 | `PageUp`/`PageDown` | Previous / next tab (same as `[`/`]`) |
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |

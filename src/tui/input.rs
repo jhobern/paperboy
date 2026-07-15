@@ -818,6 +818,51 @@ impl TuiApp {
                     _ => self.overlay = Some(Overlay::FileSaveMenu(sel)),
                 }
             }
+            Overlay::FileLoadSource(kind, sel) => {
+                let s = Strings::for_language(&self.language);
+                let items = file_load_source_items(&s);
+                match key.code {
+                    // Esc steps back to the kind list with this kind still lit.
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.overlay = Some(Overlay::FileLoadMenu(file_load_kind_index(kind)));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Some(Overlay::FileLoadSource(kind, sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = items.len() - 1;
+                        self.overlay = Some(Overlay::FileLoadSource(kind, (sel + 1).min(n)));
+                    }
+                    KeyCode::Enter => self.activate_file_load_source(kind, sel),
+                    KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                        Some(i) => self.activate_file_load_source(kind, i),
+                        None => self.overlay = Some(Overlay::FileLoadSource(kind, sel)),
+                    },
+                    _ => self.overlay = Some(Overlay::FileLoadSource(kind, sel)),
+                }
+            }
+            Overlay::FileSaveDest(kind, sel) => {
+                let s = Strings::for_language(&self.language);
+                let items = file_save_dest_items(kind, &s);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.overlay = Some(Overlay::FileSaveMenu(file_save_kind_index(kind)));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.overlay = Some(Overlay::FileSaveDest(kind, sel.saturating_sub(1)));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = items.len() - 1;
+                        self.overlay = Some(Overlay::FileSaveDest(kind, (sel + 1).min(n)));
+                    }
+                    KeyCode::Enter => self.activate_file_save_dest(kind, sel),
+                    KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                        Some(i) => self.activate_file_save_dest(kind, i),
+                        None => self.overlay = Some(Overlay::FileSaveDest(kind, sel)),
+                    },
+                    _ => self.overlay = Some(Overlay::FileSaveDest(kind, sel)),
+                }
+            }
             Overlay::Options(sel) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -3497,31 +3542,62 @@ impl TuiApp {
     pub(crate) fn activate_file_load_item(&mut self, sel: usize) {
         let s = Strings::for_language(&self.language);
         match sel {
+            // Request is local-only, so it skips the source step entirely.
             0 => self.open_path_prompt(FileAction::LoadRequest, s.load_request, ""),
-            1 => self.open_browser(FileAction::OpenCollection),
-            2 => self.open_remote_wizard(RemoteKind::Collection),
-            3 => self.open_browser(FileAction::LoadEnv),
-            4 => self.open_remote_wizard(RemoteKind::Environment),
-            5 => self.open_browser(FileAction::OpenWorkspace),
-            _ => self.open_remote_wizard(RemoteKind::Workspace),
+            1 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Collection, 0)),
+            2 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 0)),
+            _ => self.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 0)),
+        }
+    }
+
+    /// Second step of Load: `sel` is `0` for a local file, `1` for git.
+    pub(crate) fn activate_file_load_source(&mut self, kind: FileKind, sel: usize) {
+        let local = sel == 0;
+        match (kind, local) {
+            (FileKind::Collection, true) => self.open_browser(FileAction::OpenCollection),
+            (FileKind::Collection, false) => self.open_remote_wizard(RemoteKind::Collection),
+            (FileKind::Environment, true) => self.open_browser(FileAction::LoadEnv),
+            (FileKind::Environment, false) => self.open_remote_wizard(RemoteKind::Environment),
+            (FileKind::Workspace, true) => self.open_browser(FileAction::OpenWorkspace),
+            (FileKind::Workspace, false) => self.open_remote_wizard(RemoteKind::Workspace),
         }
     }
 
     pub(crate) fn activate_file_save_item(&mut self, sel: usize) {
         let s = Strings::for_language(&self.language);
         match sel {
-            // "Save …" writes back to the original file (confirming only
-            // when there are changes); "Save … As" always prompts for a
-            // name (confirming an overwrite of an existing).
+            // Request and Response are single-destination path prompts, so
+            // they skip the destination step entirely.
             0 => self.open_path_prompt(FileAction::SaveRequest, s.save_request, "request.json"),
-            1 => self.begin_save(FileAction::SaveCollection),
-            2 => self.begin_save_as(FileAction::SaveCollection),
-            3 => self.open_git_save_wizard(),
-            4 => self.begin_save(FileAction::SaveEnv),
-            5 => self.begin_save_as(FileAction::SaveEnv),
-            6 => self.begin_save_workspace_as(),
-            7 => self.open_git_workspace_save_wizard(),
+            1 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Collection, 0)),
+            2 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Environment, 0)),
+            3 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
             _ => self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json"),
+        }
+    }
+
+    /// Second step of Save: routes the destination `sel` for `kind`. The item
+    /// list (and therefore `sel`) varies per kind — see
+    /// [`crate::tui::app::file_save_dest_items`]:
+    /// Collection = Save / Save As / To Git; Environment = Save / Save As;
+    /// Workspace = Save As / To Git.
+    pub(crate) fn activate_file_save_dest(&mut self, kind: FileKind, sel: usize) {
+        match kind {
+            // "Save …" writes back to the original file (confirming only when
+            // there are changes); "Save … As" always prompts for a name.
+            FileKind::Collection => match sel {
+                0 => self.begin_save(FileAction::SaveCollection),
+                1 => self.begin_save_as(FileAction::SaveCollection),
+                _ => self.open_git_save_wizard(),
+            },
+            FileKind::Environment => match sel {
+                0 => self.begin_save(FileAction::SaveEnv),
+                _ => self.begin_save_as(FileAction::SaveEnv),
+            },
+            FileKind::Workspace => match sel {
+                0 => self.begin_save_workspace_as(),
+                _ => self.open_git_workspace_save_wizard(),
+            },
         }
     }
 

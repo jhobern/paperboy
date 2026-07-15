@@ -263,14 +263,25 @@ pub(crate) enum Overlay {
     /// grouped submenu (see `FileLoadMenu`/`FileSaveMenu`) — replaces the old
     /// flat 12-item list that had grown hard to scan.
     FileMenu(usize),
-    /// The "Load" submenu of the File menu (Request / Collection / Collection
-    /// from Git / Environment / Environment from Git). Esc/q returns to
-    /// `FileMenu(0)`.
+    /// The "Load" submenu of the File menu: just the *kinds* (Request /
+    /// Collection / Environment / Workspace). Picking a kind that can come
+    /// from more than one place opens `FileLoadSource` to choose local vs
+    /// git; Request (local-only) goes straight to its path prompt. Esc/q
+    /// returns to `FileMenu(0)`.
     FileLoadMenu(usize),
-    /// The "Save" submenu of the File menu (Request / Collection / Collection
-    /// As / Collection to Git / Environment / Environment As / Response).
-    /// Esc/q returns to `FileMenu(1)`.
+    /// The "Save" submenu of the File menu: just the *kinds* (Request /
+    /// Collection / Environment / Workspace / Response). Picking a kind with
+    /// more than one destination opens `FileSaveDest`; Request/Response go
+    /// straight to their path prompt. Esc/q returns to `FileMenu(1)`.
     FileSaveMenu(usize),
+    /// Second step of "Load": where should this `FileKind` come from —
+    /// `(L)ocal file…` or `From (G)it…`. Esc/q returns to `FileLoadMenu` with
+    /// the kind re-highlighted.
+    FileLoadSource(FileKind, usize),
+    /// Second step of "Save": where should this `FileKind` go — `(S)ave` /
+    /// `Save (A)s…` / `To (G)it…` (the exact set depends on the kind). Esc/q
+    /// returns to `FileSaveMenu` with the kind re-highlighted.
+    FileSaveDest(FileKind, usize),
     /// The "Settings" menu (Language / Preferences / Clear all collections) —
     /// opened with `s`. Not to be confused with `Preferences`, the submenu one
     /// level down that holds the actual toggle-able preferences.
@@ -437,32 +448,83 @@ pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
     [s.file_menu_item_load, s.file_menu_item_save]
 }
 
-/// The 7 items of the File menu's "Load" submenu.
-pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 7] {
+/// The kinds of thing the File menu can load or save. Chosen in the first
+/// step of Load/Save; the local-vs-git (or Save/Save As/Git) choice is a
+/// second step (see [`Overlay::FileLoadSource`] / [`Overlay::FileSaveDest`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum FileKind {
+    Collection,
+    Environment,
+    Workspace,
+}
+
+impl FileKind {
+    /// The plain (mnemonic-free) name shown in a second-step popup title.
+    pub(crate) fn name(self, s: &Strings) -> &'static str {
+        match self {
+            FileKind::Collection => s.file_kind_collection,
+            FileKind::Environment => s.file_kind_environment,
+            FileKind::Workspace => s.file_kind_workspace,
+        }
+    }
+}
+
+/// The row this kind occupies in the "Load" kind list (see
+/// [`file_load_items`]), used to re-highlight it when Esc steps back.
+pub(crate) fn file_load_kind_index(kind: FileKind) -> usize {
+    match kind {
+        FileKind::Collection => 1,
+        FileKind::Environment => 2,
+        FileKind::Workspace => 3,
+    }
+}
+
+/// The row this kind occupies in the "Save" kind list (see
+/// [`file_save_items`]), used to re-highlight it when Esc steps back.
+pub(crate) fn file_save_kind_index(kind: FileKind) -> usize {
+    match kind {
+        FileKind::Collection => 1,
+        FileKind::Environment => 2,
+        FileKind::Workspace => 3,
+    }
+}
+
+/// The 4 kinds of the File menu's "Load" submenu.
+pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 4] {
     [
         s.file_load_item_request,
         s.file_load_item_collection,
-        s.file_load_item_collection_git,
         s.file_load_item_environment,
-        s.file_load_item_environment_git,
         s.file_load_item_workspace,
-        s.file_load_item_workspace_git,
     ]
 }
 
-/// The 8 items of the File menu's "Save" submenu.
-pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 9] {
+/// The 5 kinds of the File menu's "Save" submenu.
+pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 5] {
     [
         s.file_save_item_request,
         s.file_save_item_collection,
-        s.file_save_item_collection_as,
-        s.file_save_item_collection_git,
         s.file_save_item_environment,
-        s.file_save_item_environment_as,
         s.file_save_item_workspace,
-        s.file_save_item_workspace_git,
         s.file_save_item_response,
     ]
+}
+
+/// The two "Load" source choices: a local file or a git remote.
+pub(crate) fn file_load_source_items(s: &Strings) -> [&'static str; 2] {
+    [s.file_source_local, s.file_source_git]
+}
+
+/// The "Save" destination choices for `kind`. Collections can be saved to
+/// their file, to a new file, or to git; environments to their file or a new
+/// file (no git save); a workspace is a folder, so only "save as a copy" or
+/// git apply.
+pub(crate) fn file_save_dest_items(kind: FileKind, s: &Strings) -> Vec<&'static str> {
+    match kind {
+        FileKind::Collection => vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git],
+        FileKind::Environment => vec![s.file_dest_save, s.file_dest_save_as],
+        FileKind::Workspace => vec![s.file_dest_save_as, s.file_dest_git],
+    }
 }
 
 /// Extracts the mnemonic letter embedded in a menu label using the "(X)"
