@@ -57,6 +57,7 @@ strings! {
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
     confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
+    always_save_when_prompted => "Always save unsaved changes when prompted", "Toujours enregistrer les modifications non enregistrées lorsque demandé", "Gem altid ugemte ændringer, når du bliver spurgt";
     view_json_label => "JSON", "JSON", "JSON";
     view_hurl_label => "Hurl", "Hurl", "Hurl";
     confirm_exit_q => "Quit PaperBoy?", "Quitter PaperBoy\u{a0}?", "Afslut PaperBoy?";
@@ -233,6 +234,10 @@ strings! {
     git_save_ws_unsaved_save => "Save changes, then push", "Enregistrer les modifications, puis envoyer", "Gem ændringer, og push derefter";
     git_save_ws_unsaved_ignore => "Push the saved version (discard unsaved changes)", "Envoyer la version enregistrée (ignorer les modifications non enregistrées)", "Push den gemte version (kassér ugemte ændringer)";
     git_save_ws_unsaved_cancel => "Cancel", "Annuler", "Annuller";
+    ws_switch_unsaved_q => "The current collection has unsaved changes. Opening a different collection replaces them in memory, so they will be lost unless you save them first.\n\nWhat would you like to do?", "La collection actuelle a des modifications non enregistrées. Ouvrir une autre collection les remplace en mémoire, elles seront donc perdues si vous ne les enregistrez pas d'abord.\n\nQue souhaitez-vous faire ?", "Den aktuelle samling har ugemte ændringer. Hvis du åbner en anden samling, erstattes de i hukommelsen, så de går tabt, medmindre du gemmer dem først.\n\nHvad vil du gøre?";
+    ws_switch_unsaved_save => "Save changes, then switch", "Enregistrer les modifications, puis changer", "Gem ændringer, og skift derefter";
+    ws_switch_unsaved_discard => "Discard changes and switch", "Ignorer les modifications et changer", "Kassér ændringer og skift";
+    ws_switch_unsaved_cancel => "Cancel", "Annuler", "Annuller";
     git_save_include_env_label => "Also save the environment", "Enregistrer aussi l'environnement", "Gem også miljøet";
     git_save_collection_path_label => "Collection path in repo", "Chemin de la collection dans le dépôt", "Samlingens sti i repoet";
     git_save_env_path_label => "Environment path in repo", "Chemin de l'environnement dans le dépôt", "Miljøets sti i repoet";

@@ -631,6 +631,40 @@ impl TuiApp {
                 },
                 _ => self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel }),
             },
+            Overlay::WorkspaceSwitchUnsaved { ci, target, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                    self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+                        ci,
+                        target,
+                        sel: (sel + 2) % 3,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                    self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+                        ci,
+                        target,
+                        sel: (sel + 1) % 3,
+                    });
+                }
+                KeyCode::Enter => match sel {
+                    // Save the in-memory edits to disk first, then switch —
+                    // but only if the save actually succeeded.
+                    0 => {
+                        self.overlay = None;
+                        if self.save_workspace_current_file(ci) {
+                            self.load_workspace_file(ci, target);
+                        }
+                    }
+                    // Discard the edits and switch.
+                    1 => {
+                        self.overlay = None;
+                        self.load_workspace_file(ci, target);
+                    }
+                    _ => self.overlay = None,
+                },
+                _ => self.overlay = Some(Overlay::WorkspaceSwitchUnsaved { ci, target, sel }),
+            },
             Overlay::WorkspaceReloadConfirm { idx, reload, sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     // Declined: same outcome as any other Workspace whose
@@ -824,7 +858,7 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Preferences((sel + 1).min(2)));
+                    self.overlay = Some(Overlay::Preferences((sel + 1).min(3)));
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     match sel {
@@ -838,7 +872,7 @@ impl TuiApp {
                             self.save_state();
                             self.overlay = Some(Overlay::Preferences(sel));
                         }
-                        _ => {
+                        2 => {
                             // Open the Default Request View submenu,
                             // preselecting the current view.
                             let cur = match self.default_request_view {
@@ -846,6 +880,11 @@ impl TuiApp {
                                 request::RequestView::Hurl => 1,
                             };
                             self.overlay = Some(Overlay::RequestViewMenu(cur));
+                        }
+                        _ => {
+                            self.always_save_when_prompted = !self.always_save_when_prompted;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
                         }
                     }
                 }
@@ -2198,7 +2237,25 @@ impl TuiApp {
                 self.scroll_list_h(-4)
             }
             KeyCode::Right | KeyCode::Char('l') if self.focus == Pane::List => {
-                self.scroll_list_h(4)
+                // In a Workspace tab's file-tree, Right opens whatever is
+                // highlighted (descend into a folder, or open/expand a
+                // collection), matching a file browser; otherwise it
+                // horizontally scrolls the selected request's URL.
+                let ci = self.active_tab;
+                let col = &self.collections[ci];
+                let row = col
+                    .is_workspace()
+                    .then(|| col.ws_rows().into_iter().nth(col.list_cursor))
+                    .flatten();
+                match row {
+                    Some(crate::collection::WsRow::Folder(name)) => {
+                        self.workspace_folder_down(ci, name)
+                    }
+                    Some(crate::collection::WsRow::Collection {
+                        path, open: false, ..
+                    }) => self.activate_workspace_collection(ci, path),
+                    _ => self.scroll_list_h(4),
+                }
             }
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::GlobalEnv => {
                 self.scroll_env_h(-4)
@@ -2439,6 +2496,86 @@ impl TuiApp {
         col.list_cursor = 0;
     }
 
+    /// Handle Enter on a Workspace tab's file-tree list row. `../` and
+    /// subfolders navigate the filesystem breadcrumb; a collection file row
+    /// opens/collapses it (switching files warns first if the current one has
+    /// unsaved edits); a request row edits it.
+    fn on_enter_workspace_list(&mut self, ci: usize) {
+        let cursor = self.collections[ci].list_cursor;
+        let Some(row) = self.collections[ci].ws_rows().into_iter().nth(cursor) else {
+            self.focus = Pane::Main;
+            return;
+        };
+        match row {
+            crate::collection::WsRow::Up => {
+                let col = &mut self.collections[ci];
+                col.workspace_browse.pop();
+                col.list_cursor = 0;
+            }
+            crate::collection::WsRow::Folder(name) => {
+                self.workspace_folder_down(ci, name);
+            }
+            crate::collection::WsRow::Collection { path, open, .. } => {
+                if open {
+                    // The open collection's own row collapses it.
+                    self.collections[ci].workspace_collapsed = true;
+                } else {
+                    self.activate_workspace_collection(ci, path);
+                }
+            }
+            crate::collection::WsRow::Request(_) => {
+                self.focus = Pane::Main;
+                self.open_edit_request_wizard(ci);
+            }
+        }
+    }
+
+    /// Descend into a subfolder in a Workspace tab's file-tree list (Enter or
+    /// Right on a folder row): push it onto the browse breadcrumb and reset
+    /// the highlight to the top of the new folder.
+    fn workspace_folder_down(&mut self, ci: usize, name: String) {
+        let col = &mut self.collections[ci];
+        col.workspace_browse.push(name);
+        col.list_cursor = 0;
+    }
+
+    /// "Open" a *collapsed* collection file row in a Workspace tab (Enter or
+    /// Right on it): re-expand it if it's the already-loaded file, otherwise
+    /// load it (which warns first if the current file has unsaved edits, since
+    /// loading replaces its entries wholesale).
+    fn activate_workspace_collection(&mut self, ci: usize, path: PathBuf) {
+        if self.collections[ci].path.as_deref() == Some(path.as_path()) {
+            self.collections[ci].workspace_collapsed = false;
+            self.collections[ci].sync_ws_cursor();
+        } else {
+            self.open_workspace_collection(ci, path);
+        }
+    }
+
+    /// Load collection `path` into Workspace tab `ci`, first warning (via
+    /// [`Overlay::WorkspaceSwitchUnsaved`]) if the currently-loaded file has
+    /// unsaved in-memory edits that switching would discard.
+    fn open_workspace_collection(&mut self, ci: usize, path: PathBuf) {
+        if self.changed_request_count(ci) == 0 || self.collections[ci].path.is_none() {
+            self.load_workspace_file(ci, path);
+            return;
+        }
+        // Unsaved in-memory edits would be replaced by loading another file.
+        // With "always save" on, auto-pick Save (switch only if the write
+        // succeeded); otherwise ask.
+        if self.always_save_when_prompted {
+            if self.save_workspace_current_file(ci) {
+                self.load_workspace_file(ci, path);
+            }
+            return;
+        }
+        self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+            ci,
+            target: path,
+            sel: 0,
+        });
+    }
+
     pub(crate) fn nav(&mut self, delta: i32) {
         let step = |cur: usize, len: usize, d: i32| -> usize {
             if len == 0 {
@@ -2451,17 +2588,26 @@ impl TuiApp {
         match self.focus {
             Pane::Tabs => {}
             Pane::List => {
-                // Move within the current folder's rows (Up/Folder/Entry —
-                // see `crate::tree`), keeping `selected_entry` pointed at
-                // whichever request is highlighted so every other action
-                // (run, edit, delete, raw mode) keeps acting on it.
-                let rows = self.collections[ci].rows();
-                let len = rows.len();
+                // Move within the current folder's rows, keeping
+                // `selected_entry` pointed at whichever request is highlighted
+                // so every other action (run, edit, delete, raw mode) keeps
+                // acting on it. Workspace tabs use the filesystem file-tree
+                // (`ws_rows`), ordinary tabs the title-folder tree (`rows`).
                 let cur = self.collections[ci].list_cursor;
-                let next = step(cur, len, delta);
-                self.collections[ci].list_cursor = next;
-                if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
-                    self.collections[ci].selected_entry = *idx;
+                if self.collections[ci].is_workspace() {
+                    let rows = self.collections[ci].ws_rows();
+                    let next = step(cur, rows.len(), delta);
+                    self.collections[ci].list_cursor = next;
+                    if let Some(crate::collection::WsRow::Request(idx)) = rows.get(next) {
+                        self.collections[ci].selected_entry = *idx;
+                    }
+                } else {
+                    let rows = self.collections[ci].rows();
+                    let next = step(cur, rows.len(), delta);
+                    self.collections[ci].list_cursor = next;
+                    if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
+                        self.collections[ci].selected_entry = *idx;
+                    }
                 }
                 self.main_scroll = 0;
                 // Reset horizontal scroll so each newly selected name starts unscrolled.
@@ -2504,10 +2650,17 @@ impl TuiApp {
                 }
             }
             Pane::List => {
-                // Enter's meaning depends on what's highlighted: a folder row
-                // descends into it, the "up" row ascends to the parent
-                // folder, and a request row jumps straight into editing it
-                // (same as pressing Enter again once focused on the panel).
+                // Enter's meaning depends on what's highlighted. Workspace
+                // tabs use the filesystem file-tree (`ws_rows`); ordinary
+                // tabs the title-folder tree (`rows`).
+                if self.collections[ci].is_workspace() {
+                    self.on_enter_workspace_list(ci);
+                    return;
+                }
+                // A folder row descends into it, the "up" row ascends to the
+                // parent folder, and a request row jumps straight into
+                // editing it (same as pressing Enter again once focused on
+                // the panel).
                 match self.collections[ci]
                     .rows()
                     .get(self.collections[ci].list_cursor)
@@ -2862,6 +3015,7 @@ impl TuiApp {
             .map(PathBuf::from);
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
+        self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;
         self.recent_git_urls = state.recent_git_urls;
@@ -2895,6 +3049,7 @@ impl TuiApp {
                 .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
+            always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,
             recent_git_urls: self.recent_git_urls.clone(),

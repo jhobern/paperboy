@@ -6,6 +6,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, WidgetRef, Wrap,
 };
 
+use crate::collection::{Collection, WsRow};
 use crate::environment::ValueSource;
 use crate::hurl::RunStatus;
 use crate::i18n::{Language, Strings};
@@ -39,6 +40,57 @@ pub(crate) const SHADOW_ICON: &str = "!";
 /// editor's form) hints that a File-kind field's Value opens a file picker
 /// on Enter.
 pub(crate) const FOLDER_ICON: &str = "\u{1F4C1}";
+/// Chevrons on a Workspace collection file row: expanded (requests inlined)
+/// vs collapsed.
+const COLLECTION_OPEN_ICON: &str = "\u{25BE}"; // ▾
+const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
+
+/// A rendered row of the request list, unifying the ordinary title-folder
+/// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
+/// [`draw_collection_left`] can lay both out with one loop. `Entry.indent`
+/// nudges a Workspace request under its collection's file row.
+enum LeftRow {
+    Up,
+    Folder(String),
+    Collection { name: String, open: bool },
+    Entry { idx: usize, indent: bool },
+}
+
+impl LeftRow {
+    /// The list rows for tab `col`: the Workspace file-tree when it's bound to
+    /// a folder, otherwise the title-folder tree.
+    fn build(col: &Collection) -> Vec<LeftRow> {
+        if col.is_workspace() {
+            col.ws_rows()
+                .into_iter()
+                .map(|r| match r {
+                    WsRow::Up => LeftRow::Up,
+                    WsRow::Folder(name) => LeftRow::Folder(name),
+                    WsRow::Collection { name, open, .. } => LeftRow::Collection { name, open },
+                    WsRow::Request(idx) => LeftRow::Entry { idx, indent: true },
+                })
+                .collect()
+        } else {
+            col.rows()
+                .into_iter()
+                .map(|r| match r {
+                    tree::Row::Up => LeftRow::Up,
+                    tree::Row::Folder(name) => LeftRow::Folder(name),
+                    tree::Row::Entry(idx) => LeftRow::Entry { idx, indent: false },
+                })
+                .collect()
+        }
+    }
+
+    /// The entry index if this is a request row (for URL scrolling/substitution).
+    fn entry_idx(&self) -> Option<usize> {
+        match self {
+            LeftRow::Entry { idx, .. } => Some(*idx),
+            _ => None,
+        }
+    }
+}
+
 
 pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> {
     let border = if focused { th.accent } else { th.dim };
@@ -271,13 +323,14 @@ pub(crate) fn draw_collection_left(
     let panes = Layout::vertical([Constraint::Min(3), Constraint::Percentage(app.response_pct)])
         .split(area);
 
-    // Entry list, folder-aware: `col.rows()` mixes `Up`/`Folder` navigation
-    // rows in with the requests directly inside the folder currently being
-    // browsed (`col.folder`), so deeply nested collections stay a flat,
-    // scannable list instead of an ever-more-indented tree.
+    // Entry list. For an ordinary tab this is the title-folder tree
+    // (`col.rows()`); for a Workspace tab it's the real filesystem file-tree
+    // with the open collection's requests inlined (`col.ws_rows()`). Both are
+    // unified into `LeftRow` so a single loop lays them out — either way
+    // deeply nested content stays a flat, scannable list.
     let focused = app.focus == Pane::List;
     let col = &app.collections[ci];
-    let view_rows = col.rows();
+    let view_rows = LeftRow::build(col);
     let sel = col.list_cursor.min(view_rows.len().saturating_sub(1));
     // Classify every `{{ VAR }}` the requests reference so the list URLs can be
     // substituted and colour-coded by whether their value is loaded.
@@ -289,13 +342,11 @@ pub(crate) fn draw_collection_left(
     let url_w = panes[0].width.saturating_sub(2 + 2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
-    // Folder/Up rows have no scrollable URL text.
+    // Folder/Up/collection rows have no scrollable URL text.
     let sel_len = view_rows
         .get(sel)
-        .and_then(|r| match r {
-            tree::Row::Entry(idx) => col.entries.get(*idx),
-            _ => None,
-        })
+        .and_then(LeftRow::entry_idx)
+        .and_then(|idx| col.entries.get(idx))
         .map(|e| crate::request::subst_display(&e.url, &smap).chars().count())
         .unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((url_w as usize).saturating_sub(1));
@@ -304,15 +355,26 @@ pub(crate) fn draw_collection_left(
         .iter()
         .enumerate()
         .map(|(i, row)| match row {
-            tree::Row::Up => ListItem::new(Line::from(Span::styled(
+            LeftRow::Up => ListItem::new(Line::from(Span::styled(
                 s.list_up_row.to_string(),
                 Style::default().fg(th.dim),
             ))),
-            tree::Row::Folder(name) => ListItem::new(Line::from(Span::styled(
+            LeftRow::Folder(name) => ListItem::new(Line::from(Span::styled(
                 format!("{FOLDER_ICON} {name}/"),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ))),
-            tree::Row::Entry(idx) => {
+            LeftRow::Collection { name, open } => {
+                let chevron = if *open {
+                    COLLECTION_OPEN_ICON
+                } else {
+                    COLLECTION_CLOSED_ICON
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{chevron} {name}"),
+                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                )))
+            }
+            LeftRow::Entry { idx, indent } => {
                 let e = &col.entries[*idx];
                 // A plus marks a request the user added by hand (in a real
                 // collection); a pencil marks one edited away from its loaded
@@ -324,15 +386,19 @@ pub(crate) fn draw_collection_left(
                 } else {
                     ("  ", th.text)
                 };
-                let mut spans = vec![
-                    Span::styled(marker, Style::default().fg(marker_fg)),
-                    Span::styled(
-                        format!("{:<5}", e.method),
-                        Style::default()
-                            .fg(method_color(&e.method))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ];
+                // Workspace request rows are indented one level so they read
+                // as children of their collection's file row.
+                let mut spans = Vec::new();
+                if *indent {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(marker, Style::default().fg(marker_fg)));
+                spans.push(Span::styled(
+                    format!("{:<5}", e.method),
+                    Style::default()
+                        .fg(method_color(&e.method))
+                        .add_modifier(Modifier::BOLD),
+                ));
                 // Pass/fail from the most recent "Run All" (Alt+F5); a
                 // dotted marker while a run is still in progress; blank
                 // until a batch run has actually covered this entry.
@@ -402,7 +468,11 @@ pub(crate) fn draw_collection_left(
         };
         format!("{}{}", tab_icons(col), display_name)
     };
-    if !col.folder.is_empty() {
+    if col.is_workspace() {
+        if !col.workspace_browse.is_empty() {
+            title = format!("{title} › {}", col.workspace_browse.join(" › "));
+        }
+    } else if !col.folder.is_empty() {
         title = format!("{title} › {}", col.folder.join(" › "));
     }
     // A collection linked to a Global Environment shows that environment's
@@ -1645,7 +1715,14 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 request::RequestView::Hurl => "Hurl",
             };
             let view_item = format!("{}: {view_label}", s.default_request_view_label);
-            let items = [exit_item.as_str(), clear_item.as_str(), view_item.as_str()];
+            let always_save_item =
+                format!("{} {}", mark(app.always_save_when_prompted), s.always_save_when_prompted);
+            let items = [
+                exit_item.as_str(),
+                clear_item.as_str(),
+                view_item.as_str(),
+                always_save_item.as_str(),
+            ];
             draw_menu_popup(f, s.preferences_menu, &items, *sel, th);
         }
         Overlay::Confirm { action, sel } => {
@@ -2175,6 +2252,14 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.git_save_ws_unsaved_cancel,
             ];
             draw_confirm_popup(f, s.git_save_ws_unsaved_q, &choices, *sel, th);
+        }
+        Overlay::WorkspaceSwitchUnsaved { sel, .. } => {
+            let choices = [
+                s.ws_switch_unsaved_save,
+                s.ws_switch_unsaved_discard,
+                s.ws_switch_unsaved_cancel,
+            ];
+            draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th);
         }
     }
 }

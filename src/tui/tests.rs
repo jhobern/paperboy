@@ -11680,10 +11680,15 @@ fn workspace_bound_list_title_hints_the_w_shortcut_when_there_is_room_but_not_on
 }
 
 #[test]
-fn a_workspace_tab_with_no_collection_chosen_shows_the_empty_state_hint_instead_of_a_blank_list() {
+fn a_workspace_tab_with_no_collections_at_all_shows_the_empty_state_hint_instead_of_a_blank_list() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
-    let dir = workspace_temp_dir("empty_hint");
+    // A genuinely empty workspace root (no folders or collections to browse):
+    // the file-tree has nothing to show, so the friendly empty-state hint
+    // stands in for the blank list.
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_empty_hint_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let s = Strings::for_language(&Language::English);
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -11701,6 +11706,341 @@ fn a_workspace_tab_with_no_collection_chosen_shows_the_empty_state_hint_instead_
         "the empty-state hint replaces the blank list"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_workspace_tab_with_no_file_loaded_still_shows_the_browsable_file_tree() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("browse_no_file");
+    let mut col = Collection::new("my-ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    col.workspace_auto_prompt_dismissed = true;
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    app.active_tab = app.collections.len() - 1;
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains("alpha.hurl"),
+        "the root's collection files are listed even before one is opened"
+    );
+    assert!(
+        text.contains("sub"),
+        "subfolders are listed too, so the user can browse into them"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a Workspace tab bound to `dir` and return the app plus its index.
+fn workspace_app(dir: &std::path::Path) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.to_path_buf());
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    (app, ci)
+}
+
+#[test]
+fn workspace_rows_list_folders_and_collections_and_inline_the_open_collections_requests() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_rows");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+
+    let rows = app.collections[ci].ws_rows();
+    // Root: the `sub/` folder, then `alpha.hurl` (open, so its one request is
+    // inlined right beneath it). No `../` at the root.
+    assert!(matches!(&rows[0], WsRow::Folder(n) if n == "sub"));
+    assert!(matches!(&rows[1], WsRow::Collection { name, open: true, .. } if name == "alpha.hurl"));
+    assert!(matches!(rows[2], WsRow::Request(0)));
+    assert_eq!(rows.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn entering_a_workspace_subfolder_and_then_up_navigates_the_breadcrumb() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_breadcrumb");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Enter on the `sub/` folder row (index 0 at the root) descends into it.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    assert_eq!(app.collections[ci].workspace_browse, vec!["sub".to_string()]);
+    let rows = app.collections[ci].ws_rows();
+    assert!(matches!(rows[0], WsRow::Up));
+    assert!(matches!(&rows[1], WsRow::Collection { name, open: false, .. } if name == "beta.json"));
+
+    // Enter on the `../` row (index 0) climbs back to the root.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    assert!(app.collections[ci].workspace_browse.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_accordion");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // The `alpha.hurl` collection row sits at index 1 (after `sub/`).
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+    assert!(app.collections[ci].workspace_collapsed);
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        !rows.iter().any(|r| matches!(r, WsRow::Request(_))),
+        "a collapsed collection hides its request rows"
+    );
+    assert!(matches!(&rows[1], WsRow::Collection { open: false, .. }));
+
+    // Enter again on the same row re-expands it.
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+    assert!(!app.collections[ci].workspace_collapsed);
+    assert!(
+        app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Request(0)))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn opening_a_different_collection_with_unsaved_edits_warns_before_switching() {
+    let dir = workspace_temp_dir("ws_switch_warn");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    // An unsaved in-memory edit on the loaded collection.
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+
+    // Browse into `sub/` and try to open `beta.json`.
+    app.collections[ci].list_cursor = 0; // sub/
+    app.on_enter();
+    app.collections[ci].list_cursor = 1; // beta.json
+    app.on_enter();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::WorkspaceSwitchUnsaved { ci: c, .. }) if c == ci),
+        "switching with unsaved edits raises the warning first"
+    );
+    // The file has NOT changed yet — still on alpha.hurl.
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn discarding_at_the_workspace_switch_warning_loads_the_new_collection() {
+    let dir = workspace_temp_dir("ws_switch_discard");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+    app.collections[ci].list_cursor = 0;
+    app.on_enter(); // into sub/
+    app.collections[ci].list_cursor = 1;
+    app.on_enter(); // warning
+
+    // Move the selection to "Discard changes and switch" (sel 1) and confirm.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "the new collection was loaded, discarding the edit"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cancelling_the_workspace_switch_warning_keeps_the_current_collection_and_edits() {
+    let dir = workspace_temp_dir("ws_switch_cancel");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    app.collections[ci].list_cursor = 1;
+    app.on_enter(); // warning
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "the unsaved edit is preserved when the switch is cancelled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enter_on_a_workspace_request_row_opens_the_edit_wizard() {
+    let dir = workspace_temp_dir("ws_edit_request");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // The single request is inlined at index 2 (after `sub/` and `alpha.hurl`).
+    app.collections[ci].list_cursor = 2;
+    app.on_enter();
+
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "Enter on a request row opens the edit wizard"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn right_arrow_descends_into_a_highlighted_workspace_folder() {
+    let dir = workspace_temp_dir("ws_right");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Highlight the `sub/` folder row (index 0) and press Right.
+    app.collections[ci].list_cursor = 0;
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        app.collections[ci].workspace_browse,
+        vec!["sub".to_string()],
+        "Right on a folder row descends into it, like Enter"
+    );
+
+    // Right on a request row must NOT navigate — it still scrolls the URL.
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+    let request_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request(_)))
+        .unwrap();
+    app.collections[ci].list_cursor = request_row;
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.collections[ci].workspace_browse.is_empty(),
+        "Right on a request row does not navigate the tree"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_right_collection");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.focus = Pane::List;
+
+    // Collapse the open `alpha.hurl` (row index 1), then Right re-expands it.
+    app.collections[ci].workspace_collapsed = true;
+    let alpha_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Collection { open: false, .. }))
+        .unwrap();
+    app.collections[ci].list_cursor = alpha_row;
+    press(&mut app, KeyCode::Right);
+    assert!(
+        !app.collections[ci].workspace_collapsed,
+        "Right on the collapsed loaded collection expands it"
+    );
+    assert!(
+        app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Request(0))),
+        "its requests are visible again"
+    );
+
+    // Browse into `sub/` and open `beta.json` with Right (a different file).
+    app.collections[ci].list_cursor = 0; // sub/
+    press(&mut app, KeyCode::Right);
+    let beta_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Collection { .. }))
+        .unwrap();
+    app.collections[ci].list_cursor = beta_row;
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "Right on a collapsed, unloaded collection opens it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn always_save_preference_auto_saves_instead_of_prompting_on_a_workspace_switch() {
+    let dir = workspace_temp_dir("ws_always_save");
+    let (mut app, ci) = workspace_app(&dir);
+    app.always_save_when_prompted = true;
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    // Edit the request so the collection has an unsaved in-memory change.
+    app.collections[ci].entries[0].url = "https://example.com/edited".to_string();
+    app.collections[ci].entries[0].modified = true;
+    app.focus = Pane::List;
+
+    // Browse into `sub/` and open `beta.json` — no prompt should appear.
+    app.collections[ci].list_cursor = 0;
+    app.on_enter();
+    app.collections[ci].list_cursor = 1;
+    app.on_enter();
+
+    assert!(
+        app.overlay.is_none(),
+        "with always-save on, no Save/Discard/Cancel prompt is shown"
+    );
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("sub").join("beta.json")),
+        "the switch went through"
+    );
+    let saved = std::fs::read_to_string(dir.join("alpha.hurl")).unwrap();
+    assert!(
+        saved.contains("https://example.com/edited"),
+        "the edit was auto-saved to disk before switching"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_default() {
+    let mut app = TuiApp::default();
+    assert!(
+        !app.always_save_when_prompted,
+        "the preference is off by default"
+    );
+
+    app.overlay = Some(Overlay::Preferences(3));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.always_save_when_prompted, "Enter toggles it on");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        "the highlight stays on the toggle row"
+    );
+
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        !app.always_save_when_prompted,
+        "Space toggles it back off"
+    );
 }
 
 #[test]

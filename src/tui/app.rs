@@ -380,6 +380,17 @@ pub(crate) enum Overlay {
         ci: usize,
         sel: usize,
     },
+    /// Shown when the user opens a *different* collection in a Workspace tab
+    /// while the currently-loaded one has unsaved in-memory edits: loading a
+    /// file replaces the tab's entries wholesale, so those edits would be
+    /// silently discarded. `ci` is the Workspace tab, `target` the collection
+    /// file to switch to. `sel`: 0 = save the edits first then switch, 1 =
+    /// discard the edits and switch, 2 = cancel (stay).
+    WorkspaceSwitchUnsaved {
+        ci: usize,
+        target: PathBuf,
+        sel: usize,
+    },
 }
 
 /// Which action a confirmation popup is guarding.
@@ -681,6 +692,11 @@ pub struct TuiApp {
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
+    /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
+    /// for unsaved in-memory edits (switching collections in a Workspace, or
+    /// pushing one to git) is skipped and the "Save" action taken
+    /// automatically. Off by default, so the prompt is shown.
+    pub(crate) always_save_when_prompted: bool,
     /// Preferences (persisted): which of JSON / Hurl text the Main (Request)
     /// panel shows by default, for every request. Changed from the
     /// Preferences submenu (Settings → Preferences → Default Request View).
@@ -792,6 +808,7 @@ impl Default for TuiApp {
             browser_forward_path: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
             enhanced_keys: false,
             pending_save_path: None,
@@ -1663,6 +1680,8 @@ impl TuiApp {
                     col.workspace_filter_hurl_json = filter;
                     col.invalidate_request_json();
                     col.sync_folder_to_selected();
+                    col.set_workspace_browse_from_path();
+                    col.sync_ws_cursor();
                 }
                 self.active_tab = collection_idx;
                 self.focus = Pane::List;
@@ -1732,6 +1751,7 @@ impl TuiApp {
         col.selected_entry = col.entries.len() - 1;
         col.invalidate_request_json();
         col.sync_folder_to_selected();
+        col.sync_ws_cursor();
         self.active_tab = ci;
         self.focus = Pane::Main;
         self.status = None;
@@ -2248,6 +2268,14 @@ impl TuiApp {
         // file has edits that only live in memory (and thus a place on disk
         // to save them to) so the user can choose whether to include them.
         if col.path.is_some() && self.changed_request_count(ci) > 0 {
+            // With "always save" on, auto-pick Save (push only if the write
+            // succeeded); otherwise ask.
+            if self.always_save_when_prompted {
+                if self.save_workspace_current_file(ci) {
+                    self.start_git_workspace_save_wizard(ci);
+                }
+                return;
+            }
             self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved { ci, sel: 0 });
             return;
         }

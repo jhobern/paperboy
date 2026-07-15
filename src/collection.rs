@@ -11,6 +11,30 @@ use crate::git_remote::GitOrigin;
 use crate::hurl::{HurlEntry, collection_to_hurl};
 use crate::tree::{self, Row};
 
+/// One row in the Workspace tab's file-tree request list (see
+/// [`Collection::ws_rows`]). Unlike [`Row`], which navigates the *virtual*
+/// folders encoded in request titles inside one file, this navigates the real
+/// filesystem under the workspace root and inlines the currently-open
+/// collection's requests directly beneath its file row (an accordion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsRow {
+    /// Go up to the parent folder (only present when not at the workspace root).
+    Up,
+    /// Descend into an immediate subfolder of the folder being browsed.
+    Folder(String),
+    /// A collection file in the folder being browsed. `open` is true for the
+    /// currently-loaded, not-collapsed file — its requests follow as
+    /// [`WsRow::Request`] rows.
+    Collection {
+        path: PathBuf,
+        name: String,
+        open: bool,
+    },
+    /// A request of the currently-open collection (index into `entries`),
+    /// shown indented under its [`WsRow::Collection`] row.
+    Request(usize),
+}
+
 /// A loaded Hurl collection (one .hurl file).
 #[derive(Clone)]
 pub struct Collection {
@@ -87,6 +111,19 @@ pub struct Collection {
     /// commit rather than losing track of the workspace entirely — see
     /// `PersistedTab::into_collection`'s `PendingWorkspaceReload`.
     pub workspace_git_origin: Option<crate::tui::remote::WorkspaceGitOrigin>,
+    /// For a Workspace tab, the folder currently being browsed in the
+    /// file-tree request list, as a breadcrumb path relative to
+    /// `workspace_root` (root = empty). Reused from `folder`'s role for
+    /// ordinary tabs but keyed to the *real* filesystem rather than
+    /// title-encoded virtual folders (which are flattened in the Workspace
+    /// view). View state only, never persisted; re-derived from `path` on
+    /// load/restore.
+    pub workspace_browse: Vec<String>,
+    /// For a Workspace tab, whether the currently-loaded collection is
+    /// collapsed (its requests hidden) in the file-tree list. Toggled by
+    /// pressing Enter on its file row; reset to expanded whenever a file is
+    /// loaded. View state only, never persisted.
+    pub workspace_collapsed: bool,
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -117,6 +154,8 @@ impl Collection {
             workspace_auto_prompt_dismissed: false,
             workspace_downloaded_from_git: false,
             workspace_git_origin: None,
+            workspace_browse: Vec::new(),
+            workspace_collapsed: false,
         };
         c.sync_folder_to_selected();
         c
@@ -139,6 +178,87 @@ impl Collection {
     /// browsed.
     pub fn rows(&self) -> Vec<Row> {
         tree::rows_for(&self.entries, &self.folder)
+    }
+
+    /// True when this tab is bound to a Workspace folder (so the list uses the
+    /// filesystem file-tree via [`Self::ws_rows`] instead of [`Self::rows`]).
+    pub fn is_workspace(&self) -> bool {
+        self.workspace_root.is_some()
+    }
+
+    /// The rows to show in a Workspace tab's file-tree request list: `../`
+    /// (unless at the root), then the browsed folder's subfolders and
+    /// collection files, with the currently-open collection's requests inlined
+    /// beneath its file row. Empty for a non-Workspace tab. Requests are shown
+    /// flat (their title-encoded virtual folders are ignored here).
+    pub fn ws_rows(&self) -> Vec<WsRow> {
+        let Some(root) = &self.workspace_root else {
+            return Vec::new();
+        };
+        let mut dir = root.clone();
+        for seg in &self.workspace_browse {
+            dir.push(seg);
+        }
+        let mut rows = Vec::new();
+        if !self.workspace_browse.is_empty() {
+            rows.push(WsRow::Up);
+        }
+        for e in crate::workspace::list_dir(&dir, true) {
+            if e.is_dir {
+                rows.push(WsRow::Folder(e.display_name));
+            } else {
+                let open =
+                    self.path.as_deref() == Some(e.path.as_path()) && !self.workspace_collapsed;
+                rows.push(WsRow::Collection {
+                    path: e.path,
+                    name: e.display_name,
+                    open,
+                });
+                if open {
+                    rows.extend((0..self.entries.len()).map(WsRow::Request));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Point the Workspace browse breadcrumb at the folder containing the
+    /// currently-loaded file (`path`), relative to `workspace_root`, and
+    /// expand it. Root (empty) if there's no file or it sits at the root.
+    /// A no-op for a non-Workspace tab.
+    pub fn set_workspace_browse_from_path(&mut self) {
+        self.workspace_browse = Vec::new();
+        self.workspace_collapsed = false;
+        if let (Some(root), Some(path)) = (&self.workspace_root, &self.path)
+            && let Some(parent) = path.parent()
+            && let Ok(rel) = parent.strip_prefix(root)
+        {
+            self.workspace_browse = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+                .collect();
+        }
+    }
+
+    /// For a Workspace tab, move `list_cursor` onto the row for
+    /// `selected_entry` (a request of the open collection) if it's visible,
+    /// otherwise onto the open collection's file row, otherwise the top.
+    /// A no-op for a non-Workspace tab.
+    pub fn sync_ws_cursor(&mut self) {
+        if !self.is_workspace() {
+            return;
+        }
+        let rows = self.ws_rows();
+        let sel = self.selected_entry;
+        let target = rows
+            .iter()
+            .position(|r| matches!(r, WsRow::Request(i) if *i == sel))
+            .or_else(|| {
+                rows.iter()
+                    .position(|r| matches!(r, WsRow::Collection { open: true, .. }))
+            })
+            .unwrap_or(0);
+        self.list_cursor = target.min(rows.len().saturating_sub(1));
     }
 
     /// Re-derive `folder`/`list_cursor` so the Requests list is browsing (and
