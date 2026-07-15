@@ -2321,7 +2321,11 @@ pub(crate) fn draw_workspace_picker(
     st.select(Some(picker.selected));
     f.render_stateful_widget(list, rows[0], &mut st);
     let hint = Paragraph::new(Line::styled(
-        s.workspace_picker_hint,
+        if picker.adding_request {
+            s.workspace_picker_hint_add
+        } else {
+            s.workspace_picker_hint
+        },
         Style::default().fg(th.dim),
     ));
     f.render_widget(hint, rows[1]);

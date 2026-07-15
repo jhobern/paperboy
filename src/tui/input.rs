@@ -1068,6 +1068,12 @@ impl TuiApp {
                             self.overlay = Some(Overlay::EnvPopup(popup));
                         } else if matches!(kind, PromptKind::WorkspaceSaveName) {
                             self.cancel_workspace_save();
+                        } else if let PromptKind::NewWorkspaceCollection(ci) = kind {
+                            // Cancelling the name prompt drops back to the
+                            // workspace destination picker (still parked
+                            // request, if any), rather than silently aborting
+                            // the whole "add request" flow.
+                            self.open_workspace_dest_picker(ci);
                         }
                     }
                     Act::Edit => {
@@ -1285,8 +1291,22 @@ impl TuiApp {
                         keep = false; // cancel the whole form
                     }
                 } else if submit {
-                    do_submit = true;
-                    keep = false;
+                    // A request can't be saved without a URL — that's the one
+                    // field `submit_new_request` bails on (silently discarding
+                    // everything else the user typed). Every other section
+                    // (headers/cookies/form fields/asserts/captures/body) is
+                    // either dropped-if-empty or stored as-is and only checked
+                    // at run time, so the URL is the sole save-time blocker.
+                    // Keep the wizard open, jump focus to the URL field, and
+                    // say why instead of closing on an empty URL.
+                    if form.url.text().trim().is_empty() {
+                        self.status = Some(Status::NewRequestUrlRequired);
+                        form.focus = NewField::Url;
+                        form.view_tab = WizardTab::All;
+                    } else {
+                        do_submit = true;
+                        keep = false;
+                    }
                 } else if reveal_key_dropdown || reveal_kind_dropdown || reveal_ctype_dropdown {
                     // The dropdown was just revealed above; stay put so the
                     // user can browse it with Down/Up instead of also
@@ -2604,8 +2624,14 @@ impl TuiApp {
         if url.is_empty() {
             return; // nothing to create/save
         }
+        // An untitled request keeps an empty title so it lives at the root of
+        // the folder tree (see `tree::entry_path`). Defaulting the title to
+        // the URL used to be convenient, but a URL like `http://h/x` contains
+        // slashes, so `entry_path` split it into phantom folders (`http:/…`),
+        // filing the new request away in a nested section apart from its
+        // siblings. The list already shows the URL for every row, so an empty
+        // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let name = if name.is_empty() { url.clone() } else { name };
         let headers: Vec<(String, String)> = form
             .headers
             .iter()
@@ -2725,6 +2751,18 @@ impl TuiApp {
         // Requests added to a real collection (not the Scratch Space, tab 0) are
         // marked so they're distinguishable from those loaded from the file.
         entry.user_added = target != 0;
+
+        // A Workspace tab's entries belong to whichever file it currently has
+        // loaded, so there's no single obvious destination — park the request
+        // and let the user pick (or create) a collection in the workspace
+        // tree instead of silently pushing it onto (or losing it against) the
+        // loaded file.
+        if self.collections[target].workspace_root.is_some() {
+            self.pending_workspace_request = Some(entry);
+            self.open_workspace_dest_picker(target);
+            return;
+        }
+
         self.active_tab = target;
         let col = &mut self.collections[target];
         col.entries.push(entry);
@@ -3211,6 +3249,9 @@ impl TuiApp {
                 {
                     col.workspace_auto_prompt_dismissed = true;
                 }
+                // Abandon any parked new request so an aborted "add to
+                // workspace" flow doesn't leak state into the next one.
+                self.pending_workspace_request = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.nav(-1);
@@ -3228,10 +3269,31 @@ impl TuiApp {
                 }
                 self.overlay = Some(Overlay::WorkspacePicker(picker));
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                // Create a brand-new collection in this workspace (the parked
+                // request, if any, seeds it) instead of loading an existing
+                // file — see `open_new_workspace_collection_prompt`.
+                self.open_new_workspace_collection_prompt(picker.collection_idx);
+            }
             KeyCode::Enter => match picker.entries.get(picker.selected) {
                 Some(entry) if !entry.is_dir => {
                     let path = entry.path.clone();
-                    self.load_workspace_file(picker.collection_idx, path);
+                    let ci = picker.collection_idx;
+                    let adding = picker.adding_request;
+                    self.load_workspace_file(ci, path.clone());
+                    if adding {
+                        // Only append if the load actually took effect; on a
+                        // read error `load_workspace_file` leaves the tab
+                        // untouched, so keep the request parked.
+                        let loaded_ok = self
+                            .collections
+                            .get(ci)
+                            .and_then(|c| c.path.as_deref())
+                            == Some(path.as_path());
+                        if loaded_ok {
+                            self.append_pending_request_to_loaded(ci);
+                        }
+                    }
                 }
                 _ => self.overlay = Some(Overlay::WorkspacePicker(picker)),
             },

@@ -105,7 +105,11 @@ strings! {
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
     foot_workspace => "browse workspace", "parcourir workspace", "gennemse workspace";
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
-    workspace_picker_hint => "Enter open · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint => "Enter open · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
+    workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
+    new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
     workspace_filter_on => "Filter: .hurl/.json", "Filtre : .hurl/.json", "Filter: .hurl/.json";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
     workspace_no_files => "No matching files in this folder.", "Aucun fichier correspondant dans ce dossier.", "Ingen matchende filer i denne mappe.";
@@ -416,6 +420,15 @@ pub enum Status {
     /// detail (a filesystem error, or the chosen destination already
     /// existing / overlapping the source).
     WorkspaceSaveFailed(String),
+    /// A brand-new (in-memory, not yet written) collection was created inside
+    /// a Workspace — names the relative file path so the user knows where the
+    /// just-added request landed and that it still needs saving.
+    WorkspaceCollectionCreated(String),
+    /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
+    /// URL, which is the one field a request can't be saved without — the
+    /// wizard is kept open (focused on the URL field) instead of silently
+    /// discarding everything the user typed.
+    NewRequestUrlRequired,
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
 }
@@ -477,6 +490,10 @@ impl Status {
             Status::NotWorkspace => s.file_not_workspace.to_string(),
             Status::WorkspaceSaved => s.workspace_save_success.to_string(),
             Status::WorkspaceSaveFailed(e) => s.workspace_save_failed.replace("{e}", e),
+            Status::WorkspaceCollectionCreated(name) => {
+                s.workspace_collection_created.replace("{name}", name)
+            }
+            Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::CollectionRunSummary {
                 passed,
                 failed,

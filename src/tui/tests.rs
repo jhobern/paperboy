@@ -4962,6 +4962,69 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
 }
 
 #[test]
+fn f2_with_an_empty_url_keeps_the_wizard_open_and_warns_instead_of_discarding() {
+    let mut app = TuiApp::default();
+    app.focus = Pane::List;
+
+    // Open the New Request wizard and type only a Name (no URL).
+    press(&mut app, KeyCode::Char('n'));
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.name = super::editor::Editor::new("draft", false);
+    } else {
+        panic!("wizard did not open");
+    }
+
+    // F2 must NOT close the wizard or discard the typed fields when the URL
+    // is empty — the request can't be saved without one.
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::NewRequest(form)) => {
+            assert_eq!(form.focus, NewField::Url, "focus jumps to the URL field");
+            assert_eq!(form.name.text(), "draft", "typed fields are preserved");
+        }
+        _ => panic!("the wizard must stay open on an empty-URL submit"),
+    }
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::NewRequestUrlRequired)),
+        "a status hint explains why saving was blocked"
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "nothing was saved to any collection"
+    );
+
+    // Once a URL is filled in, F2 saves normally.
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.url = super::editor::Editor::new("http://h/ok", false);
+    }
+    press(&mut app, KeyCode::F(2));
+    assert!(app.overlay.is_none(), "the wizard closes once the URL is valid");
+    assert_eq!(app.collections[0].entries.len(), 1);
+    assert_eq!(app.collections[0].entries[0].url, "http://h/ok");
+}
+
+#[test]
+fn an_untitled_request_stays_at_the_root_instead_of_a_url_named_folder() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new("api".into(), vec![]));
+
+    // No name typed → the URL (which contains slashes) must NOT become the
+    // title, or `tree::entry_path` would file it under a phantom "http:/"
+    // folder away from its siblings.
+    let mut form = NewReq::new(String::new(), vec!["Scratch".into(), "api".into()], 1, None);
+    form.url = super::editor::Editor::new("http://host/path/x", false);
+    app.submit_new_request(form);
+
+    let entry = &app.collections[1].entries[0];
+    assert_eq!(entry.title, "", "an untitled request keeps an empty title");
+    assert!(
+        crate::tree::folder_of(&app.collections[1].entries, 0).is_empty(),
+        "it lives at the root of the folder tree, not in a URL-named folder"
+    );
+}
+
+#[test]
 fn collection_list_shows_the_plus_for_a_user_added_request() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
@@ -11154,6 +11217,182 @@ fn enter_on_a_file_row_loads_it_and_closes_the_picker() {
     assert_eq!(
         app.collections[ci].name, "ws",
         "the tab's own name is untouched by picking a file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Build a `NewReq` form targeting tab `ci` with the given URL. The
+/// `target_names` vector is padded so `NewReq::new`'s internal
+/// `target_idx.min(len-1)` clamp keeps `ci` intact.
+fn new_request_form_for_tab(ci: usize, url: &str) -> NewReq {
+    let names: Vec<String> = (0..=ci).map(|i| format!("tab{i}")).collect();
+    let mut form = NewReq::new(String::new(), names, ci, None);
+    form.url = super::editor::Editor::new(url, false);
+    form
+}
+
+#[test]
+fn new_request_targeting_a_workspace_opens_the_destination_picker() {
+    let dir = workspace_temp_dir("newreq_opens_picker");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    assert!(
+        app.collections[ci].entries.is_empty(),
+        "the request is NOT silently pushed onto the loaded file"
+    );
+    assert!(
+        app.pending_workspace_request.is_some(),
+        "the request is parked awaiting a destination"
+    );
+    match &app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.collection_idx, ci);
+            assert!(p.adding_request, "picker is in add-request mode");
+        }
+        _ => panic!("expected the workspace destination picker to open"),
+    }
+    assert_eq!(app.active_tab, ci, "focus moved to the workspace tab");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn picking_a_file_in_add_mode_appends_the_request_and_shows_it() {
+    let dir = workspace_temp_dir("newreq_append");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    // Highlight alpha.hurl in the just-opened destination picker.
+    if let Some(Overlay::WorkspacePicker(picker)) = &mut app.overlay {
+        picker.selected = picker
+            .entries
+            .iter()
+            .position(|e| e.display_name == "alpha.hurl")
+            .unwrap();
+    } else {
+        panic!("expected the destination picker");
+    }
+
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none(), "the picker closes after landing");
+    assert!(
+        app.pending_workspace_request.is_none(),
+        "the parked request has been placed"
+    );
+    assert_eq!(app.collections[ci].path, Some(dir.join("alpha.hurl")));
+    // The file's own request plus the appended new one.
+    assert_eq!(app.collections[ci].entries.len(), 2);
+    let added = app.collections[ci].entries.last().unwrap();
+    assert_eq!(added.url, "http://h/new");
+    assert!(added.user_added && added.modified, "marked as an unsaved add");
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "the new request is selected so it's visible"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn n_in_the_picker_creates_a_new_collection_holding_the_request() {
+    let dir = workspace_temp_dir("newreq_new_collection");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+
+    // `n` in the destination picker → the "name a new collection" prompt.
+    press(&mut app, KeyCode::Char('n'));
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, .. }) => {
+            assert!(matches!(kind, PromptKind::NewWorkspaceCollection(idx) if *idx == ci));
+        }
+        _ => panic!("expected the new-collection name prompt"),
+    }
+
+    // A relative subfolder path with no extension → `.hurl` is defaulted and
+    // the folder is only created on save.
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new("api/orders", false);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_none());
+    assert!(app.pending_workspace_request.is_none());
+    assert_eq!(
+        app.collections[ci].path,
+        Some(dir.join("api").join("orders.hurl")),
+        "extension defaulted to .hurl and rooted under the workspace"
+    );
+    assert_eq!(app.collections[ci].entries.len(), 1);
+    let added = &app.collections[ci].entries[0];
+    assert_eq!(added.url, "http://h/new");
+    assert!(added.user_added && added.modified);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceCollectionCreated(_))
+    ));
+
+    // Saving writes the file, creating the missing `api/` parent folder.
+    app.active_tab = ci;
+    app.do_file_action(
+        FileAction::SaveCollection,
+        dir.join("api").join("orders.hurl").to_str().unwrap(),
+    );
+    assert!(dir.join("api").join("orders.hurl").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn escaping_the_destination_picker_clears_the_parked_request() {
+    let dir = workspace_temp_dir("newreq_cancel");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.submit_new_request(new_request_form_for_tab(ci, "http://h/new"));
+    assert!(app.pending_workspace_request.is_some());
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert!(
+        app.pending_workspace_request.is_none(),
+        "an aborted flow must not leak the parked request"
+    );
+    assert!(app.collections[ci].entries.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_workspace_collection_rejects_paths_escaping_the_root() {
+    let dir = workspace_temp_dir("newreq_escape");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.create_workspace_collection(ci, "../evil".to_string());
+
+    assert_eq!(
+        app.collections[ci].path, None,
+        "a `..` path is rejected, not created"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -78,6 +78,12 @@ pub(crate) enum PromptKind {
     /// workspace's own (sub)folder name within it. Defaults to the tab's
     /// current name.
     WorkspaceSaveName,
+    /// Naming a brand-new collection file being created inside a Workspace
+    /// tab (the `usize` is the workspace collection index). The typed text is
+    /// a path relative to the workspace root; subfolders are allowed and a
+    /// `.hurl` extension is defaulted. Reached via `n` in the workspace
+    /// destination picker.
+    NewWorkspaceCollection(usize),
 }
 
 impl PromptKind {
@@ -87,6 +93,7 @@ impl PromptKind {
         match self {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
+            PromptKind::NewWorkspaceCollection(_) => ".hurl",
             _ => "",
         }
     }
@@ -188,6 +195,11 @@ pub(crate) struct WorkspacePickerState {
     /// grouping), or `entries.len()` if there are no files at all to select.
     pub(crate) selected: usize,
     pub(crate) scroll: u16,
+    /// `true` when this picker was opened to choose the destination for a
+    /// brand-new request that's parked in `TuiApp::pending_workspace_request`
+    /// (rather than just browsing to load a file). Changes the Enter action
+    /// (load-then-append instead of load-only) and the on-screen hint.
+    pub(crate) adding_request: bool,
 }
 
 impl WorkspacePickerState {
@@ -208,6 +220,7 @@ impl WorkspacePickerState {
             entries,
             selected,
             scroll: 0,
+            adding_request: false,
         }
     }
 
@@ -681,6 +694,15 @@ pub struct TuiApp {
     /// Target path for a pending "Save As" overwrite confirmation.
     pub(crate) pending_save_path: Option<PathBuf>,
 
+    /// A brand-new request awaiting a destination inside a Workspace tab. Set
+    /// when a "New Request" form targets a Workspace (whose entries belong to
+    /// whichever file is loaded, so there's no single obvious destination);
+    /// the workspace destination picker then either appends it to the file
+    /// the user opens or seeds a new collection created with `n`. Taken (set
+    /// back to `None`) as soon as it lands somewhere or the picker is
+    /// cancelled, so an aborted flow never leaks state.
+    pub(crate) pending_workspace_request: Option<HurlEntry>,
+
     /// Git URLs the user has loaded a collection/environment from, most recent
     /// first. Offered as a pickable list in the "Load from Git" wizard and
     /// persisted across restarts.
@@ -773,6 +795,7 @@ impl Default for TuiApp {
             default_request_view: request::RequestView::default(),
             enhanced_keys: false,
             pending_save_path: None,
+            pending_workspace_request: None,
             recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
@@ -1168,6 +1191,9 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::WorkspaceSaveName => self.finish_workspace_save(text),
+            PromptKind::NewWorkspaceCollection(ci) => {
+                self.create_workspace_collection(ci, text)
+            }
         }
     }
 
@@ -1297,6 +1323,11 @@ impl TuiApp {
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
                 let text = self.collections[ci].to_hurl();
+                if let Some(parent) = PathBuf::from(path).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 match std::fs::write(path, text) {
                     Ok(()) => {
                         self.collections[ci].path = Some(PathBuf::from(path));
@@ -1659,7 +1690,140 @@ impl TuiApp {
         )));
     }
 
-    /// Called once per frame (see `draw`): if the active tab is Workspace-
+    /// Open the Workspace file-tree popup for tab `ci` in "choose a
+    /// destination for the pending new request" mode (see
+    /// [`TuiApp::pending_workspace_request`]). Identical to
+    /// `open_workspace_picker_for_active_tab` except it also focuses the tab
+    /// and flags the picker so Enter *appends* the parked request to whatever
+    /// file is opened (rather than merely loading it), and the hint reflects
+    /// that. A no-op if `ci` isn't a Workspace-bound tab (the request is left
+    /// parked; callers guard on this).
+    pub(crate) fn open_workspace_dest_picker(&mut self, ci: usize) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let filter = col.workspace_filter_hurl_json;
+        self.active_tab = ci;
+        let mut picker = WorkspacePickerState::new(ci, root, filter);
+        picker.adding_request = self.pending_workspace_request.is_some();
+        self.overlay = Some(Overlay::WorkspacePicker(picker));
+    }
+
+    /// Append the parked [`TuiApp::pending_workspace_request`], if any, to
+    /// the collection currently loaded in Workspace tab `ci`, marking it as a
+    /// user-added, unsaved edit and selecting it so it's immediately visible.
+    /// Meant to be called right after `load_workspace_file` succeeded. The
+    /// request is only taken once it's been placed; on a missing tab it's
+    /// left parked for the caller to handle.
+    pub(crate) fn append_pending_request_to_loaded(&mut self, ci: usize) {
+        let Some(mut entry) = self.pending_workspace_request.take() else {
+            return;
+        };
+        let Some(col) = self.collections.get_mut(ci) else {
+            self.pending_workspace_request = Some(entry);
+            return;
+        };
+        entry.user_added = true;
+        entry.modified = true;
+        col.entries.push(entry);
+        col.selected_entry = col.entries.len() - 1;
+        col.invalidate_request_json();
+        col.sync_folder_to_selected();
+        self.active_tab = ci;
+        self.focus = Pane::Main;
+        self.status = None;
+        self.save_state();
+    }
+
+    /// Open the "name a new collection" prompt for Workspace tab `ci` (see
+    /// [`PromptKind::NewWorkspaceCollection`]). The typed text is a path
+    /// relative to the workspace root; `.hurl` is ghosted as the default
+    /// extension.
+    pub(crate) fn open_new_workspace_collection_prompt(&mut self, ci: usize) {
+        if self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::NewWorkspaceCollection(ci),
+            editor: Editor::blank(),
+            title: s.workspace_new_collection_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Create a brand-new (in-memory, not-yet-written) collection file inside
+    /// Workspace tab `ci`'s root at the relative path `rel`. Subfolders are
+    /// allowed; a missing extension defaults to `.hurl`. The parked
+    /// [`TuiApp::pending_workspace_request`], if any, becomes the collection's
+    /// sole (user-added) entry so the just-created request is visible. The
+    /// tab now shows this new file (unsaved — Ctrl+S writes it, creating any
+    /// parent folders). Paths that are absolute or try to escape the root via
+    /// `..` are rejected.
+    pub(crate) fn create_workspace_collection(&mut self, ci: usize, rel: String) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let filter = col.workspace_filter_hurl_json;
+        let rel = rel.trim();
+        if rel.is_empty() {
+            return;
+        }
+        let mut rel_path = PathBuf::from(rel);
+        if rel_path.extension().is_none() {
+            rel_path.set_extension("hurl");
+        }
+        // Reject absolute paths or any `..`/root component that would let the
+        // new file escape the workspace root.
+        let safe = rel_path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if !safe {
+            self.status = Some(Status::Error(rel_path.display().to_string()));
+            return;
+        }
+        let full_path = root.join(&rel_path);
+        let mut entries = Vec::new();
+        if let Some(mut entry) = self.pending_workspace_request.take() {
+            entry.user_added = true;
+            entry.modified = true;
+            entries.push(entry);
+        }
+        let has_entry = !entries.is_empty();
+        if let Some(col) = self.collections.get_mut(ci) {
+            col.entries = entries;
+            col.selected_entry = 0;
+            col.path = Some(full_path);
+            col.workspace_root = Some(root);
+            col.workspace_filter_hurl_json = filter;
+            col.invalidate_request_json();
+            col.sync_folder_to_selected();
+        }
+        self.active_tab = ci;
+        self.focus = if has_entry { Pane::Main } else { Pane::List };
+        self.status = Some(Status::WorkspaceCollectionCreated(
+            rel_path.display().to_string(),
+        ));
+        self.save_state();
+    }
+
     /// bound but has no collection file chosen yet (a freshly-created tab,
     /// or one whose last file vanished on restore) — and the user hasn't
     /// already cancelled this same prompt — pop the file picker open
