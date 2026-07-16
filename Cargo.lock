@@ -2296,6 +2296,8 @@ dependencies = [
 [[package]]
 name = "tui-line-editor"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edda2767590e56ca31a74774210d2b6229cf6aa4cd102c1f9ec46c136d33c536"
 dependencies = [
  "ratatui",
 ]
@@ -2303,6 +2305,8 @@ dependencies = [
 [[package]]
 name = "tui-panel-select"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53dc69c3610b7d7e9937133f55974948bb07f56cc60c294856e7f2bf62232e07"
 dependencies = [
  "base64",
  "ratatui",
@@ -2311,6 +2315,8 @@ dependencies = [
 [[package]]
 name = "tui-rgb-picker"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a93bfde8ca9130ca7d776f80b1cb49e00c6bbcd386bf4920c18a860211adc4"
 dependencies = [
  "ratatui",
 ]

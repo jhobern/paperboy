@@ -45,30 +45,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Internal
 
-- **Panel text selection & clipboard copy extracted into the reusable
-  `tui-panel-select` crate** (`crates/tui-panel-select`). The panel-scoped
-  mouse selection, resize-stable wrap cache, and cross-platform clipboard copy
-  now live in a standalone, documented library with a simple `SelectablePanel`
-  API; PaperBoy consumes it. No user-facing behaviour change.
-- **Theme colour picker extracted into the reusable `tui-rgb-picker` crate**
-  (`crates/tui-rgb-picker`). The R/G/B channel-slider picker (state, input, and
-  a styleable/localizable ratatui widget) is now a standalone library; the
-  theme editor consumes it, supplying its own colours, labels and hint. No
-  user-facing behaviour change.
-- **Line/multi-line editor extracted into the reusable `tui-line-editor` crate**
-  (`crates/tui-line-editor`). The single- and multi-line text editor primitive
-  (cursor, selection, masking, and the scrolling/field renderers) is now a
-  standalone library; PaperBoy's `editor` module is a thin theming shim over it.
-  (`tui-textarea` was evaluated but only supports ratatui 0.29, incompatible
-  with PaperBoy's ratatui 0.30.) No user-facing behaviour change.
-- **`tui-panel-select` gains an opt-in mouse handler and a panic-safe terminal
-  guard.** A batteries-included `SelectablePanel::handle_mouse` (configured via
-  `MouseConfig`, e.g. copy-on-release) wires up drag-to-select-to-copy in one
-  call, while the low-level `begin`/`extend`/`copy_selection` methods stay
-  available. A new default-on `terminal-guard` feature adds a `TerminalGuard`
-  RAII helper that enables mouse capture (and optional keyboard enhancement) and
-  restores the terminal on drop *and* on any panic; PaperBoy's TUI setup now
-  uses it. No user-facing behaviour change.
+- **Reusable TUI components split out into standalone crates, published to
+  crates.io, and consumed as dependencies** (repository:
+  [`paperboy-tui`](https://github.com/jhobern/paperboy-tui)). PaperBoy no longer
+  vendors these in-tree — they're ordinary dependencies now. No user-facing
+  behaviour change.
+  - **`tui-panel-select`** — panel-scoped mouse selection, resize-stable wrap
+    cache, and cross-platform clipboard copy, behind a simple `SelectablePanel`
+    API. Also provides an opt-in batteries-included
+    `SelectablePanel::handle_mouse` (configured via `MouseConfig`, e.g.
+    copy-on-release) that wires up drag-to-select-to-copy in one call while the
+    low-level `begin`/`extend`/`copy_selection` methods stay available, and a
+    default-on `terminal-guard` feature whose `TerminalGuard` RAII helper
+    enables mouse capture (and optional keyboard enhancement) and restores the
+    terminal on drop *and* on any panic — PaperBoy's TUI setup uses it.
+  - **`tui-rgb-picker`** — the R/G/B channel-slider colour picker (state, input,
+    and a styleable/localizable ratatui widget); the theme editor consumes it,
+    supplying its own colours, labels and hint.
+  - **`tui-line-editor`** — the single- and multi-line text editor primitive
+    (cursor, selection, masking, and the scrolling/field renderers); PaperBoy's
+    `editor` module is a thin theming shim over it. (`tui-textarea` was
+    evaluated but only supports ratatui 0.29, incompatible with PaperBoy's
+    ratatui 0.30.)
 
 ## [0.1.3] - 2026-07-15
 

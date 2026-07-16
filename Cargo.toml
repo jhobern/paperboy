@@ -8,13 +8,10 @@ repository = "https://github.com/jhobern/paperboy"
 license = "MIT"
 
 
-[workspace]
-members = ["crates/tui-panel-select", "crates/tui-rgb-picker", "crates/tui-line-editor"]
-
 [dependencies]
-tui-panel-select = { path = "crates/tui-panel-select" }
-tui-rgb-picker = { path = "crates/tui-rgb-picker" }
-tui-line-editor = { path = "crates/tui-line-editor" }
+tui-panel-select = "0.1"
+tui-rgb-picker = "0.1"
+tui-line-editor = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hurl = "~8.0"
