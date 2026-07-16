@@ -14,66 +14,34 @@ pub(crate) mod remote;
 mod selection;
 #[cfg(test)]
 mod tests;
-mod theme;
+pub(crate) mod theme;
+mod theme_editor;
 mod wrapcache;
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use std::io;
 use std::time::Duration;
 
 use app::TuiApp;
 use draw::draw;
+use tui_panel_select::TerminalGuard;
 
 /// Entry point: set up the terminal, run the loop, and restore on exit.
 pub fn run() -> io::Result<()> {
     let mut terminal = ratatui::init();
 
-    // Enable the keyboard enhancement protocol where the terminal supports it,
-    // so modifier combinations like Ctrl+Enter are reported distinctly from a
-    // plain Enter. (F5 is the universal fallback for terminals that don't.)
-    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        let _ = execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        );
-    }
-    // Capture the mouse ourselves so drag selections can be scoped to a
-    // single panel (Request JSON / Response) instead of the terminal
-    // emulator's own whole-row native selection.
-    let _ = execute!(io::stdout(), EnableMouseCapture);
-
-    // `ratatui::init()` already installed a panic hook that disables raw
-    // mode and leaves the alternate screen on any panic — but it has no
-    // idea we also turned on mouse capture (and, maybe, the keyboard
-    // enhancement protocol) above, so it never undoes *those*. If anything
-    // panics while either is still active — including a panic inside
-    // crossterm's own event parser itself (a real, reproducible crash: a
-    // malformed/edge-case SGR mouse escape sequence, e.g. one reporting a
-    // coordinate of 0, hits an unchecked `- 1` in
-    // crossterm 0.29.0's `parse_csi_sgr_mouse` and panics) — the terminal
-    // emulator is left with mouse tracking still switched on. Every mouse
-    // move after that keeps sending raw tracking escape sequences straight
-    // into what is now just a plain shell prompt, which shows up to the
-    // user as the terminal continuously filling with garbage characters:
-    // exactly this bug's reported symptom. Wrapping the existing hook with
-    // one that also disables mouse capture (and pops the keyboard
-    // enhancement flags, if pushed) closes that gap for *any* panic,
-    // regardless of whether it originates in our own code or a dependency.
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-        if enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        previous_hook(info);
-    }));
+    // Enable mouse capture (so drag selections can be scoped to a single panel
+    // instead of the terminal emulator's own whole-row native selection) and
+    // the keyboard-enhancement protocol where supported (so Ctrl+Enter is
+    // reported distinctly from a plain Enter; F5 is the universal fallback).
+    // The guard also wraps the panic hook so both are restored on any panic —
+    // including a panic inside crossterm's own SGR mouse-sequence parser —
+    // instead of leaving the shell with mouse tracking still switched on and
+    // filling with garbage. See the `tui-panel-select` `terminal` module.
+    let guard = TerminalGuard::install(true)?;
+    let enhanced = guard.keyboard_enhancement_active();
 
     let mut app = TuiApp::restored();
     app.enhanced_keys = enhanced;
@@ -195,10 +163,7 @@ pub fn run() -> io::Result<()> {
         }
     };
 
-    if enhanced {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    drop(guard); // pops keyboard-enhancement flags + disables mouse capture
     ratatui::restore();
     result
 }

@@ -316,11 +316,15 @@ pub(crate) enum Overlay {
     /// `Save (A)s…` / `To (G)it…` (the exact set depends on the kind). Esc/q
     /// returns to `FileSaveMenu` with the kind re-highlighted.
     FileSaveDest(FileKind, usize),
-    /// The "Settings" menu (Language / Preferences / Clear all collections) —
-    /// opened with `s`. Not to be confused with `Preferences`, the submenu one
-    /// level down that holds the actual toggle-able preferences.
+    /// The "Settings" menu (Language / Theme / Preferences / Clear all
+    /// collections) — opened with `s`. Not to be confused with `Preferences`,
+    /// the submenu one level down that holds the actual toggle-able preferences.
     Options(usize),
     LanguageMenu(usize),
+    /// The Theme editor (Settings → Theme): pick a preset/custom theme or build
+    /// your own. Carries its whole working state (see
+    /// [`crate::tui::theme_editor::ThemeEditorState`]).
+    ThemeEditor(crate::tui::theme_editor::ThemeEditorState),
     /// The "Preferences" submenu of the Settings menu: confirm-on-exit,
     /// confirm-on-clear, and the default Request panel view (JSON/Hurl).
     Preferences(usize),
@@ -650,6 +654,11 @@ pub struct TuiApp {
     /// used for substitution in any collection (subject to being overridden
     /// by that collection's own `linked_env_id`, if set, on name collision).
     pub(crate) active_env_id: Option<u64>,
+    /// Undo stack for deleted Global Environments: each entry is the list index
+    /// the environment was removed from plus the environment itself, so `u`
+    /// (in the Global Environments panel) can reopen the most recent one. The
+    /// exact parallel of a collection's `deleted_entries`.
+    pub(crate) deleted_envs: Vec<(usize, Environment)>,
 
     pub(crate) focus: Pane,
     /// Selected row in the Global Environments list (panel showing env
@@ -788,6 +797,10 @@ pub struct TuiApp {
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
+    /// Preferences (persisted): confirm before deleting a Global Environment
+    /// (`x` in the Global Environments panel). On by default; turn it off to
+    /// always delete immediately (the deletion stays undoable with `u`).
+    pub(crate) confirm_on_delete_env: bool,
     /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
     /// for unsaved in-memory edits (switching collections in a Workspace, or
     /// pushing one to git) is skipped and the "Save" action taken
@@ -797,6 +810,14 @@ pub struct TuiApp {
     /// panel shows by default, for every request. Changed from the
     /// Preferences submenu (Settings → Preferences → Default Request View).
     pub(crate) default_request_view: request::RequestView,
+
+    /// User-created themes (persisted). Shown in the Theme editor alongside the
+    /// built-in presets; deletable (unlike presets) with `Ctrl+D`.
+    pub(crate) custom_themes: Vec<crate::tui::theme::ThemeSpec>,
+    /// The explicitly-chosen theme name, or `None` to follow the language's
+    /// preset. Set the moment the user picks any theme in the Theme editor;
+    /// while `None`, changing language also changes the effective theme.
+    pub(crate) active_theme: Option<String>,
 
     /// `true` when the terminal supports the keyboard-enhancement protocol, so
     /// Ctrl+Enter is reported distinctly from a plain Enter. Advanced shortcuts
@@ -876,6 +897,7 @@ impl Default for TuiApp {
             response: Arc::new(Mutex::new(ApiResponse::default())),
             global_envs: Vec::new(),
             active_env_id: None,
+            deleted_envs: Vec::new(),
             focus: Pane::List,
             global_env_idx: 0,
             resp_scroll: 0,
@@ -913,8 +935,11 @@ impl Default for TuiApp {
             browser_forward_path: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            confirm_on_delete_env: true,
             always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
+            custom_themes: Vec::new(),
+            active_theme: None,
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
@@ -2316,13 +2341,16 @@ impl TuiApp {
     }
 
     /// Delete the Global Environment at `idx`: any collection linked to it
-    /// becomes unlinked, and it's deactivated if it was active.
+    /// becomes unlinked, and it's deactivated if it was active. The removed
+    /// environment is pushed onto `deleted_envs` so `u` can reopen it, and a
+    /// status naming it (with the undo hint) is shown.
     pub(crate) fn delete_global_env(&mut self, idx: usize) {
         if idx >= self.global_envs.len() {
             return;
         }
-        let id = self.global_envs[idx].id;
-        self.global_envs.remove(idx);
+        let removed = self.global_envs.remove(idx);
+        let id = removed.id;
+        let name = removed.name.clone();
         if self.active_env_id == Some(id) {
             self.active_env_id = None;
         }
@@ -2331,18 +2359,69 @@ impl TuiApp {
                 col.linked_env_id = None;
             }
         }
+        self.deleted_envs.push((idx, removed));
         self.global_env_idx = self
             .global_env_idx
             .min(self.global_envs.len().saturating_sub(1));
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
+        self.status = Some(crate::i18n::Status::EnvDeleted(name));
         self.save_state();
     }
 
-    /// Link (or, if already linked to it, unlink) Global Environment `env_id`
-    /// to collection `ci`. Any number of collections may link the same
-    /// environment.
+    /// Reopen the most recently deleted Global Environment (`u`, Global
+    /// Environments panel), restoring it as close as possible to the index it
+    /// was removed from and selecting it. The parallel of
+    /// [`Self::restore_deleted_request`] for environments.
+    pub(crate) fn restore_deleted_env(&mut self) {
+        let Some((idx, env)) = self.deleted_envs.pop() else {
+            return;
+        };
+        let idx = idx.min(self.global_envs.len());
+        let name = env.name.clone();
+        self.global_envs.insert(idx, env);
+        self.global_env_idx = idx;
+        for col in &mut self.collections {
+            col.invalidate_request_json();
+        }
+        self.status = Some(crate::i18n::Status::EnvReopened(name));
+        self.save_state();
+    }
+
+    /// Every theme offered in the Theme editor, in display order: the built-in
+    /// presets first, then the user's own custom themes.
+    pub(crate) fn all_themes(&self) -> Vec<crate::tui::theme::ThemeSpec> {
+        let mut themes = crate::tui::theme::builtin_presets();
+        themes.extend(self.custom_themes.iter().cloned());
+        themes
+    }
+
+    /// Look a theme up by name across presets and custom themes.
+    pub(crate) fn find_theme(&self, name: &str) -> Option<crate::tui::theme::ThemeSpec> {
+        self.all_themes().into_iter().find(|t| t.name == name)
+    }
+
+    /// The theme spec currently in effect: the manually-chosen theme if set
+    /// (and still present), otherwise the current language's preset.
+    pub(crate) fn active_theme_spec(&self) -> crate::tui::theme::ThemeSpec {
+        if let Some(name) = &self.active_theme
+            && let Some(spec) = self.find_theme(name)
+        {
+            return spec;
+        }
+        crate::tui::theme::preset_for_language(&self.language)
+    }
+
+    /// The runtime [`Theme`](crate::tui::theme::Theme) to draw with. While the
+    /// Theme editor is open its live draft is returned instead, so every colour
+    /// tweak previews across the whole UI immediately.
+    pub(crate) fn theme(&self) -> crate::tui::theme::Theme {
+        if let Some(Overlay::ThemeEditor(state)) = &self.overlay {
+            return state.draft.to_theme();
+        }
+        self.active_theme_spec().to_theme()
+    }
     pub(crate) fn set_linked_env(&mut self, ci: usize, env_id: Option<u64>) {
         if let Some(col) = self.collections.get_mut(ci) {
             col.linked_env_id = if col.linked_env_id == env_id {

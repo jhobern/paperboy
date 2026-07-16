@@ -1,4 +1,5 @@
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 
@@ -28,52 +29,168 @@ pub(crate) struct Theme {
     pub(crate) select_fg: Color,
 }
 
-pub(crate) fn theme(lang: &Language) -> Theme {
-    match lang {
-        // French: Provence — warm plum/aubergine, soft amethyst-lavender accent,
-        // cream text.
-        Language::French => Theme {
-            bg: Color::Rgb(34, 28, 50),
-            panel: Color::Rgb(48, 40, 70),
-            text: Color::Rgb(238, 232, 226),
-            dim: Color::Rgb(170, 158, 190),
-            accent: Color::Rgb(180, 142, 226),
-            ok: Color::Rgb(73, 204, 144),
-            err: Color::Rgb(248, 81, 73),
-            subst: Color::Rgb(120, 200, 210),
-            pending: Color::Rgb(252, 161, 48),
-            select_bg: Color::Rgb(255, 214, 10),
-            select_fg: Color::Rgb(20, 20, 20),
-        },
-        Language::Danish => Theme {
-            bg: Color::Rgb(30, 22, 24),
-            panel: Color::Rgb(44, 33, 35),
-            text: Color::Rgb(240, 233, 228),
-            dim: Color::Rgb(184, 166, 164),
-            accent: Color::Rgb(224, 62, 84),
-            ok: Color::Rgb(73, 204, 144),
-            err: Color::Rgb(248, 81, 73),
-            subst: Color::Rgb(120, 200, 210),
-            pending: Color::Rgb(252, 161, 48),
-            select_bg: Color::Rgb(255, 214, 10),
-            select_fg: Color::Rgb(20, 20, 20),
-        },
-        // English (default): Britannia — royal Union navy, soft claret-rose
-        // accent, parchment cream text.
-        _ => Theme {
-            bg: Color::Rgb(18, 26, 54),
-            panel: Color::Rgb(26, 36, 70),
-            text: Color::Rgb(240, 236, 226),
-            dim: Color::Rgb(150, 164, 194),
-            accent: Color::Rgb(178, 58, 74),
-            ok: Color::Rgb(73, 204, 144),
-            err: Color::Rgb(248, 81, 73),
-            subst: Color::Rgb(120, 200, 210),
-            pending: Color::Rgb(252, 161, 48),
-            select_bg: Color::Rgb(255, 214, 10),
-            select_fg: Color::Rgb(20, 20, 20),
-        },
+/// Number of individually-editable colours in a theme.
+pub(crate) const THEME_COLOR_COUNT: usize = 11;
+
+/// A named, serialisable theme definition. Colours are stored as RGB triples
+/// (not `ratatui::Color`) so they persist to `state.json` without depending on
+/// ratatui's optional serde feature, and so the theme editor can adjust each
+/// channel directly. Convert to a runtime [`Theme`] with [`ThemeSpec::to_theme`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThemeSpec {
+    pub(crate) name: String,
+    pub(crate) bg: [u8; 3],
+    pub(crate) panel: [u8; 3],
+    pub(crate) text: [u8; 3],
+    pub(crate) dim: [u8; 3],
+    pub(crate) accent: [u8; 3],
+    pub(crate) ok: [u8; 3],
+    pub(crate) err: [u8; 3],
+    pub(crate) subst: [u8; 3],
+    pub(crate) pending: [u8; 3],
+    pub(crate) select_bg: [u8; 3],
+    pub(crate) select_fg: [u8; 3],
+}
+
+impl ThemeSpec {
+    pub(crate) fn to_theme(&self) -> Theme {
+        let c = |[r, g, b]: [u8; 3]| Color::Rgb(r, g, b);
+        Theme {
+            bg: c(self.bg),
+            panel: c(self.panel),
+            text: c(self.text),
+            dim: c(self.dim),
+            accent: c(self.accent),
+            ok: c(self.ok),
+            err: c(self.err),
+            subst: c(self.subst),
+            pending: c(self.pending),
+            select_bg: c(self.select_bg),
+            select_fg: c(self.select_fg),
+        }
     }
+
+    /// The `i`th editable colour (`0..THEME_COLOR_COUNT`), in display order.
+    pub(crate) fn color(&self, i: usize) -> [u8; 3] {
+        match i {
+            0 => self.bg,
+            1 => self.panel,
+            2 => self.text,
+            3 => self.dim,
+            4 => self.accent,
+            5 => self.ok,
+            6 => self.err,
+            7 => self.subst,
+            8 => self.pending,
+            9 => self.select_bg,
+            _ => self.select_fg,
+        }
+    }
+
+    pub(crate) fn set_color(&mut self, i: usize, rgb: [u8; 3]) {
+        let slot = match i {
+            0 => &mut self.bg,
+            1 => &mut self.panel,
+            2 => &mut self.text,
+            3 => &mut self.dim,
+            4 => &mut self.accent,
+            5 => &mut self.ok,
+            6 => &mut self.err,
+            7 => &mut self.subst,
+            8 => &mut self.pending,
+            9 => &mut self.select_bg,
+            _ => &mut self.select_fg,
+        };
+        *slot = rgb;
+    }
+}
+
+pub(crate) const PRESET_ENGLISH: &str = "Britannia";
+pub(crate) const PRESET_FRENCH: &str = "Parisian Purple";
+pub(crate) const PRESET_DANISH: &str = "Dannebrog";
+
+// English (default): Britannia — royal Union navy, soft claret-rose accent,
+// parchment cream text (evoking the Union Jack).
+fn britannia() -> ThemeSpec {
+    ThemeSpec {
+        name: PRESET_ENGLISH.to_string(),
+        bg: [18, 26, 54],
+        panel: [26, 36, 70],
+        text: [240, 236, 226],
+        dim: [150, 164, 194],
+        accent: [178, 58, 74],
+        ok: [73, 204, 144],
+        err: [248, 81, 73],
+        subst: [120, 200, 210],
+        pending: [252, 161, 48],
+        select_bg: [255, 214, 10],
+        select_fg: [20, 20, 20],
+    }
+}
+
+// French: Parisian Purple — warm plum/aubergine, soft amethyst-lavender accent,
+// cream text.
+fn parisian_purple() -> ThemeSpec {
+    ThemeSpec {
+        name: PRESET_FRENCH.to_string(),
+        bg: [34, 28, 50],
+        panel: [48, 40, 70],
+        text: [238, 232, 226],
+        dim: [170, 158, 190],
+        accent: [180, 142, 226],
+        ok: [73, 204, 144],
+        err: [248, 81, 73],
+        subst: [120, 200, 210],
+        pending: [252, 161, 48],
+        select_bg: [255, 214, 10],
+        select_fg: [20, 20, 20],
+    }
+}
+
+// Danish: Dannebrog — deep red ground with a soft crimson accent, echoing the
+// Danish flag.
+fn dannebrog() -> ThemeSpec {
+    ThemeSpec {
+        name: PRESET_DANISH.to_string(),
+        bg: [30, 22, 24],
+        panel: [44, 33, 35],
+        text: [240, 233, 228],
+        dim: [184, 166, 164],
+        accent: [224, 62, 84],
+        ok: [73, 204, 144],
+        err: [248, 81, 73],
+        subst: [120, 200, 210],
+        pending: [252, 161, 48],
+        select_bg: [255, 214, 10],
+        select_fg: [20, 20, 20],
+    }
+}
+
+/// The built-in presets, in display order (one per bundled language).
+pub(crate) fn builtin_presets() -> Vec<ThemeSpec> {
+    vec![britannia(), parisian_purple(), dannebrog()]
+}
+
+/// The preset a language defaults to when the user hasn't chosen a theme.
+pub(crate) fn preset_for_language(lang: &Language) -> ThemeSpec {
+    match lang {
+        Language::French => parisian_purple(),
+        Language::Danish => dannebrog(),
+        Language::English => britannia(),
+    }
+}
+
+/// Whether `name` is a built-in preset (presets can't be edited or deleted).
+pub(crate) fn is_builtin(name: &str) -> bool {
+    builtin_presets().iter().any(|p| p.name == name)
+}
+
+/// The runtime theme for a language's preset. Retained for callers/tests that
+/// want a language preset directly; the live app resolves through
+/// [`crate::tui::app::TuiApp::theme`] to honour custom themes.
+#[cfg(test)]
+pub(crate) fn theme(lang: &Language) -> Theme {
+    preset_for_language(lang).to_theme()
 }
 
 pub(crate) fn method_color(method: &str) -> Color {

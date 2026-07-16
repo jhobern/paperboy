@@ -316,6 +316,9 @@ pub struct PersistedState {
     /// Ask for confirmation before closing all collections.
     #[serde(default = "yes")]
     pub confirm_on_clear: bool,
+    /// Ask for confirmation before deleting a Global Environment.
+    #[serde(default = "yes")]
+    pub confirm_on_delete_env: bool,
     /// When set, auto-pick "Save" on a Save/Discard/Cancel unsaved-changes
     /// prompt (Workspace collection switch or git push) instead of showing it.
     #[serde(default)]
@@ -336,6 +339,13 @@ pub struct PersistedState {
     /// every request (Settings → Preferences → Default Request View).
     #[serde(default)]
     pub default_request_view: RequestView,
+    /// User-created themes (Settings → Theme). Built-in presets are not stored.
+    #[serde(default)]
+    pub custom_themes: Vec<crate::tui::theme::ThemeSpec>,
+    /// The explicitly-chosen theme name, or `None` to follow the language
+    /// preset. Persisted so a manual theme choice survives restarts.
+    #[serde(default)]
+    pub active_theme: Option<String>,
     /// The global list of Environments (source form only — no resolved
     /// secrets), shared across all collections. Replaces the old per-tab
     /// `env` field.
@@ -370,11 +380,14 @@ impl Default for PersistedState {
             last_env_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            confirm_on_delete_env: true,
             always_save_when_prompted: false,
             list_width: default_list_width(),
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),
             default_request_view: RequestView::default(),
+            custom_themes: Vec::new(),
+            active_theme: None,
             global_envs: Vec::new(),
             active_global_env: None,
         }

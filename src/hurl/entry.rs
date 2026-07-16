@@ -2,26 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Whether a `[Form]`/`[Multipart]` field is a plain text value or a file
-/// upload. A `Text`-only set of fields serializes as `[Form]`; the presence of
-/// any `File` field switches the whole section to `[Multipart]`, matching Hurl
-/// semantics (see https://hurl.dev/docs/request.html).
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+/// Whether a `[Form]`/`[Multipart]` field is a plain text value, a file
+/// upload, or a file whose base64 encoding is sent inline as text. A
+/// `Text`-only set of fields serializes as `[Form]`; the presence of any
+/// `File` field switches the whole section to `[Multipart]`, matching Hurl
+/// semantics (see https://hurl.dev/docs/request.html). `Base64File` is a
+/// PaperBoy-specific kind: the user picks a file (like `File`), but at send
+/// time it is transmitted as a plain text field whose value is
+/// `base64_prefix` followed by the file's base64 encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FormFieldKind {
     #[default]
     Text,
     File,
+    Base64File,
 }
+
+/// Marker stored in a `Base64File` field's Hurl content-type slot so a saved
+/// `.hurl` round-trips back into a `Base64File` (Hurl has no native concept
+/// of "encode this file as base64 text"). The base64_prefix follows the
+/// marker, URL-safe-base64 encoded so it is a valid Hurl content-type token.
+pub(crate) const BASE64_FILE_CT_MARKER: &str = "x-paperboy-base64;";
 
 /// One row of a `[Form]`/`[Multipart]` section. `content_type` is only
 /// meaningful for `File` fields: when `None`, Hurl infers the content type
 /// from the file extension (defaulting to `application/octet-stream`).
+/// `base64_prefix` is only meaningful for `Base64File` fields: it is
+/// prepended to the file's base64 encoding at send time.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FormField {
     pub key: String,
     pub value: String,
     pub kind: FormFieldKind,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub base64_prefix: Option<String>,
 }
 
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
@@ -148,6 +165,36 @@ impl HurlEntry {
         }
     }
 
+    /// Add an explicit `Content-Length: 0` header when this is a bodyless
+    /// request whose method normally carries a body (`POST`/`PUT`/`PATCH`/
+    /// `DELETE`). Browsers and Postman always send `Content-Length: 0` in this
+    /// case, but libcurl (which the Hurl runner uses) omits it for a bodyless
+    /// request over HTTP/2, and some servers reject such a request with a
+    /// `400 Bad Request`. Matching the Postman/browser behaviour keeps those
+    /// requests working.
+    ///
+    /// A no-op when a body or form fields are present (libcurl computes the
+    /// length itself), when the method doesn't carry a body, or when the user
+    /// already set a `Content-Length` header. Applied only to the transient
+    /// copy that's run — never to what's saved to disk — so saved `.hurl`
+    /// files stay free of synthesized headers.
+    pub fn ensure_run_content_length(&mut self) {
+        let carries_body = matches!(
+            self.method.to_ascii_uppercase().as_str(),
+            "POST" | "PUT" | "PATCH" | "DELETE"
+        );
+        let has_body = self.body.as_deref().is_some_and(|b| !b.trim().is_empty())
+            || !self.form_fields.is_empty();
+        let has_content_length = self
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        if carries_body && !has_body && !has_content_length {
+            self.headers
+                .push(("Content-Length".to_string(), "0".to_string()));
+        }
+    }
+
     /// Serialize this entry to Hurl text. Ordered so it round-trips through
     /// [`parse_hurl`](super::parse_hurl): a body (which must be JSON/quoted to
     /// be re-detected) is emitted right after the headers; request sections and
@@ -192,11 +239,13 @@ impl HurlEntry {
         }
         if !self.form_fields.is_empty() {
             // Any File field switches the whole section to `[Multipart]`
-            // (Hurl's `[Form]` section is text-only); otherwise `[Form]`.
+            // (Hurl's `[Form]` section is text-only); a Base64File also
+            // serializes as a `file,...` line (carrying its marker), so it
+            // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
             let multipart = self
                 .form_fields
                 .iter()
-                .any(|f| f.kind == FormFieldKind::File);
+                .any(|f| matches!(f.kind, FormFieldKind::File | FormFieldKind::Base64File));
             out.push_str(if multipart {
                 "[Multipart]\n"
             } else {
@@ -213,6 +262,22 @@ impl HurlEntry {
                             }
                             _ => out.push_str(&format!("{}: file,{};\n", f.key, path)),
                         }
+                    }
+                    // A Base64File is transformed into a plain Text field
+                    // before an actual request runs (see
+                    // `expand_base64_form_fields`); this branch only runs when
+                    // serializing for *saving* to disk. Encode it as a file
+                    // line whose content-type carries a PaperBoy marker plus
+                    // the URL-safe-base64 encoded prefix, so parsing restores
+                    // the Base64File kind and its prefix.
+                    FormFieldKind::Base64File => {
+                        let path = escape_form_file_path(&f.value);
+                        let encoded_prefix = URL_SAFE_NO_PAD
+                            .encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
+                        out.push_str(&format!(
+                            "{}: file,{}; {}{}\n",
+                            f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
+                        ));
                     }
                 }
             }
@@ -269,4 +334,98 @@ pub fn method_rgb(method: &str) -> Option<(u8, u8, u8)> {
         "ANY" => (252, 161, 48),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(method: &str) -> HurlEntry {
+        HurlEntry {
+            method: method.to_string(),
+            url: "http://x/y".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bodyless_post_gets_an_explicit_content_length_zero() {
+        let mut e = entry("POST");
+        e.ensure_run_content_length();
+        assert!(
+            e.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Length" && v == "0")
+        );
+    }
+
+    #[test]
+    fn content_length_added_for_all_body_carrying_methods() {
+        for m in ["POST", "PUT", "PATCH", "DELETE", "post", "Put"] {
+            let mut e = entry(m);
+            e.ensure_run_content_length();
+            assert!(
+                e.headers.iter().any(|(k, _)| k == "Content-Length"),
+                "expected Content-Length for {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_and_head_never_get_a_content_length() {
+        for m in ["GET", "HEAD"] {
+            let mut e = entry(m);
+            e.ensure_run_content_length();
+            assert!(
+                !e.headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
+                "did not expect Content-Length for {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_length_skipped_when_a_body_is_present() {
+        let mut e = entry("POST");
+        e.body = Some("{\"a\":1}".to_string());
+        e.ensure_run_content_length();
+        assert!(
+            !e.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        );
+    }
+
+    #[test]
+    fn content_length_skipped_when_form_fields_are_present() {
+        let mut e = entry("POST");
+        e.form_fields = vec![FormField {
+            key: "a".to_string(),
+            value: "b".to_string(),
+            kind: FormFieldKind::Text,
+            content_type: None,
+            base64_prefix: None,
+        }];
+        e.ensure_run_content_length();
+        assert!(
+            !e.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        );
+    }
+
+    #[test]
+    fn a_user_set_content_length_is_not_duplicated() {
+        let mut e = entry("POST");
+        e.headers
+            .push(("content-length".to_string(), "5".to_string()));
+        e.ensure_run_content_length();
+        let count = e
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .count();
+        assert_eq!(count, 1);
+    }
 }

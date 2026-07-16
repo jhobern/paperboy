@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "paperboy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64",
  "clap",
@@ -1469,6 +1469,9 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tui-line-editor",
+ "tui-panel-select",
+ "tui-rgb-picker",
  "uuid",
 ]
 
@@ -2288,6 +2291,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "tui-line-editor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edda2767590e56ca31a74774210d2b6229cf6aa4cd102c1f9ec46c136d33c536"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
+name = "tui-panel-select"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53dc69c3610b7d7e9937133f55974948bb07f56cc60c294856e7f2bf62232e07"
+dependencies = [
+ "base64",
+ "ratatui",
+]
+
+[[package]]
+name = "tui-rgb-picker"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a93bfde8ca9130ca7d776f80b1cb49e00c6bbcd386bf4920c18a860211adc4"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]

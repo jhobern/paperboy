@@ -63,24 +63,28 @@ cargo build --release
   keeping invalid text open for correction rather than discarding it.
 - **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
   add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
-  `Text` — press `Enter` to open it and pick `File` instead, Value, a
-  separate Content-Type column, and a free-text Description column — Kind
-  comes before Value so filling a row naturally picks `Text`/`File` before
-  typing the value) and cookies (checkbox, Key, Value), using the same
-  table and tabbing conventions as `[Headers]`. Saving picks the correct Hurl
-  section automatically — all-Text fields become `[Form]`, and any File
-  field promotes the section to `[Multipart]`. File fields are colored to
-  show whether the referenced path exists and is readable — relative paths
-  resolve against the collection's own directory, matching where Hurl
-  actually looks for them when sending the request. With focus on a
-  `File`-kind Value cell, `Ctrl+F` (or `Enter`) opens a file picker to
-  choose the path instead of typing it (without stealing focus to the
-  Content-Type column afterwards); the Content-Type cell is a dropdown
-  offering "Auto" plus the fixed MIME types from
+  `Text` — press `Enter` to open it and pick `File` or `Base64 File` instead,
+  Value, a separate Content-Type column, a Base64 Prefix column, and a
+  free-text Description column — Kind comes before Value so filling a row
+  naturally picks the type before typing the value) and cookies (checkbox,
+  Key, Value), using the same table and tabbing conventions as `[Headers]`.
+  Saving picks the correct Hurl section automatically — all-Text fields become
+  `[Form]`, and any File field promotes the section to `[Multipart]`. File
+  fields are colored to show whether the referenced path exists and is
+  readable — relative paths resolve against the collection's own directory,
+  matching where Hurl actually looks for them when sending the request. With
+  focus on a `File`- or `Base64 File`-kind Value cell, `Ctrl+F` (or `Enter`)
+  opens a file picker to choose the path instead of typing it (without
+  stealing focus to the Content-Type column afterwards); the Content-Type cell
+  is a dropdown offering "Auto" plus the fixed MIME types from
   [hurl.dev](https://hurl.dev/docs/request.html) (still editable as free
   text for anything else), and is auto-set from the picked file's
   extension. An empty/auto-detected Content-Type cell shows a dimmed
-  "Auto" placeholder rather than looking blank. Editing a request into an
+  "Auto" placeholder rather than looking blank. A **`Base64 File`** field is
+  sent as plain text: its picked file is base64-encoded (unwrapped) at send
+  time and the field value becomes `<Base64 Prefix><base64>`, so a prefix like
+  `data:image/png;base64,` produces a ready-to-use data URI. The Base64 Prefix
+  column only affects `Base64 File` rows. Editing a request into an
   impossible Body + Form/Multipart combination shows a clear status-bar
   error instead of sending it.
 - **Headers, Cookies, Form, Asserts, and Captures all start empty** — just
@@ -115,8 +119,11 @@ cargo build --release
   `Body` also grows a left-hand scrollbar once it overflows.
 - **Per-section wizard tabs**: the request wizard has a tab bar (`All │
   Headers │ Cookies │ Form │ Body │ Asserts │ Captures`), switched with
-  `PageUp`/`PageDown` and reordered with `Ctrl+Shift+←`/`→` (just like
-  collection tabs). Picking a section tab gives that section almost the
+  `[`/`]` or `PageUp`/`PageDown` and reordered with `Ctrl+Shift+←`/`→`
+  (just like collection tabs). `[`/`]` only cycle tabs when focus is on a
+  non-text field (Method, Target, or a "+ Add …" row), so they can still be
+  typed into URLs, bodies, and other text cells; `PageUp`/`PageDown` always
+  switch tabs. Picking a section tab gives that section almost the
   whole dialog to itself — handy for editing long Headers or Form-field
   lists — while `All` keeps the combined, everything-at-once layout. Every
   tab is just a different view of the same request, so edits made on one
@@ -163,6 +170,8 @@ cargo build --release
 - The app remembers your window layout, active tab/request, language, and
   recently-used git URLs across restarts.
 - English, French and Danish UI languages (Options → Language).
+- **Custom themes.** Settings → Theme lets you pick a per-language preset or
+  build and save your own colour scheme (see [Themes](#themes)).
 - **Nested folders.** A request's name can encode a folder path with `/`
   separators (e.g. `Auth/Tokens/Refresh`); the Requests list browses these
   as folders — `Enter` on a folder row descends into it, `Enter` on the
@@ -219,16 +228,48 @@ Notes on saving:
 
 ### Settings & preferences
 
-Open the **Settings** menu with `s` and choose **Preferences** for a few
-toggles that persist across restarts:
+Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
+**Preferences** for a few toggles that persist across restarts:
 
 - **Confirm on exit** / **Confirm on clear** — ask before quitting or before
   clearing all collections.
+- **Confirm before deleting an environment** (on by default) — ask before
+  deleting a Global Environment with `x`. Turn it off to delete straight away;
+  either way the deletion is undoable with `u`.
 - **Always save when prompted** (off by default) — whenever an action would
   otherwise pop up a **Save / Discard / Cancel** choice (e.g. switching away
   from a Workspace collection with unsaved changes), automatically pick
   **Save** without asking. Leave it off to keep being prompted each time.
 - **Default Request view** — whether the Request panel opens in JSON or Hurl.
+
+### Themes
+
+Settings → **Theme** opens a theme editor. PaperBoy ships three presets — one
+per UI language, evoking its country: **Britannia** (English), **Parisian
+Purple** (French), and **Dannebrog** (Danish). By default the theme follows
+the current language; pick any preset (or a custom theme) from the list to use
+it. Presets are read-only — to make your own, base a new theme on one:
+
+- `Ctrl+N` — open the **New theme** popup. Give it a name — the cursor blinks
+  in the name field ready for typing — and choose an existing theme to copy its
+  colours from (`Tab` switches between the name and the base list). Pressing
+  `Enter` creates the theme, activates it, adds it to the list, and drops you
+  into the colour rows to edit.
+- Editing colours — with a custom theme selected, step into the colour rows
+  with `→` (or `Tab`). The first row is the theme's **name** — edit it to rename
+  the theme, then press `Enter` (or move off the row) to submit. Below it are
+  the colours. Move between rows with `↑`/`↓`. Press
+  `Enter` on a colour to open the **colour picker**: adjust the highlighted
+  R/G/B channel with `←`/`→` (±1) or `Ctrl`+`←`/`→` / `PageUp`/`PageDown` (±16),
+  or type a `0`–`255` value, and switch channels with `↑`/`↓`. The whole UI
+  previews live; `Enter` applies (and **auto-saves**), `Esc` cancels. `←` steps
+  back from the rows to the list.
+- `Ctrl+D` — delete the selected custom theme (presets can't be deleted); focus
+  moves to the theme just above the deleted one.
+- `Esc` — close the editor.
+
+Once you've chosen a theme by hand it stays put; changing language only
+switches the theme while you're still on **Automatic**.
 
 ## Loading & saving via git
 
@@ -400,6 +441,7 @@ up-to-date list. Highlights:
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |
 | `x` | Delete request / close collection tab |
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
+| `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
 | `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |
@@ -408,12 +450,13 @@ up-to-date list. Highlights:
 | `<` / `>` | Grow / shrink the left column |
 | `Ctrl+↑`/`↓` (in wizard) | Jump to the previous/next section (Headers/Cookies/Form/Body/Asserts/Captures) |
 | `Alt+1`-`6` (in wizard) | Jump directly to a section (1=Headers, 2=Cookies, 3=Form, 4=Body, 5=Asserts, 6=Captures) — `Alt`, not `Ctrl`, since most terminals can't report `Ctrl`+digit without special keyboard-protocol support |
+| `[` / `]` (in wizard) | Switch the wizard's section-view tab, same as `PageUp`/`PageDown` — only when focus is on a non-text field (Method, Target, or a "+ Add …" row), so brackets can still be typed into URLs/bodies/values |
 | `PageUp`/`PageDown` (in wizard) | Switch the wizard's section-view tab (`All`/Headers/Cookies/Form/Body/Asserts/Captures); switching to a section tab focuses its first entry |
 | `Ctrl+Shift+←`/`→` (in wizard) | Reorder the wizard's section-view tabs |
 | `Ctrl+D` (on a Header/Cookie/Form/Assert/Capture row) | Delete that row |
 | `Ctrl+E` (on a Header/Cookie/Form row) | Toggle that row's enabled/disabled state and focus its checkbox |
 | `←` (from a row's Key cell) | Reach the Enabled checkbox — it's the leftmost visual column, so arrowing left from Key goes straight to it |
-| `Ctrl+F`, `Enter` (on a `File`-kind Form Value cell) | Open a file picker to choose the path |
+| `Ctrl+F`, `Enter` (on a `File`- or `Base64 File`-kind Form Value cell) | Open a file picker to choose the path |
 | `F2`, `Ctrl+Enter` | Save the open editor / wizard |
 | `Esc` | Cancel |
 | `q`, `Ctrl+C` | Quit |

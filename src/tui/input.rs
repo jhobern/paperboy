@@ -22,7 +22,6 @@ use super::editor::*;
 use super::new_request::*;
 use super::remote::*;
 use super::selection;
-use super::theme::*;
 
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
@@ -543,6 +542,7 @@ impl TuiApp {
             Overlay::EnvPopup(popup) => self.on_key_env_popup(popup, key),
             Overlay::EnvLinkPicker(picker) => self.on_key_env_link_picker(picker, key),
             Overlay::EnvCollision(collision) => self.on_key_env_collision(*collision, key),
+            Overlay::ThemeEditor(state) => self.on_key_theme_editor(state, key),
             Overlay::WorkspacePicker(picker) => self.on_key_workspace_picker(picker, key),
             Overlay::CloseGitWorkspace { idx, path, sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
@@ -875,7 +875,7 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Options(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Options((sel + 1).min(2)));
+                    self.overlay = Some(Overlay::Options((sel + 1).min(3)));
                 }
                 KeyCode::Enter => match sel {
                     0 => {
@@ -887,7 +887,8 @@ impl TuiApp {
                         };
                         self.overlay = Some(Overlay::LanguageMenu(cur));
                     }
-                    1 => self.overlay = Some(Overlay::Preferences(0)),
+                    1 => self.open_theme_editor(),
+                    2 => self.overlay = Some(Overlay::Preferences(0)),
                     _ => {
                         // Close all collections, guarded by the confirm setting.
                         if self.confirm_on_clear {
@@ -904,12 +905,12 @@ impl TuiApp {
                 _ => self.overlay = Some(Overlay::Options(sel)),
             },
             Overlay::Preferences(sel) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::Options(1)),
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::Options(2)),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Preferences((sel + 1).min(3)));
+                    self.overlay = Some(Overlay::Preferences((sel + 1).min(4)));
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     match sel {
@@ -924,6 +925,16 @@ impl TuiApp {
                             self.overlay = Some(Overlay::Preferences(sel));
                         }
                         2 => {
+                            self.confirm_on_delete_env = !self.confirm_on_delete_env;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
+                        }
+                        3 => {
+                            self.always_save_when_prompted = !self.always_save_when_prompted;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
+                        }
+                        _ => {
                             // Open the Default Request View submenu,
                             // preselecting the current view.
                             let cur = match self.default_request_view {
@@ -931,11 +942,6 @@ impl TuiApp {
                                 request::RequestView::Hurl => 1,
                             };
                             self.overlay = Some(Overlay::RequestViewMenu(cur));
-                        }
-                        _ => {
-                            self.always_save_when_prompted = !self.always_save_when_prompted;
-                            self.save_state();
-                            self.overlay = Some(Overlay::Preferences(sel));
                         }
                     }
                 }
@@ -988,7 +994,7 @@ impl TuiApp {
                 // to Preferences afterwards; there's nothing left to
                 // "confirm" or "cancel" since the value's already applied.
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                    self.overlay = Some(Overlay::Preferences(2))
+                    self.overlay = Some(Overlay::Preferences(4))
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let new_sel = sel.saturating_sub(1);
@@ -1417,14 +1423,23 @@ impl TuiApp {
                     }
                     form.focus_next(true);
                 } else if !ctrl && kind_open && matches!(key.code, KeyCode::Up | KeyCode::Down) {
-                    // Only two real options, so either arrow just flips
-                    // between them.
+                    // Step through Text → File → Base64 File (Down) or the
+                    // reverse (Up), clamped at the ends like a small list.
                     if let NewField::FormField(i, FormCol::Kind) = form.focus
                         && let Some(row) = form.form_fields.get_mut(i)
                     {
-                        row.kind = match row.kind {
-                            FormFieldKind::Text => FormFieldKind::File,
-                            FormFieldKind::File => FormFieldKind::Text,
+                        row.kind = if key.code == KeyCode::Down {
+                            match row.kind {
+                                FormFieldKind::Text => FormFieldKind::File,
+                                FormFieldKind::File => FormFieldKind::Base64File,
+                                FormFieldKind::Base64File => FormFieldKind::Base64File,
+                            }
+                        } else {
+                            match row.kind {
+                                FormFieldKind::Base64File => FormFieldKind::File,
+                                FormFieldKind::File => FormFieldKind::Text,
+                                FormFieldKind::Text => FormFieldKind::Text,
+                            }
                         };
                     }
                 } else if kind_open && key.code == KeyCode::Enter {
@@ -1455,19 +1470,26 @@ impl TuiApp {
                 } else if !ctrl
                     && key.code == KeyCode::Enter
                     && let NewField::FormField(i, FormCol::Value) = form.focus
-                    && form.form_fields.get(i).map(|r| r.kind) == Some(FormFieldKind::File)
+                    && matches!(
+                        form.form_fields.get(i).map(|r| r.kind),
+                        Some(FormFieldKind::File | FormFieldKind::Base64File)
+                    )
                 {
-                    // Enter on a `File`-kind Form row's Value cell opens the
-                    // file picker too, not just Ctrl+F — it's the more
-                    // discoverable of the two.
+                    // Enter on a `File`/`Base64File`-kind Form row's Value
+                    // cell opens the file picker too, not just Ctrl+F — it's
+                    // the more discoverable of the two.
                     self.parked_wizard = Some(form);
                     self.open_browser(FileAction::PickFormFile(i));
                     return;
                 } else if ctrl && key.code == KeyCode::Char('f') {
                     // Ctrl+F opens a file picker for the focused Form row's
-                    // Value cell (only meaningful for `File`-kind rows).
+                    // Value cell (only meaningful for `File`/`Base64File`
+                    // rows, which both point at a file).
                     if let NewField::FormField(i, FormCol::Value) = form.focus
-                        && form.form_fields.get(i).map(|r| r.kind) == Some(FormFieldKind::File)
+                        && matches!(
+                            form.form_fields.get(i).map(|r| r.kind),
+                            Some(FormFieldKind::File | FormFieldKind::Base64File)
+                        )
                     {
                         self.parked_wizard = Some(form);
                         self.open_browser(FileAction::PickFormFile(i));
@@ -1481,6 +1503,17 @@ impl TuiApp {
                     form.cycle_view_tab(true);
                 } else if key.code == KeyCode::PageUp {
                     form.cycle_view_tab(false);
+                } else if !ctrl
+                    && !alt
+                    && matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
+                    && !form.focus_is_text_entry()
+                {
+                    // `[` / `]` cycle the section-view tab too, mirroring the
+                    // main view's tab keys (an easier-to-reach alias for
+                    // PageUp/PageDown). Only active when focus isn't on a
+                    // text-entry cell, so the brackets can still be typed into
+                    // URLs, JSON bodies, header/cookie/form values, etc.
+                    form.cycle_view_tab(key.code == KeyCode::Char(']'));
                 } else if ctrl && key.code == KeyCode::Char('d') {
                     // Delete the focused Header/Cookie/Form/Assert/Capture row;
                     // focus moves to the row sliding into its place, or the
@@ -2104,6 +2137,9 @@ impl TuiApp {
             // collection (mirroring how `x` deletes a request there instead of
             // closing the tab) — see `restore_deleted_request`.
             KeyCode::Char('u') if self.focus == Pane::List => self.restore_deleted_request(),
+            // `u` in the Global Environments panel reopens the most recently
+            // deleted environment (mirroring how `x` deletes one there).
+            KeyCode::Char('u') if self.focus == Pane::GlobalEnv => self.restore_deleted_env(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // Ctrl+Shift+Left/Right reorders the active tab (index 0, the
             // built-in Request tab, never moves).
@@ -2162,11 +2198,17 @@ impl TuiApp {
             KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
+            // Guarded by the confirm-on-delete-env preference; when it's off,
+            // delete straight away (still undoable with `u`).
             KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                self.overlay = Some(Overlay::Confirm {
-                    action: ConfirmAction::DeleteEnv(self.global_env_idx),
-                    sel: 1,
-                });
+                if self.confirm_on_delete_env {
+                    self.overlay = Some(Overlay::Confirm {
+                        action: ConfirmAction::DeleteEnv(self.global_env_idx),
+                        sel: 1,
+                    });
+                } else {
+                    self.delete_global_env(self.global_env_idx);
+                }
             }
             KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
             // 'm' / 'c' move / copy the highlighted request in a Workspace tab
@@ -2917,11 +2959,16 @@ impl TuiApp {
                 } else {
                     None
                 };
+                // The Base64 Prefix cell is only meaningful for Base64File
+                // rows; store it verbatim (it may legitimately be empty).
+                let base64_prefix =
+                    (kind == FormFieldKind::Base64File).then(|| r.base64_prefix.text().to_string());
                 FormField {
                     key: r.key.text().trim().to_string(),
                     value: r.value.text().trim().to_string(),
                     kind,
                     content_type,
+                    base64_prefix,
                 }
             })
             .collect();
@@ -3106,11 +3153,14 @@ impl TuiApp {
             .map(PathBuf::from);
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
+        self.confirm_on_delete_env = state.confirm_on_delete_env;
         self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;
         self.recent_git_urls = state.recent_git_urls;
         self.default_request_view = state.default_request_view;
+        self.custom_themes = state.custom_themes;
+        self.active_theme = state.active_theme;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
@@ -3140,11 +3190,14 @@ impl TuiApp {
                 .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
+            confirm_on_delete_env: self.confirm_on_delete_env,
             always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,
             recent_git_urls: self.recent_git_urls.clone(),
             default_request_view: self.default_request_view,
+            custom_themes: self.custom_themes.clone(),
+            active_theme: self.active_theme.clone(),
             global_envs: self
                 .global_envs
                 .iter()
@@ -3537,11 +3590,9 @@ impl TuiApp {
                             // Only append if the load actually took effect; on
                             // a read error `load_workspace_file` leaves the tab
                             // untouched, so keep the request parked.
-                            let loaded_ok = self
-                                .collections
-                                .get(ci)
-                                .and_then(|c| c.path.as_deref())
-                                == Some(path.as_path());
+                            let loaded_ok =
+                                self.collections.get(ci).and_then(|c| c.path.as_deref())
+                                    == Some(path.as_path());
                             if loaded_ok {
                                 self.append_pending_request_to_loaded(ci);
                             }
@@ -3687,7 +3738,7 @@ impl TuiApp {
     }
 
     pub(crate) fn open_browser(&mut self, action: FileAction) {
-        let th = theme(&self.language);
+        let th = self.theme();
         let s = Strings::for_language(&self.language);
         let label = match action {
             FileAction::OpenCollection => s.open_collection,

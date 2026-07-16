@@ -204,6 +204,111 @@ fn shadowed_env_keys_is_empty_without_both_a_linked_and_an_active_environment() 
 }
 
 #[test]
+fn deleting_an_environment_asks_for_confirmation_by_default() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteEnv(0),
+                ..
+            })
+        ),
+        "x opens the delete confirmation by default"
+    );
+
+    press(&mut app, KeyCode::Char('y')); // confirm the deletion
+    assert!(
+        app.global_envs.is_empty(),
+        "confirming deletes the environment"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvDeleted(ref n)) if n == "staging"),
+        "a status naming the deleted environment (with the undo hint) is shown"
+    );
+}
+
+#[test]
+fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
+    let mut app = TuiApp::default();
+    app.confirm_on_delete_env = false;
+    add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation popup when the preference is off"
+    );
+    assert!(app.global_envs.is_empty(), "the environment is deleted");
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvDeleted(ref n)) if n == "staging"),
+        "the delete status is still shown"
+    );
+}
+
+#[test]
+fn u_reopens_the_most_recently_deleted_environment() {
+    let mut app = TuiApp::default();
+    app.confirm_on_delete_env = false;
+    add_empty_global_env(&mut app, "alpha");
+    add_empty_global_env(&mut app, "bravo");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 1; // bravo
+
+    press(&mut app, KeyCode::Char('x')); // delete bravo
+    assert_eq!(app.global_envs.len(), 1);
+
+    press(&mut app, KeyCode::Char('u')); // reopen it
+    assert_eq!(app.global_envs.len(), 2, "the environment comes back");
+    assert_eq!(
+        app.global_envs[1].name, "bravo",
+        "it returns to the index it was deleted from"
+    );
+    assert_eq!(
+        app.global_env_idx, 1,
+        "the reopened environment becomes selected"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvReopened(ref n)) if n == "bravo"),
+        "a reopen status naming the environment is shown"
+    );
+}
+
+#[test]
+fn the_confirm_on_delete_env_preference_toggles_and_persists() {
+    let mut app = TuiApp::default();
+    assert!(
+        app.confirm_on_delete_env,
+        "confirmation is on by default (safe)"
+    );
+
+    app.overlay = Some(Overlay::Preferences(2));
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.confirm_on_delete_env, "Enter toggles it off");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        "the highlight stays on the toggle row"
+    );
+
+    // The setting round-trips through persistence.
+    let persisted = app.to_persisted();
+    assert!(!persisted.confirm_on_delete_env);
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(persisted);
+    assert!(
+        !restored.confirm_on_delete_env,
+        "the preference survives a save/load cycle"
+    );
+}
+
+#[test]
 fn f2_on_the_environments_panel_renames_the_selected_environment() {
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("staging".into(), "TOKEN=v");
@@ -1214,7 +1319,8 @@ fn clearing_via_the_options_menu_asks_for_confirmation() {
         .push(HurlEntry::from_fields("r", "GET", "http://h/x", vec![], ""));
 
     press(&mut app, KeyCode::Char('s')); // open Options (sel 0 = Language)
-    press(&mut app, KeyCode::Down); // -> Settings
+    press(&mut app, KeyCode::Down); // -> Theme
+    press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Down); // -> Close all collections
     press(&mut app, KeyCode::Enter); // opens confirm popup (confirm_on_clear default true)
 
@@ -1252,6 +1358,7 @@ fn declining_the_clear_confirmation_keeps_requests() {
     press(&mut app, KeyCode::Char('s'));
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter); // confirm popup (defaults to No)
     press(&mut app, KeyCode::Char('n')); // decline
 
@@ -1270,6 +1377,7 @@ fn clearing_is_immediate_when_confirmation_is_disabled() {
         .push(HurlEntry::from_fields("r", "GET", "http://h/x", vec![], ""));
 
     press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter); // clears immediately, no popup
@@ -1330,6 +1438,7 @@ fn preferences_menu_toggles_confirmation_flags() {
     );
 
     press(&mut app, KeyCode::Char('s')); // Options (sel 0)
+    press(&mut app, KeyCode::Down); // -> Theme
     press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Enter); // open Preferences (sel 0 = Confirm on exit)
     press(&mut app, KeyCode::Enter); // toggle it off
@@ -1343,7 +1452,7 @@ fn preferences_menu_toggles_confirmation_flags() {
 }
 
 #[test]
-fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
+fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
@@ -1352,13 +1461,16 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
     );
 
     press(&mut app, KeyCode::Char('s')); // Options (sel 0)
+    press(&mut app, KeyCode::Down); // -> Theme
     press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Enter); // open Preferences (sel 0)
     press(&mut app, KeyCode::Down); // -> sel 1 (Confirm on clear)
-    press(&mut app, KeyCode::Down); // -> sel 2 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
-        "Down moves to the 3rd item without wrapping past it"
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        "Down moves to the last item without wrapping past it"
     );
 
     press(&mut app, KeyCode::Enter); // open the Default Request View submenu
@@ -1385,7 +1497,7 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
         "selecting Hurl in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -1393,14 +1505,14 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects Hurl (index 1) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(2)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(4)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
         "preselects Hurl (index 1)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -1417,10 +1529,13 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // render each view while still browsing the menu.
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Down); // -> Theme
     press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down); // -> sel 1
-    press(&mut app, KeyCode::Down); // -> sel 2 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects JSON (0)
     assert_eq!(app.default_request_view, RequestView::Json);
 
@@ -1440,7 +1555,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(2))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(4))));
     assert_eq!(app.default_request_view, RequestView::Json);
 }
 
@@ -3528,6 +3643,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_env_rename,
         s.help_env_activate,
         s.help_env_delete,
+        s.help_env_reopen,
         s.help_env_link,
         s.help_env_view_linked,
         s.help_tab_manage,
@@ -8595,6 +8711,8 @@ fn content_type_and_description_are_independent_form_columns() {
     }
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
+    press(&mut app, KeyCode::Right); // -> Prefix (inert on a File row)
+    assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Prefix));
     press(&mut app, KeyCode::Right); // -> Desc, independent from Ctype
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Desc));
     for ch in "a note".chars() {
@@ -9060,6 +9178,7 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
         value: "bar".to_string(),
         kind: crate::hurl::FormFieldKind::Text,
         content_type: None,
+        base64_prefix: None,
     });
 
     let mut app = TuiApp::default();
@@ -9350,6 +9469,47 @@ fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
         NewField::AddCapture,
         "captures start empty, so the entry point is the Add row"
     );
+}
+
+#[test]
+fn brackets_cycle_wizard_section_tabs_on_non_text_fields() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    // Name is a text field, so `]` types into it rather than cycling.
+    assert_eq!(new_focus(&app), NewField::Name);
+    press(&mut app, KeyCode::Char(']'));
+    assert_eq!(
+        form_ref(&app).view_tab,
+        WizardTab::All,
+        "`]` typed into Name"
+    );
+    assert_eq!(form_ref(&app).name.text(), "]");
+
+    // Move to Method (a selector, not a text field): `]` / `[` cycle tabs.
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    assert_eq!(new_focus(&app), NewField::Method);
+    press(&mut app, KeyCode::Char(']')); // forward -> Headers
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+    press(&mut app, KeyCode::Char(']')); // forward -> Cookies
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Cookies);
+    press(&mut app, KeyCode::Char('[')); // back -> Headers
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+}
+
+#[test]
+fn brackets_are_typed_into_wizard_text_fields() {
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app); // -> Header(0, Key), a text field
+    for ch in "a[0]".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    assert_eq!(
+        form_ref(&app).view_tab,
+        WizardTab::All,
+        "brackets must not cycle tabs while a text cell is focused"
+    );
+    assert_eq!(form_ref(&app).headers[0].key.text(), "a[0]");
 }
 
 #[test]
@@ -11553,7 +11713,10 @@ fn m_moves_the_highlighted_request_to_another_collection_file() {
     press(&mut app, KeyCode::Enter);
 
     assert!(app.overlay.is_none());
-    assert!(app.pending_workspace_transfer.is_none(), "transfer committed");
+    assert!(
+        app.pending_workspace_transfer.is_none(),
+        "transfer committed"
+    );
     // The destination file now holds the moved request...
     let dest = std::fs::read_to_string(dir.join("sub").join("beta.json")).unwrap();
     assert!(dest.contains("https://example.com/alpha"));
@@ -11564,7 +11727,10 @@ fn m_moves_the_highlighted_request_to_another_collection_file() {
         app.collections[ci].entries.is_empty(),
         "the request left the in-memory source too"
     );
-    assert!(matches!(app.status, Some(crate::i18n::Status::RequestMoved(..))));
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::RequestMoved(..))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11628,7 +11794,10 @@ fn moving_a_request_onto_its_own_source_file_is_a_no_op() {
         1,
         "moving onto the same file changes nothing"
     );
-    assert!(matches!(app.status, Some(crate::i18n::Status::RequestMoved(..))));
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::RequestMoved(..))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11636,8 +11805,13 @@ fn moving_a_request_onto_its_own_source_file_is_a_no_op() {
 fn m_and_c_are_no_ops_on_a_non_workspace_tab() {
     let mut app = TuiApp::default();
     let mut col = Collection::new("plain".to_string(), Vec::new());
-    col.entries
-        .push(crate::hurl::HurlEntry::from_fields("x", "GET", "http://h/x", Vec::new(), ""));
+    col.entries.push(crate::hurl::HurlEntry::from_fields(
+        "x",
+        "GET",
+        "http://h/x",
+        Vec::new(),
+        "",
+    ));
     app.collections.push(col);
     let ci = app.collections.len() - 1;
     app.active_tab = ci;
@@ -11654,8 +11828,13 @@ fn m_and_c_are_no_ops_on_a_non_workspace_tab() {
 fn deleting_a_request_reports_the_undo_hint_in_the_status_bar() {
     let mut app = TuiApp::default();
     let mut col = Collection::new("plain".to_string(), Vec::new());
-    col.entries
-        .push(crate::hurl::HurlEntry::from_fields("x", "POST", "http://h/x", Vec::new(), ""));
+    col.entries.push(crate::hurl::HurlEntry::from_fields(
+        "x",
+        "POST",
+        "http://h/x",
+        Vec::new(),
+        "",
+    ));
     app.collections.push(col);
     let ci = app.collections.len() - 1;
     app.active_tab = ci;
@@ -12622,28 +12801,6 @@ fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
     );
 }
 
-/// `wrapped_row_count` must match `wrap_line`'s own boundary math
-/// exactly, since `wrapcache::PanelWrap` relies on it to size the total
-/// scrollable extent and locate a scroll position without ever wrapping
-/// every line.
-#[test]
-fn wrapped_row_count_matches_wrap_line_for_various_lengths() {
-    use super::draw::{wrap_line, wrapped_row_count};
-    use ratatui::text::Line;
-
-    for (len, width) in [(0, 10), (1, 10), (10, 10), (11, 10), (25, 10), (7, 0)] {
-        let text = "x".repeat(len);
-        let actual = wrap_line(Line::raw(text), width).len();
-        assert_eq!(
-            wrapped_row_count(len, width),
-            actual,
-            "len={len} width={width}"
-        );
-    }
-}
-
-// `total_wrapped_rows_sums_every_lines_row_count` and
-// `total_wrapped_rows_is_never_less_than_one_even_for_no_lines` are
 // superseded by `wrapcache::PanelWrap::total_rows`'s own test coverage
 // (e.g. `total_rows_accounts_for_wrapping_long_lines` and
 // `empty_body_has_one_line_and_one_row` in `wrapcache.rs`).
@@ -13182,4 +13339,516 @@ fn collection_name_hides_only_known_extensions() {
         collection_name_from_path("/x/notes.txt", "collection"),
         "notes.txt"
     );
+}
+
+// ---- Custom themes (Settings → Theme) -------------------------------------
+
+use super::theme_editor::{NewThemeFocus, ThemePane};
+
+/// Open the Theme editor the way a user does: Settings (s) → Theme (item 1).
+fn open_theme_editor(app: &mut TuiApp) {
+    press(app, KeyCode::Char('s'));
+    press(app, KeyCode::Down); // Language -> Theme
+    press(app, KeyCode::Enter); // open the Theme editor
+    assert!(
+        matches!(app.overlay, Some(Overlay::ThemeEditor(_))),
+        "the Theme editor opens"
+    );
+}
+
+/// Create a custom theme through the New-theme popup, based on the popup's
+/// default base, and land in the colour fields ready to edit.
+fn create_custom_theme(app: &mut TuiApp, name: &str) {
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)); // popup
+    for c in name.chars() {
+        press(app, KeyCode::Char(c));
+    }
+    press(app, KeyCode::Enter); // create + activate + focus the fields
+}
+
+fn theme_state(app: &TuiApp) -> &super::theme_editor::ThemeEditorState {
+    match &app.overlay {
+        Some(Overlay::ThemeEditor(st)) => st,
+        _ => panic!("the Theme editor should be open"),
+    }
+}
+
+#[test]
+fn the_theme_list_starts_with_automatic_then_the_three_presets() {
+    let app = TuiApp::default();
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let entries = app.theme_picker_entries(&s);
+    assert_eq!(entries[0], s.theme_auto, "row 0 follows the language");
+    assert_eq!(
+        &entries[1..],
+        &[
+            super::theme::PRESET_ENGLISH.to_string(),
+            super::theme::PRESET_FRENCH.to_string(),
+            super::theme::PRESET_DANISH.to_string(),
+        ],
+        "the three presets follow, in language order"
+    );
+}
+
+#[test]
+fn selecting_a_preset_in_the_picker_activates_it() {
+    let mut app = TuiApp::default();
+    assert_eq!(
+        app.active_theme, None,
+        "starts on Automatic (follows language)"
+    );
+
+    open_theme_editor(&mut app);
+    // Automatic(0) -> Britannia(1) -> Parisian Purple(2) -> Dannebrog(3).
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some(super::theme::PRESET_DANISH),
+        "hovering a preset activates it live"
+    );
+
+    // Returning to Automatic clears the manual choice.
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        app.active_theme, None,
+        "row 0 goes back to following the language"
+    );
+}
+
+#[test]
+fn presets_are_read_only_and_cannot_be_edited() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app); // opens on a preset via Automatic
+
+    // Trying to step into the colour fields on a preset is refused.
+    press(&mut app, KeyCode::Right);
+    assert!(
+        matches!(theme_state(&app).pane, ThemePane::List),
+        "focus stays on the list for a read-only preset"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ThemePresetReadonly)),
+        "a read-only hint is shown"
+    );
+}
+
+#[test]
+fn ctrl_n_opens_a_popup_that_creates_selects_and_focuses_a_new_theme() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert!(
+        theme_state(&app).new_popup.is_some(),
+        "Ctrl+N opens the New-theme popup"
+    );
+
+    for c in "Ocean".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        app.custom_themes.iter().any(|t| t.name == "Ocean"),
+        "the theme is created"
+    );
+    assert_eq!(app.active_theme.as_deref(), Some("Ocean"), "and activated");
+    let st = theme_state(&app);
+    assert!(st.new_popup.is_none(), "the popup closes");
+    assert!(
+        matches!(st.pane, ThemePane::Fields),
+        "focus drops into the colour fields, ready to edit"
+    );
+    let expected = app
+        .all_themes()
+        .iter()
+        .position(|t| t.name == "Ocean")
+        .unwrap()
+        + 1;
+    assert_eq!(
+        st.list_idx, expected,
+        "the new theme is selected in the list"
+    );
+}
+
+#[test]
+fn the_new_theme_popup_copies_the_chosen_base_colours() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+    for c in "Nordic".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    // Move focus into the base list and pick Dannebrog (Britannia, Parisian,
+    // Dannebrog -> down twice from the first entry).
+    press(&mut app, KeyCode::Down); // Name -> Base (Britannia)
+    press(&mut app, KeyCode::Down); // -> Parisian Purple
+    press(&mut app, KeyCode::Down); // -> Dannebrog
+    press(&mut app, KeyCode::Enter);
+
+    let created = app
+        .custom_themes
+        .iter()
+        .find(|t| t.name == "Nordic")
+        .expect("theme created");
+    let dannebrog = super::theme::preset_for_language(&Language::Danish);
+    assert_eq!(
+        created.color(0),
+        dannebrog.color(0),
+        "the new theme copies the chosen base's colours"
+    );
+}
+
+#[test]
+fn the_new_theme_popup_rejects_empty_reserved_and_duplicate_names() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    press(&mut app, KeyCode::Enter); // empty name
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ThemeNameRequired)
+    ));
+    assert!(
+        theme_state(&app).new_popup.is_some(),
+        "the popup stays open"
+    );
+
+    for c in super::theme::PRESET_ENGLISH.chars() {
+        press(&mut app, KeyCode::Char(c)); // a reserved preset name
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ThemeNameReserved)
+    ));
+    assert!(app.custom_themes.is_empty(), "nothing is created");
+
+    // Cancel, make a real theme, then try to reuse its name.
+    press(&mut app, KeyCode::Esc);
+    create_custom_theme(&mut app, "Dusk");
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    for c in "Dusk".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ThemeNameTaken)
+    ));
+    assert_eq!(
+        app.custom_themes
+            .iter()
+            .filter(|t| t.name == "Dusk")
+            .count(),
+        1,
+        "the duplicate is not created"
+    );
+}
+
+#[test]
+fn editing_a_custom_theme_colour_auto_saves_and_previews_live() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean"); // now in the fields, on colour 0 (bg)
+
+    // Open the colour picker on the focused row and dial in pure red.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        theme_state(&app).color_popup.is_some(),
+        "Enter on a colour row opens the picker popup"
+    );
+    for c in "255".chars() {
+        press(&mut app, KeyCode::Char(c)); // red channel
+    }
+    press(&mut app, KeyCode::Down); // green channel
+    press(&mut app, KeyCode::Char('0'));
+    press(&mut app, KeyCode::Down); // blue channel
+    press(&mut app, KeyCode::Char('0'));
+
+    assert!(
+        matches!(app.theme().bg, ratatui::style::Color::Rgb(255, 0, 0)),
+        "the whole-UI preview reflects the in-progress edit immediately"
+    );
+
+    // Enter commits the picker and auto-saves the theme.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        theme_state(&app).color_popup.is_none(),
+        "Enter closes the picker popup"
+    );
+    let saved = app
+        .custom_themes
+        .iter()
+        .find(|t| t.name == "Ocean")
+        .expect("theme still present");
+    assert_eq!(
+        saved.color(0),
+        [255, 0, 0],
+        "committing the picker auto-saves to the stored custom theme (no explicit save)"
+    );
+}
+
+#[test]
+fn renaming_a_custom_theme_from_the_name_row_auto_applies() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean"); // in the fields, on colour 0
+
+    press(&mut app, KeyCode::Up); // colour 0 -> name row
+    assert!(
+        theme_state(&app).name_focused,
+        "Up from the first colour focuses the name row"
+    );
+
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Backspace); // clear "Ocean"
+    }
+    for c in "Sea".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter); // submit the rename
+
+    assert!(
+        theme_state(&app).name_focused,
+        "Enter submits the name but keeps focus on the name row"
+    );
+    assert!(
+        app.custom_themes.iter().any(|t| t.name == "Sea"),
+        "the stored theme is renamed in place"
+    );
+    assert!(
+        !app.custom_themes.iter().any(|t| t.name == "Ocean"),
+        "the old name is gone"
+    );
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some("Sea"),
+        "the active theme follows the rename"
+    );
+    assert_eq!(theme_state(&app).draft.name, "Sea");
+}
+
+#[test]
+fn renaming_over_a_reserved_or_duplicate_name_is_ignored() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean");
+
+    press(&mut app, KeyCode::Up); // focus the name row
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for c in "Britannia".chars() {
+        press(&mut app, KeyCode::Char(c)); // a reserved preset name
+    }
+    press(&mut app, KeyCode::Down); // leave the name row → rename is rejected
+
+    assert!(
+        app.custom_themes.iter().any(|t| t.name == "Ocean"),
+        "a collision with a reserved preset name never renames the theme"
+    );
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some("Ocean"),
+        "the active theme keeps its valid name"
+    );
+    assert_eq!(theme_state(&app).draft.name, "Ocean");
+}
+
+#[test]
+fn deleting_a_theme_focuses_the_one_above_it() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Alpha");
+    create_custom_theme(&mut app, "Bravo"); // active, selected at the bottom
+
+    press(&mut app, KeyCode::Left); // step back from the fields to the list
+    let bravo_idx = theme_state(&app).list_idx;
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    assert!(
+        !app.custom_themes.iter().any(|t| t.name == "Bravo"),
+        "Bravo is deleted"
+    );
+    assert_eq!(
+        theme_state(&app).list_idx,
+        bravo_idx - 1,
+        "focus moves to the row just above the deleted theme, not the top"
+    );
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some("Alpha"),
+        "the theme above becomes active"
+    );
+}
+
+#[test]
+fn colour_picker_ctrl_arrows_step_the_channel_by_sixteen() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean");
+
+    press(&mut app, KeyCode::Enter); // open picker on colour 0, channel red
+    // Zero the red channel so the ±16 step is unambiguous.
+    press(&mut app, KeyCode::Char('0'));
+    assert_eq!(theme_state(&app).draft.color(0)[0], 0);
+
+    app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(
+        theme_state(&app).draft.color(0)[0],
+        16,
+        "Ctrl+Right steps the channel up by sixteen, like PageUp"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(
+        theme_state(&app).draft.color(0)[0],
+        0,
+        "Ctrl+Left steps the channel down by sixteen, like PageDown"
+    );
+}
+
+#[test]
+fn colour_picker_esc_restores_the_original_colour() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean");
+    let before = theme_state(&app).draft.color(0);
+
+    press(&mut app, KeyCode::Enter); // open picker on colour 0
+    press(&mut app, KeyCode::Right); // nudge red +1
+    assert_ne!(
+        theme_state(&app).draft.color(0),
+        before,
+        "the draft previews the nudge live"
+    );
+
+    press(&mut app, KeyCode::Esc); // cancel
+    assert!(theme_state(&app).color_popup.is_none());
+    assert_eq!(
+        theme_state(&app).draft.color(0),
+        before,
+        "Esc restores the colour to its value before the picker opened"
+    );
+}
+
+#[test]
+fn left_arrow_steps_back_from_the_fields_to_the_theme_list() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    create_custom_theme(&mut app, "Ocean"); // in the fields, on a colour row
+
+    assert!(
+        matches!(theme_state(&app).pane, ThemePane::Fields),
+        "creating a theme drops into the Fields pane"
+    );
+    press(&mut app, KeyCode::Left);
+    assert!(
+        matches!(theme_state(&app).pane, ThemePane::List),
+        "Left in the Fields pane steps back to the theme list"
+    );
+}
+
+#[test]
+fn ctrl_d_deletes_a_custom_theme_but_never_a_preset() {
+    let mut app = TuiApp::default();
+    let mut spec = super::theme::preset_for_language(&Language::English);
+    spec.name = "Sunset".to_string();
+    app.custom_themes.push(spec);
+    app.active_theme = Some("Sunset".to_string());
+
+    open_theme_editor(&mut app); // opens on the active theme (Sunset)
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(app.custom_themes.is_empty(), "the custom theme is deleted");
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some("Dannebrog"),
+        "focus (and the active theme) moves to the row just above the deleted one"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ThemeDeleted(ref n)) if n == "Sunset"),
+        "a deletion status is shown"
+    );
+
+    // Try to delete the built-in preset now under the cursor.
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ThemeCannotDelete)),
+        "presets can't be deleted"
+    );
+    assert_eq!(app.all_themes().len(), 3, "the three presets remain");
+}
+
+#[test]
+fn the_new_theme_popup_focus_toggles_between_name_and_base() {
+    let mut app = TuiApp::default();
+    open_theme_editor(&mut app);
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+    assert!(matches!(
+        theme_state(&app).new_popup.as_ref().unwrap().focus,
+        NewThemeFocus::Name
+    ));
+    press(&mut app, KeyCode::Tab);
+    assert!(matches!(
+        theme_state(&app).new_popup.as_ref().unwrap().focus,
+        NewThemeFocus::Base
+    ));
+    press(&mut app, KeyCode::Tab);
+    assert!(matches!(
+        theme_state(&app).new_popup.as_ref().unwrap().focus,
+        NewThemeFocus::Name
+    ));
+}
+
+#[test]
+fn changing_language_follows_the_preset_unless_a_theme_is_set() {
+    let mut app = TuiApp::default();
+    assert_eq!(
+        app.active_theme_spec().name,
+        super::theme::PRESET_ENGLISH,
+        "Automatic English -> Britannia"
+    );
+
+    app.language = Language::Danish;
+    assert_eq!(
+        app.active_theme_spec().name,
+        super::theme::PRESET_DANISH,
+        "changing language moves to that language's preset"
+    );
+
+    app.active_theme = Some(super::theme::PRESET_FRENCH.to_string());
+    app.language = Language::English;
+    assert_eq!(
+        app.active_theme_spec().name,
+        super::theme::PRESET_FRENCH,
+        "a manually-set theme is not overridden by a language change"
+    );
+}
+
+#[test]
+fn custom_themes_and_active_theme_survive_persistence() {
+    let mut app = TuiApp::default();
+    let mut spec = super::theme::preset_for_language(&Language::English);
+    spec.name = "Sunset".to_string();
+    spec.set_color(0, [1, 2, 3]);
+    app.custom_themes.push(spec);
+    app.active_theme = Some("Sunset".to_string());
+
+    let restored = {
+        let persisted = app.to_persisted();
+        let mut restored = TuiApp::default();
+        restored.apply_persisted(persisted);
+        restored
+    };
+    assert_eq!(restored.active_theme.as_deref(), Some("Sunset"));
+    assert_eq!(restored.custom_themes.len(), 1);
+    assert_eq!(restored.custom_themes[0].color(0), [1, 2, 3]);
 }

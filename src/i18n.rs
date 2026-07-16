@@ -49,6 +49,37 @@ strings! {
     lang_english => "English", "English", "English";
     lang_french => "Français", "Français", "Français";
     lang_danish => "Dansk", "Dansk", "Dansk";
+    theme_menu => "Theme", "Thème", "Tema";
+    theme_editor_title => "Theme", "Thème", "Tema";
+    theme_auto => "Automatic (match language)", "Automatique (selon la langue)", "Automatisk (efter sprog)";
+    theme_name_label => "Name", "Nom", "Navn";
+    theme_editor_hint => "^N new · ^D delete · Esc close", "^N nouveau · ^D supprimer · Échap fermer", "^N nyt · ^D slet · Esc luk";
+    theme_fields_hint => "Enter edit colour · Tab list · Esc close", "Entrée modifier la couleur · Tab liste · Échap fermer", "Enter rediger farve · Tab liste · Esc luk";
+    theme_c_bg => "Background", "Arrière-plan", "Baggrund";
+    theme_c_panel => "Panel", "Panneau", "Panel";
+    theme_c_text => "Text", "Texte", "Tekst";
+    theme_c_dim => "Dim text", "Texte atténué", "Dæmpet tekst";
+    theme_c_accent => "Accent", "Accent", "Accent";
+    theme_c_ok => "Success", "Succès", "Succes";
+    theme_c_err => "Error", "Erreur", "Fejl";
+    theme_c_subst => "Substitution", "Substitution", "Substitution";
+    theme_c_pending => "Pending", "En attente", "Afventer";
+    theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
+    theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
+    theme_saved => "Theme saved:", "Thème enregistré\u{a0}:", "Tema gemt:";
+    theme_deleted => "Theme deleted:", "Thème supprimé\u{a0}:", "Tema slettet:";
+    theme_name_required => "Give the theme a name before saving", "Donnez un nom au thème avant d'enregistrer", "Giv temaet et navn før du gemmer";
+    theme_name_reserved => "That name belongs to a built-in preset; choose another", "Ce nom appartient à un préréglage intégré\u{a0}; choisissez-en un autre", "Det navn tilhører en indbygget forudindstilling; vælg et andet";
+    theme_cannot_delete => "Built-in presets can't be deleted", "Les préréglages intégrés ne peuvent pas être supprimés", "Indbyggede forudindstillinger kan ikke slettes";
+    theme_name_taken => "A theme with that name already exists", "Un thème portant ce nom existe déjà", "Der findes allerede et tema med det navn";
+    theme_preset_readonly => "Presets can't be edited — press ^N to make a copy", "Les préréglages ne peuvent pas être modifiés — appuyez sur ^N pour en faire une copie", "Forudindstillinger kan ikke redigeres — tryk på ^N for at lave en kopi";
+    theme_new_title => "New theme", "Nouveau thème", "Nyt tema";
+    theme_new_base => "Base on", "Basé sur", "Baseret på";
+    theme_new_popup_hint => "Enter create · Esc cancel", "Entrée créer · Échap annuler", "Enter opret · Esc annuller";
+    theme_ch_red => "R", "R", "R";
+    theme_ch_green => "G", "G", "G";
+    theme_ch_blue => "B", "B", "B";
+    theme_color_popup_hint => "←/→ ±1 · ^←/^→ or PgUp/Dn ±16 · type 0-255 · ↑/↓ channel · Enter apply · Esc cancel", "←/→ ±1 · ^←/^→ ou PgPréc/Suiv ±16 · saisir 0-255 · ↑/↓ canal · Entrée appliquer · Échap annuler", "←/→ ±1 · ^←/^→ eller PgUp/Ned ±16 · indtast 0-255 · ↑/↓ kanal · Enter anvend · Esc annuller";
     clear_all => "Close all collections", "Fermer toutes les collections", "Luk alle samlinger";
     clear_all_done => "All collections closed", "Toutes les collections ont été fermées", "Alle samlinger er lukket";
     copied_to_clipboard => "Copied to clipboard", "Copié dans le presse-papiers", "Kopieret til udklipsholder";
@@ -56,6 +87,7 @@ strings! {
     confirm_on_exit => "Confirm on exit", "Confirmer à la sortie", "Bekræft ved afslutning";
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
     confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
+    confirm_on_delete_env => "Confirm before deleting an environment", "Confirmer avant de supprimer un environnement", "Bekræft før sletning af et miljø";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
     always_save_when_prompted => "Always save unsaved changes when prompted", "Toujours enregistrer les modifications non enregistrées lorsque demandé", "Gem altid ugemte ændringer, når du bliver spurgt";
     view_json_label => "JSON", "JSON", "JSON";
@@ -113,6 +145,8 @@ strings! {
     workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
     request_deleted => "{m} request deleted. Press (u) to restore request.", "Requête {m} supprimée. Appuyez sur (u) pour la restaurer.", "{m}-forespørgsel slettet. Tryk (u) for at gendanne.";
     tab_closed => "Collection closed. Press (u) to reopen tab.", "Collection fermée. Appuyez sur (u) pour rouvrir l'onglet.", "Samling lukket. Tryk (u) for at genåbne fanen.";
+    env_deleted => "Environment '{n}' deleted. Press (u) to reopen environment.", "Environnement «\u{a0}{n}\u{a0}» supprimé. Appuyez sur (u) pour le rouvrir.", "Miljøet '{n}' slettet. Tryk (u) for at genåbne miljøet.";
+    env_reopened => "Environment '{n}' reopened.", "Environnement «\u{a0}{n}\u{a0}» rouvert.", "Miljøet '{n}' genåbnet.";
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
@@ -150,6 +184,8 @@ strings! {
     hdr_type => "Type", "Type", "Type";
     form_type_text => "Text", "Texte", "Tekst";
     form_type_file => "File", "Fichier", "Fil";
+    form_type_base64file => "Base64 File", "Fichier Base64", "Base64-fil";
+    hdr_base64_prefix => "Base64 Prefix", "Préfixe Base64", "Base64-præfiks";
     content_type_hint => "Content-Type", "Type de contenu", "Content-Type";
     content_type_auto => "Auto (detect from extension)", "Auto (détecter depuis l'extension)", "Auto (registrer fra filtype)";
     content_type_auto_placeholder => "Auto", "Auto", "Auto";
@@ -338,6 +374,7 @@ strings! {
     help_reload_var => "reload a failed environment entry (env var / 1Password / SSM)", "recharger une entrée d'environnement en échec (var d'env / 1Password / SSM)", "genindlæs en mislykket miljøvariabel (miljøvariabel / 1Password / SSM)";
     help_env_activate => "activate / deactivate the selected Global Environment", "activer / désactiver l'environnement global sélectionné", "aktivér / deaktivér det valgte globale miljø";
     help_env_delete => "delete the selected Global Environment (unlinks any collections using it)", "supprimer l'environnement global sélectionné (délie les collections qui l'utilisent)", "slet det valgte globale miljø (fjerner link fra samlinger, der bruger det)";
+    help_env_reopen => "reopen the most recently deleted Global Environment", "rouvrir l'environnement global supprimé le plus récemment", "genåbn det senest slettede globale miljø";
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
@@ -452,12 +489,32 @@ pub enum Status {
     /// A collection tab was closed (`x` / Ctrl+W). Pairs with the "press u to
     /// reopen" hint, mirroring [`Status::RequestDeleted`].
     TabClosed,
+    /// A Global Environment was deleted (`x`, or auto-confirmed). Holds its
+    /// name and pairs with the "press u to reopen" hint.
+    EnvDeleted(String),
+    /// A deleted Global Environment was reopened (`u`); names it.
+    EnvReopened(String),
     /// A request was moved to another collection file in the workspace. Holds
     /// the HTTP method and the destination file's display name.
     RequestMoved(String, String),
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
+    /// A theme was saved (created or updated) from the Theme editor; names it.
+    ThemeSaved(String),
+    /// A custom theme was deleted from the Theme editor; names it.
+    ThemeDeleted(String),
+    /// Save was pressed in the Theme editor with an empty name.
+    ThemeNameRequired,
+    /// Save was pressed in the Theme editor with a name that clashes with a
+    /// built-in preset (presets can't be overwritten).
+    ThemeNameReserved,
+    /// Delete was pressed in the Theme editor on Automatic or a built-in preset.
+    ThemeCannotDelete,
+    /// The "New theme" popup was confirmed with a name already in use.
+    ThemeNameTaken,
+    /// An edit was attempted on a read-only preset (or Automatic) in the editor.
+    ThemePresetReadonly,
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
 }
@@ -480,6 +537,9 @@ impl Status {
                     | Status::WorkspaceSaved
                     | Status::RequestMoved(_, _)
                     | Status::RequestCopied(_, _)
+                    | Status::ThemeSaved(_)
+                    | Status::ThemeDeleted(_)
+                    | Status::EnvReopened(_)
             ),
         }
     }
@@ -527,12 +587,23 @@ impl Status {
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),
-            Status::RequestMoved(method, dest) => {
-                s.request_moved.replace("{m}", method).replace("{dest}", dest)
-            }
-            Status::RequestCopied(method, dest) => {
-                s.request_copied.replace("{m}", method).replace("{dest}", dest)
-            }
+            Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
+            Status::EnvReopened(name) => s.env_reopened.replace("{n}", name),
+            Status::RequestMoved(method, dest) => s
+                .request_moved
+                .replace("{m}", method)
+                .replace("{dest}", dest),
+            Status::RequestCopied(method, dest) => s
+                .request_copied
+                .replace("{m}", method)
+                .replace("{dest}", dest),
+            Status::ThemeSaved(name) => format!("{} {name}", s.theme_saved),
+            Status::ThemeDeleted(name) => format!("{} {name}", s.theme_deleted),
+            Status::ThemeNameRequired => s.theme_name_required.to_string(),
+            Status::ThemeNameReserved => s.theme_name_reserved.to_string(),
+            Status::ThemeCannotDelete => s.theme_cannot_delete.to_string(),
+            Status::ThemeNameTaken => s.theme_name_taken.to_string(),
+            Status::ThemePresetReadonly => s.theme_preset_readonly.to_string(),
             Status::CollectionRunSummary {
                 passed,
                 failed,
