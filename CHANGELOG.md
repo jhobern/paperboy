@@ -55,6 +55,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   a styleable/localizable ratatui widget) is now a standalone library; the
   theme editor consumes it, supplying its own colours, labels and hint. No
   user-facing behaviour change.
+- **Line/multi-line editor extracted into the reusable `tui-line-editor` crate**
+  (`crates/tui-line-editor`). The single- and multi-line text editor primitive
+  (cursor, selection, masking, and the scrolling/field renderers) is now a
+  standalone library; PaperBoy's `editor` module is a thin theming shim over it.
+  (`tui-textarea` was evaluated but only supports ratatui 0.29, incompatible
+  with PaperBoy's ratatui 0.30.) No user-facing behaviour change.
+- **`tui-panel-select` gains an opt-in mouse handler and a panic-safe terminal
+  guard.** A batteries-included `SelectablePanel::handle_mouse` (configured via
+  `MouseConfig`, e.g. copy-on-release) wires up drag-to-select-to-copy in one
+  call, while the low-level `begin`/`extend`/`copy_selection` methods stay
+  available. A new default-on `terminal-guard` feature adds a `TerminalGuard`
+  RAII helper that enables mouse capture (and optional keyboard enhancement) and
+  restores the terminal on drop *and* on any panic; PaperBoy's TUI setup now
+  uses it. No user-facing behaviour change.
 
 ## [0.1.3] - 2026-07-15
 

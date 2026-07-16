@@ -11,3 +11,10 @@ categories = ["command-line-interface"]
 [dependencies]
 ratatui = "0.30.2"
 base64 = "0.22"
+
+[features]
+default = ["terminal-guard"]
+# Opt-in (default-on) panic-safe terminal mouse-capture guard. Disable it if
+# you only want the pure selection/wrapping logic and would rather not pull in
+# the process-global panic-hook and terminal side effects.
+terminal-guard = []

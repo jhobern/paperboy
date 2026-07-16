@@ -52,12 +52,52 @@
 
 use std::sync::Arc;
 
-use ratatui::layout::Rect;
+use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
 use crate::clipboard::copy_to_clipboard;
 use crate::selection;
 use crate::wrapcache::{PanelWrap, TextPos};
+
+/// How [`SelectablePanel::handle_mouse`] should behave. Every field is a
+/// per-application choice, so different consumers can wire the same panel up
+/// differently. Start from [`MouseConfig::default`] and override what you want.
+#[derive(Clone, Copy, Debug)]
+pub struct MouseConfig {
+    /// Copy the selection to the clipboard when the left button is released.
+    /// `true` mirrors a typical terminal drag-select-to-copy; set it `false`
+    /// if you'd rather copy from an explicit key binding (call
+    /// [`SelectablePanel::copy_selection`] yourself).
+    pub copy_on_release: bool,
+    /// Clear the selection when the left button is pressed *outside* the
+    /// panel's text area (a click elsewhere deselects). `false` leaves any
+    /// existing selection untouched on an outside click.
+    pub clear_on_outside_click: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            copy_on_release: true,
+            clear_on_outside_click: true,
+        }
+    }
+}
+
+/// What [`SelectablePanel::handle_mouse`] did with an event, so the host
+/// knows whether to redraw or react.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    /// A selection was started or extended (the highlight likely changed).
+    Selecting,
+    /// The selection was copied to the clipboard (on release).
+    Copied,
+    /// The selection was cleared (an outside click, per [`MouseConfig`]).
+    Cleared,
+    /// Nothing relevant happened (some other event/button).
+    Ignored,
+}
 
 /// One scrollable, mouse-selectable text panel.
 ///
@@ -160,6 +200,70 @@ impl SelectablePanel {
         }
     }
 
+    /// Batteries-included mouse handling for the common "drag to select, release
+    /// to copy" workflow. This is entirely opt-in — the lower-level
+    /// [`begin_selection`](Self::begin_selection) /
+    /// [`extend_selection`](Self::extend_selection) /
+    /// [`copy_selection`](Self::copy_selection) methods stay available if you
+    /// want to wire events up yourself.
+    ///
+    /// Pass the panel's inner `area`, its current `scroll` (in wrapped rows),
+    /// and a [`MouseConfig`] describing the behaviour you want. The returned
+    /// [`MouseAction`] tells you whether anything changed so you can redraw.
+    ///
+    /// Only the left button is handled. A left press inside `area` starts a
+    /// selection; a drag extends it; a release copies it (when
+    /// [`MouseConfig::copy_on_release`]).
+    ///
+    /// ```no_run
+    /// use ratatui::layout::Rect;
+    /// use ratatui::crossterm::event::MouseEvent;
+    /// use tui_panel_select::{MouseConfig, SelectablePanel};
+    ///
+    /// # fn demo(panel: &mut SelectablePanel, area: Rect, scroll: u16, ev: MouseEvent) {
+    /// let cfg = MouseConfig::default();
+    /// let _action = panel.handle_mouse(ev, area, scroll, &cfg);
+    /// # }
+    /// ```
+    pub fn handle_mouse(
+        &mut self,
+        event: MouseEvent,
+        area: Rect,
+        scroll: u16,
+        config: &MouseConfig,
+    ) -> MouseAction {
+        let point = (event.column, event.row);
+        let inside = area.contains(Position {
+            x: event.column,
+            y: event.row,
+        });
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if inside {
+                    self.begin_selection(area, scroll, point);
+                    MouseAction::Selecting
+                } else if config.clear_on_outside_click && self.has_selection() {
+                    self.clear_selection();
+                    MouseAction::Cleared
+                } else {
+                    MouseAction::Ignored
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.has_selection() => {
+                self.extend_selection(area, scroll, point);
+                MouseAction::Selecting
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.has_selection() => {
+                if config.copy_on_release && self.copy_selection() {
+                    MouseAction::Copied
+                } else {
+                    MouseAction::Ignored
+                }
+            }
+            _ => MouseAction::Ignored,
+        }
+    }
+
     /// The visible wrapped rows for a `height`-row window starting at
     /// wrapped-row `scroll` — ready to render. Only the rows actually on
     /// screen are wrapped, regardless of total content size.
@@ -254,5 +358,120 @@ mod tests {
         // Same text, narrower width (forces a rewrap); selection unchanged.
         p.set_content(Arc::from("hello world"), 5);
         assert_eq!(p.selected_text().as_deref(), Some("hello"));
+    }
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        use ratatui::crossterm::event::KeyModifiers;
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn handle_mouse_drags_a_selection_and_copies_on_release() {
+        let mut p = panel("hello world", 40);
+        let area = Rect::new(2, 1, 40, 5);
+        let cfg = MouseConfig::default();
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+
+        assert_eq!(
+            p.handle_mouse(mouse(down, 2, 1), area, 0, &cfg),
+            MouseAction::Selecting
+        );
+        assert_eq!(
+            p.handle_mouse(mouse(drag, 6, 1), area, 0, &cfg),
+            MouseAction::Selecting
+        );
+        assert_eq!(p.selected_text().as_deref(), Some("hello"));
+        assert_eq!(
+            p.handle_mouse(mouse(up, 6, 1), area, 0, &cfg),
+            MouseAction::Copied
+        );
+    }
+
+    #[test]
+    fn handle_mouse_respects_copy_on_release_false() {
+        let mut p = panel("hello world", 40);
+        let area = Rect::new(0, 0, 40, 5);
+        let cfg = MouseConfig {
+            copy_on_release: false,
+            ..MouseConfig::default()
+        };
+        p.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            area,
+            0,
+            &cfg,
+        );
+        p.handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0),
+            area,
+            0,
+            &cfg,
+        );
+        assert_eq!(
+            p.handle_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), 4, 0),
+                area,
+                0,
+                &cfg
+            ),
+            MouseAction::Ignored
+        );
+        // Selection is still present so the host can copy on its own terms.
+        assert_eq!(p.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn handle_mouse_clears_selection_on_outside_click() {
+        let mut p = panel("hello world", 40);
+        let area = Rect::new(2, 1, 10, 3);
+        let cfg = MouseConfig::default();
+        p.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            area,
+            0,
+            &cfg,
+        );
+        p.handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 6, 1),
+            area,
+            0,
+            &cfg,
+        );
+        assert!(p.has_selection());
+        // A press well outside the panel area clears it.
+        assert_eq!(
+            p.handle_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 30, 20),
+                area,
+                0,
+                &cfg
+            ),
+            MouseAction::Cleared
+        );
+        assert!(!p.has_selection());
+    }
+
+    #[test]
+    fn handle_mouse_ignores_other_buttons() {
+        let mut p = panel("hello", 40);
+        let area = Rect::new(0, 0, 40, 5);
+        let cfg = MouseConfig::default();
+        assert_eq!(
+            p.handle_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Right), 0, 0),
+                area,
+                0,
+                &cfg
+            ),
+            MouseAction::Ignored
+        );
+        assert!(!p.has_selection());
     }
 }

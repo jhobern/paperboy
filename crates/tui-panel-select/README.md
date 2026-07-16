@@ -67,6 +67,47 @@ call `begin_selection` on `MouseEventKind::Down`, `extend_selection` on `Drag`,
 and `copy_selection` on `Up`. Call `set_content` every frame — it only rebuilds
 its cache when the text (by `Arc` identity) or width actually changed.
 
+## Opt-in mouse handler
+
+If you'd rather not wire the three events up yourself, `handle_mouse` does the
+common "drag to select, release to copy" flow in one call. Behaviour is
+configured per-application via `MouseConfig` (e.g. `copy_on_release`), and the
+low-level methods above stay available:
+
+```rust,no_run
+# use tui_panel_select::{MouseConfig, SelectablePanel};
+# use ratatui::layout::Rect;
+# use ratatui::crossterm::event::MouseEvent;
+# fn demo(panel: &mut SelectablePanel, area: Rect, scroll: u16, ev: MouseEvent) {
+let cfg = MouseConfig::default(); // copy_on_release: true
+let _action = panel.handle_mouse(ev, area, scroll, &cfg);
+# }
+```
+
+## Panic-safe terminal guard (feature `terminal-guard`, on by default)
+
+Enabling panel selection means turning on the terminal's mouse-tracking mode,
+which must be undone on exit *and* on any panic — otherwise the user's shell is
+left spewing tracking escape sequences. `TerminalGuard` centralises that: it
+enables mouse capture (and, optionally, the keyboard-enhancement protocol),
+wraps the panic hook, and restores everything on drop:
+
+```rust,no_run
+# fn main() -> std::io::Result<()> {
+use tui_panel_select::TerminalGuard;
+
+let mut terminal = ratatui::init();
+let guard = TerminalGuard::install(true)?;
+// ... run your event loop ...
+drop(guard);           // restores mouse capture / keyboard flags
+ratatui::restore();
+# Ok(())
+# }
+```
+
+Disable the `terminal-guard` feature (`default-features = false`) if you only
+want the pure selection/wrapping logic without the process-global panic hook.
+
 ## Low-level primitives
 
 If your app already owns its selection state (e.g. multiple simultaneous

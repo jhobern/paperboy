@@ -33,8 +33,12 @@
 pub mod clipboard;
 pub mod panel;
 pub mod selection;
+#[cfg(feature = "terminal-guard")]
+pub mod terminal;
 pub mod wrap;
 pub mod wrapcache;
 
-pub use panel::SelectablePanel;
+pub use panel::{MouseAction, MouseConfig, SelectablePanel};
+#[cfg(feature = "terminal-guard")]
+pub use terminal::TerminalGuard;
 pub use wrapcache::{PanelWrap, TextPos};
