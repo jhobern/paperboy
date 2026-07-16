@@ -76,6 +76,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
     evaluated but only supports ratatui 0.29, incompatible with PaperBoy's
     ratatui 0.30.)
 
+### Fixed
+
+- **Postman import no longer fails on `null` string fields** — collections
+  exported from Postman routinely carry an explicit `"value": null` (or null
+  `src`) on blank `file` form-data entries. A single such `null` previously
+  aborted the whole import and the file couldn't be opened as a collection;
+  these are now treated as empty strings.
+
 ## [0.1.3] - 2026-07-15
 
 ### Added

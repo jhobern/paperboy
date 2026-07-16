@@ -88,17 +88,32 @@ struct Body {
 
 /// A `{key, value, …}` entry shared by headers, auth and body params; the extra
 /// fields only matter for form-data files (`src`/`type`/`contentType`).
+///
+/// Postman commonly emits an explicit `null` for string fields it leaves blank
+/// (e.g. `"value": null` on a `file` form entry). `#[serde(default)]` only
+/// fills in *absent* fields, not `null` ones, so the string fields use
+/// [`de_str`] to coerce `null` to an empty string; otherwise a single `null`
+/// would fail the whole collection import.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Param {
+    #[serde(deserialize_with = "de_str")]
     key: String,
+    #[serde(deserialize_with = "de_str")]
     value: String,
     disabled: bool,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "de_str")]
     kind: String,
+    #[serde(deserialize_with = "de_str")]
     src: String,
     #[serde(rename = "contentType")]
     content_type: Option<String>,
+}
+
+/// Deserialize a string field tolerantly: an explicit JSON `null` (which
+/// `#[serde(default)]` does *not* handle) becomes an empty string.
+fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 impl Param {
@@ -347,5 +362,42 @@ mod tests {
     fn non_postman_json_is_not_detected() {
         assert!(!looks_like_postman("{\"foo\": 1}"));
         assert!(!looks_like_postman("GET http://x/y\nHTTP 200\n"));
+    }
+
+    #[test]
+    fn form_field_with_explicit_null_value_still_imports() {
+        // Postman routinely emits `"value": null` (and null `src`) for blank
+        // `file` form entries. `#[serde(default)]` only covers *absent*
+        // fields, so without null-tolerant deserialization a single null
+        // would fail the whole collection import.
+        let json = r#"{
+            "info": {"name": "n"},
+            "item": [
+                {
+                    "name": "upload",
+                    "request": {
+                        "method": "POST",
+                        "url": "http://x/upload",
+                        "body": {
+                            "mode": "formdata",
+                            "formdata": [
+                                {"key": "doc", "value": "hi", "type": "text"},
+                                {"key": "file", "type": "file", "value": null, "src": null},
+                                {"key": "back", "type": "file", "src": "/tmp/a.png"}
+                            ]
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let entries = import_postman(json);
+        assert_eq!(entries.len(), 1);
+        let keys: Vec<&str> = entries[0]
+            .form_fields
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect();
+        assert_eq!(keys, ["doc", "file", "back"]);
+        assert_eq!(entries[0].form_fields[2].value, "/tmp/a.png");
     }
 }
