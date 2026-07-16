@@ -113,7 +113,7 @@ pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     let s = Strings::for_language(&app.language);
-    let th = theme(&app.language);
+    let th = app.theme();
 
     app.refresh_json(app.active_tab);
     app.maybe_auto_open_workspace_picker();
@@ -1712,7 +1712,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             draw_menu_popup(f, &title, &items, *sel, th);
         }
         Overlay::Options(sel) => {
-            let items = [s.language_label, s.preferences_menu, s.clear_all];
+            let items = [
+                s.language_label,
+                s.theme_menu,
+                s.preferences_menu,
+                s.clear_all,
+            ];
             draw_menu_popup(f, s.options_menu, &items, *sel, th);
         }
         Overlay::Preferences(sel) => {
@@ -1782,6 +1787,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         Overlay::LanguageMenu(sel) => {
             let items = [s.lang_english, s.lang_french, s.lang_danish];
             draw_menu_popup(f, s.language_label, &items, *sel, th);
+        }
+        Overlay::ThemeEditor(state) => {
+            let entries = app.theme_picker_entries(s);
+            super::theme_editor::draw_theme_editor(f, state, &entries, s, th);
         }
         Overlay::RequestViewMenu(sel) => {
             let items = [s.view_json_label, s.view_hurl_label];

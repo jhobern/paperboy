@@ -58,7 +58,7 @@ Rust edition is **2024**.
 (all UI state); `input.rs` is the keyboard dispatch (large `match` per mode);
 `draw.rs` renders; `new_request.rs` is the request wizard (`NewReq` +
 section-view tabs); `editor.rs` is the multiline text editor; plus
-`selection.rs`, `wrapcache.rs`, `clipboard.rs`, `theme.rs`.
+`selection.rs`, `wrapcache.rs`, `clipboard.rs`, `theme.rs`, `theme_editor.rs`.
 
 ## Conventions
 
@@ -78,6 +78,12 @@ section-view tabs); `editor.rs` is the multiline text editor; plus
 - **Terminal state must be restored on exit and on panic.** Mouse capture and
   the keyboard-enhancement protocol are toggled in `tui/mod.rs`; the panic hook
   there also undoes them — preserve that when changing startup/teardown.
+- **Colours go through the theme, never hardcoded.** Draw code reads
+  `app.theme()` (a runtime `Theme` of `ratatui` colours) rather than fixed
+  colours. Themes are `ThemeSpec`s (RGB triples, serialisable to `state.json`)
+  built from language presets in `theme.rs` or user-defined custom themes;
+  `active_theme: None` means "follow the language". Add a new theme colour by
+  extending `ThemeSpec`/`Theme`, `THEME_COLOR_COUNT`, and its `i18n.rs` label.
 - **Keybinding placement:** main-view keys are handled in `input.rs::on_key`;
   wizard keys in the `new_request` key handler. Tabs cycle with `[`/`]` and
   `PageUp`/`PageDown`; in the wizard `[`/`]` only cycle when focus isn't on a

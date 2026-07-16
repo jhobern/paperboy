@@ -22,7 +22,6 @@ use super::editor::*;
 use super::new_request::*;
 use super::remote::*;
 use super::selection;
-use super::theme::*;
 
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
@@ -543,6 +542,7 @@ impl TuiApp {
             Overlay::EnvPopup(popup) => self.on_key_env_popup(popup, key),
             Overlay::EnvLinkPicker(picker) => self.on_key_env_link_picker(picker, key),
             Overlay::EnvCollision(collision) => self.on_key_env_collision(*collision, key),
+            Overlay::ThemeEditor(state) => self.on_key_theme_editor(state, key),
             Overlay::WorkspacePicker(picker) => self.on_key_workspace_picker(picker, key),
             Overlay::CloseGitWorkspace { idx, path, sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
@@ -875,7 +875,7 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Options(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Options((sel + 1).min(2)));
+                    self.overlay = Some(Overlay::Options((sel + 1).min(3)));
                 }
                 KeyCode::Enter => match sel {
                     0 => {
@@ -887,7 +887,8 @@ impl TuiApp {
                         };
                         self.overlay = Some(Overlay::LanguageMenu(cur));
                     }
-                    1 => self.overlay = Some(Overlay::Preferences(0)),
+                    1 => self.open_theme_editor(),
+                    2 => self.overlay = Some(Overlay::Preferences(0)),
                     _ => {
                         // Close all collections, guarded by the confirm setting.
                         if self.confirm_on_clear {
@@ -904,7 +905,7 @@ impl TuiApp {
                 _ => self.overlay = Some(Overlay::Options(sel)),
             },
             Overlay::Preferences(sel) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::Options(1)),
+                KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::Options(2)),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
                 }
@@ -3122,6 +3123,8 @@ impl TuiApp {
         self.response_pct = state.response_pct;
         self.recent_git_urls = state.recent_git_urls;
         self.default_request_view = state.default_request_view;
+        self.custom_themes = state.custom_themes;
+        self.active_theme = state.active_theme;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
@@ -3156,6 +3159,8 @@ impl TuiApp {
             response_pct: self.response_pct,
             recent_git_urls: self.recent_git_urls.clone(),
             default_request_view: self.default_request_view,
+            custom_themes: self.custom_themes.clone(),
+            active_theme: self.active_theme.clone(),
             global_envs: self
                 .global_envs
                 .iter()
@@ -3548,11 +3553,9 @@ impl TuiApp {
                             // Only append if the load actually took effect; on
                             // a read error `load_workspace_file` leaves the tab
                             // untouched, so keep the request parked.
-                            let loaded_ok = self
-                                .collections
-                                .get(ci)
-                                .and_then(|c| c.path.as_deref())
-                                == Some(path.as_path());
+                            let loaded_ok =
+                                self.collections.get(ci).and_then(|c| c.path.as_deref())
+                                    == Some(path.as_path());
                             if loaded_ok {
                                 self.append_pending_request_to_loaded(ci);
                             }
@@ -3698,7 +3701,7 @@ impl TuiApp {
     }
 
     pub(crate) fn open_browser(&mut self, action: FileAction) {
-        let th = theme(&self.language);
+        let th = self.theme();
         let s = Strings::for_language(&self.language);
         let label = match action {
             FileAction::OpenCollection => s.open_collection,

@@ -49,6 +49,37 @@ strings! {
     lang_english => "English", "English", "English";
     lang_french => "Français", "Français", "Français";
     lang_danish => "Dansk", "Dansk", "Dansk";
+    theme_menu => "Theme", "Thème", "Tema";
+    theme_editor_title => "Theme", "Thème", "Tema";
+    theme_auto => "Automatic (match language)", "Automatique (selon la langue)", "Automatisk (efter sprog)";
+    theme_name_label => "Name", "Nom", "Navn";
+    theme_editor_hint => "^N new · ^D delete · Esc close", "^N nouveau · ^D supprimer · Échap fermer", "^N nyt · ^D slet · Esc luk";
+    theme_fields_hint => "Enter edit colour · Tab list · Esc close", "Entrée modifier la couleur · Tab liste · Échap fermer", "Enter rediger farve · Tab liste · Esc luk";
+    theme_c_bg => "Background", "Arrière-plan", "Baggrund";
+    theme_c_panel => "Panel", "Panneau", "Panel";
+    theme_c_text => "Text", "Texte", "Tekst";
+    theme_c_dim => "Dim text", "Texte atténué", "Dæmpet tekst";
+    theme_c_accent => "Accent", "Accent", "Accent";
+    theme_c_ok => "Success", "Succès", "Succes";
+    theme_c_err => "Error", "Erreur", "Fejl";
+    theme_c_subst => "Substitution", "Substitution", "Substitution";
+    theme_c_pending => "Pending", "En attente", "Afventer";
+    theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
+    theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
+    theme_saved => "Theme saved:", "Thème enregistré\u{a0}:", "Tema gemt:";
+    theme_deleted => "Theme deleted:", "Thème supprimé\u{a0}:", "Tema slettet:";
+    theme_name_required => "Give the theme a name before saving", "Donnez un nom au thème avant d'enregistrer", "Giv temaet et navn før du gemmer";
+    theme_name_reserved => "That name belongs to a built-in preset; choose another", "Ce nom appartient à un préréglage intégré\u{a0}; choisissez-en un autre", "Det navn tilhører en indbygget forudindstilling; vælg et andet";
+    theme_cannot_delete => "Built-in presets can't be deleted", "Les préréglages intégrés ne peuvent pas être supprimés", "Indbyggede forudindstillinger kan ikke slettes";
+    theme_name_taken => "A theme with that name already exists", "Un thème portant ce nom existe déjà", "Der findes allerede et tema med det navn";
+    theme_preset_readonly => "Presets can't be edited — press ^N to make a copy", "Les préréglages ne peuvent pas être modifiés — appuyez sur ^N pour en faire une copie", "Forudindstillinger kan ikke redigeres — tryk på ^N for at lave en kopi";
+    theme_new_title => "New theme", "Nouveau thème", "Nyt tema";
+    theme_new_base => "Base on", "Basé sur", "Baseret på";
+    theme_new_popup_hint => "Enter create · Esc cancel", "Entrée créer · Échap annuler", "Enter opret · Esc annuller";
+    theme_ch_red => "R", "R", "R";
+    theme_ch_green => "G", "G", "G";
+    theme_ch_blue => "B", "B", "B";
+    theme_color_popup_hint => "←/→ ±1 · ^←/^→ or PgUp/Dn ±16 · type 0-255 · ↑/↓ channel · Enter apply · Esc cancel", "←/→ ±1 · ^←/^→ ou PgPréc/Suiv ±16 · saisir 0-255 · ↑/↓ canal · Entrée appliquer · Échap annuler", "←/→ ±1 · ^←/^→ eller PgUp/Ned ±16 · indtast 0-255 · ↑/↓ kanal · Enter anvend · Esc annuller";
     clear_all => "Close all collections", "Fermer toutes les collections", "Luk alle samlinger";
     clear_all_done => "All collections closed", "Toutes les collections ont été fermées", "Alle samlinger er lukket";
     copied_to_clipboard => "Copied to clipboard", "Copié dans le presse-papiers", "Kopieret til udklipsholder";
@@ -458,6 +489,21 @@ pub enum Status {
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
+    /// A theme was saved (created or updated) from the Theme editor; names it.
+    ThemeSaved(String),
+    /// A custom theme was deleted from the Theme editor; names it.
+    ThemeDeleted(String),
+    /// Save was pressed in the Theme editor with an empty name.
+    ThemeNameRequired,
+    /// Save was pressed in the Theme editor with a name that clashes with a
+    /// built-in preset (presets can't be overwritten).
+    ThemeNameReserved,
+    /// Delete was pressed in the Theme editor on Automatic or a built-in preset.
+    ThemeCannotDelete,
+    /// The "New theme" popup was confirmed with a name already in use.
+    ThemeNameTaken,
+    /// An edit was attempted on a read-only preset (or Automatic) in the editor.
+    ThemePresetReadonly,
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
 }
@@ -480,6 +526,8 @@ impl Status {
                     | Status::WorkspaceSaved
                     | Status::RequestMoved(_, _)
                     | Status::RequestCopied(_, _)
+                    | Status::ThemeSaved(_)
+                    | Status::ThemeDeleted(_)
             ),
         }
     }
@@ -527,12 +575,21 @@ impl Status {
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),
-            Status::RequestMoved(method, dest) => {
-                s.request_moved.replace("{m}", method).replace("{dest}", dest)
-            }
-            Status::RequestCopied(method, dest) => {
-                s.request_copied.replace("{m}", method).replace("{dest}", dest)
-            }
+            Status::RequestMoved(method, dest) => s
+                .request_moved
+                .replace("{m}", method)
+                .replace("{dest}", dest),
+            Status::RequestCopied(method, dest) => s
+                .request_copied
+                .replace("{m}", method)
+                .replace("{dest}", dest),
+            Status::ThemeSaved(name) => format!("{} {name}", s.theme_saved),
+            Status::ThemeDeleted(name) => format!("{} {name}", s.theme_deleted),
+            Status::ThemeNameRequired => s.theme_name_required.to_string(),
+            Status::ThemeNameReserved => s.theme_name_reserved.to_string(),
+            Status::ThemeCannotDelete => s.theme_cannot_delete.to_string(),
+            Status::ThemeNameTaken => s.theme_name_taken.to_string(),
+            Status::ThemePresetReadonly => s.theme_preset_readonly.to_string(),
             Status::CollectionRunSummary {
                 passed,
                 failed,

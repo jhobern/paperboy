@@ -9,6 +9,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.1.4] - 2026-07-15
 
+### Added
+
+- **Custom themes** — Settings → Theme opens a theme editor. The three
+  built-in per-language looks are now named, non-deletable presets (Britannia,
+  Parisian Purple, Dannebrog) you can pick from a list. `Ctrl+N` opens a popup
+  to create your own: name it (with a blinking cursor ready for typing) and
+  choose an existing theme to copy its colours from, and it's added to the list,
+  activated, and opened for editing. Select a custom theme and step into the
+  colour rows (`→`/`Tab`) to change any of its eleven colours; press `Enter` on
+  a colour to open a picker where you dial each R/G/B channel with the arrow
+  keys (`←`/`→` ±1, `Ctrl`+`←`/`→` or `PageUp`/`PageDown` ±16) or type a
+  `0`–`255` value — the whole UI previews live as you go, `Enter` applies (and
+  auto-saves), `Esc` cancels. Rename a custom theme from the editable name row
+  above the colours (`Enter` submits the new name). `Ctrl+D` deletes a custom
+  theme, moving focus to the theme just above it. Built-in presets are
+  read-only. Changing language still switches to that language's preset unless
+  you've manually chosen a theme.
+
 ### Changed
 
 - **`[` / `]` switch section tabs in the New Request wizard** — an

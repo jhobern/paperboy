@@ -316,11 +316,15 @@ pub(crate) enum Overlay {
     /// `Save (A)s…` / `To (G)it…` (the exact set depends on the kind). Esc/q
     /// returns to `FileSaveMenu` with the kind re-highlighted.
     FileSaveDest(FileKind, usize),
-    /// The "Settings" menu (Language / Preferences / Clear all collections) —
-    /// opened with `s`. Not to be confused with `Preferences`, the submenu one
-    /// level down that holds the actual toggle-able preferences.
+    /// The "Settings" menu (Language / Theme / Preferences / Clear all
+    /// collections) — opened with `s`. Not to be confused with `Preferences`,
+    /// the submenu one level down that holds the actual toggle-able preferences.
     Options(usize),
     LanguageMenu(usize),
+    /// The Theme editor (Settings → Theme): pick a preset/custom theme or build
+    /// your own. Carries its whole working state (see
+    /// [`crate::tui::theme_editor::ThemeEditorState`]).
+    ThemeEditor(crate::tui::theme_editor::ThemeEditorState),
     /// The "Preferences" submenu of the Settings menu: confirm-on-exit,
     /// confirm-on-clear, and the default Request panel view (JSON/Hurl).
     Preferences(usize),
@@ -798,6 +802,14 @@ pub struct TuiApp {
     /// Preferences submenu (Settings → Preferences → Default Request View).
     pub(crate) default_request_view: request::RequestView,
 
+    /// User-created themes (persisted). Shown in the Theme editor alongside the
+    /// built-in presets; deletable (unlike presets) with `Ctrl+D`.
+    pub(crate) custom_themes: Vec<crate::tui::theme::ThemeSpec>,
+    /// The explicitly-chosen theme name, or `None` to follow the language's
+    /// preset. Set the moment the user picks any theme in the Theme editor;
+    /// while `None`, changing language also changes the effective theme.
+    pub(crate) active_theme: Option<String>,
+
     /// `true` when the terminal supports the keyboard-enhancement protocol, so
     /// Ctrl+Enter is reported distinctly from a plain Enter. Advanced shortcuts
     /// (Ctrl+Enter) are only advertised in the UI when this is set.
@@ -915,6 +927,8 @@ impl Default for TuiApp {
             confirm_on_clear: true,
             always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
+            custom_themes: Vec::new(),
+            active_theme: None,
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
@@ -2340,9 +2354,39 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Link (or, if already linked to it, unlink) Global Environment `env_id`
-    /// to collection `ci`. Any number of collections may link the same
-    /// environment.
+    /// Every theme offered in the Theme editor, in display order: the built-in
+    /// presets first, then the user's own custom themes.
+    pub(crate) fn all_themes(&self) -> Vec<crate::tui::theme::ThemeSpec> {
+        let mut themes = crate::tui::theme::builtin_presets();
+        themes.extend(self.custom_themes.iter().cloned());
+        themes
+    }
+
+    /// Look a theme up by name across presets and custom themes.
+    pub(crate) fn find_theme(&self, name: &str) -> Option<crate::tui::theme::ThemeSpec> {
+        self.all_themes().into_iter().find(|t| t.name == name)
+    }
+
+    /// The theme spec currently in effect: the manually-chosen theme if set
+    /// (and still present), otherwise the current language's preset.
+    pub(crate) fn active_theme_spec(&self) -> crate::tui::theme::ThemeSpec {
+        if let Some(name) = &self.active_theme
+            && let Some(spec) = self.find_theme(name)
+        {
+            return spec;
+        }
+        crate::tui::theme::preset_for_language(&self.language)
+    }
+
+    /// The runtime [`Theme`](crate::tui::theme::Theme) to draw with. While the
+    /// Theme editor is open its live draft is returned instead, so every colour
+    /// tweak previews across the whole UI immediately.
+    pub(crate) fn theme(&self) -> crate::tui::theme::Theme {
+        if let Some(Overlay::ThemeEditor(state)) = &self.overlay {
+            return state.draft.to_theme();
+        }
+        self.active_theme_spec().to_theme()
+    }
     pub(crate) fn set_linked_env(&mut self, ci: usize, env_id: Option<u64>) {
         if let Some(col) = self.collections.get_mut(ci) {
             col.linked_env_id = if col.linked_env_id == env_id {

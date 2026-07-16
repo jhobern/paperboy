@@ -14,7 +14,8 @@ pub(crate) mod remote;
 mod selection;
 #[cfg(test)]
 mod tests;
-mod theme;
+pub(crate) mod theme;
+mod theme_editor;
 mod wrapcache;
 
 use ratatui::crossterm::event::{

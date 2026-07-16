@@ -166,6 +166,8 @@ cargo build --release
 - The app remembers your window layout, active tab/request, language, and
   recently-used git URLs across restarts.
 - English, French and Danish UI languages (Options → Language).
+- **Custom themes.** Settings → Theme lets you pick a per-language preset or
+  build and save your own colour scheme (see [Themes](#themes)).
 - **Nested folders.** A request's name can encode a folder path with `/`
   separators (e.g. `Auth/Tokens/Refresh`); the Requests list browses these
   as folders — `Enter` on a folder row descends into it, `Enter` on the
@@ -222,8 +224,8 @@ Notes on saving:
 
 ### Settings & preferences
 
-Open the **Settings** menu with `s` and choose **Preferences** for a few
-toggles that persist across restarts:
+Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
+**Preferences** for a few toggles that persist across restarts:
 
 - **Confirm on exit** / **Confirm on clear** — ask before quitting or before
   clearing all collections.
@@ -232,6 +234,35 @@ toggles that persist across restarts:
   from a Workspace collection with unsaved changes), automatically pick
   **Save** without asking. Leave it off to keep being prompted each time.
 - **Default Request view** — whether the Request panel opens in JSON or Hurl.
+
+### Themes
+
+Settings → **Theme** opens a theme editor. PaperBoy ships three presets — one
+per UI language, evoking its country: **Britannia** (English), **Parisian
+Purple** (French), and **Dannebrog** (Danish). By default the theme follows
+the current language; pick any preset (or a custom theme) from the list to use
+it. Presets are read-only — to make your own, base a new theme on one:
+
+- `Ctrl+N` — open the **New theme** popup. Give it a name — the cursor blinks
+  in the name field ready for typing — and choose an existing theme to copy its
+  colours from (`Tab` switches between the name and the base list). Pressing
+  `Enter` creates the theme, activates it, adds it to the list, and drops you
+  into the colour rows to edit.
+- Editing colours — with a custom theme selected, step into the colour rows
+  with `→` (or `Tab`). The first row is the theme's **name** — edit it to rename
+  the theme, then press `Enter` (or move off the row) to submit. Below it are
+  the colours. Move between rows with `↑`/`↓`. Press
+  `Enter` on a colour to open the **colour picker**: adjust the highlighted
+  R/G/B channel with `←`/`→` (±1) or `Ctrl`+`←`/`→` / `PageUp`/`PageDown` (±16),
+  or type a `0`–`255` value, and switch channels with `↑`/`↓`. The whole UI
+  previews live; `Enter` applies (and **auto-saves**), `Esc` cancels. `←` steps
+  back from the rows to the list.
+- `Ctrl+D` — delete the selected custom theme (presets can't be deleted); focus
+  moves to the theme just above the deleted one.
+- `Esc` — close the editor.
+
+Once you've chosen a theme by hand it stays put; changing language only
+switches the theme while you're still on **Automatic**.
 
 ## Loading & saving via git
 
