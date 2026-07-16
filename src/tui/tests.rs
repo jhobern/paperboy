@@ -204,6 +204,111 @@ fn shadowed_env_keys_is_empty_without_both_a_linked_and_an_active_environment() 
 }
 
 #[test]
+fn deleting_an_environment_asks_for_confirmation_by_default() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteEnv(0),
+                ..
+            })
+        ),
+        "x opens the delete confirmation by default"
+    );
+
+    press(&mut app, KeyCode::Char('y')); // confirm the deletion
+    assert!(
+        app.global_envs.is_empty(),
+        "confirming deletes the environment"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvDeleted(ref n)) if n == "staging"),
+        "a status naming the deleted environment (with the undo hint) is shown"
+    );
+}
+
+#[test]
+fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
+    let mut app = TuiApp::default();
+    app.confirm_on_delete_env = false;
+    add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation popup when the preference is off"
+    );
+    assert!(app.global_envs.is_empty(), "the environment is deleted");
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvDeleted(ref n)) if n == "staging"),
+        "the delete status is still shown"
+    );
+}
+
+#[test]
+fn u_reopens_the_most_recently_deleted_environment() {
+    let mut app = TuiApp::default();
+    app.confirm_on_delete_env = false;
+    add_empty_global_env(&mut app, "alpha");
+    add_empty_global_env(&mut app, "bravo");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 1; // bravo
+
+    press(&mut app, KeyCode::Char('x')); // delete bravo
+    assert_eq!(app.global_envs.len(), 1);
+
+    press(&mut app, KeyCode::Char('u')); // reopen it
+    assert_eq!(app.global_envs.len(), 2, "the environment comes back");
+    assert_eq!(
+        app.global_envs[1].name, "bravo",
+        "it returns to the index it was deleted from"
+    );
+    assert_eq!(
+        app.global_env_idx, 1,
+        "the reopened environment becomes selected"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::EnvReopened(ref n)) if n == "bravo"),
+        "a reopen status naming the environment is shown"
+    );
+}
+
+#[test]
+fn the_confirm_on_delete_env_preference_toggles_and_persists() {
+    let mut app = TuiApp::default();
+    assert!(
+        app.confirm_on_delete_env,
+        "confirmation is on by default (safe)"
+    );
+
+    app.overlay = Some(Overlay::Preferences(2));
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.confirm_on_delete_env, "Enter toggles it off");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        "the highlight stays on the toggle row"
+    );
+
+    // The setting round-trips through persistence.
+    let persisted = app.to_persisted();
+    assert!(!persisted.confirm_on_delete_env);
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(persisted);
+    assert!(
+        !restored.confirm_on_delete_env,
+        "the preference survives a save/load cycle"
+    );
+}
+
+#[test]
 fn f2_on_the_environments_panel_renames_the_selected_environment() {
     let mut app = TuiApp::default();
     let (env, _) = crate::environment::parse_vars_pending("staging".into(), "TOKEN=v");
@@ -1347,7 +1452,7 @@ fn preferences_menu_toggles_confirmation_flags() {
 }
 
 #[test]
-fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
+fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
@@ -1360,10 +1465,12 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Enter); // open Preferences (sel 0)
     press(&mut app, KeyCode::Down); // -> sel 1 (Confirm on clear)
-    press(&mut app, KeyCode::Down); // -> sel 2 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
-        "Down moves to the 3rd item without wrapping past it"
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        "Down moves to the last item without wrapping past it"
     );
 
     press(&mut app, KeyCode::Enter); // open the Default Request View submenu
@@ -1390,7 +1497,7 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
         "selecting Hurl in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -1398,14 +1505,14 @@ fn preferences_menu_third_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects Hurl (index 1) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(2)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(4)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
         "preselects Hurl (index 1)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(2))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -1426,7 +1533,9 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> Preferences
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down); // -> sel 1
-    press(&mut app, KeyCode::Down); // -> sel 2 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects JSON (0)
     assert_eq!(app.default_request_view, RequestView::Json);
 
@@ -1446,7 +1555,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(2))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(4))));
     assert_eq!(app.default_request_view, RequestView::Json);
 }
 
@@ -3534,6 +3643,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_env_rename,
         s.help_env_activate,
         s.help_env_delete,
+        s.help_env_reopen,
         s.help_env_link,
         s.help_env_view_linked,
         s.help_tab_manage,

@@ -1724,6 +1724,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let mark = |b: bool| if b { "[x]" } else { "[ ]" };
             let exit_item = format!("{} {}", mark(app.confirm_on_exit), s.confirm_on_exit);
             let clear_item = format!("{} {}", mark(app.confirm_on_clear), s.confirm_on_clear);
+            let delete_env_item = format!(
+                "{} {}",
+                mark(app.confirm_on_delete_env),
+                s.confirm_on_delete_env
+            );
             let view_label = match app.default_request_view {
                 request::RequestView::Json => "JSON",
                 request::RequestView::Hurl => "Hurl",
@@ -1737,8 +1742,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let items = [
                 exit_item.as_str(),
                 clear_item.as_str(),
-                view_item.as_str(),
+                delete_env_item.as_str(),
                 always_save_item.as_str(),
+                view_item.as_str(),
             ];
             draw_menu_popup(f, s.preferences_menu, &items, *sel, th);
         }
@@ -1896,6 +1902,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
                             ("x", s.help_env_delete),
+                            ("u (Env panel)", s.help_env_reopen),
                             ("p (List pane)", s.help_env_link),
                             ("v", s.help_env_view_linked),
                         ],

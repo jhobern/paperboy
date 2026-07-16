@@ -910,7 +910,7 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.overlay = Some(Overlay::Preferences((sel + 1).min(3)));
+                    self.overlay = Some(Overlay::Preferences((sel + 1).min(4)));
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     match sel {
@@ -925,6 +925,16 @@ impl TuiApp {
                             self.overlay = Some(Overlay::Preferences(sel));
                         }
                         2 => {
+                            self.confirm_on_delete_env = !self.confirm_on_delete_env;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
+                        }
+                        3 => {
+                            self.always_save_when_prompted = !self.always_save_when_prompted;
+                            self.save_state();
+                            self.overlay = Some(Overlay::Preferences(sel));
+                        }
+                        _ => {
                             // Open the Default Request View submenu,
                             // preselecting the current view.
                             let cur = match self.default_request_view {
@@ -932,11 +942,6 @@ impl TuiApp {
                                 request::RequestView::Hurl => 1,
                             };
                             self.overlay = Some(Overlay::RequestViewMenu(cur));
-                        }
-                        _ => {
-                            self.always_save_when_prompted = !self.always_save_when_prompted;
-                            self.save_state();
-                            self.overlay = Some(Overlay::Preferences(sel));
                         }
                     }
                 }
@@ -989,7 +994,7 @@ impl TuiApp {
                 // to Preferences afterwards; there's nothing left to
                 // "confirm" or "cancel" since the value's already applied.
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                    self.overlay = Some(Overlay::Preferences(2))
+                    self.overlay = Some(Overlay::Preferences(4))
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     let new_sel = sel.saturating_sub(1);
@@ -2116,6 +2121,9 @@ impl TuiApp {
             // collection (mirroring how `x` deletes a request there instead of
             // closing the tab) — see `restore_deleted_request`.
             KeyCode::Char('u') if self.focus == Pane::List => self.restore_deleted_request(),
+            // `u` in the Global Environments panel reopens the most recently
+            // deleted environment (mirroring how `x` deletes one there).
+            KeyCode::Char('u') if self.focus == Pane::GlobalEnv => self.restore_deleted_env(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // Ctrl+Shift+Left/Right reorders the active tab (index 0, the
             // built-in Request tab, never moves).
@@ -2174,11 +2182,17 @@ impl TuiApp {
             KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
+            // Guarded by the confirm-on-delete-env preference; when it's off,
+            // delete straight away (still undoable with `u`).
             KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                self.overlay = Some(Overlay::Confirm {
-                    action: ConfirmAction::DeleteEnv(self.global_env_idx),
-                    sel: 1,
-                });
+                if self.confirm_on_delete_env {
+                    self.overlay = Some(Overlay::Confirm {
+                        action: ConfirmAction::DeleteEnv(self.global_env_idx),
+                        sel: 1,
+                    });
+                } else {
+                    self.delete_global_env(self.global_env_idx);
+                }
             }
             KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
             // 'm' / 'c' move / copy the highlighted request in a Workspace tab
@@ -3118,6 +3132,7 @@ impl TuiApp {
             .map(PathBuf::from);
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
+        self.confirm_on_delete_env = state.confirm_on_delete_env;
         self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;
@@ -3154,6 +3169,7 @@ impl TuiApp {
                 .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
+            confirm_on_delete_env: self.confirm_on_delete_env,
             always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,

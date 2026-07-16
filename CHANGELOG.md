@@ -26,6 +26,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   theme, moving focus to the theme just above it. Built-in presets are
   read-only. Changing language still switches to that language's preset unless
   you've manually chosen a theme.
+- **Reopen a deleted Global Environment** — deleting an environment (`x` in the
+  Global Environments panel) is now undoable: press `u` to reopen the most
+  recently deleted one, restored to where it was. Both the deletion and the
+  reopen are reported in the status bar.
+- **"Confirm before deleting an environment" preference** — Settings →
+  Preferences gains a toggle (on by default) to skip the delete-environment
+  confirmation popup; with it off, `x` deletes straight away (still undoable
+  with `u`).
 
 ### Changed
 

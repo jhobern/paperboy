@@ -229,6 +229,9 @@ Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
 
 - **Confirm on exit** / **Confirm on clear** — ask before quitting or before
   clearing all collections.
+- **Confirm before deleting an environment** (on by default) — ask before
+  deleting a Global Environment with `x`. Turn it off to delete straight away;
+  either way the deletion is undoable with `u`.
 - **Always save when prompted** (off by default) — whenever an action would
   otherwise pop up a **Save / Discard / Cancel** choice (e.g. switching away
   from a Workspace collection with unsaved changes), automatically pick
@@ -434,6 +437,7 @@ up-to-date list. Highlights:
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |
 | `x` | Delete request / close collection tab |
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
+| `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
 | `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |

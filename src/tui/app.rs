@@ -654,6 +654,11 @@ pub struct TuiApp {
     /// used for substitution in any collection (subject to being overridden
     /// by that collection's own `linked_env_id`, if set, on name collision).
     pub(crate) active_env_id: Option<u64>,
+    /// Undo stack for deleted Global Environments: each entry is the list index
+    /// the environment was removed from plus the environment itself, so `u`
+    /// (in the Global Environments panel) can reopen the most recent one. The
+    /// exact parallel of a collection's `deleted_entries`.
+    pub(crate) deleted_envs: Vec<(usize, Environment)>,
 
     pub(crate) focus: Pane,
     /// Selected row in the Global Environments list (panel showing env
@@ -792,6 +797,10 @@ pub struct TuiApp {
     /// Settings (persisted): confirm before quitting / closing all collections.
     pub(crate) confirm_on_exit: bool,
     pub(crate) confirm_on_clear: bool,
+    /// Preferences (persisted): confirm before deleting a Global Environment
+    /// (`x` in the Global Environments panel). On by default; turn it off to
+    /// always delete immediately (the deletion stays undoable with `u`).
+    pub(crate) confirm_on_delete_env: bool,
     /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
     /// for unsaved in-memory edits (switching collections in a Workspace, or
     /// pushing one to git) is skipped and the "Save" action taken
@@ -888,6 +897,7 @@ impl Default for TuiApp {
             response: Arc::new(Mutex::new(ApiResponse::default())),
             global_envs: Vec::new(),
             active_env_id: None,
+            deleted_envs: Vec::new(),
             focus: Pane::List,
             global_env_idx: 0,
             resp_scroll: 0,
@@ -925,6 +935,7 @@ impl Default for TuiApp {
             browser_forward_path: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
+            confirm_on_delete_env: true,
             always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
             custom_themes: Vec::new(),
@@ -2330,13 +2341,16 @@ impl TuiApp {
     }
 
     /// Delete the Global Environment at `idx`: any collection linked to it
-    /// becomes unlinked, and it's deactivated if it was active.
+    /// becomes unlinked, and it's deactivated if it was active. The removed
+    /// environment is pushed onto `deleted_envs` so `u` can reopen it, and a
+    /// status naming it (with the undo hint) is shown.
     pub(crate) fn delete_global_env(&mut self, idx: usize) {
         if idx >= self.global_envs.len() {
             return;
         }
-        let id = self.global_envs[idx].id;
-        self.global_envs.remove(idx);
+        let removed = self.global_envs.remove(idx);
+        let id = removed.id;
+        let name = removed.name.clone();
         if self.active_env_id == Some(id) {
             self.active_env_id = None;
         }
@@ -2345,12 +2359,33 @@ impl TuiApp {
                 col.linked_env_id = None;
             }
         }
+        self.deleted_envs.push((idx, removed));
         self.global_env_idx = self
             .global_env_idx
             .min(self.global_envs.len().saturating_sub(1));
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
+        self.status = Some(crate::i18n::Status::EnvDeleted(name));
+        self.save_state();
+    }
+
+    /// Reopen the most recently deleted Global Environment (`u`, Global
+    /// Environments panel), restoring it as close as possible to the index it
+    /// was removed from and selecting it. The parallel of
+    /// [`Self::restore_deleted_request`] for environments.
+    pub(crate) fn restore_deleted_env(&mut self) {
+        let Some((idx, env)) = self.deleted_envs.pop() else {
+            return;
+        };
+        let idx = idx.min(self.global_envs.len());
+        let name = env.name.clone();
+        self.global_envs.insert(idx, env);
+        self.global_env_idx = idx;
+        for col in &mut self.collections {
+            col.invalidate_request_json();
+        }
+        self.status = Some(crate::i18n::Status::EnvReopened(name));
         self.save_state();
     }
 

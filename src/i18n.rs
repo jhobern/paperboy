@@ -87,6 +87,7 @@ strings! {
     confirm_on_exit => "Confirm on exit", "Confirmer à la sortie", "Bekræft ved afslutning";
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
     confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
+    confirm_on_delete_env => "Confirm before deleting an environment", "Confirmer avant de supprimer un environnement", "Bekræft før sletning af et miljø";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
     always_save_when_prompted => "Always save unsaved changes when prompted", "Toujours enregistrer les modifications non enregistrées lorsque demandé", "Gem altid ugemte ændringer, når du bliver spurgt";
     view_json_label => "JSON", "JSON", "JSON";
@@ -144,6 +145,8 @@ strings! {
     workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
     request_deleted => "{m} request deleted. Press (u) to restore request.", "Requête {m} supprimée. Appuyez sur (u) pour la restaurer.", "{m}-forespørgsel slettet. Tryk (u) for at gendanne.";
     tab_closed => "Collection closed. Press (u) to reopen tab.", "Collection fermée. Appuyez sur (u) pour rouvrir l'onglet.", "Samling lukket. Tryk (u) for at genåbne fanen.";
+    env_deleted => "Environment '{n}' deleted. Press (u) to reopen environment.", "Environnement «\u{a0}{n}\u{a0}» supprimé. Appuyez sur (u) pour le rouvrir.", "Miljøet '{n}' slettet. Tryk (u) for at genåbne miljøet.";
+    env_reopened => "Environment '{n}' reopened.", "Environnement «\u{a0}{n}\u{a0}» rouvert.", "Miljøet '{n}' genåbnet.";
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
@@ -369,6 +372,7 @@ strings! {
     help_reload_var => "reload a failed environment entry (env var / 1Password / SSM)", "recharger une entrée d'environnement en échec (var d'env / 1Password / SSM)", "genindlæs en mislykket miljøvariabel (miljøvariabel / 1Password / SSM)";
     help_env_activate => "activate / deactivate the selected Global Environment", "activer / désactiver l'environnement global sélectionné", "aktivér / deaktivér det valgte globale miljø";
     help_env_delete => "delete the selected Global Environment (unlinks any collections using it)", "supprimer l'environnement global sélectionné (délie les collections qui l'utilisent)", "slet det valgte globale miljø (fjerner link fra samlinger, der bruger det)";
+    help_env_reopen => "reopen the most recently deleted Global Environment", "rouvrir l'environnement global supprimé le plus récemment", "genåbn det senest slettede globale miljø";
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
@@ -483,6 +487,11 @@ pub enum Status {
     /// A collection tab was closed (`x` / Ctrl+W). Pairs with the "press u to
     /// reopen" hint, mirroring [`Status::RequestDeleted`].
     TabClosed,
+    /// A Global Environment was deleted (`x`, or auto-confirmed). Holds its
+    /// name and pairs with the "press u to reopen" hint.
+    EnvDeleted(String),
+    /// A deleted Global Environment was reopened (`u`); names it.
+    EnvReopened(String),
     /// A request was moved to another collection file in the workspace. Holds
     /// the HTTP method and the destination file's display name.
     RequestMoved(String, String),
@@ -528,6 +537,7 @@ impl Status {
                     | Status::RequestCopied(_, _)
                     | Status::ThemeSaved(_)
                     | Status::ThemeDeleted(_)
+                    | Status::EnvReopened(_)
             ),
         }
     }
@@ -575,6 +585,8 @@ impl Status {
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),
+            Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
+            Status::EnvReopened(name) => s.env_reopened.replace("{n}", name),
             Status::RequestMoved(method, dest) => s
                 .request_moved
                 .replace("{m}", method)
