@@ -1,0 +1,13 @@
+[package]
+name = "tui-panel-select"
+version = "0.1.0"
+edition = "2024"
+description = "Panel-scoped mouse text selection and clipboard copy for ratatui apps"
+license = "MIT"
+repository = "https://github.com/jhobern/paperboy"
+keywords = ["ratatui", "tui", "selection", "clipboard", "terminal"]
+categories = ["command-line-interface"]
+
+[dependencies]
+ratatui = "0.30.2"
+base64 = "0.22"

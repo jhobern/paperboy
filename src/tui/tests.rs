@@ -12798,28 +12798,6 @@ fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
     );
 }
 
-/// `wrapped_row_count` must match `wrap_line`'s own boundary math
-/// exactly, since `wrapcache::PanelWrap` relies on it to size the total
-/// scrollable extent and locate a scroll position without ever wrapping
-/// every line.
-#[test]
-fn wrapped_row_count_matches_wrap_line_for_various_lengths() {
-    use super::draw::{wrap_line, wrapped_row_count};
-    use ratatui::text::Line;
-
-    for (len, width) in [(0, 10), (1, 10), (10, 10), (11, 10), (25, 10), (7, 0)] {
-        let text = "x".repeat(len);
-        let actual = wrap_line(Line::raw(text), width).len();
-        assert_eq!(
-            wrapped_row_count(len, width),
-            actual,
-            "len={len} width={width}"
-        );
-    }
-}
-
-// `total_wrapped_rows_sums_every_lines_row_count` and
-// `total_wrapped_rows_is_never_less_than_one_even_for_no_lines` are
 // superseded by `wrapcache::PanelWrap::total_rows`'s own test coverage
 // (e.g. `total_rows_accounts_for_wrapping_long_lines` and
 // `empty_body_has_one_line_and_one_row` in `wrapcache.rs`).

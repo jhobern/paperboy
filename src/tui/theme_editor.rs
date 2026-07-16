@@ -10,13 +10,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 use super::app::TuiApp;
 use super::draw::{centered_rect, panel};
 use super::editor::{Editor, render_line_field};
 use super::theme::{THEME_COLOR_COUNT, Theme, ThemeSpec};
 use crate::i18n::Strings;
+use tui_rgb_picker::{ColorPicker, ColorPickerLabels, ColorPickerStyle};
 
 /// Which pane of the Theme editor has focus.
 #[derive(Clone, Copy, PartialEq)]
@@ -45,47 +46,15 @@ pub(crate) struct NewThemeState {
     pub(crate) focus: NewThemeFocus,
 }
 
-/// The R/G/B picker popup for editing a single theme colour.
-pub(crate) struct ColorPickerState {
+/// The R/G/B picker popup for editing a single theme colour. Wraps the
+/// reusable [`ColorPicker`] (from the `tui-rgb-picker` crate) with the one
+/// piece of context the crate stays agnostic about: *which* theme colour
+/// (`0..THEME_COLOR_COUNT`) is being edited.
+pub(crate) struct ColorPopup {
     /// Which theme colour (`0..THEME_COLOR_COUNT`) is being edited.
     pub(crate) color_idx: usize,
-    /// The focused channel: `0` = red, `1` = green, `2` = blue.
-    pub(crate) channel: usize,
-    /// The working colour, previewed live and committed on Enter.
-    pub(crate) rgb: [u8; 3],
-    /// The colour on open, restored if the user cancels with Esc.
-    pub(crate) orig: [u8; 3],
-    /// Digits typed for the current channel since it was focused; cleared as
-    /// soon as an arrow adjustment or a channel change happens.
-    pub(crate) buf: String,
-}
-
-impl ColorPickerState {
-    fn adjust(&mut self, delta: i16) {
-        let v = self.rgb[self.channel] as i16 + delta;
-        self.rgb[self.channel] = v.clamp(0, 255) as u8;
-        self.buf.clear();
-    }
-
-    fn set_channel(&mut self, channel: usize) {
-        self.channel = channel;
-        self.buf.clear();
-    }
-
-    fn type_digit(&mut self, d: char) {
-        if self.buf.len() >= 3 {
-            self.buf.clear();
-        }
-        self.buf.push(d);
-        let n = self.buf.parse::<u16>().unwrap_or(0).min(255);
-        self.rgb[self.channel] = n as u8;
-    }
-
-    fn backspace(&mut self) {
-        self.buf.pop();
-        let n = self.buf.parse::<u16>().unwrap_or(0).min(255);
-        self.rgb[self.channel] = n as u8;
-    }
+    /// The reusable picker state (working colour, focused channel, original).
+    pub(crate) picker: ColorPicker,
 }
 
 pub(crate) struct ThemeEditorState {
@@ -107,7 +76,7 @@ pub(crate) struct ThemeEditorState {
     /// When `Some`, the "New theme" popup is open and takes all key input.
     pub(crate) new_popup: Option<NewThemeState>,
     /// When `Some`, the colour picker popup is open and takes all key input.
-    pub(crate) color_popup: Option<ColorPickerState>,
+    pub(crate) color_popup: Option<ColorPopup>,
 }
 
 impl ThemeEditorState {
@@ -379,7 +348,7 @@ fn draw_new_theme_popup(
     );
 }
 
-fn draw_color_popup(f: &mut Frame, cp: &ColorPickerState, s: &Strings, th: &Theme) {
+fn draw_color_popup(f: &mut Frame, cp: &ColorPopup, s: &Strings, th: &Theme) {
     let width = 46u16;
     let height = 9u16.min(f.area().height.max(6));
     let area = centered_rect(width, height, f.area());
@@ -389,57 +358,22 @@ fn draw_color_popup(f: &mut Frame, cp: &ColorPickerState, s: &Strings, th: &Them
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows = Layout::vertical([
-        Constraint::Length(1), // swatch + hex
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // R
-        Constraint::Length(1), // G
-        Constraint::Length(1), // B
-        Constraint::Length(2), // hint (wraps over two lines)
-    ])
-    .split(inner);
-
-    let color = Color::Rgb(cp.rgb[0], cp.rgb[1], cp.rgb[2]);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("      ", Style::default().bg(color)),
-            Span::raw("  "),
-            Span::styled(hex_display(cp.rgb), Style::default().fg(th.text)),
-        ])),
-        rows[0],
-    );
-
-    let labels = [s.theme_ch_red, s.theme_ch_green, s.theme_ch_blue];
-    let bar_w = 16usize;
-    for ch in 0..3 {
-        let value = cp.rgb[ch] as usize;
-        let filled = value * bar_w / 255;
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
-        let on = cp.channel == ch;
-        let marker = if on { "›" } else { " " };
-        let label_style = if on {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th.dim)
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{marker} {} ", labels[ch]), label_style),
-                Span::styled(bar, Style::default().fg(th.accent)),
-                Span::styled(format!(" {value:>3}"), Style::default().fg(th.text)),
-            ])),
-            rows[2 + ch],
-        );
-    }
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            s.theme_color_popup_hint,
-            Style::default().fg(th.dim),
-        )))
-        .wrap(Wrap { trim: true }),
-        rows[5],
-    );
+    // The swatch/hex/slider layout and input live in the reusable
+    // `tui-rgb-picker` crate; here we only supply PaperBoy's theme colours,
+    // localized channel labels, and its keybinding hint.
+    let style = ColorPickerStyle {
+        label: Style::default().fg(th.dim),
+        label_focused: Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        bar: Style::default().fg(th.accent),
+        value: Style::default().fg(th.text),
+        hint: Style::default().fg(th.dim),
+        bar_width: 16,
+    };
+    let labels = ColorPickerLabels {
+        channels: [s.theme_ch_red, s.theme_ch_green, s.theme_ch_blue],
+        hint: Some(s.theme_color_popup_hint),
+    };
+    f.render_widget(cp.picker.widget(&style, &labels), inner);
 }
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -583,12 +517,9 @@ impl TuiApp {
     /// Open the colour picker popup for the focused colour row.
     fn theme_open_color_popup(&mut self, st: &mut ThemeEditorState) {
         let rgb = st.draft.color(st.field);
-        st.color_popup = Some(ColorPickerState {
+        st.color_popup = Some(ColorPopup {
             color_idx: st.field,
-            channel: 0,
-            rgb,
-            orig: rgb,
-            buf: String::new(),
+            picker: ColorPicker::new(rgb),
         });
     }
 
@@ -714,34 +645,38 @@ impl TuiApp {
             };
             match key.code {
                 KeyCode::Esc => {
-                    let (idx, orig) = (cp.color_idx, cp.orig);
+                    let (idx, orig) = (cp.color_idx, cp.picker.original());
                     st.draft.set_color(idx, orig);
                     st.color_popup = None;
                     return;
                 }
                 KeyCode::Enter => {
-                    let (idx, rgb) = (cp.color_idx, cp.rgb);
+                    let (idx, rgb) = (cp.color_idx, cp.picker.rgb());
                     st.draft.set_color(idx, rgb);
                     st.color_popup = None;
                     self.theme_persist_draft(st);
                     return;
                 }
-                KeyCode::Up | KeyCode::Char('k') => cp.set_channel(cp.channel.saturating_sub(1)),
-                KeyCode::Down | KeyCode::Char('j') => cp.set_channel((cp.channel + 1).min(2)),
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => cp.adjust(-16),
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => cp.adjust(16),
-                KeyCode::Left => cp.adjust(-1),
-                KeyCode::Right => cp.adjust(1),
-                KeyCode::PageDown => cp.adjust(-16),
-                KeyCode::PageUp => cp.adjust(16),
-                KeyCode::Char(c) if c.is_ascii_digit() => cp.type_digit(c),
-                KeyCode::Backspace => cp.backspace(),
+                KeyCode::Up | KeyCode::Char('k') => cp.picker.focus_prev_channel(),
+                KeyCode::Down | KeyCode::Char('j') => cp.picker.focus_next_channel(),
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cp.picker.adjust(-16)
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    cp.picker.adjust(16)
+                }
+                KeyCode::Left => cp.picker.adjust(-1),
+                KeyCode::Right => cp.picker.adjust(1),
+                KeyCode::PageDown => cp.picker.adjust(-16),
+                KeyCode::PageUp => cp.picker.adjust(16),
+                KeyCode::Char(c) if c.is_ascii_digit() => cp.picker.type_digit(c),
+                KeyCode::Backspace => cp.picker.backspace(),
                 _ => {}
             }
         }
         // Live whole-app preview of the in-progress colour.
         if let Some(cp) = &st.color_popup {
-            let (idx, rgb) = (cp.color_idx, cp.rgb);
+            let (idx, rgb) = (cp.color_idx, cp.picker.rgb());
             st.draft.set_color(idx, rgb);
         }
     }

@@ -43,6 +43,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   field (Method, Target, or a "+ Add …" row), so the brackets can still be
   typed into URLs, JSON bodies, and header/cookie/form values.
 
+### Internal
+
+- **Panel text selection & clipboard copy extracted into the reusable
+  `tui-panel-select` crate** (`crates/tui-panel-select`). The panel-scoped
+  mouse selection, resize-stable wrap cache, and cross-platform clipboard copy
+  now live in a standalone, documented library with a simple `SelectablePanel`
+  API; PaperBoy consumes it. No user-facing behaviour change.
+- **Theme colour picker extracted into the reusable `tui-rgb-picker` crate**
+  (`crates/tui-rgb-picker`). The R/G/B channel-slider picker (state, input, and
+  a styleable/localizable ratatui widget) is now a standalone library; the
+  theme editor consumes it, supplying its own colours, labels and hint. No
+  user-facing behaviour change.
+
 ## [0.1.3] - 2026-07-15
 
 ### Added
