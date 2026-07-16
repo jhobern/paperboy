@@ -165,6 +165,36 @@ impl HurlEntry {
         }
     }
 
+    /// Add an explicit `Content-Length: 0` header when this is a bodyless
+    /// request whose method normally carries a body (`POST`/`PUT`/`PATCH`/
+    /// `DELETE`). Browsers and Postman always send `Content-Length: 0` in this
+    /// case, but libcurl (which the Hurl runner uses) omits it for a bodyless
+    /// request over HTTP/2, and some servers reject such a request with a
+    /// `400 Bad Request`. Matching the Postman/browser behaviour keeps those
+    /// requests working.
+    ///
+    /// A no-op when a body or form fields are present (libcurl computes the
+    /// length itself), when the method doesn't carry a body, or when the user
+    /// already set a `Content-Length` header. Applied only to the transient
+    /// copy that's run — never to what's saved to disk — so saved `.hurl`
+    /// files stay free of synthesized headers.
+    pub fn ensure_run_content_length(&mut self) {
+        let carries_body = matches!(
+            self.method.to_ascii_uppercase().as_str(),
+            "POST" | "PUT" | "PATCH" | "DELETE"
+        );
+        let has_body = self.body.as_deref().is_some_and(|b| !b.trim().is_empty())
+            || !self.form_fields.is_empty();
+        let has_content_length = self
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        if carries_body && !has_body && !has_content_length {
+            self.headers
+                .push(("Content-Length".to_string(), "0".to_string()));
+        }
+    }
+
     /// Serialize this entry to Hurl text. Ordered so it round-trips through
     /// [`parse_hurl`](super::parse_hurl): a body (which must be JSON/quoted to
     /// be re-detected) is emitted right after the headers; request sections and
@@ -304,4 +334,98 @@ pub fn method_rgb(method: &str) -> Option<(u8, u8, u8)> {
         "ANY" => (252, 161, 48),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(method: &str) -> HurlEntry {
+        HurlEntry {
+            method: method.to_string(),
+            url: "http://x/y".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bodyless_post_gets_an_explicit_content_length_zero() {
+        let mut e = entry("POST");
+        e.ensure_run_content_length();
+        assert!(
+            e.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Length" && v == "0")
+        );
+    }
+
+    #[test]
+    fn content_length_added_for_all_body_carrying_methods() {
+        for m in ["POST", "PUT", "PATCH", "DELETE", "post", "Put"] {
+            let mut e = entry(m);
+            e.ensure_run_content_length();
+            assert!(
+                e.headers.iter().any(|(k, _)| k == "Content-Length"),
+                "expected Content-Length for {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_and_head_never_get_a_content_length() {
+        for m in ["GET", "HEAD"] {
+            let mut e = entry(m);
+            e.ensure_run_content_length();
+            assert!(
+                !e.headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
+                "did not expect Content-Length for {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_length_skipped_when_a_body_is_present() {
+        let mut e = entry("POST");
+        e.body = Some("{\"a\":1}".to_string());
+        e.ensure_run_content_length();
+        assert!(
+            !e.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        );
+    }
+
+    #[test]
+    fn content_length_skipped_when_form_fields_are_present() {
+        let mut e = entry("POST");
+        e.form_fields = vec![FormField {
+            key: "a".to_string(),
+            value: "b".to_string(),
+            kind: FormFieldKind::Text,
+            content_type: None,
+            base64_prefix: None,
+        }];
+        e.ensure_run_content_length();
+        assert!(
+            !e.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        );
+    }
+
+    #[test]
+    fn a_user_set_content_length_is_not_duplicated() {
+        let mut e = entry("POST");
+        e.headers
+            .push(("content-length".to_string(), "5".to_string()));
+        e.ensure_run_content_length();
+        let count = e
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .count();
+        assert_eq!(count, 1);
+    }
 }

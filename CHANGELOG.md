@@ -78,6 +78,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Bodyless `POST`/`PUT`/`PATCH`/`DELETE` requests now send `Content-Length:
+  0`** — matching what Postman and browsers send. libcurl (which the runner
+  uses) omits the header for a bodyless request over HTTP/2, and some servers
+  reject such a request with `400 Bad Request`; the header is now added
+  automatically at run time (unless the request has a body/form fields or you
+  set `Content-Length` yourself). Saved `.hurl` files are unaffected.
 - **Postman import no longer fails on `null` string fields** — collections
   exported from Postman routinely carry an explicit `"value": null` (or null
   `src`) on blank `file` form-data entries. A single such `null` previously

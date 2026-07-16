@@ -553,6 +553,7 @@ pub fn run_collection(
         let staged_dir =
             stage_out_of_scope_form_files(&mut entries, file_root.as_deref()).unwrap_or_default();
         run_entry = entries[0].clone();
+        run_entry.ensure_run_content_length();
         let run_root = staged_dir.as_deref().or(file_root.as_deref());
         let content = run_entry.to_hurl();
 
@@ -639,6 +640,9 @@ pub fn run_all_entries(
         let staged_dir = stage_out_of_scope_form_files(&mut run_entries, file_root.as_deref())
             .unwrap_or_default();
         let run_root = staged_dir.as_deref().or(file_root.as_deref());
+        for e in &mut run_entries {
+            e.ensure_run_content_length();
+        }
         let content = collection_to_hurl(&run_entries);
 
         let out = run_hurl(&content, &vars, run_root);

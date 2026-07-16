@@ -61,6 +61,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
         }
     }
     let run_content = if looks_like_postman(&col_content) || has_base64 {
+        // These paths re-serialize from the entry model, so normalize each
+        // entry the same way the TUI runner does: a bodyless POST/PUT/PATCH/
+        // DELETE gets an explicit `Content-Length: 0` (Postman/browsers send
+        // it; libcurl omits it over HTTP/2 and some servers 400 without it).
+        for e in &mut entries {
+            e.ensure_run_content_length();
+        }
         collection_to_hurl(&entries)
     } else {
         col_content
