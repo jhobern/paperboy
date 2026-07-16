@@ -119,6 +119,7 @@ impl Param {
                 value: self.src.clone(),
                 kind: FormFieldKind::File,
                 content_type: self.content_type.clone(),
+                base64_prefix: None,
             }
         } else {
             FormField {
@@ -126,6 +127,7 @@ impl Param {
                 value: self.value.clone(),
                 kind: FormFieldKind::Text,
                 content_type: None,
+                base64_prefix: None,
             }
         })
     }
@@ -288,13 +290,15 @@ mod tests {
                     key: "a".into(),
                     value: "1".into(),
                     kind: FormFieldKind::Text,
-                    content_type: None
+                    content_type: None,
+                    base64_prefix: None,
                 },
                 FormField {
                     key: "f".into(),
                     value: "x".into(),
                     kind: FormFieldKind::File,
-                    content_type: None
+                    content_type: None,
+                    base64_prefix: None,
                 },
             ],
             "text and file form-data fields are both imported"

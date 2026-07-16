@@ -4,13 +4,14 @@
 //! must preserve their exact source text (URL, headers, body, captures, asserts)
 //! are taken via `ToSource`/`Display` or by slicing the original source lines.
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hurl_core::ast::{
     Body, Bytes, Capture, Cookie, Entry, KeyValue, MultipartParam, SectionValue, StatusValue,
 };
 use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
 
-use super::entry::{FormField, FormFieldKind, HurlEntry, RunStatus};
+use super::entry::{BASE64_FILE_CT_MARKER, FormField, FormFieldKind, HurlEntry, RunStatus};
 
 /// Parse a Hurl-format string into a list of [`HurlEntry`] values. Invalid input
 /// yields an empty list (the UI treats "no entries" as a failed load).
@@ -42,6 +43,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
                             value,
                             kind: FormFieldKind::Text,
                             content_type: None,
+                            base64_prefix: None,
                         }
                     })
                     .collect();
@@ -124,22 +126,48 @@ fn multipart_field(p: &MultipartParam) -> FormField {
                 value,
                 kind: FormFieldKind::Text,
                 content_type: None,
+                base64_prefix: None,
             }
         }
-        MultipartParam::FilenameParam(fp) => FormField {
-            key: fp.key.to_source().to_string(),
-            // The decoded filename (spaces and other escapes resolved), so it
-            // matches a real filesystem path — the same form the file picker
-            // stores. Re-escaping happens on the way back out (see
-            // `entry.rs`'s `escape_form_file_path`).
-            value: fp.value.filename.to_string(),
-            kind: FormFieldKind::File,
-            content_type: fp
+        MultipartParam::FilenameParam(fp) => {
+            let content_type = fp
                 .value
                 .content_type
                 .as_ref()
-                .map(|t| t.to_source().to_string()),
-        },
+                .map(|t| t.to_source().to_string());
+            // A PaperBoy-marked content-type means this was a Base64File on
+            // save (Hurl has no native base64-file concept). Restore the
+            // Base64File kind and decode its URL-safe-base64 prefix; a bad
+            // encoding degrades gracefully to an empty prefix.
+            if let Some(encoded) = content_type
+                .as_deref()
+                .and_then(|ct| ct.strip_prefix(BASE64_FILE_CT_MARKER))
+            {
+                let prefix = URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .unwrap_or_default();
+                return FormField {
+                    key: fp.key.to_source().to_string(),
+                    value: fp.value.filename.to_string(),
+                    kind: FormFieldKind::Base64File,
+                    content_type: None,
+                    base64_prefix: Some(prefix),
+                };
+            }
+            FormField {
+                key: fp.key.to_source().to_string(),
+                // The decoded filename (spaces and other escapes resolved), so it
+                // matches a real filesystem path — the same form the file picker
+                // stores. Re-escaping happens on the way back out (see
+                // `entry.rs`'s `escape_form_file_path`).
+                value: fp.value.filename.to_string(),
+                kind: FormFieldKind::File,
+                content_type,
+                base64_prefix: None,
+            }
+        }
     }
 }
 
@@ -335,12 +363,14 @@ mod tests {
                 value: "bob".to_string(),
                 kind: FormFieldKind::Text,
                 content_type: None,
+                base64_prefix: None,
             },
             FormField {
                 key: "pass".to_string(),
                 value: "secret".to_string(),
                 kind: FormFieldKind::Text,
                 content_type: None,
+                base64_prefix: None,
             },
         ];
 
@@ -367,18 +397,21 @@ mod tests {
                 value: "value1".to_string(),
                 kind: FormFieldKind::Text,
                 content_type: None,
+                base64_prefix: None,
             },
             FormField {
                 key: "field2".to_string(),
                 value: "example.txt".to_string(),
                 kind: FormFieldKind::File,
                 content_type: None,
+                base64_prefix: None,
             },
             FormField {
                 key: "field3".to_string(),
                 value: "example.zip".to_string(),
                 kind: FormFieldKind::File,
                 content_type: Some("application/zip".to_string()),
+                base64_prefix: None,
             },
         ];
 
@@ -404,6 +437,7 @@ mod tests {
             value: "/tmp/my report final.pdf".to_string(),
             kind: FormFieldKind::File,
             content_type: None,
+            base64_prefix: None,
         }];
 
         let text = entry.to_hurl();
@@ -427,5 +461,54 @@ mod tests {
             parsed[0].form_fields[0].value, "my report.pdf",
             "the stored path is the decoded real path, not the escaped source"
         );
+    }
+
+    #[test]
+    fn base64_file_field_round_trips_with_its_prefix() {
+        // A Base64File keeps its file path + prefix across a save/reload cycle
+        // via the PaperBoy content-type marker (Hurl has no native concept of
+        // it). It serializes as a [Multipart] file line and comes back as a
+        // Base64File, not a plain File.
+        let mut entry =
+            HurlEntry::from_fields("Upload", "POST", "{{ BASE_URL }}/upload", vec![], "");
+        entry.form_fields = vec![FormField {
+            key: "avatar".to_string(),
+            value: "/tmp/pic.png".to_string(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: Some("data:image/png;base64,".to_string()),
+        }];
+
+        let text = entry.to_hurl();
+        assert!(
+            text.contains("[Multipart]"),
+            "a Base64File field serializes under [Multipart]:\n{text}"
+        );
+        assert!(
+            text.contains("x-paperboy-base64;"),
+            "the emitted Hurl carries the PaperBoy marker:\n{text}"
+        );
+        let reparsed = parse_hurl(&text);
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(
+            reparsed[0].form_fields, entry.form_fields,
+            "the Base64File kind and its prefix survive the round trip"
+        );
+    }
+
+    #[test]
+    fn base64_file_field_with_empty_prefix_round_trips() {
+        let mut entry =
+            HurlEntry::from_fields("Upload", "POST", "{{ BASE_URL }}/upload", vec![], "");
+        entry.form_fields = vec![FormField {
+            key: "blob".to_string(),
+            value: "/tmp/data.bin".to_string(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: Some(String::new()),
+        }];
+
+        let reparsed = parse_hurl(&entry.to_hurl());
+        assert_eq!(reparsed[0].form_fields, entry.form_fields);
     }
 }

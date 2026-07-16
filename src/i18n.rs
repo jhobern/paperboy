@@ -184,6 +184,8 @@ strings! {
     hdr_type => "Type", "Type", "Type";
     form_type_text => "Text", "Texte", "Tekst";
     form_type_file => "File", "Fichier", "Fil";
+    form_type_base64file => "Base64 File", "Fichier Base64", "Base64-fil";
+    hdr_base64_prefix => "Base64 Prefix", "Préfixe Base64", "Base64-præfiks";
     content_type_hint => "Content-Type", "Type de contenu", "Content-Type";
     content_type_auto => "Auto (detect from extension)", "Auto (détecter depuis l'extension)", "Auto (registrer fra filtype)";
     content_type_auto_placeholder => "Auto", "Auto", "Auto";

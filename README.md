@@ -63,24 +63,28 @@ cargo build --release
   keeping invalid text open for correction rather than discarding it.
 - **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
   add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
-  `Text` — press `Enter` to open it and pick `File` instead, Value, a
-  separate Content-Type column, and a free-text Description column — Kind
-  comes before Value so filling a row naturally picks `Text`/`File` before
-  typing the value) and cookies (checkbox, Key, Value), using the same
-  table and tabbing conventions as `[Headers]`. Saving picks the correct Hurl
-  section automatically — all-Text fields become `[Form]`, and any File
-  field promotes the section to `[Multipart]`. File fields are colored to
-  show whether the referenced path exists and is readable — relative paths
-  resolve against the collection's own directory, matching where Hurl
-  actually looks for them when sending the request. With focus on a
-  `File`-kind Value cell, `Ctrl+F` (or `Enter`) opens a file picker to
-  choose the path instead of typing it (without stealing focus to the
-  Content-Type column afterwards); the Content-Type cell is a dropdown
-  offering "Auto" plus the fixed MIME types from
+  `Text` — press `Enter` to open it and pick `File` or `Base64 File` instead,
+  Value, a separate Content-Type column, a Base64 Prefix column, and a
+  free-text Description column — Kind comes before Value so filling a row
+  naturally picks the type before typing the value) and cookies (checkbox,
+  Key, Value), using the same table and tabbing conventions as `[Headers]`.
+  Saving picks the correct Hurl section automatically — all-Text fields become
+  `[Form]`, and any File field promotes the section to `[Multipart]`. File
+  fields are colored to show whether the referenced path exists and is
+  readable — relative paths resolve against the collection's own directory,
+  matching where Hurl actually looks for them when sending the request. With
+  focus on a `File`- or `Base64 File`-kind Value cell, `Ctrl+F` (or `Enter`)
+  opens a file picker to choose the path instead of typing it (without
+  stealing focus to the Content-Type column afterwards); the Content-Type cell
+  is a dropdown offering "Auto" plus the fixed MIME types from
   [hurl.dev](https://hurl.dev/docs/request.html) (still editable as free
   text for anything else), and is auto-set from the picked file's
   extension. An empty/auto-detected Content-Type cell shows a dimmed
-  "Auto" placeholder rather than looking blank. Editing a request into an
+  "Auto" placeholder rather than looking blank. A **`Base64 File`** field is
+  sent as plain text: its picked file is base64-encoded (unwrapped) at send
+  time and the field value becomes `<Base64 Prefix><base64>`, so a prefix like
+  `data:image/png;base64,` produces a ready-to-use data URI. The Base64 Prefix
+  column only affects `Base64 File` rows. Editing a request into an
   impossible Body + Form/Multipart combination shows a clear status-bar
   error instead of sending it.
 - **Headers, Cookies, Form, Asserts, and Captures all start empty** — just
@@ -452,7 +456,7 @@ up-to-date list. Highlights:
 | `Ctrl+D` (on a Header/Cookie/Form/Assert/Capture row) | Delete that row |
 | `Ctrl+E` (on a Header/Cookie/Form row) | Toggle that row's enabled/disabled state and focus its checkbox |
 | `←` (from a row's Key cell) | Reach the Enabled checkbox — it's the leftmost visual column, so arrowing left from Key goes straight to it |
-| `Ctrl+F`, `Enter` (on a `File`-kind Form Value cell) | Open a file picker to choose the path |
+| `Ctrl+F`, `Enter` (on a `File`- or `Base64 File`-kind Form Value cell) | Open a file picker to choose the path |
 | `F2`, `Ctrl+Enter` | Save the open editor / wizard |
 | `Esc` | Cancel |
 | `q`, `Ctrl+C` | Quit |

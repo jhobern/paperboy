@@ -8711,6 +8711,8 @@ fn content_type_and_description_are_independent_form_columns() {
     }
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
+    press(&mut app, KeyCode::Right); // -> Prefix (inert on a File row)
+    assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Prefix));
     press(&mut app, KeyCode::Right); // -> Desc, independent from Ctype
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Desc));
     for ch in "a note".chars() {
@@ -9176,6 +9178,7 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
         value: "bar".to_string(),
         kind: crate::hurl::FormFieldKind::Text,
         content_type: None,
+        base64_prefix: None,
     });
 
     let mut app = TuiApp::default();

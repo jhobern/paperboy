@@ -11,6 +11,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **"Base64 File" form field type** — the Form section's `Type` dropdown gains
+  a "Base64 File" option alongside Text and File. Like a File field its `Value`
+  cell opens a file picker (`Enter`/`Ctrl+F`), but at send time the field is
+  transmitted as plain **Text** whose value is the file's base64 encoding
+  (unwrapped, single line). A new "Base64 Prefix" column lets you prepend a
+  string to that encoding — e.g. a `data:image/png;base64,` prefix — so the
+  request value becomes `<prefix><base64>`. Saved collections round-trip the
+  file reference and prefix so the field reloads as a Base64 File.
 - **Custom themes** — Settings → Theme opens a theme editor. The three
   built-in per-language looks are now named, non-deletable presets (Britannia,
   Parisian Purple, Dannebrog) you can pick from a list. `Ctrl+N` opens a popup

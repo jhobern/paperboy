@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use hurl::util::path::ContextDir;
 
 use super::entry::{FormFieldKind, HurlEntry};
@@ -102,6 +103,58 @@ pub fn stage_out_of_scope_form_files(
     Ok(Some(stage_dir))
 }
 
+/// Expands every `Base64File` form field in `entries` into a plain `Text`
+/// field, in place, so an actual request never sees PaperBoy's
+/// PaperBoy-specific `Base64File` kind (Hurl has no equivalent). For each
+/// such field the referenced file is read, base64-encoded (standard alphabet,
+/// no line breaks — the `base64` crate never wraps), and the field's value is
+/// set to `base64_prefix` followed by that encoding; its kind becomes `Text`
+/// and its `base64_prefix`/`content_type` are cleared. A field whose path is
+/// empty encodes to just its prefix (nothing to read). Paths resolve the same
+/// way file staging resolves them: absolute as-is, relative against
+/// `file_root` (or the process's current directory when none is given).
+///
+/// Reading is done by PaperBoy itself, not Hurl, so — unlike `File` fields —
+/// there's no sandbox to satisfy and out-of-scope files work everywhere.
+/// Call this *before* [`stage_out_of_scope_form_files`] so staging only ever
+/// sees the resulting `Text`/`File` fields. Returns `Err` (leaving already
+/// expanded fields expanded) if a referenced file can't be read, so the
+/// caller can surface a clear error instead of sending a half-formed request.
+pub fn expand_base64_form_fields(
+    entries: &mut [HurlEntry],
+    file_root: Option<&Path>,
+) -> io::Result<()> {
+    let current_dir = std::env::current_dir().unwrap_or_default();
+    let root = file_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_dir.clone());
+
+    for entry in entries.iter_mut() {
+        for f in entry.form_fields.iter_mut() {
+            if f.kind != FormFieldKind::Base64File {
+                continue;
+            }
+            let prefix = f.base64_prefix.clone().unwrap_or_default();
+            let raw = f.value.trim();
+            let encoded = if raw.is_empty() {
+                String::new()
+            } else {
+                let source = if Path::new(raw).is_absolute() {
+                    PathBuf::from(raw)
+                } else {
+                    root.join(raw)
+                };
+                STANDARD.encode(std::fs::read(&source)?)
+            };
+            f.value = format!("{prefix}{encoded}");
+            f.kind = FormFieldKind::Text;
+            f.base64_prefix = None;
+            f.content_type = None;
+        }
+    }
+    Ok(())
+}
+
 /// Returns `base` unchanged the first time it's seen; on every subsequent
 /// collision, inserts a `_N` counter before the extension (or at the end,
 /// if there isn't one) so two different source files that happen to share
@@ -131,6 +184,7 @@ mod tests {
             value: value.to_string(),
             kind: FormFieldKind::File,
             content_type: None,
+            base64_prefix: None,
         }
     }
 
@@ -357,6 +411,7 @@ mod tests {
             value: "/completely/unrelated/path".to_string(),
             kind: FormFieldKind::Text,
             content_type: None,
+            base64_prefix: None,
         }])];
         let result = stage_out_of_scope_form_files(&mut entries, Some(&collection_dir)).unwrap();
         assert!(
@@ -365,5 +420,63 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&collection_dir).ok();
+    }
+
+    #[test]
+    fn expands_a_base64_file_field_into_prefixed_base64_text() {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_b64_expand_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bytes chosen so their base64 is well known: "hi" -> "aGk=".
+        std::fs::write(dir.join("blob.bin"), b"hi").unwrap();
+
+        let mut entries = vec![entry_with_form(vec![FormField {
+            key: "avatar".to_string(),
+            value: "blob.bin".to_string(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: Some("data:x;base64,".to_string()),
+        }])];
+        expand_base64_form_fields(&mut entries, Some(&dir)).unwrap();
+
+        let f = &entries[0].form_fields[0];
+        assert_eq!(f.kind, FormFieldKind::Text, "it becomes a plain Text field");
+        assert_eq!(f.value, "data:x;base64,aGk=", "prefix + unwrapped base64");
+        assert_eq!(f.base64_prefix, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expanding_a_base64_file_with_no_path_yields_just_the_prefix() {
+        let mut entries = vec![entry_with_form(vec![FormField {
+            key: "empty".to_string(),
+            value: String::new(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: Some("pfx-".to_string()),
+        }])];
+        expand_base64_form_fields(&mut entries, None).unwrap();
+        let f = &entries[0].form_fields[0];
+        assert_eq!(f.kind, FormFieldKind::Text);
+        assert_eq!(
+            f.value, "pfx-",
+            "no file to read, so only the prefix remains"
+        );
+    }
+
+    #[test]
+    fn expanding_a_base64_file_with_a_missing_path_is_an_error() {
+        let mut entries = vec![entry_with_form(vec![FormField {
+            key: "gone".to_string(),
+            value: "/no/such/file/here.bin".to_string(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: None,
+        }])];
+        assert!(
+            expand_base64_form_fields(&mut entries, None).is_err(),
+            "an unreadable Base64File must surface as an error, not a silent send"
+        );
     }
 }

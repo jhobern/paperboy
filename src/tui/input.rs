@@ -1423,14 +1423,23 @@ impl TuiApp {
                     }
                     form.focus_next(true);
                 } else if !ctrl && kind_open && matches!(key.code, KeyCode::Up | KeyCode::Down) {
-                    // Only two real options, so either arrow just flips
-                    // between them.
+                    // Step through Text → File → Base64 File (Down) or the
+                    // reverse (Up), clamped at the ends like a small list.
                     if let NewField::FormField(i, FormCol::Kind) = form.focus
                         && let Some(row) = form.form_fields.get_mut(i)
                     {
-                        row.kind = match row.kind {
-                            FormFieldKind::Text => FormFieldKind::File,
-                            FormFieldKind::File => FormFieldKind::Text,
+                        row.kind = if key.code == KeyCode::Down {
+                            match row.kind {
+                                FormFieldKind::Text => FormFieldKind::File,
+                                FormFieldKind::File => FormFieldKind::Base64File,
+                                FormFieldKind::Base64File => FormFieldKind::Base64File,
+                            }
+                        } else {
+                            match row.kind {
+                                FormFieldKind::Base64File => FormFieldKind::File,
+                                FormFieldKind::File => FormFieldKind::Text,
+                                FormFieldKind::Text => FormFieldKind::Text,
+                            }
                         };
                     }
                 } else if kind_open && key.code == KeyCode::Enter {
@@ -1461,19 +1470,26 @@ impl TuiApp {
                 } else if !ctrl
                     && key.code == KeyCode::Enter
                     && let NewField::FormField(i, FormCol::Value) = form.focus
-                    && form.form_fields.get(i).map(|r| r.kind) == Some(FormFieldKind::File)
+                    && matches!(
+                        form.form_fields.get(i).map(|r| r.kind),
+                        Some(FormFieldKind::File | FormFieldKind::Base64File)
+                    )
                 {
-                    // Enter on a `File`-kind Form row's Value cell opens the
-                    // file picker too, not just Ctrl+F — it's the more
-                    // discoverable of the two.
+                    // Enter on a `File`/`Base64File`-kind Form row's Value
+                    // cell opens the file picker too, not just Ctrl+F — it's
+                    // the more discoverable of the two.
                     self.parked_wizard = Some(form);
                     self.open_browser(FileAction::PickFormFile(i));
                     return;
                 } else if ctrl && key.code == KeyCode::Char('f') {
                     // Ctrl+F opens a file picker for the focused Form row's
-                    // Value cell (only meaningful for `File`-kind rows).
+                    // Value cell (only meaningful for `File`/`Base64File`
+                    // rows, which both point at a file).
                     if let NewField::FormField(i, FormCol::Value) = form.focus
-                        && form.form_fields.get(i).map(|r| r.kind) == Some(FormFieldKind::File)
+                        && matches!(
+                            form.form_fields.get(i).map(|r| r.kind),
+                            Some(FormFieldKind::File | FormFieldKind::Base64File)
+                        )
                     {
                         self.parked_wizard = Some(form);
                         self.open_browser(FileAction::PickFormFile(i));
@@ -2943,11 +2959,16 @@ impl TuiApp {
                 } else {
                     None
                 };
+                // The Base64 Prefix cell is only meaningful for Base64File
+                // rows; store it verbatim (it may legitimately be empty).
+                let base64_prefix =
+                    (kind == FormFieldKind::Base64File).then(|| r.base64_prefix.text().to_string());
                 FormField {
                     key: r.key.text().trim().to_string(),
                     value: r.value.text().trim().to_string(),
                     kind,
                     content_type,
+                    base64_prefix,
                 }
             })
             .collect();

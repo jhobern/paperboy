@@ -205,13 +205,16 @@ impl HeaderRow {
 }
 
 /// Which column of a `[Form]`/`[Multipart]` row is focused. Like [`HdrCol`]
-/// but with an extra `Kind` (Text/File type) dropdown column.
+/// but with an extra `Kind` (Text/File/Base64 File type) dropdown column and,
+/// for `Base64File` rows, a `Prefix` column holding the text prepended to the
+/// file's base64 encoding.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum FormCol {
     Key,
     Value,
     Kind,
     Ctype,
+    Prefix,
     Desc,
     Enabled,
 }
@@ -225,6 +228,9 @@ pub(crate) struct FormRow {
     pub(crate) key: Editor,
     pub(crate) value: Editor,
     pub(crate) ctype: Editor,
+    /// Text prepended to the file's base64 encoding for `Base64File` rows
+    /// (e.g. `data:image/png;base64,`); persisted, ignored for other kinds.
+    pub(crate) base64_prefix: Editor,
     pub(crate) desc: Editor,
     pub(crate) enabled: bool,
     /// Defaults to `Text` on a fresh row — with only two real options,
@@ -241,6 +247,7 @@ impl FormRow {
             key: Editor::blank(),
             value: Editor::blank(),
             ctype: Editor::blank(),
+            base64_prefix: Editor::blank(),
             desc: Editor::blank(),
             enabled: true,
             kind: FormFieldKind::Text,
@@ -252,6 +259,7 @@ impl FormRow {
         self.key.text().is_empty()
             && self.value.text().is_empty()
             && self.ctype.text().is_empty()
+            && self.base64_prefix.text().is_empty()
             && self.desc.text().is_empty()
     }
 
@@ -260,6 +268,7 @@ impl FormRow {
             FormCol::Key => Some(&mut self.key),
             FormCol::Value => Some(&mut self.value),
             FormCol::Ctype => Some(&mut self.ctype),
+            FormCol::Prefix => Some(&mut self.base64_prefix),
             FormCol::Desc => Some(&mut self.desc),
             FormCol::Kind | FormCol::Enabled => None,
         }
@@ -486,6 +495,9 @@ pub(crate) struct NewReq {
     /// Set during draw: whether the Form table's Content-Type column
     /// currently has room. Focus navigation skips it when it does not.
     pub(crate) form_ctype_visible: std::cell::Cell<bool>,
+    /// Set during draw: whether the Form table's Base64 Prefix column
+    /// currently has room. Focus navigation skips it when it does not.
+    pub(crate) form_prefix_visible: std::cell::Cell<bool>,
     /// Per-section scroll offset (index of the first visible row), updated at
     /// draw time to keep the focused row in view once a section has more rows
     /// than fit on screen.
@@ -549,6 +561,7 @@ impl NewReq {
             cookie_desc_visible: std::cell::Cell::new(true),
             form_desc_visible: std::cell::Cell::new(true),
             form_ctype_visible: std::cell::Cell::new(true),
+            form_prefix_visible: std::cell::Cell::new(true),
             header_scroll: std::cell::Cell::new(0),
             cookie_scroll: std::cell::Cell::new(0),
             form_scroll: std::cell::Cell::new(0),
@@ -612,6 +625,8 @@ impl NewReq {
                     row.key = Editor::new(&f.key, false);
                     row.value = Editor::new(&f.value, false);
                     row.ctype = Editor::new(f.content_type.as_deref().unwrap_or(""), false);
+                    row.base64_prefix =
+                        Editor::new(f.base64_prefix.as_deref().unwrap_or(""), false);
                     row.kind = f.kind;
                     row
                 })
@@ -662,6 +677,7 @@ impl NewReq {
             cookie_desc_visible: std::cell::Cell::new(true),
             form_desc_visible: std::cell::Cell::new(true),
             form_ctype_visible: std::cell::Cell::new(true),
+            form_prefix_visible: std::cell::Cell::new(true),
             header_scroll: std::cell::Cell::new(0),
             cookie_scroll: std::cell::Cell::new(0),
             form_scroll: std::cell::Cell::new(0),
@@ -1195,6 +1211,9 @@ impl NewReq {
         if self.form_ctype_visible.get() {
             cols.push(FormCol::Ctype);
         }
+        if self.form_prefix_visible.get() {
+            cols.push(FormCol::Prefix);
+        }
         if self.form_desc_visible.get() {
             cols.push(FormCol::Desc);
         }
@@ -1212,6 +1231,9 @@ impl NewReq {
         let mut cols = vec![FormCol::Key, FormCol::Kind, FormCol::Value];
         if self.form_ctype_visible.get() {
             cols.push(FormCol::Ctype);
+        }
+        if self.form_prefix_visible.get() {
+            cols.push(FormCol::Prefix);
         }
         if self.form_desc_visible.get() {
             cols.push(FormCol::Desc);
@@ -1262,8 +1284,9 @@ impl NewReq {
                 FormCol::Kind => 1,
                 FormCol::Value => 2,
                 FormCol::Ctype => 3,
-                FormCol::Desc => 4,
-                FormCol::Enabled => 5,
+                FormCol::Prefix => 4,
+                FormCol::Desc => 5,
+                FormCol::Enabled => 6,
             }
         }
         match f {
@@ -1441,7 +1464,7 @@ impl NewReq {
             }
             NewField::FormField(_, col) => matches!(
                 col,
-                FormCol::Key | FormCol::Value | FormCol::Ctype | FormCol::Desc
+                FormCol::Key | FormCol::Value | FormCol::Ctype | FormCol::Prefix | FormCol::Desc
             ),
             NewField::Method
             | NewField::Target
@@ -1538,10 +1561,14 @@ pub(crate) fn draw_new_request(
     } else {
         hint_str.replace(&format!("{}/F2", s.ctrl_enter_key), "F2")
     };
-    // Contextual addition: only shown while a `File`-kind Form row's Value
-    // cell is focused, so the always-visible hint bar stays short otherwise.
+    // Contextual addition: only shown while a `File`- or `Base64 File`-kind
+    // Form row's Value cell is focused (both pick a file), so the
+    // always-visible hint bar stays short otherwise.
     if let NewField::FormField(i, FormCol::Value) = form.focus
-        && form.form_fields.get(i).map(|r| r.kind) == Some(FormFieldKind::File)
+        && matches!(
+            form.form_fields.get(i).map(|r| r.kind),
+            Some(FormFieldKind::File | FormFieldKind::Base64File)
+        )
     {
         hint = format!("{hint} · {}", s.hint_pick_file);
     }
@@ -1934,10 +1961,11 @@ pub(crate) fn draw_kind_dropdown(f: &mut Frame, form: &NewReq, s: &Strings, th: 
         return;
     };
     let fr = f.area();
-    let options = [s.form_type_text, s.form_type_file];
+    let options = [s.form_type_text, s.form_type_file, s.form_type_base64file];
     let selected = Some(match row.kind {
         FormFieldKind::Text => 0,
         FormFieldKind::File => 1,
+        FormFieldKind::Base64File => 2,
     });
 
     let content_w = options.iter().map(|o| o.len()).max().unwrap_or(0) as u16;
@@ -2481,37 +2509,45 @@ pub(crate) fn draw_cookie_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
 }
 
 /// Column widths for the Form/Multipart table: `(enabled, key, value, kind,
-/// ctype, desc)`. Description is the first to be dropped as width shrinks,
-/// then Content-Type, then the Kind dropdown cell (fixed
-/// `"File \u{25be}"`-width) itself.
-pub(crate) fn form_widths(total: u16) -> (u16, u16, u16, u16, u16, u16) {
+/// ctype, prefix, desc)`. Description is the first to be dropped as width
+/// shrinks, then Base64 Prefix, then Content-Type, then the Kind dropdown
+/// cell (fixed `"File \u{25be}"`-width) itself.
+pub(crate) fn form_widths(total: u16) -> (u16, u16, u16, u16, u16, u16, u16) {
     let en = ENABLED_W;
     let kind_w = 8u16;
     let ctype_w = 18u16;
+    let prefix_w = 16u16;
     let key = 14u16;
     let value = 20u16;
-    if total >= en + kind_w + ctype_w + key + value + 6 + 5 {
-        let desc = total - en - kind_w - ctype_w - key - value - 5;
-        (en, key, value, kind_w, ctype_w, desc)
+    // Widest layout: every column including Prefix and Desc.
+    if total >= en + kind_w + ctype_w + prefix_w + key + value + 6 + 6 {
+        let desc = total - en - kind_w - ctype_w - prefix_w - key - value - 6;
+        (en, key, value, kind_w, ctype_w, prefix_w, desc)
+    } else if total >= en + kind_w + ctype_w + prefix_w + key + value + 5 {
+        // Room for Prefix + Ctype but not Desc.
+        (en, key, value, kind_w, ctype_w, prefix_w, 0)
     } else if total >= en + kind_w + ctype_w + key + value + 4 {
-        (en, key, value, kind_w, ctype_w, 0)
+        // Room for Ctype but neither Prefix nor Desc.
+        (en, key, value, kind_w, ctype_w, 0, 0)
     } else if total >= en + kind_w + 4 + 3 {
         let rest = total - en - kind_w - 3;
         let key = (rest / 2).max(1);
-        (en, key, rest.saturating_sub(key).max(1), kind_w, 0, 0)
+        (en, key, rest.saturating_sub(key).max(1), kind_w, 0, 0, 0)
     } else {
         // Extremely narrow: drop Kind too, minimal Key/Value only.
         let rest = total.saturating_sub(en + 2).max(2);
         let key = (rest / 2).max(1);
-        (en, key, rest.saturating_sub(key).max(1), 0, 0, 0)
+        (en, key, rest.saturating_sub(key).max(1), 0, 0, 0, 0)
     }
 }
 
-/// Split one Form table row into cell rectangles; Kind/Ctype/Desc columns
-/// are omitted entirely when their width is 0 (mirrors `header_cell_rects`).
-/// Column order: Enabled, Key, Kind (if shown), Value, Ctype (if shown),
-/// Desc (if shown) — Kind sits before Value so filling a row top-to-bottom
-/// naturally chooses Text/File before typing the value.
+/// Split one Form table row into cell rectangles; Kind/Ctype/Prefix/Desc
+/// columns are omitted entirely when their width is 0 (mirrors
+/// `header_cell_rects`). Column order: Enabled, Key, Kind (if shown), Value,
+/// Ctype (if shown), Prefix (if shown), Desc (if shown) — Kind sits before
+/// Value so filling a row top-to-bottom naturally chooses the type before
+/// typing the value.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn form_cell_rects(
     area: Rect,
     en: u16,
@@ -2519,6 +2555,7 @@ pub(crate) fn form_cell_rects(
     vw: u16,
     kindw: u16,
     ctypew: u16,
+    prefixw: u16,
     dw: u16,
 ) -> Vec<Rect> {
     let mut cons = vec![Constraint::Length(en), Constraint::Length(kw)];
@@ -2528,6 +2565,9 @@ pub(crate) fn form_cell_rects(
     cons.push(Constraint::Length(vw));
     if ctypew > 0 {
         cons.push(Constraint::Length(ctypew));
+    }
+    if prefixw > 0 {
+        cons.push(Constraint::Length(prefixw));
     }
     if dw > 0 {
         cons.push(Constraint::Length(dw));
@@ -2540,7 +2580,7 @@ pub(crate) fn form_cell_rects(
 /// directory when unset) to an existing file, `th.err` otherwise. Text
 /// fields and empty paths use the normal text colour.
 fn form_value_color(row: &FormRow, file_root: Option<&PathBuf>, th: &Theme) -> Color {
-    if row.kind != FormFieldKind::File {
+    if !matches!(row.kind, FormFieldKind::File | FormFieldKind::Base64File) {
         return th.text;
     }
     let text = row.value.text();
@@ -2585,9 +2625,10 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         return;
     };
 
-    let (en, kw, vw, kindw, ctypew, dw) = form_widths(table_area.width);
+    let (en, kw, vw, kindw, ctypew, prefixw, dw) = form_widths(table_area.width);
     form.form_desc_visible.set(dw > 0);
     form.form_ctype_visible.set(ctypew > 0);
+    form.form_prefix_visible.set(prefixw > 0);
 
     let lbl = |t: &str| {
         Paragraph::new(Span::styled(
@@ -2596,13 +2637,22 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         ))
     };
     // Column order: [0]=Enabled, [1]=Key, [kind_idx]=Kind (if shown),
-    // [value_idx]=Value, [ctype_idx]=Ctype (if shown), [desc_idx]=Desc (if shown).
+    // [value_idx]=Value, [ctype_idx]=Ctype (if shown), [prefix_idx]=Prefix
+    // (if shown), [desc_idx]=Desc (if shown).
     let value_idx = if kindw > 0 { 3 } else { 2 };
-    let ctype_idx = value_idx + 1;
-    let desc_idx = ctype_idx + if ctypew > 0 { 1 } else { 0 };
+    let mut next = value_idx + 1;
+    let ctype_idx = next;
+    if ctypew > 0 {
+        next += 1;
+    }
+    let prefix_idx = next;
+    if prefixw > 0 {
+        next += 1;
+    }
+    let desc_idx = next;
 
     if let Some(hrect) = header_rect {
-        let hcells = form_cell_rects(hrect, en, kw, vw, kindw, ctypew, dw);
+        let hcells = form_cell_rects(hrect, en, kw, vw, kindw, ctypew, prefixw, dw);
         f.render_widget(lbl("\u{2713}"), hcells[0]);
         f.render_widget(lbl(s.hdr_key), hcells[1]);
         if kindw > 0 {
@@ -2612,6 +2662,9 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         if ctypew > 0 {
             f.render_widget(lbl(s.content_type_hint), hcells[ctype_idx]);
         }
+        if prefixw > 0 {
+            f.render_widget(lbl(s.hdr_base64_prefix), hcells[prefix_idx]);
+        }
         if dw > 0 {
             f.render_widget(lbl(s.hdr_description), hcells[desc_idx]);
         }
@@ -2620,7 +2673,7 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
     for (slot, row_area) in data_rects.iter().enumerate() {
         let i = start + slot;
         let row = &form.form_fields[i];
-        let cells = form_cell_rects(*row_area, en, kw, vw, kindw, ctypew, dw);
+        let cells = form_cell_rects(*row_area, en, kw, vw, kindw, ctypew, prefixw, dw);
         draw_checkbox_cell(
             f,
             cells[0],
@@ -2641,6 +2694,7 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             let label = match row.kind {
                 FormFieldKind::Text => s.form_type_text,
                 FormFieldKind::File => s.form_type_file,
+                FormFieldKind::Base64File => s.form_type_base64file,
             };
             // A dropdown indicator (▾), not cycle arrows: Left/Right now hop
             // to the neighbouring column instead of changing the value.
@@ -2659,18 +2713,18 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         }
 
         let value_focused = form.focus == NewField::FormField(i, FormCol::Value);
-        // Show a folder icon at the left edge of a File-kind row's Value
-        // cell — visually anchoring it to the Value field it belongs to —
-        // as a hint that pressing Enter (or Ctrl+F) opens a file picker,
-        // not otherwise obvious since the cell looks like plain text entry.
-        let (file_icon_rect, text_rect) =
-            if row.kind == FormFieldKind::File && cells[value_idx].width > 2 {
-                let split = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)])
-                    .split(cells[value_idx]);
-                (Some(split[0]), split[1])
-            } else {
-                (None, cells[value_idx])
-            };
+        // Show a folder icon at the left edge of a File/Base64File-kind row's
+        // Value cell — both pick a file — anchoring it to the Value field, as
+        // a hint that pressing Enter (or Ctrl+F) opens a file picker, not
+        // otherwise obvious since the cell looks like plain text entry.
+        let value_is_file = matches!(row.kind, FormFieldKind::File | FormFieldKind::Base64File);
+        let (file_icon_rect, text_rect) = if value_is_file && cells[value_idx].width > 2 {
+            let split = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)])
+                .split(cells[value_idx]);
+            (Some(split[0]), split[1])
+        } else {
+            (None, cells[value_idx])
+        };
         if value_focused {
             render_editor(f, text_rect, &row.value, false, th);
         } else {
@@ -2704,11 +2758,33 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
                     )),
                     cells[ctype_idx],
                 );
+            } else if row.kind == FormFieldKind::Base64File {
+                // Content-Type doesn't apply to a Base64File (it's sent as
+                // plain text): leave the cell blank rather than editable.
             } else {
                 draw_header_cell(f, cells[ctype_idx], &row.ctype, ctype_focused, th);
             }
             if ctype_focused && row.kind == FormFieldKind::File {
                 form.ctype_cell_rect.set(Some(cells[ctype_idx]));
+            }
+        }
+
+        if prefixw > 0 {
+            let prefix_focused = form.focus == NewField::FormField(i, FormCol::Prefix);
+            // The Base64 Prefix only affects Base64File rows; on other kinds
+            // it's an inert cell (still editable, but ignored on save). Show a
+            // dimmed placeholder for an empty, unfocused non-Base64File cell
+            // so the column reads as inactive there, otherwise the editor.
+            if row.kind != FormFieldKind::Base64File
+                && !prefix_focused
+                && row.base64_prefix.text().is_empty()
+            {
+                f.render_widget(
+                    Paragraph::new(Span::styled("\u{2014}", Style::default().fg(th.dim))),
+                    cells[prefix_idx],
+                );
+            } else {
+                draw_header_cell(f, cells[prefix_idx], &row.base64_prefix, prefix_focused, th);
             }
         }
 

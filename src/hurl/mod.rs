@@ -15,4 +15,4 @@ pub use entry::{
 };
 pub use parser::parse_hurl;
 pub use run::{AssertOutcome, EntryOutcome, run_hurl, run_hurl_streaming};
-pub use stage::stage_out_of_scope_form_files;
+pub use stage::{expand_base64_form_fields, stage_out_of_scope_form_files};

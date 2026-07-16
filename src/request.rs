@@ -15,7 +15,8 @@ use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
 use crate::http::ApiResponse;
 use crate::hurl::{
-    FormField, HurlEntry, collection_to_hurl, run_hurl, stage_out_of_scope_form_files,
+    FormField, HurlEntry, collection_to_hurl, expand_base64_form_fields, run_hurl,
+    stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -205,15 +206,17 @@ enum FormKind {
     #[default]
     Text,
     File,
+    #[serde(rename = "base64file")]
+    Base64File,
 }
 
 impl<'de> serde::Deserialize<'de> for FormKind {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = Value::deserialize(d)?;
-        Ok(if v.as_str() == Some("file") {
-            FormKind::File
-        } else {
-            FormKind::Text
+        Ok(match v.as_str() {
+            Some("file") => FormKind::File,
+            Some("base64file") => FormKind::Base64File,
+            _ => FormKind::Text,
         })
     }
 }
@@ -221,6 +224,8 @@ impl<'de> serde::Deserialize<'de> for FormKind {
 /// One `form_fields` entry (fields alphabetical, matching [`RequestJson`]).
 #[derive(Serialize, Deserialize)]
 struct FormFieldJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base64_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
     #[serde(default)]
@@ -234,10 +239,12 @@ struct FormFieldJson {
 impl From<&FormField> for FormFieldJson {
     fn from(f: &FormField) -> Self {
         Self {
+            base64_prefix: f.base64_prefix.clone(),
             content_type: f.content_type.clone(),
             key: TextValue(f.key.clone()),
             kind: match f.kind {
                 crate::hurl::FormFieldKind::File => FormKind::File,
+                crate::hurl::FormFieldKind::Base64File => FormKind::Base64File,
                 crate::hurl::FormFieldKind::Text => FormKind::Text,
             },
             value: TextValue(f.value.clone()),
@@ -252,9 +259,11 @@ impl From<FormFieldJson> for FormField {
             value: f.value.0,
             kind: match f.kind {
                 FormKind::File => crate::hurl::FormFieldKind::File,
+                FormKind::Base64File => crate::hurl::FormFieldKind::Base64File,
                 FormKind::Text => crate::hurl::FormFieldKind::Text,
             },
             content_type: f.content_type,
+            base64_prefix: f.base64_prefix,
         }
     }
 }
@@ -408,6 +417,7 @@ pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<Re
             value: substitute(&f.value, &vars),
             kind: f.kind,
             content_type: f.content_type.as_deref().map(|ct| substitute(ct, &vars)),
+            base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, &vars)),
         })
         .collect();
     let body = entry.body.as_deref().map(|b| substitute(b, &vars));
@@ -530,11 +540,19 @@ pub fn run_collection(
         // scope. Falls back to running unstaged on any I/O error so Hurl's
         // own error (e.g. "no such file") still surfaces normally.
         let mut entries = [run_entry.clone()];
+        // Turn any Base64File field into the plain Text field it's actually
+        // sent as (prefix + the file's base64), before staging: staging then
+        // only sees real File fields. A read failure surfaces as an error
+        // rather than silently sending a half-formed request.
+        if let Err(e) = expand_base64_form_fields(&mut entries, file_root.as_deref()) {
+            let mut r = state.lock().unwrap();
+            r.loading = false;
+            r.error = format!("Base64 file error: {e}");
+            return;
+        }
         let staged_dir =
             stage_out_of_scope_form_files(&mut entries, file_root.as_deref()).unwrap_or_default();
-        if staged_dir.is_some() {
-            run_entry = entries[0].clone();
-        }
+        run_entry = entries[0].clone();
         let run_root = staged_dir.as_deref().or(file_root.as_deref());
         let content = run_entry.to_hurl();
 
@@ -595,7 +613,6 @@ pub fn run_all_entries(
         r.error = format!("{} ({})", BODY_FORM_CONFLICT_ERROR, bad.title);
         return None;
     }
-    let content = collection_to_hurl(&col.entries);
     let vars = collection_vars(env, &col.captures);
     let col_id = col.id;
     let file_root = col
@@ -609,16 +626,20 @@ pub fn run_all_entries(
     thread::spawn(move || {
         // See the matching comment in `run_collection`: bring any
         // out-of-scope `[Form]`/`[Multipart]` files into a temp directory
-        // alongside file_root first, re-serializing only if staging
-        // actually happened (the common case is a no-op).
+        // alongside file_root first. `collection_to_hurl` is (re)computed
+        // after expansion + staging so it reflects both.
+        // See `run_collection`: expand Base64File fields to their sent Text
+        // form before staging, surfacing a read failure as an error.
+        if let Err(e) = expand_base64_form_fields(&mut run_entries, file_root.as_deref()) {
+            let mut r = state.lock().unwrap();
+            r.loading = false;
+            r.error = format!("Base64 file error: {e}");
+            return;
+        }
         let staged_dir = stage_out_of_scope_form_files(&mut run_entries, file_root.as_deref())
             .unwrap_or_default();
         let run_root = staged_dir.as_deref().or(file_root.as_deref());
-        let content = if staged_dir.is_some() {
-            collection_to_hurl(&run_entries)
-        } else {
-            content
-        };
+        let content = collection_to_hurl(&run_entries);
 
         let out = run_hurl(&content, &vars, run_root);
         if let Some(dir) = &staged_dir {
@@ -860,12 +881,14 @@ mod tests {
                     value: "widget".into(),
                     kind: FormFieldKind::Text,
                     content_type: None,
+                    base64_prefix: None,
                 },
                 FormField {
                     key: "file".into(),
                     value: "./a.bin".into(),
                     kind: FormFieldKind::File,
                     content_type: Some("application/octet-stream".into()),
+                    base64_prefix: None,
                 },
             ],
             body: Some(r#"{"a":1}"#.into()),

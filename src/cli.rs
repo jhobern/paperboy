@@ -12,7 +12,10 @@ use std::io::IsTerminal;
 use ratatui::crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
-use crate::hurl::{EntryOutcome, collection_to_hurl, run_hurl, run_hurl_streaming};
+use crate::hurl::{
+    EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, run_hurl,
+    run_hurl_streaming,
+};
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::shared_utils::stem;
 
@@ -40,7 +43,24 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
         eprintln!("warning: no requests found in '{collection_path}'");
         return 0;
     }
-    let run_content = if looks_like_postman(&col_content) {
+    // A Base64File field is a PaperBoy concept Hurl can't run directly: expand
+    // each into the plain `key: prefix+base64` text it's actually sent as
+    // (resolving files against the collection's directory) and always run from
+    // the re-serialized text so the on-disk marker never reaches the server.
+    let has_base64 = entries.iter().any(|e| {
+        e.form_fields
+            .iter()
+            .any(|f| f.kind == FormFieldKind::Base64File)
+    });
+    let mut entries = entries;
+    if has_base64 {
+        let root = std::path::Path::new(&collection_path).parent();
+        if let Err(e) = expand_base64_form_fields(&mut entries, root) {
+            eprintln!("error: cannot read a Base64 File form field: {e}");
+            return 1;
+        }
+    }
+    let run_content = if looks_like_postman(&col_content) || has_base64 {
         collection_to_hurl(&entries)
     } else {
         col_content

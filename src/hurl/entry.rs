@@ -2,26 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Whether a `[Form]`/`[Multipart]` field is a plain text value or a file
-/// upload. A `Text`-only set of fields serializes as `[Form]`; the presence of
-/// any `File` field switches the whole section to `[Multipart]`, matching Hurl
-/// semantics (see https://hurl.dev/docs/request.html).
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+/// Whether a `[Form]`/`[Multipart]` field is a plain text value, a file
+/// upload, or a file whose base64 encoding is sent inline as text. A
+/// `Text`-only set of fields serializes as `[Form]`; the presence of any
+/// `File` field switches the whole section to `[Multipart]`, matching Hurl
+/// semantics (see https://hurl.dev/docs/request.html). `Base64File` is a
+/// PaperBoy-specific kind: the user picks a file (like `File`), but at send
+/// time it is transmitted as a plain text field whose value is
+/// `base64_prefix` followed by the file's base64 encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FormFieldKind {
     #[default]
     Text,
     File,
+    Base64File,
 }
+
+/// Marker stored in a `Base64File` field's Hurl content-type slot so a saved
+/// `.hurl` round-trips back into a `Base64File` (Hurl has no native concept
+/// of "encode this file as base64 text"). The base64_prefix follows the
+/// marker, URL-safe-base64 encoded so it is a valid Hurl content-type token.
+pub(crate) const BASE64_FILE_CT_MARKER: &str = "x-paperboy-base64;";
 
 /// One row of a `[Form]`/`[Multipart]` section. `content_type` is only
 /// meaningful for `File` fields: when `None`, Hurl infers the content type
 /// from the file extension (defaulting to `application/octet-stream`).
+/// `base64_prefix` is only meaningful for `Base64File` fields: it is
+/// prepended to the file's base64 encoding at send time.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FormField {
     pub key: String,
     pub value: String,
     pub kind: FormFieldKind,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub base64_prefix: Option<String>,
 }
 
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
@@ -192,11 +209,13 @@ impl HurlEntry {
         }
         if !self.form_fields.is_empty() {
             // Any File field switches the whole section to `[Multipart]`
-            // (Hurl's `[Form]` section is text-only); otherwise `[Form]`.
+            // (Hurl's `[Form]` section is text-only); a Base64File also
+            // serializes as a `file,...` line (carrying its marker), so it
+            // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
             let multipart = self
                 .form_fields
                 .iter()
-                .any(|f| f.kind == FormFieldKind::File);
+                .any(|f| matches!(f.kind, FormFieldKind::File | FormFieldKind::Base64File));
             out.push_str(if multipart {
                 "[Multipart]\n"
             } else {
@@ -213,6 +232,22 @@ impl HurlEntry {
                             }
                             _ => out.push_str(&format!("{}: file,{};\n", f.key, path)),
                         }
+                    }
+                    // A Base64File is transformed into a plain Text field
+                    // before an actual request runs (see
+                    // `expand_base64_form_fields`); this branch only runs when
+                    // serializing for *saving* to disk. Encode it as a file
+                    // line whose content-type carries a PaperBoy marker plus
+                    // the URL-safe-base64 encoded prefix, so parsing restores
+                    // the Base64File kind and its prefix.
+                    FormFieldKind::Base64File => {
+                        let path = escape_form_file_path(&f.value);
+                        let encoded_prefix = URL_SAFE_NO_PAD
+                            .encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
+                        out.push_str(&format!(
+                            "{}: file,{}; {}{}\n",
+                            f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
+                        ));
                     }
                 }
             }
