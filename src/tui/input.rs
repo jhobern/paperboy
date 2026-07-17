@@ -3585,14 +3585,41 @@ impl TuiApp {
                 NewField::FormField(i, col) => match key.code {
                     KeyCode::Up => {
                         form.focus = if i > 0 {
-                            NewField::FormField(i - 1, col)
+                            let mut target_col = col;
+
+                            // If the target field is one that the new row doesn't have then
+                            // set focus to a field it does have
+                            if form.form_fields[i - 1].kind == FormFieldKind::Base64File
+                                && col == FormCol::Ctype
+                            {
+                                target_col = FormCol::Prefix;
+                            } else if form.form_fields[i - 1].kind != FormFieldKind::Base64File
+                                && col == FormCol::Prefix
+                            {
+                                target_col = FormCol::Ctype;
+                            }
+
+                            NewField::FormField(i - 1, target_col)
                         } else {
                             form.up_into_cookies()
                         };
                     }
                     KeyCode::Down => {
                         form.focus = if i + 1 < form.form_fields.len() {
-                            NewField::FormField(i + 1, col)
+                            let mut target_col = col;
+
+                            // If the target field is one that the new row doesn't have then
+                            // set focus to a field it does have
+                            if form.form_fields[i + 1].kind == FormFieldKind::Base64File
+                                && col == FormCol::Ctype
+                            {
+                                target_col = FormCol::Prefix;
+                            } else if form.form_fields[i + 1].kind != FormFieldKind::Base64File
+                                && col == FormCol::Prefix
+                            {
+                                target_col = FormCol::Ctype;
+                            }
+                            NewField::FormField(i + 1, target_col)
                         } else {
                             NewField::AddFormField
                         };
@@ -3615,6 +3642,20 @@ impl TuiApp {
                                 ed.end();
                             }
                             form.focus = NewField::FormField(i, prev);
+
+                            // If this was one of the fields that is not relevant to this file type then
+                            // we need to skip over it again
+                            if ((form.form_fields[i].kind == FormFieldKind::Base64File
+                                && prev == FormCol::Ctype)
+                                || (form.form_fields[i].kind != FormFieldKind::Base64File
+                                    && prev == FormCol::Prefix))
+                                && let Some(prev) = form.prev_form_col(prev)
+                            {
+                                if let Some(ed) = form.form_fields[i].cell_mut(prev) {
+                                    ed.end();
+                                }
+                                form.focus = NewField::FormField(i, prev);
+                            }
                         }
                     }
                     KeyCode::Right => {
@@ -3635,6 +3676,20 @@ impl TuiApp {
                                 ed.home();
                             }
                             form.focus = NewField::FormField(i, next);
+
+                            // If this was one of the fields that is not relevant to this file type then
+                            // we need to skip over it again
+                            if ((form.form_fields[i].kind == FormFieldKind::Base64File
+                                && next == FormCol::Ctype)
+                                || (form.form_fields[i].kind != FormFieldKind::Base64File
+                                    && next == FormCol::Prefix))
+                                && let Some(next) = form.next_form_col(next)
+                            {
+                                if let Some(ed) = form.form_fields[i].cell_mut(next) {
+                                    ed.end();
+                                }
+                                form.focus = NewField::FormField(i, next);
+                            }
                         }
                     }
                     KeyCode::Enter => form.focus_next(true),
