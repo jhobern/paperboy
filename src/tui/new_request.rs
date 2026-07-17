@@ -1260,12 +1260,21 @@ impl NewReq {
         cells.get(idx + 1).copied()
     }
 
-    pub(crate) fn focus_next(&mut self, forward: bool) {
+    pub(crate) fn focus_next(&mut self, forward: bool, wrap: bool) {
         self.focus = if forward {
-            self.next_forward()
+            self.next_forward(wrap)
         } else {
-            self.next_backward()
+            self.next_backward(wrap)
         };
+
+        // If we landed on a field that isn't active for the form kind then
+        // we just need to keep walking
+        if let NewField::FormField(i, c) = self.focus
+            && ((c == FormCol::Prefix && self.form_fields[i].kind != FormFieldKind::Base64File)
+                || (c == FormCol::Ctype && self.form_fields[i].kind == FormFieldKind::Base64File))
+        {
+            self.focus_next(forward, wrap);
+        }
     }
 
     /// A total ordering over every focusable field, used to walk the Tab
@@ -1375,10 +1384,12 @@ impl NewReq {
     /// the ends. Works even when `self.focus` isn't itself a stop (e.g. an
     /// `Enabled` checkbox reached with the arrow keys): its ordering key
     /// still places it between the appropriate stops.
-    fn step(&self, forward: bool) -> NewField {
+    fn step(&self, forward: bool, wrap: bool) -> NewField {
+        let original_field = self.focus;
         let stops = self.tab_stops();
-        let here = Self::field_key(self.focus);
-        if forward {
+        let here = Self::field_key(original_field);
+
+        let new_field = if forward {
             stops
                 .iter()
                 .copied()
@@ -1391,15 +1402,21 @@ impl NewReq {
                 .copied()
                 .find(|&s| Self::field_key(s) < here)
                 .unwrap_or(stops[stops.len() - 1])
+        };
+
+        if !wrap && std::mem::discriminant(&original_field) != std::mem::discriminant(&new_field) {
+            original_field
+        } else {
+            new_field
         }
     }
 
-    pub(crate) fn next_forward(&self) -> NewField {
-        self.step(true)
+    pub(crate) fn next_forward(&self, wrap: bool) -> NewField {
+        self.step(true, wrap)
     }
 
-    pub(crate) fn next_backward(&self) -> NewField {
-        self.step(false)
+    pub(crate) fn next_backward(&self, wrap: bool) -> NewField {
+        self.step(false, wrap)
     }
 
     /// Ctrl+Down: jump straight to the first field of the next section
@@ -1410,7 +1427,7 @@ impl NewReq {
     pub(crate) fn jump_forward(&self) -> NewField {
         match self.focus {
             NewField::Name | NewField::Target | NewField::Method | NewField::Url => {
-                self.next_forward()
+                self.next_forward(true)
             }
             NewField::Header(..) | NewField::AddHeader => self.cookie_entry(),
             NewField::Cookie(..) | NewField::AddCookie => self.form_entry(),
@@ -1429,7 +1446,7 @@ impl NewReq {
             // Wrapping backward past the first field lands on the last section,
             // matching jump_forward's `Capture -> Name` wrap.
             NewField::Name => self.capture_entry(),
-            NewField::Target | NewField::Method | NewField::Url => self.next_backward(),
+            NewField::Target | NewField::Method | NewField::Url => self.next_backward(true),
             NewField::Header(..) | NewField::AddHeader => NewField::Url,
             NewField::Cookie(..) | NewField::AddCookie => self.header_entry(),
             NewField::FormField(..) | NewField::AddFormField => self.cookie_entry(),

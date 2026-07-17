@@ -1486,7 +1486,6 @@ impl TuiApp {
             col.invalidate_request_json();
             col.sync_folder_to_selected();
             self.active_tab = ci;
-            self.focus = Pane::Main;
             self.status = None;
             self.save_state();
             return;
@@ -3238,7 +3237,7 @@ impl TuiApp {
                 let name = sugs[k];
                 form.accept_suggestion(name);
             }
-            form.focus_next(true);
+            form.focus_next(true, true);
         } else if !ctrl && kind_open && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             // Step through Text → File → Base64 File (Down) or the
             // reverse (Up), clamped at the ends like a small list.
@@ -3266,7 +3265,7 @@ impl TuiApp {
             form.kind_dropdown_hidden = true;
         } else if kind_open && key.code == KeyCode::Tab {
             form.kind_dropdown_hidden = true;
-            form.focus_next(true);
+            form.focus_next(true, true);
         } else if !ctrl && ctype_open && key.code == KeyCode::Down {
             let last = ctype_len - 1;
             form.ctype_hi = Some(match form.ctype_selected_index(&s) {
@@ -3283,7 +3282,7 @@ impl TuiApp {
             && matches!(key.code, KeyCode::Enter | KeyCode::Tab)
         {
             form.accept_content_type(&s);
-            form.focus_next(true);
+            form.focus_next(true, true);
         } else if !ctrl
             && key.code == KeyCode::Enter
             && let NewField::FormField(i, FormCol::Value) = form.focus
@@ -3315,9 +3314,9 @@ impl TuiApp {
                 return;
             }
         } else if key.code == KeyCode::Tab {
-            form.focus_next(true);
+            form.focus_next(true, true);
         } else if key.code == KeyCode::BackTab {
-            form.focus_next(false);
+            form.focus_next(false, true);
         } else if key.code == KeyCode::PageDown {
             form.cycle_view_tab(true);
         } else if key.code == KeyCode::PageUp {
@@ -3384,31 +3383,28 @@ impl TuiApp {
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
                         form.method_idx = (form.method_idx + 1) % METHODS.len();
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
-                NewField::Target => {
-                    let n = form.target_names.len().max(1);
-                    match key.code {
-                        KeyCode::Left | KeyCode::Char('h') => {
-                            form.target_idx = (form.target_idx + n - 1) % n;
-                        }
-                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-                            form.target_idx = (form.target_idx + 1) % n;
-                        }
-                        KeyCode::Down => form.focus_next(true),
-                        KeyCode::Up => form.focus_next(false),
-                        _ => {}
+                NewField::Target => match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        form.focus_next(false, false);
                     }
-                }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                        form.focus_next(true, false);
+                    }
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
                 NewField::AddHeader => match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         form.headers.push(HeaderRow::new());
                         form.focus = NewField::Header(form.headers.len() - 1, HdrCol::Key);
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
                 NewField::Header(i, col) => match key.code {
@@ -3470,7 +3466,7 @@ impl TuiApp {
                             form.focus = NewField::Header(i, next);
                         }
                     }
-                    KeyCode::Enter => form.focus_next(true),
+                    KeyCode::Enter => form.focus_next(true, true),
                     KeyCode::Char(' ') if col == HdrCol::Enabled => {
                         if let Some(row) = form.headers.get_mut(i) {
                             row.enabled = !row.enabled;
@@ -3493,8 +3489,8 @@ impl TuiApp {
                         form.cookies.push(HeaderRow::new());
                         form.focus = NewField::Cookie(form.cookies.len() - 1, HdrCol::Key);
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
                 NewField::Cookie(i, col) => match key.code {
@@ -3552,7 +3548,7 @@ impl TuiApp {
                             form.focus = NewField::Cookie(i, next);
                         }
                     }
-                    KeyCode::Enter => form.focus_next(true),
+                    KeyCode::Enter => form.focus_next(true, true),
                     KeyCode::Char(' ') if col == HdrCol::Enabled => {
                         if let Some(row) = form.cookies.get_mut(i) {
                             row.enabled = !row.enabled;
@@ -3575,8 +3571,8 @@ impl TuiApp {
                         form.form_fields.push(FormRow::new());
                         form.focus = NewField::FormField(form.form_fields.len() - 1, FormCol::Key);
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
                 NewField::FormField(i, col) => match key.code {
@@ -3638,21 +3634,7 @@ impl TuiApp {
                             if let Some(ed) = form.form_fields[i].cell_mut(prev) {
                                 ed.end();
                             }
-                            form.focus = NewField::FormField(i, prev);
-
-                            // If this was one of the fields that is not relevant to this file type then
-                            // we need to skip over it again
-                            if ((form.form_fields[i].kind == FormFieldKind::Base64File
-                                && prev == FormCol::Ctype)
-                                || (form.form_fields[i].kind != FormFieldKind::Base64File
-                                    && prev == FormCol::Prefix))
-                                && let Some(prev) = form.prev_form_col(prev)
-                            {
-                                if let Some(ed) = form.form_fields[i].cell_mut(prev) {
-                                    ed.end();
-                                }
-                                form.focus = NewField::FormField(i, prev);
-                            }
+                            form.focus_next(false, false);
                         }
                     }
                     KeyCode::Right => {
@@ -3672,24 +3654,10 @@ impl TuiApp {
                             if let Some(ed) = form.form_fields[i].cell_mut(next) {
                                 ed.home();
                             }
-                            form.focus = NewField::FormField(i, next);
-
-                            // If this was one of the fields that is not relevant to this file type then
-                            // we need to skip over it again
-                            if ((form.form_fields[i].kind == FormFieldKind::Base64File
-                                && next == FormCol::Ctype)
-                                || (form.form_fields[i].kind != FormFieldKind::Base64File
-                                    && next == FormCol::Prefix))
-                                && let Some(next) = form.next_form_col(next)
-                            {
-                                if let Some(ed) = form.form_fields[i].cell_mut(next) {
-                                    ed.end();
-                                }
-                                form.focus = NewField::FormField(i, next);
-                            }
+                            form.focus_next(true, false);
                         }
                     }
-                    KeyCode::Enter => form.focus_next(true),
+                    KeyCode::Enter => form.focus_next(true, true),
                     KeyCode::Char(' ') if col == FormCol::Enabled => {
                         if let Some(row) = form.form_fields.get_mut(i) {
                             row.enabled = !row.enabled;
@@ -3712,8 +3680,8 @@ impl TuiApp {
                         form.asserts.push(AssertRow::new());
                         form.focus = NewField::Assert(form.asserts.len() - 1);
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
                 NewField::Assert(i) => match key.code {
@@ -3731,7 +3699,7 @@ impl TuiApp {
                             NewField::AddAssert
                         };
                     }
-                    KeyCode::Enter => form.focus_next(true),
+                    KeyCode::Enter => form.focus_next(true, true),
                     KeyCode::Char(ch) => {
                         if let Some(row) = form.asserts.get_mut(i) {
                             row.expr.insert(ch);
@@ -3777,8 +3745,8 @@ impl TuiApp {
                         form.captures.push(CaptureRow::new());
                         form.focus = NewField::Capture(form.captures.len() - 1, CapCol::Name);
                     }
-                    KeyCode::Down => form.focus_next(true),
-                    KeyCode::Up => form.focus_next(false),
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
                 NewField::Capture(i, col) => match key.code {
@@ -3823,7 +3791,7 @@ impl TuiApp {
                             form.focus = NewField::Capture(i, next);
                         }
                     }
-                    KeyCode::Enter => form.focus_next(true),
+                    KeyCode::Enter => form.focus_next(true, true),
                     KeyCode::Char(ch) => form.captures[i].cell_mut(col).insert(ch),
                     KeyCode::Backspace => form.captures[i].cell_mut(col).backspace(),
                     KeyCode::Home => form.captures[i].cell_mut(col).home(),
@@ -3862,7 +3830,7 @@ impl TuiApp {
                             _ => true, // single-line fields always move sections
                         };
                         if leave {
-                            form.focus_next(down);
+                            form.focus_next(down, true);
                         }
                     } else if let Some(ed) = form.active_editor() {
                         let single = !ed.multiline;
@@ -3878,7 +3846,7 @@ impl TuiApp {
                             _ => {}
                         }
                         if single && key.code == KeyCode::Enter {
-                            form.focus_next(true);
+                            form.focus_next(true, true);
                         }
                     }
                 }

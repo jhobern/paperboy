@@ -487,7 +487,7 @@ fn form_ref(app: &TuiApp) -> &NewReq {
 fn form_step(app: &mut TuiApp, forward: bool) -> NewField {
     match app.overlay.as_mut().unwrap() {
         Overlay::NewRequest(f) => {
-            f.focus_next(forward);
+            f.focus_next(forward, true);
             f.focus
         }
         _ => panic!("New Request overlay not open"),

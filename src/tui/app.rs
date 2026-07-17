@@ -1539,7 +1539,7 @@ impl TuiApp {
                         // still override it afterwards.
                         let inferred = infer_content_type(path).unwrap_or("");
 
-                        if row.kind == FormFieldKind::Base64File {
+                        if row.kind == FormFieldKind::Base64File && !inferred.is_empty() {
                             let prefix_default = format!("data:{inferred};base64,");
                             row.base64_prefix = Editor::new(&prefix_default, false);
                         } else {
