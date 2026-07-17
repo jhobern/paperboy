@@ -117,9 +117,9 @@ fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 }
 
 impl Param {
-    /// A `{key, value}` pair, unless the entry is disabled or keyless.
-    fn enabled_kv(&self) -> Option<(String, String)> {
-        (!self.disabled && !self.key.is_empty()).then(|| (self.key.clone(), self.value.clone()))
+    /// A `{key, value}` pair, unless the entry is  keyless.
+    fn enabled_kve(&self) -> Option<(String, String, bool)> {
+        (!self.key.is_empty()).then(|| (self.key.clone(), self.value.clone(), !self.disabled))
     }
 
     /// A form field — text, or a `File` using `src` as its path — unless the
@@ -135,6 +135,7 @@ impl Param {
                 kind: FormFieldKind::File,
                 content_type: self.content_type.clone(),
                 base64_prefix: None,
+                enabled: true,
             }
         } else {
             FormField {
@@ -143,6 +144,7 @@ impl Param {
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             }
         })
     }
@@ -202,8 +204,8 @@ fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) 
 }
 
 fn map_request(name: &str, req: &Request) -> HurlEntry {
-    let mut headers: Vec<(String, String)> =
-        req.header.iter().filter_map(Param::enabled_kv).collect();
+    let mut headers: Vec<(String, String, bool)> =
+        req.header.iter().filter_map(Param::enabled_kve).collect();
 
     // Auth → basic_auth, or a `Bearer` Authorization header for bearer tokens.
     let mut basic_auth = None;
@@ -219,7 +221,7 @@ fn map_request(name: &str, req: &Request) -> HurlEntry {
             "bearer" => {
                 let t = Auth::field(&auth.bearer, "token");
                 if !t.is_empty() {
-                    headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+                    headers.push(("Authorization".to_string(), format!("Bearer {t}"), true));
                 }
             }
             _ => {}
@@ -293,7 +295,11 @@ mod tests {
         assert_eq!(e[0].url, "{{url}}/login?next=1");
         assert_eq!(
             e[0].headers,
-            vec![("Content-Type".to_string(), "application/json".to_string())]
+            vec![(
+                "Content-Type".to_string(),
+                "application/json".to_string(),
+                true
+            )]
         );
         assert_eq!(e[0].body.as_deref(), Some("{\"u\":\"a\"}"));
 
@@ -307,6 +313,7 @@ mod tests {
                     kind: FormFieldKind::Text,
                     content_type: None,
                     base64_prefix: None,
+                    enabled: true
                 },
                 FormField {
                     key: "f".into(),
@@ -314,6 +321,7 @@ mod tests {
                     kind: FormFieldKind::File,
                     content_type: None,
                     base64_prefix: None,
+                    enabled: true
                 },
             ],
             "text and file form-data fields are both imported"
@@ -328,10 +336,11 @@ mod tests {
         }}]}"#;
         let e = import_postman(json);
         assert_eq!(e.len(), 1);
-        assert!(
-            e[0].headers
-                .contains(&("Authorization".to_string(), "Bearer {{tok}}".to_string()))
-        );
+        assert!(e[0].headers.contains(&(
+            "Authorization".to_string(),
+            "Bearer {{tok}}".to_string(),
+            true
+        )));
     }
 
     #[test]

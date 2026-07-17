@@ -37,13 +37,14 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
                 form_fields = kvs
                     .iter()
                     .map(|kv| {
-                        let (key, value) = kv_pair(kv);
+                        let (key, value, enabled) = kv_triple(kv);
                         FormField {
                             key,
                             value,
                             kind: FormFieldKind::Text,
                             content_type: None,
                             base64_prefix: None,
+                            enabled,
                         }
                     })
                     .collect();
@@ -52,7 +53,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
                 form_fields = parts.iter().map(multipart_field).collect();
             }
             SectionValue::QueryParams(kvs, _) => query_params = kvs.iter().map(kv_pair).collect(),
-            SectionValue::Cookies(cs) => cookies = cs.iter().map(cookie_pair).collect(),
+            SectionValue::Cookies(cs) => cookies = cs.iter().map(cookie_triple).collect(),
             _ => {}
         }
     }
@@ -80,13 +81,15 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
         }
     }
 
-    let is_multipart = form_fields.iter().any(|f| f.kind.is_multipart());
+    let is_multipart = form_fields
+        .iter()
+        .any(|f| f.enabled && f.kind.is_multipart());
 
     HurlEntry {
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
         url: req.url.to_source().to_string(),
-        headers: req.headers.iter().map(kv_pair).collect(),
+        headers: req.headers.iter().map(kv_triple).collect(),
         basic_auth,
         form_fields,
         is_multipart,
@@ -110,11 +113,20 @@ fn kv_pair(kv: &KeyValue) -> (String, String) {
     )
 }
 
+fn kv_triple(kv: &KeyValue) -> (String, String, bool) {
+    (
+        kv.key.to_source().to_string(),
+        kv.value.to_source().to_string(),
+        true,
+    )
+}
+
 /// A `[Cookies]` row's `(name, value)` pair.
-fn cookie_pair(c: &Cookie) -> (String, String) {
+fn cookie_triple(c: &Cookie) -> (String, String, bool) {
     (
         c.name.to_source().to_string(),
         c.value.to_source().to_string(),
+        true,
     )
 }
 
@@ -123,13 +135,14 @@ fn cookie_pair(c: &Cookie) -> (String, String) {
 fn multipart_field(p: &MultipartParam) -> FormField {
     match p {
         MultipartParam::Param(kv) => {
-            let (key, value) = kv_pair(kv);
+            let (key, value, enabled) = kv_triple(kv);
             FormField {
                 key,
                 value,
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled,
             }
         }
         MultipartParam::FilenameParam(fp) => {
@@ -157,6 +170,7 @@ fn multipart_field(p: &MultipartParam) -> FormField {
                     kind: FormFieldKind::Base64File,
                     content_type: None,
                     base64_prefix: Some(prefix),
+                    enabled: true,
                 };
             }
             FormField {
@@ -169,6 +183,7 @@ fn multipart_field(p: &MultipartParam) -> FormField {
                 kind: FormFieldKind::File,
                 content_type,
                 base64_prefix: None,
+                enabled: true,
             }
         }
     }
@@ -261,14 +276,14 @@ mod tests {
                 "Create post",
                 "POST",
                 "{{ BASE_URL }}/posts",
-                vec![("Content-Type".into(), "application/json".into())],
+                vec![("Content-Type".into(), "application/json".into(), true)],
                 "{\n  \"title\": \"hi\"\n}",
             ),
             HurlEntry::from_fields(
                 "Health",
                 "GET",
                 "{{ BASE_URL }}/health",
-                vec![("Accept".into(), "application/json".into())],
+                vec![("Accept".into(), "application/json".into(), true)],
                 "",
             ),
         ];
@@ -343,8 +358,8 @@ mod tests {
     fn cookies_round_trip() {
         let mut entry = HurlEntry::from_fields("Login", "GET", "{{ BASE_URL }}/me", vec![], "");
         entry.cookies = vec![
-            ("session".to_string(), "abc123".to_string()),
-            ("theme".to_string(), "dark".to_string()),
+            ("session".to_string(), "abc123".to_string(), true),
+            ("theme".to_string(), "dark".to_string(), true),
         ];
 
         let text = entry.to_hurl();
@@ -367,6 +382,7 @@ mod tests {
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             },
             FormField {
                 key: "pass".to_string(),
@@ -374,6 +390,7 @@ mod tests {
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             },
         ];
 
@@ -401,6 +418,7 @@ mod tests {
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             },
             FormField {
                 key: "field2".to_string(),
@@ -408,6 +426,7 @@ mod tests {
                 kind: FormFieldKind::File,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             },
             FormField {
                 key: "field3".to_string(),
@@ -415,6 +434,7 @@ mod tests {
                 kind: FormFieldKind::File,
                 content_type: Some("application/zip".to_string()),
                 base64_prefix: None,
+                enabled: true,
             },
         ];
 
@@ -441,6 +461,7 @@ mod tests {
             kind: FormFieldKind::File,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }];
 
         let text = entry.to_hurl();
@@ -480,6 +501,7 @@ mod tests {
             kind: FormFieldKind::Base64File,
             content_type: None,
             base64_prefix: Some("data:image/png;base64,".to_string()),
+            enabled: true,
         }];
 
         let text = entry.to_hurl();
@@ -509,6 +531,7 @@ mod tests {
             kind: FormFieldKind::Base64File,
             content_type: None,
             base64_prefix: Some(String::new()),
+            enabled: true,
         }];
 
         let reparsed = parse_hurl(&entry.to_hurl());

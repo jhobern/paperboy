@@ -234,6 +234,8 @@ struct FormFieldJson {
     kind: FormKind,
     #[serde(default)]
     value: TextValue,
+    #[serde(default)]
+    enabled: bool,
 }
 
 impl From<&FormField> for FormFieldJson {
@@ -248,6 +250,7 @@ impl From<&FormField> for FormFieldJson {
                 crate::hurl::FormFieldKind::Text => FormKind::Text,
             },
             value: TextValue(f.value.clone()),
+            enabled: f.enabled,
         }
     }
 }
@@ -264,6 +267,7 @@ impl From<FormFieldJson> for FormField {
             },
             content_type: f.content_type,
             base64_prefix: f.base64_prefix,
+            enabled: f.enabled,
         }
     }
 }
@@ -289,15 +293,22 @@ struct RequestJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body: Option<Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    cookies: BTreeMap<String, TextValue>,
+    cookies: BTreeMap<String, (TextValue, bool)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     form_fields: Vec<FormFieldJson>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    headers: BTreeMap<String, TextValue>,
+    headers: BTreeMap<String, (TextValue, bool)>,
     method: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     query_params: BTreeMap<String, TextValue>,
     url: String,
+}
+
+fn triples_to_map(triples: &[(String, String, bool)]) -> BTreeMap<String, (TextValue, bool)> {
+    triples
+        .iter()
+        .map(|(k, v, e)| (k.clone(), (TextValue(v.clone()), *e)))
+        .collect()
 }
 
 fn pairs_to_map(pairs: &[(String, String)]) -> BTreeMap<String, TextValue> {
@@ -309,6 +320,10 @@ fn pairs_to_map(pairs: &[(String, String)]) -> BTreeMap<String, TextValue> {
 
 fn map_to_pairs(map: BTreeMap<String, TextValue>) -> Vec<(String, String)> {
     map.into_iter().map(|(k, v)| (k, v.0)).collect()
+}
+
+fn map_to_triples(map: BTreeMap<String, (TextValue, bool)>) -> Vec<(String, String, bool)> {
+    map.into_iter().map(|(k, (v, e))| (k, v.0, e)).collect()
 }
 
 /// Pretty-printed JSON of the request in its RAW, editable form: `{{ VAR }}`
@@ -324,9 +339,9 @@ pub fn build_request_json(entry: &HurlEntry) -> String {
         body: entry.body.as_deref().map(|raw| {
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
         }),
-        cookies: pairs_to_map(&entry.cookies),
+        cookies: triples_to_map(&entry.cookies),
         form_fields: entry.form_fields.iter().map(FormFieldJson::from).collect(),
-        headers: pairs_to_map(&entry.headers),
+        headers: triples_to_map(&entry.headers),
         method: entry.method.clone(),
         query_params: pairs_to_map(&entry.query_params),
         url: entry.url.clone(),
@@ -351,8 +366,8 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
     entry.method = dto.method;
     entry.url = dto.url;
     entry.basic_auth = dto.basic_auth.map(|ba| (ba.user.0, ba.pass.0));
-    entry.headers = map_to_pairs(dto.headers);
-    entry.cookies = map_to_pairs(dto.cookies);
+    entry.headers = map_to_triples(dto.headers);
+    entry.cookies = map_to_triples(dto.cookies);
     entry.query_params = map_to_pairs(dto.query_params);
     entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
     entry.body = body;
@@ -394,7 +409,8 @@ pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<Re
     let mut headers: Vec<(String, String)> = entry
         .headers
         .iter()
-        .map(|(k, v)| (k.clone(), substitute(v, &vars)))
+        .filter(|(_, _, e)| *e)
+        .map(|(k, v, _)| (k.clone(), substitute(v, &vars)))
         .collect();
     if let Some((user, pass)) = &entry.basic_auth {
         let cred = STANDARD.encode(format!(
@@ -407,17 +423,20 @@ pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<Re
     let cookies: Vec<(String, String)> = entry
         .cookies
         .iter()
-        .map(|(k, v)| (substitute(k, &vars), substitute(v, &vars)))
+        .filter(|(_, _, e)| *e)
+        .map(|(k, v, _)| (substitute(k, &vars), substitute(v, &vars)))
         .collect();
     let form_fields: Vec<FormField> = entry
         .form_fields
         .iter()
+        .filter(|f| f.enabled)
         .map(|f| FormField {
             key: substitute(&f.key, &vars),
             value: substitute(&f.value, &vars),
             kind: f.kind,
             content_type: f.content_type.as_deref().map(|ct| substitute(ct, &vars)),
             base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, &vars)),
+            enabled: f.enabled,
         })
         .collect();
 
@@ -480,12 +499,20 @@ fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry>
         title: String::new(),
         method: resolved.method,
         url: resolved.url,
-        headers: resolved.headers,
+        headers: resolved
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone(), true))
+            .collect(),
         basic_auth: None, // already encoded into `headers` by resolve_request
         form_fields: resolved.form_fields,
         is_multipart,
         query_params: base.query_params.clone(),
-        cookies: resolved.cookies,
+        cookies: resolved
+            .cookies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone(), true))
+            .collect(),
         body: resolved.body,
         expected_status: base.expected_status,
         captures: base.captures.clone(),
@@ -758,7 +785,7 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
     let mut add = |text: &str| keys.extend(crate::environment::referenced_keys(text));
 
     add(&entry.url);
-    for (k, v) in &entry.headers {
+    for (k, v, _) in &entry.headers {
         add(k);
         add(v);
     }
@@ -770,7 +797,7 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
         add(&f.key);
         add(&f.value);
     }
-    for (k, v) in &entry.cookies {
+    for (k, v, _) in &entry.cookies {
         add(k);
         add(v);
     }
@@ -881,10 +908,10 @@ mod tests {
             url: "http://example.com/api".into(),
             // Deliberately out of order to prove keys come out sorted.
             headers: vec![
-                ("X-Zed".into(), "z".into()),
-                ("Authorization".into(), "Bearer t".into()),
+                ("X-Zed".into(), "z".into(), true),
+                ("Authorization".into(), "Bearer t".into(), true),
             ],
-            cookies: vec![("session".into(), "abc".into())],
+            cookies: vec![("session".into(), "abc".into(), true)],
             query_params: vec![("page".into(), "2".into())],
             basic_auth: Some(("alice".into(), "secret".into())),
             form_fields: vec![
@@ -894,6 +921,7 @@ mod tests {
                     kind: FormFieldKind::Text,
                     content_type: None,
                     base64_prefix: None,
+                    enabled: true,
                 },
                 FormField {
                     key: "file".into(),
@@ -901,6 +929,7 @@ mod tests {
                     kind: FormFieldKind::File,
                     content_type: Some("application/octet-stream".into()),
                     base64_prefix: None,
+                    enabled: true,
                 },
             ],
             body: Some(r#"{"a":1}"#.into()),
@@ -953,8 +982,8 @@ mod tests {
         assert_eq!(
             back.headers,
             vec![
-                ("Authorization".to_string(), "Bearer t".to_string()),
-                ("X-Zed".to_string(), "z".to_string()),
+                ("Authorization".to_string(), "Bearer t".to_string(), true),
+                ("X-Zed".to_string(), "z".to_string(), true),
             ]
         );
         assert_eq!(back.form_fields.len(), 2);
@@ -974,7 +1003,7 @@ mod tests {
         let entry = apply_request_json(&base, text).unwrap();
         assert_eq!(
             entry.headers,
-            vec![("X-Count".to_string(), "5".to_string())]
+            vec![("X-Count".to_string(), "5".to_string(), true)]
         );
         assert_eq!(entry.form_fields[0].kind, FormFieldKind::Text);
     }
@@ -990,7 +1019,11 @@ mod tests {
         HurlEntry {
             method: "GET".into(),
             url: "{{ BASE_URL }}/me".into(),
-            headers: vec![("Authorization".into(), "Bearer {{ API_TOKEN }}".into())],
+            headers: vec![(
+                "Authorization".into(),
+                "Bearer {{ API_TOKEN }}".into(),
+                true,
+            )],
             ..Default::default()
         }
     }

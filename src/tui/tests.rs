@@ -434,7 +434,7 @@ fn creating_a_request_with_a_header_via_the_table() {
     assert_eq!(e.len(), 1);
     assert_eq!(
         e[0].headers,
-        vec![("X-Test".to_string(), "abc".to_string())]
+        vec![("X-Test".to_string(), "abc".to_string(), true)]
     );
 }
 
@@ -1190,7 +1190,7 @@ fn persisted_state_round_trips_requests_and_settings() {
         "post",
         "POST",
         "http://h/x",
-        vec![("X-A".into(), "1".into())],
+        vec![("X-A".into(), "1".into(), true)],
         "{}",
     ));
 
@@ -1205,7 +1205,10 @@ fn persisted_state_round_trips_requests_and_settings() {
     assert_eq!(e.len(), 2);
     assert_eq!(e[0].url, "http://h/health");
     assert_eq!(e[1].method, "POST");
-    assert_eq!(e[1].headers, vec![("X-A".to_string(), "1".to_string())]);
+    assert_eq!(
+        e[1].headers,
+        vec![("X-A".to_string(), "1".to_string(), true)]
+    );
 }
 
 #[test]
@@ -6094,7 +6097,7 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     let entry = HurlEntry {
         method: "GET".into(),
         url: "http://example.com/path".into(),
-        headers: vec![("X-Token".into(), "{{ TOKEN }}".into())],
+        headers: vec![("X-Token".into(), "{{ TOKEN }}".into(), true)],
         ..Default::default()
     };
     app.collections[ci].entries = vec![entry];
@@ -6196,7 +6199,7 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
     let entry = HurlEntry {
         method: "GET".into(),
         url: "http://example.com/path!important".into(),
-        headers: vec![("X-Token".into(), "{{ TOKEN }}".into())],
+        headers: vec![("X-Token".into(), "{{ TOKEN }}".into(), true)],
         ..Default::default()
     };
     app.collections[ci].entries = vec![entry];
@@ -6666,8 +6669,8 @@ fn dragging_from_main_panel_past_its_bottom_edge_into_the_response_panel_does_no
     // than the viewport once wrapped — so autoscroll must cross
     // several *wrapped* rows within a single raw JSON line, not just
     // advance line by line.
-    let headers: Vec<(String, String)> = (0..40)
-        .map(|i| (format!("X-Header-{i}"), "v".repeat(300)))
+    let headers: Vec<(String, String, bool)> = (0..40)
+        .map(|i| (format!("X-Header-{i}"), "v".repeat(300), true))
         .collect();
     app.collections[ci].entries = vec![HurlEntry {
         title: "tall-request".into(),
@@ -7766,7 +7769,7 @@ fn request_preview_substitutes_env_values_and_masks_secrets() {
         "r",
         "GET",
         "{{ BASE_URL }}/x",
-        vec![("Authorization".into(), "Bearer {{ TOKEN }}".into())],
+        vec![("Authorization".into(), "Bearer {{ TOKEN }}".into(), true)],
         "",
     ));
     app.collections[0].selected_entry = app.collections[0].entries.len() - 1;
@@ -7958,7 +7961,7 @@ fn editing_request_json_via_f2_persists_and_marks_modified() {
         "r",
         "GET",
         "http://h/x",
-        vec![("X-A".into(), "1".into())],
+        vec![("X-A".into(), "1".into(), true)],
         "",
     );
     app.collections
@@ -7980,7 +7983,7 @@ fn editing_request_json_via_f2_persists_and_marks_modified() {
     let entry = &app.collections[1].entries[0];
     assert_eq!(
         entry.headers,
-        vec![("X-A".to_string(), "2".to_string())],
+        vec![("X-A".to_string(), "2".to_string(), true)],
         "the header edit should persist"
     );
     assert!(entry.modified, "F2 commit should also flag modified");
@@ -8451,7 +8454,7 @@ fn creating_a_request_with_a_cookie_via_the_table() {
     assert_eq!(e.len(), 1);
     assert_eq!(
         e[0].cookies,
-        vec![("session".to_string(), "abc123".to_string())]
+        vec![("session".to_string(), "abc123".to_string(), true)]
     );
 }
 
@@ -9190,6 +9193,7 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
         kind: crate::hurl::FormFieldKind::Text,
         content_type: None,
         base64_prefix: None,
+        enabled: true,
     });
 
     let mut app = TuiApp::default();

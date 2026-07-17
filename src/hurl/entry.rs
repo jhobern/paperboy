@@ -45,6 +45,7 @@ pub struct FormField {
     pub content_type: Option<String>,
     #[serde(default)]
     pub base64_prefix: Option<String>,
+    pub enabled: bool,
 }
 
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
@@ -92,7 +93,7 @@ pub struct HurlEntry {
     pub title: String,
     pub method: String,
     pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, String, bool)>,
     pub basic_auth: Option<(String, String)>,
     /// `[Form]` (all `Text`) or `[Multipart]` (any `File`) fields, chosen
     /// automatically by [`to_hurl`](HurlEntry::to_hurl). `#[serde(default)]`
@@ -106,7 +107,7 @@ pub struct HurlEntry {
     /// `[Cookies]` `(name, value)` pairs — syntactic sugar over a `Cookie:`
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
-    pub cookies: Vec<(String, String)>,
+    pub cookies: Vec<(String, String, bool)>,
     pub body: Option<String>,
     pub expected_status: Option<u16>,
     /// (variable_name, query_expression) pairs, e.g. `("token", "jsonpath \"$.token\"")`.
@@ -144,19 +145,19 @@ pub struct HurlEntry {
 
 impl HurlEntry {
     /// Build an entry from user-entered form fields. `headers` is a list of
-    /// `(key, value)` pairs; pairs with an empty key are skipped. An empty
+    /// `(key, value, enabled)` triples; triples with an false enabled are skipped. An empty
     /// `body` becomes `None`.
     pub fn from_fields(
         name: &str,
         method: &str,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, String, bool)>,
         body: &str,
     ) -> Self {
         let headers = headers
             .into_iter()
-            .filter(|(k, _)| !k.trim().is_empty())
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _, _)| !k.trim().is_empty())
+            .map(|(k, v, e)| (k.trim().to_string(), v.trim().to_string(), e))
             .collect();
         let body = if body.trim().is_empty() {
             None
@@ -197,10 +198,10 @@ impl HurlEntry {
         let has_content_length = self
             .headers
             .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+            .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"));
         if carries_body && !has_body && !has_content_length && !has_forms {
             self.headers
-                .push(("Content-Length".to_string(), "0".to_string()));
+                .push(("Content-Length".to_string(), "0".to_string(), true));
         }
     }
 
@@ -222,8 +223,10 @@ impl HurlEntry {
             self.method.as_str()
         };
         out.push_str(&format!("{method} {}\n", self.url));
-        for (k, v) in &self.headers {
-            out.push_str(&format!("{k}: {v}\n"));
+        for (k, v, enabled) in &self.headers {
+            if *enabled {
+                out.push_str(&format!("{k}: {v}\n"));
+            }
         }
         if let Some(body) = &self.body {
             out.push_str(body);
@@ -236,8 +239,10 @@ impl HurlEntry {
         }
         if !self.cookies.is_empty() {
             out.push_str("[Cookies]\n");
-            for (k, v) in &self.cookies {
-                out.push_str(&format!("{k}: {v}\n"));
+            for (k, v, enabled) in &self.cookies {
+                if *enabled {
+                    out.push_str(&format!("{k}: {v}\n"));
+                }
             }
         }
         if !self.query_params.is_empty() {
@@ -251,14 +256,17 @@ impl HurlEntry {
             // (Hurl's `[Form]` section is text-only); a Base64File also
             // serializes as a `file,...` line (carrying its marker), so it
             // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
-            let multipart =
-                self.form_fields.iter().any(|f| f.kind.is_multipart()) || self.is_multipart;
+            let multipart = self
+                .form_fields
+                .iter()
+                .any(|f| f.enabled && f.kind.is_multipart())
+                || self.is_multipart;
             out.push_str(if multipart {
                 "[Multipart]\n"
             } else {
                 "[Form]\n"
             });
-            for f in &self.form_fields {
+            for f in self.form_fields.iter().filter(|field| field.enabled) {
                 match f.kind {
                     FormFieldKind::Text => out.push_str(&format!("{}: {}\n", f.key, f.value)),
                     FormFieldKind::File => {
@@ -362,7 +370,7 @@ mod tests {
         assert!(
             e.headers
                 .iter()
-                .any(|(k, v)| k == "Content-Length" && v == "0")
+                .any(|(k, v, _)| k == "Content-Length" && v == "0")
         );
     }
 
@@ -372,7 +380,7 @@ mod tests {
             let mut e = entry(m);
             e.ensure_run_content_length();
             assert!(
-                e.headers.iter().any(|(k, _)| k == "Content-Length"),
+                e.headers.iter().any(|(k, _, _)| k == "Content-Length"),
                 "expected Content-Length for {m}"
             );
         }
@@ -386,7 +394,7 @@ mod tests {
             assert!(
                 !e.headers
                     .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
+                    .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length")),
                 "did not expect Content-Length for {m}"
             );
         }
@@ -400,7 +408,7 @@ mod tests {
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
         );
     }
 
@@ -413,12 +421,13 @@ mod tests {
             kind: FormFieldKind::Text,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }];
         e.ensure_run_content_length();
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
         );
     }
 
@@ -426,12 +435,12 @@ mod tests {
     fn a_user_set_content_length_is_not_duplicated() {
         let mut e = entry("POST");
         e.headers
-            .push(("content-length".to_string(), "5".to_string()));
+            .push(("content-length".to_string(), "5".to_string(), true));
         e.ensure_run_content_length();
         let count = e
             .headers
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .filter(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
             .count();
         assert_eq!(count, 1);
     }

@@ -1378,34 +1378,33 @@ impl TuiApp {
         // siblings. The list already shows the URL for every row, so an empty
         // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let headers: Vec<(String, String)> = form
+        let headers: Vec<(String, String, bool)> = form
             .headers
             .iter()
-            .filter(|r| r.enabled)
             .map(|r| {
                 (
                     r.key.text().trim().to_string(),
                     r.value.text().trim().to_string(),
+                    r.enabled,
                 )
             })
-            .filter(|(k, _)| !k.is_empty())
+            .filter(|(k, _, _)| !k.is_empty())
             .collect();
-        let cookies: Vec<(String, String)> = form
+        let cookies: Vec<(String, String, bool)> = form
             .cookies
             .iter()
-            .filter(|r| r.enabled)
             .map(|r| {
                 (
                     r.key.text().trim().to_string(),
                     r.value.text().trim().to_string(),
+                    r.enabled,
                 )
             })
-            .filter(|(k, _)| !k.is_empty())
+            .filter(|(k, _, _)| !k.is_empty())
             .collect();
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
-            .filter(|r| r.enabled)
             .filter(|r| !r.key.text().trim().is_empty())
             .map(|r| {
                 // For File-kind rows the Content-Type cell is the optional
@@ -1429,6 +1428,7 @@ impl TuiApp {
                     kind,
                     content_type,
                     base64_prefix,
+                    enabled: r.enabled,
                 }
             })
             .collect();

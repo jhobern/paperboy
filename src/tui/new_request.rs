@@ -592,10 +592,11 @@ impl NewReq {
             entry
                 .headers
                 .iter()
-                .map(|(k, v)| {
+                .map(|(k, v, e)| {
                     let mut row = HeaderRow::new();
                     row.key = Editor::new(k, false);
                     row.value = Editor::new(v, false);
+                    row.enabled = *e;
                     row
                 })
                 .collect()
@@ -606,10 +607,11 @@ impl NewReq {
             entry
                 .cookies
                 .iter()
-                .map(|(k, v)| {
+                .map(|(k, v, e)| {
                     let mut row = HeaderRow::new();
                     row.key = Editor::new(k, false);
                     row.value = Editor::new(v, false);
+                    row.enabled = *e;
                     row
                 })
                 .collect()
@@ -628,6 +630,7 @@ impl NewReq {
                     row.base64_prefix =
                         Editor::new(f.base64_prefix.as_deref().unwrap_or(""), false);
                     row.kind = f.kind;
+                    row.enabled = f.enabled;
                     row
                 })
                 .collect()

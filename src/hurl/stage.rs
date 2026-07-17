@@ -191,6 +191,7 @@ mod tests {
             kind: FormFieldKind::File,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }
     }
 
@@ -418,6 +419,7 @@ mod tests {
             kind: FormFieldKind::Text,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }])];
         let result = stage_out_of_scope_form_files(&mut entries, Some(&collection_dir)).unwrap();
         assert!(
@@ -442,6 +444,7 @@ mod tests {
             kind: FormFieldKind::Base64File,
             content_type: None,
             base64_prefix: Some("data:x;base64,".to_string()),
+            enabled: true,
         }])];
         expand_base64_form_fields(&mut entries, Some(&dir)).unwrap();
 
@@ -461,6 +464,7 @@ mod tests {
             kind: FormFieldKind::Base64File,
             content_type: None,
             base64_prefix: Some("pfx-".to_string()),
+            enabled: true,
         }])];
         expand_base64_form_fields(&mut entries, None).unwrap();
         let f = &entries[0].form_fields[0];
@@ -479,6 +483,7 @@ mod tests {
             kind: FormFieldKind::Base64File,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }])];
         assert!(
             expand_base64_form_fields(&mut entries, None).is_err(),
