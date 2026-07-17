@@ -1264,13 +1264,10 @@ impl TuiApp {
                     Some(crate::tree::Row::Up) => self.list_folder_up(ci),
                     Some(crate::tree::Row::Folder(name)) => self.list_folder_down(ci, name.clone()),
                     Some(crate::tree::Row::Entry(_)) => {
-                        self.focus = Pane::Main;
                         self.open_edit_request_wizard(ci);
                     }
-                    // An empty list (no folders, no requests): still move
-                    // focus into the panel, matching plain Enter elsewhere,
-                    // but there's nothing to edit so no overlay opens.
-                    None => self.focus = Pane::Main,
+                    // An empty list (no folders, no requests): do nothing
+                    None => {}
                 }
             }
             Pane::GlobalEnv => {
