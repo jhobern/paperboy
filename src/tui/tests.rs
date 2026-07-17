@@ -235,8 +235,10 @@ fn deleting_an_environment_asks_for_confirmation_by_default() {
 
 #[test]
 fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
-    let mut app = TuiApp::default();
-    app.confirm_on_delete_env = false;
+    let mut app = TuiApp {
+        confirm_on_delete_env: false,
+        ..Default::default()
+    };
     add_empty_global_env(&mut app, "staging");
     app.focus = Pane::GlobalEnv;
     app.global_env_idx = 0;
@@ -255,8 +257,10 @@ fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
 
 #[test]
 fn u_reopens_the_most_recently_deleted_environment() {
-    let mut app = TuiApp::default();
-    app.confirm_on_delete_env = false;
+    let mut app = TuiApp {
+        confirm_on_delete_env: false,
+        ..Default::default()
+    };
     add_empty_global_env(&mut app, "alpha");
     add_empty_global_env(&mut app, "bravo");
     app.focus = Pane::GlobalEnv;
@@ -2472,8 +2476,10 @@ fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
 
 #[test]
 fn the_load_source_step_esc_returns_to_the_kind_list_with_the_kind_relit() {
-    let mut app = TuiApp::default();
-    app.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 1));
+    let mut app = TuiApp {
+        overlay: Some(Overlay::FileLoadSource(FileKind::Environment, 1)),
+        ..Default::default()
+    };
     press(&mut app, KeyCode::Esc);
     assert!(
         matches!(app.overlay, Some(Overlay::FileLoadMenu(2))),
@@ -2491,8 +2497,11 @@ fn the_save_destination_step_lists_the_right_choices_per_kind() {
     assert_eq!(file_save_dest_items(FileKind::Environment, &s).len(), 2);
     assert_eq!(file_save_dest_items(FileKind::Workspace, &s).len(), 2);
 
-    let mut app = TuiApp::default();
-    app.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0));
+    let mut app = TuiApp {
+        overlay: Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
+        ..Default::default()
+    };
+
     press(&mut app, KeyCode::Esc);
     assert!(
         matches!(app.overlay, Some(Overlay::FileSaveMenu(3))),
@@ -5180,8 +5189,10 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
 
 #[test]
 fn f2_with_an_empty_url_keeps_the_wizard_open_and_warns_instead_of_discarding() {
-    let mut app = TuiApp::default();
-    app.focus = Pane::List;
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
 
     // Open the New Request wizard and type only a Name (no URL).
     press(&mut app, KeyCode::Char('n'));
