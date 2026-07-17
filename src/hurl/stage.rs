@@ -123,14 +123,19 @@ pub fn stage_out_of_scope_form_files(
 pub fn expand_base64_form_fields(
     entries: &mut [HurlEntry],
     file_root: Option<&Path>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let current_dir = std::env::current_dir().unwrap_or_default();
     let root = file_root
         .map(PathBuf::from)
         .unwrap_or_else(|| current_dir.clone());
 
+    let mut entry_count = 0;
     for entry in entries.iter_mut() {
+        entry.is_multipart = false;
         for f in entry.form_fields.iter_mut() {
+            if f.kind.is_multipart() {
+                entry.is_multipart = true;
+            }
             if f.kind != FormFieldKind::Base64File {
                 continue;
             }
@@ -150,9 +155,10 @@ pub fn expand_base64_form_fields(
             f.kind = FormFieldKind::Text;
             f.base64_prefix = None;
             f.content_type = None;
+            entry_count += 1;
         }
     }
-    Ok(())
+    Ok(entry_count)
 }
 
 /// Returns `base` unchanged the first time it's seen; on every subsequent

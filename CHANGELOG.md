@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
+
+## [0.1.5] - 2026-07-16
+
+### Fixed
+
+- **Bodyless `POST`/`PUT`/`PATCH`/`DELETE` requests now only switch to having
+  `Content-Length: 0`** if there are no Forms and no Body.
+- Requests with a Form field with a `Type` of `Base64 File` will now correctly
+  send as `[Multipart]` requests. 
+
 ## [0.1.4] - 2026-07-15
 
 ### Added

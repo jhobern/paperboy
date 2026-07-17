@@ -420,6 +420,7 @@ pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<Re
             base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, &vars)),
         })
         .collect();
+
     let body = entry.body.as_deref().map(|b| substitute(b, &vars));
     Some(ResolvedRequest {
         method,
@@ -471,6 +472,10 @@ pub struct BatchRunUpdate {
 fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry> {
     let base = col.entries.get(col.selected_entry)?;
     let resolved = resolve_request(col, env)?;
+    let is_multipart = resolved
+        .form_fields
+        .iter()
+        .any(|form| form.kind.is_multipart());
     Some(HurlEntry {
         title: String::new(),
         method: resolved.method,
@@ -478,6 +483,7 @@ fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry>
         headers: resolved.headers,
         basic_auth: None, // already encoded into `headers` by resolve_request
         form_fields: resolved.form_fields,
+        is_multipart,
         query_params: base.query_params.clone(),
         cookies: resolved.cookies,
         body: resolved.body,
@@ -549,12 +555,14 @@ pub fn run_collection(
             r.loading = false;
             r.error = format!("Base64 file error: {e}");
             return;
-        }
+        };
+
         let staged_dir =
             stage_out_of_scope_form_files(&mut entries, file_root.as_deref()).unwrap_or_default();
         run_entry = entries[0].clone();
         run_entry.ensure_run_content_length();
         let run_root = staged_dir.as_deref().or(file_root.as_deref());
+
         let content = run_entry.to_hurl();
 
         let out = run_hurl(&content, &vars, run_root);
