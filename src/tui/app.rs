@@ -13,7 +13,7 @@ use crate::environment::{
 };
 use crate::git_remote::{self, GitOrigin, RefKind};
 use crate::http::ApiResponse;
-use crate::hurl::{HurlEntry, RunStatus};
+use crate::hurl::{FormFieldKind, HurlEntry, RunStatus};
 use crate::i18n::{Language, Status, Strings};
 use crate::request::{self, AppVars, CaptureUpdate, build_request_json};
 
@@ -1538,7 +1538,13 @@ impl TuiApp {
                         // extension and set the dropdown to it; the user can
                         // still override it afterwards.
                         let inferred = infer_content_type(path).unwrap_or("");
-                        row.ctype = Editor::new(inferred, false);
+
+                        if row.kind == FormFieldKind::Base64File {
+                            let prefix_default = format!("data:{inferred};base64,");
+                            row.base64_prefix = Editor::new(&prefix_default, false);
+                        } else {
+                            row.ctype = Editor::new(inferred, false);
+                        }
                     }
                     form.focus = NewField::FormField(i, FormCol::Value);
                     self.overlay = Some(Overlay::NewRequest(form));
