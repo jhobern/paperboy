@@ -1596,16 +1596,6 @@ impl TuiApp {
                             _ => {}
                         },
                         NewField::Header(i, col) => match key.code {
-                            KeyCode::Left if ctrl => {
-                                if let Some(ed) = form.headers[i].cell_mut(col) {
-                                    ed.home();
-                                }
-                            }
-                            KeyCode::Right if ctrl => {
-                                if let Some(ed) = form.headers[i].cell_mut(col) {
-                                    ed.end();
-                                }
-                            }
                             KeyCode::Up => {
                                 // Move up a row, or leave the table upward to the
                                 // URL section when already on the first row.
@@ -1631,7 +1621,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_start {
                                     if let Some(ed) = form.headers[i].cell_mut(col) {
-                                        ed.left();
+                                        if ctrl {
+                                            ed.home()
+                                        } else {
+                                            ed.left();
+                                        }
                                     }
                                 } else if let Some(prev) = form.prev_col(col) {
                                     if let Some(ed) = form.headers[i].cell_mut(prev) {
@@ -1647,7 +1641,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_end {
                                     if let Some(ed) = form.headers[i].cell_mut(col) {
-                                        ed.right();
+                                        if ctrl {
+                                            ed.end();
+                                        } else {
+                                            ed.right();
+                                        }
                                     }
                                 } else if let Some(next) = form.next_col(col) {
                                     if let Some(ed) = form.headers[i].cell_mut(next) {
@@ -1684,16 +1682,6 @@ impl TuiApp {
                             _ => {}
                         },
                         NewField::Cookie(i, col) => match key.code {
-                            KeyCode::Left if ctrl => {
-                                if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                    ed.home();
-                                }
-                            }
-                            KeyCode::Right if ctrl => {
-                                if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                    ed.end();
-                                }
-                            }
                             KeyCode::Up => {
                                 form.focus = if i > 0 {
                                     NewField::Cookie(i - 1, col)
@@ -1715,7 +1703,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_start {
                                     if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                        ed.left();
+                                        if ctrl {
+                                            ed.home();
+                                        } else {
+                                            ed.left();
+                                        }
                                     }
                                 } else if let Some(prev) = form.prev_cookie_col(col) {
                                     if let Some(ed) = form.cookies[i].cell_mut(prev) {
@@ -1731,7 +1723,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_end {
                                     if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                        ed.right();
+                                        if ctrl {
+                                            ed.end();
+                                        } else {
+                                            ed.right();
+                                        }
                                     }
                                 } else if let Some(next) = form.next_cookie_col(col) {
                                     if let Some(ed) = form.cookies[i].cell_mut(next) {
@@ -1769,16 +1765,6 @@ impl TuiApp {
                             _ => {}
                         },
                         NewField::FormField(i, col) => match key.code {
-                            KeyCode::Left if ctrl => {
-                                if let Some(ed) = form.form_fields[i].cell_mut(col) {
-                                    ed.home();
-                                }
-                            }
-                            KeyCode::Right if ctrl => {
-                                if let Some(ed) = form.form_fields[i].cell_mut(col) {
-                                    ed.end();
-                                }
-                            }
                             KeyCode::Up => {
                                 form.focus = if i > 0 {
                                     NewField::FormField(i - 1, col)
@@ -1800,7 +1786,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_start {
                                     if let Some(ed) = form.form_fields[i].cell_mut(col) {
-                                        ed.left();
+                                        if ctrl {
+                                            ed.home();
+                                        } else {
+                                            ed.left();
+                                        }
                                     }
                                 } else if let Some(prev) = form.prev_form_col(col) {
                                     if let Some(ed) = form.form_fields[i].cell_mut(prev) {
@@ -1816,7 +1806,11 @@ impl TuiApp {
                                     .unwrap_or(true);
                                 if !at_end {
                                     if let Some(ed) = form.form_fields[i].cell_mut(col) {
-                                        ed.right();
+                                        if ctrl {
+                                            ed.end();
+                                        } else {
+                                            ed.right();
+                                        }
                                     }
                                 } else if let Some(next) = form.next_form_col(col) {
                                     if let Some(ed) = form.form_fields[i].cell_mut(next) {
@@ -1880,12 +1874,20 @@ impl TuiApp {
                             }
                             KeyCode::Left => {
                                 if let Some(row) = form.asserts.get_mut(i) {
-                                    row.expr.left();
+                                    if ctrl {
+                                        row.expr.home();
+                                    } else {
+                                        row.expr.left();
+                                    }
                                 }
                             }
                             KeyCode::Right => {
                                 if let Some(row) = form.asserts.get_mut(i) {
-                                    row.expr.right();
+                                    if ctrl {
+                                        row.expr.end();
+                                    } else {
+                                        row.expr.right();
+                                    }
                                 }
                             }
                             KeyCode::Home => {
@@ -1928,7 +1930,11 @@ impl TuiApp {
                             KeyCode::Left => {
                                 let at_start = form.captures[i].cell_mut(col).col == 0;
                                 if !at_start {
-                                    form.captures[i].cell_mut(col).left();
+                                    if ctrl {
+                                        form.captures[i].cell_mut(col).home();
+                                    } else {
+                                        form.captures[i].cell_mut(col).left();
+                                    }
                                 } else if let Some(prev) = form.prev_cap_col(col) {
                                     form.captures[i].cell_mut(prev).end();
                                     form.focus = NewField::Capture(i, prev);
@@ -1938,7 +1944,11 @@ impl TuiApp {
                                 let ed = form.captures[i].cell_mut(col);
                                 let at_end = ed.col >= ed.line_len(ed.row);
                                 if !at_end {
-                                    form.captures[i].cell_mut(col).right();
+                                    if ctrl {
+                                        form.captures[i].cell_mut(col).end();
+                                    } else {
+                                        form.captures[i].cell_mut(col).right();
+                                    }
                                 } else if let Some(next) = form.next_cap_col(col) {
                                     form.captures[i].cell_mut(next).home();
                                     form.focus = NewField::Capture(i, next);

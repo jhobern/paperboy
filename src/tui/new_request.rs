@@ -2340,10 +2340,7 @@ pub(crate) fn draw_header_cell(f: &mut Frame, area: Rect, ed: &Editor, focused: 
     if focused {
         render_editor(f, area, ed, false, th);
     } else {
-        f.render_widget(
-            Paragraph::new(ed.text()).style(Style::default().fg(th.text)),
-            area,
-        );
+        render_clippable_line(f, ed.text(), area, th.text, th);
     }
 }
 
@@ -2515,10 +2512,10 @@ pub(crate) fn draw_cookie_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
 /// cell (fixed `"File \u{25be}"`-width) itself.
 pub(crate) fn form_widths(total: u16) -> (u16, u16, u16, u16, u16, u16, u16) {
     let en = ENABLED_W;
-    let kind_w = 12u16;
-    let ctype_w = 18u16;
-    let prefix_w = 16u16;
-    let key = 14u16;
+    let kind_w = 11u16;
+    let ctype_w = 14u16;
+    let prefix_w = 14u16;
+    let key = 20u16;
     let value = 20u16;
     // Widest layout: every column including Prefix and Desc.
     if total >= en + kind_w + ctype_w + prefix_w + key + value + 6 + 6 {
@@ -2598,6 +2595,30 @@ fn form_value_color(row: &FormRow, file_root: Option<&PathBuf>, th: &Theme) -> C
             .join(path)
     };
     if resolved.is_file() { th.ok } else { th.err }
+}
+
+fn render_clippable_line(
+    frame: &mut Frame,
+    text: String,
+    text_rect: Rect,
+    color: Color,
+    theme: &Theme,
+) {
+    let width = text_rect.width.into();
+    let clipped = text.len() > width;
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(color)),
+        text_rect,
+    );
+    if clipped {
+        let ellipsis = "\u{2026}";
+        let mut last_character_position = text_rect;
+        last_character_position.x += width as u16 - 1;
+        frame.render_widget(
+            Paragraph::new(ellipsis).style(Style::default().fg(theme.dim)),
+            last_character_position,
+        );
+    }
 }
 
 /// Draw the `[Form]`/`[Multipart]` table: Enabled/Key/Type/Value/Content-Type/
@@ -2730,10 +2751,7 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             render_editor(f, text_rect, &row.value, false, th);
         } else {
             let color = form_value_color(row, form.file_root.as_ref(), th);
-            f.render_widget(
-                Paragraph::new(row.value.text()).style(Style::default().fg(color)),
-                text_rect,
-            );
+            render_clippable_line(f, row.value.text(), text_rect, color, th);
         }
         if let Some(icon_rect) = file_icon_rect {
             let icon_color = if value_focused { th.accent } else { th.dim };
@@ -2760,8 +2778,16 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
                     cells[ctype_idx],
                 );
             } else if row.kind == FormFieldKind::Base64File {
+                let padding = " ".repeat((cells[ctype_idx].width - 2) as usize / 2);
                 // Content-Type doesn't apply to a Base64File (it's sent as
                 // plain text): leave the cell blank rather than editable.
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("{padding}\u{2014}"),
+                        Style::default().fg(th.dim),
+                    )),
+                    cells[ctype_idx],
+                );
             } else {
                 draw_header_cell(f, cells[ctype_idx], &row.ctype, ctype_focused, th);
             }
@@ -2780,8 +2806,12 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
                 && !prefix_focused
                 && row.base64_prefix.text().is_empty()
             {
+                let padding = " ".repeat((cells[prefix_idx].width - 2) as usize / 2);
                 f.render_widget(
-                    Paragraph::new(Span::styled("\u{2014}", Style::default().fg(th.dim))),
+                    Paragraph::new(Span::styled(
+                        format!("{padding}\u{2014}"),
+                        Style::default().fg(th.dim),
+                    )),
                     cells[prefix_idx],
                 );
             } else {
