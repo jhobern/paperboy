@@ -1540,9 +1540,11 @@ impl TuiApp {
                         let inferred = infer_content_type(path).unwrap_or("");
 
                         if row.kind == FormFieldKind::Base64File && !inferred.is_empty() {
+                            row.ctype = Editor::new("", false);
                             let prefix_default = format!("data:{inferred};base64,");
                             row.base64_prefix = Editor::new(&prefix_default, false);
                         } else {
+                            row.base64_prefix = Editor::new("", false);
                             row.ctype = Editor::new(inferred, false);
                         }
                     }

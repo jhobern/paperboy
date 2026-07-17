@@ -3259,6 +3259,25 @@ impl TuiApp {
                 };
             }
         } else if kind_open && key.code == KeyCode::Enter {
+            if let NewField::FormField(i, _) = form.focus
+                && let Some(row) = form.form_fields.get_mut(i)
+            {
+                if row.kind == FormFieldKind::Base64File {
+                    row.ctype = Editor::new("", false);
+                    // Auto-infer the content type from the picked file's
+                    // extension and set the dropdown to it; the user can
+                    // still override it afterwards.
+                    let inferred = infer_content_type(&row.value.text()).unwrap_or("");
+
+                    if !inferred.is_empty() {
+                        let prefix_default = format!("data:{inferred};base64,");
+                        row.base64_prefix = Editor::new(&prefix_default, false);
+                    }
+                } else {
+                    row.base64_prefix = Editor::new("", false);
+                }
+            }
+
             // Enter just confirms the picked Type and closes the
             // dropdown — focus stays on the Kind cell since the
             // dropdown arrows can't accidentally steal it back.
