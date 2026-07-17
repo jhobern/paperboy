@@ -1470,10 +1470,11 @@ impl TuiApp {
                 } else if !ctrl
                     && key.code == KeyCode::Enter
                     && let NewField::FormField(i, FormCol::Value) = form.focus
-                    && matches!(
-                        form.form_fields.get(i).map(|r| r.kind),
-                        Some(FormFieldKind::File | FormFieldKind::Base64File)
-                    )
+                    && form
+                        .form_fields
+                        .get(i)
+                        .map(|r| r.kind)
+                        .is_some_and(|v| v.is_multipart())
                 {
                     // Enter on a `File`/`Base64File`-kind Form row's Value
                     // cell opens the file picker too, not just Ctrl+F — it's
@@ -1486,10 +1487,11 @@ impl TuiApp {
                     // Value cell (only meaningful for `File`/`Base64File`
                     // rows, which both point at a file).
                     if let NewField::FormField(i, FormCol::Value) = form.focus
-                        && matches!(
-                            form.form_fields.get(i).map(|r| r.kind),
-                            Some(FormFieldKind::File | FormFieldKind::Base64File)
-                        )
+                        && form
+                            .form_fields
+                            .get(i)
+                            .map(|r| r.kind)
+                            .is_some_and(|v| v.is_multipart())
                     {
                         self.parked_wizard = Some(form);
                         self.open_browser(FileAction::PickFormFile(i));

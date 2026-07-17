@@ -1565,10 +1565,11 @@ pub(crate) fn draw_new_request(
     // Form row's Value cell is focused (both pick a file), so the
     // always-visible hint bar stays short otherwise.
     if let NewField::FormField(i, FormCol::Value) = form.focus
-        && matches!(
-            form.form_fields.get(i).map(|r| r.kind),
-            Some(FormFieldKind::File | FormFieldKind::Base64File)
-        )
+        && form
+            .form_fields
+            .get(i)
+            .map(|r| r.kind)
+            .is_some_and(|v| v.is_multipart())
     {
         hint = format!("{hint} · {}", s.hint_pick_file);
     }
@@ -2514,7 +2515,7 @@ pub(crate) fn draw_cookie_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
 /// cell (fixed `"File \u{25be}"`-width) itself.
 pub(crate) fn form_widths(total: u16) -> (u16, u16, u16, u16, u16, u16, u16) {
     let en = ENABLED_W;
-    let kind_w = 8u16;
+    let kind_w = 12u16;
     let ctype_w = 18u16;
     let prefix_w = 16u16;
     let key = 14u16;
@@ -2580,7 +2581,7 @@ pub(crate) fn form_cell_rects(
 /// directory when unset) to an existing file, `th.err` otherwise. Text
 /// fields and empty paths use the normal text colour.
 fn form_value_color(row: &FormRow, file_root: Option<&PathBuf>, th: &Theme) -> Color {
-    if !matches!(row.kind, FormFieldKind::File | FormFieldKind::Base64File) {
+    if !row.kind.is_multipart() {
         return th.text;
     }
     let text = row.value.text();
@@ -2717,7 +2718,7 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         // Value cell — both pick a file — anchoring it to the Value field, as
         // a hint that pressing Enter (or Ctrl+F) opens a file picker, not
         // otherwise obvious since the cell looks like plain text entry.
-        let value_is_file = matches!(row.kind, FormFieldKind::File | FormFieldKind::Base64File);
+        let value_is_file = row.kind.is_multipart();
         let (file_icon_rect, text_rect) = if value_is_file && cells[value_idx].width > 2 {
             let split = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)])
                 .split(cells[value_idx]);

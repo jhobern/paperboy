@@ -80,6 +80,8 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
         }
     }
 
+    let is_multipart = form_fields.iter().any(|f| f.kind.is_multipart());
+
     HurlEntry {
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
@@ -87,6 +89,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
         headers: req.headers.iter().map(kv_pair).collect(),
         basic_auth,
         form_fields,
+        is_multipart,
         query_params,
         cookies,
         body: req.body.as_ref().and_then(body_source),

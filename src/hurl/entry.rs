@@ -20,6 +20,12 @@ pub enum FormFieldKind {
     Base64File,
 }
 
+impl FormFieldKind {
+    pub fn is_multipart(&self) -> bool {
+        matches!(self, FormFieldKind::Base64File | FormFieldKind::File)
+    }
+}
+
 /// Marker stored in a `Base64File` field's Hurl content-type slot so a saved
 /// `.hurl` round-trips back into a `Base64File` (Hurl has no native concept
 /// of "encode this file as base64 text"). The base64_prefix follows the
@@ -94,6 +100,8 @@ pub struct HurlEntry {
     /// loadable — they simply start with no form fields.
     #[serde(default)]
     pub form_fields: Vec<FormField>,
+    #[serde(default)]
+    pub is_multipart: bool,
     pub query_params: Vec<(String, String)>,
     /// `[Cookies]` `(name, value)` pairs — syntactic sugar over a `Cookie:`
     /// header. `#[serde(default)]` keeps older saved states loadable.
@@ -183,13 +191,14 @@ impl HurlEntry {
             self.method.to_ascii_uppercase().as_str(),
             "POST" | "PUT" | "PATCH" | "DELETE"
         );
+        let has_forms = !self.form_fields.is_empty();
         let has_body = self.body.as_deref().is_some_and(|b| !b.trim().is_empty())
             || !self.form_fields.is_empty();
         let has_content_length = self
             .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
-        if carries_body && !has_body && !has_content_length {
+        if carries_body && !has_body && !has_content_length && !has_forms {
             self.headers
                 .push(("Content-Length".to_string(), "0".to_string()));
         }
@@ -242,10 +251,8 @@ impl HurlEntry {
             // (Hurl's `[Form]` section is text-only); a Base64File also
             // serializes as a `file,...` line (carrying its marker), so it
             // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
-            let multipart = self
-                .form_fields
-                .iter()
-                .any(|f| matches!(f.kind, FormFieldKind::File | FormFieldKind::Base64File));
+            let multipart =
+                self.form_fields.iter().any(|f| f.kind.is_multipart()) || self.is_multipart;
             out.push_str(if multipart {
                 "[Multipart]\n"
             } else {
