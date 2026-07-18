@@ -52,7 +52,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
             SectionValue::MultipartFormData(parts, _) => {
                 form_fields = parts.iter().map(multipart_field).collect();
             }
-            SectionValue::QueryParams(kvs, _) => query_params = kvs.iter().map(kv_pair).collect(),
+            SectionValue::QueryParams(kvs, _) => query_params = kvs.iter().map(kv_triple).collect(),
             SectionValue::Cookies(cs) => cookies = cs.iter().map(cookie_triple).collect(),
             _ => {}
         }
@@ -93,7 +93,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
         basic_auth,
         form_fields,
         is_multipart,
-        query_params,
+        queries: query_params,
         cookies,
         body: req.body.as_ref().and_then(body_source),
         expected_status,

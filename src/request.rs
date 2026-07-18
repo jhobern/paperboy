@@ -300,7 +300,7 @@ struct RequestJson {
     headers: BTreeMap<String, (TextValue, bool)>,
     method: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query_params: BTreeMap<String, TextValue>,
+    query_params: BTreeMap<String, (TextValue, bool)>,
     url: String,
 }
 
@@ -343,7 +343,7 @@ pub fn build_request_json(entry: &HurlEntry) -> String {
         form_fields: entry.form_fields.iter().map(FormFieldJson::from).collect(),
         headers: triples_to_map(&entry.headers),
         method: entry.method.clone(),
-        query_params: pairs_to_map(&entry.query_params),
+        query_params: triples_to_map(&entry.queries),
         url: entry.url.clone(),
     };
     serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".into())
@@ -368,7 +368,7 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
     entry.basic_auth = dto.basic_auth.map(|ba| (ba.user.0, ba.pass.0));
     entry.headers = map_to_triples(dto.headers);
     entry.cookies = map_to_triples(dto.cookies);
-    entry.query_params = map_to_pairs(dto.query_params);
+    entry.queries = map_to_triples(dto.query_params);
     entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
     entry.body = body;
     Ok(entry)
@@ -507,7 +507,7 @@ fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry>
         basic_auth: None, // already encoded into `headers` by resolve_request
         form_fields: resolved.form_fields,
         is_multipart,
-        query_params: base.query_params.clone(),
+        queries: base.queries.clone(),
         cookies: resolved
             .cookies
             .iter()
@@ -789,7 +789,7 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
         add(k);
         add(v);
     }
-    for (k, v) in &entry.query_params {
+    for (k, v, _) in &entry.queries {
         add(k);
         add(v);
     }
@@ -912,7 +912,7 @@ mod tests {
                 ("Authorization".into(), "Bearer t".into(), true),
             ],
             cookies: vec![("session".into(), "abc".into(), true)],
-            query_params: vec![("page".into(), "2".into())],
+            queries: vec![("page".into(), "2".into(), true)],
             basic_auth: Some(("alice".into(), "secret".into())),
             form_fields: vec![
                 FormField {

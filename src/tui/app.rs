@@ -1265,7 +1265,7 @@ impl TuiApp {
                             || entry.headers != parsed.headers
                             || entry.basic_auth != parsed.basic_auth
                             || entry.form_fields != parsed.form_fields
-                            || entry.query_params != parsed.query_params
+                            || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
                             || entry.body != parsed.body
                             || entry.expected_status != parsed.expected_status
@@ -1324,7 +1324,7 @@ impl TuiApp {
                             || entry.headers != parsed.headers
                             || entry.basic_auth != parsed.basic_auth
                             || entry.form_fields != parsed.form_fields
-                            || entry.query_params != parsed.query_params
+                            || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
                             || entry.body != parsed.body;
                         if changed {

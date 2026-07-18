@@ -1366,6 +1366,19 @@ impl TuiApp {
     /// entry in place — preserving fields the wizard doesn't expose
     /// (`query_params`/`form_params`/`basic_auth`/`expected_status`).
     pub(crate) fn submit_new_request(&mut self, form: NewReq) {
+        fn header_rows_to_triples(rows: &[HeaderRow]) -> Vec<(String, String, bool)> {
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.key.text().trim().to_string(),
+                        r.value.text().trim().to_string(),
+                        r.enabled,
+                    )
+                })
+                .filter(|(k, _, _)| !k.is_empty())
+                .collect()
+        }
+
         let url = form.url.text().trim().to_string();
         if url.is_empty() {
             return; // nothing to create/save
@@ -1378,30 +1391,9 @@ impl TuiApp {
         // siblings. The list already shows the URL for every row, so an empty
         // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let headers: Vec<(String, String, bool)> = form
-            .headers
-            .iter()
-            .map(|r| {
-                (
-                    r.key.text().trim().to_string(),
-                    r.value.text().trim().to_string(),
-                    r.enabled,
-                )
-            })
-            .filter(|(k, _, _)| !k.is_empty())
-            .collect();
-        let cookies: Vec<(String, String, bool)> = form
-            .cookies
-            .iter()
-            .map(|r| {
-                (
-                    r.key.text().trim().to_string(),
-                    r.value.text().trim().to_string(),
-                    r.enabled,
-                )
-            })
-            .filter(|(k, _, _)| !k.is_empty())
-            .collect();
+        let headers: Vec<(String, String, bool)> = header_rows_to_triples(&form.headers);
+        let cookies: Vec<(String, String, bool)> = header_rows_to_triples(&form.cookies);
+        let queries: Vec<(String, String, bool)> = header_rows_to_triples(&form.queries);
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
@@ -1467,6 +1459,7 @@ impl TuiApp {
                 || entry.url != url
                 || entry.headers != headers
                 || entry.cookies != cookies
+                || entry.queries != queries
                 || entry.form_fields != form_fields
                 || entry.body != body
                 || entry.asserts != asserts
@@ -1477,6 +1470,7 @@ impl TuiApp {
                 entry.url = url;
                 entry.headers = headers;
                 entry.cookies = cookies;
+                entry.queries = queries;
                 entry.form_fields = form_fields;
                 entry.body = body;
                 entry.asserts = asserts;
@@ -1494,6 +1488,7 @@ impl TuiApp {
         let mut entry =
             HurlEntry::from_fields(&name, form.method(), &url, headers, &form.body.text());
         entry.cookies = cookies;
+        entry.queries = queries;
         entry.form_fields = form_fields;
         entry.asserts = asserts;
         entry.captures = captures;
@@ -3141,6 +3136,91 @@ impl TuiApp {
     }
 
     fn new_request_key_handler(&mut self, key: KeyEvent, mut form: Box<NewReq>) {
+        fn handle_input_headerlike_table(
+            mut form: Box<NewReq>,
+            row: &mut [HeaderRow],
+            (i, col): (usize, HdrCol),
+            key: &KeyEvent,
+            new_focus: fn(usize, HdrCol) -> NewField,
+            up_destination: NewField,
+            down_destination: NewField,
+        ) {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Up => {
+                    // Move up a row, or leave the table upward to the
+                    // given `up_destination` when already on the first row.
+                    form.focus = if i > 0 {
+                        new_focus(i - 1, col)
+                    } else {
+                        up_destination
+                    };
+                }
+                KeyCode::Down => {
+                    // Move down a row, or leave the table downward to
+                    // the given `down_destination` when on the last row.
+                    form.focus = if i + 1 < row.len() {
+                        new_focus(i + 1, col)
+                    } else {
+                        down_destination
+                    };
+                }
+                KeyCode::Left => {
+                    let at_start = row[i].cell_mut(col).map(|ed| ed.col == 0).unwrap_or(true);
+                    if !at_start {
+                        if let Some(ed) = row[i].cell_mut(col) {
+                            if ctrl {
+                                ed.home()
+                            } else {
+                                ed.left();
+                            }
+                        }
+                    } else if let Some(prev) = form.prev_col(col) {
+                        if let Some(ed) = row[i].cell_mut(prev) {
+                            ed.end();
+                        }
+                        form.focus = new_focus(i, prev);
+                    }
+                }
+                KeyCode::Right => {
+                    let at_end = row[i]
+                        .cell_mut(col)
+                        .map(|ed| ed.col >= ed.line_len(ed.row))
+                        .unwrap_or(true);
+                    if !at_end {
+                        if let Some(ed) = row[i].cell_mut(col) {
+                            if ctrl {
+                                ed.end();
+                            } else {
+                                ed.right();
+                            }
+                        }
+                    } else if let Some(next) = form.next_col(col) {
+                        if let Some(ed) = row[i].cell_mut(next) {
+                            ed.home();
+                        }
+                        form.focus = new_focus(i, next);
+                    }
+                }
+                KeyCode::Enter => form.focus_next(true, true),
+                KeyCode::Char(' ') if col == HdrCol::Enabled => {
+                    if let Some(row) = row.get_mut(i) {
+                        row.enabled = !row.enabled;
+                    }
+                }
+                _ => {
+                    if let Some(ed) = row[i].cell_mut(col) {
+                        match key.code {
+                            KeyCode::Char(ch) => ed.insert(ch),
+                            KeyCode::Backspace => ed.backspace(),
+                            KeyCode::Home => ed.home(),
+                            KeyCode::End => ed.end(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
         let prev_focus = form.focus;
@@ -3370,7 +3450,7 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='6') = key.code {
+        } else if alt && let KeyCode::Char(c @ '1'..='7') = key.code {
             // Alt+1..6 jumps directly to a section by number
             // (Headers/Cookies/Form/Body/Asserts/Captures), regardless
             // of the current section-view tab — a direct-jump
@@ -3383,10 +3463,11 @@ impl TuiApp {
             let tab = match c {
                 '1' => WizardTab::Headers,
                 '2' => WizardTab::Cookies,
-                '3' => WizardTab::Form,
-                '4' => WizardTab::Body,
-                '5' => WizardTab::Asserts,
-                _ => WizardTab::Captures, // '6'
+                '3' => WizardTab::Queries,
+                '4' => WizardTab::Form,
+                '5' => WizardTab::Body,
+                '6' => WizardTab::Asserts,
+                _ => WizardTab::Captures, // '7'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -3585,6 +3666,88 @@ impl TuiApp {
                         }
                     }
                 },
+                NewField::AddQuery => match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        form.queries.push(HeaderRow::new());
+                        form.focus = NewField::Query(form.queries.len() - 1, HdrCol::Key);
+                    }
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
+                NewField::Query(i, col) => match key.code {
+                    KeyCode::Up => {
+                        form.focus = if i > 0 {
+                            NewField::Query(i - 1, col)
+                        } else {
+                            form.up_into_cookies()
+                        };
+                    }
+                    KeyCode::Down => {
+                        form.focus = if i + 1 < form.queries.len() {
+                            NewField::Query(i + 1, col)
+                        } else {
+                            NewField::AddQuery
+                        };
+                    }
+                    KeyCode::Left => {
+                        let at_start = form.queries[i]
+                            .cell_mut(col)
+                            .map(|ed| ed.col == 0)
+                            .unwrap_or(true);
+                        if !at_start {
+                            if let Some(ed) = form.queries[i].cell_mut(col) {
+                                if ctrl {
+                                    ed.home();
+                                } else {
+                                    ed.left();
+                                }
+                            }
+                        } else if let Some(prev) = form.prev_query_col(col) {
+                            if let Some(ed) = form.queries[i].cell_mut(prev) {
+                                ed.end();
+                            }
+                            form.focus = NewField::Query(i, prev);
+                        }
+                    }
+                    KeyCode::Right => {
+                        let at_end = form.queries[i]
+                            .cell_mut(col)
+                            .map(|ed| ed.col >= ed.line_len(ed.row))
+                            .unwrap_or(true);
+                        if !at_end {
+                            if let Some(ed) = form.queries[i].cell_mut(col) {
+                                if ctrl {
+                                    ed.end();
+                                } else {
+                                    ed.right();
+                                }
+                            }
+                        } else if let Some(next) = form.next_query_col(col) {
+                            if let Some(ed) = form.queries[i].cell_mut(next) {
+                                ed.home();
+                            }
+                            form.focus = NewField::Query(i, next);
+                        }
+                    }
+                    KeyCode::Enter => form.focus_next(true, true),
+                    KeyCode::Char(' ') if col == HdrCol::Enabled => {
+                        if let Some(row) = form.queries.get_mut(i) {
+                            row.enabled = !row.enabled;
+                        }
+                    }
+                    _ => {
+                        if let Some(ed) = form.queries[i].cell_mut(col) {
+                            match key.code {
+                                KeyCode::Char(ch) => ed.insert(ch),
+                                KeyCode::Backspace => ed.backspace(),
+                                KeyCode::Home => ed.home(),
+                                KeyCode::End => ed.end(),
+                                _ => {}
+                            }
+                        }
+                    }
+                },
                 NewField::AddFormField => match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         form.form_fields.push(FormRow::new());
@@ -3613,7 +3776,7 @@ impl TuiApp {
 
                             NewField::FormField(i - 1, target_col)
                         } else {
-                            form.up_into_cookies()
+                            form.up_into_queries()
                         };
                     }
                     KeyCode::Down => {

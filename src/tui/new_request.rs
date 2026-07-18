@@ -339,6 +339,8 @@ pub(crate) enum NewField {
     AddHeader,
     Cookie(usize, HdrCol),
     AddCookie,
+    Query(usize, HdrCol),
+    AddQuery,
     FormField(usize, FormCol),
     AddFormField,
     Body,
@@ -358,6 +360,7 @@ impl NewField {
             NewField::Name | NewField::Target | NewField::Method | NewField::Url => None,
             NewField::Header(..) | NewField::AddHeader => Some(WizardTab::Headers),
             NewField::Cookie(..) | NewField::AddCookie => Some(WizardTab::Cookies),
+            NewField::Query(..) | NewField::AddQuery => Some(WizardTab::Queries),
             NewField::FormField(..) | NewField::AddFormField => Some(WizardTab::Form),
             NewField::Body => Some(WizardTab::Body),
             NewField::Assert(..) | NewField::AddAssert => Some(WizardTab::Asserts),
@@ -376,6 +379,7 @@ pub(crate) enum WizardTab {
     All,
     Headers,
     Cookies,
+    Queries,
     Form,
     Body,
     Asserts,
@@ -385,10 +389,11 @@ pub(crate) enum WizardTab {
 impl WizardTab {
     /// All tabs, in their default display order — used to initialize a
     /// fresh `NewReq::tab_order` (which the user may subsequently reorder).
-    pub(crate) const ALL: [WizardTab; 7] = [
+    pub(crate) const ALL: [WizardTab; 8] = [
         WizardTab::All,
         WizardTab::Headers,
         WizardTab::Cookies,
+        WizardTab::Queries,
         WizardTab::Form,
         WizardTab::Body,
         WizardTab::Asserts,
@@ -400,6 +405,7 @@ impl WizardTab {
             WizardTab::All => s.tab_all,
             WizardTab::Headers => s.field_headers,
             WizardTab::Cookies => s.field_cookies,
+            WizardTab::Queries => s.field_queries,
             WizardTab::Form => s.field_form,
             WizardTab::Body => s.field_body,
             WizardTab::Asserts => s.field_asserts,
@@ -418,6 +424,7 @@ impl WizardTab {
             WizardTab::All => NewField::Name,
             WizardTab::Headers => NewField::Header(0, HdrCol::Key),
             WizardTab::Cookies => NewField::Cookie(0, HdrCol::Key),
+            WizardTab::Queries => NewField::Query(0, HdrCol::Key),
             WizardTab::Form => NewField::FormField(0, FormCol::Key),
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::Assert(0),
@@ -432,6 +439,7 @@ impl WizardTab {
             WizardTab::All => NewField::Name,
             WizardTab::Headers => NewField::AddHeader,
             WizardTab::Cookies => NewField::AddCookie,
+            WizardTab::Queries => NewField::AddQuery,
             WizardTab::Form => NewField::AddFormField,
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::AddAssert,
@@ -446,6 +454,7 @@ pub(crate) struct NewReq {
     pub(crate) url: Editor,
     pub(crate) headers: Vec<HeaderRow>,
     pub(crate) cookies: Vec<HeaderRow>,
+    pub(crate) queries: Vec<HeaderRow>,
     pub(crate) form_fields: Vec<FormRow>,
     pub(crate) body: Editor,
     pub(crate) asserts: Vec<AssertRow>,
@@ -490,6 +499,9 @@ pub(crate) struct NewReq {
     /// Like `desc_visible`, but for the Cookies table (a separate table with
     /// its own available width).
     pub(crate) cookie_desc_visible: std::cell::Cell<bool>,
+    /// Like `desc_visible`, but for the Queries table (a separate table with
+    /// its own available width).
+    pub(crate) query_desc_visible: std::cell::Cell<bool>,
     /// Like `desc_visible`, but for the Form table's Description column.
     pub(crate) form_desc_visible: std::cell::Cell<bool>,
     /// Set during draw: whether the Form table's Content-Type column
@@ -503,6 +515,7 @@ pub(crate) struct NewReq {
     /// than fit on screen.
     pub(crate) header_scroll: std::cell::Cell<usize>,
     pub(crate) cookie_scroll: std::cell::Cell<usize>,
+    pub(crate) query_scroll: std::cell::Cell<usize>,
     pub(crate) form_scroll: std::cell::Cell<usize>,
     pub(crate) assert_scroll: std::cell::Cell<usize>,
     pub(crate) capture_scroll: std::cell::Cell<usize>,
@@ -540,6 +553,7 @@ impl NewReq {
             url: Editor::blank(),
             headers: Vec::new(),
             cookies: Vec::new(),
+            queries: Vec::new(),
             form_fields: Vec::new(),
             body: Editor::new("", true),
             asserts: Vec::new(),
@@ -559,11 +573,13 @@ impl NewReq {
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             cookie_desc_visible: std::cell::Cell::new(true),
+            query_desc_visible: std::cell::Cell::new(true),
             form_desc_visible: std::cell::Cell::new(true),
             form_ctype_visible: std::cell::Cell::new(true),
             form_prefix_visible: std::cell::Cell::new(true),
             header_scroll: std::cell::Cell::new(0),
             cookie_scroll: std::cell::Cell::new(0),
+            query_scroll: std::cell::Cell::new(0),
             form_scroll: std::cell::Cell::new(0),
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
@@ -585,37 +601,30 @@ impl NewReq {
         target_names: Vec<String>,
         file_root: Option<PathBuf>,
     ) -> Self {
+        fn header_rows_from_triples(triples: &[(String, String, bool)]) -> Vec<HeaderRow> {
+            if triples.is_empty() {
+                Vec::new()
+            } else {
+                triples
+                    .iter()
+                    .map(|(k, v, e)| {
+                        let mut row = HeaderRow::new();
+                        row.key = Editor::new(k, false);
+                        row.value = Editor::new(v, false);
+                        row.enabled = *e;
+                        row
+                    })
+                    .collect()
+            }
+        }
+
         let method_idx = METHODS.iter().position(|m| *m == entry.method).unwrap_or(0);
-        let headers = if entry.headers.is_empty() {
-            Vec::new()
-        } else {
-            entry
-                .headers
-                .iter()
-                .map(|(k, v, e)| {
-                    let mut row = HeaderRow::new();
-                    row.key = Editor::new(k, false);
-                    row.value = Editor::new(v, false);
-                    row.enabled = *e;
-                    row
-                })
-                .collect()
-        };
-        let cookies = if entry.cookies.is_empty() {
-            Vec::new()
-        } else {
-            entry
-                .cookies
-                .iter()
-                .map(|(k, v, e)| {
-                    let mut row = HeaderRow::new();
-                    row.key = Editor::new(k, false);
-                    row.value = Editor::new(v, false);
-                    row.enabled = *e;
-                    row
-                })
-                .collect()
-        };
+        let headers = header_rows_from_triples(&entry.headers);
+
+        let cookies = header_rows_from_triples(&entry.cookies);
+
+        let queries = header_rows_from_triples(&entry.queries);
+
         let form_fields = if entry.form_fields.is_empty() {
             Vec::new()
         } else {
@@ -659,6 +668,7 @@ impl NewReq {
             url: Editor::new(&entry.url, false),
             headers,
             cookies,
+            queries,
             form_fields,
             body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
             asserts,
@@ -678,11 +688,13 @@ impl NewReq {
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             cookie_desc_visible: std::cell::Cell::new(true),
+            query_desc_visible: std::cell::Cell::new(true),
             form_desc_visible: std::cell::Cell::new(true),
             form_ctype_visible: std::cell::Cell::new(true),
             form_prefix_visible: std::cell::Cell::new(true),
             header_scroll: std::cell::Cell::new(0),
             cookie_scroll: std::cell::Cell::new(0),
+            query_scroll: std::cell::Cell::new(0),
             form_scroll: std::cell::Cell::new(0),
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
@@ -902,6 +914,7 @@ impl NewReq {
             NewField::Body => Some(&mut self.body),
             NewField::Header(i, col) => self.headers.get_mut(i).and_then(|r| r.cell_mut(col)),
             NewField::Cookie(i, col) => self.cookies.get_mut(i).and_then(|r| r.cell_mut(col)),
+            NewField::Query(i, col) => self.queries.get_mut(i).and_then(|r| r.cell_mut(col)),
             NewField::FormField(i, col) => {
                 self.form_fields.get_mut(i).and_then(|r| r.cell_mut(col))
             }
@@ -911,6 +924,7 @@ impl NewReq {
             | NewField::Target
             | NewField::AddHeader
             | NewField::AddCookie
+            | NewField::AddQuery
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture => None,
@@ -1031,6 +1045,7 @@ impl NewReq {
         let row = match self.focus {
             NewField::Header(i, _) => self.headers.get_mut(i).map(|r| &mut r.enabled),
             NewField::Cookie(i, _) => self.cookies.get_mut(i).map(|r| &mut r.enabled),
+            NewField::Query(i, _) => self.queries.get_mut(i).map(|r| &mut r.enabled),
             NewField::FormField(i, _) => self.form_fields.get_mut(i).map(|r| &mut r.enabled),
             _ => None,
         };
@@ -1043,6 +1058,12 @@ impl NewReq {
     /// tabbing between Headers and Form.
     pub(crate) fn cookies_blank(&self) -> bool {
         self.cookies.iter().all(HeaderRow::is_blank)
+    }
+
+    /// True when every query row is blank — the section is then skipped when
+    /// tabbing between Headers and Form.
+    pub(crate) fn queries_blank(&self) -> bool {
+        self.queries.iter().all(HeaderRow::is_blank)
     }
 
     /// True when every form-field row is blank — the section is then skipped
@@ -1069,6 +1090,15 @@ impl NewReq {
             NewField::AddCookie
         } else {
             NewField::Cookie(0, HdrCol::Key)
+        }
+    }
+
+    /// Like [`Self::header_entry`], but for Queries.
+    pub(crate) fn query_entry(&self) -> NewField {
+        if self.queries.is_empty() {
+            NewField::AddQuery
+        } else {
+            NewField::Query(0, HdrCol::Key)
         }
     }
 
@@ -1103,6 +1133,17 @@ impl NewReq {
             NewField::AddCookie
         } else {
             NewField::Cookie(self.cookies.len() - 1, HdrCol::Key)
+        }
+    }
+    /// Like [`Self::up_into_headers`], but for leaving the first Form-field
+    /// row upward into Queries: lands on the last Query row, or "+ Add
+    /// Query" when Queries is empty — never skips straight past it into
+    /// Cookies, mirroring Down's own one-section-at-a-time behaviour.
+    pub(crate) fn up_into_queries(&self) -> NewField {
+        if self.queries.is_empty() {
+            NewField::AddQuery
+        } else {
+            NewField::Query(self.queries.len() - 1, HdrCol::Key)
         }
     }
 
@@ -1144,6 +1185,19 @@ impl NewReq {
         }
     }
 
+    /// Columns visited by Tab / Shift+Tab within a `Key/Value/Desc/Enabled`
+    /// row. The Enabled checkbox is intentionally excluded — it is reached
+    /// with the arrow keys or by pressing Ctrl+E. A brand new row always
+    /// starts focus on Key regardless of this order (set explicitly when the
+    /// row is created), not by tabbing from the first entry here.
+    fn hdr_query_cells(desc_visible: bool) -> Vec<HdrCol> {
+        if desc_visible {
+            vec![HdrCol::Key, HdrCol::Value, HdrCol::Desc]
+        } else {
+            vec![HdrCol::Key, HdrCol::Value]
+        }
+    }
+
     /// All columns of a header row, for arrow-key navigation. See
     /// [`Self::hdr_row_cells`].
     pub(crate) fn row_cells(&self) -> Vec<HdrCol> {
@@ -1175,9 +1229,20 @@ impl NewReq {
         Self::hdr_row_cells(self.cookie_desc_visible.get())
     }
 
+    /// All columns of a query row, for arrow-key navigation (a Query row has
+    /// the same shape as a header row, with its own Description visibility).
+    pub(crate) fn query_row_cells(&self) -> Vec<HdrCol> {
+        Self::hdr_row_cells(self.query_desc_visible.get())
+    }
+
     /// Columns visited by Tab / Shift+Tab within a cookie row.
     pub(crate) fn cookie_tab_cells(&self) -> Vec<HdrCol> {
         Self::hdr_tab_cells(self.cookie_desc_visible.get())
+    }
+
+    /// Columns visited by Tab / Shift+Tab within a query row.
+    pub(crate) fn query_tab_cells(&self) -> Vec<HdrCol> {
+        Self::hdr_query_cells(self.query_desc_visible.get())
     }
 
     /// The column to the left of `col` within a cookie row, if any.
@@ -1187,9 +1252,23 @@ impl NewReq {
         idx.checked_sub(1).map(|p| cells[p])
     }
 
+    /// The column to the left of `col` within a query row, if any.
+    pub(crate) fn prev_query_col(&self, col: HdrCol) -> Option<HdrCol> {
+        let cells = self.query_row_cells();
+        let idx = cells.iter().position(|c| *c == col)?;
+        idx.checked_sub(1).map(|p| cells[p])
+    }
+
     /// The column to the right of `col` within a cookie row, if any.
     pub(crate) fn next_cookie_col(&self, col: HdrCol) -> Option<HdrCol> {
         let cells = self.cookie_row_cells();
+        let idx = cells.iter().position(|c| *c == col)?;
+        cells.get(idx + 1).copied()
+    }
+
+    /// The column to the right of `col` within a query row, if any.
+    pub(crate) fn next_query_col(&self, col: HdrCol) -> Option<HdrCol> {
+        let cells = self.query_row_cells();
         let idx = cells.iter().position(|c| *c == col)?;
         cells.get(idx + 1).copied()
     }
@@ -1310,13 +1389,15 @@ impl NewReq {
             NewField::AddHeader => (4, usize::MAX, 0),
             NewField::Cookie(i, c) => (5, i, hdr(c)),
             NewField::AddCookie => (5, usize::MAX, 0),
-            NewField::FormField(i, c) => (6, i, form(c)),
-            NewField::AddFormField => (6, usize::MAX, 0),
-            NewField::Body => (7, 0, 0),
-            NewField::Assert(i) => (8, i, 0),
-            NewField::AddAssert => (8, usize::MAX, 0),
-            NewField::Capture(i, c) => (9, i, if c == CapCol::Name { 0 } else { 1 }),
-            NewField::AddCapture => (9, usize::MAX, 0),
+            NewField::Query(i, c) => (6, i, hdr(c)),
+            NewField::AddQuery => (6, usize::MAX, 0),
+            NewField::FormField(i, c) => (7, i, form(c)),
+            NewField::AddFormField => (7, usize::MAX, 0),
+            NewField::Body => (8, 0, 0),
+            NewField::Assert(i) => (9, i, 0),
+            NewField::AddAssert => (9, usize::MAX, 0),
+            NewField::Capture(i, c) => (10, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddCapture => (10, usize::MAX, 0),
         }
     }
 
@@ -1351,6 +1432,15 @@ impl NewReq {
                 v.extend(cells.iter().map(|&c| NewField::Cookie(i, c)));
             }
             v.push(NewField::AddCookie);
+        }
+        if self.queries_blank() {
+            v.push(self.query_entry());
+        } else {
+            let cells = self.query_tab_cells();
+            for i in 0..self.queries.len() {
+                v.extend(cells.iter().map(|&c| NewField::Query(i, c)));
+            }
+            v.push(NewField::AddQuery);
         }
         if self.form_fields_blank() {
             v.push(self.form_entry());
@@ -1430,7 +1520,8 @@ impl NewReq {
                 self.next_forward(true)
             }
             NewField::Header(..) | NewField::AddHeader => self.cookie_entry(),
-            NewField::Cookie(..) | NewField::AddCookie => self.form_entry(),
+            NewField::Cookie(..) | NewField::AddCookie => self.query_entry(),
+            NewField::Query(..) | NewField::AddQuery => self.form_entry(),
             NewField::FormField(..) | NewField::AddFormField => NewField::Body,
             NewField::Body => self.assert_entry(),
             NewField::Assert(..) | NewField::AddAssert => self.capture_entry(),
@@ -1449,7 +1540,8 @@ impl NewReq {
             NewField::Target | NewField::Method | NewField::Url => self.next_backward(true),
             NewField::Header(..) | NewField::AddHeader => NewField::Url,
             NewField::Cookie(..) | NewField::AddCookie => self.header_entry(),
-            NewField::FormField(..) | NewField::AddFormField => self.cookie_entry(),
+            NewField::Query(..) | NewField::AddQuery => self.cookie_entry(),
+            NewField::FormField(..) | NewField::AddFormField => self.query_entry(),
             NewField::Body => self.form_entry(),
             NewField::Assert(..) | NewField::AddAssert => NewField::Body,
             NewField::Capture(..) | NewField::AddCapture => self.assert_entry(),
@@ -1479,7 +1571,7 @@ impl NewReq {
         match self.focus {
             NewField::Name | NewField::Url | NewField::Body => true,
             NewField::Assert(_) | NewField::Capture(..) => true,
-            NewField::Header(_, col) | NewField::Cookie(_, col) => {
+            NewField::Header(_, col) | NewField::Cookie(_, col) | NewField::Query(_, col) => {
                 matches!(col, HdrCol::Key | HdrCol::Value | HdrCol::Desc)
             }
             NewField::FormField(_, col) => matches!(
@@ -1490,6 +1582,7 @@ impl NewReq {
             | NewField::Target
             | NewField::AddHeader
             | NewField::AddCookie
+            | NewField::AddQuery
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture => false,
@@ -1712,6 +1805,8 @@ pub(crate) fn draw_new_request(
             Constraint::Length(1),                                         // cookies label
             Constraint::Length(section_height(1, form.cookies.len())),     // cookies table
             Constraint::Length(1),                                         // form label
+            Constraint::Length(section_height(1, form.queries.len())),     // queries table
+            Constraint::Length(1),                                         // form label
             Constraint::Length(section_height(1, form.form_fields.len())), // form table
             Constraint::Length(1),                                         // body label
             Constraint::Length(4),                                         // body editor
@@ -1724,10 +1819,11 @@ pub(crate) fn draw_new_request(
 
         draw_headers_section(f, sub[0], sub[1], form, s, th);
         draw_cookies_section(f, sub[2], sub[3], form, s, th);
-        draw_form_section(f, sub[4], sub[5], form, s, th);
-        draw_body_section(f, sub[6], sub[7], form, s, th);
-        draw_asserts_section(f, sub[8], sub[9], form, s, th);
-        draw_captures_section(f, sub[10], sub[11], form, s, th);
+        draw_queries_section(f, sub[4], sub[5], form, s, th);
+        draw_form_section(f, sub[6], sub[7], form, s, th);
+        draw_body_section(f, sub[8], sub[9], form, s, th);
+        draw_asserts_section(f, sub[10], sub[11], form, s, th);
+        draw_captures_section(f, sub[12], sub[13], form, s, th);
     } else {
         // A single section tab is active: give it essentially the whole
         // remaining dialog body instead of a fixed sliver, so long lists are
@@ -1742,6 +1838,7 @@ pub(crate) fn draw_new_request(
             WizardTab::All => unreachable!(),
             WizardTab::Headers => draw_headers_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Cookies => draw_cookies_section(f, sub[0], sub[1], form, s, th),
+            WizardTab::Queries => draw_queries_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Form => draw_form_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th),
@@ -1831,6 +1928,29 @@ fn draw_cookies_section(
         label,
     );
     draw_cookie_table(f, table, form, s, th);
+}
+
+/// Draw the Cookies label + table into the given (label, table) rects.
+fn draw_queries_section(
+    f: &mut Frame,
+    label: Rect,
+    table: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+) {
+    let query_focused =
+        matches!(form.focus, NewField::Query(..)) || form.focus == NewField::AddQuery;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            s.field_queries.to_string(),
+            Style::default()
+                .fg(if query_focused { th.accent } else { th.dim })
+                .add_modifier(Modifier::BOLD),
+        )),
+        label,
+    );
+    draw_query_table(f, table, form, s, th);
 }
 
 /// Draw the Form label + table into the given (label, table) rects.
@@ -2521,6 +2641,29 @@ pub(crate) fn draw_cookie_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
         |i, col| form.focus == NewField::Cookie(i, col),
         form.focus == NewField::AddCookie,
         s.add_cookie,
+        s,
+        th,
+    );
+}
+
+/// Draw the `[Queries]` table: same column layout as Headers, but a separate
+/// list/scroll state and no header-name suggestion dropdown.
+pub(crate) fn draw_query_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+    let focused_idx = match form.focus {
+        NewField::Query(i, _) => Some(i),
+        _ => None,
+    };
+    draw_headerlike_table(
+        f,
+        area,
+        &form.queries,
+        &form.query_desc_visible,
+        &form.query_scroll,
+        None,
+        focused_idx,
+        |i, col| form.focus == NewField::Query(i, col),
+        form.focus == NewField::AddQuery,
+        s.add_query,
         s,
         th,
     );

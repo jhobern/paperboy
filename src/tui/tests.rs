@@ -8284,7 +8284,7 @@ fn enter_on_an_empty_requests_list_does_not_open_an_editor() {
 fn editing_a_request_preserves_fields_the_wizard_does_not_expose() {
     let mut app = TuiApp::default();
     let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
-    entry.query_params = vec![("q".into(), "1".into())];
+    entry.queries = vec![("q".into(), "1".into(), true)];
     entry.basic_auth = Some(("user".into(), "pass".into()));
     entry.expected_status = Some(200);
     app.collections[0].entries.push(entry);
@@ -8303,8 +8303,8 @@ fn editing_a_request_preserves_fields_the_wizard_does_not_expose() {
     assert_eq!(e.title, "renamed", "the edited field is applied");
     assert!(e.modified, "the entry is flagged modified");
     assert_eq!(
-        e.query_params,
-        vec![("q".to_string(), "1".to_string())],
+        e.queries,
+        vec![("q".to_string(), "1".to_string(), true)],
         "query params untouched"
     );
     assert_eq!(

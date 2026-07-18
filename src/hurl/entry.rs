@@ -103,7 +103,7 @@ pub struct HurlEntry {
     pub form_fields: Vec<FormField>,
     #[serde(default)]
     pub is_multipart: bool,
-    pub query_params: Vec<(String, String)>,
+    pub queries: Vec<(String, String, bool)>,
     /// `[Cookies]` `(name, value)` pairs — syntactic sugar over a `Cookie:`
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
@@ -245,10 +245,12 @@ impl HurlEntry {
                 }
             }
         }
-        if !self.query_params.is_empty() {
+        if !self.queries.is_empty() {
             out.push_str("[Query]\n");
-            for (k, v) in &self.query_params {
-                out.push_str(&format!("{k}: {v}\n"));
+            for (k, v, enabled) in &self.queries {
+                if *enabled {
+                    out.push_str(&format!("{k}: {v}\n"));
+                }
             }
         }
         if !self.form_fields.is_empty() {
