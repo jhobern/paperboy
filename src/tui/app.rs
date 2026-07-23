@@ -21,7 +21,8 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use super::wrapcache::{PanelWrap, TextPos};
+use super::wrapcache::TextPos;
+use tui_panel_select::MultiSelectPanel;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum FileAction {
@@ -471,16 +472,10 @@ pub(crate) enum Pane {
 }
 
 /// Where `pane` ranks in top-to-bottom reading order among the panes that
-/// can hold a text selection — used to order multi-region copies (Main
-/// before Response) regardless of the order the selections were made in.
-pub(crate) fn pane_rank(pane: Pane) -> u8 {
-    match pane {
-        Pane::Main => 0,
-        Pane::Response => 1,
-        _ => 2,
-    }
-}
-
+/// can hold a text selection — Main before Response — so a cross-panel copy
+/// concatenates them in reading order (see
+/// `input::concatenated_selection_text`, which iterates the two panels in
+/// this order directly).
 /// The 2 top-level File menu items: "(L)oad" and "(S)ave".
 pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
     [s.file_menu_item_load, s.file_menu_item_save]
@@ -588,21 +583,6 @@ pub(crate) fn mnemonic_index(items: &[&str], ch: char) -> Option<usize> {
         .position(|label| menu_mnemonic(label) == Some(ch))
 }
 
-/// An in-progress or just-finished mouse (or keyboard-extended) text
-/// selection, scoped to whichever of the Main (Request JSON) / Response
-/// panels it started in. Positions are logical ([`TextPos`]: raw line +
-/// char offset), never raw terminal (column, row) cells — so the exact same
-/// characters stay selected across a rewrap/rescroll/resize instead of
-/// silently re-interpreting stale screen coordinates against new content.
-/// Projected onto the current frame's screen space fresh every draw (see
-/// `draw::paint_selection_highlight`) via that panel's [`PanelWrap`] cache.
-#[derive(Clone, Copy)]
-pub(crate) struct TextSelection {
-    pub(crate) pane: Pane,
-    pub(crate) anchor: TextPos,
-    pub(crate) cursor: TextPos,
-}
-
 /// A background Workspace-redownload attempt in flight: the tab index it's
 /// for, the previously-selected file's path relative to the old root (to
 /// re-select it in the fresh checkout if it still exists), and the receiver
@@ -667,14 +647,14 @@ pub struct TuiApp {
     /// inline Environment panel; that per-variable selection now lives in
     /// `Overlay::EnvPopup`'s own `EnvPopupState::idx`.
     pub(crate) global_env_idx: usize,
-    pub(crate) resp_scroll: u16,
-    /// Max value `resp_scroll` may take (wrapped content lines − viewport
-    /// height); updated each frame by `draw_response` so scrolling stops once
-    /// the last line of the response body is in view (no blank overscroll).
+    /// Max scroll offset for the Response body (wrapped content rows −
+    /// viewport height); cached each frame by `draw_response` from
+    /// `resp_panel.clamp_scroll(..)` so a scrollbar drag between frames (and
+    /// the footer) can read it without a live viewport height. The scroll
+    /// offset itself now lives in `resp_panel`.
     pub(crate) resp_max_scroll: u16,
-    pub(crate) main_scroll: u16,
-    /// Max value `main_scroll` may take (content lines − viewport height);
-    /// updated each frame by `draw_collection_main`.
+    /// Same, for the Request JSON/Hurl body; cached by `draw_collection_main`.
+    /// The offset itself lives in `main_panel`.
     pub(crate) main_max_scroll: u16,
     /// Horizontal scroll offset (in characters) for the selected entry's name in
     /// the collections list, so long request URLs can be read end-to-end.
@@ -682,50 +662,34 @@ pub struct TuiApp {
     /// Same, for the selected Global Environment's name in the Global
     /// Environments list (in case a name is longer than the panel is wide).
     pub(crate) global_env_hscroll: u16,
-    /// The current ("active") mouse text selection (if any), scoped to
-    /// whichever of the Main/Response panels it started in — the one a
-    /// plain click-drag creates/replaces, that Shift+Arrow extends, and
-    /// that a further Alt+Click+Drag finalizes into `extra_selections`
-    /// before starting the next one. `None` when nothing is selected.
-    pub(crate) text_selection: Option<TextSelection>,
-    /// Additional, already-finished selection regions made via
-    /// Alt+Click+Drag (each finalized when the *next* Alt+Click starts a
-    /// new region, or cleared entirely by a plain click / Esc). Kept
-    /// separate from `text_selection` because only the latter is "live"
-    /// (draggable, autoscrollable, Shift+Arrow-extendable) — these are
-    /// static once made, and are simply painted and copied alongside it.
-    pub(crate) extra_selections: Vec<TextSelection>,
-    /// Set while a drag has moved past the top/bottom edge of its panel:
-    /// which panel and which direction (-1 up, +1 down) to keep scrolling —
-    /// consumed once per event *and* once per idle main-loop tick (see
-    /// `tui::run`), so holding the drag outside the panel keeps revealing
-    /// (and selecting) further lines even without further mouse movement.
-    pub(crate) pending_autoscroll: Option<(Pane, i8)>,
     /// The exact screen Rect the Request JSON body was rendered into last
     /// frame, used to hit-test mouse clicks/drags against this panel.
     pub(crate) main_text_area: Rect,
-    /// Cached line/wrap structure for the Request JSON body (see
-    /// `wrapcache::PanelWrap`), rebuilt each frame `draw_collection_main`
-    /// runs (its content is always small) — the single source of truth for
-    /// rendering, mapping mouse coordinates to text, and extracting a
-    /// selection, so all three always agree on exactly the same content.
-    pub(crate) main_wrap: Option<PanelWrap>,
-    /// Character positions (within `main_wrap`'s logical text) of every
+    /// The Request JSON/Hurl body panel: owns its scroll offset, wrap cache
+    /// and text selection (active + Alt+Click+Drag regions). Its wrap is
+    /// rebuilt fresh each frame by `draw_collection_main` (the content is
+    /// always small) — the single source of truth for rendering, mapping
+    /// mouse coordinates to text, and extracting a selection, so all three
+    /// always agree on exactly the same content.
+    pub(crate) main_panel: MultiSelectPanel,
+    /// Character positions (within `main_panel`'s logical text) of every
     /// shadow-warning icon (see `draw::SHADOW_ICON`) rendered into the
-    /// Request JSON/Hurl body this frame — recomputed alongside `main_wrap`
-    /// every time it's rebuilt. A purely visual annotation, so it's
-    /// excluded from copied/selected text (see `whole_panel_text`,
+    /// Request JSON/Hurl body this frame — recomputed each frame the panel's
+    /// content is rebuilt. A purely visual annotation, so it's excluded from
+    /// copied/selected text (see `whole_panel_text`,
     /// `concatenated_selection_text`) rather than corrupting a pasted
     /// request with a stray "!" the recipient would have to notice and
     /// remove by hand.
     pub(crate) main_shadow_icon_positions: std::collections::HashSet<TextPos>,
-    /// Same as `main_text_area`/`main_wrap`, for the Response body — except
-    /// `resp_wrap` is *not* rebuilt unconditionally every frame: it's only
-    /// rebuilt when the response body or panel width actually changes (see
-    /// `PanelWrap::rebuild_if_needed`), which is what keeps dragging a
-    /// selection or scrolling responsive even for an "obscenely large" body.
+    /// The exact screen Rect the Response body was rendered into last frame,
+    /// used to hit-test mouse clicks/drags against this panel.
     pub(crate) resp_text_area: Rect,
-    pub(crate) resp_wrap: Option<PanelWrap>,
+    /// The Response body panel: like `main_panel`, but its wrap cache is
+    /// *not* rebuilt unconditionally every frame — only when the body or
+    /// panel width actually changes (`set_content` → `rebuild_if_needed`),
+    /// which is what keeps dragging a selection or scrolling responsive even
+    /// for an "obscenely large" body.
+    pub(crate) resp_panel: MultiSelectPanel,
     /// The exact screen Rect the Request JSON panel's scrollbar thumb/track
     /// was last rendered into (one column, on the panel's right border),
     /// used to hit-test mouse clicks/drags for click-to-jump and
@@ -900,20 +864,15 @@ impl Default for TuiApp {
             deleted_envs: Vec::new(),
             focus: Pane::List,
             global_env_idx: 0,
-            resp_scroll: 0,
             resp_max_scroll: 0,
-            main_scroll: 0,
             main_max_scroll: 0,
             list_hscroll: 0,
             global_env_hscroll: 0,
-            text_selection: None,
-            extra_selections: Vec::new(),
-            pending_autoscroll: None,
             main_text_area: Rect::default(),
-            main_wrap: None,
+            main_panel: MultiSelectPanel::new(),
             main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
-            resp_wrap: None,
+            resp_panel: MultiSelectPanel::new(),
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,
@@ -956,11 +915,11 @@ impl Default for TuiApp {
 }
 
 impl TuiApp {
-    /// Whether there's any text selection at all — the "active" one
-    /// (`text_selection`) and/or any additional Alt+Click+Drag regions.
+    /// Whether there's any text selection at all — in either the Request
+    /// (`main_panel`) or Response (`resp_panel`) body, active or finalized.
     /// Used to gate the `y`/Esc shortcuts.
     pub(crate) fn has_any_selection(&self) -> bool {
-        self.text_selection.is_some() || !self.extra_selections.is_empty()
+        self.main_panel.has_selection() || self.resp_panel.has_selection()
     }
 
     /// Whether pressing `y` right now would actually copy anything: either
@@ -977,8 +936,8 @@ impl TuiApp {
     /// about to change (a fresh response, a different tab, a different list
     /// entry) so a highlight never lingers over stale content.
     pub(crate) fn clear_selections(&mut self) {
-        self.text_selection = None;
-        self.extra_selections.clear();
+        self.main_panel.clear();
+        self.resp_panel.clear();
     }
 
     pub(crate) fn begin_request(&mut self) {
@@ -998,11 +957,10 @@ impl TuiApp {
             return;
         }
         self.status = None;
-        self.resp_scroll = 0;
+        self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
         self.clear_selections();
-        self.pending_autoscroll = None;
         self.begin_request();
         if let Some(rx) = request::run_collection(
             &self.collections[col_idx],
@@ -1033,11 +991,10 @@ impl TuiApp {
             return;
         }
         self.status = None;
-        self.resp_scroll = 0;
+        self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
         self.clear_selections();
-        self.pending_autoscroll = None;
         self.begin_request();
         // Mark every entry as "in progress" immediately (not just when the
         // background thread finishes) so the Requests list shows a live
@@ -3377,5 +3334,99 @@ pub(crate) fn collection_name_from_path(path: &str, fallback: &str) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| fallback.to_string()),
+    }
+}
+
+/// Test-only mirror of the pre-`MultiSelectPanel` selection model. The UI
+/// tests were written against a flat `text_selection` (the single active
+/// region) plus `extra_selections` (the finalized Alt+Click+Drag regions),
+/// each tagged with its `Pane`. Selections now live inside each panel
+/// (`main_panel` / `resp_panel`), so these helpers translate between the two
+/// shapes and keep the large existing test-suite readable.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct TextSelection {
+    pub(crate) pane: Pane,
+    pub(crate) anchor: TextPos,
+    pub(crate) cursor: TextPos,
+}
+
+#[cfg(test)]
+impl TuiApp {
+    /// The active selection (whichever body panel currently holds one), in the
+    /// old `text_selection` shape. At most one panel is ever active.
+    pub(crate) fn text_selection(&self) -> Option<TextSelection> {
+        if let Some((anchor, cursor)) = self.main_panel.active_selection() {
+            Some(TextSelection {
+                pane: Pane::Main,
+                anchor,
+                cursor,
+            })
+        } else {
+            self.resp_panel
+                .active_selection()
+                .map(|(anchor, cursor)| TextSelection {
+                    pane: Pane::Response,
+                    anchor,
+                    cursor,
+                })
+        }
+    }
+
+    /// Set (with `Some`) or clear (with `None`) the active selection, mirroring
+    /// an assignment to the old `text_selection` field. `None` drops every
+    /// region on both panels.
+    pub(crate) fn set_text_selection(&mut self, sel: Option<TextSelection>) {
+        match sel {
+            None => self.clear_selections(),
+            Some(s) => match s.pane {
+                Pane::Main => self.main_panel.set_active_selection(s.anchor, s.cursor),
+                _ => self.resp_panel.set_active_selection(s.anchor, s.cursor),
+            },
+        }
+    }
+
+    /// Every finalized (Alt+Click+Drag) region across both panels, in the old
+    /// `extra_selections` shape.
+    pub(crate) fn extra_selections(&self) -> Vec<TextSelection> {
+        let mut v = Vec::new();
+        for (anchor, cursor) in self.main_panel.finalized_selections() {
+            v.push(TextSelection {
+                pane: Pane::Main,
+                anchor,
+                cursor,
+            });
+        }
+        for (anchor, cursor) in self.resp_panel.finalized_selections() {
+            v.push(TextSelection {
+                pane: Pane::Response,
+                anchor,
+                cursor,
+            });
+        }
+        v
+    }
+
+    /// Push a finalized region, mirroring `extra_selections.push(...)`.
+    pub(crate) fn push_extra_selection(&mut self, sel: TextSelection) {
+        match sel.pane {
+            Pane::Main => self.main_panel.push_finalized(sel.anchor, sel.cursor),
+            _ => self.resp_panel.push_finalized(sel.anchor, sel.cursor),
+        }
+    }
+
+    /// Start a drag-autoscroll on a panel, mirroring the old
+    /// `pending_autoscroll = Some((pane, dir))` assignment. A negative `dir`
+    /// scrolls up, otherwise down.
+    pub(crate) fn set_pending_autoscroll(&mut self, pane: Pane, dir: i32) {
+        let d = if dir < 0 {
+            tui_panel_select::AutoScroll::Up
+        } else {
+            tui_panel_select::AutoScroll::Down
+        };
+        match pane {
+            Pane::Main => self.main_panel.start_autoscroll(d),
+            _ => self.resp_panel.start_autoscroll(d),
+        }
     }
 }

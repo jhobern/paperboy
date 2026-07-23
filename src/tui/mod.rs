@@ -154,7 +154,7 @@ pub fn run() -> io::Result<()> {
         // even when the mouse itself isn't moving (no new Drag event to
         // drive it) — ticked once per idle loop iteration, roughly every
         // 120ms while nothing else arrives.
-        if app.pending_autoscroll.is_some() {
+        if app.has_pending_autoscroll() {
             app.autoscroll_tick();
         }
         if app.quit {

@@ -24,6 +24,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   disabled entry (ordinary prose comments are left untouched), and the Raw Hurl
   view shows disabled rows as those comments so you can see exactly what will be
   saved and sent.
+- **Soft-wrapped lines are marked in the Request and Response panels.** When a
+  long line in the request preview or response body wraps onto further rows, a
+  dim `↵` now appears in the panel's rightmost column on each continued row, so
+  a wrapped line reads unambiguously as one line rather than several separate
+  ones. The marker sits in a reserved column and never hides any content.
 
 ### Fixed
 
@@ -38,6 +43,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `←`/`→` now step onto a Form row's leading enabled checkbox, and skip the
   Content-Type cell on a Base64 File row (where it doesn't apply) rather than
   stopping on it.
+
+### Internal
+
+- **The Request and Response body panels now use `tui-panel-select`'s
+  `MultiSelectPanel`** instead of PaperBoy's own re-implemented
+  selection/scroll/wrap plumbing. The crate type owns multi-region selection,
+  keyboard extension, drag-autoscroll, scroll clamping, styled/plain content,
+  and the new end-of-row wrap marker; PaperBoy keeps only the app-specific
+  cross-panel orchestration (copy ordering, syntax-highlighted content,
+  scrollbar drag). No user-facing behaviour change beyond the wrap marker above.
+- **The clipped-cell truncation ellipsis moved into `tui-line-editor`** (as a
+  reusable `TruncationMarker` / `render_clipped_line`), so PaperBoy's wizard
+  cells render it through the shared crate rather than a local copy.
 
 
 ## [0.1.5] - 2026-07-16

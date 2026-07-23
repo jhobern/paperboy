@@ -24,6 +24,7 @@ use super::editor::*;
 use super::new_request::*;
 use super::remote::*;
 use super::selection;
+use tui_panel_select::{Motion, MultiSelectPanel};
 
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
@@ -47,14 +48,15 @@ impl TuiApp {
     /// editors (see `on_mouse_raw_text_editor`), which support their own
     /// click-drag selection scoped to their own text.
     ///
-    /// A plain click-drag replaces the *entire* selection (clearing any
-    /// additional regions too). Alt+Click+Drag instead *adds* a new region:
-    /// whatever was the active region is finalized into `extra_selections`
-    /// and a fresh one starts at the click point, so an arbitrary number of
-    /// (possibly cross-panel) regions can be built up one at a time. Alt
-    /// isn't used by terminals for their own native-selection bypass (that's
-    /// Shift) or hyperlink-opening (that's usually Ctrl), so it's the one
-    /// modifier that reliably reaches the app in both cases.
+    /// A plain click-drag replaces the *entire* selection (clearing every
+    /// region in both panels). Alt+Click+Drag instead *adds* a new region:
+    /// whichever panel holds the live region has it finalized (kept, but no
+    /// longer the draggable one) and a fresh one starts at the click point,
+    /// so an arbitrary number of (possibly cross-panel) regions can be built
+    /// up one at a time. Alt isn't used by terminals for their own
+    /// native-selection bypass (that's Shift) or hyperlink-opening (that's
+    /// usually Ctrl), so it's the one modifier that reliably reaches the app
+    /// in both cases.
     pub(crate) fn on_mouse(&mut self, ev: MouseEvent) {
         if self.overlay_is_raw_text_editor() {
             self.on_mouse_raw_text_editor(ev);
@@ -81,24 +83,27 @@ impl TuiApp {
                 } else {
                     None
                 };
-                self.pending_autoscroll = None;
                 if ev.modifiers.contains(KeyModifiers::ALT) {
-                    if let Some(prev) = self.text_selection.take() {
-                        self.extra_selections.push(prev);
+                    // Alt+Click *adds* a region: finalize whichever panel
+                    // currently holds the live one (keeping it, and any
+                    // earlier regions, painted) before a fresh one starts.
+                    if let Some(active) = self.active_selection_pane()
+                        && let Some(panel) = self.panel_mut(active)
+                    {
+                        panel.finalize_active();
                     }
                 } else {
-                    self.extra_selections.clear();
+                    // A plain click replaces the *entire* selection, across
+                    // both panels.
+                    self.main_panel.clear();
+                    self.resp_panel.clear();
                 }
-                self.text_selection = pane.and_then(|pane| {
-                    let (area, scroll) = self.panel_area_scroll(pane)?;
-                    let wrap = self.panel_wrap(pane)?;
-                    let pos = selection::point_to_textpos((ev.column, ev.row), area, scroll, wrap);
-                    Some(TextSelection {
-                        pane,
-                        anchor: pos,
-                        cursor: pos,
-                    })
-                });
+                if let Some(pane) = pane {
+                    let area = self.panel_area(pane);
+                    if let Some(panel) = self.panel_mut(pane) {
+                        panel.begin(area, (ev.column, ev.row));
+                    }
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(pane) = self.scrollbar_drag {
@@ -111,7 +116,8 @@ impl TuiApp {
                 if self.scrollbar_drag.take().is_some() {
                     return;
                 }
-                self.pending_autoscroll = None;
+                self.main_panel.end_drag();
+                self.resp_panel.end_drag();
                 self.copy_selection_to_clipboard();
             }
             _ => {}
@@ -147,10 +153,8 @@ impl TuiApp {
             .saturating_sub(area.y)
             .min(area.height.saturating_sub(1)) as f64;
         let scroll = ((rel / track) * max_scroll as f64).round() as u16;
-        match pane {
-            Pane::Main => self.main_scroll = scroll.min(max_scroll),
-            Pane::Response => self.resp_scroll = scroll.min(max_scroll),
-            _ => {}
+        if let Some(panel) = self.panel_mut(pane) {
+            panel.set_scroll(scroll.min(max_scroll));
         }
     }
 
@@ -171,10 +175,9 @@ impl TuiApp {
     /// editor (the actual Hurl or JSON text opened with Shift+H / Shift+J),
     /// mirroring the Main/Response panels' mouse-selection behavior but
     /// scoped to `prompt_editor_area` and the editor's own
-    /// `sel_anchor`/`(row, col)` cursor instead of a `TextSelection`/
-    /// `PanelWrap`. A click outside the editor's text area (e.g. on the
-    /// border or hint) is ignored rather than starting a selection at a
-    /// nonsensical position.
+    /// `sel_anchor`/`(row, col)` cursor instead of a `MultiSelectPanel`. A
+    /// click outside the editor's text area (e.g. on the border or hint) is
+    /// ignored rather than starting a selection at a nonsensical position.
     fn on_mouse_raw_text_editor(&mut self, ev: MouseEvent) {
         let area = self.prompt_editor_area;
         if area.width == 0 || area.height == 0 {
@@ -207,24 +210,49 @@ impl TuiApp {
         }
     }
 
-    /// The panel's own Rect and current (wrapped-row) scroll offset, for
-    /// whichever of Main/Response `pane` is — `None` for any other pane.
-    fn panel_area_scroll(&self, pane: Pane) -> Option<(Rect, u16)> {
+    /// The Main/Response text panel for `pane` (immutable), or `None` for a
+    /// pane that holds no selectable body text.
+    fn panel(&self, pane: Pane) -> Option<&MultiSelectPanel> {
         match pane {
-            Pane::Main => Some((self.main_text_area, self.main_scroll)),
-            Pane::Response => Some((self.resp_text_area, self.resp_scroll)),
+            Pane::Main => Some(&self.main_panel),
+            Pane::Response => Some(&self.resp_panel),
             _ => None,
         }
     }
 
-    /// The panel's cached line/wrap structure (see `wrapcache::PanelWrap`),
-    /// for whichever of Main/Response `pane` is — `None` if that panel has
-    /// no content yet (nothing drawn/no response) or `pane` is neither.
-    fn panel_wrap(&self, pane: Pane) -> Option<&super::wrapcache::PanelWrap> {
+    /// The Main/Response text panel for `pane` (mutable), or `None` for a
+    /// pane that holds no selectable body text.
+    fn panel_mut(&mut self, pane: Pane) -> Option<&mut MultiSelectPanel> {
         match pane {
-            Pane::Main => self.main_wrap.as_ref(),
-            Pane::Response => self.resp_wrap.as_ref(),
+            Pane::Main => Some(&mut self.main_panel),
+            Pane::Response => Some(&mut self.resp_panel),
             _ => None,
+        }
+    }
+
+    /// The screen Rect `pane`'s body was last drawn into (used as the panel's
+    /// inner area for begin/drag/extend/highlight). `Rect::default()` for a
+    /// pane that holds no selectable body text.
+    fn panel_area(&self, pane: Pane) -> Rect {
+        match pane {
+            Pane::Main => self.main_text_area,
+            Pane::Response => self.resp_text_area,
+            _ => Rect::default(),
+        }
+    }
+
+    /// Which of the two body panels currently holds the *live* (active,
+    /// still-draggable / -extendable) selection region, if any. At most one
+    /// does at a time: starting a plain selection clears both panels first,
+    /// and Alt+Click finalizes the live one before beginning the next — so
+    /// this is the panel a drag / Shift+Arrow / autoscroll acts on.
+    fn active_selection_pane(&self) -> Option<Pane> {
+        if self.main_panel.active_selection().is_some() {
+            Some(Pane::Main)
+        } else if self.resp_panel.active_selection().is_some() {
+            Some(Pane::Response)
+        } else {
+            None
         }
     }
 
@@ -237,7 +265,7 @@ impl TuiApp {
     /// they're a purely visual annotation, so a copied/pasted request must
     /// never actually contain one.
     pub(crate) fn whole_panel_text(&self, pane: Pane) -> Option<String> {
-        let text = self.panel_wrap(pane)?.source();
+        let text = self.panel(pane)?.whole_text()?;
         if text.is_empty() {
             return None;
         }
@@ -251,219 +279,92 @@ impl TuiApp {
         }
     }
 
-    /// Continue an active selection drag to `point`. When the drag has
-    /// moved past the panel's own top/bottom edge, this doesn't just clamp
-    /// the point back inside (stalling the selection there): it starts
-    /// auto-scrolling that panel in that direction, extending the selection
-    /// a full line at a time so it keeps growing for as long as the drag
-    /// stays outside the bounds — even without further mouse movement, since
-    /// `pending_autoscroll` is also ticked once per idle main-loop iteration
-    /// (see `tui::run`).
+    /// Continue the live selection drag to `point` on whichever panel owns
+    /// it. When the drag has moved past that panel's own top/bottom edge, the
+    /// panel doesn't just clamp the point back inside (stalling the selection
+    /// there): it starts auto-scrolling in that direction, extending the
+    /// selection a full line at a time so it keeps growing for as long as the
+    /// drag stays outside the bounds — even without further mouse movement,
+    /// since [`autoscroll_tick`](Self::autoscroll_tick) is also ticked once
+    /// per idle main-loop iteration (see `tui::run`).
     fn drag_selection_to(&mut self, point: (u16, u16)) {
-        let Some(sel) = self.text_selection else {
+        let Some(pane) = self.active_selection_pane() else {
             return;
         };
-        let pane = sel.pane;
-        let Some((area, scroll)) = self.panel_area_scroll(pane) else {
-            return;
-        };
-        let (_, row) = point;
-        if area.height > 0 && row < area.y {
-            self.pending_autoscroll = Some((pane, -1));
-            self.autoscroll_tick();
-            return;
-        }
-        if area.height > 0 && row >= area.y.saturating_add(area.height) {
-            self.pending_autoscroll = Some((pane, 1));
-            self.autoscroll_tick();
-            return;
-        }
-        self.pending_autoscroll = None;
-        let Some(wrap) = self.panel_wrap(pane) else {
-            return;
-        };
-        let pos = selection::point_to_textpos(point, area, scroll, wrap);
-        if let Some(sel) = self.text_selection.as_mut() {
-            sel.cursor = pos;
+        let area = self.panel_area(pane);
+        if let Some(panel) = self.panel_mut(pane) {
+            // The panel itself handles the "dragged past the edge" case:
+            // it starts (and immediately advances) an auto-scroll that the
+            // idle main loop keeps ticking (see `autoscroll_tick`).
+            panel.drag(area, point);
         }
     }
 
-    /// One "tick" of auto-scrolling a drag held past the panel's vertical
-    /// bounds: scrolls one row in the pending direction and extends the
-    /// selection cursor to the newly revealed edge line (its start when
-    /// scrolling up into view, its end when scrolling down into view) — a
-    /// whole line at a time, as intended for a drag that's left the panel's
-    /// visible area entirely. Once the content's own top/bottom is reached
-    /// (scrolling can't go any further) but the drag is still held past the
-    /// edge, it instead keeps snapping the cursor to the very first/last
-    /// line's full extent, so that boundary line ends up entirely
-    /// highlighted rather than left wherever the drag last was inside the
-    /// panel.
+    /// One "tick" of any panel's auto-scroll — a selection drag being held
+    /// past that panel's top/bottom edge. Called once per idle main-loop
+    /// iteration (see `tui::run`) so the drag keeps revealing (and selecting)
+    /// further lines even without further mouse movement. At most one panel
+    /// has a pending auto-scroll at a time (the one with the live drag), but
+    /// ticking both is harmless and keeps this policy-free.
     pub(crate) fn autoscroll_tick(&mut self) {
-        let Some((pane, dir)) = self.pending_autoscroll else {
-            return;
-        };
-        if self.text_selection.is_none() {
-            self.pending_autoscroll = None;
-            return;
+        if self.main_panel.has_pending_autoscroll() {
+            let area = self.main_text_area;
+            self.main_panel.autoscroll_tick(area);
         }
-        let (area, max_scroll) = match pane {
-            Pane::Main => (self.main_text_area, self.main_max_scroll),
-            Pane::Response => (self.resp_text_area, self.resp_max_scroll),
-            _ => {
-                self.pending_autoscroll = None;
-                return;
-            }
-        };
-        let scroll_field = match pane {
-            Pane::Main => &mut self.main_scroll,
-            Pane::Response => &mut self.resp_scroll,
-            _ => unreachable!(),
-        };
-        let new_scroll = if dir < 0 {
-            scroll_field.saturating_sub(1)
-        } else {
-            (*scroll_field + 1).min(max_scroll)
-        };
-        let reached_bound = new_scroll == *scroll_field;
-        *scroll_field = new_scroll;
-        let Some(wrap) = self.panel_wrap(pane) else {
-            return;
-        };
-        let edge_row = if reached_bound {
-            if dir < 0 {
-                0
-            } else {
-                wrap.total_rows().saturating_sub(1)
-            }
-        } else if dir < 0 {
-            new_scroll as u32
-        } else {
-            (new_scroll as u32 + area.height as u32).saturating_sub(1)
-        };
-        let col = if dir < 0 { 0 } else { usize::MAX };
-        let pos = wrap.row_col_to_textpos(edge_row, col);
-        if let Some(sel) = self.text_selection.as_mut() {
-            sel.cursor = pos;
+        if self.resp_panel.has_pending_autoscroll() {
+            let area = self.resp_text_area;
+            self.resp_panel.autoscroll_tick(area);
         }
+    }
+
+    /// Whether any panel has a selection drag held past its edge, waiting for
+    /// [`autoscroll_tick`](Self::autoscroll_tick) to keep scrolling — the
+    /// idle main loop checks this to decide whether to keep ticking.
+    pub(crate) fn has_pending_autoscroll(&self) -> bool {
+        self.main_panel.has_pending_autoscroll() || self.resp_panel.has_pending_autoscroll()
     }
 
     /// Shift+Arrow: move the *end* of the active selection by one character
     /// (Left/Right, crossing line boundaries) or one logical line (Up/Down,
     /// keeping the same column where possible) — a keyboard-only way to
     /// adjust a selection already started with the mouse, without redoing
-    /// the whole drag. Scrolls the panel to keep the moved end in view.
+    /// the whole drag. The panel scrolls itself to keep the moved end in view.
     pub(crate) fn extend_selection(&mut self, dir: KeyCode) {
-        let Some(sel) = self.text_selection else {
-            return;
-        };
-        let Some(wrap) = self.panel_wrap(sel.pane) else {
-            return;
-        };
-        let mut pos = sel.cursor;
-        match dir {
-            KeyCode::Left => {
-                if pos.col > 0 {
-                    pos.col -= 1;
-                } else if pos.line > 0 {
-                    pos.line -= 1;
-                    pos.col = wrap.line_char_len(pos.line).saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                let len = wrap.line_char_len(pos.line);
-                if pos.col + 1 < len {
-                    pos.col += 1;
-                } else if pos.line + 1 < wrap.line_count() {
-                    pos.line += 1;
-                    pos.col = 0;
-                }
-            }
-            KeyCode::Up => {
-                if pos.line > 0 {
-                    pos.line -= 1;
-                    pos.col = pos.col.min(wrap.line_char_len(pos.line).saturating_sub(1));
-                }
-            }
-            KeyCode::Down => {
-                if pos.line + 1 < wrap.line_count() {
-                    pos.line += 1;
-                    pos.col = pos.col.min(wrap.line_char_len(pos.line).saturating_sub(1));
-                }
-            }
-            _ => return,
-        }
-        if let Some(sel) = self.text_selection.as_mut() {
-            sel.cursor = pos;
-        }
-        self.scroll_selection_cursor_into_view();
-    }
-
-    /// After moving the selection's cursor end (Shift+Arrow), nudge the
-    /// owning panel's scroll so that end stays visible, exactly like a text
-    /// editor's cursor never being allowed to scroll off-screen.
-    fn scroll_selection_cursor_into_view(&mut self) {
-        let Some(sel) = self.text_selection else {
-            return;
-        };
-        let Some((area, _)) = self.panel_area_scroll(sel.pane) else {
-            return;
-        };
-        if area.height == 0 {
-            return;
-        }
-        let Some(wrap) = self.panel_wrap(sel.pane) else {
-            return;
-        };
-        let (row, _) = wrap.textpos_to_row_col(sel.cursor);
-        let max_scroll = match sel.pane {
-            Pane::Main => self.main_max_scroll,
-            Pane::Response => self.resp_max_scroll,
+        let motion = match dir {
+            KeyCode::Left => Motion::Left,
+            KeyCode::Right => Motion::Right,
+            KeyCode::Up => Motion::Up,
+            KeyCode::Down => Motion::Down,
             _ => return,
         };
-        let scroll_field = match sel.pane {
-            Pane::Main => &mut self.main_scroll,
-            Pane::Response => &mut self.resp_scroll,
-            _ => return,
+        let Some(pane) = self.active_selection_pane() else {
+            return;
         };
-        if row < *scroll_field as u32 {
-            *scroll_field = row as u16;
-        } else if row >= *scroll_field as u32 + area.height as u32 {
-            *scroll_field = (row + 1).saturating_sub(area.height as u32) as u16;
+        let area = self.panel_area(pane);
+        if let Some(panel) = self.panel_mut(pane) {
+            panel.extend(motion, area);
         }
-        *scroll_field = (*scroll_field).min(max_scroll);
     }
 
     /// Concatenate the extracted text of every active selection region —
-    /// the active one (`text_selection`) plus any additional Alt+Click+Drag
-    /// regions in `extra_selections` — ordered by where each region actually
-    /// starts in the text (panel order, then position within it), not by
-    /// the order the regions were drawn in. So dragging the end of a body
-    /// first and then Alt+Click+Dragging the start still copies start-then-
-    /// end. Pure (no clipboard I/O), so the multi-region logic itself is
-    /// directly unit-testable; `None` when there's nothing selected anywhere.
+    /// across both the Request (`main_panel`) and Response (`resp_panel`)
+    /// bodies — in reading order: Main before Response, and within each
+    /// panel by where each region actually starts in the text (not the order
+    /// the regions were drawn in). So dragging the end of a body first and
+    /// then Alt+Click+Dragging the start still copies start-then-end. Pure
+    /// (no clipboard I/O), so the multi-region logic is directly
+    /// unit-testable; `None` when there's nothing selected anywhere.
     pub(crate) fn concatenated_selection_text(&self) -> Option<String> {
-        let mut sels: Vec<&TextSelection> = self
-            .extra_selections
-            .iter()
-            .chain(self.text_selection.iter())
-            .collect();
-        sels.sort_by_key(|sel| (pane_rank(sel.pane), sel.anchor.min(sel.cursor)));
-
         let mut parts = Vec::new();
-        for sel in sels {
-            let Some(wrap) = self.panel_wrap(sel.pane) else {
-                continue;
-            };
-            // Only the Main panel can ever contain a shadow-warning icon
-            // (see `main_shadow_icon_positions`) — exclude it from the
-            // copied text so a dragged selection never carries a stray "!"
-            // into a pasted request, same as the whole-panel copy fallback.
-            let exclude = (sel.pane == Pane::Main).then_some(&self.main_shadow_icon_positions);
-            if let Some(text) = selection::extract_text(sel.anchor, sel.cursor, wrap, exclude) {
-                parts.push(text);
-            }
-        }
+        // Only the Main panel can ever contain a shadow-warning icon (see
+        // `main_shadow_icon_positions`) — exclude it so a dragged selection
+        // never carries a stray "!" into a pasted request, same as the
+        // whole-panel copy fallback.
+        parts.extend(
+            self.main_panel
+                .selected_parts(Some(&self.main_shadow_icon_positions)),
+        );
+        parts.extend(self.resp_panel.selected_parts(None));
         if parts.is_empty() {
             None
         } else {
@@ -585,7 +486,7 @@ impl TuiApp {
             // time) a selection begun with the mouse, without redoing the
             // whole drag.
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-                if shift && !ctrl && self.text_selection.is_some() =>
+                if shift && !ctrl && self.active_selection_pane().is_some() =>
             {
                 self.extend_selection(key.code);
             }
@@ -896,14 +797,13 @@ impl TuiApp {
         } else {
             (self.active_tab + total - 1) % total
         };
-        self.main_scroll = 0;
+        self.main_panel.set_scroll(0);
         self.list_hscroll = 0;
         // Global Environments selection/scroll state is independent of the
         // active collection tab, so it is intentionally NOT reset here.
         // The Main/Response panels now show a different tab's content; any
         // selection over the old one is stale.
         self.clear_selections();
-        self.pending_autoscroll = None;
         // Keep focus where it is (usually the Tabs bar) so the user can move
         // across several tabs; only correct it if the current pane doesn't exist
         // in the newly-active tab's layout.
@@ -1205,13 +1105,12 @@ impl TuiApp {
                         self.collections[ci].selected_entry = *idx;
                     }
                 }
-                self.main_scroll = 0;
+                self.main_panel.set_scroll(0);
                 // Reset horizontal scroll so each newly selected name starts unscrolled.
                 self.list_hscroll = 0;
                 // The Main panel now shows a different entry's JSON; any
                 // selection over the previous one is stale.
                 self.clear_selections();
-                self.pending_autoscroll = None;
             }
             Pane::GlobalEnv => {
                 let len = self.global_envs.len();
@@ -1221,11 +1120,13 @@ impl TuiApp {
             }
             Pane::Main => {
                 let max = self.main_max_scroll as i32;
-                self.main_scroll = (self.main_scroll as i32 + delta).clamp(0, max) as u16;
+                let next = (self.main_panel.scroll() as i32 + delta).clamp(0, max) as u16;
+                self.main_panel.set_scroll(next);
             }
             Pane::Response => {
                 let max = self.resp_max_scroll as i32;
-                self.resp_scroll = (self.resp_scroll as i32 + delta).clamp(0, max) as u16;
+                let next = (self.resp_panel.scroll() as i32 + delta).clamp(0, max) as u16;
+                self.resp_panel.set_scroll(next);
             }
         }
     }

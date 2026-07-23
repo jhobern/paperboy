@@ -77,12 +77,20 @@ fn main_scroll_is_clamped_to_content() {
     for _ in 0..10 {
         app.nav(1);
     }
-    assert_eq!(app.main_scroll, 3, "must not scroll past the last line");
+    assert_eq!(
+        app.main_panel.scroll(),
+        3,
+        "must not scroll past the last line"
+    );
 
     for _ in 0..10 {
         app.nav(-1);
     }
-    assert_eq!(app.main_scroll, 0, "must not scroll above the first line");
+    assert_eq!(
+        app.main_panel.scroll(),
+        0,
+        "must not scroll above the first line"
+    );
 }
 
 #[test]
@@ -94,12 +102,20 @@ fn resp_scroll_is_clamped_to_content() {
     for _ in 0..10 {
         app.nav(1);
     }
-    assert_eq!(app.resp_scroll, 3, "must not scroll past the last line");
+    assert_eq!(
+        app.resp_panel.scroll(),
+        3,
+        "must not scroll past the last line"
+    );
 
     for _ in 0..10 {
         app.nav(-1);
     }
-    assert_eq!(app.resp_scroll, 0, "must not scroll above the first line");
+    assert_eq!(
+        app.resp_panel.scroll(),
+        0,
+        "must not scroll above the first line"
+    );
 }
 
 fn press(app: &mut TuiApp, code: KeyCode) {
@@ -4734,7 +4750,7 @@ fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
 fn flattened_content(buf: &ratatui::buffer::Buffer) -> String {
     buffer_text(buf)
         .chars()
-        .filter(|c| !"\n│─┌┐└┘\u{2588}".contains(*c))
+        .filter(|c| !"\n│─┌┐└┘\u{2588}\u{21b5}".contains(*c))
         .collect()
 }
 
@@ -5565,6 +5581,41 @@ fn response_panel_wraps_long_lines_instead_of_truncating() {
 }
 
 #[test]
+fn a_soft_wrapped_response_line_shows_the_wrap_marker_glyph() {
+    // The wrap marker (a dim `↵` in the reserved rightmost column) is what
+    // tells the user a row is a soft-wrapped continuation rather than a
+    // distinct logical line. It must actually be painted on a wrapped body.
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let long_line: String = (0..100).map(|i| format!("{i:03}")).collect();
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "long".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: Arc::from(long_line.as_str()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+
+    let painted = buffer_text(term.backend().buffer());
+    assert!(
+        painted.contains('\u{21b5}'),
+        "a soft-wrapped response row must show the wrap marker:\n{painted}"
+    );
+}
+
+#[test]
 fn response_panel_scroll_stops_at_the_last_line() {
     // The user must not be able to keep scrolling down indefinitely: once
     // the last (wrapped) line of the response body is in view, further
@@ -5606,7 +5657,8 @@ fn response_panel_scroll_stops_at_the_last_line() {
             .unwrap();
     }
     assert_eq!(
-        app.resp_scroll, app.resp_max_scroll,
+        app.resp_panel.scroll(),
+        app.resp_max_scroll,
         "scrolling stops once the last line is in view, it never scrolls past it"
     );
     let out = buffer_text(term.backend().buffer());
@@ -5646,7 +5698,7 @@ fn clicking_the_response_scrollbar_jumps_the_scroll_to_that_position() {
         bar.height > 1,
         "the scrollbar must actually render for this test"
     );
-    assert_eq!(app.resp_scroll, 0);
+    assert_eq!(app.resp_panel.scroll(), 0);
 
     // Click at the very bottom of the scrollbar track.
     let ev = MouseEvent {
@@ -5657,13 +5709,14 @@ fn clicking_the_response_scrollbar_jumps_the_scroll_to_that_position() {
     };
     app.on_mouse(ev);
     assert_eq!(
-        app.resp_scroll, app.resp_max_scroll,
+        app.resp_panel.scroll(),
+        app.resp_max_scroll,
         "clicking the bottom of the track jumps straight there"
     );
     assert_eq!(app.scrollbar_drag, Some(Pane::Response));
 
     // The click must not have started (or disturbed) a text selection.
-    assert!(app.text_selection.is_none());
+    assert!(app.text_selection().is_none());
 
     // Dragging back up to the top of the track should scroll back to 0,
     // even though a Drag event's column may drift off the one-column
@@ -5676,7 +5729,8 @@ fn clicking_the_response_scrollbar_jumps_the_scroll_to_that_position() {
     };
     app.on_mouse(up);
     assert_eq!(
-        app.resp_scroll, 0,
+        app.resp_panel.scroll(),
+        0,
         "dragging to the top of the track scrolls back to the start"
     );
 
@@ -5717,7 +5771,7 @@ fn clicking_the_main_panel_scrollbar_scrolls_the_request_json_panel() {
         bar.height > 1,
         "the scrollbar must actually render for this test"
     );
-    assert_eq!(app.main_scroll, 0);
+    assert_eq!(app.main_panel.scroll(), 0);
 
     let ev = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -5726,7 +5780,7 @@ fn clicking_the_main_panel_scrollbar_scrolls_the_request_json_panel() {
         modifiers: KeyModifiers::NONE,
     };
     app.on_mouse(ev);
-    assert_eq!(app.main_scroll, app.main_max_scroll);
+    assert_eq!(app.main_panel.scroll(), app.main_max_scroll);
     assert_eq!(app.scrollbar_drag, Some(Pane::Main));
 }
 
@@ -5773,19 +5827,25 @@ fn ctrl_up_down_page_scrolls_the_response_panel_by_its_visible_height() {
 
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(
-        app.resp_scroll, page,
+        app.resp_panel.scroll(),
+        page,
         "Ctrl+Down scrolls down by exactly one page"
     );
 
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
-        app.resp_scroll, 0,
+        app.resp_panel.scroll(),
+        0,
         "Ctrl+Up scrolls back up by exactly one page"
     );
 
     // Plain (unmodified) ↑/↓ still moves one line at a time.
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(app.resp_scroll, 1, "plain Down still scrolls a single line");
+    assert_eq!(
+        app.resp_panel.scroll(),
+        1,
+        "plain Down still scrolls a single line"
+    );
 }
 
 #[test]
@@ -5988,13 +6048,13 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 5));
 
     let sel = app
-        .text_selection
+        .text_selection()
         .expect("dragging inside the response panel should start a selection");
     assert_eq!(sel.pane, Pane::Response);
     let text = super::selection::extract_text(
         sel.anchor,
         sel.cursor,
-        app.resp_wrap.as_ref().unwrap(),
+        app.resp_panel.wrap().unwrap(),
         None,
     );
     assert_eq!(
@@ -6033,19 +6093,17 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
 /// press and that `y` is a no-op when there is nothing selected.
 #[test]
 fn y_recopies_the_active_selection_without_clearing_it() {
-    let mut app = TuiApp {
-        text_selection: Some(TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(0, 2),
-            cursor: TextPos::new(0, 5),
-        }),
-        ..TuiApp::default()
-    };
+    let mut app = TuiApp::default();
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(0, 2),
+        cursor: TextPos::new(0, 5),
+    }));
 
     app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
     assert!(
-        app.text_selection.is_some(),
+        app.text_selection().is_some(),
         "`y` must not clear the selection it just copied"
     );
 }
@@ -6075,11 +6133,11 @@ fn copying_a_selection_sets_the_copied_status_message() {
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Response,
         anchor: TextPos::new(0, 0),
         cursor: TextPos::new(0, 5),
-    });
+    }));
     assert!(app.status.is_none(), "no status before copying");
 
     app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -6091,14 +6149,11 @@ fn copying_a_selection_sets_the_copied_status_message() {
 
 #[test]
 fn y_without_an_active_selection_is_a_no_op() {
-    let mut app = TuiApp {
-        text_selection: None,
-        ..TuiApp::default()
-    };
+    let mut app = TuiApp::default();
 
     app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
-    assert!(app.text_selection.is_none());
+    assert!(app.text_selection().is_none());
     assert!(
         app.status.is_none(),
         "nothing was copied, so no status message is shown"
@@ -6236,10 +6291,11 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     let area = app.main_text_area;
     let row_idx = (0..area.height)
         .find(|&r| {
-            app.main_wrap
+            app.main_panel
+                .wrap()
                 .as_ref()
                 .map(|w| {
-                    w.line_text((app.main_scroll + r) as usize)
+                    w.line_text((app.main_panel.scroll() + r) as usize)
                         .contains("secret123")
                 })
                 .unwrap_or(false)
@@ -6255,12 +6311,12 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 30));
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 30));
     let sel = app
-        .text_selection
+        .text_selection()
         .expect("dragging inside the Main panel should start a selection");
     let selected = super::selection::extract_text(
         sel.anchor,
         sel.cursor,
-        app.main_wrap.as_ref().unwrap(),
+        app.main_panel.wrap().unwrap(),
         None,
     )
     .expect("selection should extract text");
@@ -6332,10 +6388,11 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
     let area = app.main_text_area;
     let row_idx = (0..area.height)
         .find(|&r| {
-            app.main_wrap
+            app.main_panel
+                .wrap()
                 .as_ref()
                 .map(|w| {
-                    w.line_text((app.main_scroll + r) as usize)
+                    w.line_text((app.main_panel.scroll() + r) as usize)
                         .contains("secret123")
                 })
                 .unwrap_or(false)
@@ -6351,7 +6408,7 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
     app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 30));
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 30));
     let sel = app
-        .text_selection
+        .text_selection()
         .expect("dragging inside the Main panel should start a selection");
     let selected = app
         .concatenated_selection_text()
@@ -6496,8 +6553,8 @@ fn y_with_no_selection_copies_the_whole_focused_panel_without_creating_a_selecti
 
     // `y` copying the whole panel must not fabricate a selection —
     // there's still nothing highlighted on screen afterwards.
-    assert!(app.text_selection.is_none());
-    assert!(app.extra_selections.is_empty());
+    assert!(app.text_selection().is_none());
+    assert!(app.extra_selections().is_empty());
 }
 
 #[test]
@@ -6531,7 +6588,7 @@ fn main_panel_drag_extracts_the_expected_text() {
         "main text area must render"
     );
     assert_eq!(
-        app.main_wrap.as_ref().map(|w| w.line_text(0)),
+        app.main_panel.wrap().map(|w| w.line_text(0)),
         Some("{"),
         "the JSON body's opening brace must be the first visible row"
     );
@@ -6549,13 +6606,13 @@ fn main_panel_drag_extracts_the_expected_text() {
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end_col));
 
     let sel = app
-        .text_selection
+        .text_selection()
         .expect("dragging inside the Main panel should start a selection");
     assert_eq!(sel.pane, Pane::Main);
     let text = super::selection::extract_text(
         sel.anchor,
         sel.cursor,
-        app.main_wrap.as_ref().unwrap(),
+        app.main_panel.wrap().unwrap(),
         None,
     );
     assert_eq!(
@@ -6622,14 +6679,15 @@ fn dragging_past_the_bottom_edge_autoscrolls_and_extends_the_selection() {
     });
 
     assert!(
-        app.pending_autoscroll.is_some(),
+        app.has_pending_autoscroll(),
         "dragging past the bottom edge must arm auto-scroll"
     );
     assert_eq!(
-        app.resp_scroll, 1,
+        app.resp_panel.scroll(),
+        1,
         "the single drag event already ticks auto-scroll once"
     );
-    let cursor_after_one_tick = app.text_selection.unwrap().cursor;
+    let cursor_after_one_tick = app.text_selection().unwrap().cursor;
     assert!(
         cursor_after_one_tick.line > 0,
         "the selection must already extend past the first line"
@@ -6641,10 +6699,11 @@ fn dragging_past_the_bottom_edge_autoscrolls_and_extends_the_selection() {
         app.autoscroll_tick();
     }
     assert_eq!(
-        app.resp_scroll, 6,
+        app.resp_panel.scroll(),
+        6,
         "each tick scrolls one more row while still held past the edge"
     );
-    let cursor_after_more_ticks = app.text_selection.unwrap().cursor;
+    let cursor_after_more_ticks = app.text_selection().unwrap().cursor;
     assert!(
         cursor_after_more_ticks.line > cursor_after_one_tick.line,
         "continued auto-scroll ticks keep extending the selection further down"
@@ -6659,7 +6718,7 @@ fn dragging_past_the_bottom_edge_autoscrolls_and_extends_the_selection() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        app.pending_autoscroll.is_none(),
+        !app.has_pending_autoscroll(),
         "returning inside the panel cancels auto-scroll"
     );
 }
@@ -6712,17 +6771,20 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
         row: area.y,
         modifiers: KeyModifiers::NONE,
     });
-    app.pending_autoscroll = Some((Pane::Response, 1));
+    app.set_pending_autoscroll(Pane::Response, 1);
     for _ in 0..(max_scroll as usize + 5) {
         app.autoscroll_tick();
         term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     }
     assert_eq!(
-        app.resp_scroll, max_scroll,
+        app.resp_panel.scroll(),
+        max_scroll,
         "scrolling must stop once the last line is in view"
     );
-    let sel = app.text_selection.expect("selection must still be active");
-    let wrap = app.resp_wrap.as_ref().unwrap();
+    let sel = app
+        .text_selection()
+        .expect("selection must still be active");
+    let wrap = app.resp_panel.wrap().unwrap();
     let last_line = wrap.line_count() - 1;
     assert_eq!(
         sel.cursor.line, last_line,
@@ -6744,23 +6806,26 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
         row: area.y,
         modifiers: KeyModifiers::NONE,
     });
-    app.resp_scroll = max_scroll;
+    app.resp_panel.set_scroll(max_scroll);
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: area.x,
         row: area.y + area.height - 1,
         modifiers: KeyModifiers::NONE,
     });
-    app.pending_autoscroll = Some((Pane::Response, -1));
+    app.set_pending_autoscroll(Pane::Response, -1);
     for _ in 0..(max_scroll as usize + 5) {
         app.autoscroll_tick();
         term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     }
     assert_eq!(
-        app.resp_scroll, 0,
+        app.resp_panel.scroll(),
+        0,
         "scrolling must stop once the first line is in view"
     );
-    let sel = app.text_selection.expect("selection must still be active");
+    let sel = app
+        .text_selection()
+        .expect("selection must still be active");
     assert_eq!(
         sel.cursor.line, 0,
         "held past the top, the cursor must sit on the very first line"
@@ -6769,7 +6834,7 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
         sel.cursor.col, 0,
         "held past the top, the cursor must sit at the very start of that line"
     );
-    let wrap = app.resp_wrap.as_ref().unwrap();
+    let wrap = app.resp_panel.wrap().unwrap();
     let text = super::selection::extract_text(sel.anchor, sel.cursor, wrap, None)
         .expect("selection has text");
     assert!(
@@ -6781,9 +6846,9 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
 /// Reported crash: dragging a selection started in the Main (Request
 /// JSON) panel down past its own bottom edge into the Response panel
 /// below it must auto-scroll and extend the selection, not panic.
-/// Unlike the Response panel's `resp_wrap` (cached via
+/// Unlike the Response panel (whose wrap cache is reused via
 /// `Arc::ptr_eq`-based `rebuild_if_needed`), `draw_collection_main`
-/// rebuilds `main_wrap` fresh on *every* draw — so this must redraw
+/// rebuilds `main_panel`'s wrap fresh on *every* draw — so this must redraw
 /// between each drag step, exactly like the real main loop
 /// (event -> draw -> event -> draw...), to reproduce a bug that only
 /// shows up once the wrap has been rebuilt mid-drag.
@@ -6859,7 +6924,7 @@ fn dragging_from_main_panel_past_its_bottom_edge_into_the_response_panel_does_no
     }
 
     assert_eq!(
-        app.text_selection.map(|s| s.pane),
+        app.text_selection().map(|s| s.pane),
         Some(Pane::Main),
         "the selection must stay scoped to the Main panel it started in"
     );
@@ -6899,14 +6964,14 @@ fn shift_arrow_extends_the_selection_and_scrolls_it_into_view() {
     );
 
     let start = TextPos::new(0, 2);
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Response,
         anchor: start,
         cursor: start,
-    });
+    }));
 
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-    let after_down = app.text_selection.unwrap();
+    let after_down = app.text_selection().unwrap();
     assert_eq!(
         after_down.anchor, start,
         "Shift+Down must not move the anchor"
@@ -6918,7 +6983,7 @@ fn shift_arrow_extends_the_selection_and_scrolls_it_into_view() {
 
     app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
     assert_eq!(
-        app.text_selection.unwrap().cursor.col,
+        app.text_selection().unwrap().cursor.col,
         3,
         "Shift+Right moves the cursor end one char right"
     );
@@ -6929,20 +6994,20 @@ fn shift_arrow_extends_the_selection_and_scrolls_it_into_view() {
     for _ in 0..(visible_rows + 5) {
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
     }
-    let far_cursor = app.text_selection.unwrap().cursor;
+    let far_cursor = app.text_selection().unwrap().cursor;
     assert!(
         far_cursor.line >= visible_rows,
         "the selection cursor should have advanced well past the first screenful"
     );
     assert!(
-        app.resp_scroll > 0,
+        app.resp_panel.scroll() > 0,
         "scrolling down far enough via Shift+Down must scroll the panel to follow the cursor"
     );
-    let wrap = app.resp_wrap.as_ref().unwrap();
+    let wrap = app.resp_panel.wrap().unwrap();
     let (row, _) = wrap.textpos_to_row_col(far_cursor);
     assert!(
-        row >= app.resp_scroll as u32
-            && row < app.resp_scroll as u32 + app.resp_text_area.height as u32,
+        row >= app.resp_panel.scroll() as u32
+            && row < app.resp_panel.scroll() as u32 + app.resp_text_area.height as u32,
         "the moved cursor's row must be inside the scrolled-to viewport"
     );
 }
@@ -6985,12 +7050,12 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
         anchor: TextPos::new(0, 10),
         cursor: TextPos::new(0, 19),
     };
-    app.text_selection = Some(sel);
+    app.set_text_selection(Some(sel));
     let expected: String = long_line.chars().skip(10).take(10).collect();
     let before_text = super::selection::extract_text(
         sel.anchor,
         sel.cursor,
-        app.resp_wrap.as_ref().unwrap(),
+        app.resp_panel.wrap().unwrap(),
         None,
     );
     assert_eq!(before_text.as_deref(), Some(expected.as_str()));
@@ -7011,7 +7076,7 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     let after_text = super::selection::extract_text(
         sel.anchor,
         sel.cursor,
-        app.resp_wrap.as_ref().unwrap(),
+        app.resp_panel.wrap().unwrap(),
         None,
     );
     assert_eq!(
@@ -7023,10 +7088,10 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     // The on-screen highlight must also land on the (possibly relocated)
     // correct cells after the resize.
     let buf = term.backend().buffer();
-    let wrap = app.resp_wrap.as_ref().unwrap();
+    let wrap = app.resp_panel.wrap().unwrap();
     let (row, col) = wrap.textpos_to_row_col(TextPos::new(0, 10));
     let area = app.resp_text_area;
-    let screen_row = area.y + row as u16 - app.resp_scroll.min(row as u16);
+    let screen_row = area.y + row as u16 - app.resp_panel.scroll().min(row as u16);
     let cell = buf.cell((area.x + col as u16, screen_row)).unwrap();
     let select_bg = super::theme::theme(&Language::English).select_bg;
     assert_eq!(
@@ -7039,14 +7104,12 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
 fn clicking_outside_both_text_panels_clears_any_selection() {
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-    let mut app = TuiApp {
-        text_selection: Some(TextSelection {
-            pane: Pane::Main,
-            anchor: TextPos::new(0, 0),
-            cursor: TextPos::new(0, 0),
-        }),
-        ..Default::default()
-    };
+    let mut app = TuiApp::default();
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Main,
+        anchor: TextPos::new(0, 0),
+        cursor: TextPos::new(0, 0),
+    }));
     // Row 0 is always outside both panels' cached text areas (menu bar).
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -7055,7 +7118,7 @@ fn clicking_outside_both_text_panels_clears_any_selection() {
         modifiers: KeyModifiers::NONE,
     });
     assert!(
-        app.text_selection.is_none(),
+        app.text_selection().is_none(),
         "clicking outside a text panel clears the selection"
     );
 }
@@ -7112,7 +7175,7 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
         KeyModifiers::NONE,
     ));
     assert!(
-        app.extra_selections.is_empty(),
+        app.extra_selections().is_empty(),
         "a single plain drag makes no extra regions yet"
     );
 
@@ -7138,20 +7201,20 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
     ));
 
     assert_eq!(
-        app.extra_selections.len(),
+        app.extra_selections().len(),
         1,
         "the first region is finalized, not discarded"
     );
-    let wrap = app.resp_wrap.as_ref().unwrap();
+    let wrap = app.resp_panel.wrap().unwrap();
     let first_text = super::selection::extract_text(
-        app.extra_selections[0].anchor,
-        app.extra_selections[0].cursor,
+        app.extra_selections()[0].anchor,
+        app.extra_selections()[0].cursor,
         wrap,
         None,
     );
     assert_eq!(first_text.as_deref(), Some("first"));
     let active = app
-        .text_selection
+        .text_selection()
         .expect("the Alt-drag becomes the new active region");
     let second_text = super::selection::extract_text(active.anchor, active.cursor, wrap, None);
     assert_eq!(second_text.as_deref(), Some("second"));
@@ -7187,22 +7250,22 @@ fn copying_multiple_regions_orders_by_document_position_not_creation_order() {
     // start-then-end, not the reverse creation order.
     let mut app = TuiApp {
         focus: Pane::Response,
-        // Made first (finalized into `extra_selections`): the *later*
-        // region in the text.
-        extra_selections: vec![TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(1, 0),
-            cursor: TextPos::new(1, 6),
-        }],
-        // Made second (the currently-active region): the *earlier*
-        // region in the text.
-        text_selection: Some(TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(0, 0),
-            cursor: TextPos::new(0, 5),
-        }),
         ..Default::default()
     };
+    // Made first (finalized into `extra_selections`): the *later* region in
+    // the text.
+    app.push_extra_selection(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(1, 0),
+        cursor: TextPos::new(1, 6),
+    });
+    // Made second (the currently-active region): the *earlier* region in the
+    // text.
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(0, 0),
+        cursor: TextPos::new(0, 5),
+    }));
     let ci = app.active_tab;
     app.collections[ci].entries = vec![HurlEntry {
         title: "order".into(),
@@ -7230,19 +7293,17 @@ fn copying_multiple_regions_orders_by_document_position_not_creation_order() {
 fn a_plain_click_drag_clears_every_extra_region() {
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-    let mut app = TuiApp {
-        extra_selections: vec![TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(0, 0),
-            cursor: TextPos::new(0, 3),
-        }],
-        text_selection: Some(TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(1, 0),
-            cursor: TextPos::new(1, 3),
-        }),
-        ..Default::default()
-    };
+    let mut app = TuiApp::default();
+    app.push_extra_selection(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(0, 0),
+        cursor: TextPos::new(0, 3),
+    });
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(1, 0),
+        cursor: TextPos::new(1, 3),
+    }));
     // Row 0 is outside both panels' cached text areas — a plain click
     // there clears the active selection *and* every extra region.
     app.on_mouse(MouseEvent {
@@ -7251,32 +7312,30 @@ fn a_plain_click_drag_clears_every_extra_region() {
         row: 0,
         modifiers: KeyModifiers::NONE,
     });
-    assert!(app.text_selection.is_none());
+    assert!(app.text_selection().is_none());
     assert!(
-        app.extra_selections.is_empty(),
+        app.extra_selections().is_empty(),
         "a plain click clears every region, not just the active one"
     );
 }
 
 #[test]
 fn escape_clears_every_selection_region_and_y_is_a_no_op_afterwards() {
-    let mut app = TuiApp {
-        extra_selections: vec![TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(0, 0),
-            cursor: TextPos::new(0, 3),
-        }],
-        text_selection: Some(TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(1, 0),
-            cursor: TextPos::new(1, 3),
-        }),
-        ..Default::default()
-    };
+    let mut app = TuiApp::default();
+    app.push_extra_selection(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(0, 0),
+        cursor: TextPos::new(0, 3),
+    });
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(1, 0),
+        cursor: TextPos::new(1, 3),
+    }));
     press(&mut app, KeyCode::Esc);
-    assert!(app.text_selection.is_none());
+    assert!(app.text_selection().is_none());
     assert!(
-        app.extra_selections.is_empty(),
+        app.extra_selections().is_empty(),
         "Escape clears every region, not just the active one"
     );
     assert_eq!(
@@ -7288,17 +7347,15 @@ fn escape_clears_every_selection_region_and_y_is_a_no_op_afterwards() {
 
 #[test]
 fn escape_clears_an_active_text_selection() {
-    let mut app = TuiApp {
-        text_selection: Some(TextSelection {
-            pane: Pane::Response,
-            anchor: TextPos::new(0, 0),
-            cursor: TextPos::new(0, 0),
-        }),
-        ..Default::default()
-    };
+    let mut app = TuiApp::default();
+    app.set_text_selection(Some(TextSelection {
+        pane: Pane::Response,
+        anchor: TextPos::new(0, 0),
+        cursor: TextPos::new(0, 0),
+    }));
     press(&mut app, KeyCode::Esc);
     assert!(
-        app.text_selection.is_none(),
+        app.text_selection().is_none(),
         "Escape dismisses an active selection"
     );
 }
@@ -7313,14 +7370,14 @@ fn selecting_a_different_list_entry_clears_the_text_selection() {
         .entries
         .push(HurlEntry::from_fields("b", "GET", "http://h/b", vec![], ""));
     app.focus = Pane::List;
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Main,
         anchor: TextPos::new(0, 0),
         cursor: TextPos::new(0, 0),
-    });
+    }));
     app.nav(1);
     assert!(
-        app.text_selection.is_none(),
+        app.text_selection().is_none(),
         "navigating to a different entry invalidates the old selection"
     );
 }
@@ -7330,14 +7387,14 @@ fn switching_tabs_clears_the_text_selection() {
     let mut app = TuiApp::default();
     app.collections
         .push(Collection::new("t".to_string(), vec![]));
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Response,
         anchor: TextPos::new(0, 0),
         cursor: TextPos::new(0, 0),
-    });
+    }));
     app.cycle_tab(true);
     assert!(
-        app.text_selection.is_none(),
+        app.text_selection().is_none(),
         "switching tabs invalidates the old panel's selection"
     );
 }
@@ -7346,14 +7403,14 @@ fn switching_tabs_clears_the_text_selection() {
 fn running_a_request_clears_the_text_selection() {
     let mut app = app_in_main_pane();
     let ci = app.active_tab;
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Response,
         anchor: TextPos::new(0, 0),
         cursor: TextPos::new(0, 0),
-    });
+    }));
     app.run_entry(ci);
     assert!(
-        app.text_selection.is_none(),
+        app.text_selection().is_none(),
         "starting a new request invalidates any selection over the old response"
     );
 }
@@ -13019,20 +13076,21 @@ fn a_huge_response_body_still_scrolls_and_clamps_correctly() {
     }];
     app.focus = Pane::Response;
     // Scroll far past the end on purpose — must clamp, not panic or hang.
-    app.resp_scroll = u16::MAX;
+    app.resp_panel.set_scroll(u16::MAX);
 
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 
     assert_eq!(
-        app.resp_scroll, app.resp_max_scroll,
+        app.resp_panel.scroll(),
+        app.resp_max_scroll,
         "scroll must clamp to the last-line boundary"
     );
     let wrap = app
-        .resp_wrap
-        .as_ref()
+        .resp_panel
+        .wrap()
         .expect("a huge response body must populate the wrap cache");
-    let visible = wrap.visible_window(app.resp_scroll, app.resp_text_area.height);
+    let visible = wrap.visible_window(app.resp_panel.scroll(), app.resp_text_area.height);
     assert!(
         !visible.is_empty(),
         "the clamped scroll position must still show real content"
@@ -13134,11 +13192,11 @@ fn a_single_enormous_line_response_with_an_active_selection_redraws_quickly() {
         ..Default::default()
     }];
     app.focus = Pane::Response;
-    app.text_selection = Some(TextSelection {
+    app.set_text_selection(Some(TextSelection {
         pane: Pane::Response,
         anchor: TextPos::new(0, 0),
         cursor: TextPos::new(0, 3),
-    });
+    }));
 
     let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();

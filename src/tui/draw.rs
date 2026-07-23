@@ -18,11 +18,10 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use super::selection;
 use super::theme::*;
-use super::wrapcache::{PanelWrap, TextPos};
+use super::wrapcache::TextPos;
 use std::sync::Arc;
-use tui_panel_select::wrap::wrap_line;
+use tui_panel_select::WrapMarker;
 
 /// Marks a collection/environment title as loaded from git — shown before the
 /// name whenever `Collection::git_origin` / `env_git_origin` is set.
@@ -37,6 +36,17 @@ pub(crate) const LINK_ICON: &str = "\u{1F517}";
 /// that one with emoji-style double-cell width even without a variation
 /// selector, which visually overlaps the very next character.
 pub(crate) const SHADOW_ICON: &str = "!";
+/// The end-of-row marker painted in a reserved rightmost column whenever a
+/// logical line is soft-wrapped by a body panel (Request/Response), so a
+/// wrapped line reads unambiguously as one line rather than several separate
+/// ones. Drawn dim so it never competes with the content. Built per-frame
+/// from the active theme (see `MultiSelectPanel::set_wrap_marker`).
+fn wrap_marker(th: &Theme) -> WrapMarker {
+    WrapMarker {
+        glyph: '↵',
+        style: Style::default().fg(th.dim),
+    }
+}
 /// Marks a subfolder row in the request list tree, and (in the request
 /// editor's form) hints that a File-kind field's Value opens a file picker
 /// on Enter.
@@ -158,29 +168,20 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 /// highlight can never bleed into a neighbouring panel or the rest of the
 /// terminal row.
 fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
-    if app.text_selection.is_none() && app.extra_selections.is_empty() {
+    if !app.has_any_selection() {
         return;
     }
-    let buf = f.buffer_mut();
     let style = Style::default().bg(th.select_bg).fg(th.select_fg);
-    for sel in app
-        .extra_selections
-        .iter()
-        .copied()
-        .chain(app.text_selection)
-    {
-        let (area, scroll, wrap) = match sel.pane {
-            Pane::Main => (app.main_text_area, app.main_scroll, app.main_wrap.as_ref()),
-            Pane::Response => (app.resp_text_area, app.resp_scroll, app.resp_wrap.as_ref()),
-            _ => continue,
-        };
-        let Some(wrap) = wrap else { continue };
-        let cells = selection::highlight_cells(sel.anchor, sel.cursor, wrap, area, scroll);
-        for (row, from, to) in cells {
-            for col in from..to {
-                if let Some(cell) = buf.cell_mut((col, row)) {
-                    cell.set_style(style);
-                }
+    // Each panel projects its own logical regions onto the current frame's
+    // screen cells (bounded to its own text area), so a highlight can never
+    // bleed into a neighbouring panel or the rest of the terminal row.
+    let mut cells = app.main_panel.highlight_regions(app.main_text_area);
+    cells.extend(app.resp_panel.highlight_regions(app.resp_text_area));
+    let buf = f.buffer_mut();
+    for (row, from, to) in cells {
+        for col in from..to {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_style(style);
             }
         }
     }
@@ -1114,9 +1115,11 @@ pub(crate) fn draw_collection_main(
 
     if app.collections[ci].entries.is_empty() {
         app.main_max_scroll = 0;
-        app.main_scroll = 0;
+        app.main_panel
+            .set_content(Arc::from(""), inner.width.max(1) as usize);
+        app.main_panel.clear();
+        app.main_panel.set_scroll(0);
         app.main_text_area = Rect::default();
-        app.main_wrap = None;
         app.main_shadow_icon_positions.clear();
         app.main_scrollbar_area = Rect::default();
         f.render_widget(
@@ -1191,7 +1194,7 @@ pub(crate) fn draw_collection_main(
     // `TuiApp::main_shadow_icon_positions`) rather than corrupting a pasted
     // request with a stray "!".
     let mut shadow_positions: std::collections::HashSet<TextPos> = std::collections::HashSet::new();
-    let body_lines: Vec<Line> = buf
+    let mut body_lines: Vec<Line> = buf
         .lines()
         .enumerate()
         .map(|(li, l)| {
@@ -1203,29 +1206,21 @@ pub(crate) fn draw_collection_main(
             Line::from(spans)
         })
         .collect();
-    // The plain text `body_lines` actually renders — i.e. `buf` with every
-    // resolved `{{ VAR }}` already substituted in, exactly like the user
-    // sees on screen — rather than `buf` itself, which still has the raw
-    // `{{ VAR }}` moustache syntax. This (not `buf`) is what backs the
-    // panel's scroll geometry, mouse-selection extraction, and the
-    // whole-panel copy fallback, so a copied/selected value always matches
-    // what's visually shown instead of the underlying template.
-    let mut display_text: String = body_lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|sp| sp.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // `buf.lines()` (used to build `body_lines` above) drops a trailing
-    // newline just like `str::lines()` always does, so restore it here —
-    // otherwise a whole-panel copy of Hurl text would silently lose the
-    // trailing newline the raw buffer actually had.
+    // `body_lines` is what the panel actually renders — i.e. `buf` with every
+    // resolved `{{ VAR }}` already substituted in, exactly like the user sees
+    // on screen — rather than `buf` itself, which still has the raw
+    // `{{ VAR }}` moustache syntax. The panel derives its plain text from
+    // these lines (joined by `\n`), which is what backs its scroll geometry,
+    // mouse-selection extraction, and the whole-panel copy fallback, so a
+    // copied/selected value always matches what's visually shown instead of
+    // the underlying template.
+    //
+    // `buf.lines()` drops a trailing newline just like `str::lines()` always
+    // does, so re-add it as an empty trailing line — otherwise a whole-panel
+    // copy of Hurl text would silently lose the trailing newline the raw
+    // buffer actually had (and its geometry would be one row short).
     if buf.ends_with('\n') {
-        display_text.push('\n');
+        body_lines.push(Line::from(""));
     }
     top_lines.push(if valid {
         Line::styled(
@@ -1312,37 +1307,19 @@ pub(crate) fn draw_collection_main(
     // Clamp scrolling so the user can't scroll past the last line into blank space.
     let text_area = split[1];
     let width = text_area.width as usize;
-    // Request bodies (JSON or Hurl text) are realistically small, so
-    // rebuilding this cache fresh every frame (rather than reusing it across
-    // frames the way the Response panel does) is cheap and sidesteps having
-    // to separately invalidate it when `dvars`/highlighting-relevant state
-    // changes instead of just the buffer text itself.
-    let wrap = PanelWrap::build(Arc::from(display_text.as_str()), width);
-    let total_lines = wrap.total_rows().min(u16::MAX as u32) as u16;
-    let max_scroll = total_lines.saturating_sub(text_area.height);
+    // Push the styled body into the panel (rebuilt fresh every frame — the
+    // content is always small). The end-of-row wrap marker makes a soft wrap
+    // read unambiguously as one logical line rather than several. The panel
+    // wraps only the visible window internally, so scrolling/dragging stays
+    // responsive even for a large body.
+    app.main_panel.set_wrap_marker(Some(wrap_marker(th)));
+    app.main_panel.set_styled_content(&body_lines, width);
+    let total_lines = app.main_panel.total_rows().min(u16::MAX as u32) as u16;
+    let max_scroll = app.main_panel.clamp_scroll(text_area.height);
     app.main_max_scroll = max_scroll;
-    app.main_scroll = app.main_scroll.min(max_scroll);
-    let scroll = app.main_scroll;
-
-    // Only the visible window's raw lines are re-highlighted/wrapped — this
-    // keeps dragging a selection or scrolling responsive even for a large body.
-    let start = wrap.row_col_to_textpos(scroll as u32, 0);
-    let row_in_start_line = start.col.checked_div(width).unwrap_or(0);
+    let scroll = app.main_panel.scroll();
     let height = text_area.height as usize;
-    let mut visible_wrapped: Vec<Line<'static>> = Vec::with_capacity(height);
-    'outer: for (idx, line) in body_lines.iter().enumerate().skip(start.line) {
-        let skip = if idx == start.line {
-            row_in_start_line
-        } else {
-            0
-        };
-        for row in wrap_line(line.clone(), width).into_iter().skip(skip) {
-            visible_wrapped.push(row);
-            if visible_wrapped.len() >= height {
-                break 'outer;
-            }
-        }
-    }
+    let visible_wrapped = app.main_panel.visible_rows(text_area.height);
 
     // Overlay a scrollbar on the panel's right border (not stealing an inner
     // text column) whenever the body has more wrapped rows than fit, so it's
@@ -1368,10 +1345,9 @@ pub(crate) fn draw_collection_main(
         app.main_scrollbar_area = Rect::default();
     }
 
-    // Cache the wrap/geometry so mouse selection can map coordinates back to
-    // real, copyable text — scoped to this panel's own Rect only.
+    // Record the panel's Rect and shadow-icon positions so mouse selection can
+    // map coordinates back to real, copyable text — scoped to this panel only.
     app.main_text_area = text_area;
-    app.main_wrap = Some(wrap);
     app.main_shadow_icon_positions = shadow_positions;
 
     f.render_widget(
@@ -1419,7 +1395,10 @@ pub(crate) fn draw_response(
     if loading {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        app.resp_panel
+            .set_content(Arc::from(""), area.width.max(1) as usize);
+        app.resp_panel.clear();
+        app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -1433,7 +1412,10 @@ pub(crate) fn draw_response(
     if !error.is_empty() {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        app.resp_panel
+            .set_content(Arc::from(""), area.width.max(1) as usize);
+        app.resp_panel.clear();
+        app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
         f.render_widget(
             Paragraph::new(format!("{} {error}", s.req_error_prefix))
@@ -1446,7 +1428,10 @@ pub(crate) fn draw_response(
     if status == 0 {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        app.resp_panel
+            .set_content(Arc::from(""), area.width.max(1) as usize);
+        app.resp_panel.clear();
+        app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -1523,22 +1508,23 @@ pub(crate) fn draw_response(
     }
 
     // Wrap long lines to the body width and clamp scrolling so the user can't
-    // scroll past the last line into blank space. The wrap/line structure is
-    // cached (`PanelWrap::rebuild_if_needed`) and reused across frames as
-    // long as `body`'s identity and the panel width haven't changed, and even
-    // a rebuild only wraps the rows actually on screen — this is what keeps
-    // dragging a selection or scrolling responsive regardless of how large
-    // an "obscenely large" response body is.
+    // scroll past the last line into blank space. The panel caches the
+    // wrap/line structure (`set_content` → `rebuild_if_needed`) and reuses it
+    // across frames as long as `body`'s identity and the panel width haven't
+    // changed, and even a rebuild only wraps the rows actually on screen —
+    // this is what keeps dragging a selection or scrolling responsive
+    // regardless of how large an "obscenely large" response body is. The
+    // end-of-row wrap marker makes a soft wrap read as one logical line.
     let body_area = rows[2];
     let width = body_area.width as usize;
-    PanelWrap::rebuild_if_needed(&mut app.resp_wrap, &body, width);
-    let wrap = app.resp_wrap.as_ref().expect("just rebuilt above");
-    let total_lines = wrap.total_rows().min(u16::MAX as u32) as u16;
-    let max_scroll = total_lines.saturating_sub(body_area.height);
+    app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
+    app.resp_panel.set_content(body.clone(), width);
+    let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
+    let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
-    app.resp_scroll = app.resp_scroll.min(max_scroll);
+    let scroll = app.resp_panel.scroll();
 
-    let visible_wrapped = wrap.visible_window(app.resp_scroll, body_area.height);
+    let visible_wrapped = app.resp_panel.visible_rows(body_area.height);
 
     // Overlay a scrollbar on the panel's right border (not stealing an inner
     // text column, and safely outside `resp_text_area` so it can never be
@@ -1556,7 +1542,7 @@ pub(crate) fn draw_response(
             bar_area,
             total_lines as usize,
             body_area.height as usize,
-            app.resp_scroll as usize,
+            scroll as usize,
             th,
         );
         app.resp_scrollbar_area = bar_area;
