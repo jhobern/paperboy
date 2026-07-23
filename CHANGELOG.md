@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [Unreleased]
+
+### Added
+
+- **PaperTrail reports — new Reports view (work in progress).** A report is a
+  new kind of tab, opened with **Shift+R**, that lives alongside the collection
+  tabs but takes the whole body (no list / environment / response panels, so it
+  fits small screens). Each report holds a PaperTrail flow (`.report` source)
+  that will drive a bound collection against ranges of files/environments to
+  produce a tabular report. This first slice adds the tab itself: a read-only
+  view of the flow source with its live validation (bound-collection status,
+  parse errors, and per-statement diagnostics), an **`e`** modal source editor
+  (F2 / Ctrl+S to save, Esc to cancel), and persistence of report tabs (source
+  text is snapshotted so an unsaved scratch report survives a restart). Running
+  a report, CSV export, and binding a collection follow in later updates.
+
+
 ## [0.1.6] - 2026-07-18
 
 ### Added

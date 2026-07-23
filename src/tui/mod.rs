@@ -11,6 +11,7 @@ mod git_save;
 mod input;
 mod new_request;
 pub(crate) mod remote;
+mod reports;
 mod selection;
 #[cfg(test)]
 mod tests;

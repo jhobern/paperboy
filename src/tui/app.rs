@@ -373,6 +373,14 @@ pub(crate) enum Overlay {
     },
     Browser(FileAction, Box<FileExplorer>),
     NewRequest(Box<NewReq>),
+    /// Full-screen modal editor for the active report tab's PaperTrail source
+    /// text (reuses the multiline [`Editor`], like Raw Mode for a request).
+    /// F2 / Ctrl+S commits the edited text back into the report (and
+    /// re-validates); Esc cancels. Mirrors the app's other modal-edit paths so
+    /// single-key typing never collides with the main view's shortcuts.
+    ReportEdit {
+        editor: Editor,
+    },
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
     GitSave(Box<GitSaveWizard>),
@@ -629,11 +637,26 @@ pub(crate) struct PendingWorkspaceSave {
     pub(crate) dest_dir: Option<PathBuf>,
 }
 
+/// A tab that was closed and can be reopened with `u` / Ctrl+Shift+T. Unifying
+/// collection and report tabs in one recency-ordered stack keeps the undo order
+/// correct across both kinds (rather than two independent stacks that could
+/// restore out of order). Each variant remembers the *within-kind* index it was
+/// closed from so it reappears close to where it was.
+pub(crate) enum ClosedTab {
+    Collection(usize, Collection),
+    Report(usize, crate::tui::reports::ReportTab),
+}
+
 pub struct TuiApp {
     pub(crate) language: Language,
     pub(crate) vars: AppVars,
     pub(crate) collections: Vec<Collection>,
     pub(crate) active_tab: usize,
+    /// Report tabs (PaperTrail `.report` documents), shown in the same tab bar
+    /// *after* the collection tabs. The unified tab index (`active_tab`) counts
+    /// collections first, then reports: index `>= collections.len()` selects
+    /// `reports[active_tab - collections.len()]`. See [`Self::active_is_report`].
+    pub(crate) reports: Vec<crate::tui::reports::ReportTab>,
     pub(crate) response: Arc<Mutex<ApiResponse>>,
 
     /// The global list of Environments, shared across all collections (see
@@ -833,8 +856,9 @@ pub struct TuiApp {
 
     /// Stack of recently closed tabs (with the index they were closed from),
     /// most-recently-closed last, so Ctrl+Shift+T can reopen them in order.
-    /// Runtime-only (not persisted).
-    pub(crate) closed_tabs: Vec<(usize, Collection)>,
+    /// Holds both collection and report tabs (see [`ClosedTab`]) so undo order
+    /// stays correct across the two kinds. Runtime-only (not persisted).
+    pub(crate) closed_tabs: Vec<ClosedTab>,
 
     /// The in-progress New/Edit Request wizard, stashed here while the file
     /// browser is open for `FileAction::PickFormFile` (the overlay is a
@@ -892,6 +916,7 @@ impl Default for TuiApp {
             vars: AppVars::default(),
             collections: vec![Collection::new("Request".to_string(), Vec::new())],
             active_tab: 0,
+            reports: Vec::new(),
             response: Arc::new(Mutex::new(ApiResponse::default())),
             global_envs: Vec::new(),
             active_env_id: None,

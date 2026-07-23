@@ -302,6 +302,28 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(mk(name, app.active_tab == i));
         pos += w;
     }
+    // Report tabs follow the collection tabs in the same strip (unified index:
+    // `collections.len() + report_index`). A leading icon distinguishes them,
+    // and a dirty marker flags unsaved source edits.
+    let report_base = app.collections.len();
+    for (r, rt) in app.reports.iter().enumerate() {
+        spans.push(Span::raw("│"));
+        pos += 1;
+        let marker = if rt.report.dirty {
+            s.report_dirty_marker
+        } else {
+            ""
+        };
+        let name = format!("{}{}{}", s.report_tab_icon, marker, rt.report.name);
+        let idx = report_base + r;
+        let w = name.chars().count() + 2;
+        if app.active_tab == idx {
+            active_start = pos;
+            active_w = w;
+        }
+        spans.push(mk(name, app.active_tab == idx));
+        pos += w;
+    }
     let total_w = pos;
     // Content width available inside the panel borders.
     let avail = area.width.saturating_sub(2) as usize;
@@ -344,6 +366,14 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
 }
 
 pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &mut TuiApp, s: &Strings, th: &Theme) {
+    // A report tab takes the whole body (no list/environment/response panels),
+    // per the design — so branch before the collection-tab layout below, which
+    // indexes `app.collections[app.active_tab]` and would panic on a report's
+    // unified tab index.
+    if app.active_is_report() {
+        super::reports::draw_report_body(f, area, app, s, th);
+        return;
+    }
     let cols =
         Layout::horizontal([Constraint::Length(app.list_width), Constraint::Min(10)]).split(area);
     let ci = app.active_tab;
@@ -2251,6 +2281,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             }
         }
         Overlay::NewRequest(form) => draw_new_request(f, form, s, th, app.enhanced_keys),
+        Overlay::ReportEdit { editor } => {
+            super::reports::draw_report_edit_overlay(f, editor, s, th)
+        }
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th),
         Overlay::RemoteGit(w) => draw_remote_wizard(f, w, s, th),
         Overlay::GitSave(w) => draw_git_save_wizard(f, w, s, th),

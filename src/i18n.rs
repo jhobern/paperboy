@@ -424,6 +424,20 @@ strings! {
     browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
+    report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
+    report_tab_icon => "▤ ", "▤ ", "▤ ";
+    report_source_heading => "Report Source", "Source du rapport", "Rapportkilde";
+    report_validation_heading => "Validation", "Validation", "Validering";
+    report_binding_heading => "Binding", "Liaison", "Binding";
+    report_bound_prefix => "Bound collection:", "Collection liée :", "Bundet samling:";
+    report_unbound => "No collection bound — edit the report's '# collection:' header to bind one.", "Aucune collection liée — modifiez l'en-tête « # collection: » du rapport pour en lier une.", "Ingen samling bundet — rediger rapportens « # collection: »-header for at binde en.";
+    report_collection_missing => "Bound collection is not loaded — open it as a tab so its requests can be validated.", "La collection liée n'est pas chargée — ouvrez-la dans un onglet pour valider ses requêtes.", "Den bundne samling er ikke indlæst — åbn den som en fane, så dens anmodninger kan valideres.";
+    report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
+    report_empty_source => "Empty report — press e to edit its source.", "Rapport vide — appuyez sur e pour modifier sa source.", "Tom rapport — tryk e for at redigere kilden.";
+    report_hint_edit => "e edit", "e modifier", "e rediger";
+    report_hints => "e edit · [ ] switch tabs · ^w close · u reopen", "e modifier · [ ] changer d'onglet · ^w fermer · u rouvrir", "e rediger · [ ] skift faner · ^w luk · u genåbn";
+    report_edit_title => "Edit Report Source", "Modifier la source du rapport", "Rediger rapportkilde";
+    report_dirty_marker => "●", "●", "●";
 }
 
 /// A language-independent status / notification message. It stores *what*

@@ -14,7 +14,7 @@ use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, METHODS};
 use crate::i18n::{Language, Status, Strings};
 use crate::persistence::{
-    self, PendingWorkspaceReload, PersistedEnv, PersistedState, PersistedTab,
+    self, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState, PersistedTab,
 };
 use crate::request::{self, AppVars, build_request_json};
 
@@ -467,10 +467,19 @@ impl TuiApp {
             Overlay::EnvVarForm(form) => self.env_var_form_key_handler(key, form),
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
+            Overlay::ReportEdit { editor } => self.report_edit_key_handler(key, editor),
         }
     }
 
     pub(crate) fn on_key_normal(&mut self, key: KeyEvent) {
+        // A report tab has an entirely separate (much smaller) key map handled
+        // in `reports.rs`; intercept it here before any of the arms below, which
+        // freely index `self.collections[self.active_tab]` and would panic on a
+        // report's unified tab index.
+        if self.active_is_report() {
+            self.on_key_report(key);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -530,6 +539,9 @@ impl TuiApp {
                 self.help_scroll = 0;
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // Shift+R opens a brand-new PaperTrail report tab (report tabs live
+            // after the collection tabs in the same strip).
+            KeyCode::Char('R') => self.new_report_tab(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.response_pct = self.response_pct.saturating_sub(5).max(15);
                 self.save_state();
@@ -803,7 +815,7 @@ impl TuiApp {
     }
 
     pub(crate) fn cycle_tab(&mut self, forward: bool) {
-        let total = self.collections.len();
+        let total = self.tab_count();
         self.active_tab = if forward {
             (self.active_tab + 1) % total
         } else {
@@ -834,6 +846,13 @@ impl TuiApp {
     /// [`Overlay::CloseGitWorkspace`] and [`Self::finish_close_tab`].
     pub(crate) fn close_active_tab(&mut self) {
         let idx = self.active_tab;
+        // A report tab (unified index past the collections) is closed via its
+        // own path — it has no git-workspace folder to reason about and lives
+        // in a separate vector.
+        if self.active_is_report() {
+            self.close_active_report_tab();
+            return;
+        }
         if idx == 0 {
             return; // the built-in Request tab is not closable
         }
@@ -863,7 +882,7 @@ impl TuiApp {
             // Remember it (with the index it was closed from) so Ctrl+Shift+T
             // can bring it back; capped so this can't grow unbounded in a
             // long session.
-            self.closed_tabs.push((idx, removed));
+            self.closed_tabs.push(ClosedTab::Collection(idx, removed));
             if self.closed_tabs.len() > 20 {
                 self.closed_tabs.remove(0);
             }
@@ -882,12 +901,21 @@ impl TuiApp {
     /// Reopen the most recently closed tab (Ctrl+Shift+T), restoring it as
     /// close as possible to the index it was closed from and making it active.
     pub(crate) fn reopen_closed_tab(&mut self) {
-        let Some((idx, col)) = self.closed_tabs.pop() else {
+        let Some(closed) = self.closed_tabs.pop() else {
             return;
         };
-        let idx = idx.min(self.collections.len());
-        self.collections.insert(idx, col);
-        self.active_tab = idx;
+        match closed {
+            ClosedTab::Collection(idx, col) => {
+                let idx = idx.min(self.collections.len());
+                self.collections.insert(idx, col);
+                self.active_tab = idx;
+            }
+            ClosedTab::Report(ridx, rt) => {
+                let ridx = ridx.min(self.reports.len());
+                self.reports.insert(ridx, rt);
+                self.active_tab = self.collections.len() + ridx;
+            }
+        }
         self.focus = Pane::Tabs;
         self.save_state();
     }
@@ -895,6 +923,28 @@ impl TuiApp {
     /// Move the active tab one position left/right among the reorderable tabs
     /// (index 0, the built-in Request tab, is fixed and never moved past).
     pub(crate) fn move_active_tab(&mut self, forward: bool) {
+        // Report tabs reorder only among themselves (they always follow the
+        // collection tabs in the unified strip), so a report never swaps across
+        // the collection/report boundary.
+        if self.active_is_report() {
+            let base = self.collections.len();
+            let ridx = self.active_tab - base;
+            let target = if forward {
+                ridx + 1
+            } else {
+                ridx.wrapping_sub(1)
+            };
+            if forward && target >= self.reports.len() {
+                return;
+            }
+            if !forward && ridx == 0 {
+                return;
+            }
+            self.reports.swap(ridx, target);
+            self.active_tab = base + target;
+            self.save_state();
+            return;
+        }
         let idx = self.active_tab;
         if idx == 0 {
             return;
@@ -1519,7 +1569,17 @@ impl TuiApp {
             self.pending_workspace_reloads = pending_reloads;
             self.open_next_pending_workspace_reload();
         }
-        self.active_tab = state.active_tab.min(self.collections.len() - 1);
+        // Restore report tabs after the collections, then clamp the active tab
+        // against the *unified* tab count (collections + reports).
+        self.reports = state
+            .reports
+            .into_iter()
+            .map(|pr| crate::tui::reports::ReportTab::new(pr.into_report()))
+            .collect();
+        self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
+        for i in 0..self.reports.len() {
+            self.revalidate_report(i);
+        }
         self.last_browse_dir = state
             .last_browse_dir
             .filter(|s| !s.is_empty())
@@ -1557,9 +1617,13 @@ impl TuiApp {
                     PersistedTab::from_collection(c, linked_env_index)
                 })
                 .collect(),
-            // Populated once the TUI holds report tabs (Phase 9); the
-            // persistence round-trip itself is exercised at the model layer.
-            reports: Vec::new(),
+            // Report tabs are persisted as source-text snapshots (see
+            // `PersistedReport`) so an unsaved scratch report survives a restart.
+            reports: self
+                .reports
+                .iter()
+                .map(|rt| PersistedReport::from_report(&rt.report))
+                .collect(),
             active_tab: self.active_tab,
             last_browse_dir: self
                 .last_browse_dir

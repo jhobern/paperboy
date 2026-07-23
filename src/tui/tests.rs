@@ -14320,3 +14320,122 @@ fn custom_themes_and_active_theme_survive_persistence() {
     assert_eq!(restored.custom_themes.len(), 1);
     assert_eq!(restored.custom_themes[0].color(0), [1, 2, 3]);
 }
+
+// ---- PaperTrail report tabs (Phase 9) ------------------------------------
+
+use crate::report::validate::Severity;
+
+/// Shift+R from the main view opens a new (scratch) report tab and makes it
+/// active — report tabs live after the collection tabs in the unified strip.
+#[test]
+fn shift_r_opens_a_new_report_tab() {
+    let mut app = TuiApp::default();
+    assert_eq!(app.reports.len(), 0);
+    app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    assert_eq!(app.reports.len(), 1);
+    assert!(app.active_is_report());
+    // First report tab sits immediately after the collection tabs.
+    assert_eq!(app.active_tab, app.collections.len());
+}
+
+/// A brand-new scratch report has a blank `# collection:` header, so validation
+/// flags it as unbound (an error) without any parse error.
+#[test]
+fn new_scratch_report_flags_unbound_collection() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let rt = app.active_report().expect("active report");
+    assert!(rt.parse_error.is_none(), "scratch template must parse");
+    assert!(
+        rt.diagnostics.iter().any(|d| d.severity == Severity::Error),
+        "an unbound collection should be an error diagnostic"
+    );
+}
+
+/// `e` opens the modal source editor; typing then F2 commits the edited text
+/// back into the report (marking it dirty) and closes the overlay.
+#[test]
+fn report_edit_overlay_commits_edited_source() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    press(&mut app, KeyCode::Char('e'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportEdit { .. })));
+    app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    assert!(app.overlay.is_none(), "F2 commits and closes the editor");
+    let rt = app.active_report().expect("active report");
+    assert!(rt.report.text.contains('x'));
+    assert!(rt.report.dirty, "committing an edit marks the report dirty");
+}
+
+/// Esc in the modal editor cancels without changing the report.
+#[test]
+fn report_edit_overlay_esc_discards_edits() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let before = app.active_report().unwrap().report.text.clone();
+    press(&mut app, KeyCode::Char('e'));
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+    assert_eq!(app.active_report().unwrap().report.text, before);
+}
+
+/// Tab cycling visits report tabs alongside collection tabs (unified index).
+#[test]
+fn cycle_tab_reaches_report_tabs() {
+    let mut app = TuiApp::default();
+    app.new_report_tab(); // collections=1, reports=1, active=1 (report)
+    assert!(app.active_is_report());
+    app.cycle_tab(true); // wraps back to collection tab 0
+    assert!(!app.active_is_report());
+    assert_eq!(app.active_tab, 0);
+    app.cycle_tab(true); // forward to the report tab again
+    assert!(app.active_is_report());
+}
+
+/// Closing a report tab (Ctrl+W) removes it, and `u` reopens it intact.
+#[test]
+fn closing_report_tab_then_reopening_restores_it() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# name: R1\n# collection: c.hurl\n");
+    assert_eq!(app.reports.len(), 1);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.reports.len(), 0);
+    assert!(!app.active_is_report());
+    assert_eq!(app.active_tab, 0);
+
+    press(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.reports.len(), 1);
+    assert_eq!(app.reports[0].report.name, "R1");
+    assert!(app.active_is_report());
+}
+
+/// Report tabs (source text + name + active selection) survive a persistence
+/// round-trip through `to_persisted` / `apply_persisted`.
+#[test]
+fn report_tabs_survive_persist_round_trip() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# name: Nightly\n# collection: c.hurl\nREQUEST x\n");
+    let active_before = app.active_tab;
+
+    let state = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(state);
+
+    assert_eq!(restored.reports.len(), 1);
+    assert_eq!(restored.reports[0].report.name, "Nightly");
+    assert_eq!(restored.active_tab, active_before);
+    assert!(restored.active_is_report());
+    // Restored reports are revalidated, so diagnostics are populated.
+    assert!(!restored.reports[0].report.dirty);
+}
