@@ -11,6 +11,7 @@ mod hurl;
 mod i18n;
 mod persistence;
 mod postman;
+mod report;
 mod request;
 mod shared_utils;
 mod tree;

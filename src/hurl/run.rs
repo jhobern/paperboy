@@ -44,8 +44,17 @@ pub struct EntryOutcome {
     pub headers: Vec<(String, String)>,
     /// Response body, pretty-printed when it parses as JSON.
     pub body: String,
+    /// The response body exactly as received (never reformatted), so a report
+    /// can render `RESPONSE RAW` without losing the server's original bytes
+    /// (whitespace, key order, non-JSON payloads). `body` is the pretty view of
+    /// this same content.
+    pub raw_body: String,
     pub asserts: Vec<AssertOutcome>,
     pub captures: Vec<(String, String)>,
+    /// Effective duration of the HTTP transfer(s) for this entry, in
+    /// milliseconds (excludes assert/capture processing). Reports surface this
+    /// as the per-request "Time" column.
+    pub duration_ms: u64,
     /// `true` when the runner reported no errors for this entry (status
     /// expectation, asserts and transport all satisfied).
     pub ok: bool,
@@ -225,7 +234,7 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         .last()
         .map(|c| (c.request.method.clone(), c.request.url.to_string()))
         .unwrap_or_default();
-    let (status, headers, body) = match e.calls.last() {
+    let (status, headers, body, raw_body) = match e.calls.last() {
         Some(call) => {
             let r = &call.response;
             let hdrs = r
@@ -236,10 +245,10 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
             let raw = String::from_utf8_lossy(&r.body).to_string();
             let body = serde_json::from_str::<JsonValue>(&raw)
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone()))
-                .unwrap_or(raw);
-            (r.status as u16, hdrs, body)
+                .unwrap_or_else(|_| raw.clone());
+            (r.status as u16, hdrs, body, raw)
         }
-        None => (0, Vec::new(), String::new()),
+        None => (0, Vec::new(), String::new(), String::new()),
     };
 
     // Only surface EXPLICIT [Asserts] plus the implicit status assertion; the
@@ -325,8 +334,10 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
             status_text: reason(status).to_string(),
             headers,
             body,
+            raw_body,
             asserts,
             captures,
+            duration_ms: e.transfer_duration.as_millis() as u64,
             ok: e.errors.is_empty(),
             error: entry_error.clone(),
         },

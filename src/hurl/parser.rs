@@ -20,7 +20,39 @@ pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
-    file.entries.iter().map(|e| map_entry(e, &lines)).collect()
+    // Each entry's `# [Reports]` comment block is recovered by scanning the raw
+    // source within that entry's line window; the window ends at the next
+    // entry's method line (or end-of-file for the last entry). We deliberately
+    // use the next entry's *method* line, not its `source_info.start.line`:
+    // `hurl_core` attaches an inter-entry comment block (which includes our
+    // `# [Reports]` block) to the *following* entry's start, so a start-based
+    // window would cut the block off from the entry it belongs to.
+    let method_lines: Vec<usize> = file
+        .entries
+        .iter()
+        .map(|e| first_method_line(&lines, e.request.source_info.start.line))
+        .collect();
+    file.entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let end = method_lines.get(i + 1).copied().unwrap_or(lines.len() + 1);
+            map_entry(e, &lines, method_lines[i], end)
+        })
+        .collect()
+}
+
+/// The 1-based line number of an entry's HTTP-method line: the first
+/// non-comment, non-blank line at or after `start_line` (which may itself be a
+/// leading comment). Used to bound each entry's raw-source scan window.
+fn first_method_line(lines: &[&str], start_line: usize) -> usize {
+    (start_line.saturating_sub(1)..lines.len())
+        .find(|&i| {
+            let l = lines[i].trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+        .map(|i| i + 1)
+        .unwrap_or(lines.len() + 1)
 }
 
 /// Explain, in one short line, *why* `content` isn't valid Hurl — for the Raw
@@ -64,7 +96,7 @@ pub fn parse_hurl_error(content: &str) -> Option<String> {
     Some(reason)
 }
 
-fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
+fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> HurlEntry {
     let req = &e.request;
 
     let mut basic_auth = None;
@@ -135,6 +167,7 @@ fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
         expected_status,
         captures,
         asserts,
+        reports: reports_from_span(lines, scan_start, scan_end),
         user_added: false,
         modified: false,
         last_run: RunStatus::default(),
@@ -461,6 +494,68 @@ fn capture_pair(c: &Capture, lines: &[&str]) -> Option<(String, String)> {
     Some((name.trim().to_string(), expr.trim().to_string()))
 }
 
+/// Recover a request's PaperBoy `# [Reports]` block from raw source, within the
+/// entry's 1-based line window `[start, end)`. A real `[Reports]` response
+/// section is a non-recoverable `hurl_core` parse error, so report-field
+/// definitions are round-tripped as comments (see [`HurlEntry::to_hurl`]): the
+/// `# [Reports]` marker followed by contiguous `# name: query` rows. Scanning
+/// stops at the first line that isn't such a row (a blank line, a real section,
+/// or a prose comment), mirroring the disabled-row scan.
+fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, String)> {
+    let from = start.saturating_sub(1);
+    let to = end.saturating_sub(1).min(lines.len());
+    let mut reports = Vec::new();
+    let mut i = from;
+    // Locate the marker.
+    while i < to {
+        if is_reports_marker(lines[i]) {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    // Collect the contiguous `# name: query` rows that follow it.
+    while i < to {
+        match parse_report_row(lines[i]) {
+            Some(row) => reports.push(row),
+            None => break,
+        }
+        i += 1;
+    }
+    reports
+}
+
+/// `true` when `line` is the `# [Reports]` block marker (leading whitespace and
+/// the comment `#` allowed, case-insensitive on the section name).
+fn is_reports_marker(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('#')
+        .map(str::trim)
+        .is_some_and(|rest| rest.eq_ignore_ascii_case("[Reports]"))
+}
+
+/// Parse one `# name: query` report row into `(name, query)`. `name` must be a
+/// single identifier-like token (alphanumeric / `_` / `-`) so a prose comment
+/// (which may contain a colon) doesn't get mistaken for a report field.
+fn parse_report_row(line: &str) -> Option<(String, String)> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if rest.starts_with('[') {
+        return None;
+    }
+    let (name, query) = rest.split_once(':')?;
+    let name = name.trim();
+    let query = query.trim();
+    if name.is_empty()
+        || query.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some((name.to_string(), query.to_string()))
+}
+
 /// Title = the `#` comment lines immediately above the request's method line
 /// (reset by a blank line), with `#` and `-`/`=` decoration stripped. The
 /// entry's `source_info.start` is sometimes the leading comment and sometimes
@@ -638,6 +733,64 @@ mod tests {
         let reparsed = parse_hurl(&text);
         assert_eq!(reparsed.len(), 1);
         assert_eq!(reparsed[0].cookies, entry.cookies);
+    }
+
+    #[test]
+    fn reports_block_round_trips_through_serialize_and_parse() {
+        let mut entry = HurlEntry::from_fields("Process", "POST", "{{ URL }}/process", vec![], "");
+        entry.reports = vec![
+            ("status".to_string(), "jsonpath \"$.status\"".to_string()),
+            (
+                "overall".to_string(),
+                "jsonpath \"$.dfa_overall_result\"".to_string(),
+            ),
+        ];
+
+        let text = entry.to_hurl();
+        assert!(
+            text.contains("# [Reports]"),
+            "expected a commented Reports marker:\n{text}"
+        );
+        // The block must survive re-parsing.
+        let reparsed = parse_hurl(&text);
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(reparsed[0].reports, entry.reports);
+    }
+
+    #[test]
+    fn reports_block_is_ignored_by_hurl_core_so_the_file_still_parses() {
+        // The whole point of comment-encoding: `hurl_core` must still parse a
+        // request that carries a `# [Reports]` block (a literal `[Reports]`
+        // response section would be a non-recoverable parse error).
+        let mut entry = HurlEntry::from_fields("Process", "POST", "http://h/process", vec![], "");
+        entry.captures = vec![("token".to_string(), "jsonpath \"$.token\"".to_string())];
+        entry.reports = vec![("status".to_string(), "jsonpath \"$.status\"".to_string())];
+        let text = entry.to_hurl();
+        assert!(
+            parse_hurl_file(&text).is_ok(),
+            "hurl_core should still parse a file with a # [Reports] block:\n{text}"
+        );
+        // And the real [Captures] section alongside it is unaffected.
+        let reparsed = parse_hurl(&text);
+        assert_eq!(reparsed[0].captures, entry.captures);
+        assert_eq!(reparsed[0].reports, entry.reports);
+    }
+
+    #[test]
+    fn reports_block_scan_does_not_bleed_across_entries() {
+        // Two entries; only the first has a Reports block. The scan window must
+        // stop at the next entry so the block isn't attributed to the wrong one.
+        let mut a = HurlEntry::from_fields("First", "GET", "http://h/a", vec![], "");
+        a.reports = vec![("s".to_string(), "jsonpath \"$.s\"".to_string())];
+        let b = HurlEntry::from_fields("Second", "GET", "http://h/b", vec![], "");
+        let doc = collection_to_hurl(&[a.clone(), b.clone()]);
+        let parsed = parse_hurl(&doc);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].reports, a.reports);
+        assert!(
+            parsed[1].reports.is_empty(),
+            "second entry must not inherit the first's Reports block"
+        );
     }
 
     #[test]

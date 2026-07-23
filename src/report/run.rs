@@ -1,0 +1,1704 @@
+//! The PaperTrail interpreter: walk a [`ReportFlow`] and produce a
+//! [`ReportResult`] (the wide row model in [`super::model`]).
+//!
+//! # Design
+//!
+//! The interpreter is **front-end agnostic** and, crucially, **runner
+//! agnostic**: every actual HTTP send goes through the [`EntryRunner`] trait so
+//! the whole engine is unit-testable without a network (tests inject a fake
+//! runner that returns canned responses). The production implementation
+//! ([`LiveRunner`]) wraps [`crate::request::run_resolved_entry`], the exact
+//! single-request pipeline the TUI uses, so a report request is sent
+//! identically to a hand-run one.
+//!
+//! # Rows
+//!
+//! The output is *wide*: a **row** is one innermost-loop iteration (or the one
+//! row of a loop-free flow). Each `REPORT` statement contributes namespaced
+//! cells to the current row(s); a `REPORT` at an outer level (e.g. before a
+//! loop) is evaluated once and **broadcast** into every row the block produces.
+//! [`Exec::exec_block`] implements this by accumulating this-level cells and
+//! merging them into the rows returned by any nested loops (or emitting a single
+//! row when the block has no loop).
+//!
+//! # Report fields are evaluated natively, not as captures
+//!
+//! `[Reports]`/`WITH` fields look like `[Captures]` (`name: <hurl query>`) but
+//! are **not** run as captures. Hurl captures are all-or-nothing: a single
+//! query that matches nothing aborts the entry and discards *every* capture
+//! (verified against `hurl` 8.0.1), which would both break capture chaining and
+//! violate the "always emit a row, show a no-match marker" contract. Hurl also
+//! does not expose its query evaluator publicly. So report fields are evaluated
+//! *tolerantly* against the response we already have (see [`eval_field`]): a
+//! non-match yields `None` (rendered as `PRELUDE_NO_MATCH_MARKER`) and never
+//! affects the request's real captures. The supported query subset covers the
+//! practical report cases (`status`, `header`, `body`, `jsonpath`, `regex`);
+//! richer queries are a documented follow-up.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::environment::substitute;
+use crate::hurl::HurlEntry;
+use crate::hurl::{EntryOutcome, RunOutput};
+
+use super::flow::{
+    Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
+    ResponseFmt, WithItem,
+};
+use super::model::{ReportResult, ReportRow};
+use super::producers::{self, ProducerItem};
+
+/// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
+/// `PRELUDE_*=…` assignment).
+const DEFAULT_NO_MATCH: &str = "";
+const DEFAULT_RESPONSE_FORMAT: &str = "pretty";
+/// Default `PARALLEL` worker cap when a bare `PARALLEL` loop doesn't set one and
+/// `PRELUDE_MAX_PARALLEL` is unset.
+const DEFAULT_MAX_PARALLEL: usize = 8;
+
+/// Abstraction over "send one resolved request and get its outcome", so the
+/// interpreter can run against a fake in tests and the real pipeline in
+/// production. Must be `Sync` so parallel loop workers (Phase 7.5) can share one
+/// runner across threads.
+pub trait EntryRunner: Sync {
+    /// Send `base` with `vars` substituted, returning the raw run output. The
+    /// interpreter only ever passes single-entry `base`s, so `entries` holds one
+    /// [`EntryOutcome`] on success.
+    fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput;
+}
+
+/// Production [`EntryRunner`]: routes each send through
+/// [`crate::request::run_resolved_entry`] (base64 expansion → form-file staging
+/// → content-length → `to_hurl` → `run_hurl`), rooted at `file_root` (the bound
+/// collection's directory) so relative form-file paths resolve as expected.
+pub struct LiveRunner {
+    pub file_root: Option<PathBuf>,
+}
+
+impl EntryRunner for LiveRunner {
+    fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+        crate::request::run_resolved_entry(base, vars, self.file_root.as_deref(), &[])
+    }
+}
+
+/// The immutable context a flow runs against: the bound collection's entries,
+/// the base variable layer (global + pinned env, resolved once), any named
+/// environments an `ENVS` loop may select, the report file's directory (for
+/// resolving relative producer paths), and the runner.
+pub struct RunContext<'a> {
+    /// The bound collection's entries, resolved by title (see [`resolve_title`]).
+    pub entries: &'a [HurlEntry],
+    /// Global + pinned environment variables, already merged (pinned wins). The
+    /// lowest layer of the variable precedence stack.
+    pub base_vars: HashMap<String, String>,
+    /// Environments selectable by name in a `FOR … IN ENVS` loop, each a flat
+    /// `KEY → value` map. Empty when the flow has no `ENVS` loop.
+    pub named_envs: HashMap<String, HashMap<String, String>>,
+    /// Directory the report file lives in; relative producer paths (`FILES`,
+    /// `FOLDERS`, `TUPLES FROM`) resolve against it (overridable via `# root:`).
+    pub root: Option<PathBuf>,
+    /// How each request is actually sent.
+    pub runner: &'a dyn EntryRunner,
+}
+
+/// Resolve a request `name` against the bound collection's entries, mirroring
+/// [`super::validate`]: exact full title → unique leaf (last `/`-segment) →
+/// `None` (ambiguous or missing). Validation surfaces the ambiguous/missing
+/// cases to the user before a run; at run time an unresolved name is recorded as
+/// an error and the row still emitted.
+pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a HurlEntry> {
+    let exact: Vec<&HurlEntry> = entries.iter().filter(|e| e.title == name).collect();
+    if exact.len() == 1 {
+        return Some(exact[0]);
+    }
+    if exact.len() > 1 {
+        return None;
+    }
+    let leaves: Vec<&HurlEntry> = entries
+        .iter()
+        .filter(|e| e.title.rsplit('/').next() == Some(name))
+        .collect();
+    if leaves.len() == 1 {
+        Some(leaves[0])
+    } else {
+        None
+    }
+}
+
+/// Run a whole flow and collect its rows.
+pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
+    let mut ex = Exec::new(ctx);
+    let rows = ex.exec_block(&flow.nodes);
+    // The table-wide no-match marker is the effective top-level
+    // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
+    // base frame holds the top-level value), defaulting to empty.
+    let no_match_marker = ex
+        .scopes
+        .first()
+        .and_then(|f| f.get("PRELUDE_NO_MATCH_MARKER"))
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
+    ReportResult {
+        rows,
+        column_order: ex.column_order,
+        no_match_marker,
+        errors: ex.errors,
+    }
+}
+
+/// Mutable interpreter state threaded through the walk.
+struct Exec<'a> {
+    ctx: &'a RunContext<'a>,
+    /// Lexical scope stack (outer → inner). Each frame holds this-block's
+    /// `Assign`/loop-bind variables; inner frames shadow outer.
+    scopes: Vec<HashMap<String, String>>,
+    /// Declared `LIST`s in scope (flat; list names are unique in practice).
+    lists: HashMap<String, Producer>,
+    /// Forward capture chain (values captured by requests, threaded to later
+    /// requests). Highest precedence in [`Exec::vars_for`].
+    captures: HashMap<String, String>,
+    /// In-scope `FILES`/list loop-variable *values* in binding order — the row
+    /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
+    key_parts: Vec<String>,
+    /// The current `ENVS` target (environment name), if inside an `ENVS` loop.
+    target: Option<String>,
+    /// The current `ENVS` target's variables, layered above pinned/global.
+    target_env: Option<HashMap<String, String>>,
+    /// Produced column keys in first-seen order (the default column order).
+    column_order: Vec<String>,
+    /// Non-fatal problems (unresolved request, transport failure, …). Every
+    /// issue still leaves a row.
+    errors: Vec<String>,
+}
+
+/// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
+/// accumulators) — the seed each loop iteration forks from, so iterations are
+/// independent (a requirement for `PARALLEL`, and applied to sequential loops
+/// too for consistent semantics: a loop is a self-contained per-item chain and
+/// its captures don't leak to the continuation).
+#[derive(Clone)]
+struct ExecState {
+    scopes: Vec<HashMap<String, String>>,
+    lists: HashMap<String, Producer>,
+    captures: HashMap<String, String>,
+    key_parts: Vec<String>,
+    target: Option<String>,
+    target_env: Option<HashMap<String, String>>,
+}
+
+/// The per-iteration output collected from a forked [`Exec`], reassembled in
+/// iteration order after a (possibly parallel) loop.
+struct IterOut {
+    rows: Vec<ReportRow>,
+    columns: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl<'a> Exec<'a> {
+    fn new(ctx: &'a RunContext<'a>) -> Self {
+        Exec {
+            ctx,
+            scopes: vec![HashMap::new()],
+            lists: HashMap::new(),
+            captures: HashMap::new(),
+            key_parts: Vec::new(),
+            target: None,
+            target_env: None,
+            column_order: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Snapshot the cloneable execution state (everything except the run-output
+    /// accumulators). Used to fork independent iterations for a `PARALLEL` loop
+    /// and to isolate each iteration's variable/capture scope.
+    fn to_state(&self) -> ExecState {
+        ExecState {
+            scopes: self.scopes.clone(),
+            lists: self.lists.clone(),
+            captures: self.captures.clone(),
+            key_parts: self.key_parts.clone(),
+            target: self.target.clone(),
+            target_env: self.target_env.clone(),
+        }
+    }
+
+    /// Build a fresh [`Exec`] from a snapshot (with empty output accumulators) —
+    /// the seed for one forked loop iteration.
+    fn from_state(ctx: &'a RunContext<'a>, state: ExecState) -> Self {
+        Exec {
+            ctx,
+            scopes: state.scopes,
+            lists: state.lists,
+            captures: state.captures,
+            key_parts: state.key_parts,
+            target: state.target,
+            target_env: state.target_env,
+            column_order: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// The effective `PARALLEL` worker count for a loop marked with `spec`:
+    /// `PARALLEL(n)` → `n`; bare `PARALLEL` → `PRELUDE_MAX_PARALLEL` (default
+    /// [`DEFAULT_MAX_PARALLEL`]). Clamped to `1..=count` (never more workers than
+    /// iterations).
+    fn parallel_degree(&self, spec: &ParallelSpec, count: usize) -> usize {
+        let want = spec.degree.map(|d| d as usize).unwrap_or_else(|| {
+            self.lookup("PRELUDE_MAX_PARALLEL")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_PARALLEL)
+        });
+        want.clamp(1, count.max(1))
+    }
+
+    /// The variables visible for `columns:`/`REPORT (var)` — every layer except
+    /// captures, low → high (base env, `ENVS` target env, then scope frames).
+    fn visible_vars(&self) -> HashMap<String, String> {
+        let mut m = self.ctx.base_vars.clone();
+        if let Some(env) = &self.target_env {
+            for (k, v) in env {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        for frame in &self.scopes {
+            for (k, v) in frame {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        m
+    }
+
+    /// The full substitution map (precedence, low → high): global+pinned →
+    /// `ENVS` env → flow assigns/loop binds → captures. Captures win, matching
+    /// the resolved precedence in the design plan.
+    fn vars_for(&self) -> HashMap<String, String> {
+        let mut m = self.visible_vars();
+        for (k, v) in &self.captures {
+            m.insert(k.clone(), v.clone());
+        }
+        m
+    }
+
+    /// Look up a single variable across the full precedence stack.
+    fn lookup(&self, key: &str) -> Option<String> {
+        if let Some(v) = self.captures.get(key) {
+            return Some(v.clone());
+        }
+        for frame in self.scopes.iter().rev() {
+            if let Some(v) = frame.get(key) {
+                return Some(v.clone());
+            }
+        }
+        if let Some(env) = &self.target_env
+            && let Some(v) = env.get(key)
+        {
+            return Some(v.clone());
+        }
+        self.ctx.base_vars.get(key).cloned()
+    }
+
+    /// Set a variable in the current (innermost) scope frame.
+    fn set_var(&mut self, key: &str, value: String) {
+        self.scopes
+            .last_mut()
+            .expect("scope stack is never empty")
+            .insert(key.to_string(), value);
+    }
+
+    /// The current effective default response format.
+    fn default_response_fmt(&self) -> ResponseFmt {
+        match self.lookup("PRELUDE_RESPONSE_FORMAT") {
+            Some(v) if v.eq_ignore_ascii_case("raw") => ResponseFmt::Raw,
+            _ => ResponseFmt::Pretty,
+        }
+    }
+
+    fn note_column(&mut self, key: &str) {
+        if !self.column_order.iter().any(|c| c == key) {
+            self.column_order.push(key.to_string());
+        }
+    }
+
+    /// Walk a block, returning the rows it produces. This-level `REPORT` cells
+    /// are accumulated and either broadcast into the rows produced by nested
+    /// loops or, when the block has no loop, emitted as a single row.
+    fn exec_block(&mut self, nodes: &[FlowNode]) -> Vec<ReportRow> {
+        let mut own: HashMap<String, String> = HashMap::new();
+        let mut child_rows: Vec<ReportRow> = Vec::new();
+        let mut has_loop = false;
+
+        for node in nodes {
+            match node {
+                FlowNode::Assign { key, value } => {
+                    let v = substitute(&unquote(value), &self.vars_for());
+                    self.set_var(key, v);
+                }
+                FlowNode::ListDecl { name, producer } => {
+                    self.lists.insert(name.clone(), producer.clone());
+                }
+                FlowNode::Request { name } => {
+                    self.run_request(name);
+                }
+                FlowNode::Report(stmt) => {
+                    let cells = self.eval_report(stmt);
+                    for (k, v) in cells {
+                        self.note_column(&k);
+                        own.insert(k, v);
+                    }
+                }
+                FlowNode::ForEach {
+                    pattern,
+                    producer,
+                    body,
+                    parallel,
+                } => {
+                    has_loop = true;
+                    child_rows.extend(self.run_for_each(
+                        pattern,
+                        producer,
+                        body,
+                        parallel.as_ref(),
+                    ));
+                }
+                FlowNode::ForEnvs {
+                    var,
+                    clause,
+                    body,
+                    parallel,
+                } => {
+                    has_loop = true;
+                    child_rows.extend(self.run_for_envs(var, clause, body, parallel.as_ref()));
+                }
+            }
+        }
+
+        if has_loop {
+            for row in &mut child_rows {
+                for (k, v) in &own {
+                    row.cells.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            child_rows
+        } else {
+            vec![self.emit_row(own)]
+        }
+    }
+
+    /// Build the single row for a loop-free (innermost) block: this-block's
+    /// cells plus a snapshot of the visible variables, the current row key, and
+    /// the current `ENVS` target.
+    fn emit_row(&self, cells: HashMap<String, String>) -> ReportRow {
+        ReportRow {
+            cells,
+            vars: self.visible_vars(),
+            key: self.key_parts.clone(),
+            target: self.target.clone(),
+        }
+    }
+
+    // --- requests & reports ------------------------------------------------
+
+    /// Send a request by name (no column emitted), threading its captures
+    /// forward. Records an error (but does not abort) if the name is unresolved
+    /// or the send fails.
+    fn run_request(&mut self, name: &str) -> Option<EntryOutcome> {
+        let base = match resolve_title(self.ctx.entries, name) {
+            Some(e) => e.clone(),
+            None => {
+                self.errors
+                    .push(format!("request '{name}' could not be resolved"));
+                return None;
+            }
+        };
+        let vars = self.vars_for();
+        let out = self.ctx.runner.run(&base, &vars);
+        if let Some(err) = &out.error {
+            self.errors.push(format!("{name}: {err}"));
+        }
+        let eo = out.entries.into_iter().next();
+        if let Some(eo) = &eo {
+            for (k, v) in &eo.captures {
+                self.captures.insert(k.clone(), v.clone());
+            }
+        }
+        eo
+    }
+
+    /// Evaluate a `REPORT` statement into cells for the current row. Cells are
+    /// returned in a **stable order** (so the default column order is
+    /// deterministic run-to-run — a `HashMap` here would randomise it).
+    fn eval_report(&mut self, stmt: &ReportStmt) -> Vec<(String, String)> {
+        match stmt {
+            ReportStmt::Vars(vars) => vars
+                .iter()
+                .map(|v| (v.clone(), self.lookup(v).unwrap_or_default()))
+                .collect(),
+            ReportStmt::Computed { template, name } => {
+                let value = substitute(template, &self.vars_for());
+                vec![(name.clone(), value)]
+            }
+            ReportStmt::Request {
+                name,
+                alias,
+                response_fmt,
+                with,
+            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, with),
+        }
+    }
+
+    /// Run a `REPORT REQUEST`: send the request, thread its captures, and emit
+    /// its intrinsic columns (`HttpStatus`/`Time`/`Asserts`/`Error`/`Response`)
+    /// plus one column per `[Reports]`/`WITH` field, all namespaced by `alias`
+    /// (default: the request's leaf name). Columns are emitted in a fixed order
+    /// (intrinsics, then `[Reports]` fields, then `WITH` fields) so report output
+    /// is deterministic.
+    fn eval_report_request(
+        &mut self,
+        name: &str,
+        alias: Option<&str>,
+        response_fmt: Option<ResponseFmt>,
+        with: &[WithItem],
+    ) -> Vec<(String, String)> {
+        let alias = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| leaf(name).to_string());
+        let mut cells: Vec<(String, String)> = Vec::new();
+
+        let base = match resolve_title(self.ctx.entries, name) {
+            Some(e) => e.clone(),
+            None => {
+                self.errors
+                    .push(format!("request '{name}' could not be resolved"));
+                cells.push((
+                    format!("{alias}.Error"),
+                    format!("unresolved request '{name}'"),
+                ));
+                return cells;
+            }
+        };
+
+        let vars = self.vars_for();
+        let out = self.ctx.runner.run(&base, &vars);
+        let eo = match out.entries.into_iter().next() {
+            Some(eo) => eo,
+            None => {
+                let err = out
+                    .error
+                    .unwrap_or_else(|| "request produced no response".into());
+                self.errors.push(format!("{name}: {err}"));
+                cells.push((format!("{alias}.Error"), err));
+                return cells;
+            }
+        };
+
+        // Thread real captures forward (report fields are evaluated separately
+        // and never touch the capture chain).
+        for (k, v) in &eo.captures {
+            self.captures.insert(k.clone(), v.clone());
+        }
+
+        // Resolve the response format: per-statement / WITH override, else the
+        // prelude default.
+        let with_fmt = with.iter().find_map(|w| match w {
+            WithItem::ResponseFmt(f) => Some(*f),
+            _ => None,
+        });
+        let fmt = response_fmt
+            .or(with_fmt)
+            .unwrap_or_else(|| self.default_response_fmt());
+        let response = match fmt {
+            ResponseFmt::Raw => eo.raw_body.clone(),
+            ResponseFmt::Pretty => eo.body.clone(),
+        };
+
+        // Intrinsics (fixed order).
+        cells.push((format!("{alias}.HttpStatus"), eo.status.to_string()));
+        cells.push((format!("{alias}.Time"), eo.duration_ms.to_string()));
+        cells.push((format!("{alias}.Asserts"), asserts_summary(&eo)));
+        cells.push((
+            format!("{alias}.Error"),
+            eo.error.clone().unwrap_or_default(),
+        ));
+        cells.push((format!("{alias}.Response"), response));
+
+        // Report fields: the request's own `[Reports]` block, then `WITH` fields
+        // (report-level overrides on name clash). Fields are stored raw (empty
+        // for a non-match); the no-match marker is applied once, at render time.
+        let mut fields: Vec<(String, String)> = base.reports.clone();
+        for w in with {
+            if let WithItem::Field { name, query } = w {
+                fields.retain(|(n, _)| n != name);
+                fields.push((name.clone(), query.clone()));
+            }
+        }
+        for (fname, query) in fields {
+            let value = eval_field(&query, &eo).unwrap_or_default();
+            cells.push((format!("{alias}.{fname}"), value));
+        }
+
+        cells
+    }
+
+    // --- loops -------------------------------------------------------------
+
+    /// Run a `FOR <pattern> IN <producer>` loop, returning all rows its
+    /// iterations produce (always in producer order, even when parallel). Each
+    /// item binds its positional values to the pattern (feeding the row key) and
+    /// its named fields directly into scope; an arity mismatch is recorded but
+    /// does not abort the run. Iterations are independent (captures do not leak
+    /// between them or to the continuation).
+    fn run_for_each(
+        &mut self,
+        pattern: &Pattern,
+        producer: &Producer,
+        body: &[FlowNode],
+        parallel: Option<&ParallelSpec>,
+    ) -> Vec<ReportRow> {
+        let items = match self.expand_producer(producer) {
+            Ok(t) => t,
+            Err(e) => {
+                self.errors.push(e);
+                return Vec::new();
+            }
+        };
+        // How one iteration seeds a fresh forked `Exec` and runs the body.
+        let seed = self.to_state();
+        let ctx = self.ctx;
+        let run_one = |i: usize| -> IterOut {
+            let item = &items[i];
+            let mut sub = Exec::from_state(ctx, seed.clone());
+            sub.check_arity(pattern, item);
+            sub.scopes.push(HashMap::new());
+            sub.bind_pattern(pattern, &item.values);
+            for (k, v) in &item.named {
+                sub.set_var(k, v.clone());
+            }
+            let rows = sub.exec_block(body);
+            IterOut {
+                rows,
+                columns: sub.column_order,
+                errors: sub.errors,
+            }
+        };
+        self.run_iterations(items.len(), parallel, run_one)
+    }
+
+    /// Run a `FOR <var> IN ENVS <clause>` loop: swap the target-env layer per
+    /// environment and run the body once each. `ENVS` is *not* part of the row
+    /// key (it is the comparison axis); baseline envs run first. Iterations are
+    /// independent and may run in parallel.
+    fn run_for_envs(
+        &mut self,
+        var: &str,
+        clause: &EnvClause,
+        body: &[FlowNode],
+        parallel: Option<&ParallelSpec>,
+    ) -> Vec<ReportRow> {
+        let names: Vec<String> = match clause {
+            EnvClause::Plain(names) => names.clone(),
+            EnvClause::Roles {
+                baseline,
+                comparisons,
+            } => baseline.iter().chain(comparisons).cloned().collect(),
+        };
+        let seed = self.to_state();
+        let ctx = self.ctx;
+        let run_one = |i: usize| -> IterOut {
+            let name = &names[i];
+            let mut sub = Exec::from_state(ctx, seed.clone());
+            sub.target = Some(name.clone());
+            sub.target_env = ctx.named_envs.get(name).cloned();
+            if sub.target_env.is_none() {
+                sub.errors
+                    .push(format!("environment '{name}' is not loaded"));
+            }
+            sub.scopes.push(HashMap::new());
+            sub.set_var(var, name.clone());
+            let rows = sub.exec_block(body);
+            IterOut {
+                rows,
+                columns: sub.column_order,
+                errors: sub.errors,
+            }
+        };
+        self.run_iterations(names.len(), parallel, run_one)
+    }
+
+    /// Execute `count` independent loop iterations — sequentially, or across a
+    /// bounded thread pool when the loop is marked `PARALLEL` — and reassemble
+    /// their output in iteration order (so a `PARALLEL` run is byte-identical to
+    /// the sequential one, only faster). Merges each iteration's column-order
+    /// notes and errors back into this `Exec`.
+    fn run_iterations<F>(
+        &mut self,
+        count: usize,
+        parallel: Option<&ParallelSpec>,
+        run_one: F,
+    ) -> Vec<ReportRow>
+    where
+        F: Fn(usize) -> IterOut + Sync,
+    {
+        let outs: Vec<IterOut> = match parallel {
+            Some(spec) if count > 1 => {
+                let degree = self.parallel_degree(spec, count);
+                let next = AtomicUsize::new(0);
+                let slots: Vec<Mutex<Option<IterOut>>> =
+                    (0..count).map(|_| Mutex::new(None)).collect();
+                std::thread::scope(|s| {
+                    for _ in 0..degree {
+                        s.spawn(|| {
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= count {
+                                    break;
+                                }
+                                let out = run_one(i);
+                                *slots[i].lock().unwrap() = Some(out);
+                            }
+                        });
+                    }
+                });
+                slots
+                    .into_iter()
+                    .map(|m| m.into_inner().unwrap().expect("every slot is filled"))
+                    .collect()
+            }
+            _ => (0..count).map(&run_one).collect(),
+        };
+
+        let mut rows = Vec::new();
+        for out in outs {
+            for c in &out.columns {
+                self.note_column(c);
+            }
+            self.errors.extend(out.errors);
+            rows.extend(out.rows);
+        }
+        rows
+    }
+
+    /// Record (but don't abort on) a destructuring arity mismatch: without a
+    /// `...` rest, the pattern's positions must equal the item's values; with a
+    /// rest, the pattern may bind fewer.
+    fn check_arity(&mut self, pattern: &Pattern, item: &ProducerItem) {
+        let want = pattern.binders.len();
+        let got = item.values.len();
+        let ok = if pattern.rest {
+            want <= got
+        } else {
+            want == got
+        };
+        if !ok {
+            self.errors.push(format!(
+                "pattern binds {want} value(s) but the item has {got}"
+            ));
+        }
+    }
+
+    /// Bind one producer tuple to a destructuring pattern (introducing the named
+    /// binders into the current scope and their values into the row key).
+    fn bind_pattern(&mut self, pattern: &Pattern, tuple: &[String]) {
+        for (i, binder) in pattern.binders.iter().enumerate() {
+            let value = tuple.get(i).cloned().unwrap_or_default();
+            if let Binder::Named(n) = binder {
+                self.set_var(n, value.clone());
+                self.key_parts.push(value);
+            }
+        }
+    }
+
+    /// Expand a producer into its items (positional values + named fields).
+    /// `LIST` literals and named lists are pure; `FILES`/`FOLDERS`/`TUPLES`/`ZIP`
+    /// touch the filesystem via [`super::producers`], resolving relative paths
+    /// against the run root and substituting `{{var}}`s in paths/globs first.
+    fn expand_producer(&self, producer: &Producer) -> Result<Vec<ProducerItem>, String> {
+        let root = self.ctx.root.as_deref();
+        match producer {
+            Producer::List(elements) => Ok(elements
+                .iter()
+                .map(|el| match el {
+                    Element::Scalar(s) => ProducerItem::scalar(self.subst_unquoted(s)),
+                    Element::Tuple(parts) => ProducerItem {
+                        values: parts.iter().map(|p| self.subst_unquoted(p)).collect(),
+                        named: Vec::new(),
+                    },
+                })
+                .collect()),
+            Producer::Named(name) => {
+                let inner = self
+                    .lists
+                    .get(name)
+                    .ok_or_else(|| format!("list '{name}' is not declared"))?
+                    .clone();
+                self.expand_producer(&inner)
+            }
+            Producer::Files { dir, glob } => {
+                let dir = producers::resolve_path(root, &self.subst_unquoted(dir));
+                let glob = glob.as_ref().map(|g| self.subst_unquoted(g));
+                Ok(producers::list_files(&dir, glob.as_deref())?
+                    .into_iter()
+                    .map(|p| ProducerItem::scalar(p.to_string_lossy().into_owned()))
+                    .collect())
+            }
+            Producer::Folders { dir, roles } => {
+                let dir = producers::resolve_path(root, &self.subst_unquoted(dir));
+                let roles: Vec<(String, String)> = roles
+                    .iter()
+                    .map(|(r, g)| (r.clone(), self.subst_unquoted(g)))
+                    .collect();
+                let mut items = Vec::new();
+                for folder in producers::list_folders(&dir)? {
+                    let named = producers::folder_roles(&folder, &roles)?;
+                    items.push(ProducerItem {
+                        values: vec![folder.to_string_lossy().into_owned()],
+                        named,
+                    });
+                }
+                Ok(items)
+            }
+            Producer::Tuples { path } => {
+                let path = producers::resolve_path(root, &self.subst_unquoted(path));
+                producers::read_tuples(&path)
+            }
+            Producer::Zip(parts) => {
+                let lists: Result<Vec<Vec<ProducerItem>>, String> =
+                    parts.iter().map(|p| self.expand_producer(p)).collect();
+                producers::zip_items(lists?)
+            }
+        }
+    }
+
+    /// Substitute `{{var}}`s in `s` (after stripping a whole-string quote).
+    fn subst_unquoted(&self, s: &str) -> String {
+        substitute(&unquote(s), &self.vars_for())
+    }
+}
+
+// --- helpers ---------------------------------------------------------------
+
+/// The leaf (last `/`-segment) of a request title — the default alias.
+fn leaf(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Strip one layer of surrounding double quotes if the whole string is quoted.
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t[1..t.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// A compact `passed/total` summary of an entry's asserts (empty when there are
+/// none), surfaced as the `alias.Asserts` intrinsic column.
+fn asserts_summary(eo: &EntryOutcome) -> String {
+    let total = eo.asserts.len();
+    if total == 0 {
+        return String::new();
+    }
+    let passed = eo.asserts.iter().filter(|a| a.passed).count();
+    format!("{passed}/{total}")
+}
+
+/// Evaluate one `[Reports]`/`WITH` field query against an already-received
+/// response, *tolerantly*: a non-match (or an unsupported query type) returns
+/// `None` (so the caller renders the no-match marker) rather than failing.
+///
+/// Supported query types (a practical subset of Hurl's grammar):
+/// - `status` — the numeric HTTP status.
+/// - `header "Name"` — the first matching response header (case-insensitive).
+/// - `body` — the whole response body (as received).
+/// - `jsonpath "$.a.b[0]"` — a dotted/indexed path into a JSON body.
+/// - `regex "pat"` — first capture group (or whole match) against the body.
+fn eval_field(query: &str, eo: &EntryOutcome) -> Option<String> {
+    let query = query.trim();
+    let (kind, rest) = match query.split_once(char::is_whitespace) {
+        Some((k, r)) => (k, r.trim()),
+        None => (query, ""),
+    };
+    match kind {
+        "status" => Some(eo.status.to_string()),
+        "body" => Some(eo.raw_body.clone()),
+        "header" => {
+            let name = string_arg(rest)?;
+            eo.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v.clone())
+        }
+        "jsonpath" => {
+            let path = string_arg(rest)?;
+            let root: serde_json::Value = serde_json::from_str(&eo.raw_body).ok()?;
+            json_path_get(&root, &path).map(json_value_to_string)
+        }
+        "regex" => {
+            let pat = string_arg(rest)?;
+            let re = regex::Regex::new(&pat).ok()?;
+            let caps = re.captures(&eo.raw_body)?;
+            caps.get(1)
+                .or_else(|| caps.get(0))
+                .map(|m| m.as_str().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The double-quoted string argument of a query (`header "X"` → `X`). Returns
+/// `None` if the argument isn't a simple quoted string.
+fn string_arg(s: &str) -> Option<String> {
+    let s = s.trim();
+    let inner = s.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+/// Evaluate a minimal JSONPath (`$`, `.key`, `["key"]`/`['key']`, `[index]`)
+/// against a JSON value. Deliberately small — it covers the paths report fields
+/// actually use; wildcards/recursive-descent/filters are a documented follow-up.
+fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let rest = path.strip_prefix('$')?;
+    let mut cur = root;
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
+                    i += 1;
+                }
+                let key = &rest[start..i];
+                if key.is_empty() {
+                    return None;
+                }
+                cur = cur.get(key)?;
+            }
+            b'[' => {
+                let end = rest[i..].find(']')? + i;
+                let inner = rest[i + 1..end].trim();
+                cur = if let Some(k) = inner
+                    .strip_prefix('"')
+                    .and_then(|k| k.strip_suffix('"'))
+                    .or_else(|| inner.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+                {
+                    cur.get(k)?
+                } else {
+                    let idx: usize = inner.parse().ok()?;
+                    cur.get(idx)?
+                };
+                i = end + 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(cur.clone())
+}
+
+/// Render a JSON value as a report cell: a string node yields its inner text
+/// (no quotes); anything else its compact JSON form — never lossy.
+fn json_value_to_string(v: serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hurl::AssertOutcome;
+    use crate::report::parse_flow;
+    use std::sync::Mutex;
+
+    /// A canned response for a request title, built fresh into an
+    /// [`EntryOutcome`] on each call (which isn't `Clone`).
+    #[derive(Clone, Default)]
+    struct Canned {
+        status: u16,
+        raw_body: String,
+        pretty_body: String,
+        captures: Vec<(String, String)>,
+        headers: Vec<(String, String)>,
+        asserts: Vec<(bool,)>,
+        duration_ms: u64,
+        error: Option<String>,
+    }
+
+    /// A fake [`EntryRunner`] that records every `(title, vars)` it is asked to
+    /// run and returns a per-title canned response, so the interpreter can be
+    /// exercised with zero network. It also tracks peak concurrency (via
+    /// `active`/`max_active`) so parallel execution can be observed, with an
+    /// optional per-call `delay_ms` to widen the concurrency window.
+    struct Fake {
+        canned: HashMap<String, Canned>,
+        calls: Mutex<Vec<(String, HashMap<String, String>)>>,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        delay_ms: u64,
+    }
+
+    impl Fake {
+        fn new(canned: &[(&str, Canned)]) -> Self {
+            Fake {
+                canned: canned
+                    .iter()
+                    .map(|(k, c)| (k.to_string(), c.clone()))
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                delay_ms: 0,
+            }
+        }
+        /// Add a per-call delay so overlapping (parallel) calls are observable.
+        fn with_delay(mut self, ms: u64) -> Self {
+            self.delay_ms = ms;
+            self
+        }
+        fn call_vars(&self, title: &str) -> HashMap<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(t, _)| t == title)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+        /// The highest number of concurrent `run` calls observed.
+        fn peak_concurrency(&self) -> usize {
+            self.max_active.load(Ordering::Relaxed)
+        }
+    }
+
+    impl EntryRunner for Fake {
+        fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            if self.delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((base.title.clone(), vars.clone()));
+            let c = self.canned.get(&base.title).cloned().unwrap_or_default();
+            let eo = EntryOutcome {
+                method: base.method.clone(),
+                url: base.url.clone(),
+                status: c.status,
+                status_text: String::new(),
+                headers: c.headers,
+                body: if c.pretty_body.is_empty() {
+                    c.raw_body.clone()
+                } else {
+                    c.pretty_body
+                },
+                raw_body: c.raw_body,
+                asserts: c
+                    .asserts
+                    .iter()
+                    .map(|(p,)| AssertOutcome {
+                        expr: String::new(),
+                        passed: *p,
+                        detail: String::new(),
+                    })
+                    .collect(),
+                captures: c.captures,
+                duration_ms: c.duration_ms,
+                ok: c.error.is_none(),
+                error: c.error.clone(),
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            RunOutput {
+                entries: vec![eo],
+                error: c.error,
+            }
+        }
+    }
+
+    /// Build an entry with the given title and optional `[Reports]` fields.
+    fn entry(title: &str, reports: &[(&str, &str)]) -> HurlEntry {
+        HurlEntry {
+            title: title.to_string(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            reports: reports
+                .iter()
+                .map(|(n, q)| (n.to_string(), q.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn run(
+        src: &str,
+        entries: &[HurlEntry],
+        base_vars: &[(&str, &str)],
+        named_envs: &[(&str, &[(&str, &str)])],
+        fake: &Fake,
+    ) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            base_vars: base_vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            named_envs: named_envs
+                .iter()
+                .map(|(name, kvs)| {
+                    (
+                        name.to_string(),
+                        kvs.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            root: None,
+            runner: fake,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn linear_flow_emits_one_row_and_threads_captures() {
+        let fake = Fake::new(&[
+            (
+                "Oauth",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "abc".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "me",
+                Canned {
+                    status: 200,
+                    raw_body: "{\"name\":\"jo\"}".into(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [
+            entry("Oauth", &[]),
+            entry("me", &[("name", "jsonpath \"$.name\"")]),
+        ];
+        let res = run(
+            "REQUEST Oauth\nREPORT REQUEST me\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 1, "loop-free flow = one row");
+        // The captured `token` from Oauth must be visible to the `me` request.
+        assert_eq!(fake.call_vars("me").get("token"), Some(&"abc".to_string()));
+        assert_eq!(res.rows[0].cells.get("me.name"), Some(&"jo".to_string()));
+        assert_eq!(
+            res.rows[0].cells.get("me.HttpStatus"),
+            Some(&"200".to_string())
+        );
+    }
+
+    #[test]
+    fn assign_overrides_env_and_capture_overrides_assign() {
+        // base env URL=base; flow assigns URL=flow -> the request sees flow.
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("send", &[])];
+        run(
+            "URL=flow\nREQUEST send\n",
+            &entries,
+            &[("URL", "base")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_vars("send").get("URL"), Some(&"flow".to_string()));
+
+        // Now a capture named URL should win over the assign.
+        let fake2 = Fake::new(&[
+            (
+                "cap",
+                Canned {
+                    status: 200,
+                    captures: vec![("URL".into(), "captured".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "send",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries2 = [entry("cap", &[]), entry("send", &[])];
+        run(
+            "URL=flow\nREQUEST cap\nREQUEST send\n",
+            &entries2,
+            &[("URL", "base")],
+            &[],
+            &fake2,
+        );
+        assert_eq!(
+            fake2.call_vars("send").get("URL"),
+            Some(&"captured".to_string())
+        );
+    }
+
+    #[test]
+    fn report_request_emits_intrinsics_and_fields() {
+        let fake = Fake::new(&[(
+            "process",
+            Canned {
+                status: 201,
+                raw_body: "{\"status\":\"ok\",\"n\":3}".into(),
+                pretty_body: "{\n  \"status\": \"ok\"\n}".into(),
+                asserts: vec![(true,), (true,), (false,)],
+                duration_ms: 42,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("process", &[("status", "jsonpath \"$.status\"")])];
+        let res = run("REPORT REQUEST process\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("process.HttpStatus"), Some(&"201".to_string()));
+        assert_eq!(cells.get("process.Time"), Some(&"42".to_string()));
+        assert_eq!(cells.get("process.Asserts"), Some(&"2/3".to_string()));
+        assert_eq!(cells.get("process.status"), Some(&"ok".to_string()));
+        // Default response format is pretty.
+        assert_eq!(
+            cells.get("process.Response"),
+            Some(&"{\n  \"status\": \"ok\"\n}".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_field_uses_no_match_marker() {
+        let fake = Fake::new(&[(
+            "process",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("process", &[("missing", "jsonpath \"$.nope\"")])];
+        let res = run(
+            "PRELUDE_NO_MATCH_MARKER=\u{2205}\nREPORT REQUEST process\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        // The raw cell is empty; the marker is applied once, at render time.
+        assert_eq!(res.no_match_marker, "\u{2205}");
+        let col = crate::report::OutputColumn {
+            header: "m".into(),
+            sources: vec!["process.missing".into()],
+        };
+        assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
+    }
+
+    #[test]
+    fn report_vars_and_computed_columns() {
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FILE=a.jpg\nREPORT (FILE)\nREPORT \"doc-{{FILE}}\" AS label\n",
+            &[],
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows[0].cells.get("FILE"), Some(&"a.jpg".to_string()));
+        assert_eq!(
+            res.rows[0].cells.get("label"),
+            Some(&"doc-a.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn list_loop_emits_row_per_element_with_key() {
+        let fake = Fake::new(&[]);
+        let res = run(
+            "LIST DOCS=[\"a\",\"b\",\"c\"]\nFOR X IN DOCS\n    REPORT (X)\nEND\n",
+            &[],
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 3);
+        let names: Vec<_> = res
+            .rows
+            .iter()
+            .filter_map(|r| r.cells.get("X").cloned())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // Row key carries the loop var value.
+        assert_eq!(res.rows[0].key, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn tuple_list_loop_destructures_and_binds_both() {
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let res = run(
+            "LIST DOCS=[(\"f1\",\"b1\"),(\"f2\",\"b2\")]\nFOR (FRONT, BACK) IN DOCS\n    REPORT REQUEST up\n    REPORT (FRONT, BACK)\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(res.rows[0].cells.get("FRONT"), Some(&"f1".to_string()));
+        assert_eq!(res.rows[0].cells.get("BACK"), Some(&"b1".to_string()));
+        assert_eq!(res.rows[0].key, vec!["f1".to_string(), "b1".to_string()]);
+        // The request `up` ran once per iteration.
+        assert_eq!(fake.call_count(), 2);
+    }
+
+    #[test]
+    fn outer_report_broadcasts_into_every_loop_row() {
+        let fake = Fake::new(&[
+            (
+                "oauth",
+                Canned {
+                    status: 200,
+                    raw_body: "{}".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "up",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("oauth", &[]), entry("up", &[])];
+        let res = run(
+            "REPORT REQUEST oauth\nLIST DOCS=[\"a\",\"b\"]\nFOR X IN DOCS\n    REPORT REQUEST up\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 2);
+        // oauth ran once, but its intrinsic column is on both rows.
+        assert_eq!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| t == "oauth")
+                .count(),
+            1
+        );
+        for row in &res.rows {
+            assert!(row.cells.contains_key("oauth.HttpStatus"));
+        }
+    }
+
+    #[test]
+    fn envs_loop_sets_target_and_layers_env_vars() {
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("send", &[])];
+        let res = run(
+            "FOR T IN ENVS \"au\", \"eu\"\n    REPORT REQUEST send\nEND\n",
+            &entries,
+            &[],
+            &[("au", &[("REGION", "au-1")]), ("eu", &[("REGION", "eu-1")])],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(res.rows[0].target, Some("au".to_string()));
+        assert_eq!(res.rows[1].target, Some("eu".to_string()));
+        // ENVS is the comparison axis: not part of the row key.
+        assert!(res.rows[0].key.is_empty());
+        // The env's vars are visible in the row snapshot.
+        assert_eq!(res.rows[0].vars.get("REGION"), Some(&"au-1".to_string()));
+    }
+
+    #[test]
+    fn with_field_overrides_reports_block() {
+        let fake = Fake::new(&[(
+            "p",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":\"fromwith\",\"b\":\"orig\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        // [Reports] declares a -> $.b (would be "orig"); WITH overrides a -> $.a.
+        let entries = [entry("p", &[("a", "jsonpath \"$.b\"")])];
+        let res = run(
+            "REPORT REQUEST p WITH\n    a: jsonpath \"$.a\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows[0].cells.get("p.a"), Some(&"fromwith".to_string()));
+    }
+
+    #[test]
+    fn response_raw_keeps_original_bytes() {
+        let fake = Fake::new(&[(
+            "p",
+            Canned {
+                status: 200,
+                raw_body: "{\"z\":1,\"a\":2}".into(),
+                pretty_body: "{\n  \"z\": 1,\n  \"a\": 2\n}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("p", &[])];
+        let res = run("REPORT REQUEST p RESPONSE RAW\n", &entries, &[], &[], &fake);
+        assert_eq!(
+            res.rows[0].cells.get("p.Response"),
+            Some(&"{\"z\":1,\"a\":2}".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_renames_namespace() {
+        let fake = Fake::new(&[(
+            "process_file",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("process_file", &[])];
+        let res = run(
+            "REPORT REQUEST process_file AS proc\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.rows[0].cells.contains_key("proc.HttpStatus"));
+        assert!(
+            !res.rows[0]
+                .cells
+                .keys()
+                .any(|k| k.starts_with("process_file."))
+        );
+    }
+
+    #[test]
+    fn jsonpath_supports_nested_and_index() {
+        let fake = Fake::new(&[(
+            "p",
+            Canned {
+                status: 200,
+                raw_body: "{\"items\":[{\"name\":\"first\"},{\"name\":\"second\"}]}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("p", &[("n", "jsonpath \"$.items[1].name\"")])];
+        let res = run("REPORT REQUEST p\n", &entries, &[], &[], &fake);
+        assert_eq!(res.rows[0].cells.get("p.n"), Some(&"second".to_string()));
+    }
+
+    #[test]
+    fn unresolved_request_records_error_but_still_emits_row() {
+        let fake = Fake::new(&[]);
+        let res = run("REPORT REQUEST ghost\n", &[], &[], &[], &fake);
+        assert_eq!(res.rows.len(), 1);
+        assert!(res.errors.iter().any(|e| e.contains("ghost")));
+        assert!(res.rows[0].cells.contains_key("ghost.Error"));
+    }
+
+    #[test]
+    fn resolve_title_prefers_exact_then_unique_leaf() {
+        let entries = [entry("auth/Oauth", &[]), entry("upload/process_file", &[])];
+        assert!(resolve_title(&entries, "auth/Oauth").is_some());
+        assert!(resolve_title(&entries, "process_file").is_some());
+        assert!(resolve_title(&entries, "missing").is_none());
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "paperboy_run_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// End-to-end: a `FILES` loop resolves paths against the run root, binds
+    /// `{{FILE}}` and the row key, and runs the body once per matched file.
+    #[test]
+    fn files_loop_runs_body_per_file() {
+        let d = tmpdir("files");
+        std::fs::write(d.join("a.jpg"), "x").unwrap();
+        std::fs::write(d.join("b.jpg"), "x").unwrap();
+        std::fs::write(d.join("skip.png"), "x").unwrap();
+
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "FOR FILE IN FILES \".\" MATCH \"*.jpg\"\n    REPORT REQUEST up\n    REPORT (FILE)\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(res.rows.len(), 2, "one row per matched jpg");
+        assert!(res.rows[0].cells.get("FILE").unwrap().ends_with("a.jpg"));
+        assert_eq!(fake.call_count(), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn nested_loops_produce_cartesian_product() {
+        let fake = Fake::new(&[]);
+        let res = run(
+            "LIST A=[\"a1\",\"a2\"]\nLIST B=[\"b1\",\"b2\",\"b3\"]\nFOR X IN A\n    FOR Y IN B\n        REPORT (X, Y)\n    END\nEND\n",
+            &[],
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 6, "2 x 3 = 6 rows");
+        assert_eq!(res.rows[0].key, vec!["a1".to_string(), "b1".to_string()]);
+        assert_eq!(res.rows[5].key, vec!["a2".to_string(), "b3".to_string()]);
+    }
+
+    #[test]
+    fn arity_mismatch_is_recorded() {
+        let fake = Fake::new(&[]);
+        let res = run(
+            "LIST DOCS=[(\"f1\",\"b1\")]\nFOR (A, B, C) IN DOCS\n    REPORT (A)\nEND\n",
+            &[],
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.iter().any(|e| e.contains("binds 3")));
+    }
+
+    #[test]
+    fn envs_roles_run_baseline_first_then_comparisons() {
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("send", &[])];
+        let res = run(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"stg1\", \"stg2\")\n    REPORT REQUEST send\n    REPORT (TARGET)\nEND\n",
+            &entries,
+            &[],
+            &[("prod", &[]), ("stg1", &[]), ("stg2", &[])],
+            &fake,
+        );
+        let targets: Vec<_> = res.rows.iter().filter_map(|r| r.target.clone()).collect();
+        assert_eq!(targets, vec!["prod", "stg1", "stg2"], "baseline runs first");
+        // The loop var is also bound as an ordinary variable.
+        assert_eq!(res.rows[0].cells.get("TARGET"), Some(&"prod".to_string()));
+    }
+
+    #[test]
+    fn parallel_loop_matches_sequential_output() {
+        // The same flow with and without `PARALLEL` must produce byte-identical
+        // ordered rows — parallelism only changes *when* work happens.
+        let canned = [(
+            "up",
+            Canned {
+                status: 200,
+                raw_body: "{}".into(),
+                ..Default::default()
+            },
+        )];
+        let entries = [entry("up", &[])];
+        let body = "FOR X IN [\"a\",\"b\",\"c\",\"d\",\"e\"]\n    REPORT REQUEST up\n    REPORT (X)\nEND\n";
+
+        let seq = Fake::new(&canned);
+        let seq_res = run(body, &entries, &[], &[], &seq);
+        let par = Fake::new(&canned);
+        let par_res = run(&format!("PARALLEL {body}"), &entries, &[], &[], &par);
+
+        let seq_x: Vec<_> = seq_res
+            .rows
+            .iter()
+            .map(|r| r.cells.get("X").cloned())
+            .collect();
+        let par_x: Vec<_> = par_res
+            .rows
+            .iter()
+            .map(|r| r.cells.get("X").cloned())
+            .collect();
+        assert_eq!(seq_x, par_x, "parallel output order matches sequential");
+        assert_eq!(
+            par_x,
+            vec![
+                Some("a".into()),
+                Some("b".into()),
+                Some("c".into()),
+                Some("d".into()),
+                Some("e".into())
+            ]
+        );
+        assert_eq!(par_res.column_order, seq_res.column_order);
+    }
+
+    #[test]
+    fn parallel_loop_actually_runs_concurrently() {
+        // With a per-call delay, a `PARALLEL(4)` loop over 4 items must overlap;
+        // the same flow run sequentially must never overlap.
+        let canned = [(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )];
+        let entries = [entry("up", &[])];
+        let body = "FOR X IN [\"a\",\"b\",\"c\",\"d\"]\n    REPORT REQUEST up\nEND\n";
+
+        let par = Fake::new(&canned).with_delay(40);
+        run(&format!("PARALLEL(4) {body}"), &entries, &[], &[], &par);
+        assert!(par.peak_concurrency() >= 2, "parallel loop overlaps calls");
+
+        let seq = Fake::new(&canned).with_delay(40);
+        run(body, &entries, &[], &[], &seq);
+        assert_eq!(seq.peak_concurrency(), 1, "sequential loop never overlaps");
+    }
+
+    #[test]
+    fn parallel_degree_caps_concurrency() {
+        // `PARALLEL(2)` over 6 slow items must never exceed two concurrent runs.
+        let canned = [(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )];
+        let entries = [entry("up", &[])];
+        let fake = Fake::new(&canned).with_delay(20);
+        let res = run(
+            "PARALLEL(2) FOR X IN [\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"]\n    REPORT REQUEST up\n    REPORT (X)\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.rows.len(), 6);
+        assert!(
+            fake.peak_concurrency() <= 2,
+            "degree caps concurrency at 2, saw {}",
+            fake.peak_concurrency()
+        );
+    }
+
+    #[test]
+    fn loop_captures_do_not_leak_to_continuation() {
+        // A capture made inside a loop iteration must not be visible to a request
+        // that runs after the loop (iterations are isolated snapshots).
+        let fake = Fake::new(&[
+            (
+                "inside",
+                Canned {
+                    status: 200,
+                    captures: vec![("secret".into(), "leaked".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "after",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("inside", &[]), entry("after", &[])];
+        run(
+            "FOR X IN [\"a\"]\n    REQUEST inside\nEND\nREQUEST after\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_vars("after").contains_key("secret"),
+            "loop captures must not leak past END"
+        );
+    }
+
+    #[test]
+    fn parallel_envs_loop_preserves_role_order() {
+        // `PARALLEL` on an ENVS loop still emits baseline first, then comparisons.
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )])
+        .with_delay(20);
+        let entries = [entry("send", &[])];
+        let res = run(
+            "PARALLEL FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"stg1\", \"stg2\")\n    REPORT REQUEST send\n    REPORT (TARGET)\nEND\n",
+            &entries,
+            &[],
+            &[("prod", &[]), ("stg1", &[]), ("stg2", &[])],
+            &fake,
+        );
+        let targets: Vec<_> = res.rows.iter().filter_map(|r| r.target.clone()).collect();
+        assert_eq!(targets, vec!["prod", "stg1", "stg2"]);
+        assert!(
+            fake.peak_concurrency() >= 2,
+            "ENVS loop runs envs concurrently"
+        );
+    }
+}

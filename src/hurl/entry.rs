@@ -167,6 +167,15 @@ pub struct HurlEntry {
     /// requests (which had no asserts field) loadable.
     #[serde(default)]
     pub asserts: Vec<String>,
+    /// PaperBoy-specific per-request report-field definitions: `(name, query)`
+    /// pairs, each a Hurl query (same grammar as `[Captures]`) evaluated against
+    /// the response to populate a report column. Stored inside valid Hurl as a
+    /// `# [Reports]` comment block (a literal `[Reports]` response section is a
+    /// non-recoverable `hurl_core` parse error), recovered by the line-scanning
+    /// parser — the same comment-encoding used for titles and disabled rows.
+    /// `#[serde(default)]` keeps older saved requests loadable.
+    #[serde(default)]
+    pub reports: Vec<(String, String)>,
     /// `true` when the user created this request by hand in a collection other
     /// than the Scratch Space. UI-only and never written to `.hurl` files (which
     /// use the manual [`to_hurl`](HurlEntry::to_hurl) serializer); persisted in
@@ -323,9 +332,12 @@ impl HurlEntry {
         // needed to carry asserts/captures; use the wildcard `HTTP *` (any
         // status, per the Hurl spec) when no explicit status was set so those
         // sections still round-trip through parsing instead of being dropped.
+        // A `# [Reports]` block also lives in the response area, so emit the
+        // wildcard when reports are the only response-side metadata too.
         if let Some(status) = self.expected_status {
             out.push_str(&format!("HTTP {status}\n"));
-        } else if !self.asserts.is_empty() || !self.captures.is_empty() {
+        } else if !self.asserts.is_empty() || !self.captures.is_empty() || !self.reports.is_empty()
+        {
             out.push_str("HTTP *\n");
         }
         if !self.asserts.is_empty() {
@@ -339,6 +351,16 @@ impl HurlEntry {
             out.push_str("[Captures]\n");
             for (name, expr) in &self.captures {
                 out.push_str(&format!("{name}: {expr}\n"));
+            }
+        }
+        // Report fields: a comment-encoded pseudo-section. `hurl_core` treats
+        // every line here as a comment and ignores it; the PaperBoy parser
+        // recognises the `# [Reports]` marker and scans the `# name: query`
+        // rows back into `reports`. Reads like a real `[Reports]` section.
+        if !self.reports.is_empty() {
+            out.push_str("# [Reports]\n");
+            for (name, query) in &self.reports {
+                out.push_str(&format!("# {name}: {query}\n"));
             }
         }
         out

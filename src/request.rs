@@ -15,8 +15,8 @@ use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
 use crate::http::ApiResponse;
 use crate::hurl::{
-    EntryOutcome, FormField, HurlEntry, collection_to_hurl, expand_base64_form_fields, run_hurl,
-    run_hurl_streaming, stage_out_of_scope_form_files,
+    EntryOutcome, FormField, HurlEntry, RunOutput, collection_to_hurl, expand_base64_form_fields,
+    run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -450,19 +450,28 @@ pub struct ResolvedRequest {
 pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<ResolvedRequest> {
     let entry = col.entries.get(col.selected_entry)?;
     let vars = collection_vars(env, &col.captures);
+    Some(resolve_entry(entry, &vars))
+}
+
+/// Resolve one arbitrary `HurlEntry`'s `{{ VAR }}` placeholders against `vars`,
+/// folding any `basic_auth` into an `Authorization` header. This is the
+/// entry-level core of [`resolve_request`] (which applies it to the collection's
+/// *selected* entry with the collection's own vars); the report interpreter
+/// reuses it to resolve a request chosen by name with its own scoped vars.
+pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> ResolvedRequest {
     let method = entry.method.clone();
-    let url = substitute(&entry.url, &vars);
+    let url = substitute(&entry.url, vars);
     let mut headers: Vec<(String, String)> = entry
         .headers
         .iter()
         .filter(|(_, _, e)| *e)
-        .map(|(k, v, _)| (k.clone(), substitute(v, &vars)))
+        .map(|(k, v, _)| (k.clone(), substitute(v, vars)))
         .collect();
     if let Some((user, pass)) = &entry.basic_auth {
         let cred = STANDARD.encode(format!(
             "{}:{}",
-            substitute(user, &vars),
-            substitute(pass, &vars)
+            substitute(user, vars),
+            substitute(pass, vars)
         ));
         headers.push(("Authorization".to_string(), format!("Basic {cred}")));
     }
@@ -470,31 +479,31 @@ pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<Re
         .cookies
         .iter()
         .filter(|(_, _, e)| *e)
-        .map(|(k, v, _)| (substitute(k, &vars), substitute(v, &vars)))
+        .map(|(k, v, _)| (substitute(k, vars), substitute(v, vars)))
         .collect();
     let form_fields: Vec<FormField> = entry
         .form_fields
         .iter()
         .filter(|f| f.enabled)
         .map(|f| FormField {
-            key: substitute(&f.key, &vars),
-            value: substitute(&f.value, &vars),
+            key: substitute(&f.key, vars),
+            value: substitute(&f.value, vars),
             kind: f.kind,
-            content_type: f.content_type.as_deref().map(|ct| substitute(ct, &vars)),
-            base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, &vars)),
+            content_type: f.content_type.as_deref().map(|ct| substitute(ct, vars)),
+            base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, vars)),
             enabled: f.enabled,
         })
         .collect();
 
-    let body = entry.body.as_deref().map(|b| substitute(b, &vars));
-    Some(ResolvedRequest {
+    let body = entry.body.as_deref().map(|b| substitute(b, vars));
+    ResolvedRequest {
         method,
         url,
         headers,
         cookies,
         form_fields,
         body,
-    })
+    }
 }
 
 /// The result of running the collection's selected entry, routed back to its
@@ -534,14 +543,17 @@ pub struct BatchRunUpdate {
 /// Returned unserialized (rather than as Hurl text directly) so the caller
 /// can stage any out-of-scope `[Form]`/`[Multipart]` file fields first (see
 /// [`stage_out_of_scope_form_files`]).
-fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry> {
-    let base = col.entries.get(col.selected_entry)?;
-    let resolved = resolve_request(col, env)?;
+/// Build the concrete `HurlEntry` to run from a `base` entry and its already
+/// resolved request line/headers/body/form fields, keeping the base's
+/// `[Query]`/`[Captures]`/`[Asserts]`/`[Reports]`/expected-status metadata.
+/// Shared by [`run_content`] and the report interpreter so both assemble the
+/// run entry identically.
+fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
     let is_multipart = resolved
         .form_fields
         .iter()
         .any(|form| form.kind.is_multipart());
-    Some(HurlEntry {
+    HurlEntry {
         title: String::new(),
         method: resolved.method,
         url: resolved.url,
@@ -550,7 +562,7 @@ fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry>
             .iter()
             .map(|(k, v)| (k.clone(), v.clone(), true))
             .collect(),
-        basic_auth: None, // already encoded into `headers` by resolve_request
+        basic_auth: None, // already encoded into `headers` by resolve_entry
         form_fields: resolved.form_fields,
         is_multipart,
         queries: base.queries.clone(),
@@ -563,11 +575,53 @@ fn run_content(col: &Collection, env: Option<&Environment>) -> Option<HurlEntry>
         expected_status: base.expected_status,
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
+        reports: base.reports.clone(),
         user_added: base.user_added,
         modified: base.modified,
         last_run: base.last_run,
         last_response: None,
-    })
+    }
+}
+
+/// Run one already-chosen `base` entry with `vars` through the full per-request
+/// pipeline used for a normal single-request send — base64-form expansion →
+/// out-of-scope form-file staging → content-length defaulting → `to_hurl` →
+/// [`run_hurl`] — and return the raw [`RunOutput`]. Front-end agnostic (no
+/// `ApiResponse`/threads), so both [`run_collection`] and the report interpreter
+/// execute a request through exactly the same code path.
+///
+/// `extra_captures` are appended to the entry's `[Captures]` before running
+/// (used by the report interpreter to evaluate `[Reports]`/`WITH` fields as
+/// transient captures); pass an empty slice for a plain send. A base64/staging
+/// failure is surfaced as `RunOutput { entries: [], error: Some(..) }`.
+pub fn run_resolved_entry(
+    base: &HurlEntry,
+    vars: &HashMap<String, String>,
+    file_root: Option<&std::path::Path>,
+    extra_captures: &[(String, String)],
+) -> RunOutput {
+    let resolved = resolve_entry(base, vars);
+    let mut run_entry = to_run_entry(base, resolved);
+    run_entry.captures.extend(extra_captures.iter().cloned());
+
+    let mut entries = [run_entry];
+    if let Err(e) = expand_base64_form_fields(&mut entries, file_root) {
+        return RunOutput {
+            entries: vec![],
+            error: Some(format!("Base64 file error: {e}")),
+        };
+    }
+    let staged_dir = stage_out_of_scope_form_files(&mut entries, file_root).unwrap_or_default();
+    let mut run_entry = entries.into_iter().next().unwrap();
+    run_entry.ensure_run_content_length();
+    let run_root = staged_dir.as_deref().or(file_root);
+
+    let content = run_entry.to_hurl();
+    let out = run_hurl(&content, vars, run_root);
+    if let Some(dir) = &staged_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    out
 }
 
 /// Human-readable error for the one Hurl request shape that can never be
@@ -592,16 +646,14 @@ pub fn run_collection(
     env: Option<&Environment>,
     state: Arc<Mutex<ApiResponse>>,
 ) -> Option<Receiver<CaptureUpdate>> {
-    if let Some(entry) = col.entries.get(col.selected_entry)
-        && entry.body.is_some()
-        && !entry.form_fields.is_empty()
-    {
+    let base = col.entries.get(col.selected_entry)?;
+    if base.body.is_some() && !base.form_fields.is_empty() {
         let mut r = state.lock().unwrap();
         r.loading = false;
         r.error = BODY_FORM_CONFLICT_ERROR.to_string();
         return None;
     }
-    let mut run_entry = run_content(col, env)?;
+    let base = base.clone();
     let vars = collection_vars(env, &col.captures);
     let col_id = col.id;
     let entry_idx = col.selected_entry;
@@ -612,36 +664,13 @@ pub fn run_collection(
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        // Copy any `[Form]`/`[Multipart]` files that live outside file_root
-        // into a temp directory alongside it first — otherwise Hurl's own
-        // sandbox rejects them regardless of how the path is written. A
-        // no-op (no copies, same file_root) when everything's already in
-        // scope. Falls back to running unstaged on any I/O error so Hurl's
-        // own error (e.g. "no such file") still surfaces normally.
-        let mut entries = [run_entry.clone()];
-        // Turn any Base64File field into the plain Text field it's actually
-        // sent as (prefix + the file's base64), before staging: staging then
-        // only sees real File fields. A read failure surfaces as an error
-        // rather than silently sending a half-formed request.
-        if let Err(e) = expand_base64_form_fields(&mut entries, file_root.as_deref()) {
-            let mut r = state.lock().unwrap();
-            r.loading = false;
-            r.error = format!("Base64 file error: {e}");
-            return;
-        };
-
-        let staged_dir =
-            stage_out_of_scope_form_files(&mut entries, file_root.as_deref()).unwrap_or_default();
-        run_entry = entries[0].clone();
-        run_entry.ensure_run_content_length();
-        let run_root = staged_dir.as_deref().or(file_root.as_deref());
-
-        let content = run_entry.to_hurl();
-
-        let out = run_hurl(&content, &vars, run_root);
-        if let Some(dir) = &staged_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // The whole per-request pipeline (base64-form expansion, out-of-scope
+        // form-file staging, content-length defaulting, serialize + run) lives
+        // in the shared, front-end-agnostic `run_resolved_entry` so this send
+        // and the report interpreter stay in exact lockstep. A base64/staging
+        // failure comes back as `RunOutput { entries: [], error }` and surfaces
+        // via the `None` arm below.
+        let out = run_resolved_entry(&base, &vars, file_root.as_deref(), &[]);
         let mut r = state.lock().unwrap();
         r.loading = false;
         match out.entries.into_iter().next() {
