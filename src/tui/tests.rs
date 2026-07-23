@@ -14439,3 +14439,30 @@ fn report_tabs_survive_persist_round_trip() {
     // Restored reports are revalidated, so diagnostics are populated.
     assert!(!restored.reports[0].report.dirty);
 }
+
+/// Rendering a full frame while a report tab is active (and while its modal
+/// source editor is open) must not panic — the draw path has several
+/// index-sensitive branches keyed on the unified collection/report tab index.
+#[test]
+fn drawing_a_report_tab_does_not_panic() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    // A bound collection so the binding panel exercises the "bound" branch too.
+    app.collections
+        .push(Collection::new("dfa".to_string(), Vec::new()));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# name: Nightly\n# collection: dfa\nREQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    // Now with the modal source editor open.
+    press(&mut app, KeyCode::Char('e'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportEdit { .. })));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+}
