@@ -1130,14 +1130,28 @@ pub(crate) fn help_section_divider(title: &str, width: usize, th: &Theme) -> Lin
 /// continuation line is indented so it lines up under the description
 /// column instead of wrapping back to column 0.
 pub(crate) fn help_entry_lines(shortcut: &str, desc: &str, width: usize) -> Vec<Line<'static>> {
-    const KEY_COL: usize = 17;
-    let indent = shortcut.chars().count().max(KEY_COL) + 1;
+    help_entry_lines_col(shortcut, desc, 17, width)
+}
+
+/// Like [`help_entry_lines`] but with a caller-supplied key-column width. A
+/// group of entries whose left-hand sides are longer than the default 17-column
+/// shortcut layout (e.g. the report grammar, `REPORT REQUEST NAME [AS COL]`)
+/// can pass its *own* widest key so every description in that group still lines
+/// up in one column instead of each row's description starting wherever its key
+/// happens to end.
+pub(crate) fn help_entry_lines_col(
+    key: &str,
+    desc: &str,
+    key_col: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = key.chars().count().max(key_col) + 1;
     let desc_width = width.saturating_sub(indent).max(1);
     let wrapped = word_wrap(desc, desc_width);
     let mut out = Vec::with_capacity(wrapped.len().max(1));
     for (i, chunk) in wrapped.iter().enumerate() {
         if i == 0 {
-            out.push(Line::raw(format!("{shortcut:<KEY_COL$} {chunk}")));
+            out.push(Line::raw(format!("{key:<key_col$} {chunk}")));
         } else {
             out.push(Line::raw(format!("{:indent$}{chunk}", "")));
         }
@@ -2086,6 +2100,24 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             };
 
             let reports_body = || {
+                // Render one titled group whose descriptions all align to that
+                // group's own widest key (so long grammar left-hand sides don't
+                // shove their descriptions out of line with the short ones).
+                let group = |body: &mut Vec<Line<'static>>,
+                             heading: &'static str,
+                             entries: &[(&'static str, &'static str)]| {
+                    body.push(help_section_divider(heading, inner_w, th));
+                    let key_col = entries
+                        .iter()
+                        .map(|(k, _)| k.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .clamp(6, 34);
+                    for &(code, desc) in entries {
+                        body.extend(help_entry_lines_col(code, desc, key_col, inner_w));
+                    }
+                };
+
                 let mut body = vec![help_section_divider(
                     s.help_reports_about_heading,
                     inner_w,
@@ -2095,35 +2127,45 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
                     body.push(Line::raw(""));
                 }
-                body.push(help_section_divider(
+
+                group(
+                    &mut body,
                     s.help_reports_shortcuts_heading,
-                    inner_w,
-                    th,
-                ));
-                for (key, desc) in [
-                    ("Shift+R", s.help_report_new),
-                    ("e / Enter", s.help_report_edit),
-                    ("Esc", s.help_report_leave_edit),
-                ] {
-                    body.extend(help_entry_lines(key, desc, inner_w));
-                }
+                    &[
+                        ("Shift+R", s.help_report_new),
+                        ("e / Enter", s.help_report_edit),
+                        ("Esc", s.help_report_leave_edit),
+                    ],
+                );
                 body.push(Line::raw(""));
-                body.push(help_section_divider(
+                group(
+                    &mut body,
                     s.help_reports_grammar_heading,
-                    inner_w,
-                    th,
-                ));
-                for (code, desc) in [
-                    ("# collection: <path>", s.help_grammar_collection),
-                    ("KEY=value", s.help_grammar_assign),
-                    ("REQUEST <name>", s.help_grammar_request),
-                    ("REPORT REQUEST <name> [AS <col>]", s.help_grammar_report),
-                    ("FOR v IN FILES \"dir\" … END", s.help_grammar_for_files),
-                    ("FOR v IN ENVS … END", s.help_grammar_for_envs),
-                    ("PARALLEL FOR …", s.help_grammar_parallel),
-                ] {
-                    body.extend(help_entry_lines(code, desc, inner_w));
-                }
+                    &[
+                        ("# collection: PATH", s.help_grammar_collection),
+                        ("KEY = value", s.help_grammar_assign),
+                        ("REQUEST NAME", s.help_grammar_request),
+                        ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
+                        ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
+                    ],
+                );
+                body.push(Line::raw(""));
+                group(
+                    &mut body,
+                    s.help_reports_loops_heading,
+                    &[
+                        ("FOR VAR IN SRC … END", s.help_grammar_for),
+                        ("FOR (A, B) IN SRC", s.help_grammar_for_tuple),
+                        ("FOR (A, _, ...) IN SRC", s.help_grammar_pattern),
+                        ("LIST NAME = SRC", s.help_grammar_list),
+                        ("[ \"a\", (\"x\",\"y\") ]", s.help_grammar_list_literal),
+                        ("FILES \"dir\" [MATCH \"g\"]", s.help_grammar_files),
+                        ("FOLDERS \"dir\" [WITH r=\"g\"]", s.help_grammar_folders),
+                        ("TUPLES FROM \"data.csv\"", s.help_grammar_tuples),
+                        ("ZIP(a, b, …)", s.help_grammar_zip),
+                        ("ENVS \"au\", \"eu\"", s.help_grammar_envs),
+                    ],
+                );
                 body
             };
 

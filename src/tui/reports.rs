@@ -191,11 +191,11 @@ impl TuiApp {
     pub(crate) fn on_key_report(&mut self, key: KeyEvent) {
         // When the source panel has edit focus, keystrokes type into it rather
         // than acting as view shortcuts (Esc leaves edit focus).
-        if let Some(idx) = self.active_report_index() {
-            if self.reports[idx].editor.is_some() {
-                self.on_key_report_editing(key, idx);
-                return;
-            }
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].editor.is_some()
+        {
+            self.on_key_report_editing(key, idx);
+            return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);

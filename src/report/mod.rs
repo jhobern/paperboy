@@ -17,6 +17,11 @@ pub mod flow;
 pub mod model;
 pub mod parser;
 pub mod producers;
+// The `Report` domain type lives in `report::report`; the repeated name trips
+// clippy::module_inception, but renaming the file would obscure that this is
+// *the* report type's home, so the lint is allowed here rather than worked
+// around.
+#[allow(clippy::module_inception)]
 pub mod report;
 pub mod run;
 pub mod validate;

@@ -3876,14 +3876,46 @@ fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
         s.help_reports_about_heading,
         s.help_reports_shortcuts_heading,
         s.help_reports_grammar_heading,
+        s.help_reports_loops_heading,
         s.help_grammar_collection,
-        s.help_grammar_assign,
+        s.help_grammar_for_tuple,
+        s.help_grammar_zip,
     ] {
         assert!(
             text.contains(expected),
             "the Reports help tab shows {expected:?}"
         );
     }
+}
+
+/// `help_entry_lines_col` lines every description up to the same column
+/// regardless of how long each entry's left-hand side is — the fix for the
+/// report grammar rows, whose keys range from `ZIP(a, b, …)` to
+/// `REPORT REQUEST NAME [AS COL]`, previously starting each description
+/// wherever its own key happened to end.
+#[test]
+fn help_grammar_entries_align_descriptions_to_one_column() {
+    let first = |lines: Vec<ratatui::text::Line>| -> String {
+        lines[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect()
+    };
+    let short = first(super::draw::help_entry_lines_col("ZIP", "AAA", 26, 100));
+    let long = first(super::draw::help_entry_lines_col(
+        "FOLDERS \"dir\" [WITH r=\"g\"]",
+        "BBB",
+        26,
+        100,
+    ));
+    assert_eq!(
+        short.find("AAA"),
+        long.find("BBB"),
+        "descriptions start at the same column despite different key widths"
+    );
+    // key column (26) + one separating space → description at index 27.
+    assert_eq!(short.find("AAA"), Some(27));
 }
 
 #[test]
