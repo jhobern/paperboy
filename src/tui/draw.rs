@@ -309,12 +309,14 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
     for (r, rt) in app.reports.iter().enumerate() {
         spans.push(Span::raw("│"));
         pos += 1;
+        // Unsaved edits get a trailing dot (with a leading space so it never
+        // crowds the name); the report icon leads.
         let marker = if rt.report.dirty {
-            s.report_dirty_marker
+            format!(" {}", s.report_dirty_marker)
         } else {
-            ""
+            String::new()
         };
-        let name = format!("{}{}{}", s.report_tab_icon, marker, rt.report.name);
+        let name = format!("{}{}{}", s.report_tab_icon, rt.report.name, marker);
         let idx = report_base + r;
         let w = name.chars().count() + 2;
         if app.active_tab == idx {
@@ -2281,9 +2283,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             }
         }
         Overlay::NewRequest(form) => draw_new_request(f, form, s, th, app.enhanced_keys),
-        Overlay::ReportEdit { editor } => {
-            super::reports::draw_report_edit_overlay(f, editor, s, th)
-        }
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th),
         Overlay::RemoteGit(w) => draw_remote_wizard(f, w, s, th),
         Overlay::GitSave(w) => draw_git_save_wizard(f, w, s, th),

@@ -373,14 +373,6 @@ pub(crate) enum Overlay {
     },
     Browser(FileAction, Box<FileExplorer>),
     NewRequest(Box<NewReq>),
-    /// Full-screen modal editor for the active report tab's PaperTrail source
-    /// text (reuses the multiline [`Editor`], like Raw Mode for a request).
-    /// F2 / Ctrl+S commits the edited text back into the report (and
-    /// re-validates); Esc cancels. Mirrors the app's other modal-edit paths so
-    /// single-key typing never collides with the main view's shortcuts.
-    ReportEdit {
-        editor: Editor,
-    },
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
     GitSave(Box<GitSaveWizard>),

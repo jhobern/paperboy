@@ -14352,33 +14352,49 @@ fn new_scratch_report_flags_unbound_collection() {
     );
 }
 
-/// `e` opens the modal source editor; typing then F2 commits the edited text
-/// back into the report (marking it dirty) and closes the overlay.
+/// `e` gives the source panel edit focus; typing goes straight into the panel,
+/// updating the report text live and marking it dirty. Esc leaves edit focus,
+/// keeping the typed text (edits are applied live, not on a separate commit).
 #[test]
-fn report_edit_overlay_commits_edited_source() {
+fn report_inline_edit_types_into_source() {
     let mut app = TuiApp::default();
     app.new_report_tab();
     press(&mut app, KeyCode::Char('e'));
-    assert!(matches!(app.overlay, Some(Overlay::ReportEdit { .. })));
+    assert!(
+        app.active_report().unwrap().editor.is_some(),
+        "e gives the source panel edit focus"
+    );
     app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-    assert!(app.overlay.is_none(), "F2 commits and closes the editor");
+    // Edits apply live, before leaving edit focus.
     let rt = app.active_report().expect("active report");
     assert!(rt.report.text.contains('x'));
-    assert!(rt.report.dirty, "committing an edit marks the report dirty");
+    assert!(rt.report.dirty, "typing marks the report dirty");
+    // Esc leaves edit focus but keeps the text.
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let rt = app.active_report().expect("active report");
+    assert!(rt.editor.is_none(), "Esc leaves edit focus");
+    assert!(rt.report.text.contains('x'), "edits are kept after leaving");
 }
 
-/// Esc in the modal editor cancels without changing the report.
+/// After Esc leaves edit focus, single letters act as view shortcuts again
+/// (e.g. `R` opens another report tab rather than typing an 'R' into the body).
 #[test]
-fn report_edit_overlay_esc_discards_edits() {
+fn report_inline_edit_esc_returns_to_shortcuts() {
     let mut app = TuiApp::default();
     app.new_report_tab();
-    let before = app.active_report().unwrap().report.text.clone();
     press(&mut app, KeyCode::Char('e'));
     app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert!(app.active_report().unwrap().report.text.contains('z'));
     app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(app.overlay.is_none());
-    assert_eq!(app.active_report().unwrap().report.text, before);
+    assert!(app.active_report().unwrap().editor.is_none());
+    let before = app.reports.len();
+    // A plain 'R' is a shortcut again (new report), not typed text.
+    app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    assert_eq!(
+        app.reports.len(),
+        before + 1,
+        "R opens a new report once edit focus has been left"
+    );
 }
 
 /// Tab cycling visits report tabs alongside collection tabs (unified index).
@@ -14461,8 +14477,11 @@ fn drawing_a_report_tab_does_not_panic() {
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 
-    // Now with the modal source editor open.
+    // Now with the source panel in edit focus (inline editor rendered).
     press(&mut app, KeyCode::Char('e'));
-    assert!(matches!(app.overlay, Some(Overlay::ReportEdit { .. })));
+    assert!(
+        app.active_report().unwrap().editor.is_some(),
+        "e gives the source panel edit focus"
+    );
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 }

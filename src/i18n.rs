@@ -435,8 +435,7 @@ strings! {
     report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
     report_empty_source => "Empty report — press e to edit its source.", "Rapport vide — appuyez sur e pour modifier sa source.", "Tom rapport — tryk e for at redigere kilden.";
     report_hint_edit => "e edit", "e modifier", "e rediger";
-    report_hints => "e edit · [ ] switch tabs · ^w close · u reopen", "e modifier · [ ] changer d'onglet · ^w fermer · u rouvrir", "e rediger · [ ] skift faner · ^w luk · u genåbn";
-    report_edit_title => "Edit Report Source", "Modifier la source du rapport", "Rediger rapportkilde";
+    report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
 }
 

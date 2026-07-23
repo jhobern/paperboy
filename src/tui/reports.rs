@@ -4,21 +4,23 @@
 //! panels, so it fits small monitors, per the design).
 //!
 //! The core [`Report`] stays front-end agnostic; everything ratatui-specific
-//! (cached diagnostics, the modal source editor, drawing) lives here so a
-//! future GUI can reuse the core unchanged. A report tab is a mostly-read-only
-//! view of the flow source plus its live validation; editing happens in a modal
-//! [`Overlay::ReportEdit`] editor (like Raw Mode for a request) so single-key
-//! shortcuts in the main view never collide with typing into the source.
+//! (cached diagnostics, the inline source editor, drawing) lives here so a
+//! future GUI can reuse the core unchanged. A report tab shows the flow source
+//! plus its live validation. Editing is *focus-based inline* (like the request
+//! wizard's text cells): pressing `e`/Enter gives the source panel edit focus
+//! so keystrokes type directly into it, and Esc returns to navigation mode
+//! where single letters act as view shortcuts again. Edits apply live (the
+//! validation panel refreshes as you type); Esc just leaves edit focus.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::{Overlay, Pane, TuiApp};
-use super::draw::{centered_rect, panel};
+use super::draw::panel;
 use super::editor::{Editor, render_editor};
 use super::theme::Theme;
 use crate::i18n::Strings;
@@ -36,6 +38,11 @@ pub(crate) struct ReportTab {
     /// Parser error message, if the source doesn't currently parse (shown in
     /// place of `diagnostics`, which can't be computed without a parse tree).
     pub(crate) parse_error: Option<String>,
+    /// When `Some`, the source panel has *edit focus*: keystrokes type into
+    /// this live buffer (mirrored into `report.text` on every edit so the
+    /// validation panel and tab name stay current) instead of acting as view
+    /// shortcuts. `None` = navigation mode.
+    pub(crate) editor: Option<Editor>,
 }
 
 impl ReportTab {
@@ -44,6 +51,7 @@ impl ReportTab {
             report,
             diagnostics: Vec::new(),
             parse_error: None,
+            editor: None,
         }
     }
 }
@@ -139,23 +147,13 @@ impl TuiApp {
         }
     }
 
-    /// Open the modal source editor for the active report tab.
-    pub(crate) fn open_report_editor(&mut self) {
-        if let Some(rt) = self.active_report() {
-            let editor = Editor::new(&rt.report.text, true);
-            self.overlay = Some(Overlay::ReportEdit { editor });
-        }
-    }
-
-    /// Commit edited source text back into the active report, refresh its name,
-    /// revalidate and persist. Called when the modal editor is confirmed.
-    pub(crate) fn commit_report_editor(&mut self, text: String) {
+    /// Give the active report tab's source panel edit focus, seeding an
+    /// [`Editor`] from the current source text. While focused, keystrokes type
+    /// directly into the panel (see [`TuiApp::on_key_report_editing`]).
+    pub(crate) fn enter_report_edit(&mut self) {
         if let Some(idx) = self.active_report_index() {
-            if let Some(rt) = self.reports.get_mut(idx) {
-                rt.report.set_text(text);
-            }
-            self.revalidate_report(idx);
-            self.save_state();
+            let text = self.reports[idx].report.text.clone();
+            self.reports[idx].editor = Some(Editor::new(&text, true));
         }
     }
 
@@ -191,6 +189,14 @@ impl TuiApp {
     /// handler dispatches here at its very top. Only tab-navigation, global
     /// menu, and report-specific keys are honoured.
     pub(crate) fn on_key_report(&mut self, key: KeyEvent) {
+        // When the source panel has edit focus, keystrokes type into it rather
+        // than acting as view shortcuts (Esc leaves edit focus).
+        if let Some(idx) = self.active_report_index() {
+            if self.reports[idx].editor.is_some() {
+                self.on_key_report_editing(key, idx);
+                return;
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -213,92 +219,99 @@ impl TuiApp {
             }
             // Open another new report.
             KeyCode::Char('R') => self.new_report_tab(),
-            // Report-specific: edit the source.
-            KeyCode::Char('e') => self.open_report_editor(),
+            // Report-specific: give the source panel edit focus.
+            KeyCode::Char('e') | KeyCode::Enter => self.enter_report_edit(),
             _ => {}
         }
     }
 
-    /// Key handling for the modal report-source editor ([`Overlay::ReportEdit`]).
-    /// F2 / Ctrl+S commit the edited text (and revalidate); Esc cancels.
-    /// Everything else edits the multiline buffer (Enter inserts a newline).
-    pub(crate) fn report_edit_key_handler(&mut self, key: KeyEvent, mut editor: Editor) {
+    /// Key handling while the active report's source panel has edit focus.
+    /// Esc leaves edit focus (keeping the typed text — edits are applied live);
+    /// everything else edits the multiline buffer (Enter inserts a newline).
+    /// After each edit the buffer is mirrored into `report.text` and the tab is
+    /// revalidated so the validation panel stays live.
+    fn on_key_report_editing(&mut self, key: KeyEvent, idx: usize) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        enum Act {
-            Commit,
-            Cancel,
-            Edit,
-        }
-        let act = match key.code {
-            KeyCode::Esc => Act::Cancel,
-            KeyCode::F(2) => Act::Commit,
-            KeyCode::Char('s') if ctrl => Act::Commit,
-            KeyCode::Enter => {
-                editor.newline();
-                Act::Edit
-            }
-            KeyCode::Char('y') if ctrl => {
-                if let Some(text) = editor.selected_text() {
-                    super::clipboard::copy_to_clipboard(&text);
-                    self.status = Some(crate::i18n::Status::Copied);
+        let mut leave = false;
+        let mut copy: Option<String> = None;
+        // Apply the keystroke to the editor, then read back the (possibly)
+        // updated text; the borrow of `self.reports[idx].editor` ends with this
+        // block so the follow-up `revalidate_report`/`save_state` calls (which
+        // borrow all of `self`) are free to run.
+        let new_text: Option<String> = {
+            let Some(rt) = self.reports.get_mut(idx) else {
+                return;
+            };
+            let Some(editor) = rt.editor.as_mut() else {
+                return;
+            };
+            let mut changed = false;
+            match key.code {
+                KeyCode::Esc => leave = true,
+                KeyCode::Enter => {
+                    editor.newline();
+                    changed = true;
                 }
-                Act::Edit
-            }
-            KeyCode::Char(c) => {
-                editor.clear_selection();
-                editor.insert(c);
-                Act::Edit
-            }
-            KeyCode::Backspace => {
-                editor.clear_selection();
-                editor.backspace();
-                Act::Edit
-            }
-            KeyCode::Left => {
-                editor.set_selecting(shift);
-                if ctrl {
-                    editor.home()
-                } else {
-                    editor.left()
+                KeyCode::Char('y') if ctrl => copy = editor.selected_text(),
+                KeyCode::Char(c) => {
+                    editor.clear_selection();
+                    editor.insert(c);
+                    changed = true;
                 }
-                Act::Edit
-            }
-            KeyCode::Right => {
-                editor.set_selecting(shift);
-                if ctrl {
-                    editor.end()
-                } else {
-                    editor.right()
+                KeyCode::Backspace => {
+                    editor.clear_selection();
+                    editor.backspace();
+                    changed = true;
                 }
-                Act::Edit
+                KeyCode::Left => {
+                    editor.set_selecting(shift);
+                    if ctrl { editor.home() } else { editor.left() }
+                }
+                KeyCode::Right => {
+                    editor.set_selecting(shift);
+                    if ctrl { editor.end() } else { editor.right() }
+                }
+                KeyCode::Up => {
+                    editor.set_selecting(shift);
+                    editor.up();
+                }
+                KeyCode::Down => {
+                    editor.set_selecting(shift);
+                    editor.down();
+                }
+                KeyCode::Home => {
+                    editor.clear_selection();
+                    editor.home();
+                }
+                KeyCode::End => {
+                    editor.clear_selection();
+                    editor.end();
+                }
+                _ => {}
             }
-            KeyCode::Up => {
-                editor.set_selecting(shift);
-                editor.up();
-                Act::Edit
+            if leave || changed {
+                Some(editor.text())
+            } else {
+                None
             }
-            KeyCode::Down => {
-                editor.set_selecting(shift);
-                editor.down();
-                Act::Edit
-            }
-            KeyCode::Home => {
-                editor.clear_selection();
-                editor.home();
-                Act::Edit
-            }
-            KeyCode::End => {
-                editor.clear_selection();
-                editor.end();
-                Act::Edit
-            }
-            _ => Act::Edit,
         };
-        match act {
-            Act::Commit => self.commit_report_editor(editor.text()),
-            Act::Cancel => {}
-            Act::Edit => self.overlay = Some(Overlay::ReportEdit { editor }),
+
+        if let Some(text) = copy {
+            super::clipboard::copy_to_clipboard(&text);
+            self.status = Some(crate::i18n::Status::Copied);
+        }
+        if let Some(text) = new_text {
+            if let Some(rt) = self.reports.get_mut(idx) {
+                if leave {
+                    rt.editor = None;
+                }
+                rt.report.set_text(text);
+            }
+            self.revalidate_report(idx);
+            if leave {
+                self.save_state();
+            }
         }
     }
 }
@@ -390,19 +403,34 @@ fn draw_report_binding(
 }
 
 fn draw_report_source(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings, th: &Theme) {
-    // The tab is named for the report; the source panel carries the primary
-    // hints so the (otherwise chrome-free) view still advertises its keys.
-    let title = format!("{} — {}", s.report_source_heading, s.report_hints);
-    let body = rt.report.text.trim_end();
-    let para = if body.is_empty() {
-        Paragraph::new(Line::from(Span::styled(
-            s.report_empty_source,
-            Style::default().fg(th.dim),
-        )))
+    // The tab is named for the report; the source panel advertises only the
+    // report-specific action (edit / leave-edit) — the tab-navigation/close
+    // shortcuts already live in the footer, so they're not repeated here.
+    let editing = rt.editor.is_some();
+    let hint = if editing {
+        s.report_hint_leave
     } else {
-        Paragraph::new(body.to_string()).style(Style::default().fg(th.text))
+        s.report_hint_edit
     };
-    f.render_widget(para.block(panel(title, true, th)), area);
+    let title = format!("{} — {}", s.report_source_heading, hint);
+    let block = panel(title, true, th);
+    if let Some(editor) = &rt.editor {
+        // Edit focus: render the live editor (with cursor) inside the panel.
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        render_editor(f, inner, editor, false, th);
+    } else {
+        let body = rt.report.text.trim_end();
+        let para = if body.is_empty() {
+            Paragraph::new(Line::from(Span::styled(
+                s.report_empty_source,
+                Style::default().fg(th.dim),
+            )))
+        } else {
+            Paragraph::new(body.to_string()).style(Style::default().fg(th.text))
+        };
+        f.render_widget(para.block(block), area);
+    }
 }
 
 fn draw_report_validation(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings, th: &Theme) {
@@ -435,18 +463,4 @@ fn draw_report_validation(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings
             .wrap(Wrap { trim: true }),
         area,
     );
-}
-
-/// Draw the modal report-source editor overlay ([`Overlay::ReportEdit`]).
-pub(crate) fn draw_report_edit_overlay(f: &mut Frame, editor: &Editor, s: &Strings, th: &Theme) {
-    let full = f.area();
-    let w = full.width.saturating_sub(8).max(20);
-    let h = full.height.saturating_sub(6).max(6);
-    let area = centered_rect(w, h, full);
-    f.render_widget(Clear, area);
-    let title = format!("{}  ({})", s.report_edit_title, s.prompt_save_hint_ml);
-    let block = panel(title, true, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    render_editor(f, inner, editor, false, th);
 }
