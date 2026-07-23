@@ -881,7 +881,8 @@ impl TuiApp {
             // Remember it (with the index it was closed from) so Ctrl+Shift+T
             // can bring it back; capped so this can't grow unbounded in a
             // long session.
-            self.closed_tabs.push(ClosedTab::Collection(idx, removed));
+            self.closed_tabs
+                .push(ClosedTab::Collection(idx, Box::new(removed)));
             if self.closed_tabs.len() > 20 {
                 self.closed_tabs.remove(0);
             }
@@ -906,12 +907,12 @@ impl TuiApp {
         match closed {
             ClosedTab::Collection(idx, col) => {
                 let idx = idx.min(self.collections.len());
-                self.collections.insert(idx, col);
+                self.collections.insert(idx, *col);
                 self.active_tab = idx;
             }
             ClosedTab::Report(ridx, rt) => {
                 let ridx = ridx.min(self.reports.len());
-                self.reports.insert(ridx, rt);
+                self.reports.insert(ridx, *rt);
                 self.active_tab = self.collections.len() + ridx;
             }
         }

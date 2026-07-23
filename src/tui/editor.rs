@@ -5,12 +5,13 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 
 use super::theme::*;
 use ratatui::style::{Color, Style};
 use tui_line_editor::{EditorTheme, TruncationMarker};
 
-pub(crate) use tui_line_editor::{Editor, apply_edit_key};
+pub(crate) use tui_line_editor::{Editor, apply_edit_key, apply_edit_key_full};
 
 /// Map PaperBoy's [`Theme`] to the crate's [`EditorTheme`].
 fn editor_theme(th: &Theme) -> EditorTheme {
@@ -25,6 +26,21 @@ fn editor_theme(th: &Theme) -> EditorTheme {
 
 pub(crate) fn render_editor(f: &mut Frame, area: Rect, ed: &Editor, masked: bool, th: &Theme) {
     tui_line_editor::render_editor(f, area, ed, &editor_theme(th), masked);
+}
+
+/// Like [`render_editor`], but each visible logical line is drawn from the
+/// styled spans `highlight(row, line)` returns — used to keep syntax
+/// highlighting live while a report's source panel has edit focus. The cursor,
+/// selection overlay and horizontal scrolling behave exactly as in
+/// [`render_editor`].
+pub(crate) fn render_editor_highlighted(
+    f: &mut Frame,
+    area: Rect,
+    ed: &Editor,
+    th: &Theme,
+    highlight: impl Fn(usize, &str) -> Vec<Span<'static>>,
+) {
+    tui_line_editor::render_editor_highlighted(f, area, ed, &editor_theme(th), highlight);
 }
 
 /// Render a single-line editor's text into `area`, masking every character with

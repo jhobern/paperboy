@@ -14573,3 +14573,55 @@ fn drawing_a_report_tab_does_not_panic() {
     );
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 }
+
+#[test]
+fn report_source_highlights_keywords_and_underlines_the_error_line() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("api".to_string(), Vec::new()));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // A well-formed first line (REQUEST is a keyword) followed by a line the
+    // parser rejects (a bare word that is not a statement).
+    app.reports[idx]
+        .report
+        .set_text("REQUEST Oauth\nnonsense here\n");
+    app.revalidate_report(idx);
+    let accent = app.theme().accent;
+    let err = app.theme().err;
+    let err_line = app.reports[idx].parse_error_line;
+    assert!(
+        err_line.is_some(),
+        "the malformed line should give a parse error line"
+    );
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+
+    // Somewhere in the buffer, the 'R' of the REQUEST keyword is drawn in the
+    // theme accent colour (proving the styled highlighting reached the screen).
+    let mut found_accent_keyword = false;
+    let mut found_underlined_error = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            if cell.symbol() == "R" && cell.fg == accent {
+                found_accent_keyword = true;
+            }
+            if cell.fg == err && cell.modifier.contains(ratatui::style::Modifier::UNDERLINED) {
+                found_underlined_error = true;
+            }
+        }
+    }
+    assert!(
+        found_accent_keyword,
+        "the REQUEST keyword should be drawn in the accent colour"
+    );
+    assert!(
+        found_underlined_error,
+        "the rejected line should be drawn in the error colour and underlined"
+    );
+}

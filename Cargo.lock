@@ -2316,9 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "tui-line-editor"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ed0be735d39fcdd942374ccb743c9a83cadad52fb5f4ad2060f28e5bb12075"
+version = "0.1.2"
 dependencies = [
  "ratatui",
 ]

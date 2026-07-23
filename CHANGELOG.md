@@ -27,6 +27,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   restart), and the Help (**`?`**) overlay gains a **Reports** tab explaining
   what a report is, the report shortcuts, and the flow language. Running a
   report, CSV export, and binding a collection follow in later updates.
+- **Syntax highlighting in the report source.** The PaperTrail source now
+  highlights as you read and edit it: keywords (REQUEST, REPORT, FOR, END, …)
+  are drawn in the theme accent, `{{var}}` substitutions reuse the app's
+  substitution colour, `#` comment lines are dimmed, and the exact line the
+  parser rejects is recoloured and underlined so a malformed flow is obvious at
+  a glance. The read-only source and validation panels are now scrollable
+  `MultiSelectPanel`s (with a scrollbar) for a consistent feel with the rest of
+  the app — scroll the source with the arrow keys (Home/End jump to the
+  top/bottom) when it isn't in edit focus.
 
 
 ## [0.1.6] - 2026-07-18

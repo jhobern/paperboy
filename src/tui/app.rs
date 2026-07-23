@@ -635,8 +635,11 @@ pub(crate) struct PendingWorkspaceSave {
 /// restore out of order). Each variant remembers the *within-kind* index it was
 /// closed from so it reappears close to where it was.
 pub(crate) enum ClosedTab {
-    Collection(usize, Collection),
-    Report(usize, crate::tui::reports::ReportTab),
+    // Both payloads are large (a `Collection`, and a `ReportTab` carrying two
+    // `MultiSelectPanel`s), so box both to keep the enum pointer-sized and the
+    // variants balanced.
+    Collection(usize, Box<Collection>),
+    Report(usize, Box<crate::tui::reports::ReportTab>),
 }
 
 pub struct TuiApp {

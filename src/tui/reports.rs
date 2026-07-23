@@ -17,11 +17,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
+use tui_panel_select::MultiSelectPanel;
 
 use super::app::{Overlay, Pane, TuiApp};
 use super::draw::panel;
-use super::editor::{Editor, render_editor};
+use super::editor::{Editor, apply_edit_key_full, render_editor_highlighted};
+use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::Strings;
 use crate::report::Report;
@@ -38,11 +40,20 @@ pub(crate) struct ReportTab {
     /// Parser error message, if the source doesn't currently parse (shown in
     /// place of `diagnostics`, which can't be computed without a parse tree).
     pub(crate) parse_error: Option<String>,
+    /// 1-based source line the parser rejected, if any — the syntax highlighter
+    /// underlines it so a malformed script is obvious at a glance.
+    pub(crate) parse_error_line: Option<usize>,
     /// When `Some`, the source panel has *edit focus*: keystrokes type into
     /// this live buffer (mirrored into `report.text` on every edit so the
     /// validation panel and tab name stay current) instead of acting as view
     /// shortcuts. `None` = navigation mode.
     pub(crate) editor: Option<Editor>,
+    /// Selection/scroll panel backing the read-only source view (so it renders
+    /// with the same wrapping, scrollbar and mouse-selection feel as the
+    /// collection view's panels).
+    pub(crate) source_panel: MultiSelectPanel,
+    /// Selection/scroll panel backing the validation output.
+    pub(crate) validation_panel: MultiSelectPanel,
 }
 
 impl ReportTab {
@@ -51,7 +62,10 @@ impl ReportTab {
             report,
             diagnostics: Vec::new(),
             parse_error: None,
+            parse_error_line: None,
             editor: None,
+            source_panel: MultiSelectPanel::new(),
+            validation_panel: MultiSelectPanel::new(),
         }
     }
 }
@@ -116,12 +130,12 @@ impl TuiApp {
         // Compute the parse-error / diagnostics up front so the immutable reads
         // of `self.collections` / `self.global_envs` don't overlap the mutable
         // borrow of `self.reports[idx]` that stores the result.
-        let (parse_error, diagnostics) = {
+        let (parse_error, parse_error_line, diagnostics) = {
             let Some(rt) = self.reports.get(idx) else {
                 return;
             };
             match rt.report.flow() {
-                Err(e) => (Some(e.to_string()), Vec::new()),
+                Err(e) => (Some(e.to_string()), Some(e.line), Vec::new()),
                 Ok(flow) => {
                     let titles: Option<Vec<String>> =
                         self.resolve_bound_collection(&rt.report).map(|ci| {
@@ -137,12 +151,13 @@ impl TuiApp {
                         request_titles: titles.as_deref(),
                         env_names: Some(&env_names),
                     };
-                    (None, validate(&flow, &ctx))
+                    (None, None, validate(&flow, &ctx))
                 }
             }
         };
         if let Some(rt) = self.reports.get_mut(idx) {
             rt.parse_error = parse_error;
+            rt.parse_error_line = parse_error_line;
             rt.diagnostics = diagnostics;
         }
     }
@@ -166,7 +181,7 @@ impl TuiApp {
         };
         let rt = self.reports.remove(ridx);
         self.closed_tabs
-            .push(super::app::ClosedTab::Report(ridx, rt));
+            .push(super::app::ClosedTab::Report(ridx, Box::new(rt)));
         if self.closed_tabs.len() > 20 {
             self.closed_tabs.remove(0);
         }
@@ -221,7 +236,24 @@ impl TuiApp {
             KeyCode::Char('R') => self.new_report_tab(),
             // Report-specific: give the source panel edit focus.
             KeyCode::Char('e') | KeyCode::Enter => self.enter_report_edit(),
+            // Scroll the read-only source panel (edit focus uses these to move
+            // the cursor instead). Overshoot is clamped when it next draws.
+            KeyCode::Up => self.scroll_report_source(-1),
+            KeyCode::Down => self.scroll_report_source(1),
+            KeyCode::Home => self.scroll_report_source(i32::MIN),
+            KeyCode::End => self.scroll_report_source(i32::MAX),
             _ => {}
+        }
+    }
+
+    /// Nudge the active report's read-only source panel scroll by `delta` rows
+    /// (`i32::MIN`/`MAX` jump to the top/bottom). The draw pass clamps to the
+    /// real content height, so this doesn't need the viewport size.
+    fn scroll_report_source(&mut self, delta: i32) {
+        if let Some(idx) = self.active_report_index() {
+            let panel = &mut self.reports[idx].source_panel;
+            let next = (panel.scroll() as i32).saturating_add(delta).max(0);
+            panel.set_scroll(next.min(u16::MAX as i32) as u16);
         }
     }
 
@@ -231,8 +263,10 @@ impl TuiApp {
     /// After each edit the buffer is mirrored into `report.text` and the tab is
     /// revalidated so the validation panel stays live.
     fn on_key_report_editing(&mut self, key: KeyEvent, idx: usize) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Esc is the only key the editor doesn't own here: it leaves edit focus
+        // (keeping the live-applied text). Everything else is delegated to the
+        // shared multi-line key handler, which reports whether the text changed
+        // and any selection the host should copy.
         let mut leave = false;
         let mut copy: Option<String> = None;
         // Apply the keystroke to the editor, then read back the (possibly)
@@ -246,54 +280,17 @@ impl TuiApp {
             let Some(editor) = rt.editor.as_mut() else {
                 return;
             };
-            let mut changed = false;
-            match key.code {
-                KeyCode::Esc => leave = true,
-                KeyCode::Enter => {
-                    editor.newline();
-                    changed = true;
-                }
-                KeyCode::Char('y') if ctrl => copy = editor.selected_text(),
-                KeyCode::Char(c) => {
-                    editor.clear_selection();
-                    editor.insert(c);
-                    changed = true;
-                }
-                KeyCode::Backspace => {
-                    editor.clear_selection();
-                    editor.backspace();
-                    changed = true;
-                }
-                KeyCode::Left => {
-                    editor.set_selecting(shift);
-                    if ctrl { editor.home() } else { editor.left() }
-                }
-                KeyCode::Right => {
-                    editor.set_selecting(shift);
-                    if ctrl { editor.end() } else { editor.right() }
-                }
-                KeyCode::Up => {
-                    editor.set_selecting(shift);
-                    editor.up();
-                }
-                KeyCode::Down => {
-                    editor.set_selecting(shift);
-                    editor.down();
-                }
-                KeyCode::Home => {
-                    editor.clear_selection();
-                    editor.home();
-                }
-                KeyCode::End => {
-                    editor.clear_selection();
-                    editor.end();
-                }
-                _ => {}
-            }
-            if leave || changed {
+            if key.code == KeyCode::Esc {
+                leave = true;
                 Some(editor.text())
             } else {
-                None
+                let resp = apply_edit_key_full(editor, key);
+                copy = resp.copy;
+                if resp.changed {
+                    Some(editor.text())
+                } else {
+                    None
+                }
             }
         };
 
@@ -340,19 +337,28 @@ fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
-/// Draw a report tab's full-screen body: the binding status, the (read-only)
-/// flow source, and the live validation panel.
-pub(crate) fn draw_report_body(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    let Some(rt) = app.active_report() else {
+/// Draw a report tab's full-screen body: the binding status, the flow source
+/// (syntax-highlighted, editable in place), and the live validation panel.
+pub(crate) fn draw_report_body(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    s: &Strings,
+    th: &Theme,
+) {
+    let Some(idx) = app.active_report_index() else {
         return;
     };
 
     // Number of validation rows to reserve at the bottom (bounded so a long
     // list of problems can't crowd out the source).
-    let diag_count = if rt.parse_error.is_some() {
-        1
-    } else {
-        rt.diagnostics.len().max(1)
+    let diag_count = {
+        let rt = &app.reports[idx];
+        if rt.parse_error.is_some() {
+            1
+        } else {
+            rt.diagnostics.len().max(1)
+        }
     };
     let diag_h = (diag_count as u16 + 2).min(10);
 
@@ -363,19 +369,62 @@ pub(crate) fn draw_report_body(f: &mut Frame, area: Rect, app: &TuiApp, s: &Stri
     ])
     .split(area);
 
-    draw_report_binding(f, rows[0], app, rt, s, th);
-    draw_report_source(f, rows[1], rt, s, th);
-    draw_report_validation(f, rows[2], rt, s, th);
+    draw_report_binding(f, rows[0], app, idx, s, th);
+    draw_report_source(f, rows[1], app, idx, s, th);
+    draw_report_validation(f, rows[2], app, idx, s, th);
+}
+
+/// Render styled `lines` into `block`'s inner area through `panel`, so the read
+/// content wraps, scrolls and shows a scrollbar exactly like the collection
+/// view's panels.
+fn draw_report_panel(
+    f: &mut Frame,
+    area: Rect,
+    block: Block<'static>,
+    panel: &mut MultiSelectPanel,
+    lines: &[Line<'static>],
+    th: &Theme,
+) {
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    panel.set_styled_content(lines, inner.width as usize);
+    panel.clamp_scroll(inner.height);
+    let visible = panel.visible_rows(inner.height);
+    f.render_widget(
+        Paragraph::new(visible).style(Style::default().fg(th.text)),
+        inner,
+    );
+    if panel.max_scroll(inner.height) > 0 {
+        let total = panel.total_rows().min(u16::MAX as u32) as usize;
+        let bar = Rect {
+            x: area.x + area.width - 1,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        draw_scrollbar(
+            f,
+            bar,
+            total,
+            inner.height as usize,
+            panel.scroll() as usize,
+            th,
+        );
+    }
 }
 
 fn draw_report_binding(
     f: &mut Frame,
     area: Rect,
     app: &TuiApp,
-    rt: &ReportTab,
+    idx: usize,
     s: &Strings,
     th: &Theme,
 ) {
+    let rt = &app.reports[idx];
     let line = match app.resolve_bound_collection(&rt.report) {
         Some(ci) => Line::from(vec![
             Span::styled(s.report_bound_prefix, Style::default().fg(th.dim)),
@@ -402,11 +451,18 @@ fn draw_report_binding(
     );
 }
 
-fn draw_report_source(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings, th: &Theme) {
+fn draw_report_source(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
     // The tab is named for the report; the source panel advertises only the
     // report-specific action (edit / leave-edit) — the tab-navigation/close
     // shortcuts already live in the footer, so they're not repeated here.
-    let editing = rt.editor.is_some();
+    let editing = app.reports[idx].editor.is_some();
     let hint = if editing {
         s.report_hint_leave
     } else {
@@ -414,53 +470,84 @@ fn draw_report_source(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings, th
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
     let block = panel(title, true, th);
-    if let Some(editor) = &rt.editor {
-        // Edit focus: render the live editor (with cursor) inside the panel.
+    let error_line = app.reports[idx].parse_error_line;
+
+    if editing {
+        // Edit focus: render the live editor (with cursor) inside the panel,
+        // keeping the same syntax highlighting as the read view.
         let inner = block.inner(area);
         f.render_widget(block, area);
-        render_editor(f, inner, editor, false, th);
-    } else {
-        let body = rt.report.text.trim_end();
-        let para = if body.is_empty() {
-            Paragraph::new(Line::from(Span::styled(
-                s.report_empty_source,
-                Style::default().fg(th.dim),
-            )))
-        } else {
-            Paragraph::new(body.to_string()).style(Style::default().fg(th.text))
-        };
-        f.render_widget(para.block(block), area);
+        if let Some(editor) = app.reports[idx].editor.as_ref() {
+            render_editor_highlighted(f, inner, editor, th, |row, line| {
+                super::report_highlight::highlight_row(row, line, error_line, th)
+            });
+        }
+        return;
     }
+
+    let body = app.reports[idx].report.text.clone();
+    let trimmed = body.trim_end();
+    let lines = if trimmed.is_empty() {
+        vec![Line::from(Span::styled(
+            s.report_empty_source,
+            Style::default().fg(th.dim),
+        ))]
+    } else {
+        super::report_highlight::highlight_source(trimmed, error_line, th)
+    };
+    draw_report_panel(
+        f,
+        area,
+        block,
+        &mut app.reports[idx].source_panel,
+        &lines,
+        th,
+    );
 }
 
-fn draw_report_validation(f: &mut Frame, area: Rect, rt: &ReportTab, s: &Strings, th: &Theme) {
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(err) = &rt.parse_error {
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(th.err),
-        )));
-    } else if rt.diagnostics.is_empty() {
-        lines.push(Line::from(Span::styled(
-            s.report_no_diagnostics,
-            Style::default().fg(th.ok),
-        )));
-    } else {
-        for d in &rt.diagnostics {
-            let (icon, colour) = match d.severity {
-                Severity::Error => ("✗ ", th.err),
-                Severity::Warning => ("! ", th.pending),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(icon, Style::default().fg(colour)),
-                Span::styled(d.message.clone(), Style::default().fg(th.text)),
-            ]));
+fn draw_report_validation(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
+    let lines: Vec<Line<'static>> = {
+        let rt = &app.reports[idx];
+        if let Some(err) = &rt.parse_error {
+            vec![Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(th.err),
+            ))]
+        } else if rt.diagnostics.is_empty() {
+            vec![Line::from(Span::styled(
+                s.report_no_diagnostics,
+                Style::default().fg(th.ok),
+            ))]
+        } else {
+            rt.diagnostics
+                .iter()
+                .map(|d| {
+                    let (icon, colour) = match d.severity {
+                        Severity::Error => ("✗ ", th.err),
+                        Severity::Warning => ("! ", th.pending),
+                    };
+                    Line::from(vec![
+                        Span::styled(icon, Style::default().fg(colour)),
+                        Span::styled(d.message.clone(), Style::default().fg(th.text)),
+                    ])
+                })
+                .collect()
         }
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(panel(s.report_validation_heading.to_string(), false, th))
-            .wrap(Wrap { trim: true }),
+    };
+    let block = panel(s.report_validation_heading.to_string(), false, th);
+    draw_report_panel(
+        f,
         area,
+        block,
+        &mut app.reports[idx].validation_panel,
+        &lines,
+        th,
     );
 }
