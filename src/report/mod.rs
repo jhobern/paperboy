@@ -17,6 +17,7 @@ pub mod flow;
 pub mod model;
 pub mod parser;
 pub mod producers;
+pub mod report;
 pub mod run;
 pub mod validate;
 pub mod writer;
@@ -27,6 +28,7 @@ pub use flow::{
 };
 pub use model::{OutputColumn, ReportResult, ReportRow, TARGET_COLUMN};
 pub use parser::{ParseError, parse_flow};
+pub use report::Report;
 pub use run::{EntryRunner, LiveRunner, RunContext, resolve_title, run_flow};
 pub use validate::{Diagnostic, Severity, validate};
 pub use writer::{CsvWriter, ReportWriter};

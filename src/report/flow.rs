@@ -62,6 +62,27 @@ impl Header {
     pub fn root(&self) -> Option<&str> {
         self.get("root")
     }
+
+    /// Set (or insert) the directive named `key` to `value`, preserving the
+    /// position of an existing directive and appending a new one otherwise.
+    /// Used when the user re-points a report (e.g. BIND changes `collection:`).
+    /// Matching is case-insensitive; the stored key is left as-was on update and
+    /// written lowercase for a fresh directive (matching the serializer style).
+    pub fn set(&mut self, key: &str, value: impl Into<String>) {
+        let value = value.into();
+        for line in &mut self.lines {
+            if let HeaderLine::Directive { key: k, value: v } = line
+                && k.eq_ignore_ascii_case(key)
+            {
+                *v = value;
+                return;
+            }
+        }
+        self.lines.push(HeaderLine::Directive {
+            key: key.to_ascii_lowercase(),
+            value,
+        });
+    }
 }
 
 /// One statement in a flow body (or loop body).

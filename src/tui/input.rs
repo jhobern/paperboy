@@ -1557,6 +1557,9 @@ impl TuiApp {
                     PersistedTab::from_collection(c, linked_env_index)
                 })
                 .collect(),
+            // Populated once the TUI holds report tabs (Phase 9); the
+            // persistence round-trip itself is exercised at the model layer.
+            reports: Vec::new(),
             active_tab: self.active_tab,
             last_browse_dir: self
                 .last_browse_dir

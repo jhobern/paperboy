@@ -287,6 +287,46 @@ impl PersistedTab {
     }
 }
 
+/// One persisted report tab (see [`crate::report::Report`]). The `.report`
+/// *source text* is snapshotted (like [`PersistedTab`] snapshots collection
+/// entries) so an unsaved scratch report survives a restart; `path`/`git_origin`
+/// keep "Save" targeting the right place after a restart.
+#[derive(Serialize, Deserialize, Default)]
+pub struct PersistedReport {
+    pub name: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub git_origin: Option<GitOrigin>,
+}
+
+impl PersistedReport {
+    /// Snapshot a report's persistable parts.
+    pub fn from_report(r: &crate::report::Report) -> Self {
+        Self {
+            name: r.name.clone(),
+            text: r.text.clone(),
+            path: r.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            git_origin: r.git_origin.clone(),
+        }
+    }
+
+    /// Rebuild an in-memory report from persisted state. A restored report is
+    /// not marked dirty (it matches what was last saved/persisted).
+    pub fn into_report(self) -> crate::report::Report {
+        crate::report::Report {
+            id: crate::report::report::next_report_id(),
+            name: self.name,
+            text: self.text,
+            path: self.path.map(PathBuf::from),
+            git_origin: self.git_origin,
+            dirty: false,
+        }
+    }
+}
+
 /// The full application state saved between sessions. Environments are stored
 /// in *source* form only (references/literals) so resolved secrets are never
 /// written to disk; they are re-resolved on load.
@@ -298,6 +338,10 @@ pub struct PersistedState {
     pub base_url: String,
     #[serde(default)]
     pub tabs: Vec<PersistedTab>,
+    /// Persisted report tabs (see [`PersistedReport`]). Restored after the
+    /// collection tabs on launch.
+    #[serde(default)]
+    pub reports: Vec<PersistedReport>,
     /// The tab that was active when the app was last closed, so it reopens on
     /// the same tab.
     #[serde(default)]
@@ -379,6 +423,7 @@ impl Default for PersistedState {
             language: Language::default(),
             base_url: String::new(),
             tabs: Vec::new(),
+            reports: Vec::new(),
             active_tab: 0,
             last_browse_dir: None,
             last_env_dir: None,
@@ -431,5 +476,35 @@ pub fn save_state(state: &PersistedState) {
     }
     if let Ok(json) = serde_json::to_string_pretty(state) {
         let _ = fs::write(path, json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_report_round_trips_through_serde_and_back() {
+        let mut r = crate::report::Report::from_text(
+            "nightly",
+            "# name: Nightly\n# collection: c.hurl\nREQUEST Oauth\n",
+        );
+        r.path = Some(PathBuf::from("/tmp/nightly.report"));
+
+        let persisted = PersistedReport::from_report(&r);
+        let json = serde_json::to_string(&persisted).unwrap();
+        let back: PersistedReport = serde_json::from_str(&json).unwrap();
+        let restored = back.into_report();
+
+        assert_eq!(restored.name, "Nightly");
+        assert_eq!(restored.text, r.text);
+        assert_eq!(restored.path, r.path);
+        assert!(!restored.dirty, "a restored report is not dirty");
+    }
+
+    #[test]
+    fn persisted_state_defaults_have_no_reports() {
+        let state = PersistedState::default();
+        assert!(state.reports.is_empty());
     }
 }
