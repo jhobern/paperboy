@@ -11,7 +11,7 @@ license = "MIT"
 [dependencies]
 tui-panel-select = "0.1.4"
 tui-rgb-picker = "0.1"
-tui-line-editor = { version = "0.1.2", path = "../../PaperBoyTUI/paperboy-tui/crates/tui-line-editor" }
+tui-line-editor = "0.1.2"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps JSON object key order when we pretty-print a response
 # body (serde_json otherwise sorts keys). Reports must never silently reorder /

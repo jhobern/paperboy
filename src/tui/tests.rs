@@ -14485,6 +14485,119 @@ fn report_inline_edit_esc_returns_to_shortcuts() {
     );
 }
 
+/// Ctrl+Left / Ctrl+Right move the source editor cursor a word at a time
+/// (rather than jumping to the line ends).
+#[test]
+fn report_editor_ctrl_arrow_moves_one_word() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("REQUEST Oauth Session");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e')); // edit focus; cursor at end (col 21)
+    let end = app.active_report().unwrap().editor.as_ref().unwrap().col;
+    assert_eq!(end, 21, "cursor starts at end of the line");
+
+    // Ctrl+Left steps back one word at a time, not to column 0.
+    app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().editor.as_ref().unwrap().col,
+        14,
+        "Ctrl+Left lands at the start of 'Session'"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().editor.as_ref().unwrap().col,
+        8,
+        "a second Ctrl+Left lands at the start of 'Oauth'"
+    );
+
+    // Ctrl+Right steps forward a word at a time.
+    app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().editor.as_ref().unwrap().col,
+        13,
+        "Ctrl+Right lands at the end of 'Oauth'"
+    );
+}
+
+/// While typing a `REQUEST <name>` line, a ghost suffix from the bound
+/// collection is offered and Right arrow fills it in.
+#[test]
+fn report_editor_ghost_completes_a_request_name() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![
+            HurlEntry {
+                title: "Oauth".to_string(),
+                ..Default::default()
+            },
+            HurlEntry {
+                title: "CreateSession".to_string(),
+                ..Default::default()
+            },
+        ],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oau");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e')); // edit focus; cursor at end of "REQUEST Oau"
+
+    assert_eq!(
+        app.report_request_ghost(idx).as_deref(),
+        Some("th"),
+        "the remainder of the matching request name is offered"
+    );
+
+    // Right arrow accepts the completion.
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("REQUEST Oauth"),
+        "Right arrow fills the ghost in"
+    );
+    // With the name complete, there's no longer a ghost.
+    assert_eq!(app.report_request_ghost(idx), None);
+}
+
+/// The ghost only appears at the end of a `REQUEST`/`REPORT REQUEST` line with
+/// a non-empty, still-unfinished name.
+#[test]
+fn report_editor_ghost_is_scoped_to_request_lines() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+
+    // A non-REQUEST line offers nothing.
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nURL=Oau");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(app.report_request_ghost(idx), None);
+    press(&mut app, KeyCode::Esc);
+
+    // A REPORT REQUEST line does complete.
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oa");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(app.report_request_ghost(idx).as_deref(), Some("uth"));
+}
+
 /// Tab cycling visits report tabs alongside collection tabs (unified index).
 #[test]
 fn cycle_tab_reaches_report_tabs() {
@@ -14497,8 +14610,6 @@ fn cycle_tab_reaches_report_tabs() {
     app.cycle_tab(true); // forward to the report tab again
     assert!(app.active_is_report());
 }
-
-/// Closing a report tab (Ctrl+W) removes it, and `u` reopens it intact.
 #[test]
 fn closing_report_tab_then_reopening_restores_it() {
     let mut app = TuiApp::default();

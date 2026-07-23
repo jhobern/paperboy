@@ -1975,6 +1975,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+R", s.help_report_new),
                             ("e / Enter", s.help_report_edit),
                             ("Esc (report)", s.help_report_leave_edit),
+                            ("Ctrl+←/→ (report)", s.help_report_word_move),
+                            ("→ (report)", s.help_report_complete),
                         ],
                     ),
                     (
@@ -2135,6 +2137,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("Shift+R", s.help_report_new),
                         ("e / Enter", s.help_report_edit),
                         ("Esc", s.help_report_leave_edit),
+                        ("Ctrl+←/→", s.help_report_word_move),
+                        ("→", s.help_report_complete),
                     ],
                 );
                 body.push(Line::raw(""));

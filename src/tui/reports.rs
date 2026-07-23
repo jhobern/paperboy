@@ -259,14 +259,23 @@ impl TuiApp {
 
     /// Key handling while the active report's source panel has edit focus.
     /// Esc leaves edit focus (keeping the typed text — edits are applied live);
-    /// everything else edits the multiline buffer (Enter inserts a newline).
+    /// most keys are delegated to the shared multi-line handler, but two are
+    /// intercepted first: Ctrl+Left/Right move a word at a time (rather than to
+    /// the line ends), and Right accepts a pending `REQUEST`-name completion.
     /// After each edit the buffer is mirrored into `report.text` and the tab is
     /// revalidated so the validation panel stays live.
     fn on_key_report_editing(&mut self, key: KeyEvent, idx: usize) {
-        // Esc is the only key the editor doesn't own here: it leaves edit focus
-        // (keeping the live-applied text). Everything else is delegated to the
-        // shared multi-line key handler, which reports whether the text changed
-        // and any selection the host should copy.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A pending ghost completion (only for a plain Right-arrow accept). This
+        // is computed *before* the `&mut editor` borrow below, since it needs an
+        // immutable borrow of `self` (the bound collection's request names).
+        let ghost = if key.code == KeyCode::Right && !ctrl && !shift {
+            self.report_request_ghost(idx)
+        } else {
+            None
+        };
+
         let mut leave = false;
         let mut copy: Option<String> = None;
         // Apply the keystroke to the editor, then read back the (possibly)
@@ -280,16 +289,41 @@ impl TuiApp {
             let Some(editor) = rt.editor.as_mut() else {
                 return;
             };
-            if key.code == KeyCode::Esc {
-                leave = true;
-                Some(editor.text())
-            } else {
-                let resp = apply_edit_key_full(editor, key);
-                copy = resp.copy;
-                if resp.changed {
+            match key.code {
+                // Esc leaves edit focus (the live-applied text is kept).
+                KeyCode::Esc => {
+                    leave = true;
                     Some(editor.text())
-                } else {
+                }
+                // Ctrl+Left/Right move one word (not to the line ends), keeping
+                // Shift's selection-extend behaviour.
+                KeyCode::Left if ctrl => {
+                    editor.set_selecting(shift);
+                    word_left(editor);
                     None
+                }
+                KeyCode::Right if ctrl => {
+                    editor.set_selecting(shift);
+                    word_right(editor);
+                    None
+                }
+                // Right arrow at end of a `REQUEST` line fills in the ghost.
+                KeyCode::Right if ghost.is_some() => {
+                    editor.clear_selection();
+                    editor.insert_str(ghost.as_deref().unwrap_or_default());
+                    Some(editor.text())
+                }
+                // Everything else goes to the shared multi-line key handler,
+                // which reports whether the text changed and any selection the
+                // host should copy.
+                _ => {
+                    let resp = apply_edit_key_full(editor, key);
+                    copy = resp.copy;
+                    if resp.changed {
+                        Some(editor.text())
+                    } else {
+                        None
+                    }
                 }
             }
         };
@@ -311,6 +345,97 @@ impl TuiApp {
             }
         }
     }
+
+    /// The ghost suffix to offer while typing a `REQUEST <name>` (or
+    /// `REPORT REQUEST <name>`) line in the source editor: the remainder of the
+    /// first request title in the bound collection that the partially-typed
+    /// name is a prefix of. `None` unless the cursor is at the end of such a
+    /// line, a non-empty partial name has been typed, and a longer match exists.
+    /// The report view can't show the collection's request list (it takes the
+    /// whole body), so this keeps request names discoverable and correct.
+    pub(crate) fn report_request_ghost(&self, idx: usize) -> Option<String> {
+        let rt = self.reports.get(idx)?;
+        let editor = rt.editor.as_ref()?;
+        let line = editor.lines.get(editor.row)?;
+        // Only complete when the cursor sits at the very end of the line.
+        if editor.col != line.chars().count() {
+            return None;
+        }
+        let partial = request_name_partial(line)?;
+        let ci = self.resolve_bound_collection(&rt.report)?;
+        self.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.title.as_str())
+            .find(|t| t.len() > partial.len() && t.starts_with(&partial))
+            .map(|t| t[partial.len()..].to_string())
+    }
+}
+
+/// Move the editor cursor left to the start of the previous word: skip any
+/// whitespace immediately to the left, then the run of non-whitespace. At
+/// column 0 this falls back to a plain left move (wrapping to the previous
+/// line), matching a normal cursor.
+fn word_left(ed: &mut Editor) {
+    if ed.col == 0 {
+        ed.left();
+        return;
+    }
+    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
+    let mut c = ed.col;
+    while c > 0 && chars[c - 1].is_whitespace() {
+        c -= 1;
+    }
+    while c > 0 && !chars[c - 1].is_whitespace() {
+        c -= 1;
+    }
+    ed.col = c;
+}
+
+/// Move the editor cursor right past the current/next word: skip any whitespace
+/// under the cursor, then the run of non-whitespace. At the line end this falls
+/// back to a plain right move (wrapping to the next line).
+fn word_right(ed: &mut Editor) {
+    let len = ed.line_len(ed.row);
+    if ed.col >= len {
+        ed.right();
+        return;
+    }
+    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
+    let mut c = ed.col;
+    while c < len && chars[c].is_whitespace() {
+        c += 1;
+    }
+    while c < len && !chars[c].is_whitespace() {
+        c += 1;
+    }
+    ed.col = c;
+}
+
+/// If `s` (ignoring case) starts with the keyword `kw` followed by whitespace,
+/// return the remainder with that leading whitespace trimmed; else `None`.
+fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let head = s.get(..kw.len())?;
+    if head.eq_ignore_ascii_case(kw) {
+        let rest = &s[kw.len()..];
+        if rest.starts_with(char::is_whitespace) {
+            return Some(rest.trim_start());
+        }
+    }
+    None
+}
+
+/// Extract the partially-typed request name from a source line, if it is a
+/// `REQUEST <name>` or `REPORT REQUEST <name>` line whose name is still a single
+/// unfinished token (no trailing whitespace or further arguments).
+fn request_name_partial(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let after_report = strip_keyword(t, "REPORT").unwrap_or(t);
+    let name = strip_keyword(after_report, "REQUEST")?;
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Join a `# collection:` reference against the report's own directory (when the
@@ -416,6 +541,41 @@ fn draw_report_panel(
     }
 }
 
+/// Draw the ghost completion `ghost` as dim text starting at the editor's
+/// cursor, on top of the already-rendered editor. Mirrors the horizontal /
+/// vertical scroll maths [`render_editor_highlighted`] uses so it lands exactly
+/// at the cursor cell (the completion is only offered when the cursor is at the
+/// end of the line, so it reads as the line's continuation).
+fn draw_editor_ghost(f: &mut Frame, area: Rect, ed: &Editor, ghost: &str, th: &Theme) {
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let col_off = ed.col.saturating_sub(w.saturating_sub(1));
+    let row_off = ed.row.saturating_sub(h.saturating_sub(1));
+    let screen_col = ed.col - col_off;
+    let screen_row = ed.row - row_off;
+    let avail = w.saturating_sub(screen_col);
+    if avail == 0 || screen_row >= h {
+        return;
+    }
+    let shown: String = ghost.chars().take(avail).collect();
+    let rect = Rect {
+        x: area.x + screen_col as u16,
+        y: area.y + screen_row as u16,
+        width: shown.chars().count() as u16,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            shown,
+            Style::default().fg(th.dim).add_modifier(Modifier::DIM),
+        ))),
+        rect,
+    );
+}
+
 fn draw_report_binding(
     f: &mut Frame,
     area: Rect,
@@ -477,10 +637,15 @@ fn draw_report_source(
         // keeping the same syntax highlighting as the read view.
         let inner = block.inner(area);
         f.render_widget(block, area);
+        // A pending `REQUEST`-name completion, drawn dim after the cursor.
+        let ghost = app.report_request_ghost(idx);
         if let Some(editor) = app.reports[idx].editor.as_ref() {
             render_editor_highlighted(f, inner, editor, th, |row, line| {
                 super::report_highlight::highlight_row(row, line, error_line, th)
             });
+            if let Some(ghost) = ghost {
+                draw_editor_ghost(f, inner, editor, &ghost, th);
+            }
         }
         return;
     }

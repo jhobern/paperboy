@@ -36,6 +36,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `MultiSelectPanel`s (with a scrollbar) for a consistent feel with the rest of
   the app — scroll the source with the arrow keys (Home/End jump to the
   top/bottom) when it isn't in edit focus.
+- **Report source editor: word-wise cursor movement and request-name
+  completion.** While editing a flow, **Ctrl+←/→** now moves the cursor one word
+  at a time (instead of jumping to the line ends), and typing a `REQUEST`
+  (or `REPORT REQUEST`) name shows a dim inline suggestion of a matching request
+  from the bound collection that **→** fills in — so request names stay correct
+  and discoverable even though the report view can't show the collection list.
 
 
 ## [0.1.6] - 2026-07-18
