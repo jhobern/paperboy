@@ -138,23 +138,17 @@ impl TuiApp {
     /// Set `pane`'s scroll offset to whatever position along its scrollbar
     /// track `row` maps to (clamped to the track's own bounds), so clicking
     /// or dragging anywhere in the track jumps/scrolls proportionally —
-    /// mirroring how a native scrollbar behaves.
+    /// mirroring how a native scrollbar behaves. The proportional mapping now
+    /// lives in `tui-panel-select` (`MultiSelectPanel::scroll_to_track_row`),
+    /// which derives the scrollable extent from the track height itself.
     fn set_scroll_for_row(&mut self, pane: Pane, row: u16) {
-        let (area, max_scroll) = match pane {
-            Pane::Main => (self.main_scrollbar_area, self.main_max_scroll),
-            Pane::Response => (self.resp_scrollbar_area, self.resp_max_scroll),
+        let area = match pane {
+            Pane::Main => self.main_scrollbar_area,
+            Pane::Response => self.resp_scrollbar_area,
             _ => return,
         };
-        if area.height == 0 || max_scroll == 0 {
-            return;
-        }
-        let track = area.height.saturating_sub(1).max(1) as f64;
-        let rel = row
-            .saturating_sub(area.y)
-            .min(area.height.saturating_sub(1)) as f64;
-        let scroll = ((rel / track) * max_scroll as f64).round() as u16;
         if let Some(panel) = self.panel_mut(pane) {
-            panel.set_scroll(scroll.min(max_scroll));
+            panel.scroll_to_track_row(area, row);
         }
     }
 

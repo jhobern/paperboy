@@ -4,10 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::hurl::{FormFieldKind, METHODS};
 use crate::i18n::Strings;
@@ -2028,7 +2025,11 @@ pub(crate) fn scroll_window(
 
 /// Render a vertical scrollbar in `area` (expected to be a single-column
 /// strip) reflecting how much of a `total`-item, `capacity`-visible list is
-/// currently scrolled past `start`. No-op when everything already fits.
+/// currently scrolled past `start`. No-op when everything already fits. The
+/// actual thumb geometry and drawing live in `tui-panel-select`
+/// (`render_scrollbar`); this only supplies PaperBoy's theme colours and the
+/// `Frame`'s buffer, so the wizard tables and the body panels share one
+/// implementation.
 pub(crate) fn draw_scrollbar(
     f: &mut Frame,
     area: Rect,
@@ -2037,18 +2038,12 @@ pub(crate) fn draw_scrollbar(
     start: usize,
     th: &Theme,
 ) {
-    if area.width == 0 || area.height == 0 || total <= capacity {
-        return;
-    }
-    let mut state = ScrollbarState::new(total - capacity).position(start);
-    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .track_symbol(Some("\u{2502}"))
-        .thumb_symbol("\u{2588}")
-        .style(Style::default().fg(th.dim))
-        .thumb_style(Style::default().fg(th.accent));
-    f.render_stateful_widget(bar, area, &mut state);
+    let style = tui_panel_select::ScrollbarStyle {
+        track_style: Style::default().fg(th.dim),
+        thumb_style: Style::default().fg(th.accent),
+        ..tui_panel_select::ScrollbarStyle::default()
+    };
+    tui_panel_select::render_scrollbar(area, f.buffer_mut(), total, capacity, start, &style);
 }
 
 /// Lay out a scrollable table's rows so that the trailing "Add ..." hint row

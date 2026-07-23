@@ -56,6 +56,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 - **The clipped-cell truncation ellipsis moved into `tui-line-editor`** (as a
   reusable `TruncationMarker` / `render_clipped_line`), so PaperBoy's wizard
   cells render it through the shared crate rather than a local copy.
+- **The vertical scrollbar's row↔scroll mapping and thumb rendering moved into
+  `tui-panel-select` 0.1.4** (behind its default-on `scrollbar` feature). The
+  wizard tables and the Request/Response body panels now share the crate's
+  `render_scrollbar`, and mouse clicks on a body-panel scrollbar map to a scroll
+  position through `MultiSelectPanel::scroll_to_track_row`, replacing PaperBoy's
+  local scrollbar math. No user-facing behaviour change.
 
 
 ## [0.1.5] - 2026-07-16

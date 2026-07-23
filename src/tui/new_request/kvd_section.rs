@@ -12,7 +12,7 @@
 //! kind-dependent column visibility, cross-row column retargeting and three
 //! dropdowns, so folding it in would trade the duplication for a thicket of
 //! conditionals. The generic table *drawing* stays next to the other sections'
-//! drawing in `new_request.rs` (it reuses table helpers shared with Form /
+//! drawing in `wizard.rs` (it reuses table helpers shared with Form /
 //! Asserts / Captures); this module is the data model and input handling.
 
 use std::cell::Cell;
@@ -24,7 +24,7 @@ use ratatui::crossterm::event::KeyEvent;
 use crate::i18n::Strings;
 
 use super::super::editor::Editor;
-use super::new_request::{NewField, NewReq, WizardTab};
+use super::wizard::{NewField, NewReq, WizardTab};
 
 /// Which of the three identical `Enabled/Key/Value/Description` sections a
 /// field or row belongs to. Carried inside [`NewField::Kvd`] /
