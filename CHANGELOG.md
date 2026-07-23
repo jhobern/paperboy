@@ -27,6 +27,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Truncation ellipsis is placed correctly for multi-byte text.** The dim `…`
+  shown at the end of a clipped, unfocused wizard cell (Header/Cookie/Query/Form)
+  is now positioned by character width rather than byte length, so cells
+  containing non-ASCII text no longer mark themselves as truncated too early.
 - **The "Target collection" selector in the New Request wizard cycles again.**
   `←`/`→` (or `h`/`l`) once more move the new request between collections
   instead of doing nothing.

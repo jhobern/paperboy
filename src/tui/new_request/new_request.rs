@@ -2178,7 +2178,7 @@ pub(crate) fn draw_header_cell(f: &mut Frame, area: Rect, ed: &Editor, focused: 
     if focused {
         render_editor(f, area, ed, false, th);
     } else {
-        render_clippable_line(f, ed.text(), area, th.text, th);
+        render_clipped_line(f, area, &ed.text(), th.text, th);
     }
 }
 
@@ -2427,30 +2427,6 @@ fn form_value_color(row: &FormRow, file_root: Option<&PathBuf>, th: &Theme) -> C
     if resolved.is_file() { th.ok } else { th.err }
 }
 
-fn render_clippable_line(
-    frame: &mut Frame,
-    text: String,
-    text_rect: Rect,
-    color: Color,
-    theme: &Theme,
-) {
-    let width = text_rect.width.into();
-    let clipped = text.len() > width;
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(color)),
-        text_rect,
-    );
-    if clipped {
-        let ellipsis = "\u{2026}";
-        let mut last_character_position = text_rect;
-        last_character_position.x += width as u16 - 1;
-        frame.render_widget(
-            Paragraph::new(ellipsis).style(Style::default().fg(theme.dim)),
-            last_character_position,
-        );
-    }
-}
-
 /// Draw the `[Form]`/`[Multipart]` table: Enabled/Key/Type/Value/Content-Type/
 /// Description columns (Type comes before Value so filling a row naturally
 /// picks Text/File before typing/choosing the value). The Type column opens
@@ -2581,7 +2557,7 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             render_editor(f, text_rect, &row.value, false, th);
         } else {
             let color = form_value_color(row, form.file_root.as_ref(), th);
-            render_clippable_line(f, row.value.text(), text_rect, color, th);
+            render_clipped_line(f, text_rect, &row.value.text(), color, th);
         }
         if let Some(icon_rect) = file_icon_rect {
             let icon_color = if value_focused { th.accent } else { th.dim };

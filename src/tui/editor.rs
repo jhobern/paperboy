@@ -7,7 +7,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use super::theme::*;
-use tui_line_editor::EditorTheme;
+use ratatui::style::{Color, Style};
+use tui_line_editor::{EditorTheme, TruncationMarker};
 
 pub(crate) use tui_line_editor::{Editor, apply_edit_key};
 
@@ -38,4 +39,18 @@ pub(crate) fn render_line_field(
     th: &Theme,
 ) {
     tui_line_editor::render_line_field(f, area, ed, &editor_theme(th), focused, mask);
+}
+
+/// Render a read-only single line of `text` into `area` in `color`, drawing a
+/// dim ellipsis (`…`) in the last column when the text is too wide to fit — so
+/// truncated, unfocused cells still read as "there is more here" rather than
+/// looking complete. Used for the wizard's unfocused Header/Cookie/Query/Form
+/// cells, where the colour is chosen by the caller (e.g. a file-validity
+/// highlight) rather than by focus state.
+pub(crate) fn render_clipped_line(f: &mut Frame, area: Rect, text: &str, color: Color, th: &Theme) {
+    let marker = TruncationMarker {
+        glyph: '\u{2026}',
+        style: Style::default().fg(th.dim),
+    };
+    tui_line_editor::render_clipped_line(f, area, text, color, Some(marker));
 }
