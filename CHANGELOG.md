@@ -17,12 +17,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   tabs but takes the whole body (no list / environment / response panels, so it
   fits small screens). Each report holds a PaperTrail flow (`.report` source)
   that will drive a bound collection against ranges of files/environments to
-  produce a tabular report. This first slice adds the tab itself: a read-only
-  view of the flow source with its live validation (bound-collection status,
-  parse errors, and per-statement diagnostics), an **`e`** modal source editor
-  (F2 / Ctrl+S to save, Esc to cancel), and persistence of report tabs (source
-  text is snapshotted so an unsaved scratch report survives a restart). Running
-  a report, CSV export, and binding a collection follow in later updates.
+  produce a tabular report. This first slice adds the tab itself: a view of the
+  flow source with its live validation (bound-collection status, parse errors,
+  and per-statement diagnostics). The source is edited **inline** — press
+  **`e`**/Enter to give the source panel edit focus and type directly into it
+  (edits apply live; Esc returns to navigation mode where single letters are
+  shortcuts again), mirroring the request wizard's text cells. Report tabs are
+  persisted (source text is snapshotted so an unsaved scratch report survives a
+  restart), and the Help (**`?`**) overlay gains a **Reports** tab explaining
+  what a report is, the report shortcuts, and the flow language. Running a
+  report, CSV export, and binding a collection follow in later updates.
 
 
 ## [0.1.6] - 2026-07-18
