@@ -742,7 +742,7 @@ mod tests {
             ("status".to_string(), "jsonpath \"$.status\"".to_string()),
             (
                 "overall".to_string(),
-                "jsonpath \"$.dfa_overall_result\"".to_string(),
+                "jsonpath \"$.overall_result\"".to_string(),
             ),
         ];
 

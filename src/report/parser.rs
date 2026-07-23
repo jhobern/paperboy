@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn minimal_flow_parses_and_round_trips() {
         let flow = assert_round_trips(
-            "# name: Smoke\n# collection: ./c.hurl\n\nURL=some.url:8080/dfa\nREQUEST Oauth\nREPORT REQUEST process_file\n",
+            "# name: Smoke\n# collection: ./c.hurl\n\nURL=some.url:8080/api\nREQUEST Oauth\nREPORT REQUEST process_file\n",
         );
         assert_eq!(flow.header.collection(), Some("./c.hurl"));
         assert_eq!(flow.header.name(), Some("Smoke"));
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn files_loop_with_match_glob() {
         let flow = assert_round_trips(
-            "FOR FILE IN FILES \"DFA/Real\" MATCH \"*.jpg\"\n    REPORT REQUEST up\nEND\n",
+            "FOR FILE IN FILES \"images/real\" MATCH \"*.jpg\"\n    REPORT REQUEST up\nEND\n",
         );
         match &flow.nodes[0] {
             FlowNode::ForEach {
@@ -1030,7 +1030,7 @@ mod tests {
                 assert_eq!(
                     producer,
                     &Producer::Files {
-                        dir: "DFA/Real".into(),
+                        dir: "images/real".into(),
                         glob: Some("*.jpg".into())
                     }
                 );
@@ -1134,7 +1134,7 @@ mod tests {
     fn report_forms_round_trip() {
         // AS alias + RESPONSE + WITH block
         let flow = assert_round_trips(
-            "FOR FILE IN FILES \"d\"\n    REPORT REQUEST process AS proc RESPONSE RAW WITH\n        RESPONSE PRETTY\n        overall: jsonpath \"$.dfa_overall_result\"\n    END\n    REPORT (FILE)\n    REPORT \"run {{URL}}\" AS note\nEND\n",
+            "FOR FILE IN FILES \"d\"\n    REPORT REQUEST process AS proc RESPONSE RAW WITH\n        RESPONSE PRETTY\n        overall: jsonpath \"$.overall_result\"\n    END\n    REPORT (FILE)\n    REPORT \"run {{URL}}\" AS note\nEND\n",
         );
         if let FlowNode::ForEach { body, .. } = &flow.nodes[0] {
             match &body[0] {

@@ -14450,12 +14450,12 @@ fn drawing_a_report_tab_does_not_panic() {
     let mut app = TuiApp::default();
     // A bound collection so the binding panel exercises the "bound" branch too.
     app.collections
-        .push(Collection::new("dfa".to_string(), Vec::new()));
+        .push(Collection::new("api".to_string(), Vec::new()));
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
     app.reports[idx]
         .report
-        .set_text("# name: Nightly\n# collection: dfa\nREQUEST Oauth\n");
+        .set_text("# name: Nightly\n# collection: api\nREQUEST Oauth\n");
     app.revalidate_report(idx);
 
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();

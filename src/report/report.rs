@@ -179,10 +179,10 @@ mod tests {
 
     #[test]
     fn name_and_collection_come_from_the_header() {
-        let text = "# name: Nightly DFA\n# collection: ./dfa.hurl\n\nREQUEST Oauth\n";
+        let text = "# name: Nightly Smoke\n# collection: ./smoke.hurl\n\nREQUEST Oauth\n";
         let r = Report::from_text("fallback", text);
-        assert_eq!(r.name, "Nightly DFA");
-        assert_eq!(r.collection_ref(), Some("./dfa.hurl".to_string()));
+        assert_eq!(r.name, "Nightly Smoke");
+        assert_eq!(r.collection_ref(), Some("./smoke.hurl".to_string()));
     }
 
     #[test]
