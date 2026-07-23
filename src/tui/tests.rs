@@ -3523,8 +3523,14 @@ fn help_popup_opens_on_the_shortcuts_tab_and_tab_key_switches_to_glossary() {
 
     press(&mut app, KeyCode::Tab);
     assert!(
+        matches!(app.overlay, Some(Overlay::Help(2))),
+        "Tab from Glossary switches to the Reports tab"
+    );
+
+    press(&mut app, KeyCode::Tab);
+    assert!(
         matches!(app.overlay, Some(Overlay::Help(0))),
-        "Tab from Glossary wraps back to Shortcuts"
+        "Tab from Reports wraps back to Shortcuts"
     );
 
     press(&mut app, KeyCode::Right);
@@ -3536,6 +3542,12 @@ fn help_popup_opens_on_the_shortcuts_tab_and_tab_key_switches_to_glossary() {
     assert!(
         matches!(app.overlay, Some(Overlay::Help(0))),
         "Left arrow switches back"
+    );
+    // Left from Shortcuts wraps around to the Reports tab (3-tab cycle).
+    press(&mut app, KeyCode::Left);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help(2))),
+        "Left from Shortcuts wraps to Reports"
     );
 }
 
@@ -3691,7 +3703,7 @@ fn help_popup_shows_both_tab_names_regardless_of_which_is_active() {
     let th = super::theme::theme(&Language::English);
     let s = Strings::for_language(&Language::English);
 
-    for tab in [0, 1] {
+    for tab in [0, 1, 2] {
         let mut app = TuiApp {
             overlay: Some(Overlay::Help(tab)),
             ..Default::default()
@@ -3707,6 +3719,10 @@ fn help_popup_shows_both_tab_names_regardless_of_which_is_active() {
         assert!(
             text.contains(s.help_tab_glossary),
             "Glossary tab label visible while on tab {tab}"
+        );
+        assert!(
+            text.contains(s.help_tab_reports),
+            "Reports tab label visible while on tab {tab}"
         );
     }
 }
@@ -3727,7 +3743,7 @@ fn help_popup_stays_the_same_height_on_both_tabs() {
             overlay: Some(Overlay::Help(tab)),
             ..Default::default()
         };
-        let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 80)).unwrap();
         term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
             .unwrap();
         let text = buffer_text(term.backend().buffer());
@@ -3747,6 +3763,11 @@ fn help_popup_stays_the_same_height_on_both_tabs() {
         box_height(1),
         "the popup keeps one fixed height across both tabs"
     );
+    assert_eq!(
+        box_height(1),
+        box_height(2),
+        "the Reports tab shares that same fixed height too"
+    );
 }
 
 #[test]
@@ -3764,7 +3785,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         overlay: Some(Overlay::Help(0)),
         ..Default::default()
     };
-    let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 80)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
@@ -3776,6 +3797,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_group_menus,
         s.help_group_environments,
         s.help_group_editing,
+        s.help_group_reports,
         s.help_group_panels,
     ] {
         assert!(
@@ -3813,6 +3835,9 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_resize,
         s.help_resize_width,
         s.help_save_editor,
+        s.help_report_new,
+        s.help_report_edit,
+        s.help_report_leave_edit,
         s.help_cancel,
         s.help_quit,
     ] {
@@ -3828,6 +3853,37 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         text.contains("copy the selection"),
         "the copy-selection shortcut description still appears (possibly wrapped)"
     );
+}
+
+#[test]
+fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
+    // The third Help tab documents the Reports feature: a "what is a
+    // report" blurb, the report-specific shortcuts, and a compact
+    // summary of the flow language.
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp {
+        overlay: Some(Overlay::Help(2)),
+        ..Default::default()
+    };
+    let mut term = Terminal::new(TestBackend::new(120, 80)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    for expected in [
+        s.help_reports_about_heading,
+        s.help_reports_shortcuts_heading,
+        s.help_reports_grammar_heading,
+        s.help_grammar_collection,
+        s.help_grammar_assign,
+    ] {
+        assert!(
+            text.contains(expected),
+            "the Reports help tab shows {expected:?}"
+        );
+    }
 }
 
 #[test]

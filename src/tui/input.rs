@@ -2305,13 +2305,15 @@ impl TuiApp {
     }
 
     fn help_key_handler(&mut self, key: KeyEvent, tab: usize) {
+        // Three tabs: 0 = Shortcuts, 1 = Glossary, 2 = Reports.
+        const HELP_TABS: usize = 3;
         match key.code {
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.overlay = Some(Overlay::Help(1 - tab));
+                self.overlay = Some(Overlay::Help((tab + 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.overlay = Some(Overlay::Help(1 - tab));
+                self.overlay = Some(Overlay::Help((tab + HELP_TABS - 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
             // Scroll the body instead of closing the popup — on a small

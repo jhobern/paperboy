@@ -1861,6 +1861,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             Style::default().fg(th.dim)
                         },
                     ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!(" {} ", s.help_tab_reports),
+                        if active == 2 {
+                            Style::default()
+                                .bg(th.accent)
+                                .fg(th.bg)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th.dim)
+                        },
+                    ),
                     Span::raw("   "),
                     Span::styled(s.help_tab_switch_hint, Style::default().fg(th.dim)),
                 ])
@@ -1871,7 +1883,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // Glossary tab's two-heading layout) instead of one long
                 // flat list — new users found the un-grouped list hard to
                 // scan for the shortcut they needed.
-                let groups: [(&str, &[(&str, &str)]); 7] = [
+                let groups: [(&str, &[(&str, &str)]); 8] = [
                     (
                         s.help_group_navigation,
                         &[
@@ -1941,6 +1953,14 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("y", s.help_copy_selection),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
+                        ],
+                    ),
+                    (
+                        s.help_group_reports,
+                        &[
+                            ("Shift+R", s.help_report_new),
+                            ("e / Enter", s.help_report_edit),
+                            ("Esc (report)", s.help_report_leave_edit),
                         ],
                     ),
                     (
@@ -2065,6 +2085,48 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 body
             };
 
+            let reports_body = || {
+                let mut body = vec![help_section_divider(
+                    s.help_reports_about_heading,
+                    inner_w,
+                    th,
+                )];
+                for para in [s.help_reports_about_1, s.help_reports_about_2] {
+                    body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
+                    body.push(Line::raw(""));
+                }
+                body.push(help_section_divider(
+                    s.help_reports_shortcuts_heading,
+                    inner_w,
+                    th,
+                ));
+                for (key, desc) in [
+                    ("Shift+R", s.help_report_new),
+                    ("e / Enter", s.help_report_edit),
+                    ("Esc", s.help_report_leave_edit),
+                ] {
+                    body.extend(help_entry_lines(key, desc, inner_w));
+                }
+                body.push(Line::raw(""));
+                body.push(help_section_divider(
+                    s.help_reports_grammar_heading,
+                    inner_w,
+                    th,
+                ));
+                for (code, desc) in [
+                    ("# collection: <path>", s.help_grammar_collection),
+                    ("KEY=value", s.help_grammar_assign),
+                    ("REQUEST <name>", s.help_grammar_request),
+                    ("REPORT REQUEST <name> [AS <col>]", s.help_grammar_report),
+                    ("FOR v IN FILES \"dir\" … END", s.help_grammar_for_files),
+                    ("FOR v IN ENVS … END", s.help_grammar_for_envs),
+                    ("PARALLEL FOR …", s.help_grammar_parallel),
+                ] {
+                    body.extend(help_entry_lines(code, desc, inner_w));
+                }
+                body
+            };
+
             let mut lines = vec![
                 Line::styled(
                     s.help_heading,
@@ -2072,36 +2134,35 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 ),
                 tab_bar(*tab),
             ];
-            lines.extend(if *tab == 0 {
-                shortcuts_body()
-            } else {
-                glossary_body()
+            lines.extend(match *tab {
+                0 => shortcuts_body(),
+                1 => glossary_body(),
+                _ => reports_body(),
             });
 
-            // Both tabs share one fixed height (the taller of the two,
-            // measured with the *other* tab's body too) so switching tabs
-            // doesn't resize the popup out from under the user — a stable
-            // box makes the tab strip read as one steady window rather than
-            // a jarring resize on every switch. `centered_rect` further caps
-            // this to the terminal's own height on small terminals, in which
-            // case the body is scrolled (Up/Down) with a scrollbar on the
-            // right border rather than clipping off the bottom silently.
-            let other_len = 2 + if *tab == 0 {
-                glossary_body().len()
-            } else {
-                shortcuts_body().len()
-            };
-            let content_len = lines.len().max(other_len);
+            // All three tabs share one fixed height (the tallest body) so
+            // switching tabs doesn't resize the popup out from under the user
+            // — a stable box makes the tab strip read as one steady window
+            // rather than a jarring resize on every switch. `centered_rect`
+            // further caps this to the terminal's own height on small
+            // terminals, in which case the body is scrolled (Up/Down) with a
+            // scrollbar on the right border rather than clipping off the
+            // bottom silently.
+            let content_len = lines
+                .len()
+                .max(2 + shortcuts_body().len())
+                .max(2 + glossary_body().len())
+                .max(2 + reports_body().len());
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
             let title = format!(
                 "{} — {}",
                 s.help_title,
-                if *tab == 0 {
-                    s.help_tab_shortcuts
-                } else {
-                    s.help_tab_glossary
+                match *tab {
+                    0 => s.help_tab_shortcuts,
+                    1 => s.help_tab_glossary,
+                    _ => s.help_tab_reports,
                 }
             );
             let visible_rows = area.height.saturating_sub(2) as usize;
