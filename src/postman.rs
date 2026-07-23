@@ -295,11 +295,14 @@ mod tests {
         assert_eq!(e[0].url, "{{url}}/login?next=1");
         assert_eq!(
             e[0].headers,
-            vec![(
-                "Content-Type".to_string(),
-                "application/json".to_string(),
-                true
-            )]
+            vec![
+                (
+                    "Content-Type".to_string(),
+                    "application/json".to_string(),
+                    true
+                ),
+                ("X-Off".to_string(), "no".to_string(), false),
+            ]
         );
         assert_eq!(e[0].body.as_deref(), Some("{\"u\":\"a\"}"));
 

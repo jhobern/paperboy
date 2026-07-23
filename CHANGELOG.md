@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.1.6] - 2026-07-18
+
+### Added
+
+- **Query parameters section in the request editor** — the New Request wizard
+  gains a `[Query]` section alongside Headers and Cookies, with the same
+  enabled checkbox / key / value / description columns and the same navigation
+  shortcuts.
+- **Disabled request rows now survive a save to disk.** A disabled Header,
+  Cookie, Query or Form row is written to the `.hurl` file as a commented
+  `# key: value` line instead of being dropped, so its enabled/disabled state
+  is no longer lost when a collection is saved and reloaded. On load, a
+  commented line that still looks like a real request row is read back as a
+  disabled entry (ordinary prose comments are left untouched), and the Raw Hurl
+  view shows disabled rows as those comments so you can see exactly what will be
+  saved and sent.
+
+### Fixed
+
+- **The "Target collection" selector in the New Request wizard cycles again.**
+  `←`/`→` (or `h`/`l`) once more move the new request between collections
+  instead of doing nothing.
+- **Form-row arrow keys reach the enabled checkbox and skip inert cells.**
+  `←`/`→` now step onto a Form row's leading enabled checkbox, and skip the
+  Content-Type cell on a Base64 File row (where it doesn't apply) rather than
+  stopping on it.
+
+
 ## [0.1.5] - 2026-07-16
 
 ### Fixed

@@ -171,6 +171,45 @@ pub fn subst_display(text: &str, map: &HashMap<String, SubstInfo>) -> String {
     out
 }
 
+/// A header/cookie/query-param value together with its enabled flag, as it
+/// appears in the Raw JSON editor. An **enabled** entry serializes as a bare
+/// scalar (`"X-Foo": "bar"`) so the common case stays clean and hand-editable;
+/// a **disabled** entry serializes as a `[value, false]` pair so the flag
+/// survives a round trip through the editor. On parse it tolerates either
+/// shape: any bare scalar (string, number, bool, null) is treated as enabled,
+/// while a `[value, enabled?]` array carries an explicit flag (defaulting to
+/// enabled when the flag is omitted).
+#[derive(Clone)]
+struct KvValue {
+    value: String,
+    enabled: bool,
+}
+
+impl serde::Serialize for KvValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.enabled {
+            s.serialize_str(&self.value)
+        } else {
+            (&self.value, self.enabled).serialize(s)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KvValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Array(arr) => KvValue {
+                value: arr.first().map(value_as_text).unwrap_or_default(),
+                enabled: arr.get(1).and_then(Value::as_bool).unwrap_or(true),
+            },
+            other => KvValue {
+                value: value_as_text(&other),
+                enabled: true,
+            },
+        })
+    }
+}
+
 /// A header/cookie/query-param/basic-auth value. Serializes as a JSON string;
 /// on parse it tolerantly coerces any hand-edited scalar (number, bool, null)
 /// to text.
@@ -234,8 +273,16 @@ struct FormFieldJson {
     kind: FormKind,
     #[serde(default)]
     value: TextValue,
-    #[serde(default)]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl From<&FormField> for FormFieldJson {
@@ -293,37 +340,36 @@ struct RequestJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body: Option<Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    cookies: BTreeMap<String, (TextValue, bool)>,
+    cookies: BTreeMap<String, KvValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     form_fields: Vec<FormFieldJson>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    headers: BTreeMap<String, (TextValue, bool)>,
+    headers: BTreeMap<String, KvValue>,
     method: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query_params: BTreeMap<String, (TextValue, bool)>,
+    query_params: BTreeMap<String, KvValue>,
     url: String,
 }
 
-fn triples_to_map(triples: &[(String, String, bool)]) -> BTreeMap<String, (TextValue, bool)> {
+fn triples_to_map(triples: &[(String, String, bool)]) -> BTreeMap<String, KvValue> {
     triples
         .iter()
-        .map(|(k, v, e)| (k.clone(), (TextValue(v.clone()), *e)))
+        .map(|(k, v, e)| {
+            (
+                k.clone(),
+                KvValue {
+                    value: v.clone(),
+                    enabled: *e,
+                },
+            )
+        })
         .collect()
 }
 
-fn pairs_to_map(pairs: &[(String, String)]) -> BTreeMap<String, TextValue> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.clone(), TextValue(v.clone())))
+fn map_to_triples(map: BTreeMap<String, KvValue>) -> Vec<(String, String, bool)> {
+    map.into_iter()
+        .map(|(k, kv)| (k, kv.value, kv.enabled))
         .collect()
-}
-
-fn map_to_pairs(map: BTreeMap<String, TextValue>) -> Vec<(String, String)> {
-    map.into_iter().map(|(k, v)| (k, v.0)).collect()
-}
-
-fn map_to_triples(map: BTreeMap<String, (TextValue, bool)>) -> Vec<(String, String, bool)> {
-    map.into_iter().map(|(k, (v, e))| (k, v.0, e)).collect()
 }
 
 /// Pretty-printed JSON of the request in its RAW, editable form: `{{ VAR }}`

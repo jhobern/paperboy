@@ -1264,10 +1264,15 @@ impl TuiApp {
                     Some(crate::tree::Row::Up) => self.list_folder_up(ci),
                     Some(crate::tree::Row::Folder(name)) => self.list_folder_down(ci, name.clone()),
                     Some(crate::tree::Row::Entry(_)) => {
+                        // Entering a request focuses the panel showing it and
+                        // opens the edit wizard (same as pressing Enter again
+                        // once focused on the Main panel).
+                        self.focus = Pane::Main;
                         self.open_edit_request_wizard(ci);
                     }
-                    // An empty list (no folders, no requests): do nothing
-                    None => {}
+                    // An empty list (no folders, no requests): nothing to
+                    // edit, but focus still moves onto the request panel.
+                    None => self.focus = Pane::Main,
                 }
             }
             Pane::GlobalEnv => {
@@ -3136,91 +3141,6 @@ impl TuiApp {
     }
 
     fn new_request_key_handler(&mut self, key: KeyEvent, mut form: Box<NewReq>) {
-        fn handle_input_headerlike_table(
-            mut form: Box<NewReq>,
-            row: &mut [HeaderRow],
-            (i, col): (usize, HdrCol),
-            key: &KeyEvent,
-            new_focus: fn(usize, HdrCol) -> NewField,
-            up_destination: NewField,
-            down_destination: NewField,
-        ) {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Up => {
-                    // Move up a row, or leave the table upward to the
-                    // given `up_destination` when already on the first row.
-                    form.focus = if i > 0 {
-                        new_focus(i - 1, col)
-                    } else {
-                        up_destination
-                    };
-                }
-                KeyCode::Down => {
-                    // Move down a row, or leave the table downward to
-                    // the given `down_destination` when on the last row.
-                    form.focus = if i + 1 < row.len() {
-                        new_focus(i + 1, col)
-                    } else {
-                        down_destination
-                    };
-                }
-                KeyCode::Left => {
-                    let at_start = row[i].cell_mut(col).map(|ed| ed.col == 0).unwrap_or(true);
-                    if !at_start {
-                        if let Some(ed) = row[i].cell_mut(col) {
-                            if ctrl {
-                                ed.home()
-                            } else {
-                                ed.left();
-                            }
-                        }
-                    } else if let Some(prev) = form.prev_col(col) {
-                        if let Some(ed) = row[i].cell_mut(prev) {
-                            ed.end();
-                        }
-                        form.focus = new_focus(i, prev);
-                    }
-                }
-                KeyCode::Right => {
-                    let at_end = row[i]
-                        .cell_mut(col)
-                        .map(|ed| ed.col >= ed.line_len(ed.row))
-                        .unwrap_or(true);
-                    if !at_end {
-                        if let Some(ed) = row[i].cell_mut(col) {
-                            if ctrl {
-                                ed.end();
-                            } else {
-                                ed.right();
-                            }
-                        }
-                    } else if let Some(next) = form.next_col(col) {
-                        if let Some(ed) = row[i].cell_mut(next) {
-                            ed.home();
-                        }
-                        form.focus = new_focus(i, next);
-                    }
-                }
-                KeyCode::Enter => form.focus_next(true, true),
-                KeyCode::Char(' ') if col == HdrCol::Enabled => {
-                    if let Some(row) = row.get_mut(i) {
-                        row.enabled = !row.enabled;
-                    }
-                }
-                _ => {
-                    if let Some(ed) = row[i].cell_mut(col) {
-                        match key.code {
-                            KeyCode::Char(ch) => ed.insert(ch),
-                            KeyCode::Backspace => ed.backspace(),
-                            KeyCode::Home => ed.home(),
-                            KeyCode::End => ed.end(),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
         let prev_focus = form.focus;
@@ -3489,265 +3409,27 @@ impl TuiApp {
                 },
                 NewField::Target => match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
-                        form.focus_next(false, false);
+                        let n = form.target_names.len().max(1);
+                        form.target_idx = (form.target_idx + n - 1) % n;
                     }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-                        form.focus_next(true, false);
+                        let n = form.target_names.len().max(1);
+                        form.target_idx = (form.target_idx + 1) % n;
                     }
                     KeyCode::Down => form.focus_next(true, true),
                     KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
-                NewField::AddHeader => match key.code {
+                NewField::AddKvd(kind) => match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') => {
-                        form.headers.push(HeaderRow::new());
-                        form.focus = NewField::Header(form.headers.len() - 1, HdrCol::Key);
+                        form.kvd_mut(kind).push(HeaderRow::new());
+                        form.focus = kind.field(form.kvd(kind).len() - 1, HdrCol::Key);
                     }
                     KeyCode::Down => form.focus_next(true, true),
                     KeyCode::Up => form.focus_next(false, true),
                     _ => {}
                 },
-                NewField::Header(i, col) => match key.code {
-                    KeyCode::Up => {
-                        // Move up a row, or leave the table upward to the
-                        // URL section when already on the first row.
-                        form.focus = if i > 0 {
-                            NewField::Header(i - 1, col)
-                        } else {
-                            NewField::Url
-                        };
-                    }
-                    KeyCode::Down => {
-                        // Move down a row, or leave the table downward to
-                        // the "Add header" section when on the last row.
-                        form.focus = if i + 1 < form.headers.len() {
-                            NewField::Header(i + 1, col)
-                        } else {
-                            NewField::AddHeader
-                        };
-                    }
-                    KeyCode::Left => {
-                        let at_start = form.headers[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col == 0)
-                            .unwrap_or(true);
-                        if !at_start {
-                            if let Some(ed) = form.headers[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.home()
-                                } else {
-                                    ed.left();
-                                }
-                            }
-                        } else if let Some(prev) = form.prev_col(col) {
-                            if let Some(ed) = form.headers[i].cell_mut(prev) {
-                                ed.end();
-                            }
-                            form.focus = NewField::Header(i, prev);
-                        }
-                    }
-                    KeyCode::Right => {
-                        let at_end = form.headers[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col >= ed.line_len(ed.row))
-                            .unwrap_or(true);
-                        if !at_end {
-                            if let Some(ed) = form.headers[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.end();
-                                } else {
-                                    ed.right();
-                                }
-                            }
-                        } else if let Some(next) = form.next_col(col) {
-                            if let Some(ed) = form.headers[i].cell_mut(next) {
-                                ed.home();
-                            }
-                            form.focus = NewField::Header(i, next);
-                        }
-                    }
-                    KeyCode::Enter => form.focus_next(true, true),
-                    KeyCode::Char(' ') if col == HdrCol::Enabled => {
-                        if let Some(row) = form.headers.get_mut(i) {
-                            row.enabled = !row.enabled;
-                        }
-                    }
-                    _ => {
-                        if let Some(ed) = form.headers[i].cell_mut(col) {
-                            match key.code {
-                                KeyCode::Char(ch) => ed.insert(ch),
-                                KeyCode::Backspace => ed.backspace(),
-                                KeyCode::Home => ed.home(),
-                                KeyCode::End => ed.end(),
-                                _ => {}
-                            }
-                        }
-                    }
-                },
-                NewField::AddCookie => match key.code {
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        form.cookies.push(HeaderRow::new());
-                        form.focus = NewField::Cookie(form.cookies.len() - 1, HdrCol::Key);
-                    }
-                    KeyCode::Down => form.focus_next(true, true),
-                    KeyCode::Up => form.focus_next(false, true),
-                    _ => {}
-                },
-                NewField::Cookie(i, col) => match key.code {
-                    KeyCode::Up => {
-                        form.focus = if i > 0 {
-                            NewField::Cookie(i - 1, col)
-                        } else {
-                            form.up_into_headers()
-                        };
-                    }
-                    KeyCode::Down => {
-                        form.focus = if i + 1 < form.cookies.len() {
-                            NewField::Cookie(i + 1, col)
-                        } else {
-                            NewField::AddCookie
-                        };
-                    }
-                    KeyCode::Left => {
-                        let at_start = form.cookies[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col == 0)
-                            .unwrap_or(true);
-                        if !at_start {
-                            if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.home();
-                                } else {
-                                    ed.left();
-                                }
-                            }
-                        } else if let Some(prev) = form.prev_cookie_col(col) {
-                            if let Some(ed) = form.cookies[i].cell_mut(prev) {
-                                ed.end();
-                            }
-                            form.focus = NewField::Cookie(i, prev);
-                        }
-                    }
-                    KeyCode::Right => {
-                        let at_end = form.cookies[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col >= ed.line_len(ed.row))
-                            .unwrap_or(true);
-                        if !at_end {
-                            if let Some(ed) = form.cookies[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.end();
-                                } else {
-                                    ed.right();
-                                }
-                            }
-                        } else if let Some(next) = form.next_cookie_col(col) {
-                            if let Some(ed) = form.cookies[i].cell_mut(next) {
-                                ed.home();
-                            }
-                            form.focus = NewField::Cookie(i, next);
-                        }
-                    }
-                    KeyCode::Enter => form.focus_next(true, true),
-                    KeyCode::Char(' ') if col == HdrCol::Enabled => {
-                        if let Some(row) = form.cookies.get_mut(i) {
-                            row.enabled = !row.enabled;
-                        }
-                    }
-                    _ => {
-                        if let Some(ed) = form.cookies[i].cell_mut(col) {
-                            match key.code {
-                                KeyCode::Char(ch) => ed.insert(ch),
-                                KeyCode::Backspace => ed.backspace(),
-                                KeyCode::Home => ed.home(),
-                                KeyCode::End => ed.end(),
-                                _ => {}
-                            }
-                        }
-                    }
-                },
-                NewField::AddQuery => match key.code {
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        form.queries.push(HeaderRow::new());
-                        form.focus = NewField::Query(form.queries.len() - 1, HdrCol::Key);
-                    }
-                    KeyCode::Down => form.focus_next(true, true),
-                    KeyCode::Up => form.focus_next(false, true),
-                    _ => {}
-                },
-                NewField::Query(i, col) => match key.code {
-                    KeyCode::Up => {
-                        form.focus = if i > 0 {
-                            NewField::Query(i - 1, col)
-                        } else {
-                            form.up_into_cookies()
-                        };
-                    }
-                    KeyCode::Down => {
-                        form.focus = if i + 1 < form.queries.len() {
-                            NewField::Query(i + 1, col)
-                        } else {
-                            NewField::AddQuery
-                        };
-                    }
-                    KeyCode::Left => {
-                        let at_start = form.queries[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col == 0)
-                            .unwrap_or(true);
-                        if !at_start {
-                            if let Some(ed) = form.queries[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.home();
-                                } else {
-                                    ed.left();
-                                }
-                            }
-                        } else if let Some(prev) = form.prev_query_col(col) {
-                            if let Some(ed) = form.queries[i].cell_mut(prev) {
-                                ed.end();
-                            }
-                            form.focus = NewField::Query(i, prev);
-                        }
-                    }
-                    KeyCode::Right => {
-                        let at_end = form.queries[i]
-                            .cell_mut(col)
-                            .map(|ed| ed.col >= ed.line_len(ed.row))
-                            .unwrap_or(true);
-                        if !at_end {
-                            if let Some(ed) = form.queries[i].cell_mut(col) {
-                                if ctrl {
-                                    ed.end();
-                                } else {
-                                    ed.right();
-                                }
-                            }
-                        } else if let Some(next) = form.next_query_col(col) {
-                            if let Some(ed) = form.queries[i].cell_mut(next) {
-                                ed.home();
-                            }
-                            form.focus = NewField::Query(i, next);
-                        }
-                    }
-                    KeyCode::Enter => form.focus_next(true, true),
-                    KeyCode::Char(' ') if col == HdrCol::Enabled => {
-                        if let Some(row) = form.queries.get_mut(i) {
-                            row.enabled = !row.enabled;
-                        }
-                    }
-                    _ => {
-                        if let Some(ed) = form.queries[i].cell_mut(col) {
-                            match key.code {
-                                KeyCode::Char(ch) => ed.insert(ch),
-                                KeyCode::Backspace => ed.backspace(),
-                                KeyCode::Home => ed.home(),
-                                KeyCode::End => ed.end(),
-                                _ => {}
-                            }
-                        }
-                    }
-                },
+                NewField::Kvd(kind, i, col) => form.handle_kvd_key(kind, i, col, &key),
                 NewField::AddFormField => match key.code {
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         form.form_fields.push(FormRow::new());
@@ -3776,7 +3458,7 @@ impl TuiApp {
 
                             NewField::FormField(i - 1, target_col)
                         } else {
-                            form.up_into_queries()
+                            form.up_into_kvd(KvdKind::Query)
                         };
                     }
                     KeyCode::Down => {
@@ -3812,11 +3494,15 @@ impl TuiApp {
                                     ed.left();
                                 }
                             }
-                        } else if let Some(prev) = form.prev_form_col(col) {
+                        } else if let Some(prev) = form.prev_form_col(i, col) {
                             if let Some(ed) = form.form_fields[i].cell_mut(prev) {
                                 ed.end();
                             }
-                            form.focus_next(false, false);
+                            // Move straight to the adjacent column (which
+                            // includes the Enabled checkbox), rather than
+                            // through `focus_next`, whose Tab ordering skips
+                            // Enabled and would leak out of the row entirely.
+                            form.focus = NewField::FormField(i, prev);
                         }
                     }
                     KeyCode::Right => {
@@ -3832,11 +3518,11 @@ impl TuiApp {
                                     ed.right();
                                 }
                             }
-                        } else if let Some(next) = form.next_form_col(col) {
+                        } else if let Some(next) = form.next_form_col(i, col) {
                             if let Some(ed) = form.form_fields[i].cell_mut(next) {
                                 ed.home();
                             }
-                            form.focus_next(true, false);
+                            form.focus = NewField::FormField(i, next);
                         }
                     }
                     KeyCode::Enter => form.focus_next(true, true),
@@ -4034,7 +3720,7 @@ impl TuiApp {
                 }
             }
             // Typing in the Key cell (re)opens the dropdown for the new text.
-            if let NewField::Header(_, HdrCol::Key) = form.focus
+            if let NewField::Kvd(KvdKind::Header, _, HdrCol::Key) = form.focus
                 && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
             {
                 typed_in_key = true;
@@ -4085,7 +3771,7 @@ impl TuiApp {
                 // not immediately trap Down/Up in the dropdown; Enter
                 // can still reveal it explicitly (`reveal_key_dropdown`).
                 form.suggest_hi = None;
-                let landed_on_populated_key = matches!(form.focus, NewField::Header(i, HdrCol::Key)
+                let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
                             if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
             }

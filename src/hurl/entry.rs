@@ -69,6 +69,56 @@ fn escape_form_file_path(path: &str) -> String {
     out
 }
 
+/// Append `line` to `out` as its own line, commenting it out with a leading
+/// `# ` when the row is disabled. Disabled request rows are round-tripped as
+/// comments (Hurl ignores them at run time) so the enabled flag survives a
+/// save/reload; [`parse_hurl`](super::parse_hurl) restores a commented row
+/// that still looks like a real request line as a disabled entry.
+fn push_line(out: &mut String, line: &str, enabled: bool) {
+    if !enabled {
+        out.push_str("# ");
+    }
+    out.push_str(line);
+    out.push('\n');
+}
+
+/// Append one `key: value` request-section row to `out` (see [`push_line`] for
+/// the disabled-row handling). Shared by the Header, Cookies and Query
+/// sections, which are otherwise identical.
+fn push_kv_line(out: &mut String, k: &str, v: &str, enabled: bool) {
+    push_line(out, &format!("{k}: {v}"), enabled);
+}
+
+/// The Hurl source for one `[Form]`/`[Multipart]` field line (without the
+/// trailing newline or any disabled-row `# ` prefix). Split out so an enabled
+/// row and the commented form of a disabled row share one code path.
+fn form_field_line(f: &FormField) -> String {
+    match f.kind {
+        FormFieldKind::Text => format!("{}: {}", f.key, f.value),
+        FormFieldKind::File => {
+            let path = escape_form_file_path(&f.value);
+            match f.content_type.as_deref().map(str::trim) {
+                Some(ct) if !ct.is_empty() => format!("{}: file,{}; {}", f.key, path, ct),
+                _ => format!("{}: file,{};", f.key, path),
+            }
+        }
+        // A Base64File is transformed into a plain Text field before an actual
+        // request runs (see `expand_base64_form_fields`); this branch only runs
+        // when serializing for *saving* to disk. Encode it as a file line whose
+        // content-type carries a PaperBoy marker plus the URL-safe-base64
+        // encoded prefix, so parsing restores the Base64File kind and its prefix.
+        FormFieldKind::Base64File => {
+            let path = escape_form_file_path(&f.value);
+            let encoded_prefix =
+                URL_SAFE_NO_PAD.encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
+            format!(
+                "{}: file,{}; {}{}",
+                f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
+            )
+        }
+    }
+}
+
 /// Outcome of the most recent "Run All" (Alt+F5) pass over this entry's
 /// collection. Purely a runtime display marker for the Requests list — never
 /// persisted, and reset to `Running` for every entry the instant a new batch
@@ -224,9 +274,7 @@ impl HurlEntry {
         };
         out.push_str(&format!("{method} {}\n", self.url));
         for (k, v, enabled) in &self.headers {
-            if *enabled {
-                out.push_str(&format!("{k}: {v}\n"));
-            }
+            push_kv_line(&mut out, k, v, *enabled);
         }
         if let Some(body) = &self.body {
             out.push_str(body);
@@ -240,24 +288,23 @@ impl HurlEntry {
         if !self.cookies.is_empty() {
             out.push_str("[Cookies]\n");
             for (k, v, enabled) in &self.cookies {
-                if *enabled {
-                    out.push_str(&format!("{k}: {v}\n"));
-                }
+                push_kv_line(&mut out, k, v, *enabled);
             }
         }
         if !self.queries.is_empty() {
             out.push_str("[Query]\n");
             for (k, v, enabled) in &self.queries {
-                if *enabled {
-                    out.push_str(&format!("{k}: {v}\n"));
-                }
+                push_kv_line(&mut out, k, v, *enabled);
             }
         }
         if !self.form_fields.is_empty() {
-            // Any File field switches the whole section to `[Multipart]`
+            // Any enabled File field switches the whole section to `[Multipart]`
             // (Hurl's `[Form]` section is text-only); a Base64File also
             // serializes as a `file,...` line (carrying its marker), so it
             // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
+            // Only *enabled* fields drive this choice: a disabled row is a
+            // comment and never reaches the wire, so it must not flip an
+            // otherwise-`[Form]` request onto the multipart code path.
             let multipart = self
                 .form_fields
                 .iter()
@@ -268,35 +315,8 @@ impl HurlEntry {
             } else {
                 "[Form]\n"
             });
-            for f in self.form_fields.iter().filter(|field| field.enabled) {
-                match f.kind {
-                    FormFieldKind::Text => out.push_str(&format!("{}: {}\n", f.key, f.value)),
-                    FormFieldKind::File => {
-                        let path = escape_form_file_path(&f.value);
-                        match f.content_type.as_deref().map(str::trim) {
-                            Some(ct) if !ct.is_empty() => {
-                                out.push_str(&format!("{}: file,{}; {}\n", f.key, path, ct));
-                            }
-                            _ => out.push_str(&format!("{}: file,{};\n", f.key, path)),
-                        }
-                    }
-                    // A Base64File is transformed into a plain Text field
-                    // before an actual request runs (see
-                    // `expand_base64_form_fields`); this branch only runs when
-                    // serializing for *saving* to disk. Encode it as a file
-                    // line whose content-type carries a PaperBoy marker plus
-                    // the URL-safe-base64 encoded prefix, so parsing restores
-                    // the Base64File kind and its prefix.
-                    FormFieldKind::Base64File => {
-                        let path = escape_form_file_path(&f.value);
-                        let encoded_prefix = URL_SAFE_NO_PAD
-                            .encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
-                        out.push_str(&format!(
-                            "{}: file,{}; {}{}\n",
-                            f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
-                        ));
-                    }
-                }
+            for f in &self.form_fields {
+                push_line(&mut out, &form_field_line(f), f.enabled);
             }
         }
         // The response section (delimited by the `HTTP <status>` line) is only

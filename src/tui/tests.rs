@@ -529,12 +529,15 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     press(&mut app, KeyCode::Tab); // Target -> Method
     press(&mut app, KeyCode::Tab); // Method -> Url
     press(&mut app, KeyCode::Tab); // Url -> AddHeader (headers start empty)
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 
     press(&mut app, KeyCode::Tab); // empty header section -> AddCookie
-    assert_eq!(new_focus(&app), NewField::AddCookie);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Cookie));
 
-    press(&mut app, KeyCode::Tab); // empty cookie section -> AddFormField
+    press(&mut app, KeyCode::Tab); // empty cookie section -> AddQuery
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
+
+    press(&mut app, KeyCode::Tab); // empty query section -> AddFormField
     assert_eq!(new_focus(&app), NewField::AddFormField);
 
     press(&mut app, KeyCode::Tab); // empty form section -> jump to Body
@@ -544,9 +547,11 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::AddFormField);
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(new_focus(&app), NewField::AddCookie);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Cookie));
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::Url);
 }
@@ -577,6 +582,7 @@ fn open_form_on_form_field_kind(app: &mut TuiApp) {
     press(app, KeyCode::Tab); // -> Url
     press(app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(app, KeyCode::Enter); // creates FormField(0, Key)
     press(app, KeyCode::Char('k')); // non-blank, or Tab skips the empty section
@@ -602,45 +608,72 @@ fn deleting_the_last_header_leaves_the_section_empty() {
     }
     assert_eq!(
         new_focus(&app),
-        NewField::AddHeader,
+        NewField::AddKvd(KvdKind::Header),
         "focus lands on the Add row"
     );
 
     // Enter on the Add row creates a fresh row again.
     press(&mut app, KeyCode::Enter);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
     press(&mut app, KeyCode::Char('X'));
     press(&mut app, KeyCode::Tab); // Key -> Value
     press(&mut app, KeyCode::Tab); // Value -> Desc
     press(&mut app, KeyCode::Tab); // Desc -> Add header
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 }
 
 #[test]
 fn arrow_keys_move_between_columns_in_a_header_row() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
 
     // On an empty cell the cursor is already at the edge, so Left/Right cross cells.
     press(&mut app, KeyCode::Right);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Right);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Desc));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Desc)
+    );
     press(&mut app, KeyCode::Right); // last column clamps
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Desc));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Desc)
+    );
 
     press(&mut app, KeyCode::Left);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
 
     // The Enabled checkbox is the leftmost visual column, reached with
     // Left from Key (and clamped there — it's the first column).
     press(&mut app, KeyCode::Left);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
     press(&mut app, KeyCode::Left);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Enabled));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Enabled)
+    );
     press(&mut app, KeyCode::Left); // first column clamps
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Enabled));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Enabled)
+    );
 }
 
 #[test]
@@ -652,18 +685,27 @@ fn left_right_move_the_cursor_before_crossing_cells() {
     }
     // At the end of the text, Right crosses to the next cell.
     press(&mut app, KeyCode::Right);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     // Back in Key: Left first walks the cursor through "ab" (2 steps) then crosses.
     press(&mut app, KeyCode::Left);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
     press(&mut app, KeyCode::Left); // cursor moves within "ab"
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
 }
 
 fn focused_cell_col(app: &TuiApp) -> usize {
     match app.overlay.as_ref().unwrap() {
         Overlay::NewRequest(f) => match f.focus {
-            NewField::Header(i, col) => {
+            NewField::Kvd(KvdKind::Header, i, col) => {
                 let row = &f.headers[i];
                 match col {
                     HdrCol::Key => row.key.col,
@@ -691,7 +733,7 @@ fn ctrl_left_right_jump_to_start_and_end_of_cell() {
     app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "stays in the same cell"
     );
     assert_eq!(focused_cell_col(&app), 0, "Ctrl+Left goes to the start");
@@ -700,7 +742,7 @@ fn ctrl_left_right_jump_to_start_and_end_of_cell() {
     app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "stays in the same cell"
     );
     assert_eq!(focused_cell_col(&app), 5, "Ctrl+Right goes to the end");
@@ -715,25 +757,40 @@ fn up_down_move_between_header_rows() {
     press(&mut app, KeyCode::Tab); // -> Value
     press(&mut app, KeyCode::Tab); // -> Desc
     press(&mut app, KeyCode::Tab); // -> Add header (Enabled skipped)
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
     press(&mut app, KeyCode::Char(' ')); // add row 1
-    assert_eq!(new_focus(&app), NewField::Header(1, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 1, HdrCol::Key)
+    );
 
     // Move to the Value column, where Up/Down move between rows (the Key
     // column's Up/Down drive the suggestion dropdown instead).
     press(&mut app, KeyCode::Right); // Header(1, Value)
-    assert_eq!(new_focus(&app), NewField::Header(1, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 1, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Up);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Up); // top row now leaves the table upward to URL
     assert_eq!(new_focus(&app), NewField::Url);
     press(&mut app, KeyCode::Down); // URL drops back into the first header cell
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
     press(&mut app, KeyCode::Right); // -> Header(0, Value)
     press(&mut app, KeyCode::Down); // move down between rows
-    assert_eq!(new_focus(&app), NewField::Header(1, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 1, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Down); // last row leaves downward to "Add header"
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 }
 
 #[test]
@@ -780,7 +837,7 @@ fn arrow_up_stops_at_every_section_it_passes_through_just_like_arrow_down_does()
     press(&mut app, KeyCode::Up);
     assert_eq!(
         new_focus(&app),
-        NewField::AddHeader,
+        NewField::AddKvd(KvdKind::Header),
         "Up from the first Cookie row must stop at the empty Headers section's Add row, not skip past it to Url"
     );
     press(&mut app, KeyCode::Up);
@@ -803,19 +860,26 @@ fn arrow_up_from_the_first_form_field_stops_at_cookies_then_headers_one_section_
     press(&mut app, KeyCode::Tab); // -> Url
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Enter); // creates FormField(0, Key); headers/cookies still empty
 
     press(&mut app, KeyCode::Up);
     assert_eq!(
         new_focus(&app),
-        NewField::AddCookie,
-        "Up from the first Form row must stop at the empty Cookies section first"
+        NewField::AddKvd(KvdKind::Query),
+        "Up from the first Form row must stop at the empty Queries section first"
     );
     press(&mut app, KeyCode::Up);
     assert_eq!(
         new_focus(&app),
-        NewField::AddHeader,
+        NewField::AddKvd(KvdKind::Cookie),
+        "the next Up stops at the empty Cookies section"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Header),
         "the next Up stops at the empty Headers section, not before"
     );
     press(&mut app, KeyCode::Up);
@@ -835,7 +899,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
     press(&mut app, KeyCode::Char('n'));
     // Walk straight to Body, then on to the (empty) Asserts and Captures
     // "Add" rows.
-    for _ in 0..7 {
+    for _ in 0..8 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -861,7 +925,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
 fn up_down_in_the_body_move_the_cursor_then_leave_at_the_edges() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..7 {
+    for _ in 0..8 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body (skips the blank sections)
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -944,7 +1008,7 @@ fn dropdown_filters_as_you_type_and_enter_fills_the_key() {
     );
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Value),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value),
         "focus advances"
     );
     assert!(
@@ -960,7 +1024,7 @@ fn down_on_key_cell_navigates_suggestions_not_rows() {
     press(&mut app, KeyCode::Down);
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "focus stays on the Key cell"
     );
     assert_eq!(
@@ -1007,15 +1071,24 @@ fn tab_skips_the_enabled_checkbox() {
     press(&mut app, KeyCode::Char('k')); // make row 0 non-blank
 
     press(&mut app, KeyCode::Tab); // Key -> Value
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Tab); // Value -> Desc
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Desc));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Desc)
+    );
     press(&mut app, KeyCode::Tab); // Desc -> Add header (checkbox skipped)
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 
     // Shift+Tab returns to Desc, never the checkbox.
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Desc));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Desc)
+    );
 }
 
 #[test]
@@ -1025,9 +1098,15 @@ fn arrows_can_still_reach_the_enabled_checkbox() {
     // The checkbox is the leftmost visual column, so a single Left from
     // Key reaches it directly.
     press(&mut app, KeyCode::Left); // Key -> Enabled
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Enabled));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Enabled)
+    );
     press(&mut app, KeyCode::Right); // Enabled -> Key
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
 }
 
 #[test]
@@ -1042,14 +1121,14 @@ fn ctrl_e_toggles_enabled_without_moving_focus() {
     );
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "Ctrl+E toggles in place, without jumping focus to the checkbox"
     );
     app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     assert!(header_enabled(&app, 0), "Ctrl+E re-enables it");
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "focus still hasn't moved"
     );
 }
@@ -1066,6 +1145,7 @@ fn arrows_can_reach_the_enabled_checkbox_in_a_form_row() {
     press(&mut app, KeyCode::Tab); // -> Url
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
+    press(&mut app, KeyCode::Tab); // -> AddQuery, blank
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key), blank
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -1116,14 +1196,26 @@ fn disabled_header_is_not_sent() {
     }
     // Disable the row via Ctrl+E (focus stays on the Value cell).
     app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     assert!(!header_enabled(&app, 0), "the row is now disabled");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
     assert_eq!(e.len(), 1);
+    // The disabled row is now *retained* in the entry (so its disabled state
+    // persists), carrying enabled=false…
+    assert_eq!(
+        e[0].headers,
+        vec![("X-Test".to_string(), "abc".to_string(), false)],
+        "a disabled header is kept in the model, not discarded"
+    );
+    // …but it is excluded from the actual wire request that gets sent.
+    let sent = crate::request::resolve_request(&app.collections[0], None).unwrap();
     assert!(
-        e[0].headers.is_empty(),
+        !sent.headers.iter().any(|(k, _)| k == "X-Test"),
         "a disabled header must not be sent"
     );
 }
@@ -6324,6 +6416,44 @@ fn main_panel_shows_and_copies_hurl_text_when_the_default_view_is_hurl() {
     );
 }
 
+/// The Raw Hurl view shows a disabled row as a `# key: value` comment, so the
+/// user sees exactly what will be saved and (not) sent — the enabled flag is
+/// round-tripped through the Hurl file as a comment, and the preview reflects
+/// that faithfully.
+#[test]
+fn hurl_view_shows_disabled_rows_as_comments() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp {
+        default_request_view: RequestView::Hurl,
+        ..Default::default()
+    };
+    let ci = app.active_tab;
+    let mut entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/path".into(),
+        ..Default::default()
+    };
+    entry.headers = vec![
+        ("Accept".into(), "application/json".into(), true),
+        ("X-Debug".into(), "1".into(), false),
+    ];
+    app.collections[ci].entries = vec![entry];
+    app.focus = Pane::Main;
+
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(&term.backend().buffer().clone());
+    assert!(
+        text.contains("Accept: application/json"),
+        "the enabled header renders normally:\n{text}"
+    );
+    assert!(
+        text.contains("# X-Debug: 1"),
+        "the disabled header renders as a comment:\n{text}"
+    );
+}
+
 #[test]
 fn can_copy_is_false_with_no_selection_and_focus_on_a_panel_with_no_copyable_content() {
     // List/Env/Tabs are never a source of "whole panel" copy text, and
@@ -8325,9 +8455,10 @@ fn creating_a_request_with_an_assert_via_the_table() {
     for ch in "http://h/x".chars() {
         press(&mut app, KeyCode::Char(ch));
     }
-    press(&mut app, KeyCode::Tab); // -> Header(0, Key), blank: falls through to Body on next tabs
-    press(&mut app, KeyCode::Tab); // -> Cookie(0, Key), blank
-    press(&mut app, KeyCode::Tab); // -> FormField(0, Key), blank
+    press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
+    press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
@@ -8351,9 +8482,10 @@ fn creating_a_request_with_a_capture_via_the_table() {
     for ch in "http://h/x".chars() {
         press(&mut app, KeyCode::Char(ch));
     }
-    press(&mut app, KeyCode::Tab); // -> Header(0, Key), blank
-    press(&mut app, KeyCode::Tab); // -> Cookie(0, Key), blank
-    press(&mut app, KeyCode::Tab); // -> FormField(0, Key), blank
+    press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
+    press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Tab); // -> AddCapture (captures start empty)
@@ -8400,6 +8532,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     press(&mut app, KeyCode::Char('n'));
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
+    press(&mut app, KeyCode::PageDown); // -> Queries
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -8440,7 +8573,10 @@ fn creating_a_request_with_a_cookie_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Enter); // -> Cookie(0, Key)
-    assert_eq!(new_focus(&app), NewField::Cookie(0, HdrCol::Key));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key)
+    );
     for ch in "session".chars() {
         press(&mut app, KeyCode::Char(ch));
     }
@@ -8470,6 +8606,7 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     }
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -8504,6 +8641,7 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     }
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -8708,6 +8846,7 @@ fn content_type_and_description_are_independent_form_columns() {
     }
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -9322,17 +9461,23 @@ fn section_tab_confines_tab_navigation_to_that_section() {
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "switching tabs jumps to the first field"
     );
 
     // Walking forward within the section is unaffected.
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Value));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Value)
+    );
     press(&mut app, KeyCode::Tab); // -> Header(0, Desc)
-    assert_eq!(new_focus(&app), NewField::Header(0, HdrCol::Desc));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Desc)
+    );
     press(&mut app, KeyCode::Tab); // -> AddHeader (still within the section)
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 
     // Tab off the "Add header" row would normally cross into Cookies;
     // confined to the Headers tab, it must wrap back to the section's
@@ -9340,14 +9485,14 @@ fn section_tab_confines_tab_navigation_to_that_section() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(
         new_focus(&app),
-        NewField::Header(0, HdrCol::Key),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
         "Tab must not leak out of the active section tab"
     );
 
     // Shift+Tab backward off the first field must likewise wrap to the
     // section's last field ("Add header"), not leak to Url.
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 }
 
 #[test]
@@ -9360,6 +9505,7 @@ fn section_tab_confines_enter_navigation_to_that_section() {
     press(&mut app, KeyCode::Char('n'));
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
+    press(&mut app, KeyCode::PageDown); // -> Queries
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -9446,15 +9592,22 @@ fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
     press(&mut app, KeyCode::PageDown); // -> Headers
     assert_eq!(
         new_focus(&app),
-        NewField::AddHeader,
+        NewField::AddKvd(KvdKind::Header),
         "headers start empty, so the entry point is the Add row"
     );
 
     press(&mut app, KeyCode::PageDown); // -> Cookies
     assert_eq!(
         new_focus(&app),
-        NewField::AddCookie,
+        NewField::AddKvd(KvdKind::Cookie),
         "cookies start empty, so the entry point is the Add row"
+    );
+
+    press(&mut app, KeyCode::PageDown); // -> Queries
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Query),
+        "queries start empty, so the entry point is the Add row"
     );
 
     press(&mut app, KeyCode::PageDown); // -> Form
@@ -9605,7 +9758,7 @@ fn ctrl_left_right_are_a_third_alias_for_prev_next_tab_from_any_pane() {
 }
 
 #[test]
-fn alt_1_through_6_jump_directly_to_a_wizard_section_by_number() {
+fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
     // Alt, not Ctrl: Ctrl+<digit> has no standard control-code encoding,
     // so most terminals only report it with a modifier when the Kitty
     // keyboard protocol is active. Alt is sent as a plain ESC-prefix
@@ -9615,12 +9768,13 @@ fn alt_1_through_6_jump_directly_to_a_wizard_section_by_number() {
     press(&mut app, KeyCode::Char('n'));
 
     let cases = [
-        ('1', NewField::AddHeader),
-        ('2', NewField::AddCookie),
-        ('3', NewField::AddFormField),
-        ('4', NewField::Body),
-        ('5', NewField::AddAssert),
-        ('6', NewField::AddCapture),
+        ('1', NewField::AddKvd(KvdKind::Header)),
+        ('2', NewField::AddKvd(KvdKind::Cookie)),
+        ('3', NewField::AddKvd(KvdKind::Query)),
+        ('4', NewField::AddFormField),
+        ('5', NewField::Body),
+        ('6', NewField::AddAssert),
+        ('7', NewField::AddCapture),
     ];
     for (digit, expected) in cases {
         app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT));
@@ -9634,11 +9788,11 @@ fn alt_1_through_6_jump_directly_to_a_wizard_section_by_number() {
     // Works regardless of which section-view tab is currently active,
     // not just from `All`.
     press(&mut app, KeyCode::PageDown); // -> Headers view tab
-    app.on_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT));
+    app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT));
     assert_eq!(
         new_focus(&app),
         NewField::Body,
-        "Alt+4 still jumps to Body from a different section tab"
+        "Alt+5 still jumps to Body from a different section tab"
     );
 
     // Plain (unmodified) digits must still type into a text field
@@ -9662,15 +9816,21 @@ fn ctrl_up_down_jumps_directly_between_sections() {
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
-    assert_eq!(new_focus(&app), NewField::AddHeader);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Header));
 
     // Ctrl+Down jumps straight past Headers into Cookies, skipping the
     // rest of the (empty) Headers section.
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
-        NewField::AddCookie,
+        NewField::AddKvd(KvdKind::Cookie),
         "cookies start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Query),
+        "queries start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(
@@ -9719,13 +9879,19 @@ fn ctrl_up_down_jumps_directly_between_sections() {
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
-        NewField::AddCookie,
+        NewField::AddKvd(KvdKind::Query),
+        "queries start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Cookie),
         "cookies start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
-        NewField::AddHeader,
+        NewField::AddKvd(KvdKind::Header),
         "headers start empty, so the entry point is the Add row"
     );
 }
@@ -9786,7 +9952,7 @@ fn many_headers_scroll_and_keep_the_focused_row_rendered() {
     }
     // Focus the last row: with only a handful of visible lines, it must
     // still be scrolled into view rather than clipped off-screen.
-    form.focus = NewField::Header(7, HdrCol::Key);
+    form.focus = NewField::Kvd(KvdKind::Header, 7, HdrCol::Key);
 
     // A short area: 1 column-header line + room for only ~4 data rows.
     let area = ratatui::layout::Rect {
@@ -9796,7 +9962,7 @@ fn many_headers_scroll_and_keep_the_focused_row_rendered() {
         height: 5,
     };
     let mut term = Terminal::new(TestBackend::new(40, 5)).unwrap();
-    term.draw(|f| super::new_request::draw_header_table(f, area, &form, &s, &th))
+    term.draw(|f| super::new_request::draw_kvd_table(f, area, &form, KvdKind::Header, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
     assert!(
@@ -9822,7 +9988,7 @@ fn many_headers_always_keep_the_add_header_row_visible() {
     }
     // Focus the *first* row: the scroll window sits at the top of the
     // list, as far from the "+ Add Header" hint as possible.
-    form.focus = NewField::Header(0, HdrCol::Key);
+    form.focus = NewField::Kvd(KvdKind::Header, 0, HdrCol::Key);
 
     let area = ratatui::layout::Rect {
         x: 0,
@@ -9831,7 +9997,7 @@ fn many_headers_always_keep_the_add_header_row_visible() {
         height: 5,
     };
     let mut term = Terminal::new(TestBackend::new(40, 5)).unwrap();
-    term.draw(|f| super::new_request::draw_header_table(f, area, &form, &s, &th))
+    term.draw(|f| super::new_request::draw_kvd_table(f, area, &form, KvdKind::Header, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
     assert!(
@@ -9879,7 +10045,7 @@ fn a_section_with_exactly_five_rows_shows_them_all_without_a_scrollbar() {
         row.value = super::editor::Editor::new(&format!("Value{i}"), false);
         form.headers.push(row);
     }
-    form.focus = NewField::Header(0, HdrCol::Key);
+    form.focus = NewField::Kvd(KvdKind::Header, 0, HdrCol::Key);
 
     // Exactly the height `section_height(1, 5)` would allocate: 1 header
     // line + 5 data rows + 1 pinned Add row = 7.
@@ -9892,7 +10058,7 @@ fn a_section_with_exactly_five_rows_shows_them_all_without_a_scrollbar() {
         height,
     };
     let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
-    term.draw(|f| super::new_request::draw_header_table(f, area, &form, &s, &th))
+    term.draw(|f| super::new_request::draw_kvd_table(f, area, &form, KvdKind::Header, &s, &th))
         .unwrap();
     let buf = term.backend().buffer().clone();
     let text = buffer_text(&buf);
@@ -9935,7 +10101,7 @@ fn a_sixth_row_triggers_a_scrollbar_rendered_in_the_leftmost_column() {
         row.value = super::editor::Editor::new(&format!("Value{i}"), false);
         form.headers.push(row);
     }
-    form.focus = NewField::Header(0, HdrCol::Key);
+    form.focus = NewField::Kvd(KvdKind::Header, 0, HdrCol::Key);
 
     // The section stays capped at the same height once it would need to
     // scroll (`section_height` no longer grows past 5 visible rows).
@@ -9948,7 +10114,7 @@ fn a_sixth_row_triggers_a_scrollbar_rendered_in_the_leftmost_column() {
         height,
     };
     let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
-    term.draw(|f| super::new_request::draw_header_table(f, area, &form, &s, &th))
+    term.draw(|f| super::new_request::draw_kvd_table(f, area, &form, KvdKind::Header, &s, &th))
         .unwrap();
     let buf = term.backend().buffer().clone();
     let text = buffer_text(&buf);
