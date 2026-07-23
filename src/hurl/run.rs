@@ -242,9 +242,31 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         None => (0, Vec::new(), String::new()),
     };
 
-    // Only surface EXPLICIT [Asserts]; the implicit version/status asserts
-    // come from the `HTTP <status>` line and are reflected in the status.
+    // Only surface EXPLICIT [Asserts] plus the implicit status assertion; the
+    // implicit HTTP-version assert stays folded into the status/version line.
     let mut asserts = Vec::new();
+    // Surface the implicit HTTP status assertion (the `HTTP <code>` response
+    // line) as a leading `status == <code>` row, so the response's [Asserts]
+    // view shows the status check alongside the explicit asserts — Hurl treats
+    // the status line as an assertion too. `HTTP *` / no status line produces
+    // no `ImplicitStatus`, so nothing is shown in that case.
+    for a in &e.asserts {
+        if let AssertResult::ImplicitStatus {
+            actual, expected, ..
+        } = a
+        {
+            let failed = a.to_runner_error().is_some();
+            asserts.push(AssertOutcome {
+                expr: format!("status == {expected}"),
+                passed: !failed,
+                detail: if failed {
+                    format!("got {actual}")
+                } else {
+                    String::new()
+                },
+            });
+        }
+    }
     for a in &e.asserts {
         if !matches!(a, AssertResult::Explicit { .. }) {
             continue;
@@ -268,9 +290,32 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         .map(|c| (c.name.clone(), c.value.to_string()))
         .collect();
 
-    // The first error (transport failure, status mismatch or failed assert)
-    // is surfaced per-entry and, for the whole run, on the status bar.
-    let entry_error = e.errors.first().map(|er| render_error(er, lines));
+    // A failed status assertion gets a clear "expected X but got Y" message
+    // (with the request that produced it) rather than the runner's terse
+    // "Assert status code: HTTP 200", which hides both the expected and the
+    // actual status. Other errors (transport, failed explicit asserts) keep
+    // their concise per-line rendering.
+    let status_mismatch = e.asserts.iter().find_map(|a| match a {
+        AssertResult::ImplicitStatus {
+            actual, expected, ..
+        } if a.to_runner_error().is_some() => Some((*actual, *expected)),
+        _ => None,
+    });
+    let entry_error = if let Some((actual, expected)) = status_mismatch {
+        let reason = reason(actual as u16);
+        let actual_txt = if reason.is_empty() {
+            format!("{actual}")
+        } else {
+            format!("{actual} {reason}")
+        };
+        Some(format!(
+            "Expected status {expected} but got {actual_txt} ({method} {url})"
+        ))
+    } else {
+        // The first error (transport failure or failed assert) is surfaced
+        // per-entry and, for the whole run, on the status bar.
+        e.errors.first().map(|er| render_error(er, lines))
+    };
 
     (
         EntryOutcome {
@@ -334,6 +379,97 @@ fn reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn a one-shot HTTP/1.1 server on an ephemeral port that answers the
+    /// first connection with `status`/`reason` and a tiny JSON body, then
+    /// closes. Returns the bound port. Used to exercise the status-assertion
+    /// mapping against a real (local) response without any network access.
+    fn one_shot_server(status: u16, reason: &str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reason = reason.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// Feature: the implicit `HTTP <code>` status line surfaces in the mapped
+    /// asserts as a `status == <code>` row (so the response's [Asserts] view
+    /// shows the status check), and passes when the status matches.
+    #[test]
+    fn status_line_appears_as_a_passing_assert() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(e.ok, "entry should pass, error: {:?}", e.error);
+        let status_assert = e
+            .asserts
+            .iter()
+            .find(|a| a.expr == "status == 200")
+            .expect("a `status == 200` assert row");
+        assert!(status_assert.passed);
+    }
+
+    /// Feature: a failed status assertion is both surfaced as a failed
+    /// `status == <expected>` assert row (with the actual status in its
+    /// detail) and rendered as a clear "expected X but got Y" error message
+    /// naming the request — not the runner's terse "Assert status code".
+    #[test]
+    fn failed_status_assertion_has_a_clear_message() {
+        let port = one_shot_server(404, "Not Found");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(!e.ok);
+        let status_assert = e
+            .asserts
+            .iter()
+            .find(|a| a.expr == "status == 200")
+            .expect("a `status == 200` assert row");
+        assert!(!status_assert.passed);
+        assert!(
+            status_assert.detail.contains("404"),
+            "detail should show the actual status, got: {}",
+            status_assert.detail
+        );
+        let msg = e.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("Expected status 200") && msg.contains("got 404"),
+            "message should state expected vs actual, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Assert status code"),
+            "message should not be the terse runner default, got: {msg}"
+        );
+    }
+
+    /// A `HTTP *` wildcard status line asserts nothing about the status, so no
+    /// synthetic `status == …` row is produced.
+    #[test]
+    fn wildcard_status_line_produces_no_status_assert() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP *\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(
+            !e.asserts.iter().any(|a| a.expr.starts_with("status ==")),
+            "HTTP * should not synthesize a status assert"
+        );
+    }
 
     /// A `[Multipart]` file field referenced by a path relative to the
     /// collection's own directory must be authorized when `file_root` is

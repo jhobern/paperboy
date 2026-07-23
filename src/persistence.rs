@@ -339,6 +339,10 @@ pub struct PersistedState {
     /// every request (Settings → Preferences → Default Request View).
     #[serde(default)]
     pub default_request_view: RequestView,
+    /// Run "Run All" in batch mode (whole collection in one Hurl execution)
+    /// rather than streaming per-entry. Off by default (streaming).
+    #[serde(default)]
+    pub run_all_batch_mode: bool,
     /// User-created themes (Settings → Theme). Built-in presets are not stored.
     #[serde(default)]
     pub custom_themes: Vec<crate::tui::theme::ThemeSpec>,
@@ -386,6 +390,7 @@ impl Default for PersistedState {
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),
             default_request_view: RequestView::default(),
+            run_all_batch_mode: false,
             custom_themes: Vec::new(),
             active_theme: None,
             global_envs: Vec::new(),

@@ -1253,6 +1253,44 @@ fn right_arrow_fills_base_url_ghost() {
 }
 
 #[test]
+fn run_all_batch_mode_toggles_from_preferences_and_round_trips() {
+    let mut app = TuiApp::default();
+    assert!(
+        !app.run_all_batch_mode,
+        "Run All streams by default (batch mode off)"
+    );
+
+    // Row 4 of the Preferences menu toggles it (Enter and Space both work).
+    app.overlay = Some(Overlay::Preferences(4));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.run_all_batch_mode, "Enter toggles batch mode on");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        "the highlight stays on the toggle row"
+    );
+    press(&mut app, KeyCode::Char(' '));
+    assert!(!app.run_all_batch_mode, "Space toggles it back off");
+
+    // The 'b' mnemonic toggles it from anywhere in the menu.
+    app.overlay = Some(Overlay::Preferences(0));
+    press(&mut app, KeyCode::Char('b'));
+    assert!(
+        app.run_all_batch_mode,
+        "the (b) mnemonic toggles batch mode"
+    );
+
+    // Survives a persistence round trip.
+    let json = serde_json::to_string(&app.to_persisted()).unwrap();
+    let back: PersistedState = serde_json::from_str(&json).unwrap();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(back);
+    assert!(
+        restored.run_all_batch_mode,
+        "batch mode survives JSON (de)serialization"
+    );
+}
+
+#[test]
 fn default_request_view_setting_round_trips() {
     let mut app = TuiApp::default();
     assert_eq!(
@@ -1582,9 +1620,10 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Down); // -> sel 1 (Confirm on clear)
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
     press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        matches!(app.overlay, Some(Overlay::Preferences(5))),
         "Down moves to the last item without wrapping past it"
     );
 
@@ -1612,7 +1651,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
         "selecting Hurl in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        matches!(app.overlay, Some(Overlay::Preferences(5))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -1620,14 +1659,14 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects Hurl (index 1) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(4)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(5)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
         "preselects Hurl (index 1)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        matches!(app.overlay, Some(Overlay::Preferences(5))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -1650,7 +1689,8 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> sel 1
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
     press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects JSON (0)
     assert_eq!(app.default_request_view, RequestView::Json);
 
@@ -1670,7 +1710,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(4))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(5))));
     assert_eq!(app.default_request_view, RequestView::Json);
 }
 
@@ -7730,18 +7770,21 @@ fn save_collection_as_confirms_overwrite_of_existing_file() {
     assert!(
         matches!(
             app.overlay,
-            Some(Overlay::Prompt {
-                kind: PromptKind::FilePath(FileAction::SaveCollection),
-                ..
-            })
+            Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, _))
         ),
-        "Save As prompts for a name",
+        "Save As opens a destination-folder chooser first",
     );
-    app.commit_prompt_with_secrecy(
-        PromptKind::FilePath(FileAction::SaveCollection),
-        existing.to_string_lossy().into_owned(),
-        true,
-    );
+    // Tab to the inline filename editor and type the target name, then Enter
+    // saves it into the chosen folder.
+    app.overlay = Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_name_focused, "Tab focuses the filename field");
+    app.browser_name = super::editor::Editor::new("taken.hurl", false);
+    press(&mut app, KeyCode::Enter);
     assert!(
         matches!(
             app.overlay,
@@ -7780,11 +7823,14 @@ fn save_collection_as_to_a_new_file_writes_without_confirmation() {
     app.active_tab = 1;
 
     app.begin_save_as(FileAction::SaveCollection);
-    app.commit_prompt_with_secrecy(
-        PromptKind::FilePath(FileAction::SaveCollection),
-        fresh.to_string_lossy().into_owned(),
-        true,
-    );
+    app.overlay = Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("fresh.hurl", false);
+    press(&mut app, KeyCode::Enter);
     assert!(
         !matches!(
             app.overlay,
@@ -7814,22 +7860,56 @@ fn scratch_space_can_be_saved_as_a_collection() {
     assert!(
         matches!(
             app.overlay,
-            Some(Overlay::Prompt {
-                kind: PromptKind::FilePath(FileAction::SaveCollection),
-                ..
-            })
+            Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, _))
         ),
-        "the Scratch Space is saveable (prompts for a name since it has no file yet)",
+        "the Scratch Space is saveable — Save opens a folder chooser (it has no file yet)",
     );
-    app.commit_prompt_with_secrecy(
-        PromptKind::FilePath(FileAction::SaveCollection),
-        path.to_string_lossy().into_owned(),
-        true,
-    );
+    app.overlay = Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("scratch.hurl", false);
+    press(&mut app, KeyCode::Enter);
     assert!(
         path.exists(),
         "the Scratch Space is written to a collection file"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn save_collection_browser_defaults_a_hurl_extension_and_seeds_the_current_name() {
+    let dir = temp_dir("saveasdefaultext");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "My API".into(),
+        vec![HurlEntry::from_fields("r", "GET", "http://h/x", vec![], "")],
+    ));
+    app.active_tab = 1;
+
+    app.begin_save_as(FileAction::SaveCollection);
+    assert_eq!(
+        app.browser_name.text(),
+        "My API.hurl",
+        "the filename field is seeded from the collection's name"
+    );
+    app.overlay = Some(Overlay::Browser(FileAction::SaveCollectionChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    // Type a name with NO extension — `.hurl` is appended automatically.
+    app.browser_name = super::editor::Editor::new("noext", false);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        dir.join("noext.hurl").exists(),
+        "a missing extension defaults to .hurl"
+    );
+    assert!(app.overlay.is_none(), "a fresh file saves without a prompt");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -8061,9 +8141,12 @@ fn collection_list_substitutes_and_colour_codes_by_status() {
     let mut col = Collection::new(
         "api".into(),
         vec![
-            HurlEntry::from_fields("sel", "GET", "http://plain/0", vec![], ""), // selected (index 0)
-            HurlEntry::from_fields("a", "GET", "{{ HOST }}/a", vec![], ""),
-            HurlEntry::from_fields("b", "GET", "{{ BAD }}/b", vec![], ""),
+            // Unnamed entries so the list shows (and substitutes) the URL —
+            // a named entry would show its name instead (see the
+            // request-name display tests).
+            HurlEntry::from_fields("", "GET", "http://plain/0", vec![], ""), // selected (index 0)
+            HurlEntry::from_fields("", "GET", "{{ HOST }}/a", vec![], ""),
+            HurlEntry::from_fields("", "GET", "{{ BAD }}/b", vec![], ""),
         ],
     );
     let mut app = TuiApp::default();
@@ -8096,6 +8179,45 @@ fn collection_list_substitutes_and_colour_codes_by_status() {
         fg_at_substr(buf, "{{ BAD }}"),
         Some(th.err),
         "a failed substitution is red"
+    );
+}
+
+#[test]
+fn the_request_list_shows_a_named_entrys_name_instead_of_its_url() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let col = Collection::new(
+        "api".into(),
+        vec![
+            // A named entry shows its (leaf) name; an unnamed one falls back
+            // to the URL, so both behaviours are visible side by side.
+            HurlEntry::from_fields("Get widgets", "GET", "http://example/widgets", vec![], ""),
+            HurlEntry::from_fields("", "GET", "http://example/orphan", vec![], ""),
+        ],
+    );
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    app.active_tab = 1;
+
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 1, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(
+        out.contains("Get widgets"),
+        "a named request shows its name in the list:\n{out}"
+    );
+    assert!(
+        !out.contains("example/widgets"),
+        "the name replaces the URL for a named request:\n{out}"
+    );
+    assert!(
+        out.contains("example/orphan"),
+        "an unnamed request still falls back to its URL:\n{out}"
     );
 }
 
@@ -8461,6 +8583,65 @@ fn enter_on_an_empty_requests_list_does_not_open_an_editor() {
     assert!(
         app.overlay.is_none(),
         "there is nothing to edit on an empty list"
+    );
+}
+
+#[test]
+fn closing_the_edit_wizard_returns_focus_to_the_requests_list() {
+    let mut app = TuiApp::default();
+    app.collections[0]
+        .entries
+        .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
+    app.focus = Pane::List;
+
+    // Open the edit wizard from the list — focus moves to Main while it's open.
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.overlay, Some(Overlay::NewRequest(_))));
+    assert!(matches!(app.focus, Pane::Main));
+
+    // Cancelling (Esc) closes it and returns focus to the list, not the
+    // raw request (Main) view.
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "Esc closes the wizard");
+    assert!(
+        matches!(app.focus, Pane::List),
+        "focus returns to the Requests list after cancelling"
+    );
+
+    // Saving (F2) likewise lands back on the list rather than the Main panel.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.focus, Pane::Main),
+        "reopened, focus is on Main"
+    );
+    press(&mut app, KeyCode::F(2));
+    assert!(app.overlay.is_none(), "F2 saves and closes the wizard");
+    assert!(
+        matches!(app.focus, Pane::List),
+        "focus returns to the Requests list after saving"
+    );
+}
+
+#[test]
+fn creating_a_request_returns_focus_to_the_requests_list() {
+    let mut app = TuiApp::default();
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('n'));
+    assert!(matches!(app.overlay, Some(Overlay::NewRequest(_))));
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.url = super::editor::Editor::new("http://h/new", false);
+    }
+    press(&mut app, KeyCode::F(2));
+
+    assert_eq!(
+        app.collections[0].entries.len(),
+        1,
+        "the request is created"
+    );
+    assert!(
+        matches!(app.focus, Pane::List),
+        "focus stays on the Requests list after creating a request"
     );
 }
 
@@ -10402,6 +10583,41 @@ fn raw_mode_rejects_invalid_hurl_and_keeps_the_text_editable() {
         "the entry is untouched"
     );
     assert!(!app.collections[0].entries[0].modified);
+}
+
+#[test]
+fn raw_mode_reports_the_specific_parse_error_for_captures_without_a_response_line() {
+    let entry = HurlEntry::from_fields("r", "GET", "http://h/x", vec![], "");
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new(
+            "# Get token\nPOST http://h/oauth2\n[Captures]\ntok: jsonpath \"$.token\"",
+            true,
+        );
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let s = crate::i18n::Strings::for_language(&app.language);
+    match &app.status {
+        Some(crate::i18n::Status::Error(msg)) => {
+            assert!(
+                msg.contains("Captures") && msg.contains("HTTP"),
+                "the error names the section and the fix, not just 'expected one request': {msg}"
+            );
+        }
+        other => panic!("expected a descriptive parse error, got {other:?}"),
+    }
+
+    // Ctrl+Y copies the status line and leaves it on screen (still readable /
+    // re-copyable) rather than replacing it with a "Copied" acknowledgement.
+    let before = app.status.as_ref().map(|st| st.text(&s));
+    app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    let after = app.status.as_ref().map(|st| st.text(&s));
+    assert_eq!(before, after, "copying the status must not clear it");
 }
 
 #[test]
@@ -13287,29 +13503,24 @@ fn save_workspace_flow_copies_files_and_rebinds_a_local_workspace_tab_leaving_th
         Some(Overlay::Browser(FileAction::SaveWorkspaceChooseFolder, _))
     ));
 
-    // Simulate picking `dest_parent` as the destination folder via Space.
+    // Tab to the inline folder-name editor (seeded with the tab's name) and
+    // press Enter to save into `dest_parent`.
     app.last_browse_dir = Some(dest_parent.clone());
     app.overlay = Some(Overlay::Browser(FileAction::SaveWorkspaceChooseFolder, {
         let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
         let _ = ex.set_cwd(&dest_parent);
         Box::new(ex)
     }));
-    press(&mut app, KeyCode::Char(' '));
-
-    match &app.overlay {
-        Some(Overlay::Prompt {
-            kind: PromptKind::WorkspaceSaveName,
-            editor,
-            ..
-        }) => {
-            assert_eq!(
-                editor.text(),
-                original_name,
-                "the name prompt defaults to the tab's own name"
-            );
-        }
-        _ => panic!("the name prompt should open next"),
-    }
+    press(&mut app, KeyCode::Tab);
+    assert!(
+        app.browser_name_focused,
+        "Tab focuses the folder-name field"
+    );
+    assert_eq!(
+        app.browser_name.text(),
+        original_name,
+        "the folder-name field defaults to the tab's own name"
+    );
     press(&mut app, KeyCode::Enter);
 
     // The tab must now point at the new location.
@@ -13364,7 +13575,7 @@ fn save_workspace_flow_cleans_up_the_old_temp_folder_when_it_was_a_git_download(
         let _ = ex.set_cwd(&dest_parent);
         Box::new(ex)
     }));
-    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Enter); // commit default name ("myrepo")
 
     let new_root = app.collections[ci].workspace_root.clone().unwrap();
@@ -13422,7 +13633,7 @@ fn workspace_storage_choice_choose_a_folder_leads_to_a_brand_new_plain_tab_and_c
         let _ = ex.set_cwd(&dest_parent);
         Box::new(ex)
     }));
-    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Enter); // commit default name
 
     assert_eq!(
@@ -13487,7 +13698,7 @@ fn cancelling_the_destination_browser_falls_back_to_keeping_a_git_workspace_temp
 }
 
 #[test]
-fn an_empty_name_at_the_save_prompt_also_falls_back_to_keeping_the_workspace_temporary() {
+fn an_empty_name_in_the_save_browser_keeps_the_picker_open_then_esc_falls_back() {
     let repo = workspace_temp_dir("storage_choice_empty_name");
     let dest_parent = std::env::temp_dir().join(format!(
         "paperboy_ws_storage_choice_empty_{}",
@@ -13512,15 +13723,33 @@ fn an_empty_name_at_the_save_prompt_also_falls_back_to_keeping_the_workspace_tem
         let _ = ex.set_cwd(&dest_parent);
         Box::new(ex)
     }));
-    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab);
 
-    // Clear the pre-filled name entirely, then commit.
-    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
-        for _ in 0..editor.text().chars().count() {
-            editor.backspace();
-        }
-    }
+    // Clear the pre-filled name entirely, then try to commit — a blank name
+    // can't be saved, so the picker stays open (no tab created, nothing lost).
+    app.browser_name = super::editor::Editor::new("", false);
     press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::Browser(FileAction::SaveWorkspaceChooseFolder, _))
+        ),
+        "an empty name keeps the folder picker open rather than committing"
+    );
+    assert_eq!(
+        app.collections.len(),
+        before,
+        "nothing is created while the name is blank"
+    );
+
+    // Esc backs focus out to the folder list, and a second Esc there cancels —
+    // falling back to keeping the git download as a temporary tab.
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !app.browser_name_focused,
+        "first Esc unfocuses the name field"
+    );
+    press(&mut app, KeyCode::Esc);
 
     assert_eq!(
         app.collections.len(),

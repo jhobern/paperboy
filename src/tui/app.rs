@@ -48,6 +48,24 @@ pub(crate) enum FileAction {
     /// permanently (see [`TuiApp::pending_workspace_save`]) — confirms on
     /// `Space` exactly like `OpenWorkspace`, then a name prompt follows.
     SaveWorkspaceChooseFolder,
+    /// Picking a DESTINATION FOLDER for "Save Collection As" (including the
+    /// Scratch Space, which has no file of its own). Confirms on `Space` like
+    /// the Workspace folder pickers; a filename prompt (pre-filled with the
+    /// chosen folder) follows, and the collection is written there.
+    SaveCollectionChooseFolder,
+}
+
+impl FileAction {
+    /// Whether this browser action picks a destination FOLDER and then writes
+    /// a file/folder named in the browser's inline filename editor (Tab to it,
+    /// Enter to save). The two "Save … As" folder pickers; not `OpenWorkspace`
+    /// (which loads an existing folder) or the plain file pickers.
+    pub(crate) fn is_save_to_folder(&self) -> bool {
+        matches!(
+            self,
+            FileAction::SaveWorkspaceChooseFolder | FileAction::SaveCollectionChooseFolder
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,12 +91,6 @@ pub(crate) enum PromptKind {
     /// `Raw`, opened with Shift+J instead of Shift+H.
     RawJson(usize),
     FilePath(FileAction),
-    /// Naming a Workspace being saved to a permanent folder (see
-    /// [`TuiApp::pending_workspace_save`]) — the destination directory was
-    /// already chosen via the folder browser; this only picks the
-    /// workspace's own (sub)folder name within it. Defaults to the tab's
-    /// current name.
-    WorkspaceSaveName,
     /// Naming a brand-new collection file being created inside a Workspace
     /// tab (the `usize` is the workspace collection index). The typed text is
     /// a path relative to the workspace root; subfolders are allowed and a
@@ -607,10 +619,9 @@ pub(crate) enum WorkspaceSaveTarget {
 
 /// An in-progress "Save Workspace" action: copy `source_root`'s files to a
 /// permanent, user-chosen folder. `dest_dir` is filled in once the folder
-/// browser confirms a destination (see [`TuiApp::workspace_save_pick_folder`]);
-/// the final destination is `dest_dir.join(name)`, `name` coming from the
-/// follow-up [`PromptKind::WorkspaceSaveName`] prompt (defaulting to
-/// `default_name`).
+/// browser confirms a destination; the final destination is
+/// `dest_dir.join(name)`, `name` coming from the browser's inline filename
+/// editor (defaulting to `default_name`).
 pub(crate) struct PendingWorkspaceSave {
     pub(crate) source_root: PathBuf,
     pub(crate) default_name: String,
@@ -774,6 +785,12 @@ pub struct TuiApp {
     /// panel shows by default, for every request. Changed from the
     /// Preferences submenu (Settings → Preferences → Default Request View).
     pub(crate) default_request_view: request::RequestView,
+    /// Preferences (persisted): run "Run All" (Alt+F5) in batch mode — the
+    /// whole collection in one Hurl execution, so Hurl's cookie jar and
+    /// `[Captures]` chain across every request. Off by default, so Run All
+    /// streams results as they finish (matching the CLI default), at the cost
+    /// of not carrying automatic cookies between requests.
+    pub(crate) run_all_batch_mode: bool,
 
     /// User-created themes (persisted). Shown in the Theme editor alongside the
     /// built-in presets; deletable (unlike presets) with `Ctrl+D`.
@@ -825,6 +842,23 @@ pub struct TuiApp {
     /// Restored (with the picked path applied, on success) once the browser
     /// closes. Runtime-only (not persisted).
     pub(crate) parked_wizard: Option<Box<NewReq>>,
+    /// The inline filename editor shown at the bottom of a "save to folder"
+    /// browser (the two `*ChooseFolder` [`FileAction`]s): the file name for a
+    /// collection, or the workspace's own subfolder name. Seeded with a
+    /// sensible default when the browser opens; meaningless for other browser
+    /// actions. Runtime-only (not persisted).
+    pub(crate) browser_name: Editor,
+    /// Whether keyboard focus in a "save to folder" browser is on
+    /// `browser_name` (reached with Tab) rather than the folder list. Enter on
+    /// the focused filename saves into the current folder. Runtime-only.
+    pub(crate) browser_name_focused: bool,
+    /// Which pane focus returns to when the New/Edit Request wizard closes
+    /// (whether saved or cancelled). Opening the wizard temporarily moves
+    /// focus onto the Main panel so the request preview shows behind it, but
+    /// on close we restore the pane the user launched it from — normally the
+    /// Requests list — rather than stranding them on the raw request view.
+    /// Runtime-only (not persisted).
+    pub(crate) wizard_return_focus: Pane,
     /// A freshly-loaded environment (plus its still-pending secrets) parked
     /// here while the user is asked for a new name after choosing "Rename
     /// then add" on an [`Overlay::EnvCollision`] popup. Added to
@@ -897,6 +931,7 @@ impl Default for TuiApp {
             confirm_on_delete_env: true,
             always_save_when_prompted: false,
             default_request_view: request::RequestView::default(),
+            run_all_batch_mode: false,
             custom_themes: Vec::new(),
             active_theme: None,
             enhanced_keys: false,
@@ -906,6 +941,9 @@ impl Default for TuiApp {
             recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
+            browser_name: Editor::new("", false),
+            browser_name_focused: false,
+            wizard_return_focus: Pane::List,
             pending_collision_env: None,
             pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
@@ -971,9 +1009,11 @@ impl TuiApp {
         }
     }
 
-    /// "Run All" (Alt+F5): run every request in the collection, in order, in
-    /// one Hurl execution — the TUI equivalent of the CLI's batch mode, so
-    /// captures and the cookie jar chain across the whole run automatically.
+    /// "Run All" (Alt+F5): run every request in the collection, in order.
+    /// Streams results as each request finishes by default (the CLI default),
+    /// or runs the whole collection in one Hurl execution when the
+    /// `run_all_batch_mode` preference is set — in which case captures and the
+    /// cookie jar chain across the whole run automatically.
     pub(crate) fn run_all_entries(&mut self, col_idx: usize) {
         let Some(col) = self.collections.get(col_idx) else {
             return;
@@ -1006,7 +1046,15 @@ impl TuiApp {
             &self.collections[col_idx],
             env.as_ref(),
             self.response.clone(),
+            self.run_all_batch_mode,
         ) {
+            // Streaming Run All doesn't carry Hurl's automatic cookie jar
+            // between requests — warn about it in the status bar (batch mode
+            // is unaffected). Overwritten by the pass/fail summary once the
+            // run finishes.
+            if !self.run_all_batch_mode {
+                self.status = Some(Status::RunAllStreamingCookies);
+            }
             self.pending_batch_runs.push(rx);
         }
     }
@@ -1200,7 +1248,14 @@ impl TuiApp {
                 let entries = crate::hurl::parse_hurl(&text);
                 if entries.len() != 1 {
                     let s = Strings::for_language(&self.language);
-                    self.status = Some(Status::Error(s.invalid_hurl.to_string()));
+                    // Prefer the concrete parse reason (line + what's wrong)
+                    // over the generic "expected exactly one request" — the
+                    // latter only really fits the case where the text parses
+                    // but holds zero or several requests.
+                    let msg = crate::hurl::parse_hurl_error(&text)
+                        .map(|why| format!("{} {why}", s.invalid_hurl_prefix))
+                        .unwrap_or_else(|| s.invalid_hurl.to_string());
+                    self.status = Some(Status::Error(msg));
                     self.overlay = Some(Overlay::Prompt {
                         kind: PromptKind::Raw(ci),
                         editor: Editor::new(&text, true),
@@ -1295,7 +1350,6 @@ impl TuiApp {
                 self.save_state();
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
-            PromptKind::WorkspaceSaveName => self.finish_workspace_save(text),
             PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
         }
     }
@@ -1518,6 +1572,11 @@ impl TuiApp {
             // confirmed with `Space`, handled directly in `input.rs` via
             // `workspace_save_pick_folder`.
             FileAction::SaveWorkspaceChooseFolder => {}
+            // A folder-only picker like the two above: the destination is
+            // confirmed with `Space` (`collection_save_pick_folder` in
+            // `input.rs`), which then routes the real write through
+            // `FileAction::SaveCollection`, so this never reaches here.
+            FileAction::SaveCollectionChooseFolder => {}
         }
     }
 
@@ -1624,27 +1683,6 @@ impl TuiApp {
         self.open_browser(FileAction::SaveWorkspaceChooseFolder);
     }
 
-    /// The destination-folder browser (see
-    /// [`FileAction::SaveWorkspaceChooseFolder`]) confirmed `dir` — move on
-    /// to naming the workspace (defaulting to `PendingWorkspaceSave::default_name`).
-    pub(crate) fn workspace_save_pick_folder(&mut self, dir: PathBuf) {
-        let Some(pending) = self.pending_workspace_save.as_mut() else {
-            return;
-        };
-        pending.dest_dir = Some(dir);
-        let default_name = pending.default_name.clone();
-        let s = Strings::for_language(&self.language);
-        self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::WorkspaceSaveName,
-            editor: Editor::new(&default_name, false),
-            title: s.workspace_save_name_prompt.to_string(),
-            mask: false,
-            reset_to: None,
-            secret_intact: false,
-            secret_checkbox: None,
-        });
-    }
-
     /// Abandon an in-progress "Save Workspace" without completing the copy.
     /// For a just-downloaded git Workspace ([`WorkspaceSaveTarget::NewGitTab`])
     /// this falls back to keeping the download temporary (the pre-existing
@@ -1665,7 +1703,7 @@ impl TuiApp {
         }
     }
 
-    /// Commit the [`PromptKind::WorkspaceSaveName`] prompt: copy
+    /// Save the workspace under its inline filename editor name: copy
     /// `pending_workspace_save`'s files to `dest_dir/<name>` and either
     /// rebind the existing tab or create a brand new one, depending on
     /// `WorkspaceSaveTarget`. An empty name, a destination that already

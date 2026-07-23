@@ -45,11 +45,20 @@ strings! {
     req_error_prefix => "Request error:", "Erreur de requête :", "Anmodningsfejl:";
     options_menu => "Settings", "Paramètres", "Indstillinger";
     options_menu_label => "(S)ettings", "Paramètre(s)", "Ind(s)tillinger";
+    settings_item_language => "(L)anguage", "(L)angue", "(S)prog";
+    settings_item_theme => "(T)heme", "(T)hème", "(T)ema";
+    settings_item_preferences => "(P)references", "(P)références", "(P)ræferencer";
+    settings_item_clear => "(C)lose all collections", "(F)ermer toutes les collections", "(L)uk alle samlinger";
+    pref_item_confirm_exit => "Confirm on e(x)it", "Confirmer à la (s)ortie", "Bekræft ved (a)fslutning";
+    pref_item_confirm_clear => "Confirm on (c)lear", "Confirmer avant de (f)ermer", "Bekræft ved (l)ukning";
+    pref_item_confirm_delete_env => "Confirm before (d)eleting an environment", "Confirmer avant de supprimer un (e)nvironnement", "Bekræft før (s)letning af et miljø";
+    pref_item_always_save => "(A)lways save unsaved changes when prompted", "(T)oujours enregistrer les modifications non enregistrées lorsque demandé", "(G)em altid ugemte ændringer, når du bliver spurgt";
+    pref_item_default_view => "Default Request (V)iew", "(V)ue de requête par défaut", "Standard anmodnings(v)isning";
+    pref_item_run_all_batch => "Run All in (b)atch mode (chains cookies & captures)", "Tout exécuter en mode (b)atch (chaîne cookies et captures)", "Kør alle i (b)atch-tilstand (kæder cookies og optagelser)";
     language_label => "Language", "Langue", "Sprog";
     lang_english => "English", "English", "English";
     lang_french => "Français", "Français", "Français";
     lang_danish => "Dansk", "Dansk", "Dansk";
-    theme_menu => "Theme", "Thème", "Tema";
     theme_editor_title => "Theme", "Thème", "Tema";
     theme_auto => "Automatic (match language)", "Automatique (selon la langue)", "Automatisk (efter sprog)";
     theme_name_label => "Name", "Nom", "Navn";
@@ -80,16 +89,11 @@ strings! {
     theme_ch_green => "G", "G", "G";
     theme_ch_blue => "B", "B", "B";
     theme_color_popup_hint => "←/→ ±1 · ^←/^→ or PgUp/Dn ±16 · type 0-255 · ↑/↓ channel · Enter apply · Esc cancel", "←/→ ±1 · ^←/^→ ou PgPréc/Suiv ±16 · saisir 0-255 · ↑/↓ canal · Entrée appliquer · Échap annuler", "←/→ ±1 · ^←/^→ eller PgUp/Ned ±16 · indtast 0-255 · ↑/↓ kanal · Enter anvend · Esc annuller";
-    clear_all => "Close all collections", "Fermer toutes les collections", "Luk alle samlinger";
     clear_all_done => "All collections closed", "Toutes les collections ont été fermées", "Alle samlinger er lukket";
     copied_to_clipboard => "Copied to clipboard", "Copié dans le presse-papiers", "Kopieret til udklipsholder";
     preferences_menu => "Preferences", "Préférences", "Præferencer";
-    confirm_on_exit => "Confirm on exit", "Confirmer à la sortie", "Bekræft ved afslutning";
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
-    confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
-    confirm_on_delete_env => "Confirm before deleting an environment", "Confirmer avant de supprimer un environnement", "Bekræft før sletning af et miljø";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
-    always_save_when_prompted => "Always save unsaved changes when prompted", "Toujours enregistrer les modifications non enregistrées lorsque demandé", "Gem altid ugemte ændringer, når du bliver spurgt";
     view_json_label => "JSON", "JSON", "JSON";
     view_hurl_label => "Hurl", "Hurl", "Hurl";
     confirm_exit_q => "Quit PaperBoy?", "Quitter PaperBoy\u{a0}?", "Afslut PaperBoy?";
@@ -125,7 +129,6 @@ strings! {
     save_request => "Save Request…", "Enregistrer la requête…", "Gem anmodning…";
     load_request => "Load Request…", "Charger une requête…", "Indlæs anmodning…";
     open_collection => "Load Collection…", "Charger une collection…", "Indlæs samling…";
-    save_collection => "Save Collection…", "Enregistrer la collection…", "Gem samling…";
     save_environment => "Save Environment…", "Enregistrer l'environnement…", "Gem miljø…";
     save_response => "Save Response…", "Enregistrer la réponse…", "Gem svar…";
     file_saved => "Saved.", "Enregistré.", "Gemt.";
@@ -162,6 +165,9 @@ strings! {
     entry_raw_hurl => "Raw Mode (Hurl)", "Mode brut (Hurl)", "Rå tilstand (Hurl)";
     entry_raw_json => "Raw Mode (JSON)", "Mode brut (JSON)", "Rå tilstand (JSON)";
     invalid_hurl => "Not valid Hurl (expected exactly one request); edit and try again.", "Hurl invalide (une seule requête attendue) ; modifiez et réessayez.", "Ikke gyldig Hurl (forventede præcis én anmodning); ret og prøv igen.";
+    invalid_hurl_prefix => "Not valid Hurl —", "Hurl invalide —", "Ikke gyldig Hurl —";
+    status_copy_key => "^y", "^y", "^y";
+    status_copy_hint => "copy", "copier", "kopiér";
     invalid_request_json => "Not valid Request JSON (expected an object with at least \"method\" and \"url\"); edit and try again.", "JSON de requête invalide (un objet avec au moins « method » et « url » est attendu) ; modifiez et réessayez.", "Ikke gyldig anmodnings-JSON (forventede et objekt med mindst \"method\" og \"url\"); ret og prøv igen.";
     no_requests_hint => "No requests yet. Use \u{FF0B} New Request to create one.", "Aucune requête. Utilisez \u{FF0B} Nouvelle requête pour en créer une.", "Ingen anmodninger endnu. Brug \u{FF0B} Ny anmodning for at oprette en.";
     list_up_row => "‹ .. (up a folder)", "‹ .. (dossier parent)", "‹ .. (mappe op)";
@@ -222,6 +228,7 @@ strings! {
     run_summary_passed => "Passed", "Réussi", "Bestået";
     run_summary_failed => "Failed", "Échoué", "Fejlet";
     run_summary_total => "Total", "Total", "Total";
+    run_all_streaming_cookies => "Run All: streaming — cookies aren't carried between requests (use batch mode in Preferences)", "Tout exécuter : diffusion — les cookies ne sont pas transmis entre les requêtes (utilisez le mode par lots dans les Préférences)", "Kør alle: streaming — cookies overføres ikke mellem forespørgsler (brug batch-tilstand i Indstillinger)";
     env_add_var_title => "New environment variable", "Nouvelle variable d'environnement", "Ny miljøvariabel";
     env_var_switch => "switch", "changer", "skift";
     env_still_secret => "Still secret", "Toujours secret", "Stadig hemmelig";
@@ -265,8 +272,12 @@ strings! {
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
-    browser_hint_workspace_save => "Enter open folder · Space choose as destination · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme destination · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som destination · ← overordnet · ^r nulstil · Esc annuller";
-    workspace_save_name_prompt => "Workspace name", "Nom du Workspace", "Workspace-navn";
+    save_collection_folder => "Save Collection — Choose Destination Folder", "Enregistrer la collection — Choisir le dossier de destination", "Gem samling — Vælg destinationsmappe";
+    browser_hint_collection_save => "Enter open folder · Tab file name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du fichier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab filnavn · ← overordnet · ^r nulstil · Esc annuller";
+    browser_hint_workspace_save => "Enter open folder · Tab folder name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du dossier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab mappenavn · ← overordnet · ^r nulstil · Esc annuller";
+    browser_filename_label => "File name", "Nom du fichier", "Filnavn";
+    browser_foldername_label => "Folder name", "Nom du dossier", "Mappenavn";
+    browser_name_hint => "Enter save · Esc back to list", "Entrée enregistrer · Échap retour à la liste", "Enter gem · Esc tilbage til listen";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
     git_workspace_storage_q => "Workspace downloaded. Keep it in a temporary folder, or save it to a permanent location now?", "Workspace téléchargé. Le garder dans un dossier temporaire, ou l'enregistrer dans un emplacement permanent maintenant ?", "Workspace downloadet. Behold den i en midlertidig mappe, eller gem den på en permanent placering nu?";
@@ -296,7 +307,6 @@ strings! {
     git_save_success => "Saved to Git", "Enregistré sur Git", "Gemt til Git";
     git_tag_exists => "That tag already exists — tags are never overwritten. Choose a different name.", "Cette étiquette existe déjà — les étiquettes ne sont jamais écrasées. Choisissez un autre nom.", "Det tag findes allerede — tags bliver aldrig overskrevet. Vælg et andet navn.";
     git_ref_exists_race => "That name was just created by someone else — pick it from the list, or choose a different one.", "Ce nom vient d'être créé par quelqu'un d'autre — choisissez-le dans la liste, ou choisissez-en un autre.", "Det navn blev lige oprettet af en anden — vælg det fra listen, eller vælg et andet.";
-    hint_edit_base_url => "to edit", "pour modifier", "for at redigere";
     json_enter_to_edit => "to edit", "pour modifier", "for at redigere";
     subst_hint_loaded => "loaded", "chargé", "indlæst";
     subst_hint_literal => "literal", "littéral", "literal";
@@ -449,6 +459,10 @@ pub enum Status {
         failed: usize,
         total: usize,
     },
+    /// A streaming "Run All" started: warns that Hurl's automatic cookie jar
+    /// isn't carried between requests in streaming mode (switch to batch mode
+    /// in Preferences if the collection relies on that).
+    RunAllStreamingCookies,
     /// A restored Workspace tab's root folder no longer exists on disk (e.g.
     /// it was a git-downloaded temp folder and the OS cleared it since) —
     /// names the affected tab. The tab itself has already been reset to a
@@ -614,6 +628,7 @@ impl Status {
                 "{}: {passed}  {}: {failed}  {}: {total}",
                 s.run_summary_passed, s.run_summary_failed, s.run_summary_total
             ),
+            Status::RunAllStreamingCookies => s.run_all_streaming_cookies.to_string(),
             Status::Error(e) => format!("{} {e}", s.file_error_prefix),
         }
     }

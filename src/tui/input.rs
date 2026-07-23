@@ -32,6 +32,21 @@ impl TuiApp {
             self.quit = true;
             return;
         }
+        // Ctrl+Y copies the current status/error line to the clipboard. Error
+        // text (e.g. a Hurl parse failure) lives in the top bar where it can't
+        // be mouse-selected, so this is the one-key way to grab it — handy for
+        // pasting into a bug report, or straight back into the editor. Only
+        // intercepted while a message is actually showing, so it never shadows
+        // an editor's own Ctrl+Y the rest of the time. The message is left on
+        // screen (not replaced with "Copied") so it stays readable/re-copyable.
+        if key.code == KeyCode::Char('y')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(st) = &self.status
+        {
+            let text = st.text(&Strings::for_language(&self.language));
+            copy_to_clipboard(&text);
+            return;
+        }
         if self.overlay.is_some() {
             self.on_key_overlay(key);
         } else {
@@ -647,6 +662,9 @@ impl TuiApp {
                 if !folder.is_empty() {
                     form.name = Editor::new(&format!("{}/", folder.join("/")), false);
                 }
+                // A new request lands in the Requests list, so return focus
+                // there when the wizard closes rather than the raw request view.
+                self.wizard_return_focus = Pane::List;
                 self.overlay = Some(Overlay::NewRequest(Box::new(form)));
             }
             // Shift+H opens Raw Mode (the actual Hurl text of the selected
@@ -1161,7 +1179,9 @@ impl TuiApp {
                     Some(crate::tree::Row::Entry(_)) => {
                         // Entering a request focuses the panel showing it and
                         // opens the edit wizard (same as pressing Enter again
-                        // once focused on the Main panel).
+                        // once focused on the Main panel). Closing the wizard
+                        // returns focus here, to the list.
+                        self.wizard_return_focus = Pane::List;
                         self.focus = Pane::Main;
                         self.open_edit_request_wizard(ci);
                     }
@@ -1181,6 +1201,8 @@ impl TuiApp {
             }
             Pane::Main => {
                 if !self.collections[ci].entries.is_empty() {
+                    // Launched from the Main panel — return focus here on close.
+                    self.wizard_return_focus = Pane::Main;
                     self.open_edit_request_wizard(ci);
                 }
             }
@@ -1380,6 +1402,7 @@ impl TuiApp {
             col.invalidate_request_json();
             col.sync_folder_to_selected();
             self.active_tab = ci;
+            self.focus = self.wizard_return_focus;
             self.status = None;
             self.save_state();
             return;
@@ -1414,7 +1437,7 @@ impl TuiApp {
         col.selected_entry = col.entries.len() - 1;
         col.invalidate_request_json();
         col.sync_folder_to_selected();
-        self.focus = Pane::Main;
+        self.focus = self.wizard_return_focus;
         self.status = None;
         self.save_state();
     }
@@ -1513,6 +1536,7 @@ impl TuiApp {
         self.response_pct = state.response_pct;
         self.recent_git_urls = state.recent_git_urls;
         self.default_request_view = state.default_request_view;
+        self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
         self.active_theme = state.active_theme;
     }
@@ -1550,6 +1574,7 @@ impl TuiApp {
             response_pct: self.response_pct,
             recent_git_urls: self.recent_git_urls.clone(),
             default_request_view: self.default_request_view,
+            run_all_batch_mode: self.run_all_batch_mode,
             custom_themes: self.custom_themes.clone(),
             active_theme: self.active_theme.clone(),
             global_envs: self
@@ -1665,8 +1690,9 @@ impl TuiApp {
         }
     }
 
-    /// "Save … As": prompt for a filename (with the extension ghost). On commit,
-    /// an existing target triggers an overwrite confirmation.
+    /// "Save … As". Collections open a folder chooser (then a filename prompt);
+    /// environments prompt for a path directly (with the extension ghost). On
+    /// commit, an existing target triggers an overwrite confirmation.
     pub(crate) fn begin_save_as(&mut self, action: FileAction) {
         if action == FileAction::SaveEnv && self.current_env_id().is_none() {
             self.status = Some(Status::NotEnvironment);
@@ -1674,7 +1700,7 @@ impl TuiApp {
         }
         let s = Strings::for_language(&self.language);
         let ci = self.active_tab;
-        let (title, default) = match action {
+        match action {
             FileAction::SaveEnv => {
                 let default = self.original_save_path(action).unwrap_or_else(|| {
                     let name = self
@@ -1684,20 +1710,72 @@ impl TuiApp {
                         .unwrap_or_else(|| "environment".to_string());
                     format!("{name}.vars")
                 });
-                (s.save_environment, default)
+                self.open_path_prompt(action, s.save_environment, &default);
             }
+            // Collections (including the Scratch Space) pick a destination
+            // folder in the file browser first — the filename is entered in a
+            // follow-up prompt seeded with that folder (see the browser's
+            // `SaveCollectionChooseFolder` Space handler).
             _ => {
-                let default = self
-                    .original_save_path(action)
-                    .unwrap_or_else(|| format!("{}.hurl", self.collections[ci].name));
-                (s.save_collection, default)
+                let _ = ci;
+                self.open_browser(FileAction::SaveCollectionChooseFolder);
             }
-        };
-        self.open_path_prompt(action, title, &default);
+        }
+    }
+
+    /// A sensible default file name for "Save Collection As": the collection's
+    /// current file name when it has one, otherwise a name derived from its
+    /// display name (the Scratch Space and other never-saved collections land
+    /// here). Shown in the folder browser's inline filename editor.
+    pub(crate) fn default_save_collection_filename(&self) -> String {
+        let ci = self.active_tab;
+        self.collections[ci]
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                let name = self.collections[ci].name.trim();
+                let base = if name.is_empty() { "collection" } else { name };
+                format!("{base}.hurl")
+            })
     }
 
     /// Save `action` to `path`, first asking to confirm an overwrite when the
     /// target already exists (collections/environments only).
+    /// Finalize a "save to folder" browser: the user Tab'd to the inline
+    /// filename editor, typed `name`, and pressed Enter while the browser sat
+    /// in `dir`. Collections write `dir/<name>.hurl` (extension added when
+    /// missing) through the usual overwrite-confirming path; workspaces copy
+    /// their files into `dir/<name>`.
+    pub(crate) fn browser_commit_save(
+        &mut self,
+        action: FileAction,
+        dir: std::path::PathBuf,
+        name: String,
+    ) {
+        // Leaving the picker also clears the inline-editor focus so a later
+        // browser opens on the folder list.
+        self.browser_name_focused = false;
+        match action {
+            FileAction::SaveWorkspaceChooseFolder => {
+                if let Some(pending) = self.pending_workspace_save.as_mut() {
+                    pending.dest_dir = Some(dir);
+                }
+                self.finish_workspace_save(name);
+            }
+            FileAction::SaveCollectionChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("hurl");
+                }
+                let path = dir.join(file).to_string_lossy().into_owned();
+                self.save_as_path(FileAction::SaveCollection, &path);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn save_as_path(&mut self, action: FileAction, path: &str) {
         let exists = !path.is_empty() && std::path::Path::new(path).exists();
         if exists && matches!(action, FileAction::SaveCollection | FileAction::SaveEnv) {
@@ -2083,12 +2161,14 @@ impl TuiApp {
             FileAction::LoadEnv => s.load_environment,
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
+            FileAction::SaveCollectionChooseFolder => s.save_collection_folder,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
+            FileAction::SaveCollectionChooseFolder => s.browser_hint_collection_save,
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
@@ -2137,6 +2217,21 @@ impl TuiApp {
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
                 self.browser_forward_path = None;
+                // Seed the inline filename editor for the "save to folder"
+                // pickers (Tab focuses it, Enter saves into the current
+                // folder). Focus starts on the folder list.
+                self.browser_name_focused = false;
+                if action.is_save_to_folder() {
+                    let default = match action {
+                        FileAction::SaveWorkspaceChooseFolder => self
+                            .pending_workspace_save
+                            .as_ref()
+                            .map(|p| p.default_name.clone())
+                            .unwrap_or_default(),
+                        _ => self.default_save_collection_filename(),
+                    };
+                    self.browser_name = Editor::new(&default, false);
+                }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
             Err(e) => self.status = Some(Status::Error(e.to_string())),
@@ -2551,6 +2646,13 @@ impl TuiApp {
     }
 
     fn options_key_handler(&mut self, key: KeyEvent, sel: usize) {
+        let s = Strings::for_language(&self.language);
+        let items = [
+            s.settings_item_language,
+            s.settings_item_theme,
+            s.settings_item_preferences,
+            s.settings_item_clear,
+        ];
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2559,78 +2661,108 @@ impl TuiApp {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.overlay = Some(Overlay::Options((sel + 1).min(3)));
             }
-            KeyCode::Enter => match sel {
-                0 => {
-                    // Open the Language submenu, preselecting the current language.
-                    let cur = match self.language {
-                        Language::English => 0,
-                        Language::French => 1,
-                        Language::Danish => 2,
-                    };
-                    self.overlay = Some(Overlay::LanguageMenu(cur));
-                }
-                1 => self.open_theme_editor(),
-                2 => self.overlay = Some(Overlay::Preferences(0)),
-                _ => {
-                    // Close all collections, guarded by the confirm setting.
-                    if self.confirm_on_clear {
-                        self.overlay = Some(Overlay::Confirm {
-                            action: ConfirmAction::Clear,
-                            sel: 1,
-                        });
-                    } else {
-                        self.clear_all();
-                        self.status = Some(Status::Cleared);
-                    }
-                }
+            KeyCode::Enter => self.activate_options_item(sel),
+            KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                Some(i) => self.activate_options_item(i),
+                None => self.overlay = Some(Overlay::Options(sel)),
             },
             _ => self.overlay = Some(Overlay::Options(sel)),
         }
     }
 
+    /// Activate one Settings-menu row (shared by Enter and the mnemonic keys).
+    fn activate_options_item(&mut self, sel: usize) {
+        match sel {
+            0 => {
+                // Open the Language submenu, preselecting the current language.
+                let cur = match self.language {
+                    Language::English => 0,
+                    Language::French => 1,
+                    Language::Danish => 2,
+                };
+                self.overlay = Some(Overlay::LanguageMenu(cur));
+            }
+            1 => self.open_theme_editor(),
+            2 => self.overlay = Some(Overlay::Preferences(0)),
+            _ => {
+                // Close all collections, guarded by the confirm setting.
+                if self.confirm_on_clear {
+                    self.overlay = Some(Overlay::Confirm {
+                        action: ConfirmAction::Clear,
+                        sel: 1,
+                    });
+                } else {
+                    self.clear_all();
+                    self.status = Some(Status::Cleared);
+                }
+            }
+        }
+    }
+
     fn preferences_key_handler(&mut self, key: KeyEvent, sel: usize) {
+        let s = Strings::for_language(&self.language);
+        let items = [
+            s.pref_item_confirm_exit,
+            s.pref_item_confirm_clear,
+            s.pref_item_confirm_delete_env,
+            s.pref_item_always_save,
+            s.pref_item_run_all_batch,
+            s.pref_item_default_view,
+        ];
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = Some(Overlay::Options(2)),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::Preferences((sel + 1).min(4)));
+                self.overlay = Some(Overlay::Preferences((sel + 1).min(5)));
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                match sel {
-                    0 => {
-                        self.confirm_on_exit = !self.confirm_on_exit;
-                        self.save_state();
-                        self.overlay = Some(Overlay::Preferences(sel));
-                    }
-                    1 => {
-                        self.confirm_on_clear = !self.confirm_on_clear;
-                        self.save_state();
-                        self.overlay = Some(Overlay::Preferences(sel));
-                    }
-                    2 => {
-                        self.confirm_on_delete_env = !self.confirm_on_delete_env;
-                        self.save_state();
-                        self.overlay = Some(Overlay::Preferences(sel));
-                    }
-                    3 => {
-                        self.always_save_when_prompted = !self.always_save_when_prompted;
-                        self.save_state();
-                        self.overlay = Some(Overlay::Preferences(sel));
-                    }
-                    _ => {
-                        // Open the Default Request View submenu,
-                        // preselecting the current view.
-                        let cur = match self.default_request_view {
-                            request::RequestView::Json => 0,
-                            request::RequestView::Hurl => 1,
-                        };
-                        self.overlay = Some(Overlay::RequestViewMenu(cur));
-                    }
-                }
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate_preference_item(sel),
+            KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                Some(i) => self.activate_preference_item(i),
+                None => self.overlay = Some(Overlay::Preferences(sel)),
+            },
             _ => self.overlay = Some(Overlay::Preferences(sel)),
+        }
+    }
+
+    /// Toggle or open one Preferences row (shared by Enter/Space and mnemonics).
+    fn activate_preference_item(&mut self, sel: usize) {
+        match sel {
+            0 => {
+                self.confirm_on_exit = !self.confirm_on_exit;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            1 => {
+                self.confirm_on_clear = !self.confirm_on_clear;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            2 => {
+                self.confirm_on_delete_env = !self.confirm_on_delete_env;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            3 => {
+                self.always_save_when_prompted = !self.always_save_when_prompted;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            4 => {
+                self.run_all_batch_mode = !self.run_all_batch_mode;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            _ => {
+                // Open the Default Request View submenu,
+                // preselecting the current view.
+                let cur = match self.default_request_view {
+                    request::RequestView::Json => 0,
+                    request::RequestView::Hurl => 1,
+                };
+                self.overlay = Some(Overlay::RequestViewMenu(cur));
+            }
         }
     }
 
@@ -2688,7 +2820,7 @@ impl TuiApp {
             // to Preferences afterwards; there's nothing left to
             // "confirm" or "cancel" since the value's already applied.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                self.overlay = Some(Overlay::Preferences(4))
+                self.overlay = Some(Overlay::Preferences(5))
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let new_sel = sel.saturating_sub(1);
@@ -2864,8 +2996,6 @@ impl TuiApp {
                         let mut popup = EnvPopupState::new(env_id);
                         popup.idx = idx;
                         self.overlay = Some(Overlay::EnvPopup(popup));
-                    } else if matches!(kind, PromptKind::WorkspaceSaveName) {
-                        self.cancel_workspace_save();
                     } else if let PromptKind::NewWorkspaceCollection(ci) = kind {
                         // Cancelling the name prompt drops back to the
                         // workspace destination picker (still parked
@@ -2925,6 +3055,45 @@ impl TuiApp {
         mut ex: Box<FileExplorer>,
     ) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The "save to folder" pickers carry an inline filename editor at the
+        // bottom. Tab swaps focus between the folder list and that editor; a
+        // focused editor swallows editing keys and saves on Enter.
+        let save_folder = action.is_save_to_folder();
+        if save_folder && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.browser_name_focused = !self.browser_name_focused;
+            self.overlay = Some(Overlay::Browser(action, ex));
+            return;
+        }
+        if save_folder && self.browser_name_focused {
+            match key.code {
+                // Esc backs focus out to the folder list rather than
+                // cancelling outright (a second Esc there cancels).
+                KeyCode::Esc => {
+                    self.browser_name_focused = false;
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
+                KeyCode::Enter => {
+                    let name = self.browser_name.text().trim().to_string();
+                    if name.is_empty() {
+                        // Nothing to save under a blank name — keep the picker
+                        // open so the user can type one.
+                        self.overlay = Some(Overlay::Browser(action, ex));
+                    } else {
+                        let dir = ex.cwd().clone();
+                        self.last_browse_dir = Some(dir.clone());
+                        // On success the finalizers leave the overlay closed
+                        // (or open an overwrite confirmation); nothing to
+                        // re-show here.
+                        self.browser_commit_save(action, dir, name);
+                    }
+                }
+                _ => {
+                    apply_edit_key(&mut self.browser_name, key);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                }
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 // Cancelling the picker restores the parked wizard (if any)
@@ -2971,11 +3140,16 @@ impl TuiApp {
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else if matches!(
                     action,
-                    FileAction::OpenWorkspace | FileAction::SaveWorkspaceChooseFolder
+                    FileAction::OpenWorkspace
+                        | FileAction::SaveWorkspaceChooseFolder
+                        | FileAction::SaveCollectionChooseFolder
                 ) {
-                    // A Workspace root/destination must be a folder, not
-                    // a file — Enter on a file here is a no-op; `Space`
-                    // picks the *current* folder instead (see below).
+                    // A Workspace root/destination (or a collection save
+                    // destination) must be a folder, not a file — Enter on a
+                    // file here is a no-op. For the "save to folder" pickers,
+                    // Tab to the filename field at the bottom and press Enter
+                    // there to save into the current folder; `Space` picks the
+                    // current folder as a Workspace root (OpenWorkspace).
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else {
                     // A file is selected — remember its folder so the browser
@@ -2998,15 +3172,6 @@ impl TuiApp {
                 self.last_browse_dir = Some(root.clone());
                 self.confirm_workspace_root(root);
                 self.save_state();
-            }
-            KeyCode::Char(' ') if action == FileAction::SaveWorkspaceChooseFolder => {
-                // Confirm the CURRENT WORKING DIRECTORY as the
-                // destination folder — the workspace's own (sub)folder
-                // is created inside it once the following name prompt
-                // is committed (see `workspace_save_pick_folder`).
-                let dir = ex.cwd().clone();
-                self.last_browse_dir = Some(dir.clone());
-                self.workspace_save_pick_folder(dir);
             }
             KeyCode::Char('r') if ctrl => {
                 // Snap back to the folder the browser first opened in —
@@ -3699,6 +3864,12 @@ impl TuiApp {
                 form.ctype_dropdown_hidden = false;
             }
             self.overlay = Some(Overlay::NewRequest(form));
+        } else {
+            // The form was cancelled (Esc) — it stays closed; return focus to
+            // wherever the wizard was launched from (normally the Requests
+            // list) instead of leaving it stranded on the Main panel, which
+            // Enter-to-edit had moved it to when opening the wizard.
+            self.focus = self.wizard_return_focus;
         }
     }
 

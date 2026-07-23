@@ -197,6 +197,12 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(Span::raw("     "));
         let c = if st.is_ok() { th.ok } else { th.err };
         spans.push(Span::styled(st.text(s), Style::default().fg(c)));
+        // Advertise the copy shortcut so the (mouse-unselectable) status text
+        // can be grabbed — especially useful for long parse-error messages.
+        spans.push(Span::styled(
+            format!("  ({} {})", s.status_copy_key, s.status_copy_hint),
+            Style::default().fg(th.dim),
+        ));
     }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
@@ -217,17 +223,6 @@ pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
         ),
         Span::raw("  "),
         Span::styled(format!("[{lang}]"), Style::default().fg(th.dim)),
-        Span::raw("   "),
-        Span::styled(s.base_url, Style::default().fg(th.text)),
-        Span::raw(" "),
-        Span::styled(
-            app.vars.base_url.clone(),
-            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  (b {})", s.hint_edit_base_url),
-            Style::default().fg(th.dim),
-        ),
     ];
     // Surface the last runner error (transport failure / failed assert / parse
     // error) here on the status bar so it is never silently swallowed.
@@ -264,7 +259,6 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
 
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     let focused = app.focus == Pane::Tabs;
-    let mut spans: Vec<Span> = Vec::new();
     let mk = |label: String, active: bool| -> Span {
         if active {
             Span::styled(
@@ -278,9 +272,18 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             Span::styled(format!(" {label} "), Style::default().fg(th.dim))
         }
     };
+    // Build every tab span up front, tracking the running character offset so
+    // the active tab's position within the full strip is known — that lets the
+    // bar scroll horizontally to keep the active tab visible when the tabs
+    // overflow the available width (otherwise later tabs are unreachable).
+    let mut spans: Vec<Span> = Vec::new();
+    let mut pos = 0usize;
+    let mut active_start = 0usize;
+    let mut active_w = 0usize;
     for (i, col) in app.collections.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("│"));
+            pos += 1;
         }
         // The tab's own name is persistent (renameable with F2) and never
         // changes when the user picks a different collection within a
@@ -291,10 +294,51 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         } else {
             format!("{}{}", tab_icons(col), col.name)
         };
+        let w = name.chars().count() + 2; // " {name} "
+        if app.active_tab == i {
+            active_start = pos;
+            active_w = w;
+        }
         spans.push(mk(name, app.active_tab == i));
+        pos += w;
     }
+    let total_w = pos;
+    // Content width available inside the panel borders.
+    let avail = area.width.saturating_sub(2) as usize;
+
+    let line = if total_w <= avail || avail == 0 {
+        Line::from(spans)
+    } else {
+        // Scroll so the active tab is fully visible. Reserve up to two columns
+        // for the ‹ / › overflow markers when deciding the target window, so
+        // the active tab never hides behind a marker.
+        let target_w = avail.saturating_sub(2).max(1);
+        let mut scroll = 0usize;
+        if active_start + active_w > scroll + target_w {
+            scroll = (active_start + active_w).saturating_sub(target_w);
+        }
+        if active_start < scroll {
+            scroll = active_start;
+        }
+        // Mirror the collection-list URL scroll: a ‹ marks hidden tabs to the
+        // left, a › hidden tabs to the right, each costing one column.
+        let show_left = scroll > 0;
+        let content_w_before_right = avail.saturating_sub(show_left as usize);
+        let remaining = total_w.saturating_sub(scroll);
+        let show_right = remaining > content_w_before_right;
+        let content_w = content_w_before_right.saturating_sub(show_right as usize);
+        let mut out: Vec<Span> = Vec::new();
+        if show_left {
+            out.push(Span::styled("\u{2039}", Style::default().fg(th.accent)));
+        }
+        out.extend(take_display(skip_display(spans, scroll), content_w));
+        if show_right {
+            out.push(Span::styled("\u{203a}", Style::default().fg(th.accent)));
+        }
+        Line::from(out)
+    };
     f.render_widget(
-        Paragraph::new(Line::from(spans)).block(panel(s.tabs_heading.to_string(), focused, th)),
+        Paragraph::new(line).block(panel(s.tabs_heading.to_string(), focused, th)),
         area,
     );
 }
@@ -343,12 +387,24 @@ pub(crate) fn draw_collection_left(
     let url_w = panes[0].width.saturating_sub(2 + 2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
-    // Folder/Up/collection rows have no scrollable URL text.
+    // Folder/Up/collection rows have no scrollable URL text. A row that shows a
+    // request's name (title) instead of its URL isn't horizontally scrolled
+    // (names are short display labels), so its scroll length is zero.
     let sel_len = view_rows
         .get(sel)
         .and_then(LeftRow::entry_idx)
         .and_then(|idx| col.entries.get(idx))
-        .map(|e| crate::request::subst_display(&e.url, &smap).chars().count())
+        .map(|e| {
+            if crate::tree::entry_path(&e.title)
+                .pop()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                crate::request::subst_display(&e.url, &smap).chars().count()
+            } else {
+                0
+            }
+        })
         .unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((url_w as usize).saturating_sub(1));
     let hscroll = (app.list_hscroll as usize).min(max_scroll);
@@ -411,31 +467,43 @@ pub(crate) fn draw_collection_left(
                     }
                     RunStatus::NotRun => Span::raw("  "),
                 });
-                // The URL, with `{{ VAR }}` substituted + colour-coded by status.
-                let mut seen = SubstSeen::default();
-                let url_spans = highlight_spans(&e.url, &smap, th, &mut seen, None, None);
-                // Horizontally scroll only the selected row so its full (possibly
-                // long) URL can be read with ← / →; other rows show from the start.
-                // Arrow hints appear on whichever side still has hidden text so
-                // it's clear more can be scrolled into view in that direction.
-                if i == sel {
-                    let avail = url_w as usize;
-                    let show_left = hscroll > 0;
-                    let content_w_before_right = avail.saturating_sub(show_left as usize);
-                    let remaining = sel_len.saturating_sub(hscroll);
-                    let show_right = remaining > content_w_before_right;
-                    let content_w = content_w_before_right.saturating_sub(show_right as usize);
-                    if show_left {
-                        spans.push(Span::styled("\u{2039}", Style::default().fg(th.dim))); // ‹ = scrolled
-                    }
-                    spans.extend(take_display(skip_display(url_spans, hscroll), content_w));
-                    if show_right {
-                        spans.push(Span::styled("\u{203a}", Style::default().fg(th.dim))); // › = more to the right
-                    }
+                // Show the request's name when it has one; otherwise fall back
+                // to the URL. A title encodes a folder path (`Auth/Login`), and
+                // those folders are already rows in the tree, so only the leaf
+                // segment (the request's own name within its folder) is shown
+                // here — never the redundant folder prefix.
+                let name = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                if !name.is_empty() {
+                    spans.push(Span::styled(name, Style::default().fg(th.text)));
+                    ListItem::new(Line::from(spans))
                 } else {
-                    spans.extend(url_spans);
+                    // The URL, with `{{ VAR }}` substituted + colour-coded by status.
+                    let mut seen = SubstSeen::default();
+                    let url_spans = highlight_spans(&e.url, &smap, th, &mut seen, None, None);
+                    // Horizontally scroll only the selected row so its full (possibly
+                    // long) URL can be read with ← / →; other rows show from the start.
+                    // Arrow hints appear on whichever side still has hidden text so
+                    // it's clear more can be scrolled into view in that direction.
+                    if i == sel {
+                        let avail = url_w as usize;
+                        let show_left = hscroll > 0;
+                        let content_w_before_right = avail.saturating_sub(show_left as usize);
+                        let remaining = sel_len.saturating_sub(hscroll);
+                        let show_right = remaining > content_w_before_right;
+                        let content_w = content_w_before_right.saturating_sub(show_right as usize);
+                        if show_left {
+                            spans.push(Span::styled("\u{2039}", Style::default().fg(th.dim))); // ‹ = scrolled
+                        }
+                        spans.extend(take_display(skip_display(url_spans, hscroll), content_w));
+                        if show_right {
+                            spans.push(Span::styled("\u{203a}", Style::default().fg(th.dim)));
+                            // › = more to the right
+                        }
+                    } else {
+                        spans.extend(url_spans);
+                    }
+                    ListItem::new(Line::from(spans))
                 }
-                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -1139,6 +1207,7 @@ pub(crate) fn draw_collection_main(
     let url = entry.url.clone();
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
+    let expected_status = entry.expected_status;
     // The Hurl view always renders (it's actual Hurl syntax, not JSON, so the
     // "invalid JSON" check below is meaningless for it and skipped entirely).
     let (buf, valid) = if hurl_view {
@@ -1278,11 +1347,21 @@ pub(crate) fn draw_collection_main(
             ]));
         }
     }
-    if !asserts.is_empty() {
+    if !asserts.is_empty() || expected_status.is_some() {
         top_lines.push(Line::styled(
             "[Asserts]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
+        // Surface the `HTTP <code>` response line (stored separately as
+        // `expected_status`) as a synthesized `status == <code>` assert row so
+        // the status check reads as one of the asserts, matching how Hurl
+        // evaluates it.
+        if let Some(code) = expected_status {
+            top_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("status == {code}"), Style::default().fg(th.dim)),
+            ]));
+        }
         for a in &asserts {
             top_lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -1619,37 +1698,47 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::Options(sel) => {
             let items = [
-                s.language_label,
-                s.theme_menu,
-                s.preferences_menu,
-                s.clear_all,
+                s.settings_item_language,
+                s.settings_item_theme,
+                s.settings_item_preferences,
+                s.settings_item_clear,
             ];
             draw_menu_popup(f, s.options_menu, &items, *sel, th);
         }
         Overlay::Preferences(sel) => {
             let mark = |b: bool| if b { "[x]" } else { "[ ]" };
-            let exit_item = format!("{} {}", mark(app.confirm_on_exit), s.confirm_on_exit);
-            let clear_item = format!("{} {}", mark(app.confirm_on_clear), s.confirm_on_clear);
+            let exit_item = format!("{} {}", mark(app.confirm_on_exit), s.pref_item_confirm_exit);
+            let clear_item = format!(
+                "{} {}",
+                mark(app.confirm_on_clear),
+                s.pref_item_confirm_clear
+            );
             let delete_env_item = format!(
                 "{} {}",
                 mark(app.confirm_on_delete_env),
-                s.confirm_on_delete_env
+                s.pref_item_confirm_delete_env
             );
             let view_label = match app.default_request_view {
                 request::RequestView::Json => "JSON",
                 request::RequestView::Hurl => "Hurl",
             };
-            let view_item = format!("{}: {view_label}", s.default_request_view_label);
+            let view_item = format!("{}: {view_label}", s.pref_item_default_view);
             let always_save_item = format!(
                 "{} {}",
                 mark(app.always_save_when_prompted),
-                s.always_save_when_prompted
+                s.pref_item_always_save
+            );
+            let run_all_batch_item = format!(
+                "{} {}",
+                mark(app.run_all_batch_mode),
+                s.pref_item_run_all_batch
             );
             let items = [
                 exit_item.as_str(),
                 clear_item.as_str(),
                 delete_env_item.as_str(),
                 always_save_item.as_str(),
+                run_all_batch_item.as_str(),
                 view_item.as_str(),
             ];
             draw_menu_popup(f, s.preferences_menu, &items, *sel, th);
@@ -2118,12 +2207,48 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 );
             }
         }
-        Overlay::Browser(_action, ex) => {
+        Overlay::Browser(action, ex) => {
             let w = (f.area().width * 7 / 10).max(50);
             let h = (f.area().height * 7 / 10).max(10);
             let area = centered_rect(w, h, f.area());
             f.render_widget(Clear, area);
-            ex.widget().render_ref(area, f.buffer_mut());
+            if action.is_save_to_folder() {
+                // Reserve a bordered filename box at the bottom that the user
+                // can Tab to and press Enter to save into the current folder.
+                let rows =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+                ex.widget().render_ref(rows[0], f.buffer_mut());
+                let focused = app.browser_name_focused;
+                let label = if *action == FileAction::SaveWorkspaceChooseFolder {
+                    s.browser_foldername_label
+                } else {
+                    s.browser_filename_label
+                };
+                let title = if focused {
+                    format!("{label}  ({})", s.browser_name_hint)
+                } else {
+                    label.to_string()
+                };
+                // Use the shared themed panel (accent border + bold title when
+                // focused, dim otherwise, panel background) so the field looks
+                // like every other bordered box in the app.
+                let block = panel(title, focused, th);
+                let inner = block.inner(rows[1]);
+                f.render_widget(block, rows[1]);
+                if focused {
+                    render_editor(f, inner, &app.browser_name, false, th);
+                } else {
+                    // The folder list owns the cursor while unfocused; render
+                    // the pending name statically (no caret) so it's clear the
+                    // field isn't the active pane.
+                    f.render_widget(
+                        Paragraph::new(app.browser_name.text()).style(Style::default().fg(th.dim)),
+                        inner,
+                    );
+                }
+            } else {
+                ex.widget().render_ref(area, f.buffer_mut());
+            }
         }
         Overlay::NewRequest(form) => draw_new_request(f, form, s, th, app.enhanced_keys),
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th),

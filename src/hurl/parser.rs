@@ -23,6 +23,47 @@ pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
     file.entries.iter().map(|e| map_entry(e, &lines)).collect()
 }
 
+/// Explain, in one short line, *why* `content` isn't valid Hurl — for the Raw
+/// editor's "couldn't save" status, which is otherwise the unhelpfully generic
+/// "expected exactly one request". Returns `None` when the text parses cleanly
+/// (so any "wrong number of requests" problem is left to the caller).
+///
+/// The most common trip-up is putting `[Captures]`/`[Asserts]` on a request
+/// with no `HTTP` response line: those are *response* sections, so `hurl_core`
+/// rejects them as unknown *request* sections. We surface that case with a
+/// concrete fix (`HTTP *` matches any status) rather than the raw parser jargon.
+pub fn parse_hurl_error(content: &str) -> Option<String> {
+    use hurl_core::error::DisplaySourceError;
+    use hurl_core::parser::ParseErrorKind;
+    let err = parse_hurl_file(content).err()?;
+    let line = err.pos.line;
+    let reason = match &err.kind {
+        ParseErrorKind::RequestSectionName { name }
+            if matches!(name.as_str(), "Captures" | "Asserts") =>
+        {
+            format!(
+                "line {line}: [{name}] is a response section — add an 'HTTP' status line \
+                 above it (use 'HTTP *' to accept any status)"
+            )
+        }
+        ParseErrorKind::RequestSectionName { name } => {
+            format!("line {line}: [{name}] is not a valid request section")
+        }
+        ParseErrorKind::Method { .. } => {
+            format!("line {line}: expected an HTTP method (e.g. GET, POST)")
+        }
+        ParseErrorKind::Version => {
+            format!("line {line}: a response line must be 'HTTP <status>' (e.g. 'HTTP 200')")
+        }
+        ParseErrorKind::Status => format!("line {line}: invalid status code"),
+        ParseErrorKind::UrlInvalidStart | ParseErrorKind::UrlIllegalCharacter(_) => {
+            format!("line {line}: invalid URL")
+        }
+        _ => format!("line {line}: {}", err.description().to_lowercase()),
+    };
+    Some(reason)
+}
+
 fn map_entry(e: &Entry, lines: &[&str]) -> HurlEntry {
     let req = &e.request;
 
@@ -458,6 +499,33 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
 mod tests {
     use super::super::entry::collection_to_hurl;
     use super::*;
+
+    #[test]
+    fn parse_error_explains_captures_needing_a_response_line() {
+        // `[Captures]` on a request with no `HTTP` line is the classic trip-up:
+        // it's a *response* section, so hurl_core rejects it as an unknown
+        // request section. The message must name the section and the fix.
+        let content =
+            "# Get token\nPOST http://h/oauth2\n[Captures]\naccess_token: jsonpath \"$.token\"\n";
+        assert!(parse_hurl(content).is_empty(), "this really is unparseable");
+        let why = parse_hurl_error(content).expect("a reason is produced");
+        assert!(
+            why.contains("Captures"),
+            "names the offending section: {why}"
+        );
+        assert!(
+            why.contains("HTTP"),
+            "points at the missing response line: {why}"
+        );
+        assert!(why.contains("line 3"), "cites the line: {why}");
+    }
+
+    #[test]
+    fn parse_error_is_none_for_valid_hurl() {
+        let content = "GET http://h/x\nHTTP 200\n[Captures]\ntok: jsonpath \"$.t\"\n";
+        assert_eq!(parse_hurl(content).len(), 1);
+        assert!(parse_hurl_error(content).is_none());
+    }
 
     #[test]
     fn body_terminates_at_http_so_later_entries_parse() {

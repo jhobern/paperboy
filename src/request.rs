@@ -15,8 +15,8 @@ use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
 use crate::http::ApiResponse;
 use crate::hurl::{
-    FormField, HurlEntry, collection_to_hurl, expand_base64_form_fields, run_hurl,
-    stage_out_of_scope_form_files,
+    EntryOutcome, FormField, HurlEntry, collection_to_hurl, expand_base64_form_fields, run_hurl,
+    run_hurl_streaming, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -670,17 +670,43 @@ pub fn run_collection(
     Some(rx)
 }
 
-/// Run every entry in the collection, in order, in a single Hurl execution —
-/// mirroring the CLI's batch mode, so Hurl's own cookie jar and `[Captures]`
-/// chaining apply across the whole run exactly as they would from the command
-/// line. Always returns a `Receiver` (except when the collection is empty or
-/// a Body/Form conflict blocks it outright) since the caller needs it to
-/// learn per-entry pass/fail and each entry's own response, regardless of
-/// whether anything was captured.
+/// Build the standalone `ApiResponse` the Response pane shows for one entry of
+/// a "Run All" pass (used by both the batch and streaming paths).
+fn entry_response(eo: &EntryOutcome) -> ApiResponse {
+    ApiResponse {
+        status: eo.status,
+        status_text: eo.status_text.clone(),
+        body: Arc::from(eo.body.as_str()),
+        loading: false,
+        error: eo.error.clone().unwrap_or_default(),
+        headers: eo.headers.clone(),
+        assert_results: eo.asserts.clone(),
+    }
+}
+
+/// Run every entry in the collection, in order.
+///
+/// Two modes, mirroring the CLI:
+/// - **Streaming** (`batch == false`, the default): each entry runs on its
+///   own and results are pushed out as they finish, so the Requests list
+///   stamps each pass/fail marker live. Hurl's automatic cookie jar does
+///   *not* carry from one request to the next in this mode (an explicit
+///   `[Cookies]` section is unaffected) — the caller raises a status-bar
+///   warning about that when a streaming Run All starts.
+/// - **Batch** (`batch == true`): the whole collection runs in one Hurl
+///   execution, so the cookie jar and `[Captures]` chaining apply across the
+///   entire run exactly as they would from the command line; a single update
+///   is sent when it finishes.
+///
+/// Always returns a `Receiver` (except when the collection is empty or a
+/// Body/Form conflict blocks it outright) since the caller needs it to learn
+/// per-entry pass/fail and each entry's own response, regardless of whether
+/// anything was captured.
 pub fn run_all_entries(
     col: &Collection,
     env: Option<&Environment>,
     state: Arc<Mutex<ApiResponse>>,
+    batch: bool,
 ) -> Option<Receiver<BatchRunUpdate>> {
     if col.entries.is_empty() {
         return None;
@@ -726,15 +752,41 @@ pub fn run_all_entries(
         }
         let content = collection_to_hurl(&run_entries);
 
-        let out = run_hurl(&content, &vars, run_root);
+        let mut results: Vec<Option<bool>> = vec![None; total];
+        let mut captures: HashMap<String, String> = HashMap::new();
+        let mut responses: Vec<Option<ApiResponse>> = vec![None; total];
+
+        let out = if batch {
+            run_hurl(&content, &vars, run_root)
+        } else {
+            // Streaming: run each entry on its own and push a cumulative
+            // snapshot after every one, so the Requests list stamps each
+            // pass/fail marker the instant that entry finishes rather than
+            // only once the whole run is done. The poll side drains every
+            // queued message per frame, so the intermediate snapshots simply
+            // supersede one another. (Cookies set by one request don't carry
+            // to the next in this mode — the caller warns about that.)
+            let mut idx = 0usize;
+            run_hurl_streaming(&content, &vars, run_root, |eo| {
+                if idx < total {
+                    results[idx] = Some(eo.ok);
+                    captures.extend(eo.captures.iter().cloned());
+                    responses[idx] = Some(entry_response(eo));
+                }
+                idx += 1;
+                let _ = tx.send(BatchRunUpdate {
+                    col_id,
+                    results: results.clone(),
+                    captures: captures.clone(),
+                    responses: responses.clone(),
+                });
+            })
+        };
         if let Some(dir) = &staged_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
         let mut r = state.lock().unwrap();
         r.loading = false;
-        let mut results: Vec<Option<bool>> = vec![None; total];
-        let mut captures: HashMap<String, String> = HashMap::new();
-        let mut responses: Vec<Option<ApiResponse>> = vec![None; total];
         match out.entries.last() {
             Some(last) => {
                 r.status = last.status;
@@ -755,25 +807,22 @@ pub fn run_all_entries(
                     .unwrap_or_else(|| "no response".to_string());
             }
         }
-        for (i, eo) in out.entries.iter().enumerate().take(total) {
-            results[i] = Some(eo.ok);
-            captures.extend(eo.captures.iter().cloned());
-            responses[i] = Some(ApiResponse {
-                status: eo.status,
-                status_text: eo.status_text.clone(),
-                body: Arc::from(eo.body.as_str()),
-                loading: false,
-                error: eo.error.clone().unwrap_or_default(),
-                headers: eo.headers.clone(),
-                assert_results: eo.asserts.clone(),
+        // Batch ran the whole collection in one call, so fill the per-entry
+        // vectors from the final result set and send a single update.
+        // (Streaming already emitted its final cumulative snapshot above.)
+        if batch {
+            for (i, eo) in out.entries.iter().enumerate().take(total) {
+                results[i] = Some(eo.ok);
+                captures.extend(eo.captures.iter().cloned());
+                responses[i] = Some(entry_response(eo));
+            }
+            let _ = tx.send(BatchRunUpdate {
+                col_id,
+                results,
+                captures,
+                responses,
             });
         }
-        let _ = tx.send(BatchRunUpdate {
-            col_id,
-            results,
-            captures,
-            responses,
-        });
     });
     Some(rx)
 }
@@ -1341,8 +1390,8 @@ mod tests {
         let state = Arc::new(Mutex::new(ApiResponse::default()));
 
         assert!(
-            run_all_entries(&col, None, state).is_some(),
-            "a non-empty collection must start a batch run"
+            run_all_entries(&col, None, state, false).is_some(),
+            "a non-empty collection must start a streaming run"
         );
     }
 
@@ -1368,7 +1417,7 @@ mod tests {
         let col = Collection::new("c".into(), vec![ok_entry, bad_entry]);
         let state = Arc::new(Mutex::new(ApiResponse::default()));
 
-        let rx = run_all_entries(&col, None, state.clone());
+        let rx = run_all_entries(&col, None, state.clone(), false);
 
         assert!(rx.is_none(), "must not start a run that can never be built");
         let r = state.lock().unwrap();

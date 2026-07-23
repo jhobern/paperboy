@@ -12,6 +12,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Status-code assertions appear in the `[Asserts]` list.** A bare `HTTP 200`
+  status line is now shown as a synthesized `status == 200` row at the top of a
+  request's `[Asserts]` section (in both the Request preview and the Response
+  view) and is counted in the pass/fail badge, so an implicit status check is
+  no longer invisible.
+- **"Run All" streams results as they finish.** By default Run All (Alt+F5) now
+  runs each request on its own and stamps each pass/fail marker in the Requests
+  list the instant that request completes — matching the CLI's default — with a
+  status-bar note that automatic cookies aren't carried between requests in this
+  mode. A new **Run All in batch mode** preference (Settings → Preferences)
+  switches back to running the whole collection in one execution, which chains
+  Hurl's cookie jar and `[Captures]` across every request.
+- **The Settings and Preferences menus have shortcut keys.** Each row now shows
+  a `(letter)` mnemonic — like the File menu — that activates it directly.
+- **The tab bar scrolls when it overflows.** When more collection/workspace
+  tabs are open than fit across the top, the bar now scrolls to keep the active
+  tab in view and shows `‹`/`›` markers so you can tell there are more tabs off
+  each edge.
+- **Request names are shown in the Requests list.** A request with a name set
+  (in the request editor) now displays that name in the list instead of its
+  URL; unnamed requests still show the URL.
 - **Query parameters section in the request editor** — the New Request wizard
   gains a `[Query]` section alongside Headers and Cookies, with the same
   enabled checkbox / key / value / description columns and the same navigation
@@ -29,6 +50,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   dim `↵` now appears in the panel's rightmost column on each continued row, so
   a wrapped line reads unambiguously as one line rather than several separate
   ones. The marker sits in a reserved column and never hides any content.
+- **"Save to folder" dialogs have an inline file-name editor.** The folder
+  browser for "Save Collection As…" and "Save Workspace…" now shows a file-name
+  field at the bottom: press `Tab` to focus it, edit the name, and press `Enter`
+  to save into the current folder (a missing `.hurl` extension is added
+  automatically). This replaces the previous two-step "pick folder, then answer
+  a separate name prompt" flow.
+- **The status/error line can be copied with `^y`.** Messages in the top bar —
+  including long Hurl parse errors — can't be mouse-selected, so `Ctrl+Y` now
+  copies the current status line to the clipboard (the message stays on screen).
+
+### Changed
+
+- **A failed status assertion now explains itself.** Instead of the terse
+  `Request error: Assert status code: HTTP 200`, the Response pane now reads
+  e.g. `Expected status 200 but got 404 Not Found (GET https://example/x)`,
+  naming the expected and actual status and the request that failed.
+- **"Save Collection As…" opens a folder chooser.** Saving a collection (or the
+  Scratch Space) to a new location now lets you browse to and pick the
+  destination folder before naming the file, matching "Save Workspace…".
+- **The Raw Hurl editor explains why text won't save.** When saving from Raw
+  Mode fails, the status line now gives the specific reason and line number
+  (e.g. `[Captures] is a response section — add an 'HTTP' status line above it
+  (use 'HTTP *' to accept any status)`) instead of the generic "expected exactly
+  one request".
+- **The default-new-request URL no longer occupies the top bar.** The persistent
+  "Default New Request URL" readout has been removed from the header; the `b`
+  shortcut still opens the editor for it (and it remains documented in Help).
 
 ### Fixed
 
@@ -43,6 +91,9 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `←`/`→` now step onto a Form row's leading enabled checkbox, and skip the
   Content-Type cell on a Base64 File row (where it doesn't apply) rather than
   stopping on it.
+- **Closing the request editor returns focus to the Requests list.** Cancelling
+  or submitting the editor opened from the list no longer jumps focus to the raw
+  request view; it stays on the collection's Requests list where it was opened.
 
 ### Internal
 
