@@ -14548,7 +14548,9 @@ fn report_editor_ghost_completes_a_request_name() {
     press(&mut app, KeyCode::Char('e')); // edit focus; cursor at end of "REQUEST Oau"
 
     assert_eq!(
-        app.report_request_ghost(idx).as_deref(),
+        app.report_request_completion(idx)
+            .map(|c| c.ghost)
+            .as_deref(),
         Some("th"),
         "the remainder of the matching request name is offered"
     );
@@ -14564,7 +14566,7 @@ fn report_editor_ghost_completes_a_request_name() {
         "Right arrow fills the ghost in"
     );
     // With the name complete, there's no longer a ghost.
-    assert_eq!(app.report_request_ghost(idx), None);
+    assert!(app.report_request_completion(idx).is_none());
 }
 
 /// The ghost only appears at the end of a `REQUEST`/`REPORT REQUEST` line with
@@ -14587,7 +14589,7 @@ fn report_editor_ghost_is_scoped_to_request_lines() {
         .report
         .set_text("# collection: api\nURL=Oau");
     press(&mut app, KeyCode::Char('e'));
-    assert_eq!(app.report_request_ghost(idx), None);
+    assert!(app.report_request_completion(idx).is_none());
     press(&mut app, KeyCode::Esc);
 
     // A REPORT REQUEST line does complete.
@@ -14595,7 +14597,107 @@ fn report_editor_ghost_is_scoped_to_request_lines() {
         .report
         .set_text("# collection: api\nREPORT REQUEST Oa");
     press(&mut app, KeyCode::Char('e'));
-    assert_eq!(app.report_request_ghost(idx).as_deref(), Some("uth"));
+    assert_eq!(
+        app.report_request_completion(idx)
+            .map(|c| c.ghost)
+            .as_deref(),
+        Some("uth")
+    );
+}
+
+/// A request name with spaces must be quoted; a bare completion auto-quotes it
+/// (typing `Up` completes to `"Upload document"`), and completion inside an
+/// already-opened quote fills the rest and appends the closing quote — never
+/// producing an unparseable bare-name-with-spaces line.
+#[test]
+fn report_editor_ghost_quotes_names_with_spaces() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Create Session".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+
+    // Bare typing of a spaced title shows the plain remainder as the ghost…
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Cre");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_request_completion(idx)
+            .map(|c| c.ghost)
+            .as_deref(),
+        Some("ate Session"),
+        "the ghost shows the plain remainder (quotes added on accept)"
+    );
+    // …and accepting it wraps the whole name in quotes.
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("REQUEST \"Create Session\""),
+        "a bare completion of a spaced name is auto-quoted on accept"
+    );
+    let idx = app.active_report_index().unwrap();
+    app.revalidate_report(idx);
+    assert!(
+        app.reports[idx].parse_error.is_none(),
+        "the auto-quoted name parses cleanly"
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // Completing inside an already-opened quote fills the rest and closes it.
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST \"Create Ses");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_request_completion(idx)
+            .map(|c| c.ghost)
+            .as_deref(),
+        Some("sion\""),
+        "quoted completion fills the rest and appends the closing quote"
+    );
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("REQUEST \"Create Session\"")
+    );
+}
+
+/// Inside an opened quote, an already-complete name completes to just the
+/// closing quote.
+#[test]
+fn report_editor_ghost_closes_an_opened_quote() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST \"Oauth");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_request_completion(idx)
+            .map(|c| c.ghost)
+            .as_deref(),
+        Some("\"")
+    );
 }
 
 /// Tab cycling visits report tabs alongside collection tabs (unified index).

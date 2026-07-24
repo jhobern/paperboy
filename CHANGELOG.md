@@ -42,6 +42,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   (or `REPORT REQUEST`) name shows a dim inline suggestion of a matching request
   from the bound collection that **→** fills in — so request names stay correct
   and discoverable even though the report view can't show the collection list.
+  Completion is quote-aware: a matching name that contains spaces is
+  auto-quoted on accept (typing `Up` completes to `"Upload document"`), and
+  completing inside an already-opened `"` fills the rest of the name and appends
+  the closing quote — so an accepted completion always parses.
 
 
 ## [0.1.6] - 2026-07-18

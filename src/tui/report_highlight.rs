@@ -88,6 +88,28 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
             spans.push(Span::styled(text, Style::default().fg(th.subst)));
             continue;
         }
+        // A `"…"` string literal: never keyword-highlight its contents (a
+        // request name like `"Upload for document"` must not light up `for`),
+        // but still surface any `{{ … }}` substitution inside it.
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < n {
+                // Honour `\"` / `\\` escapes so an embedded quote doesn't end
+                // the string early.
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            push_string_spans(&mut spans, &chars[start..i], th);
+            continue;
+        }
         if is_word_char(c) {
             let start = i;
             while i < n && is_word_char(chars[i]) {
@@ -102,11 +124,12 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
             spans.push(Span::styled(word, style));
             continue;
         }
-        // A run of punctuation/whitespace, up to the next word or placeholder.
+        // A run of punctuation/whitespace, up to the next word, placeholder or
+        // string literal.
         let start = i;
         while i < n {
             let ch = chars[i];
-            if is_word_char(ch) || (ch == '{' && i + 1 < n && chars[i + 1] == '{') {
+            if is_word_char(ch) || ch == '"' || (ch == '{' && i + 1 < n && chars[i + 1] == '{') {
                 break;
             }
             i += 1;
@@ -118,6 +141,45 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
         spans.push(Span::raw(String::new()));
     }
     spans
+}
+
+/// Push the spans for a `"…"` string literal `s` (given as its chars): plain
+/// text throughout — so keywords inside it are *not* highlighted — except for
+/// any `{{ … }}` substitution, which keeps its substitution colour. The spans
+/// tile `s` exactly.
+fn push_string_spans(spans: &mut Vec<Span<'static>>, s: &[char], th: &Theme) {
+    let n = s.len();
+    let mut i = 0;
+    let mut plain_start = 0;
+    while i < n {
+        if s[i] == '{' && i + 1 < n && s[i + 1] == '{' {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    s[plain_start..i].iter().collect::<String>(),
+                    Style::default().fg(th.text),
+                ));
+            }
+            let start = i;
+            i += 2;
+            while i < n && !(s[i] == '}' && i + 1 < n && s[i + 1] == '}') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            spans.push(Span::styled(
+                s[start..i].iter().collect::<String>(),
+                Style::default().fg(th.subst),
+            ));
+            plain_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if plain_start < n {
+        spans.push(Span::styled(
+            s[plain_start..n].iter().collect::<String>(),
+            Style::default().fg(th.text),
+        ));
+    }
 }
 
 /// Apply the error highlight (error colour + underline) to a line's spans in
@@ -217,6 +279,40 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, line);
         assert_eq!(spans[0].style.fg, Some(th.dim));
+    }
+
+    #[test]
+    fn keywords_inside_a_string_literal_are_not_highlighted() {
+        let th = th();
+        // The request name contains the keyword-looking word "for".
+        let line = "REQUEST \"Upload for document\"";
+        let spans = highlight_line(line, &th);
+        assert_tiles(line, &spans);
+        // The leading REQUEST keyword is still accented…
+        let kw = spans.iter().find(|s| s.content == "REQUEST").unwrap();
+        assert_eq!(kw.style.fg, Some(th.accent));
+        // …but nothing inside the quoted string is accent-coloured (so "for"
+        // reads as part of the name, not a keyword).
+        for sp in &spans {
+            if sp.content.contains("for") || sp.content.contains("Upload") {
+                assert_eq!(
+                    sp.style.fg,
+                    Some(th.text),
+                    "string-literal content stays plain text"
+                );
+                assert!(!sp.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn substitutions_inside_a_string_literal_still_highlight() {
+        let th = th();
+        let line = "FILES \"dir/{{NAME}}\"";
+        let spans = highlight_line(line, &th);
+        assert_tiles(line, &spans);
+        let var = spans.iter().find(|s| s.content == "{{NAME}}").unwrap();
+        assert_eq!(var.style.fg, Some(th.subst));
     }
 
     #[test]

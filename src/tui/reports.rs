@@ -270,8 +270,8 @@ impl TuiApp {
         // A pending ghost completion (only for a plain Right-arrow accept). This
         // is computed *before* the `&mut editor` borrow below, since it needs an
         // immutable borrow of `self` (the bound collection's request names).
-        let ghost = if key.code == KeyCode::Right && !ctrl && !shift {
-            self.report_request_ghost(idx)
+        let completion = if key.code == KeyCode::Right && !ctrl && !shift {
+            self.report_request_completion(idx)
         } else {
             None
         };
@@ -307,10 +307,10 @@ impl TuiApp {
                     word_right(editor);
                     None
                 }
-                // Right arrow at end of a `REQUEST` line fills in the ghost.
-                KeyCode::Right if ghost.is_some() => {
-                    editor.clear_selection();
-                    editor.insert_str(ghost.as_deref().unwrap_or_default());
+                // Right arrow at end of a `REQUEST` line fills in the completion
+                // (auto-quoting the name when it contains spaces).
+                KeyCode::Right if completion.is_some() => {
+                    accept_request_completion(editor, completion.as_ref().unwrap());
                     Some(editor.text())
                 }
                 // Everything else goes to the shared multi-line key handler,
@@ -349,11 +349,24 @@ impl TuiApp {
     /// The ghost suffix to offer while typing a `REQUEST <name>` (or
     /// `REPORT REQUEST <name>`) line in the source editor: the remainder of the
     /// first request title in the bound collection that the partially-typed
-    /// name is a prefix of. `None` unless the cursor is at the end of such a
-    /// line, a non-empty partial name has been typed, and a longer match exists.
-    /// The report view can't show the collection's request list (it takes the
-    /// whole body), so this keeps request names discoverable and correct.
-    pub(crate) fn report_request_ghost(&self, idx: usize) -> Option<String> {
+    /// The request-name completion to offer while typing a `REQUEST <name>` (or
+    /// `REPORT REQUEST <name>`) line in the source editor: the first request
+    /// title in the bound collection that the partially-typed name is a prefix
+    /// of. `None` unless the cursor is at the end of such a line and a match
+    /// exists. The report view can't show the collection's request list (it
+    /// takes the whole body), so this keeps request names discoverable and
+    /// correct.
+    ///
+    /// PaperTrail requires a name that contains spaces to be quoted
+    /// (`REQUEST "Two Words"`), so completion is quote-aware and always yields a
+    /// parseable line:
+    /// - a bare fragment matching a space-free title completes bare;
+    /// - a bare fragment matching a title *with* spaces auto-quotes it (the
+    ///   opening quote is inserted before the fragment on accept, so typing
+    ///   `Up` completes to `"Upload document"`);
+    /// - inside an opened quote, any title completes and the closing quote is
+    ///   appended.
+    pub(crate) fn report_request_completion(&self, idx: usize) -> Option<RequestCompletion> {
         let rt = self.reports.get(idx)?;
         let editor = rt.editor.as_ref()?;
         let line = editor.lines.get(editor.row)?;
@@ -361,15 +374,88 @@ impl TuiApp {
         if editor.col != line.chars().count() {
             return None;
         }
-        let partial = request_name_partial(line)?;
         let ci = self.resolve_bound_collection(&rt.report)?;
-        self.collections[ci]
+        let mut titles = self.collections[ci]
             .entries
             .iter()
-            .map(|e| e.title.as_str())
-            .find(|t| t.len() > partial.len() && t.starts_with(&partial))
-            .map(|t| t[partial.len()..].to_string())
+            .map(|e| e.title.as_str());
+        match request_name_partial(line)? {
+            // Bare token: match any title (an exact match has nothing to add, so
+            // require strictly longer), auto-quoting one that contains spaces.
+            NamePartial::Bare(p) => {
+                let t = titles.find(|t| t.len() > p.len() && t.starts_with(&p))?;
+                let suffix = t[p.len()..].to_string();
+                if t.chars().any(char::is_whitespace) {
+                    // Show the plain suffix (so the ghost stays visually
+                    // balanced); on accept, wrap the whole token in quotes.
+                    Some(RequestCompletion {
+                        ghost: suffix.clone(),
+                        insert: format!("{suffix}\""),
+                        wrap_quote: true,
+                    })
+                } else {
+                    Some(RequestCompletion {
+                        ghost: suffix.clone(),
+                        insert: suffix,
+                        wrap_quote: false,
+                    })
+                }
+            }
+            // Inside an opened quote: any title is fair game (spaces are fine),
+            // and the completion appends the closing quote. An exact match still
+            // completes — to just the closing quote.
+            NamePartial::Quoted(p) => {
+                let t = titles.find(|t| t.len() >= p.len() && t.starts_with(&p))?;
+                let ghost = format!("{}\"", &t[p.len()..]);
+                Some(RequestCompletion {
+                    insert: ghost.clone(),
+                    ghost,
+                    wrap_quote: false,
+                })
+            }
+        }
     }
+}
+
+/// A pending request-name completion in the source editor.
+pub(crate) struct RequestCompletion {
+    /// The dim text shown starting at the cursor.
+    pub(crate) ghost: String,
+    /// The text inserted at the cursor when the completion is accepted (may add
+    /// a closing quote the ghost doesn't show, for the auto-quote case).
+    pub(crate) insert: String,
+    /// When set, an opening quote is inserted before the current bare name token
+    /// on accept (auto-quoting a spaced name).
+    pub(crate) wrap_quote: bool,
+}
+
+/// Apply `comp` to `ed`: optionally wrap the current bare name token in an
+/// opening quote, then insert the completion text at the cursor.
+fn accept_request_completion(ed: &mut Editor, comp: &RequestCompletion) {
+    ed.clear_selection();
+    if comp.wrap_quote {
+        // Find the start of the bare token under the cursor (scan left over
+        // non-whitespace) and insert the opening quote there.
+        let row = ed.row;
+        let chars: Vec<char> = ed.lines[row].chars().collect();
+        let mut start = ed.col;
+        while start > 0 && !chars[start - 1].is_whitespace() && chars[start - 1] != '"' {
+            start -= 1;
+        }
+        let byte = Editor::byte_idx(&ed.lines[row], start);
+        ed.lines[row].insert(byte, '"');
+        ed.col += 1;
+    }
+    ed.insert_str(&comp.insert);
+}
+
+/// The partially-typed request name on a `REQUEST`/`REPORT REQUEST` line, and
+/// whether the author has opened a quote (so a spaced name is being written).
+enum NamePartial {
+    /// A bare token with no quote and no internal whitespace.
+    Bare(String),
+    /// The text after an as-yet-unclosed opening quote (may contain spaces).
+    Quoted(String),
 }
 
 /// Move the editor cursor left to the start of the previous word: skip any
@@ -426,16 +512,26 @@ fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 }
 
 /// Extract the partially-typed request name from a source line, if it is a
-/// `REQUEST <name>` or `REPORT REQUEST <name>` line whose name is still a single
-/// unfinished token (no trailing whitespace or further arguments).
-fn request_name_partial(line: &str) -> Option<String> {
+/// `REQUEST <name>` or `REPORT REQUEST <name>` line whose name is still being
+/// typed (cursor-at-end is checked by the caller). Distinguishes a bare token
+/// from an opened-quote fragment so completion can stay grammar-valid.
+fn request_name_partial(line: &str) -> Option<NamePartial> {
     let t = line.trim_start();
     let after_report = strip_keyword(t, "REPORT").unwrap_or(t);
     let name = strip_keyword(after_report, "REQUEST")?;
-    if name.is_empty() || name.chars().any(char::is_whitespace) {
-        return None;
+    if let Some(inner) = name.strip_prefix('"') {
+        // An opened quote: complete inside it until a closing quote is typed.
+        if inner.contains('"') {
+            return None; // already closed — the name is finished
+        }
+        Some(NamePartial::Quoted(inner.to_string()))
+    } else if name.is_empty() || name.chars().any(char::is_whitespace) {
+        // Empty, or a bare token that already has spaces (unquoted → will fail
+        // validation; don't paper over it with a completion).
+        None
+    } else {
+        Some(NamePartial::Bare(name.to_string()))
     }
-    Some(name.to_string())
 }
 
 /// Join a `# collection:` reference against the report's own directory (when the
@@ -638,13 +734,13 @@ fn draw_report_source(
         let inner = block.inner(area);
         f.render_widget(block, area);
         // A pending `REQUEST`-name completion, drawn dim after the cursor.
-        let ghost = app.report_request_ghost(idx);
+        let completion = app.report_request_completion(idx);
         if let Some(editor) = app.reports[idx].editor.as_ref() {
             render_editor_highlighted(f, inner, editor, th, |row, line| {
                 super::report_highlight::highlight_row(row, line, error_line, th)
             });
-            if let Some(ghost) = ghost {
-                draw_editor_ghost(f, inner, editor, &ghost, th);
+            if let Some(completion) = completion {
+                draw_editor_ghost(f, inner, editor, &completion.ghost, th);
             }
         }
         return;
