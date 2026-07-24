@@ -62,6 +62,15 @@ impl Header {
     pub fn root(&self) -> Option<&str> {
         self.get("root")
     }
+    /// The single environment (`environment:` directive) to use as the report's
+    /// base variable layer for a plain, no-comparison run. Names an
+    /// *already-loaded* global environment (validation errors if it isn't
+    /// loaded); when absent the run falls back to the app's active + the bound
+    /// collection's pinned environment. Multi-environment comparison still uses
+    /// a `FOR … IN ENVS` loop, not this directive.
+    pub fn environment(&self) -> Option<&str> {
+        self.get("environment")
+    }
 
     /// Set (or insert) the directive named `key` to `value`, preserving the
     /// position of an existing directive and appending a new one otherwise.

@@ -93,6 +93,14 @@ impl Report {
         header_directive(&self.text, "collection").filter(|v| !v.is_empty())
     }
 
+    /// The `environment:` header directive value (trimmed, non-empty), if
+    /// present — the single environment a plain run uses as its base variable
+    /// layer. Read without a full parse so it's available even when the body has
+    /// syntax errors (mirrors [`Self::collection_ref`]).
+    pub fn environment_ref(&self) -> Option<String> {
+        header_directive(&self.text, "environment").filter(|v| !v.is_empty())
+    }
+
     /// Replace the source text, marking the report dirty and refreshing the
     /// display name from the (possibly changed) header `name:` directive.
     pub fn set_text(&mut self, text: impl Into<String>) {

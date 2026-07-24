@@ -376,6 +376,12 @@ pub(crate) enum Overlay {
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
     GitSave(Box<GitSaveWizard>),
+    /// Dry-run preview for a report tab: the projected row count, a sample of
+    /// the first few iterations' resolved bindings, and any producer /
+    /// request-resolution problems — computed by expanding the flow with a
+    /// no-op runner (no HTTP). Opened with `d` in the Reports view; scrolls with
+    /// Up/Down, closes with Esc/`q` (see [`crate::tui::reports::DryRunReport`]).
+    ReportDryRun(Box<crate::tui::reports::DryRunReport>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -755,6 +761,11 @@ pub struct TuiApp {
     /// switched. Lets a Help body taller than the terminal be scrolled with
     /// Up/Down instead of those keys just closing the popup.
     pub(crate) help_scroll: u16,
+    /// Vertical scroll offset for the report dry-run preview overlay
+    /// ([`Overlay::ReportDryRun`]) — reset to 0 when the preview is opened.
+    /// Kept on the app (like [`Self::help_scroll`]) so the immutable overlay
+    /// draw pass can clamp overshoot against the real content height.
+    pub(crate) dry_run_scroll: u16,
     pub(crate) quit: bool,
 
     /// Receivers for in-flight background secret resolution (one per env load).
@@ -938,6 +949,7 @@ impl Default for TuiApp {
             status: None,
             overlay: None,
             help_scroll: 0,
+            dry_run_scroll: 0,
             quit: false,
             pending_env: Vec::new(),
             pending_captures: Vec::new(),

@@ -56,6 +56,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   or with validation errors — says why in the status bar instead of running. The
   run is synchronous for now; background execution with live per-row updates and
   cancellation follows in a later update.
+- **Dry-run preview (`d`).** Before firing any requests, press **`d`** in the
+  Reports view to expand the flow with a no-op runner and preview the result: the
+  projected **row count**, a sample of the first iterations' resolved variable
+  bindings (e.g. `FILE=…, PREFIX=…`), and any producer/request-resolution
+  problems (empty globs, `ZIP` length mismatches, unresolved request names). This
+  catches Cartesian-product blow-ups and mis-wired loops without sending a single
+  HTTP request. The overlay scrolls with the arrow keys and closes with Esc.
+- **`# environment:` report header.** A report can now name a single, already
+  loaded environment to run against — `# environment: staging` — used as the
+  run's base variable layer for a plain, no-comparison run. It makes a report
+  self-contained and reproducible (the named env is used regardless of which
+  environment is active or pinned in the app); when omitted, the run falls back
+  to the app's active plus the bound collection's pinned environment as before.
+  Naming an environment that isn't loaded is a validation error (mirroring
+  `ENVS`), and the report's binding panel shows the chosen environment. Multi
+  environment comparison still uses a `FOR … IN ENVS` loop.
 
 
 ## [0.1.6] - 2026-07-18

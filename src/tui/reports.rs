@@ -27,8 +27,9 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
+use crate::report::flow::{FlowNode, Producer};
 use crate::report::model::ReportResult;
-use crate::report::run::{EntryRunner, LiveRunner, RunContext, run_flow};
+use crate::report::run::{DryRunner, EntryRunner, LiveRunner, RunContext, run_flow};
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
 use crate::report::writer::{CsvWriter, ReportWriter};
 
@@ -226,6 +227,33 @@ impl TuiApp {
         if let Some(reason) = self.report_run_blocker(idx) {
             return Err(reason);
         }
+        self.flow_result(idx, runner)
+    }
+
+    /// Expand report `idx`'s flow without sending any HTTP (a [`DryRunner`]),
+    /// returning the fully-materialised [`ReportResult`] so a preview can show
+    /// the projected row count, the resolved per-iteration bindings and any
+    /// producer/resolution problems. Unlike [`Self::run_report_flow`] this lets
+    /// *validation errors* (e.g. an unresolved request name) through so they
+    /// surface in the preview — only a parse error or an unbound collection (without
+    /// either, the flow can't be expanded at all) blocks it.
+    pub(crate) fn dry_run_report_flow(&self, idx: usize) -> Result<ReportResult, String> {
+        let s = Strings::for_language(&self.language);
+        let rt = self.reports.get(idx).ok_or(s.report_run_unbound)?;
+        if let Some(err) = &rt.parse_error {
+            return Err(format!("{} {err}", s.report_run_parse_error));
+        }
+        if self.resolve_bound_collection(&rt.report).is_none() {
+            return Err(s.report_run_unbound.to_string());
+        }
+        self.flow_result(idx, &DryRunner)
+    }
+
+    /// Shared core of [`Self::run_report_flow`]/[`Self::dry_run_report_flow`]:
+    /// assemble the [`RunContext`] for report `idx` and run its flow via
+    /// `runner`. Assumes the report parses and is bound (the callers gate that);
+    /// see them for the differing pre-run checks.
+    fn flow_result(&self, idx: usize, runner: &dyn EntryRunner) -> Result<ReportResult, String> {
         let s = Strings::for_language(&self.language);
         let rt = self.reports.get(idx).ok_or(s.report_run_unbound)?;
         let flow = rt.report.flow().map_err(|e| e.to_string())?;
@@ -233,13 +261,29 @@ impl TuiApp {
             .resolve_bound_collection(&rt.report)
             .ok_or(s.report_run_unbound)?;
 
-        // Base variable layer: the bound collection's effective (global + pinned)
-        // environment, flattened. Loop bindings / assignments layer on top of
-        // this inside the interpreter.
-        let base_vars = self
-            .effective_env(ci)
-            .map(|env| flatten_env(&env))
-            .unwrap_or_default();
+        // Base variable layer. A `# environment:` directive names a single
+        // loaded environment to use for a plain, no-comparison run — that env
+        // alone, so the run is reproducible regardless of what's active/pinned
+        // in the app. Without it, fall back to the bound collection's effective
+        // (active global + pinned) environment. Loop bindings / assignments
+        // layer on top of this inside the interpreter either way.
+        let base_vars = match flow
+            .header
+            .environment()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            Some(name) => self
+                .global_envs
+                .iter()
+                .find(|e| e.name == name)
+                .map(flatten_env)
+                .unwrap_or_default(),
+            None => self
+                .effective_env(ci)
+                .map(|env| flatten_env(&env))
+                .unwrap_or_default(),
+        };
         // Every loaded global environment is selectable by name in a `FOR … IN
         // ENVS` loop.
         let named_envs = self
@@ -348,6 +392,76 @@ impl TuiApp {
         }
     }
 
+    /// Dry-run the active report: expand its flow with a no-op runner (no HTTP)
+    /// and open a preview overlay summarising the projected row count, a sample
+    /// of the first few iterations' resolved bindings, and any producer /
+    /// request-resolution problems — so misaligned `ZIP`s, empty globs and
+    /// Cartesian-product blow-ups are caught before firing real requests. A run
+    /// that can't even be expanded (parse error / unbound collection) reports
+    /// why in the status bar instead.
+    pub(crate) fn open_report_dry_run(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        match self.dry_run_report_flow(idx) {
+            Ok(result) => {
+                let names = self.reports[idx]
+                    .report
+                    .flow()
+                    .map(|f| flow_local_names(&f.nodes))
+                    .unwrap_or_default();
+                let preview = DryRunReport::from_result(
+                    &Strings::for_language(&self.language),
+                    &result,
+                    &names,
+                );
+                self.dry_run_scroll = 0;
+                self.overlay = Some(Overlay::ReportDryRun(Box::new(preview)));
+            }
+            Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
+        }
+    }
+
+    /// Key handling for the report dry-run overlay ([`Overlay::ReportDryRun`]).
+    /// Mirrors the Help overlay: Up/Down/PageUp/PageDown/Home/End scroll the
+    /// preview (the draw pass clamps overshoot against the real content height);
+    /// Esc, `q` or Enter close it, and — as with Help — any other key dismisses
+    /// it too. The overlay was already `take`n by the dispatcher, so closing is
+    /// just declining to put it back.
+    pub(crate) fn report_dry_run_key_handler(&mut self, key: KeyEvent, preview: Box<DryRunReport>) {
+        let keep = |app: &mut TuiApp, preview| {
+            app.overlay = Some(Overlay::ReportDryRun(preview));
+        };
+        match key.code {
+            KeyCode::Up => {
+                self.dry_run_scroll = self.dry_run_scroll.saturating_sub(1);
+                keep(self, preview);
+            }
+            KeyCode::Down => {
+                self.dry_run_scroll = self.dry_run_scroll.saturating_add(1);
+                keep(self, preview);
+            }
+            KeyCode::PageUp => {
+                self.dry_run_scroll = self.dry_run_scroll.saturating_sub(10);
+                keep(self, preview);
+            }
+            KeyCode::PageDown => {
+                self.dry_run_scroll = self.dry_run_scroll.saturating_add(10);
+                keep(self, preview);
+            }
+            KeyCode::Home => {
+                self.dry_run_scroll = 0;
+                keep(self, preview);
+            }
+            KeyCode::End => {
+                self.dry_run_scroll = u16::MAX;
+                keep(self, preview);
+            }
+            // Esc / q / Enter / any other key: close (overlay stays taken).
+            _ => {}
+        }
+    }
+
     /// Give the active report tab's source panel edit focus, seeding an
     /// [`Editor`] from the current source text. While focused, keystrokes type
     /// directly into the panel (see [`TuiApp::on_key_report_editing`]).
@@ -427,6 +541,8 @@ impl TuiApp {
             KeyCode::Char('e') | KeyCode::Enter => self.enter_report_edit(),
             // Run the report against its bound collection and show the grid.
             KeyCode::Char('r') | KeyCode::F(5) => self.run_active_report(),
+            // Dry-run: preview the projected rows/bindings without sending HTTP.
+            KeyCode::Char('d') => self.open_report_dry_run(),
             // Flip between the source and the last run's results grid.
             KeyCode::Tab | KeyCode::Char('v') => self.toggle_report_view(),
             // Export the last run to CSV next to the report.
@@ -799,6 +915,186 @@ fn sanitize_file_stem(name: &str) -> String {
     }
 }
 
+/// How many sample iterations the dry-run preview lists before collapsing the
+/// rest into an "… +N more" line.
+const DRY_RUN_SAMPLE_CAP: usize = 12;
+
+/// Preview state for the report dry-run overlay ([`Overlay::ReportDryRun`]): the
+/// projected row count, a sample of the first few iterations' resolved
+/// bindings, and any producer / request-resolution problems the expansion hit —
+/// all computed by expanding the flow with a no-op runner (no HTTP). `scroll`
+/// is the overlay's own vertical offset, so a long preview scrolls rather than
+/// clipping silently.
+pub(crate) struct DryRunReport {
+    /// Total rows the flow would emit (`0` = nothing would run, e.g. an empty
+    /// glob at the outermost loop).
+    pub(crate) rows: usize,
+    /// One line per sampled iteration (`FILE=a.jpg, PREFIX=…`), capped at
+    /// [`DRY_RUN_SAMPLE_CAP`].
+    pub(crate) samples: Vec<String>,
+    /// How many rows beyond the sampled ones exist (drives the "… +N more"
+    /// note); `0` when every row is shown.
+    pub(crate) more: usize,
+    /// Deduplicated producer / resolution problems (empty glob, ZIP length
+    /// mismatch, unresolved request name, unloaded environment, …).
+    pub(crate) errors: Vec<String>,
+}
+
+impl DryRunReport {
+    /// Summarise an expanded [`ReportResult`] into the preview. `names` is the
+    /// set of flow-defined variable names ([`flow_local_names`]) so each sample
+    /// shows just the per-iteration bindings, hiding the inherited environment
+    /// variables that also live in a row's `vars` snapshot.
+    fn from_result(
+        s: &Strings,
+        result: &ReportResult,
+        names: &std::collections::HashSet<String>,
+    ) -> Self {
+        let samples: Vec<String> = result
+            .rows
+            .iter()
+            .take(DRY_RUN_SAMPLE_CAP)
+            .map(|row| {
+                let mut parts: Vec<(&String, &String)> = row
+                    .vars
+                    .iter()
+                    .filter(|(k, _)| names.contains(k.as_str()))
+                    .collect();
+                parts.sort_by(|a, b| a.0.cmp(b.0));
+                if parts.is_empty() {
+                    s.report_dry_run_no_bindings.to_string()
+                } else {
+                    parts
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            })
+            .collect();
+        let more = result.rows.len().saturating_sub(samples.len());
+        // A Cartesian product can repeat the same producer error on every
+        // iteration, so collapse duplicates while keeping first-seen order.
+        let mut seen = std::collections::HashSet::new();
+        let errors: Vec<String> = result
+            .errors
+            .iter()
+            .filter(|e| seen.insert((*e).clone()))
+            .cloned()
+            .collect();
+        Self {
+            rows: result.rows.len(),
+            samples,
+            more,
+            errors,
+        }
+    }
+
+    /// Render the preview body as themed lines (used by the overlay draw pass
+    /// and, via its length, for scroll clamping).
+    pub(crate) fn lines(&self, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("{} {}", s.report_dry_run_rows, self.rows),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            s.report_dry_run_samples_heading.to_string(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        )));
+        if self.samples.is_empty() {
+            lines.push(Line::from(Span::styled(
+                s.report_dry_run_no_rows.to_string(),
+                Style::default().fg(th.dim),
+            )));
+        } else {
+            for (i, sample) in self.samples.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("#{}  ", i + 1), Style::default().fg(th.dim)),
+                    Span::styled(sample.clone(), Style::default().fg(th.text)),
+                ]));
+            }
+            if self.more > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("… +{} {}", self.more, s.report_dry_run_more),
+                    Style::default().fg(th.dim),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        if self.errors.is_empty() {
+            lines.push(Line::from(Span::styled(
+                s.report_dry_run_no_problems.to_string(),
+                Style::default().fg(th.accent),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                s.report_dry_run_problems_heading.to_string(),
+                Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+            )));
+            for err in &self.errors {
+                lines.push(Line::from(Span::styled(
+                    format!("• {err}"),
+                    Style::default().fg(th.err),
+                )));
+            }
+        }
+        lines
+    }
+}
+
+/// Collect the flow-defined variable names — loop binders, `KEY=` assignments
+/// (excluding the `PRELUDE_*` engine settings), `ENVS` vars and `FOLDERS … WITH`
+/// role names — so the dry-run preview shows just those per-iteration bindings,
+/// filtering out the inherited environment variables that also live in a row's
+/// variable snapshot.
+fn flow_local_names(nodes: &[FlowNode]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_flow_names(nodes, &mut out);
+    out
+}
+
+fn collect_flow_names(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Assign { key, .. } if !key.starts_with("PRELUDE_") => {
+                out.insert(key.clone());
+            }
+            FlowNode::ForEach {
+                pattern,
+                producer,
+                body,
+                ..
+            } => {
+                for n in pattern.named() {
+                    out.insert(n.to_string());
+                }
+                collect_producer_names(producer, out);
+                collect_flow_names(body, out);
+            }
+            FlowNode::ForEnvs { var, body, .. } => {
+                out.insert(var.clone());
+                collect_flow_names(body, out);
+            }
+            FlowNode::ListDecl { producer, .. } => collect_producer_names(producer, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_producer_names(producer: &Producer, out: &mut std::collections::HashSet<String>) {
+    match producer {
+        Producer::Folders { roles, .. } => {
+            for (role, _) in roles {
+                out.insert(role.clone());
+            }
+        }
+        Producer::Zip(inner) => inner.iter().for_each(|p| collect_producer_names(p, out)),
+        _ => {}
+    }
+}
+
 /// Draw a report tab's full-screen body: the binding status, the flow source
 /// (syntax-highlighted, editable in place), and the live validation panel.
 pub(crate) fn draw_report_body(
@@ -1077,14 +1373,41 @@ fn draw_report_binding(
 ) {
     let rt = &app.reports[idx];
     let line = match app.resolve_bound_collection(&rt.report) {
-        Some(ci) => Line::from(vec![
-            Span::styled(s.report_bound_prefix, Style::default().fg(th.dim)),
-            Span::raw(" "),
-            Span::styled(
-                app.collections[ci].name.clone(),
-                Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Some(ci) => {
+            let mut spans = vec![
+                Span::styled(s.report_bound_prefix, Style::default().fg(th.dim)),
+                Span::raw(" "),
+                Span::styled(
+                    app.collections[ci].name.clone(),
+                    Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            // Show the report's declared `# environment:` (if any), flagging one
+            // that isn't currently loaded so the base-var source is obvious.
+            if let Some(env) = rt.report.environment_ref() {
+                let loaded = app.global_envs.iter().any(|e| e.name == env);
+                spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+                spans.push(Span::styled(
+                    s.report_env_prefix,
+                    Style::default().fg(th.dim),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    env,
+                    Style::default()
+                        .fg(if loaded { th.ok } else { th.pending })
+                        .add_modifier(Modifier::BOLD),
+                ));
+                if !loaded {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        s.report_env_not_loaded,
+                        Style::default().fg(th.pending),
+                    ));
+                }
+            }
+            Line::from(spans)
+        }
         None => {
             let msg = if rt.report.collection_ref().is_some() {
                 s.report_collection_missing
@@ -1117,7 +1440,10 @@ fn draw_report_source(
     let hint = if editing {
         s.report_hint_leave.to_string()
     } else {
-        format!("{} · {}", s.report_hint_edit, s.report_hint_run)
+        format!(
+            "{} · {} · {}",
+            s.report_hint_edit, s.report_hint_run, s.report_hint_dry
+        )
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
     let block = panel(title, true, th);

@@ -15067,3 +15067,229 @@ fn report_results_grid_draws_a_header_row() {
         "the results grid should draw its column headers in bold accent"
     );
 }
+
+/// A dry run expands the flow with no HTTP: a `FOR … IN FILES` loop over a
+/// folder of three files projects three rows, and the preview overlay lists
+/// each iteration's `FILE=` binding with no problems.
+#[test]
+fn dry_run_previews_row_count_and_file_bindings() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-dry-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in ["a.jpg", "b.jpg", "c.jpg"] {
+        std::fs::write(dir.join(n), b"x").unwrap();
+    }
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Upload".to_string(),
+            method: "POST".to_string(),
+            url: "http://example/upload".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(&format!(
+        "# collection: api\nFOR FILE IN FILES {:?}\n    REPORT REQUEST Upload\nEND\n",
+        dir.display().to_string()
+    ));
+    app.revalidate_report(idx);
+
+    // The core expansion projects one row per file, without any runner.
+    let result = app.dry_run_report_flow(idx).expect("expandable");
+    assert_eq!(result.rows.len(), 3);
+
+    // Opening the overlay (via the `d` key) builds a preview from that.
+    press(&mut app, KeyCode::Char('d'));
+    match app.overlay.as_ref() {
+        Some(Overlay::ReportDryRun(p)) => {
+            assert_eq!(p.rows, 3);
+            assert_eq!(p.samples.len(), 3);
+            assert!(
+                p.samples.iter().all(|line| line.starts_with("FILE=")),
+                "each sample should show the FILE binding, got {:?}",
+                p.samples
+            );
+            assert!(p.errors.is_empty(), "a valid loop should have no problems");
+        }
+        _ => panic!("the `d` key should open the dry-run preview overlay"),
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A dry run surfaces producer problems (here, a missing directory) as preview
+/// errors and projects zero rows — all without sending a request.
+#[test]
+fn dry_run_surfaces_producer_errors_without_running() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Upload".to_string(),
+            method: "POST".to_string(),
+            url: "http://example/upload".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR FILE IN FILES \"/no/such/paperboy/dir/here\"\n    REPORT REQUEST Upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+
+    app.open_report_dry_run();
+    match app.overlay.as_ref() {
+        Some(Overlay::ReportDryRun(p)) => {
+            assert_eq!(p.rows, 0, "a missing directory yields no rows");
+            assert!(
+                !p.errors.is_empty(),
+                "the missing directory should surface a producer error"
+            );
+        }
+        _ => panic!("expected the dry-run overlay"),
+    }
+}
+
+/// An unbound report can't be dry-run (there's no collection to resolve request
+/// names against): the overlay stays closed and the status bar says why.
+#[test]
+fn dry_run_is_blocked_when_unbound() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("REQUEST x\n");
+    app.revalidate_report(idx);
+
+    app.open_report_dry_run();
+    assert!(
+        app.overlay.is_none(),
+        "an unbound report can't be dry-run, so no overlay opens"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunBlocked(_))
+    ));
+}
+
+/// The dry-run overlay scrolls with Up/Down and closes on Esc; drawing it must
+/// not panic.
+#[test]
+fn dry_run_overlay_scrolls_and_closes() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Upload".to_string(),
+            method: "POST".to_string(),
+            url: "http://example/upload".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Upload\n");
+    app.revalidate_report(idx);
+
+    press(&mut app, KeyCode::Char('d'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    // Down scrolls the preview but keeps it open; Esc closes it.
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.dry_run_scroll, 1);
+    assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "Esc closes the dry-run overlay");
+}
+
+/// A `# environment:` header selects one loaded global environment as the
+/// report's base variable layer — even overriding the app's active env — so a
+/// plain, no-comparison run is reproducible regardless of app state.
+#[test]
+fn environment_header_selects_the_named_env_as_base_vars() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    // An active env with REGION=active, plus a "prod" env with REGION=prod.
+    let (active, _) = crate::environment::parse_vars_pending("global".into(), "REGION=active");
+    let active_id = add_global_env(&mut app, active);
+    app.active_env_id = Some(active_id);
+    let (prod, _) = crate::environment::parse_vars_pending("prod".into(), "REGION=prod");
+    add_global_env(&mut app, prod);
+
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\n# environment: prod\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    // No validation errors: the named env is loaded.
+    assert!(
+        !app.reports[idx]
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == crate::report::validate::Severity::Error),
+        "a loaded '# environment:' should not error: {:?}",
+        app.reports[idx].diagnostics
+    );
+
+    let result = app.dry_run_report_flow(idx).expect("expandable");
+    assert_eq!(
+        result.rows[0].vars.get("REGION"),
+        Some(&"prod".to_string()),
+        "the named environment must supply the base vars, overriding the active env"
+    );
+}
+
+/// Without a `# environment:` header, the base layer falls back to the app's
+/// active (and pinned) environment — the prior behaviour is preserved.
+#[test]
+fn without_environment_header_the_active_env_is_used() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    let (active, _) = crate::environment::parse_vars_pending("global".into(), "REGION=active");
+    let active_id = add_global_env(&mut app, active);
+    app.active_env_id = Some(active_id);
+
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let result = app.dry_run_report_flow(idx).expect("expandable");
+    assert_eq!(
+        result.rows[0].vars.get("REGION"),
+        Some(&"active".to_string()),
+        "with no '# environment:' the active env supplies the base vars"
+    );
+}

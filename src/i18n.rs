@@ -417,6 +417,7 @@ strings! {
     help_report_word_move => "move the cursor a word at a time (while editing)", "déplacer le curseur d'un mot à la fois (en édition)", "flyt markøren et ord ad gangen (under redigering)";
     help_report_complete => "fill in the suggested request name (while editing)", "compléter le nom de requête suggéré (en édition)", "udfyld det foreslåede anmodningsnavn (under redigering)";
     help_report_run => "run the report and show its results grid", "exécuter le rapport et afficher sa grille de résultats", "kør rapporten og vis resultatgitteret";
+    help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
@@ -427,6 +428,7 @@ strings! {
     help_reports_grammar_heading => "Flow language", "Langage de flux", "Flow-sprog";
     help_reports_loops_heading => "Loops & producers", "Boucles et sources", "Løkker og kilder";
     help_grammar_collection => "bind the report to a collection (required)", "lier le rapport à une collection (obligatoire)", "bind rapporten til en samling (påkrævet)";
+    help_grammar_environment => "run against one loaded environment (optional; no comparison)", "exécuter avec un environnement chargé (optionnel ; sans comparaison)", "kør mod ét indlæst miljø (valgfrit; ingen sammenligning)";
     help_grammar_assign => "set a variable, used elsewhere as {{KEY}}", "définir une variable, utilisée ailleurs comme {{KEY}}", "sæt en variabel, brugt andre steder som {{KEY}}";
     help_grammar_request => "send a request by name (no output row)", "envoyer une requête par son nom (sans ligne de sortie)", "send en anmodning ved navn (ingen outputrække)";
     help_grammar_report => "send a request and add its fields as columns", "envoyer une requête et ajouter ses champs comme colonnes", "send en anmodning og tilføj dens felter som kolonner";
@@ -461,6 +463,8 @@ strings! {
     report_validation_heading => "Validation", "Validation", "Validering";
     report_binding_heading => "Binding", "Liaison", "Binding";
     report_bound_prefix => "Bound collection:", "Collection liée :", "Bundet samling:";
+    report_env_prefix => "Environment:", "Environnement :", "Miljø:";
+    report_env_not_loaded => "(not loaded)", "(non chargé)", "(ikke indlæst)";
     report_unbound => "No collection bound — edit the report's '# collection:' header to bind one.", "Aucune collection liée — modifiez l'en-tête « # collection: » du rapport pour en lier une.", "Ingen samling bundet — rediger rapportens « # collection: »-header for at binde en.";
     report_collection_missing => "Bound collection is not loaded — open it as a tab so its requests can be validated.", "La collection liée n'est pas chargée — ouvrez-la dans un onglet pour valider ses requêtes.", "Den bundne samling er ikke indlæst — åbn den som en fane, så dens anmodninger kan valideres.";
     report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
@@ -480,6 +484,16 @@ strings! {
     report_status_rows => "rows", "lignes", "rækker";
     report_status_errors => "errors", "erreurs", "fejl";
     report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
+    report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
+    report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
+    report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
+    report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";
+    report_dry_run_no_rows => "No rows would be produced.", "Aucune ligne ne serait produite.", "Ingen rækker ville blive produceret.";
+    report_dry_run_no_bindings => "(single run, no loop variables)", "(exécution unique, sans variable de boucle)", "(enkelt kørsel, ingen løkkevariabler)";
+    report_dry_run_more => "more iterations", "itérations supplémentaires", "flere gentagelser";
+    report_dry_run_problems_heading => "Problems", "Problèmes", "Problemer";
+    report_dry_run_no_problems => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
+    report_dry_run_hint => "↑/↓ scroll · Esc close", "↑/↓ défiler · Échap fermer", "↑/↓ rul · Esc luk";
 }
 
 /// A language-independent status / notification message. It stores *what*

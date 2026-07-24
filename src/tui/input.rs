@@ -467,6 +467,7 @@ impl TuiApp {
             Overlay::EnvVarForm(form) => self.env_var_form_key_handler(key, form),
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
+            Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
         }
     }
 

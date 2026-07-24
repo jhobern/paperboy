@@ -76,6 +76,22 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
             "unsupported output format '{out}' (only 'csv' is supported in v1)"
         )));
     }
+    // An optional `# environment:` names a single already-loaded environment to
+    // use as the report's base variable layer (the plain, no-comparison run).
+    // Like an `ENVS` loop, the environment must be loaded — flag it when it
+    // isn't (only once the loaded set is known).
+    if let Some(env) = flow.header.environment() {
+        let env = env.trim();
+        if env.is_empty() {
+            diags.push(Diagnostic::error("'# environment:' is empty"));
+        } else if let Some(loaded) = ctx.env_names
+            && !loaded.iter().any(|e| e == env)
+        {
+            diags.push(Diagnostic::error(format!(
+                "environment '{env}' is not loaded"
+            )));
+        }
+    }
 
     if ctx.request_titles.is_none() {
         diags.push(Diagnostic::warning(
@@ -393,6 +409,54 @@ mod tests {
             Some(&t),
             None,
             "unsupported"
+        ));
+    }
+
+    #[test]
+    fn environment_header_naming_an_unloaded_env_is_an_error() {
+        let t = titles();
+        let envs = ["au".to_string()];
+        assert!(has_err(
+            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
+            Some(&t),
+            Some(&envs),
+            "environment 'staging' is not loaded"
+        ));
+    }
+
+    #[test]
+    fn environment_header_naming_a_loaded_env_is_accepted() {
+        let t = titles();
+        let envs = ["au".to_string(), "staging".to_string()];
+        assert!(!has_err(
+            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
+            Some(&t),
+            Some(&envs),
+            "is not loaded"
+        ));
+    }
+
+    #[test]
+    fn empty_environment_header_is_an_error() {
+        let t = titles();
+        assert!(has_err(
+            "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n",
+            Some(&t),
+            None,
+            "'# environment:' is empty"
+        ));
+    }
+
+    #[test]
+    fn environment_header_is_not_checked_until_envs_are_known() {
+        // With no loaded-env context, a named environment can't be verified —
+        // it must not spuriously error (mirrors how ENVS names are skipped).
+        let t = titles();
+        assert!(!has_err(
+            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
+            Some(&t),
+            None,
+            "is not loaded"
         ));
     }
 

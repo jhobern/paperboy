@@ -84,6 +84,36 @@ impl EntryRunner for LiveRunner {
     }
 }
 
+/// A no-op [`EntryRunner`] for **dry runs**: it sends nothing and returns a
+/// benign empty response for every request. Feeding it to [`run_flow`] exercises
+/// the whole interpreter — producer expansion, loop nesting/products, ZIP/tuple
+/// pairing, scoping and request-name resolution — so the caller learns the
+/// projected row count, the resolved per-iteration variable bindings and any
+/// producer/resolution problems, all without firing a single HTTP request.
+pub struct DryRunner;
+
+impl EntryRunner for DryRunner {
+    fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+        RunOutput {
+            entries: vec![EntryOutcome {
+                method: base.method.clone(),
+                url: base.url.clone(),
+                status: 0,
+                status_text: String::new(),
+                headers: Vec::new(),
+                body: String::new(),
+                raw_body: String::new(),
+                asserts: Vec::new(),
+                captures: Vec::new(),
+                duration_ms: 0,
+                ok: true,
+                error: None,
+            }],
+            error: None,
+        }
+    }
+}
+
 /// The immutable context a flow runs against: the bound collection's entries,
 /// the base variable layer (global + pinned env, resolved once), any named
 /// environments an `ENVS` loop may select, the report file's directory (for

@@ -1975,6 +1975,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+R", s.help_report_new),
                             ("e / Enter", s.help_report_edit),
                             ("r / F5 (report)", s.help_report_run),
+                            ("d (report)", s.help_report_dry_run),
                             ("Tab / v (report)", s.help_report_view),
                             ("x (report)", s.help_report_export),
                             ("Esc (report)", s.help_report_leave_edit),
@@ -2140,6 +2141,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("Shift+R", s.help_report_new),
                         ("e / Enter", s.help_report_edit),
                         ("r / F5", s.help_report_run),
+                        ("d", s.help_report_dry_run),
                         ("Tab / v", s.help_report_view),
                         ("x", s.help_report_export),
                         ("Esc", s.help_report_leave_edit),
@@ -2153,6 +2155,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.help_reports_grammar_heading,
                     &[
                         ("# collection: PATH", s.help_grammar_collection),
+                        ("# environment: NAME", s.help_grammar_environment),
                         ("KEY = value", s.help_grammar_assign),
                         ("REQUEST NAME", s.help_grammar_request),
                         ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
@@ -2223,6 +2226,39 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 app.help_scroll = max_scroll;
             }
             let scroll = app.help_scroll;
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(panel(title, true, th))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                area,
+            );
+            if max_scroll > 0 {
+                let bar_area = Rect {
+                    x: area.x + area.width - 1,
+                    y: area.y + 1,
+                    width: 1,
+                    height: visible_rows as u16,
+                };
+                draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
+            }
+        }
+        Overlay::ReportDryRun(preview) => {
+            let lines = preview.lines(s, th);
+            let content_len = lines.len();
+            let box_w = f.area().width.saturating_sub(6).clamp(48, 96);
+            // Leave room for the border (2) and cap the height to the terminal;
+            // long previews scroll rather than overflowing.
+            let box_h = (content_len as u16 + 2).min(f.area().height.saturating_sub(2));
+            let area = centered_rect(box_w, box_h, f.area());
+            f.render_widget(Clear, area);
+            let title = format!("{}  ({})", s.report_dry_run_title, s.report_dry_run_hint);
+            let visible_rows = area.height.saturating_sub(2) as usize;
+            let max_scroll = content_len.saturating_sub(visible_rows) as u16;
+            if app.dry_run_scroll > max_scroll {
+                app.dry_run_scroll = max_scroll;
+            }
+            let scroll = app.dry_run_scroll;
             f.render_widget(
                 Paragraph::new(lines)
                     .block(panel(title, true, th))
