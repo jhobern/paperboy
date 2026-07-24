@@ -46,6 +46,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   auto-quoted on accept (typing `Up` completes to `"Upload document"`), and
   completing inside an already-opened `"` fills the rest of the name and appends
   the closing quote — so an accepted completion always parses.
+- **Run a report and export its results to CSV.** A bound report can now be
+  **run** (**`r`**/F5): PaperBoy drives the flow against its bound collection and
+  shows the produced rows in a results **grid** (columns follow the flow's
+  `columns:` directive, else the reported fields in first-seen order). **Tab**
+  (or **`v`**) flips between the flow source and the grid, and **`x`** exports the
+  last run to a CSV file next to the report (RFC 4180, so multi-line response
+  bodies are preserved). A report that isn't ready to run — unbound, unparseable,
+  or with validation errors — says why in the status bar instead of running. The
+  run is synchronous for now; background execution with live per-row updates and
+  cancellation follows in a later update.
 
 
 ## [0.1.6] - 2026-07-18

@@ -416,6 +416,9 @@ strings! {
     help_report_leave_edit => "leave edit focus (single letters are shortcuts again)", "quitter le mode édition (les lettres redeviennent des raccourcis)", "forlad redigering (enkelte bogstaver er genveje igen)";
     help_report_word_move => "move the cursor a word at a time (while editing)", "déplacer le curseur d'un mot à la fois (en édition)", "flyt markøren et ord ad gangen (under redigering)";
     help_report_complete => "fill in the suggested request name (while editing)", "compléter le nom de requête suggéré (en édition)", "udfyld det foreslåede anmodningsnavn (under redigering)";
+    help_report_run => "run the report and show its results grid", "exécuter le rapport et afficher sa grille de résultats", "kør rapporten og vis resultatgitteret";
+    help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
+    help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
     help_reports_about_1 => "A report is a saved flow that drives a bound collection against ranges of files or environments and collects the results into a table.", "Un rapport est un flux enregistré qui exécute une collection liée sur des ensembles de fichiers ou d'environnements et rassemble les résultats dans un tableau.", "En rapport er et gemt flow, der kører en bundet samling mod intervaller af filer eller miljøer og samler resultaterne i en tabel.";
@@ -463,8 +466,20 @@ strings! {
     report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
     report_empty_source => "Empty report — press e to edit its source.", "Rapport vide — appuyez sur e pour modifier sa source.", "Tom rapport — tryk e for at redigere kilden.";
     report_hint_edit => "e edit", "e modifier", "e rediger";
+    report_hint_run => "r run", "r exécuter", "r kør";
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
+    report_results_heading => "Results", "Résultats", "Resultater";
+    report_hint_results => "Tab source · x csv", "Tab source · x csv", "Tab kilde · x csv";
+    report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
+    report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
+    report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
+    report_run_has_errors => "Fix the validation errors before running.", "Corrigez les erreurs de validation avant l'exécution.", "Ret valideringsfejlene før kørsel.";
+    report_export_no_result => "Run the report before exporting.", "Exécutez le rapport avant l'exportation.", "Kør rapporten før eksport.";
+    report_run_complete => "Report run complete:", "Exécution du rapport terminée :", "Rapportkørsel fuldført:";
+    report_status_rows => "rows", "lignes", "rækker";
+    report_status_errors => "errors", "erreurs", "fejl";
+    report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
 }
 
 /// A language-independent status / notification message. It stores *what*
@@ -574,6 +589,17 @@ pub enum Status {
     ThemePresetReadonly,
     /// A raw (non-translatable) error detail, shown after a translated prefix.
     Error(String),
+    /// A report run finished (synchronously): how many rows it produced and how
+    /// many run-level errors were collected (0 → success).
+    ReportRunDone {
+        rows: usize,
+        errors: usize,
+    },
+    /// A report couldn't be run or exported; holds an already-translated reason
+    /// (built from [`Strings`] at the call site).
+    ReportRunBlocked(String),
+    /// A report's results were written to a CSV file; holds its path.
+    ReportExported(String),
 }
 
 impl Status {
@@ -581,6 +607,7 @@ impl Status {
     pub fn is_ok(&self) -> bool {
         match self {
             Status::CollectionRunSummary { failed, .. } => *failed == 0,
+            Status::ReportRunDone { errors, .. } => *errors == 0,
             _ => matches!(
                 self,
                 Status::Saved
@@ -597,6 +624,7 @@ impl Status {
                     | Status::ThemeSaved(_)
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
+                    | Status::ReportExported(_)
             ),
         }
     }
@@ -671,6 +699,18 @@ impl Status {
             ),
             Status::RunAllStreamingCookies => s.run_all_streaming_cookies.to_string(),
             Status::Error(e) => format!("{} {e}", s.file_error_prefix),
+            Status::ReportRunDone { rows, errors } => {
+                if *errors == 0 {
+                    format!("{} {rows} {}", s.report_run_complete, s.report_status_rows)
+                } else {
+                    format!(
+                        "{} {rows} {}, {errors} {}",
+                        s.report_run_complete, s.report_status_rows, s.report_status_errors
+                    )
+                }
+            }
+            Status::ReportRunBlocked(reason) => reason.clone(),
+            Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
         }
     }
 }

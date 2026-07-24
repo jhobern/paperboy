@@ -1974,6 +1974,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("Shift+R", s.help_report_new),
                             ("e / Enter", s.help_report_edit),
+                            ("r / F5 (report)", s.help_report_run),
+                            ("Tab / v (report)", s.help_report_view),
+                            ("x (report)", s.help_report_export),
                             ("Esc (report)", s.help_report_leave_edit),
                             ("Ctrl+←/→ (report)", s.help_report_word_move),
                             ("→ (report)", s.help_report_complete),
@@ -2136,6 +2139,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     &[
                         ("Shift+R", s.help_report_new),
                         ("e / Enter", s.help_report_edit),
+                        ("r / F5", s.help_report_run),
+                        ("Tab / v", s.help_report_view),
+                        ("x", s.help_report_export),
                         ("Esc", s.help_report_leave_edit),
                         ("Ctrl+←/→", s.help_report_word_move),
                         ("→", s.help_report_complete),

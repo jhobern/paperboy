@@ -14838,3 +14838,232 @@ fn report_source_highlights_keywords_and_underlines_the_error_line() {
         "the rejected line should be drawn in the error colour and underlined"
     );
 }
+
+/// A canned [`EntryRunner`] for the report-run tests: every request returns the
+/// same `body` with HTTP 200, so a run is deterministic and network-free.
+struct FakeReportRunner {
+    body: String,
+}
+
+impl crate::report::run::EntryRunner for FakeReportRunner {
+    fn run(
+        &self,
+        base: &crate::hurl::HurlEntry,
+        _vars: &std::collections::HashMap<String, String>,
+    ) -> crate::hurl::RunOutput {
+        crate::hurl::RunOutput {
+            entries: vec![crate::hurl::EntryOutcome {
+                method: base.method.clone(),
+                url: base.url.clone(),
+                status: 200,
+                status_text: "OK".to_string(),
+                headers: Vec::new(),
+                body: self.body.clone(),
+                raw_body: self.body.clone(),
+                asserts: Vec::new(),
+                captures: Vec::new(),
+                duration_ms: 7,
+                ok: true,
+                error: None,
+            }],
+            error: None,
+        }
+    }
+}
+
+/// A bound report with a `REPORT REQUEST` produces one row per iteration whose
+/// cells carry the request's intrinsic columns (HttpStatus/Time/Response).
+#[test]
+fn report_run_populates_the_results_grid() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{\"status\":\"ok\"}".to_string(),
+    };
+    let result = app.run_report_flow(idx, &runner).expect("runnable");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0].cells.get("Oauth.HttpStatus"),
+        Some(&"200".to_string())
+    );
+    assert!(
+        result.rows[0]
+            .cells
+            .get("Oauth.Response")
+            .unwrap()
+            .contains("ok")
+    );
+}
+
+/// Running via `apply_report_run` stores the result, flips to the results view
+/// and reports the row count; toggling flips back and forth.
+#[test]
+fn running_switches_to_the_results_view_and_toggles_back() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunDone { rows: 1, errors: 0 })
+    ));
+
+    app.toggle_report_view();
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    app.toggle_report_view();
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+}
+
+/// An unbound report can't run: `run_report_flow` returns a reason and
+/// `apply_report_run` keeps the source view with a blocked status.
+#[test]
+fn report_run_is_blocked_when_unbound() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // The scratch template's `# collection:` header is empty → unbound.
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    assert!(app.run_report_flow(idx, &runner).is_err());
+
+    app.apply_report_run(idx, &runner);
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunBlocked(_))
+    ));
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    assert!(app.reports[idx].result.is_none());
+}
+
+/// Exporting writes a CSV next to a saved report, driven by the `columns:`
+/// header directive.
+#[test]
+fn report_export_writes_a_csv_next_to_the_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-export-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.report");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    app.export_active_report_csv();
+
+    let csv_path = report_path.with_extension("csv");
+    let csv = std::fs::read_to_string(&csv_path).unwrap();
+    assert_eq!(csv, "Status\r\n200\r\n");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportExported(_))
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The results grid draws a bold header row (in the accent colour) after a run.
+#[test]
+fn report_results_grid_draws_a_header_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    let accent = app.theme().accent;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+
+    // The 'S' of the "Status" header is drawn bold in the accent colour.
+    let mut found_header = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            if cell.symbol() == "S"
+                && cell.fg == accent
+                && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+            {
+                found_header = true;
+            }
+        }
+    }
+    assert!(
+        found_header,
+        "the results grid should draw its column headers in bold accent"
+    );
+}
