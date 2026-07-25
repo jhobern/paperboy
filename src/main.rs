@@ -12,6 +12,7 @@ mod i18n;
 mod persistence;
 mod postman;
 mod report;
+mod report_cli;
 mod request;
 mod shared_utils;
 mod tree;
@@ -29,12 +30,16 @@ use clap::Parser;
     long_about = "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
 Runs in one of three modes:\n\
 \x20 TUI  (default)          a terminal user interface\n\
-\x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit",
+\x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit\n\
+\x20 Report (-r/--report)    run a PaperTrail report against a collection, then exit",
     after_help = "Examples:\n\
 \x20 paperboy                            Launch the terminal UI (default)\n\
 \x20 paperboy -c collection.hurl         Run a collection headlessly\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
-\x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\n\
+\x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
+\x20 paperboy -c collection.hurl -e environment.vars -r report.report   Run a report\n\
+\x20 paperboy -c collection.hurl -r report.report --dry-run   Preview a report without sending anything\n\
+\x20 paperboy -c collection.hurl -r report.report -o out.csv   Write the report to a file (- = stdout)\n\n\
 Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 {{ ... }} provider reference resolved when the environment is loaded:\n\
 \x20 Literal value       USERNAME=demo\n\
@@ -61,10 +66,44 @@ struct Cli {
     /// explicit `[Cookies]` section on a request is unaffected either way).
     #[arg(short = 'b', long)]
     batch: bool,
+
+    /// Run a PaperTrail report (`.report`) against the collection given by
+    /// `-c` and exit. Requires `-c`; `-e` supplies the base variable layer.
+    #[arg(short = 'r', long, value_name = "FILE")]
+    report: Option<String>,
+
+    /// With `-r`: expand the report and show what it would do without sending
+    /// any request (no HTTP). Handy before a large run.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// With `-r`: where to write the report output. `-` writes CSV to stdout
+    /// (for piping); a path's extension selects the format (`.csv` only in v1);
+    /// omitted derives the file from the report's `# output:`/`# name:` headers
+    /// (next to the report file, honouring the `{time}` token).
+    #[arg(short = 'o', long, value_name = "FILE")]
+    output: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Headless report mode (`-r`): run a PaperTrail report against `-c`.
+    if let Some(report) = cli.report {
+        let Some(collection) = cli.collection else {
+            eprintln!(
+                "error: -r/--report requires -c/--collection (the collection to run against)"
+            );
+            std::process::exit(2);
+        };
+        std::process::exit(report_cli::run(
+            collection,
+            cli.env,
+            report,
+            cli.output,
+            cli.dry_run,
+        ));
+    }
 
     // Headless CLI mode (explicit "run and exit").
     if let Some(collection) = cli.collection {

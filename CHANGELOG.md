@@ -12,6 +12,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Run reports from the command line.** A report can now be run headlessly
+  without opening the TUI: `paperboy -c collection.hurl -e env.vars -r
+  report.report` runs the flow and writes its table, then exits — ideal for
+  scripting, CI, or a scheduled nightly run. `--dry-run` expands the report and
+  prints the projected table without sending a single request (handy before a
+  big run), and `-o` chooses where the output goes: `-o -` streams clean CSV to
+  stdout for piping (all human/progress text is diverted to stderr), `-o
+  out.csv` writes a named file, and omitting it derives the filename from the
+  report's `# output:`/`# name:` headers next to the report file — honouring the
+  `{time}` token so repeated runs don't overwrite each other. Live runs print a
+  `done/total` progress counter as rows complete. Validation errors block a live
+  run (as in the TUI) but a `--dry-run` still previews; `-r` requires `-c`.
 - **Report results stream in live, row by row.** Running a report no longer
   waits for the whole run to finish before showing anything: the results grid
   appears immediately as a greyed-out skeleton of every projected row (in
@@ -249,6 +261,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   in the report editor and other text fields; it is now accepted as an alias for
   Ctrl+Backspace, so word-delete works everywhere regardless of terminal
   support.
+- **Compressed response bodies are now decoded before display.** When a request
+  sends its own `Accept-Encoding` header (e.g. `gzip, deflate, br`), the server
+  compresses the response and libcurl doesn't auto-decode it, so PaperBoy was
+  showing the raw compressed bytes as garbled text in both the CLI runner and
+  the TUI response panel. The body is now decompressed by its `Content-Encoding`
+  before it's shown (and pretty-printed if it's JSON); `[Captures]`/`[Asserts]`
+  were unaffected as Hurl already decoded internally for those.
 
 
 ## [0.1.6] - 2026-07-18
