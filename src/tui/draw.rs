@@ -47,6 +47,67 @@ pub(crate) fn wrap_marker(th: &Theme) -> WrapMarker {
         style: Style::default().fg(th.dim),
     }
 }
+
+/// The display width of a single `char`, measured the same way `ratatui`
+/// measures spans (so wide glyphs count as 2). Cheap enough for the capped,
+/// modal previews that call [`wrap_lines_with_marker`].
+fn char_display_width(ch: char) -> usize {
+    Span::raw(ch.to_string()).width().max(1)
+}
+
+/// Soft-wrap already-themed `lines` to `width` columns, appending the dim
+/// [`wrap_marker`] glyph at every break so a wrapped logical line still reads
+/// as one line. This is the manual counterpart of a body panel's wrap marker,
+/// for the plain-`Paragraph` overlays (the report dry-run preview) that render
+/// outside a `MultiSelectPanel` and so don't get the marker for free. Styles
+/// are preserved across breaks; the rightmost column is reserved for the marker
+/// (matching the panels), so content wraps at `width - 1`.
+pub(crate) fn wrap_lines_with_marker(
+    lines: Vec<Line<'static>>,
+    width: u16,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    if width < 2 {
+        return lines;
+    }
+    let limit = width - 1; // reserve the last column for the marker
+    let marker = wrap_marker(th);
+    let marker_glyph = marker.glyph.to_string();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        // Lines that already fit pass straight through unchanged.
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
+        for span in line.spans {
+            let style = span.style;
+            let mut buf = String::new();
+            for ch in span.content.chars() {
+                let cw = char_display_width(ch);
+                if col + cw > limit {
+                    if !buf.is_empty() {
+                        row.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    row.push(Span::styled(marker_glyph.clone(), marker.style));
+                    out.push(Line::from(std::mem::take(&mut row)));
+                    col = 0;
+                }
+                buf.push(ch);
+                col += cw;
+            }
+            if !buf.is_empty() {
+                row.push(Span::styled(buf, style));
+            }
+        }
+        // The final segment is the logical line's true end — no marker.
+        out.push(Line::from(row));
+    }
+    out
+}
 /// Marks a subfolder row in the request list tree, and (in the request
 /// editor's form) hints that a File-kind field's Value opens a file picker
 /// on Enter.
@@ -2545,9 +2606,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             }
         }
         Overlay::ReportDryRun(preview) => {
-            let lines = preview.lines(s, th);
-            let content_len = lines.len();
             let box_w = f.area().width.saturating_sub(6).clamp(48, 96);
+            // Pre-wrap to the inner width with an explicit end-of-line marker
+            // (rather than ratatui's markerless `Wrap`) so long binding/error
+            // lines read unambiguously as single logical lines.
+            let inner_w = box_w.saturating_sub(2);
+            let lines = wrap_lines_with_marker(preview.lines(s, th), inner_w, th);
+            let content_len = lines.len();
             // Leave room for the border (2) and cap the height to the terminal;
             // long previews scroll rather than overflowing.
             let box_h = (content_len as u16 + 2).min(f.area().height.saturating_sub(2));
@@ -2563,7 +2628,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             f.render_widget(
                 Paragraph::new(lines)
                     .block(panel(title, true, th))
-                    .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
                 area,
             );

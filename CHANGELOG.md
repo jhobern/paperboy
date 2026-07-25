@@ -12,6 +12,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Report dry-run preview marks soft-wrapped lines.** Long binding/error lines
+  in the dry-run overlay (`d`) now show the same dim `↵` end-of-line marker the
+  Request/Response panels use, so a wrapped sample reads unambiguously as one
+  logical line instead of several — much easier to scan.
 - **Undo in the structured node editor (Ctrl+Z).** The node editor now keeps a
   per-report undo stack: every structural edit (insert, replace/edit, delete,
   move, folder pick, and the REPORT REQUEST detail form) snapshots the flow

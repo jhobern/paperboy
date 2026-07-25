@@ -15834,6 +15834,42 @@ fn dry_run_overlay_scrolls_and_closes() {
     assert!(app.overlay.is_none(), "Esc closes the dry-run overlay");
 }
 
+/// `wrap_lines_with_marker` breaks an over-long line into several, ending every
+/// wrapped segment (but not the last) with the dim `↵` marker, and leaves lines
+/// that already fit untouched.
+#[test]
+fn wrap_lines_with_marker_marks_soft_wraps() {
+    use ratatui::text::{Line, Span};
+    let th = TuiApp::default().theme();
+    let long = Line::from(Span::raw("abcdefghij")); // 10 columns
+    let short = Line::from(Span::raw("ok"));
+    let out = super::draw::wrap_lines_with_marker(vec![long, short], 5, &th);
+    // Width 5 reserves the last column for the marker, so content wraps at 4:
+    // "abcd↵" / "efgh↵" / "ij", then the untouched "ok".
+    assert_eq!(out.len(), 4, "3 wrapped rows + 1 short row: {out:?}");
+    let text_of = |l: &Line| -> String { l.spans.iter().map(|sp| sp.content.clone()).collect() };
+    assert!(
+        text_of(&out[0]).ends_with('↵'),
+        "row 0 marked: {:?}",
+        text_of(&out[0])
+    );
+    assert!(
+        text_of(&out[1]).ends_with('↵'),
+        "row 1 marked: {:?}",
+        text_of(&out[1])
+    );
+    assert!(!text_of(&out[2]).ends_with('↵'), "final segment unmarked");
+    assert_eq!(text_of(&out[3]), "ok", "a fitting line is unchanged");
+    // The reconstructed content (minus markers) equals the original.
+    let joined: String = out
+        .iter()
+        .take(3)
+        .map(text_of)
+        .collect::<String>()
+        .replace('↵', "");
+    assert_eq!(joined, "abcdefghij");
+}
+
 /// Build a report tab bound to `api` with the given flow `text` and a synthetic
 /// last-run result whose produced columns are `column_order` — so the column
 /// picker (which reads the last result) can be exercised without a network run.
