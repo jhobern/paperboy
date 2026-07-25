@@ -30,6 +30,11 @@ pub enum WsRow {
         name: String,
         open: bool,
     },
+    /// A PaperTrail report file (`.report`) in the folder being browsed.
+    /// Selecting it opens the workspace-aware report view (it isn't loaded into
+    /// this collection tab). Reports can live in a workspace alongside the
+    /// collections they drive.
+    Report { path: PathBuf, name: String },
     /// A request of the currently-open collection (index into `entries`),
     /// shown indented under its [`WsRow::Collection`] row.
     Request(usize),
@@ -206,6 +211,13 @@ impl Collection {
         for e in crate::workspace::list_dir(&dir, true) {
             if e.is_dir {
                 rows.push(WsRow::Folder(e.display_name));
+            } else if crate::workspace::is_report_file(&e.path) {
+                // A report file opens the report view rather than loading into
+                // this collection tab, so it's a distinct row kind.
+                rows.push(WsRow::Report {
+                    path: e.path,
+                    name: e.display_name,
+                });
             } else {
                 let open =
                     self.path.as_deref() == Some(e.path.as_path()) && !self.workspace_collapsed;

@@ -432,6 +432,7 @@ strings! {
     help_report_nodes => "toggle between the source text and the structured node editor", "basculer entre le texte source et l'éditeur de nœuds structuré", "skift mellem kildeteksten og den strukturerede node-editor";
     help_report_nodes_edit => "in the node editor: a add · e/Enter edit · f folder/detail · Del remove · Shift+↑/↓ move · Ctrl+Z undo", "dans l'éditeur de nœuds : a ajouter · e/Entrée modifier · f dossier/détail · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler", "i node-editoren: a tilføj · e/Enter rediger · f mappe/detalje · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd";
     help_report_focus_cycle => "cycle focus: editor → results → tab list → editor", "faire défiler le focus : éditeur → résultats → liste des onglets → éditeur", "skift fokus: editor → resultater → faneliste → editor";
+    help_report_workspace_tree => "in a workspace report: ↑↓ move the pinned tree · Enter open a report/collection · ←/→ up/into a folder", "dans un rapport d'espace de travail : ↑↓ déplacer l'arbre épinglé · Entrée ouvrir un rapport/une collection · ←/→ monter/entrer dans un dossier", "i en arbejdsområderapport: ↑↓ flyt det fastgjorte træ · Enter åbn en rapport/samling · ←/→ op/ind i en mappe";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_report_baseline => "save the last run as a .baseline snapshot to compare future runs against", "enregistrer la dernière exécution comme instantané .baseline pour comparer les exécutions futures", "gem den seneste kørsel som et .baseline-øjebliksbillede at sammenligne fremtidige kørsler med";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
@@ -515,6 +516,8 @@ strings! {
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "n nodes", "n nœuds", "n noder";
+    report_workspace_heading => "Workspace", "Espace de travail", "Arbejdsområde";
+    report_hint_tree => "↑↓ move · Enter open", "↑↓ déplacer · Entrée ouvrir", "↑↓ flyt · Enter åbn";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
     report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";

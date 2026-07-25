@@ -115,7 +115,9 @@ pub(crate) const FOLDER_ICON: &str = "\u{1F4C1}";
 /// Chevrons on a Workspace collection file row: expanded (requests inlined)
 /// vs collapsed.
 const COLLECTION_OPEN_ICON: &str = "\u{25BE}"; // ▾
-const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
+pub(crate) const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
+/// Marks a PaperTrail report file in the Workspace tree (a document/chart glyph).
+pub(crate) const REPORT_ICON: &str = "\u{1F4CA}"; // 📊
 
 /// A rendered row of the request list, unifying the ordinary title-folder
 /// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
@@ -125,6 +127,7 @@ enum LeftRow {
     Up,
     Folder(String),
     Collection { name: String, open: bool },
+    Report { name: String },
     Entry { idx: usize, indent: bool },
 }
 
@@ -139,6 +142,7 @@ impl LeftRow {
                     WsRow::Up => LeftRow::Up,
                     WsRow::Folder(name) => LeftRow::Folder(name),
                     WsRow::Collection { name, open, .. } => LeftRow::Collection { name, open },
+                    WsRow::Report { name, .. } => LeftRow::Report { name },
                     WsRow::Request(idx) => LeftRow::Entry { idx, indent: true },
                 })
                 .collect()
@@ -810,6 +814,10 @@ pub(crate) fn draw_collection_left(
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 )))
             }
+            LeftRow::Report { name } => ListItem::new(Line::from(Span::styled(
+                format!("{REPORT_ICON} {name}"),
+                Style::default().fg(th.accent),
+            ))),
             LeftRow::Entry { idx, indent } => {
                 let e = &col.entries[*idx];
                 // A plus marks a request the user added by hand (in a real
@@ -2328,6 +2336,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("n (report)", s.help_report_nodes),
                             ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
+                            ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                             ("x (report)", s.help_report_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
@@ -2500,6 +2509,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("n", s.help_report_nodes),
                         ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
+                        ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                         ("x", s.help_report_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),

@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Open and run reports from the Workspace tree.** A workspace can now hold
+  `.report` files alongside the collections they drive: they show up in the
+  Workspace tab's file tree (with a distinct 📊 icon) and opening one lands you
+  in the full report view with that workspace's tree pinned down the left. From
+  there you can move through the workspace's folders, jump to another report, or
+  open one of its collections without leaving — Tab cycles focus through the
+  pinned tree, the editor, the results grid and the tab list. The pinned tree is
+  keyboard-driven: ↑↓ (or j/k) move, Enter/→ open the highlighted row (descend a
+  folder, open a collection, or load another report), and ←/Backspace go back up
+  a folder. The workspace context (which folder you were browsing) is saved with
+  the session, so a workspace report reopens exactly where you left it; if the
+  workspace folder has since gone missing it degrades gracefully to an ordinary
+  report tab.
+
 - **Run reports from the command line.** A report can now be run headlessly
   without opening the TUI: `paperboy -c collection.hurl -e env.vars -r
   report.report` runs the flow and writes its table, then exits — ideal for

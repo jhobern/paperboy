@@ -836,6 +836,13 @@ pub struct TuiApp {
     /// List" stop (so the tab bar is highlighted and the body panels dimmed).
     /// It is otherwise ignored — the collection view uses `focus` instead.
     pub(crate) report_tabbar_focus: bool,
+    /// In a *workspace-aware* report view (a report opened from a Workspace
+    /// tree), `true` when the pinned left-hand tree is the focused area rather
+    /// than the report body/tab bar. `Tab` rotates focus Tree → Editor →
+    /// Results → Tab List → Tree; this flag marks the "Tree" stop. Always
+    /// `false` for an ordinary report tab (no tree). Mutually exclusive with
+    /// `report_tabbar_focus`.
+    pub(crate) report_tree_focus: bool,
     /// Set while dragging a report panel's scrollbar thumb (which panel), so a
     /// `Drag` keeps adjusting its scroll even if the cursor leaves the
     /// one-column track. Cleared on `Up`.
@@ -1064,6 +1071,7 @@ impl Default for TuiApp {
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
             report_tabbar_focus: false,
+            report_tree_focus: false,
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),

@@ -17174,3 +17174,281 @@ fn report_node_request_form_ignores_plain_request_nodes() {
         "f on a plain REQUEST falls through to the File menu"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace-aware reports: opening a `.report` from a Workspace tree pins that
+// tree to the left of the full report view, so the user can navigate the
+// workspace's collections/reports without leaving the report.
+// ---------------------------------------------------------------------------
+
+/// Build a temp workspace folder holding a collection and two report files
+/// (plus one report nested in a subfolder), and open a Workspace collection tab
+/// rooted at it. Returns the app, the collection tab index, and the workspace
+/// root path.
+fn workspace_with_reports() -> (TuiApp, usize, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "paperboy-ws-reports-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("api.hurl"), "GET https://example.test\n").unwrap();
+    std::fs::write(
+        root.join("alpha.report"),
+        "# name: Alpha\n# collection: api.hurl\nREQUEST Oauth\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.report"),
+        "# name: Beta\n# collection: api.hurl\nREQUEST Oauth\n",
+    )
+    .unwrap();
+    let sub = root.join("nested");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(
+        sub.join("gamma.report"),
+        "# name: Gamma\n# collection: api.hurl\nREQUEST Oauth\n",
+    )
+    .unwrap();
+
+    let mut col = Collection::new("api".to_string(), Vec::new());
+    col.workspace_root = Some(root.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    (app, ci, root)
+}
+
+/// Pressing Enter on a `.report` row in a Workspace tab's tree opens a
+/// workspace-aware report tab: it lands in `reports`, carries the workspace
+/// context, and its pinned tree takes focus.
+#[test]
+fn opening_a_report_from_the_workspace_tree_opens_a_workspace_aware_report_tab() {
+    let (mut app, ci, root) = workspace_with_reports();
+    // Find the `alpha.report` row and highlight it.
+    let rows = app.collections[ci].ws_rows();
+    let cursor = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.report"))
+        .expect("alpha.report is listed in the workspace tree");
+    app.collections[ci].list_cursor = cursor;
+    app.focus = super::app::Pane::List;
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.reports.len(), 1, "a report tab was opened");
+    assert!(app.active_is_report(), "the report tab is now active");
+    let rt = app.active_report().expect("active report");
+    assert_eq!(rt.report.name, "Alpha");
+    let ws = rt.workspace.as_ref().expect("workspace context is carried");
+    assert_eq!(ws.root, root, "the tree is rooted at the workspace root");
+    assert!(app.report_tree_focus, "the pinned tree takes focus on open");
+    let _ = ci;
+}
+
+/// A workspace report's pinned tree lists the browsed folder's subfolders,
+/// collections, and report files, marking the open report.
+#[test]
+fn a_workspace_report_tree_lists_folders_collections_and_reports() {
+    use super::reports::{ReportTreeRow, ReportWorkspace};
+    let (_app, _ci, root) = workspace_with_reports();
+    let ws = ReportWorkspace {
+        root: root.clone(),
+        browse: Vec::new(),
+        cursor: 0,
+    };
+    let open = root.join("alpha.report");
+    let rows = ws.rows(Some(open.as_path()));
+    // Subfolder first (list_dir puts dirs before files), then the collection,
+    // then the two reports.
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, ReportTreeRow::Folder(n) if n == "nested")),
+        "the subfolder is listed: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, ReportTreeRow::Collection { name, .. } if name == "api.hurl")),
+        "the collection is listed"
+    );
+    let alpha = rows
+        .iter()
+        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "alpha.report"))
+        .expect("alpha.report is listed");
+    assert!(
+        matches!(alpha, ReportTreeRow::Report { open: true, .. }),
+        "the currently-open report is marked open"
+    );
+    let beta = rows
+        .iter()
+        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "beta.report"))
+        .expect("beta.report is listed");
+    assert!(
+        matches!(beta, ReportTreeRow::Report { open: false, .. }),
+        "a different report is not marked open"
+    );
+}
+
+/// With the pinned tree focused, arrows move the cursor and Enter on another
+/// report opens (and activates) it as a second workspace-aware report tab.
+#[test]
+fn report_tree_navigation_opens_another_report() {
+    let (mut app, ci, root) = workspace_with_reports();
+    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    assert!(app.report_tree_focus);
+    assert_eq!(app.reports.len(), 1);
+
+    // Move the tree cursor onto `beta.report` and open it.
+    let idx = app.active_report_index().unwrap();
+    let open = app.reports[idx].report.path.clone();
+    let ws = app.reports[idx].workspace.as_ref().unwrap();
+    let target = ws
+        .rows(open.as_deref())
+        .into_iter()
+        .position(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "beta.report"))
+        .expect("beta.report is in the tree");
+    app.reports[idx].workspace.as_mut().unwrap().cursor = target;
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.reports.len(), 2, "a second report tab opened");
+    assert_eq!(app.active_report().unwrap().report.name, "Beta");
+    assert!(
+        app.active_report().unwrap().workspace.is_some(),
+        "the newly-opened report also carries workspace context"
+    );
+    let _ = ci;
+}
+
+/// Descending into a subfolder from the pinned tree updates the breadcrumb and
+/// surfaces that folder's reports.
+#[test]
+fn report_tree_descends_into_a_subfolder() {
+    let (mut app, _ci, root) = workspace_with_reports();
+    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    let idx = app.active_report_index().unwrap();
+    let open = app.reports[idx].report.path.clone();
+    let ws = app.reports[idx].workspace.as_ref().unwrap();
+    let target = ws
+        .rows(open.as_deref())
+        .into_iter()
+        .position(|r| matches!(r, super::reports::ReportTreeRow::Folder(n) if n == "nested"))
+        .expect("the subfolder is in the tree");
+    app.reports[idx].workspace.as_mut().unwrap().cursor = target;
+
+    press(&mut app, KeyCode::Enter); // descend
+
+    let ws = app.reports[idx].workspace.as_ref().unwrap();
+    assert_eq!(
+        ws.browse,
+        vec!["nested".to_string()],
+        "breadcrumb descended"
+    );
+    assert!(
+        ws.rows(open.as_deref())
+            .iter()
+            .any(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "gamma.report")),
+        "the subfolder's report is now listed"
+    );
+    // Backspace goes back up.
+    press(&mut app, KeyCode::Backspace);
+    assert!(
+        app.reports[idx]
+            .workspace
+            .as_ref()
+            .unwrap()
+            .browse
+            .is_empty(),
+        "Backspace ascends to the workspace root"
+    );
+}
+
+/// `cycle_report_focus` visits the pinned tree only for a workspace report; a
+/// plain report tab never lands on a Tree focus.
+#[test]
+fn focus_cycle_includes_the_tree_only_for_workspace_reports() {
+    // Plain report: Tab cycles editor/tabbar, never sets tree focus.
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    for _ in 0..6 {
+        app.cycle_report_focus(true);
+        assert!(
+            !app.report_tree_focus,
+            "a non-workspace report never focuses a tree"
+        );
+    }
+
+    // Workspace report: the cycle reaches the tree exactly once per lap.
+    let (mut app, _ci, root) = workspace_with_reports();
+    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    // Start from a known non-tree focus.
+    app.report_tree_focus = false;
+    app.report_tabbar_focus = false;
+    let mut saw_tree = false;
+    for _ in 0..8 {
+        app.cycle_report_focus(true);
+        saw_tree |= app.report_tree_focus;
+    }
+    assert!(
+        saw_tree,
+        "the focus cycle reaches the pinned tree for a workspace report"
+    );
+}
+
+/// The workspace context (root + browsed sub-path) round-trips through session
+/// persistence, so a workspace report reopens pinned where it was.
+#[test]
+fn workspace_report_context_round_trips_through_persistence() {
+    let (mut app, _ci, root) = workspace_with_reports();
+    app.open_workspace_report(
+        root.join("alpha.report"),
+        root.clone(),
+        vec!["nested".into()],
+    );
+    let idx = app.active_report_index().unwrap();
+    // Sanity: the browse breadcrumb we asked for is on the tab.
+    assert_eq!(
+        app.reports[idx].workspace.as_ref().unwrap().browse,
+        vec!["nested".to_string()]
+    );
+
+    let snapshot = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+
+    assert_eq!(restored.reports.len(), 1);
+    let ws = restored.reports[0]
+        .workspace
+        .as_ref()
+        .expect("workspace context restored");
+    assert_eq!(ws.root, root, "root restored");
+    assert_eq!(
+        ws.browse,
+        vec!["nested".to_string()],
+        "browsed sub-path restored"
+    );
+}
+
+/// A workspace report whose root folder has vanished restores as an ordinary
+/// (non-workspace) report tab rather than pointing at a dead folder.
+#[test]
+fn a_vanished_workspace_root_degrades_to_a_plain_report_on_restore() {
+    let (mut app, _ci, root) = workspace_with_reports();
+    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    let snapshot = app.to_persisted();
+    // The folder disappears between sessions.
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+
+    assert_eq!(restored.reports.len(), 1);
+    assert!(
+        restored.reports[0].workspace.is_none(),
+        "a missing workspace root degrades to a plain report tab"
+    );
+}

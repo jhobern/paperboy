@@ -1290,6 +1290,16 @@ impl TuiApp {
                     self.activate_workspace_collection(ci, path);
                 }
             }
+            crate::collection::WsRow::Report { path, .. } => {
+                // A report file opens the workspace-aware report view, carrying
+                // this tab's workspace root + browsed folder so the report's
+                // pinned tree opens where the user was.
+                let root = self.collections[ci].workspace_root.clone();
+                let browse = self.collections[ci].workspace_browse.clone();
+                if let Some(root) = root {
+                    self.open_workspace_report(path, root, browse);
+                }
+            }
             crate::collection::WsRow::Request(_) => {
                 self.focus = Pane::Main;
                 self.open_edit_request_wizard(ci);
@@ -1795,7 +1805,26 @@ impl TuiApp {
         self.reports = state
             .reports
             .into_iter()
-            .map(|pr| crate::tui::reports::ReportTab::new(pr.into_report()))
+            .map(|pr| {
+                // Rebuild the pinned-tree workspace context if the report was a
+                // workspace report and its root still exists (a vanished folder
+                // silently degrades to an ordinary report tab).
+                let ws = pr
+                    .workspace_root
+                    .clone()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists())
+                    .map(|root| crate::tui::reports::ReportWorkspace {
+                        root,
+                        browse: pr.workspace_browse.clone(),
+                        cursor: 0,
+                    });
+                let report = pr.into_report();
+                match ws {
+                    Some(ws) => crate::tui::reports::ReportTab::new_in_workspace(report, ws),
+                    None => crate::tui::reports::ReportTab::new(report),
+                }
+            })
             .collect();
         self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
         for i in 0..self.reports.len() {
@@ -1843,7 +1872,16 @@ impl TuiApp {
             reports: self
                 .reports
                 .iter()
-                .map(|rt| PersistedReport::from_report(&rt.report))
+                .map(|rt| {
+                    let mut pr = PersistedReport::from_report(&rt.report);
+                    // Carry the pinned-tree workspace context (TUI-only state on
+                    // the `ReportTab`) so a workspace-aware report reopens pinned.
+                    if let Some(ws) = &rt.workspace {
+                        pr.workspace_root = Some(ws.root.to_string_lossy().into_owned());
+                        pr.workspace_browse = ws.browse.clone();
+                    }
+                    pr
+                })
                 .collect(),
             active_tab: self.active_tab,
             last_browse_dir: self
@@ -2371,7 +2409,26 @@ impl TuiApp {
                 Some(entry) if !entry.is_dir => {
                     let path = entry.path.clone();
                     let ci = picker.collection_idx;
+                    let is_report = crate::workspace::is_report_file(&path);
                     match picker.mode {
+                        // A report file can't take part in a request move/copy or
+                        // seed a new request — only collections can. Ignore it
+                        // (keep the picker open) in those modes.
+                        WsPickerMode::MoveRequest | WsPickerMode::CopyRequest if is_report => {
+                            self.overlay = Some(Overlay::WorkspacePicker(picker));
+                        }
+                        WsPickerMode::AddRequest if is_report => {
+                            self.overlay = Some(Overlay::WorkspacePicker(picker));
+                        }
+                        // A report file opens the workspace-aware report view
+                        // rather than loading as a collection.
+                        WsPickerMode::Browse if is_report => {
+                            let root = self.collections[ci].workspace_root.clone();
+                            let browse = self.collections[ci].workspace_browse.clone();
+                            if let Some(root) = root {
+                                self.open_workspace_report(path, root, browse);
+                            }
+                        }
                         WsPickerMode::MoveRequest | WsPickerMode::CopyRequest => {
                             // Transfer picks write straight to disk and don't
                             // switch the loaded file — the user stays put.

@@ -300,6 +300,15 @@ pub struct PersistedReport {
     pub path: Option<String>,
     #[serde(default)]
     pub git_origin: Option<GitOrigin>,
+    /// When this report was opened from a Workspace tree, the workspace root
+    /// folder (absolute path) so it reopens pinned to that tree on restart.
+    /// `None` for an ordinary report tab.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// The browsed sub-path (folder names below `workspace_root`) the pinned
+    /// tree was showing, so it reopens where the user left it.
+    #[serde(default)]
+    pub workspace_browse: Vec<String>,
 }
 
 impl PersistedReport {
@@ -310,6 +319,11 @@ impl PersistedReport {
             text: r.text.clone(),
             path: r.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             git_origin: r.git_origin.clone(),
+            // Workspace context lives on the TUI `ReportTab`, not the core
+            // `Report`; the tui layer fills these in when snapshotting (see
+            // `TuiApp::to_persisted`).
+            workspace_root: None,
+            workspace_browse: Vec::new(),
         }
     }
 

@@ -166,16 +166,33 @@ pub fn list_dir(dir: &Path, filter_hurl_json: bool) -> Vec<WsEntry> {
     out
 }
 
-/// Whether `path`'s extension matches the collection-file filter (case
-/// insensitive `.hurl`/`.json`) — always `true` when the filter is off.
+/// Whether `path`'s extension marks it as a file the Workspace tree shows: a
+/// collection (`.hurl`/`.json`) or a PaperTrail report (`.report`) — always
+/// `true` when the filter is off. Reports are surfaced so a workspace can hold
+/// (and run) reports alongside the collections they drive; the tree classifies
+/// them by extension (see [`is_report_file`]).
 fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
     if !filter_hurl_json {
         return true;
     }
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => ext.eq_ignore_ascii_case("hurl") || ext.eq_ignore_ascii_case("json"),
+        Some(ext) => {
+            ext.eq_ignore_ascii_case("hurl")
+                || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("report")
+        }
         None => false,
     }
+}
+
+/// Whether `path` is a PaperTrail report (`.report`, case-insensitive). The
+/// Workspace tree uses this to tell a report file apart from a collection file
+/// (both are surfaced by [`is_matching_file`]), so selecting one opens the
+/// report view rather than trying to parse it as a collection.
+pub fn is_report_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("report"))
 }
 
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any
