@@ -15317,6 +15317,115 @@ fn cancelled_background_report_run_discards_its_result() {
     );
 }
 
+/// Streaming: a run's updates arrive as a `Skeleton` (the greyed projected
+/// grid) then a `Row` per completed iteration then a `Done`. The poller installs
+/// the skeleton and switches to the grid immediately, un-greys each row as it
+/// streams in while advancing the progress status, and finally swaps in the
+/// finalized result — clearing the per-row progress so the grid is fully lit.
+#[test]
+fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
+    use super::reports::{ReportRunUpdate, ReportView};
+    use crate::i18n::Status;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "send".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/send".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n",
+    );
+    app.revalidate_report(idx);
+
+    // The dry expansion is the skeleton the worker would send first.
+    let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    assert_eq!(skeleton.rows.len(), 3);
+
+    // Drive the real poll+apply path deterministically via a hand-built channel
+    // (no worker thread): register the run, then feed messages one at a time.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.running_reports.insert(
+        report_id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.pending_report_runs.push((report_id, rx));
+
+    // 1. Skeleton → greyed grid shown immediately, nothing filled yet.
+    tx.send(ReportRunUpdate::Skeleton {
+        report_id,
+        result: skeleton.clone(),
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+    let prog = app.reports[idx].run_progress.as_ref().expect("streaming");
+    assert_eq!(prog.filled, vec![false, false, false]);
+    assert_eq!(prog.done, 0);
+    assert!(matches!(
+        app.status,
+        Some(Status::ReportRunProgress { done: 0, total: 3 })
+    ));
+    // Drawing a partly-greyed grid must not panic.
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    }
+
+    // 2. Rows stream in (deliberately out of order, as PARALLEL would): each
+    //    lands in its own slot by path and advances the progress count.
+    for (order, src) in [1usize, 0, 2].into_iter().enumerate() {
+        let mut row = skeleton.rows[src].clone();
+        row.cells
+            .insert("send.Marker".to_string(), format!("v{src}"));
+        tx.send(ReportRunUpdate::Row {
+            report_id,
+            row: Box::new(row),
+        })
+        .unwrap();
+        app.poll_report_run_updates();
+        let prog = app.reports[idx].run_progress.as_ref().unwrap();
+        assert!(prog.filled[src], "slot {src} filled");
+        assert_eq!(prog.done, order + 1);
+        assert!(matches!(
+            app.status,
+            Some(Status::ReportRunProgress { total: 3, .. })
+        ));
+    }
+    // Every streamed cell landed in the right row.
+    let result = app.reports[idx].result.as_ref().unwrap();
+    for src in 0..3 {
+        assert_eq!(
+            result.rows[src].cells.get("send.Marker"),
+            Some(&format!("v{src}"))
+        );
+    }
+
+    // 3. Done → finalized result installed, progress cleared (grid fully lit).
+    tx.send(ReportRunUpdate::Done {
+        report_id,
+        result: skeleton.clone(),
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    assert!(app.reports[idx].run_progress.is_none(), "progress cleared");
+    assert!(
+        app.running_reports.is_empty(),
+        "running flag cleared on Done"
+    );
+    assert!(matches!(
+        app.status,
+        Some(Status::ReportRunDone { rows: 3, errors: 0 })
+    ));
+}
+
 /// An unbound report can't run: `run_report_flow` returns a reason and
 /// `apply_report_run` keeps the source view with a blocked status.
 #[test]

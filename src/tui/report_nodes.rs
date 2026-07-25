@@ -588,7 +588,7 @@ impl RequestForm {
 // ---------------------------------------------------------------------------
 
 impl TuiApp {
-    fn report_index_by_id(&self, id: u64) -> Option<usize> {
+    pub(crate) fn report_index_by_id(&self, id: u64) -> Option<usize> {
         self.reports.iter().position(|rt| rt.report.id == id)
     }
 

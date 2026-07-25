@@ -28,23 +28,58 @@ use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::flow::{FlowNode, Header, Producer, ReportFlow};
-use crate::report::model::{ReportResult, TARGET_COLUMN, parse_columns};
-use crate::report::run::{DryRunner, EntryRunner, LiveRunner, RunContext, run_flow};
+use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
+use crate::report::run::{
+    DryRunner, EntryRunner, LiveRunner, RunContext, finalize, run_flow, run_flow_raw,
+};
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
 use crate::report::writer::{CsvWriter, ReportWriter};
 use crate::report::{expand_output_tokens, name_has_output_token};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// The result of a finished background report run, delivered from the worker
-/// thread back to the event loop (see [`TuiApp::poll_report_run_updates`]).
-/// Keyed by the report's process-unique `report_id` so the result lands on the
-/// right tab even if tabs were reordered or closed while it ran.
-pub(crate) struct ReportRunUpdate {
-    pub(crate) report_id: u64,
-    pub(crate) result: ReportResult,
+/// A streaming update from a background report run, delivered from the worker
+/// thread back to the event loop (see [`TuiApp::poll_report_run_updates`]). Each
+/// variant is keyed by the report's process-unique `report_id` so it lands on
+/// the right tab even if tabs were reordered or closed while it ran.
+///
+/// A run streams as: one [`Skeleton`](Self::Skeleton) (the full row set, all
+/// cells still placeholder, so the grid appears immediately greyed-out), then
+/// one [`Row`](Self::Row) per completed iteration (matched into its skeleton
+/// slot by [`ReportRow::path`] and un-greyed), then one [`Done`](Self::Done)
+/// carrying the finalized (comparison/baseline-collapsed) result that replaces
+/// the streamed grid.
+pub(crate) enum ReportRunUpdate {
+    /// The projected row set from a no-HTTP dry expansion: every row present but
+    /// unfilled. Shown immediately as a greyed-out grid so the user sees the
+    /// shape and size of the run before any request completes.
+    Skeleton {
+        report_id: u64,
+        result: ReportResult,
+    },
+    /// One completed iteration's row, matched into the skeleton by
+    /// [`ReportRow::path`] and un-greyed. May arrive out of order under a
+    /// `PARALLEL` loop (the path still identifies the target slot).
+    Row { report_id: u64, row: Box<ReportRow> },
+    /// The authoritative finalized result (after the comparison/baseline
+    /// collapse), which replaces the streamed grid when the run finishes.
+    Done {
+        report_id: u64,
+        result: ReportResult,
+    },
+}
+
+impl ReportRunUpdate {
+    /// The report this update belongs to (used to route it to the right tab).
+    fn report_id(&self) -> u64 {
+        match self {
+            ReportRunUpdate::Skeleton { report_id, .. }
+            | ReportRunUpdate::Row { report_id, .. }
+            | ReportRunUpdate::Done { report_id, .. } => *report_id,
+        }
+    }
 }
 
 /// Everything a report run needs, owned (no borrow of `TuiApp`), so the whole
@@ -135,9 +170,36 @@ pub(crate) struct ReportTab {
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
+    /// Live streaming state while a background run is in flight: which of the
+    /// pre-built skeleton rows have been filled yet (so the grid greys the
+    /// pending ones), the path→row-index lookup that routes each streamed row to
+    /// its slot, and the prior result to restore if the run is cancelled.
+    /// `None` when no run is streaming (never run / finished / cancelled).
+    pub(crate) run_progress: Option<RunProgress>,
     /// Selection/scroll panel backing the results grid (clip-wrapped so each
     /// row stays on one line and columns line up, like program output).
     pub(crate) results_panel: MultiSelectPanel,
+}
+
+/// Per-tab live-streaming bookkeeping for an in-flight background report run.
+/// The skeleton rows are stored on [`ReportTab::result`] (so the grid renders
+/// them immediately, greyed); this tracks which have completed, how to route a
+/// streamed row to its slot, and what to restore on cancel.
+pub(crate) struct RunProgress {
+    /// One flag per skeleton row (index-aligned with `result.rows`): `true` once
+    /// that row's real result has streamed in. Pending (`false`) rows are drawn
+    /// greyed so the grid doubles as a progress indicator.
+    pub(crate) filled: Vec<bool>,
+    /// Maps a row's structural [`ReportRow::path`] to its index in `result.rows`,
+    /// so an out-of-order streamed row (under `PARALLEL`) still lands in the
+    /// right slot.
+    pub(crate) index: HashMap<Vec<(usize, usize)>, usize>,
+    /// How many rows have been filled so far (for the progress status).
+    pub(crate) done: usize,
+    /// The result shown before this run started, restored verbatim if the run is
+    /// cancelled (so a cancel discards the partial run and leaves the prior grid,
+    /// matching the pre-streaming cancel semantics).
+    pub(crate) prev_result: Option<ReportResult>,
 }
 
 /// One entry on a report's node-editor undo stack: a full snapshot of the
@@ -226,6 +288,7 @@ impl ReportTab {
             node_selected: 0,
             node_undo: Vec::new(),
             result: None,
+            run_progress: None,
             results_panel,
         }
     }
@@ -438,6 +501,7 @@ impl TuiApp {
             named_envs: inputs.named_envs,
             root: inputs.root,
             runner,
+            sink: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
     }
@@ -570,10 +634,16 @@ impl TuiApp {
         }
     }
 
-    /// Spawn the worker thread for a prepared run: build a [`CancellableRunner`]
-    /// around `make_runner`'s runner, run the whole flow, and send the result
-    /// back over a channel drained by [`Self::poll_report_run_updates`]. Records
-    /// the cancel flag + receiver and sets the "running" status.
+    /// Spawn the worker thread for a prepared run. The run streams back over a
+    /// channel drained by [`Self::poll_report_run_updates`] as: (1) a
+    /// [`Skeleton`](ReportRunUpdate::Skeleton) from a no-HTTP dry expansion (so
+    /// the grid appears immediately, greyed), (2) one
+    /// [`Row`](ReportRunUpdate::Row) per completed iteration via the run's
+    /// [`sink`](RunContext::sink) (un-greying its slot), then (3) a
+    /// [`Done`](ReportRunUpdate::Done) with the finalized
+    /// (comparison/baseline-collapsed) result. Requests are sent through a
+    /// [`CancellableRunner`] around `make_runner`'s runner; the cancel flag +
+    /// receiver are recorded and the "running" status set.
     fn spawn_report_run<R, F>(&mut self, report_id: u64, inputs: ReportRunInputs, make_runner: F)
     where
         R: EntryRunner + Send + Sync + 'static,
@@ -591,9 +661,51 @@ impl TuiApp {
                 root,
                 file_root,
             } = inputs;
+
+            // 1. Skeleton: expand the flow with no HTTP (a `DryRunner`) to get
+            //    the full, canonical row set up front. The base layers are
+            //    cloned so the live run below can reuse the originals. The
+            //    skeleton rows map 1:1 (by `path`) to the live rows the sink
+            //    will stream, so the front-end can pre-build the grid and fill
+            //    it in place.
+            let skeleton = {
+                let dry_ctx = RunContext {
+                    entries: &entries,
+                    base_vars: base_vars.clone(),
+                    named_envs: named_envs.clone(),
+                    root: root.clone(),
+                    runner: &DryRunner,
+                    sink: None,
+                };
+                run_flow_raw(&flow, &dry_ctx)
+            };
+            if tx
+                .send(ReportRunUpdate::Skeleton {
+                    report_id,
+                    result: skeleton,
+                })
+                .is_err()
+            {
+                return; // Receiver gone (tab closed) — nothing more to do.
+            }
+
+            // 2. Live run: stream each completed row through a `Sync` sink (the
+            //    `PARALLEL` workers call it from several threads, and an
+            //    `mpsc::Sender` is `Send` but not `Sync`, so it's wrapped in a
+            //    `Mutex`). Rows may arrive out of iteration order under
+            //    `PARALLEL`; their `path` still identifies the target slot.
             let runner = CancellableRunner {
                 inner: make_runner(file_root),
                 cancel: cancel_worker,
+            };
+            let row_tx = Mutex::new(tx.clone());
+            let sink = move |row: &ReportRow| {
+                if let Ok(tx) = row_tx.lock() {
+                    let _ = tx.send(ReportRunUpdate::Row {
+                        report_id,
+                        row: Box::new(row.clone()),
+                    });
+                }
             };
             let ctx = RunContext {
                 entries: &entries,
@@ -601,73 +713,177 @@ impl TuiApp {
                 named_envs,
                 root,
                 runner: &runner,
+                sink: Some(&sink),
             };
-            let result = run_flow(&flow, &ctx);
+            let mut result = run_flow_raw(&flow, &ctx);
+            // 3. Finalize (comparison/baseline collapse) off the raw rows, then
+            //    hand back the authoritative result to replace the streamed grid.
+            finalize(&mut result, &flow, &ctx);
             // A closed receiver (the tab was closed mid-run) is fine to ignore.
-            let _ = tx.send(ReportRunUpdate { report_id, result });
+            let _ = tx.send(ReportRunUpdate::Done { report_id, result });
         });
         self.running_reports.insert(report_id, cancel);
         self.pending_report_runs.push((report_id, rx));
         self.status = Some(Status::ReportRunning);
     }
 
-    /// Drain any finished background report runs and fold each result into its
-    /// tab (matched by `report_id`, so a reordered/kept tab still gets it). A
-    /// result whose run was cancelled is discarded (the cancel status already
-    /// stands). A worker that dropped its sender without a result (a panic) has
-    /// its "running" flag cleared so the indicator can't wedge on. Called once
-    /// per event-loop iteration.
+    /// Drain any pending background report-run updates and fold them into their
+    /// tabs (matched by `report_id`, so a reordered/kept tab still gets them).
+    /// Each run streams many messages (a skeleton, a row per iteration, a final
+    /// result), so every buffered message is drained per call rather than one
+    /// per event-loop iteration — otherwise a fast run would lag the grid. A
+    /// worker that dropped its sender (finished or panicked) has its receiver
+    /// retired and, if still marked running, its flag cleared so the indicator
+    /// can't wedge on. Called once per event-loop iteration.
     pub(crate) fn poll_report_run_updates(&mut self) {
         if self.pending_report_runs.is_empty() {
             return;
         }
         let mut still = Vec::new();
         for (report_id, rx) in std::mem::take(&mut self.pending_report_runs) {
-            match rx.try_recv() {
-                Ok(update) => self.apply_report_run_update(update),
-                Err(std::sync::mpsc::TryRecvError::Empty) => still.push((report_id, rx)),
-                // Worker panicked / dropped the sender without a result: clear
-                // the running flag so the "running" state can't wedge forever.
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.running_reports.remove(&report_id);
+            let mut alive = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(update) => self.apply_report_run_update(update),
+                    // No more buffered messages for now — keep draining next tick.
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // Sender dropped: the run finished (its `Done` already
+                    // arrived above) or the worker panicked. Retire the receiver,
+                    // clear any lingering running flag, and drop leftover
+                    // streaming progress so a panicked run can't wedge the grid
+                    // in its greyed, half-filled state.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.running_reports.remove(&report_id);
+                        if let Some(rt) = self
+                            .report_index_by_id(report_id)
+                            .map(|i| &mut self.reports[i])
+                        {
+                            rt.run_progress = None;
+                        }
+                        alive = false;
+                        break;
+                    }
                 }
+            }
+            if alive {
+                still.push((report_id, rx));
             }
         }
         self.pending_report_runs = still;
     }
 
-    /// Apply one finished background run: clear its running flag and, unless it
-    /// was cancelled, store the result on the matching tab, switch to the grid
-    /// and report the row/error counts.
+    /// Apply one streamed report-run update to its tab. Routes on the update
+    /// kind (see [`ReportRunUpdate`]): a **Skeleton** installs the greyed
+    /// projected grid and switches to Results; a **Row** fills (and un-greys) its
+    /// slot and advances the progress status; **Done** swaps in the finalized
+    /// result. A run cancelled by the user discards its streamed rows and
+    /// restores the prior grid (matching the pre-streaming cancel semantics).
     fn apply_report_run_update(&mut self, update: ReportRunUpdate) {
-        let cancelled = self
-            .running_reports
-            .remove(&update.report_id)
+        let report_id = update.report_id();
+        match update {
+            ReportRunUpdate::Skeleton { result, .. } => {
+                // If the run was cancelled before its skeleton arrived, drop it.
+                if self.report_run_cancelled(report_id) {
+                    return;
+                }
+                let Some(idx) = self.report_index_by_id(report_id) else {
+                    return;
+                };
+                let n = result.rows.len();
+                let index = result
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (row.path.clone(), i))
+                    .collect();
+                let rt = &mut self.reports[idx];
+                let prev_result = rt.result.take();
+                rt.result = Some(result);
+                rt.run_progress = Some(RunProgress {
+                    filled: vec![false; n],
+                    index,
+                    done: 0,
+                    prev_result,
+                });
+                // Show the (greyed) grid straight away so the run's shape/size
+                // is visible before any request completes — unless the user is
+                // mid-edit, in which case just stage it (they can flip with Tab).
+                if rt.editor.is_none() {
+                    rt.view = ReportView::Results;
+                    rt.results_panel.set_scroll(0);
+                    self.report_tabbar_focus = false;
+                }
+                self.status = Some(Status::ReportRunProgress { done: 0, total: n });
+            }
+            ReportRunUpdate::Row { row, .. } => {
+                if self.report_run_cancelled(report_id) {
+                    return;
+                }
+                let Some(idx) = self.report_index_by_id(report_id) else {
+                    return;
+                };
+                let rt = &mut self.reports[idx];
+                let (Some(result), Some(prog)) = (rt.result.as_mut(), rt.run_progress.as_mut())
+                else {
+                    return;
+                };
+                // Route the streamed row into its skeleton slot by structural
+                // path (stable + unique even under out-of-order `PARALLEL`).
+                if let Some(&ri) = prog.index.get(&row.path)
+                    && ri < result.rows.len()
+                {
+                    result.rows[ri] = *row;
+                    if !prog.filled[ri] {
+                        prog.filled[ri] = true;
+                        prog.done += 1;
+                    }
+                }
+                let done = prog.done;
+                let total = prog.filled.len();
+                self.status = Some(Status::ReportRunProgress { done, total });
+            }
+            ReportRunUpdate::Done { result, .. } => {
+                // Done is the run's terminal message: clear the running flag now.
+                let cancelled = self
+                    .running_reports
+                    .remove(&report_id)
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(false);
+                let Some(idx) = self.report_index_by_id(report_id) else {
+                    return;
+                };
+                let rt = &mut self.reports[idx];
+                let progress = rt.run_progress.take();
+                if cancelled {
+                    // Discard the partial streamed run: restore whatever grid was
+                    // showing before it started (may be nothing).
+                    rt.result = progress.and_then(|p| p.prev_result);
+                    if rt.result.is_none() && rt.view == ReportView::Results {
+                        rt.view = rt.editor_view;
+                    }
+                    return;
+                }
+                let rows = result.rows.len();
+                let errors = result.errors.len();
+                rt.result = Some(result);
+                if rt.editor.is_none() {
+                    rt.view = ReportView::Results;
+                    rt.results_panel.set_scroll(0);
+                    self.report_tabbar_focus = false;
+                }
+                self.status = Some(Status::ReportRunDone { rows, errors });
+            }
+        }
+    }
+
+    /// Whether the run for `report_id` has been cancelled by the user (its
+    /// cancel flag is set). A run with no live flag counts as cancelled/finished
+    /// so a stray late message is ignored.
+    fn report_run_cancelled(&self, report_id: u64) -> bool {
+        self.running_reports
+            .get(&report_id)
             .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(false);
-        if cancelled {
-            return;
-        }
-        let Some(idx) = self
-            .reports
-            .iter()
-            .position(|rt| rt.report.id == update.report_id)
-        else {
-            return;
-        };
-        let rows = update.result.rows.len();
-        let errors = update.result.errors.len();
-        let rt = &mut self.reports[idx];
-        rt.result = Some(update.result);
-        // Don't yank the user out of an in-progress source edit that they
-        // started while the run was in flight; just store the result (they can
-        // flip to the grid with `v`/Tab). Otherwise show the grid as usual.
-        if rt.editor.is_none() {
-            rt.view = ReportView::Results;
-            rt.results_panel.set_scroll(0);
-            self.report_tabbar_focus = false;
-        }
-        self.status = Some(Status::ReportRunDone { rows, errors });
+            .unwrap_or(true)
     }
 
     /// Run report `idx` via `runner` and fold the outcome into the tab: on
@@ -2367,7 +2583,10 @@ fn draw_report_results(
             ),
             Some(result) => {
                 let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
-                let lines = report_grid_lines(result, &header, th);
+                // While a run streams, grey the rows that haven't completed yet
+                // so the grid doubles as a live progress indicator.
+                let filled = rt.run_progress.as_ref().map(|p| p.filled.as_slice());
+                let lines = report_grid_lines(result, &header, filled, th);
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
                 } else {
@@ -2404,10 +2623,13 @@ fn draw_report_results(
 /// headers followed by one line per row, each cell padded to its column's
 /// width (capped) so the columns line up under [`WrapMode::Clip`]. Newlines in
 /// a cell (e.g. a multi-line response body) are collapsed to a marker so a row
-/// stays on one grid line.
+/// stays on one grid line. When `filled` is `Some` (a run is streaming), rows
+/// whose flag is `false` are drawn dimmed — the still-pending, placeholder rows
+/// of the skeleton — so the grid doubles as a live progress indicator.
 fn report_grid_lines(
     result: &ReportResult,
     header: &crate::report::flow::Header,
+    filled: Option<&[bool]>,
     th: &Theme,
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
@@ -2450,8 +2672,16 @@ fn report_grid_lines(
         &widths,
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
     ));
-    for row in &body {
-        lines.push(grid_line(row, &widths, Style::default().fg(th.text)));
+    for (i, row) in body.iter().enumerate() {
+        // A row still awaiting its result (streaming) is dimmed; completed and
+        // static (non-streaming) rows use the normal text colour.
+        let pending = filled.map(|f| f.get(i) == Some(&false)).unwrap_or(false);
+        let style = if pending {
+            Style::default().fg(th.dim)
+        } else {
+            Style::default().fg(th.text)
+        };
+        lines.push(grid_line(row, &widths, style));
     }
     lines
 }

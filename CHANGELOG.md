@@ -12,6 +12,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Report results stream in live, row by row.** Running a report no longer
+  waits for the whole run to finish before showing anything: the results grid
+  appears immediately as a greyed-out skeleton of every projected row (in
+  canonical order, so you see the run's shape and size up front), then each row
+  lights up and fills with its response as that iteration completes, with a
+  running `done/total` progress count in the status bar. Ideal for the big runs
+  (500–1000 documents) — you get a real sense of progress instead of a frozen
+  wait, and can watch which rows are done and which are still pending. Rows
+  arriving out of order (under `PARALLEL`) still land in the right slot, and the
+  final comparison/`Result` verdict is folded in once the run finishes. Cancel
+  (a second `r`) still discards the partial run and restores the prior grid.
 - **Timestamp your report output with `{time}`.** Put `{time}` anywhere in a
   report's `# name:` (e.g. `# name: staging_{time}`) and every file the run
   writes — the CSV export, a saved `.baseline` — is stamped with the local time

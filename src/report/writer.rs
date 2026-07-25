@@ -91,6 +91,7 @@ mod tests {
                 .collect(),
             vars: HashMap::new(),
             key: vec![],
+            path: Vec::new(),
             target: None,
         }
     }

@@ -32,6 +32,15 @@ pub struct ReportRow {
     /// excluded), in binding order. Two rows with the same key across different
     /// ENVS targets are the same logical row (the P11 comparison axis).
     pub key: Vec<String>,
+    /// The **structural path** to the row: one `(loop node index within its
+    /// block, iteration index)` pair per enclosing loop. Unlike [`key`](Self::key)
+    /// (which holds loop *values* and can repeat), the path is guaranteed unique
+    /// and, sorted lexicographically, reproduces the canonical row order — so a
+    /// streaming front-end can match a live row to its pre-built grid slot even
+    /// when a `PARALLEL` loop delivers rows out of order. Empty for the single
+    /// row of a loop-free flow. Not part of the persisted/exported model (it's a
+    /// run-time coordinate); baseline-snapshot rows carry an empty path.
+    pub path: Vec<(usize, usize)>,
     /// The ENVS target (environment name) this row was produced under, if the
     /// flow loops over `ENVS`. `None` for a flow with no `ENVS` loop.
     pub target: Option<String>,
@@ -227,6 +236,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             key: vec![],
+            path: Vec::new(),
             target: target.map(str::to_string),
         }
     }

@@ -534,6 +534,7 @@ strings! {
     report_bind_unsaved => "(unsaved)", "(non enregistré)", "(ikke gemt)";
     report_bind_no_collections => "Open a collection tab first, then bind the report to it", "Ouvrez d'abord un onglet de collection, puis liez-y le rapport", "Åbn først en samlingsfane, og bind derefter rapporten til den";
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
+    report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
@@ -708,6 +709,12 @@ pub enum Status {
     /// A report run has been started on a background thread (non-blocking); the
     /// app stays responsive while it runs. Cleared by the completion status.
     ReportRunning,
+    /// Live streaming progress of a background report run: how many of the
+    /// projected rows have completed so far. Updated as each row streams in.
+    ReportRunProgress {
+        done: usize,
+        total: usize,
+    },
     /// A running report was cancelled by the user before it finished; any
     /// partial result is discarded.
     ReportRunCancelled,
@@ -838,6 +845,10 @@ impl Status {
             Status::ReportColumnsNoneSelected => s.report_columns_none_selected.to_string(),
             Status::ReportColumnsApplied => s.report_columns_applied.to_string(),
             Status::ReportRunning => s.report_running.to_string(),
+            Status::ReportRunProgress { done, total } => s
+                .report_running_progress
+                .replace("{done}", &done.to_string())
+                .replace("{total}", &total.to_string()),
             Status::ReportRunCancelled => s.report_run_cancelled.to_string(),
         }
     }

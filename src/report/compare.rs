@@ -236,6 +236,7 @@ mod tests {
                 .collect(),
             vars: HashMap::new(),
             key: key.iter().map(|k| k.to_string()).collect(),
+            path: Vec::new(),
             target: Some(target.to_string()),
         }
     }

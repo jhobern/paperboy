@@ -59,6 +59,7 @@ impl BaselineRow {
             cells: self.cells.clone(),
             vars: self.vars.clone(),
             key: self.key.clone(),
+            path: Vec::new(),
             target: self.target.clone(),
         }
     }
@@ -167,6 +168,7 @@ mod tests {
                 .collect(),
             vars: HashMap::new(),
             key: key.iter().map(|k| k.to_string()).collect(),
+            path: Vec::new(),
             target: None,
         }
     }

@@ -114,6 +114,16 @@ impl EntryRunner for DryRunner {
     }
 }
 
+/// A per-row streaming hook: called once for **each row as it is emitted**
+/// (innermost-loop completion), before any outer-scope broadcast cells or the
+/// final comparison/baseline collapse are applied. It lets a front-end fill a
+/// pre-built grid live as a long run progresses (matched by [`ReportRow::path`],
+/// which is stable and unique) instead of waiting for the whole run. Must be
+/// `Sync` — `PARALLEL` loop workers call it from several threads at once (so a
+/// `mpsc::Sender` sink needs a `Mutex`), and it may arrive out of iteration
+/// order under `PARALLEL` (the `path` still identifies the target row).
+pub type RowSink<'a> = dyn Fn(&ReportRow) + Sync + 'a;
+
 /// The immutable context a flow runs against: the bound collection's entries,
 /// the base variable layer (global + pinned env, resolved once), any named
 /// environments an `ENVS` loop may select, the report file's directory (for
@@ -132,6 +142,10 @@ pub struct RunContext<'a> {
     pub root: Option<PathBuf>,
     /// How each request is actually sent.
     pub runner: &'a dyn EntryRunner,
+    /// Optional per-row streaming hook (see [`RowSink`]). `None` for a plain,
+    /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
+    /// front-end wants each row as it completes to fill a live grid.
+    pub sink: Option<&'a RowSink<'a>>,
 }
 
 /// Resolve a request `name` against the bound collection's entries, mirroring
@@ -158,8 +172,24 @@ pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a Hur
     }
 }
 
-/// Run a whole flow and collect its rows.
+/// Run a whole flow and collect its rows, applying the final comparison/baseline
+/// collapse. This is the batch entry point (CSV export, dry run, tests); for a
+/// live streaming run a front-end sets [`RunContext::sink`] and calls
+/// [`run_flow_raw`] then [`finalize`] itself, so it can act on the pre-collapse
+/// rows as they stream and swap in the finalized result at the end.
 pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
+    let mut result = run_flow_raw(flow, ctx);
+    finalize(&mut result, flow, ctx);
+    result
+}
+
+/// The **emit phase**: walk the flow and collect its rows exactly as produced —
+/// one per innermost-loop iteration, in canonical order — *without* the
+/// comparison/baseline collapse. Fires [`RunContext::sink`] once per row as it's
+/// emitted (see [`RowSink`]). Separated from [`finalize`] so a streaming
+/// front-end can build its grid from these raw rows (which map 1:1 to the sink's
+/// updates) and only collapse at the end.
+pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
@@ -171,17 +201,21 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .and_then(|f| f.get("PRELUDE_NO_MATCH_MARKER"))
         .cloned()
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
-    let mut result = ReportResult {
+    ReportResult {
         rows,
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
-    };
-    // Collapse baseline/candidate rows into a `Result` diff when the flow
-    // configures an ENVS comparison (no-op otherwise). Done here, off the row
-    // model, so the CSV writer and the TUI grid both pick it up unchanged.
+    }
+}
+
+/// The **finalize phase**: collapse baseline/candidate rows into a `Result` diff
+/// when the flow configures an ENVS comparison or names a saved `# baseline:`
+/// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
+/// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
+pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
     if let Some(roles) = super::compare::comparison_roles(flow) {
-        super::compare::apply(&mut result, &roles);
+        super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
         .header
         .baseline()
@@ -195,13 +229,12 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         // produced, just without a `Result` verdict).
         let path = super::producers::resolve_path(ctx.root.as_deref(), rel);
         match super::baseline::Baseline::load(&path) {
-            Ok(baseline) => super::baseline::apply(&mut result, &baseline),
+            Ok(baseline) => super::baseline::apply(result, &baseline),
             Err(e) => result
                 .errors
                 .push(format!("baseline {}: {e}", path.display())),
         }
     }
-    result
 }
 
 /// Mutable interpreter state threaded through the walk.
@@ -218,6 +251,12 @@ struct Exec<'a> {
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
     /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
     key_parts: Vec<String>,
+    /// The **structural path** to the current position: one `(node index in its
+    /// block, iteration index)` pair per enclosing loop. Stable and unique per
+    /// emitted row, and lexicographically ordered == canonical row order, so a
+    /// streaming front-end can match a live row to its pre-built grid slot even
+    /// when `PARALLEL` delivers rows out of order (see [`ReportRow::path`]).
+    path: Vec<(usize, usize)>,
     /// The current `ENVS` target (environment name), if inside an `ENVS` loop.
     target: Option<String>,
     /// The current `ENVS` target's variables, layered above pinned/global.
@@ -240,6 +279,7 @@ struct ExecState {
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
     key_parts: Vec<String>,
+    path: Vec<(usize, usize)>,
     target: Option<String>,
     target_env: Option<HashMap<String, String>>,
 }
@@ -260,6 +300,7 @@ impl<'a> Exec<'a> {
             lists: HashMap::new(),
             captures: HashMap::new(),
             key_parts: Vec::new(),
+            path: Vec::new(),
             target: None,
             target_env: None,
             column_order: Vec::new(),
@@ -276,6 +317,7 @@ impl<'a> Exec<'a> {
             lists: self.lists.clone(),
             captures: self.captures.clone(),
             key_parts: self.key_parts.clone(),
+            path: self.path.clone(),
             target: self.target.clone(),
             target_env: self.target_env.clone(),
         }
@@ -290,6 +332,7 @@ impl<'a> Exec<'a> {
             lists: state.lists,
             captures: state.captures,
             key_parts: state.key_parts,
+            path: state.path,
             target: state.target,
             target_env: state.target_env,
             column_order: Vec::new(),
@@ -386,7 +429,7 @@ impl<'a> Exec<'a> {
         let mut child_rows: Vec<ReportRow> = Vec::new();
         let mut has_loop = false;
 
-        for node in nodes {
+        for (node_index, node) in nodes.iter().enumerate() {
             match node {
                 FlowNode::Assign { key, value } => {
                     let v = substitute(&unquote(value), &self.vars_for());
@@ -413,6 +456,7 @@ impl<'a> Exec<'a> {
                 } => {
                     has_loop = true;
                     child_rows.extend(self.run_for_each(
+                        node_index,
                         pattern,
                         producer,
                         body,
@@ -426,7 +470,13 @@ impl<'a> Exec<'a> {
                     parallel,
                 } => {
                     has_loop = true;
-                    child_rows.extend(self.run_for_envs(var, clause, body, parallel.as_ref()));
+                    child_rows.extend(self.run_for_envs(
+                        node_index,
+                        var,
+                        clause,
+                        body,
+                        parallel.as_ref(),
+                    ));
                 }
             }
         }
@@ -445,14 +495,21 @@ impl<'a> Exec<'a> {
 
     /// Build the single row for a loop-free (innermost) block: this-block's
     /// cells plus a snapshot of the visible variables, the current row key, and
-    /// the current `ENVS` target.
+    /// the current `ENVS` target. Fires the streaming [`RowSink`] (if any) with
+    /// the finished row before returning it, so a live front-end sees each row
+    /// as it completes.
     fn emit_row(&self, cells: HashMap<String, String>) -> ReportRow {
-        ReportRow {
+        let row = ReportRow {
             cells,
             vars: self.visible_vars(),
             key: self.key_parts.clone(),
+            path: self.path.clone(),
             target: self.target.clone(),
+        };
+        if let Some(sink) = self.ctx.sink {
+            sink(&row);
         }
+        row
     }
 
     // --- requests & reports ------------------------------------------------
@@ -627,6 +684,7 @@ impl<'a> Exec<'a> {
     /// between them or to the continuation).
     fn run_for_each(
         &mut self,
+        node_index: usize,
         pattern: &Pattern,
         producer: &Producer,
         body: &[FlowNode],
@@ -645,6 +703,7 @@ impl<'a> Exec<'a> {
         let run_one = |i: usize| -> IterOut {
             let item = &items[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
+            sub.path.push((node_index, i));
             sub.check_arity(pattern, item);
             sub.scopes.push(HashMap::new());
             sub.bind_pattern(pattern, &item.values);
@@ -667,6 +726,7 @@ impl<'a> Exec<'a> {
     /// independent and may run in parallel.
     fn run_for_envs(
         &mut self,
+        node_index: usize,
         var: &str,
         clause: &EnvClause,
         body: &[FlowNode],
@@ -684,6 +744,7 @@ impl<'a> Exec<'a> {
         let run_one = |i: usize| -> IterOut {
             let name = &names[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
+            sub.path.push((node_index, i));
             sub.target = Some(name.clone());
             sub.target_env = ctx.named_envs.get(name).cloned();
             if sub.target_env.is_none() {
@@ -1151,6 +1212,7 @@ mod tests {
                 .collect(),
             root: None,
             runner: fake,
+            sink: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -1487,6 +1549,66 @@ mod tests {
         assert_eq!(res.rows[0].vars.get("REGION"), Some(&"au-1".to_string()));
     }
 
+    /// The streaming `RowSink` fires exactly once per emitted row, each row
+    /// carries a unique structural `path`, and the sink's rows sorted by path
+    /// reproduce the canonical (returned) row order — the contract the TUI relies
+    /// on to fill a pre-built skeleton grid slot-by-slot as a run streams.
+    #[test]
+    fn streaming_sink_fires_once_per_row_with_unique_ordered_paths() {
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("send", &[])];
+        let flow =
+            parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n").unwrap();
+        let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
+        let sink = |row: &ReportRow| streamed.lock().unwrap().push(row.clone());
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: Some(&sink),
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let streamed = streamed.into_inner().unwrap();
+
+        // One sink call per produced row.
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(streamed.len(), result.rows.len());
+
+        // Paths are unique across the streamed rows.
+        let mut paths: Vec<Vec<(usize, usize)>> = streamed.iter().map(|r| r.path.clone()).collect();
+        let mut unique = paths.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), paths.len(), "streamed paths are unique");
+
+        // Sorted paths reproduce the canonical returned-row order, and every
+        // streamed path indexes into the returned rows (the skeleton match).
+        paths.sort();
+        let canonical: Vec<Vec<(usize, usize)>> =
+            result.rows.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(paths, canonical);
+        let index: HashMap<Vec<(usize, usize)>, usize> = result
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.path.clone(), i))
+            .collect();
+        for row in &streamed {
+            assert!(
+                index.contains_key(&row.path),
+                "every streamed row maps to a skeleton slot"
+            );
+        }
+    }
+
     #[test]
     fn with_field_overrides_reports_block() {
         let fake = Fake::new(&[(
@@ -1577,6 +1699,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            sink: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -1665,6 +1788,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(d.clone()),
             runner: &fake,
+            sink: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
@@ -1791,6 +1915,7 @@ mod tests {
             .collect(),
             root: None,
             runner: &EchoEnv,
+            sink: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -1858,6 +1983,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            sink: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -1874,6 +2000,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            sink: None,
         };
         let second = run_flow(&flow2, &ctx2);
 
@@ -1918,6 +2045,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            sink: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -1951,6 +2079,7 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(std::env::temp_dir()),
             runner: &fake,
+            sink: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 1, "rows still produced");
