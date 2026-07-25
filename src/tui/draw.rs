@@ -255,23 +255,20 @@ fn draw_report_node_request_overlay(
     s: &Strings,
     th: &Theme,
 ) {
-    use super::report_nodes::REQUEST_FORM_HEAD_ROWS;
-    let title = format!(
-        "{} {}  ({})",
-        s.report_node_request_title, form.request, s.report_node_request_hint
-    );
-    let n = REQUEST_FORM_HEAD_ROWS + form.fields.len();
+    use super::report_nodes::FormRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
     let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
     let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
     let area = centered_rect(box_w, box_h, f.area());
     f.render_widget(Clear, area);
     let inner_h = area.height.saturating_sub(2) as usize;
-    let scroll = if form.selected >= inner_h {
-        form.selected + 1 - inner_h
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
     } else {
         0
     };
-    // Row 0 = response toggle, row 1 = alias, rows 2.. = field checkboxes.
     let response_label = match form.response {
         None => s.report_node_response_default,
         Some(crate::report::flow::ResponseFmt::Raw) => "RAW",
@@ -282,14 +279,10 @@ fn draw_report_node_request_overlay(
     } else {
         form.alias.as_str()
     };
-    let head = [
-        format!("{}: ‹{}›", s.report_node_response_label, response_label),
-        format!("{}: {}", s.report_node_alias_label, alias_shown),
-    ];
     let mut lines: Vec<Line> = Vec::new();
-    for i in scroll..n.min(scroll + inner_h) {
-        let selected = i == form.selected;
-        let base = if selected {
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
             Style::default()
                 .fg(th.bg)
                 .bg(th.accent)
@@ -297,34 +290,61 @@ fn draw_report_node_request_overlay(
         } else {
             Style::default().fg(th.text)
         };
-        match head.get(i) {
-            Some(text) => {
-                // A head row (response toggle / alias field): show a text cursor
-                // on the alias field when it's selected.
-                let mut text = text.clone();
-                if selected && i == 1 {
+        let line = match *row {
+            FormRow::Name => {
+                let shown = if form.request.is_empty() {
+                    s.report_node_name_none
+                } else {
+                    form.request.as_str()
+                };
+                Line::from(Span::styled(
+                    format!("{}: ‹{}›", s.report_node_name_label, shown),
+                    base,
+                ))
+            }
+            FormRow::Report => {
+                let mark = if form.report { "[x]" } else { "[ ]" };
+                Line::from(Span::styled(
+                    format!("{mark} {}", s.report_node_report_label),
+                    base,
+                ))
+            }
+            FormRow::Response => Line::from(Span::styled(
+                format!("{}: ‹{}›", s.report_node_response_label, response_label),
+                base,
+            )),
+            FormRow::Alias => {
+                let mut text = format!("{}: {}", s.report_node_alias_label, alias_shown);
+                if is_sel {
                     text.push('▏');
                 }
-                lines.push(Line::from(Span::styled(text, base)));
+                Line::from(Span::styled(text, base))
             }
-            None => {
-                let row = &form.fields[i - REQUEST_FORM_HEAD_ROWS];
-                let mark = if row.included { "[x]" } else { "[ ]" };
-                let style = if selected {
+            FormRow::Field(fi) => {
+                let fr = &form.fields[fi];
+                let mark = if fr.included { "[x]" } else { "[ ]" };
+                let style = if is_sel {
                     base
-                } else if row.included {
+                } else if fr.included {
                     Style::default().fg(th.text)
                 } else {
                     Style::default().fg(th.dim)
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{mark} {}", row.name),
-                    style,
-                )));
+                Line::from(Span::styled(format!("{mark} {}", fr.name), style))
             }
-        }
+        };
+        lines.push(line);
     }
-    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    // The shortcut hint lives on the bottom border (a dim footer) rather than
+    // crammed into the title, so a long request name no longer truncates it.
+    let block = panel(s.report_node_config_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_request_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,

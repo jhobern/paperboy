@@ -12,7 +12,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
-- **Open and run reports from the Workspace tree.** A workspace can now hold
+- **Turn a request into a reported one (or back) from the node editor.** The
+  report node editor's per-node configure form now has a **Report** checkbox:
+  tick it to promote a plain `REQUEST` into a `REPORT REQUEST` (which reveals
+  the response-format, alias and field options), or un-tick it to drop reporting
+  again — no need to retype the line. The request name is now chosen inline on
+  the form too (Space/←→ cycle through the bound collection's requests). This
+  answers "how do I add REPORT to a line in the node editor?" without leaving
+  the structured view.
+
+
   `.report` files alongside the collections they drive: they show up in the
   Workspace tab's file tree (with a distinct 📊 icon) and opening one lands you
   in the full report view with that workspace's tree pinned down the left. From
@@ -259,6 +268,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   section round-trips through collection save/load (stored as a spec-safe
   `# [Reports]` comment block), and a request with no report fields contributes
   its whole response to a report instead.
+
+### Changed
+
+- **Simpler, consistent keys in the report node editor.** `f` now always opens
+  the **File** menu (as it does everywhere else) instead of doing double duty as
+  a per-node "detail" key. Configuring a node — a request's options, a loop's
+  folder, or an assignment's text — is now on **Enter** (a single "configure
+  this node" form whose shape follows the node kind), and `e` remains the raw
+  "edit the source line" escape hatch. The request form's long shortcut hint
+  moved off the title onto a footer, so a long request name no longer truncates
+  it.
 
 ### Fixed
 

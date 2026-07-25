@@ -16940,7 +16940,7 @@ fn report_node_editor_rejects_an_invalid_edited_line() {
     );
 }
 
-/// `f` on a `FOR … IN FILES` node opens the folder browser (parking the node)
+/// Enter on a `FOR … IN FILES` node opens the folder browser (parking the node)
 /// so the source directory can be chosen without typing a path.
 #[test]
 fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
@@ -16950,13 +16950,13 @@ fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
     );
     app.revalidate_report(idx);
     press(&mut app, KeyCode::Down); // select the FOR head (row 1)
-    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Enter);
     assert!(
         matches!(
             app.overlay,
             Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
         ),
-        "f opens the node folder picker"
+        "Enter opens the node folder picker"
     );
     assert!(app.pending_node_folder.is_some(), "the node is parked");
 }
@@ -16981,8 +16981,8 @@ fn report_node_folder_commit_writes_into_the_loop_producer() {
     );
 }
 
-/// `f` on a node that isn't a FILES/FOLDERS loop falls through to the shared
-/// File menu rather than opening the folder picker.
+/// `f` in the node editor opens the shared File menu on any node (it's no
+/// longer overloaded as a per-node detail key — Enter configures instead).
 #[test]
 fn report_node_folder_key_falls_through_on_non_loop_nodes() {
     let (mut app, idx) = node_editor_app(&["Oauth"]);
@@ -16994,7 +16994,7 @@ fn report_node_folder_key_falls_through_on_non_loop_nodes() {
     press(&mut app, KeyCode::Char('f'));
     assert!(
         matches!(app.overlay, Some(Overlay::FileMenu(_))),
-        "f falls through to the File menu on a non-loop node"
+        "f opens the File menu"
     );
     assert!(app.pending_node_folder.is_none());
 }
@@ -17025,16 +17025,16 @@ fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
     (app, idx)
 }
 
-/// `f` on a `REPORT REQUEST` node opens the detail form, whose field rows are
-/// the request's intrinsics plus its `[Reports]` fields, all ticked when the
-/// node has no `SHOW` clause yet (emit everything).
+/// Enter on a `REPORT REQUEST` node opens the configure form, whose field rows
+/// are the request's intrinsics plus its `[Reports]` fields, all ticked when
+/// the node has no `SHOW` clause yet (emit everything).
 #[test]
 fn report_node_request_form_opens_with_fields() {
     let (mut app, _idx) = node_show_app(&["status", "overall"]);
     press(&mut app, KeyCode::Down); // select REPORT REQUEST upload
-    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Enter);
     let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
-        panic!("f opens the request detail form on a REPORT REQUEST node");
+        panic!("Enter opens the configure form on a REPORT REQUEST node");
     };
     let names: Vec<&str> = form.fields.iter().map(|r| r.name.as_str()).collect();
     assert!(
@@ -17059,10 +17059,11 @@ fn report_node_request_form_opens_with_fields() {
 fn report_node_request_form_writes_show_omitting_unticked() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Char('f'));
-    // Rows: 0 response, 1 alias, then fields HttpStatus, Time, Asserts, Error,
-    // Response, status. Response is the 5th field ⇒ row index 2 + 4 = 6.
-    for _ in 0..6 {
+    press(&mut app, KeyCode::Enter);
+    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
+    // Time, Asserts, Error, Response, status. The Response field is the 5th
+    // field ⇒ row index 4 + 4 = 8.
+    for _ in 0..8 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -17087,7 +17088,7 @@ fn report_node_request_form_all_ticked_removes_show() {
         .set_text("# collection: api\nREPORT REQUEST upload SHOW(status)\n");
     app.revalidate_report(idx);
     press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Enter);
     // The current SHOW(status) preselects only `status`.
     {
         let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
@@ -17096,9 +17097,11 @@ fn report_node_request_form_all_ticked_removes_show() {
         let ticked = form.fields.iter().filter(|r| r.included).count();
         assert_eq!(ticked, 1, "only the SHOW(status) field is preselected");
     }
-    // Move to the first field row, then tick every unticked field.
-    press(&mut app, KeyCode::Down); // -> alias
-    press(&mut app, KeyCode::Down); // -> first field
+    // Move to the first field row (0 Name, 1 Report, 2 Response, 3 Alias, 4
+    // first field), then tick every unticked field.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
     let total = {
         let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
             unreachable!()
@@ -17132,8 +17135,11 @@ fn report_node_request_form_all_ticked_removes_show() {
 fn report_node_request_form_sets_the_alias() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Char('f'));
-    press(&mut app, KeyCode::Down); // row 0 (response) -> row 1 (alias)
+    press(&mut app, KeyCode::Enter);
+    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias — three Downs reach the alias.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
     for c in ['p', 'r', 'o', 'c'] {
         press(&mut app, KeyCode::Char(c));
     }
@@ -17147,8 +17153,11 @@ fn report_node_request_form_sets_the_alias() {
 fn report_node_request_form_sets_the_response_format() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Char('f'));
-    // Selection starts on the response row; Space cycles Default -> RAW.
+    press(&mut app, KeyCode::Enter);
+    // Rows: 0 Name, 1 Report, 2 Response — two Downs reach the response row,
+    // then Space cycles Default -> RAW.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Enter);
     let text = &app.reports[idx].report.text;
@@ -17158,20 +17167,84 @@ fn report_node_request_form_sets_the_response_format() {
     );
 }
 
-/// `f` on a plain `REQUEST` node (not `REPORT REQUEST`) doesn't open the detail
-/// form — it falls through to the shared File menu.
+/// Enter on a plain `REQUEST` opens the configure form with `Report` unticked
+/// and only the Name/Report rows visible (no reporting options yet).
 #[test]
-fn report_node_request_form_ignores_plain_request_nodes() {
+fn report_node_request_form_opens_on_plain_request_nodes() {
+    let (mut app, _idx) = node_editor_app(&["Oauth"]);
+    app.reports[_idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\n");
+    app.revalidate_report(_idx);
+    press(&mut app, KeyCode::Down); // select REQUEST Oauth
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form on a plain REQUEST node");
+    };
+    assert!(!form.report, "a plain REQUEST starts with Report unticked");
+    assert_eq!(
+        form.visible_rows().len(),
+        2,
+        "only Name + Report rows show until Report is ticked"
+    );
+}
+
+/// Ticking `Report` on a plain `REQUEST` and applying rewrites it as a
+/// `REPORT REQUEST` (and un-ticking a `REPORT REQUEST` turns it back), so the
+/// node editor can add/remove reporting without editing the raw line.
+#[test]
+fn report_node_request_form_report_toggle_round_trips() {
     let (mut app, idx) = node_editor_app(&["Oauth"]);
     app.reports[idx]
         .report
         .set_text("# collection: api\nREQUEST Oauth\n");
     app.revalidate_report(idx);
-    press(&mut app, KeyCode::Down); // select REQUEST Oauth
-    press(&mut app, KeyCode::Char('f'));
+    // REQUEST -> REPORT REQUEST: Enter, tick Report (row 1), apply.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Name -> Report row
+    press(&mut app, KeyCode::Char(' ')); // tick Report
+    press(&mut app, KeyCode::Enter); // apply
     assert!(
-        matches!(app.overlay, Some(Overlay::FileMenu(_))),
-        "f on a plain REQUEST falls through to the File menu"
+        app.reports[idx]
+            .report
+            .text
+            .contains("REPORT REQUEST Oauth"),
+        "REQUEST became REPORT REQUEST: {:?}",
+        app.reports[idx].report.text
+    );
+    // REPORT REQUEST -> REQUEST: Enter, un-tick Report, apply.
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Name -> Report row
+    press(&mut app, KeyCode::Char(' ')); // un-tick Report
+    press(&mut app, KeyCode::Enter); // apply
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("REQUEST Oauth") && !text.contains("REPORT REQUEST Oauth"),
+        "REPORT REQUEST turned back into a plain REQUEST: {text:?}"
+    );
+}
+
+/// The Name row cycles through the bound collection's request titles, so the
+/// referenced request can be re-pointed without typing it.
+#[test]
+fn report_node_request_form_name_row_cycles_titles() {
+    let (mut app, idx) = node_editor_app(&["Oauth", "CreateSession"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // configure form; Name row selected
+    press(&mut app, KeyCode::Right); // cycle Oauth -> CreateSession
+    press(&mut app, KeyCode::Enter); // apply
+    assert!(
+        app.reports[idx]
+            .report
+            .text
+            .contains("REQUEST CreateSession"),
+        "Name row cycled to the next title: {:?}",
+        app.reports[idx].report.text
     );
 }
 

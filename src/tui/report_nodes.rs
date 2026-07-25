@@ -449,54 +449,81 @@ pub(crate) struct ShowRow {
     pub(crate) included: bool,
 }
 
-/// The number of fixed head rows (response toggle, alias field) that precede
-/// the field checklist in a [`RequestForm`].
-pub(crate) const REQUEST_FORM_HEAD_ROWS: usize = 2;
+/// One visible row of a [`RequestForm`]. The layout is dynamic: a plain
+/// `REQUEST` shows only Name + Report; ticking Report reveals the reporting
+/// options (response format, alias, and the field checklist).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormRow {
+    /// The request name (cycles through the bound collection's request titles).
+    Name,
+    /// The `REPORT` toggle — off = plain `REQUEST`, on = `REPORT REQUEST`.
+    Report,
+    /// The `RESPONSE RAW/PRETTY` override (only when reporting).
+    Response,
+    /// The `AS <alias>` namespace (only when reporting).
+    Alias,
+    /// A `SHOW(…)` field checkbox (index into [`RequestForm::fields`]).
+    Field(usize),
+}
 
-/// The reported-request detail form ([`Overlay::ReportNodeRequest`]) for a
-/// `REPORT REQUEST` node: one place to shape how the request is reported without
-/// editing text — its response format (`RESPONSE RAW/PRETTY`), its column
-/// namespace (`AS <alias>`), and which of the fields it can emit are shown
-/// (`SHOW(…)`, e.g. to drop a noisy base64 `Response`).
-///
-/// Rows: index 0 = the response-format toggle, 1 = the alias text field, then
-/// one checkbox per emittable field (intrinsics, then the request's `[Reports]`
-/// fields, then the node's `WITH` fields).
+/// The request configure form ([`Overlay::ReportNodeRequest`]), reached with
+/// Enter on a `REQUEST` / `REPORT REQUEST` node: one place to pick the request
+/// name, toggle whether it's *reported* (`REPORT`), and — when reported — shape
+/// how (its response format `RESPONSE RAW/PRETTY`, its column namespace
+/// `AS <alias>`, and which of the fields it can emit are shown via `SHOW(…)`,
+/// e.g. to drop a noisy base64 `Response`).
 pub(crate) struct RequestForm {
     /// The report being edited (looked up by id, resilient to tab reorder).
     pub(crate) report_id: u64,
-    /// Path of the `REPORT REQUEST` node this edits.
+    /// Path of the node this edits.
     pub(crate) path: Vec<usize>,
-    /// The request name (shown in the overlay title).
+    /// The request name.
     pub(crate) request: String,
+    /// Candidate request titles from the bound collection (Name row cycles
+    /// through these). Empty when unbound/unresolved.
+    pub(crate) titles: Vec<String>,
+    /// Whether this is a `REPORT REQUEST` (`true`) or a plain `REQUEST`.
+    pub(crate) report: bool,
     /// The `RESPONSE` override: `None` = default (no clause), else RAW/PRETTY.
     pub(crate) response: Option<ResponseFmt>,
     /// The `AS <alias>` namespace; empty = no alias (default = the request name).
     pub(crate) alias: String,
     /// The `SHOW(…)` field checklist.
     pub(crate) fields: Vec<ShowRow>,
-    /// Selected row: 0 = response, 1 = alias, `REQUEST_FORM_HEAD_ROWS..` = fields.
+    /// The node's `WITH … END` items, preserved verbatim across an edit (the
+    /// form doesn't edit them, but must not drop them when re-serializing).
+    pub(crate) with: Vec<WithItem>,
+    /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
 
 impl RequestForm {
-    /// Build the form for a `REPORT REQUEST` node. Field rows are the fields the
-    /// request can emit, in canonical output order (intrinsics, then its
-    /// `[Reports]` fields, then the node's `WITH` fields), de-duplicated. A
-    /// field is ticked when the current `show` is empty (no clause ⇒ all
-    /// emitted) or names it; any unknown `show` entry is kept as a ticked row so
-    /// applying can't silently drop it.
+    /// Build the form for a request node. Field rows are the fields the request
+    /// can emit, in canonical output order (intrinsics, then its `[Reports]`
+    /// fields, then the node's `WITH` fields), de-duplicated. A field is ticked
+    /// when the current `show` is empty (no clause ⇒ all emitted) or names it;
+    /// any unknown `show` entry is kept as a ticked row so applying can't
+    /// silently drop it.
     #[allow(clippy::too_many_arguments)]
     fn build(
         report_id: u64,
         path: Vec<usize>,
         request: String,
+        titles: Vec<String>,
+        report: bool,
         alias: Option<String>,
         response: Option<ResponseFmt>,
         current_show: &[String],
         report_fields: &[String],
-        with_fields: &[String],
+        with: Vec<WithItem>,
     ) -> Self {
+        let with_fields: Vec<String> = with
+            .iter()
+            .filter_map(|w| match w {
+                WithItem::Field { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         let mut names: Vec<String> = Vec::new();
         let push = |name: &str, names: &mut Vec<String>| {
             if !names.iter().any(|n| n == name) {
@@ -509,7 +536,7 @@ impl RequestForm {
         for f in report_fields {
             push(f, &mut names);
         }
-        for f in with_fields {
+        for f in &with_fields {
             push(f, &mut names);
         }
         // Preserve any unknown SHOW entry so applying can't drop it.
@@ -528,16 +555,31 @@ impl RequestForm {
             report_id,
             path,
             request,
+            titles,
+            report,
             response,
             alias: alias.unwrap_or_default(),
             fields,
+            with,
             selected: 0,
         }
     }
 
-    /// The last selectable row index (the two head rows plus the field rows).
+    /// The rows currently on screen, in order. Reporting-only rows (response,
+    /// alias, field checklist) appear only when [`Self::report`] is set.
+    pub(crate) fn visible_rows(&self) -> Vec<FormRow> {
+        let mut rows = vec![FormRow::Name, FormRow::Report];
+        if self.report {
+            rows.push(FormRow::Response);
+            rows.push(FormRow::Alias);
+            rows.extend((0..self.fields.len()).map(FormRow::Field));
+        }
+        rows
+    }
+
+    /// The last selectable row index.
     fn last_row(&self) -> usize {
-        (REQUEST_FORM_HEAD_ROWS + self.fields.len()).saturating_sub(1)
+        self.visible_rows().len().saturating_sub(1)
     }
 
     /// The `SHOW(…)` field list for the ticked rows, in row order. When every
@@ -562,6 +604,22 @@ impl RequestForm {
         } else {
             Some(a.to_string())
         }
+    }
+
+    /// Cycle the request name through the bound collection's titles (a no-op
+    /// when there are none). Wraps; starts at the first title when the current
+    /// name isn't one of them.
+    fn cycle_name(&mut self, forward: bool) {
+        let n = self.titles.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.titles.iter().position(|t| t == &self.request) {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None => 0,
+        };
+        self.request = self.titles[next].clone();
     }
 
     /// Cycle the response-format override: Default → RAW → PRETTY → Default
@@ -658,13 +716,15 @@ impl TuiApp {
             KeyCode::Home => self.reports[idx].node_selected = 0,
             KeyCode::End => self.reports[idx].node_selected = last,
             KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
-            KeyCode::Enter | KeyCode::Char('e') => self.edit_selected_node(idx),
-            // `f` configures the selected node's main detail: for a FOR
-            // FILES/FOLDERS loop it chooses the source folder via the file
-            // browser; for a REPORT REQUEST it opens the field (SHOW) picker.
-            // On any other node it falls through so the shared `f` (File menu)
-            // still works.
-            KeyCode::Char('f') => return self.open_report_node_detail(idx),
+            // Enter opens the friendly, structured "configure this node" form
+            // (its shape depends on the node kind — request options, a loop's
+            // folder, …). `e` is the raw escape hatch that edits the node's
+            // source line directly. `f` is deliberately NOT handled here, so it
+            // falls through to the shared File menu — consistent with every
+            // other view, instead of the old "detail on some kinds, File menu
+            // on others" overload.
+            KeyCode::Enter => self.configure_selected_node(idx),
+            KeyCode::Char('e') => self.edit_selected_node(idx),
             KeyCode::Delete | KeyCode::Backspace => self.delete_selected_node(idx),
             _ => return false,
         }
@@ -774,22 +834,41 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// The `f` key on a node: configure its main detail. A `FOR FILES/FOLDERS`
-    /// loop opens the folder browser; a `REPORT REQUEST` opens the request
-    /// detail form (response / alias / fields). Returns `true` when it handled
-    /// the node, `false` otherwise so the caller falls through to the shared
-    /// `f` (File menu).
-    fn open_report_node_detail(&mut self, idx: usize) -> bool {
-        // `open_report_node_folder` reads-only and returns false (no side
-        // effects) when the node isn't a FILES/FOLDERS loop, so it's safe to
-        // try first and fall through to the request form.
-        self.open_report_node_folder(idx) || self.open_report_node_request(idx)
+    /// Enter — open the friendly, structured "configure this node" editor for
+    /// the selected node. The form depends on the node kind: `Begin` opens the
+    /// insert palette; a request node opens the request form (name, `REPORT`
+    /// toggle, and — when reported — response/alias/`SHOW`); a `FOR FILES/
+    /// FOLDERS` loop opens the folder browser; anything else falls back to the
+    /// raw line editor (until it grows its own form). Never touches the File
+    /// menu (that's `f`).
+    fn configure_selected_node(&mut self, idx: usize) {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else { return };
+        if row.kind == RowKind::Begin {
+            self.open_report_node_menu(idx);
+            return;
+        }
+        let path = row.path.clone();
+        // Try the request form, then the loop folder browser; fall back to the
+        // raw line editor for kinds without a dedicated form yet.
+        if self.open_report_node_request(idx) {
+            return;
+        }
+        if self.open_report_node_folder(idx) {
+            return;
+        }
+        self.open_report_node_line_prompt(idx, &path);
     }
 
-    /// Open the detail form for the selected `REPORT REQUEST` node — its
-    /// response format, `AS` alias and `SHOW(…)` field checklist. Returns `true`
-    /// when the selection is such a node, `false` otherwise so the caller can
-    /// fall through.
+    /// Open the configure form for the selected request node — a plain `REQUEST`
+    /// or a `REPORT REQUEST`. Returns `true` when the selection is a request
+    /// node, `false` otherwise so the caller can try another form. The `REPORT`
+    /// toggle lets a plain request become reported (and back) from here.
     fn open_report_node_request(&mut self, idx: usize) -> bool {
         let Ok(rows) = self.report_node_rows(idx) else {
             return false;
@@ -802,46 +881,44 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (name, alias, response, current_show, with_fields) = {
+        let (name, report, alias, response, current_show, with) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
             match node_at(&flow, &path) {
+                Some(FlowNode::Request { name }) => {
+                    (name.clone(), false, None, None, Vec::new(), Vec::new())
+                }
                 Some(FlowNode::Report(ReportStmt::Request {
                     name,
                     alias,
                     response_fmt,
                     show,
                     with,
-                })) => {
-                    let with_names: Vec<String> = with
-                        .iter()
-                        .filter_map(|w| match w {
-                            WithItem::Field { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    (
-                        name.clone(),
-                        alias.clone(),
-                        *response_fmt,
-                        show.clone(),
-                        with_names,
-                    )
-                }
-                _ => return false, // not a REPORT REQUEST node
+                })) => (
+                    name.clone(),
+                    true,
+                    alias.clone(),
+                    *response_fmt,
+                    show.clone(),
+                    with.clone(),
+                ),
+                _ => return false, // not a request node
             }
         };
         let report_fields = self.request_report_fields(report_id, &name);
+        let titles = self.bound_request_titles(report_id);
         let form = RequestForm::build(
             report_id,
             path,
             name,
+            titles,
+            report,
             alias,
             response,
             &current_show,
             &report_fields,
-            &with_fields,
+            with,
         );
         self.overlay = Some(Overlay::ReportNodeRequest(Box::new(form)));
         true
@@ -862,47 +939,37 @@ impl TuiApp {
             .unwrap_or_default()
     }
 
-    /// Finish a [`RequestForm`]: write its response / alias / `SHOW(…)` back onto
-    /// the `REPORT REQUEST` node (a blank alias and all-ticked fields clear the
-    /// respective clauses), re-serialize, revalidate and persist.
+    /// Finish a [`RequestForm`]: rebuild the node from the form and write it
+    /// back. The `REPORT` toggle chooses the node kind — a plain `REQUEST`
+    /// (dropping any reporting options) or a `REPORT REQUEST` carrying the
+    /// name, response, alias (blank ⇒ none), `SHOW(…)` (all-ticked ⇒ none) and
+    /// the preserved `WITH … END` items. Re-serializes, revalidates, persists.
     pub(crate) fn apply_report_node_request(&mut self, form: RequestForm) {
         let Some(idx) = self.report_index_by_id(form.report_id) else {
             return;
         };
-        let show = form.show();
-        let alias = form.alias_opt();
-        let response = form.response;
-        {
-            let rt = &mut self.reports[idx];
-            let Ok(mut flow) = rt.report.flow() else {
-                return;
-            };
-            let Some(FlowNode::Report(ReportStmt::Request {
-                alias: alias_slot,
-                response_fmt,
-                show: show_slot,
-                ..
-            })) = node_at_mut(&mut flow, &form.path)
-            else {
-                return;
-            };
-            *alias_slot = alias;
-            *response_fmt = response;
-            *show_slot = show;
-            let text = flow.to_text();
-            rt.set_text_undoable(text);
-        }
-        self.revalidate_report(idx);
-        self.select_node_path(idx, &form.path);
-        self.save_state();
+        let node = if form.report {
+            FlowNode::Report(ReportStmt::Request {
+                name: form.request.clone(),
+                alias: form.alias_opt(),
+                response_fmt: form.response,
+                show: form.show(),
+                with: form.with.clone(),
+            })
+        } else {
+            FlowNode::Request {
+                name: form.request.clone(),
+            }
+        };
+        self.apply_node_replace(idx, &form.path, node);
     }
 
-    /// Key handling for the reported-request detail form
+    /// Key handling for the request configure form
     /// ([`Overlay::ReportNodeRequest`]). ↑/↓ (or Tab) move between rows; the
-    /// response row cycles with Space/←/→; the alias row takes typed
-    /// identifier characters and Backspace; field rows toggle with Space/`x`;
-    /// Enter applies and closes; Esc cancels (the overlay was already `take`n by
-    /// the dispatcher).
+    /// name/response rows cycle with Space/←/→; the Report row toggles with
+    /// Space; the alias row takes typed identifier characters and Backspace;
+    /// field rows toggle with Space/`x`; Enter applies and closes; Esc cancels
+    /// (the overlay was already `take`n by the dispatcher).
     pub(crate) fn report_node_request_key_handler(
         &mut self,
         key: KeyEvent,
@@ -924,9 +991,36 @@ impl TuiApp {
             KeyCode::Enter => self.apply_report_node_request(*form),
             KeyCode::Esc => {} // cancel (overlay stays taken)
             _ => {
-                match form.selected {
-                    // Response toggle.
-                    0 => match key.code {
+                // Resolve which logical row is selected via the dynamic layout,
+                // so the reporting-only rows shift correctly when Report is off.
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    // Name — cycle through the bound collection's request titles.
+                    Some(FormRow::Name) => match key.code {
+                        KeyCode::Char(' ') | KeyCode::Right => {
+                            form.cycle_name(true);
+                            keep(self, form);
+                        }
+                        KeyCode::Left => {
+                            form.cycle_name(false);
+                            keep(self, form);
+                        }
+                        _ => keep(self, form),
+                    },
+                    // Report — toggle plain REQUEST ↔ REPORT REQUEST.
+                    Some(FormRow::Report) => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                        ) {
+                            form.report = !form.report;
+                            form.selected = form.selected.min(form.last_row());
+                        }
+                        keep(self, form);
+                    }
+                    // Response override.
+                    Some(FormRow::Response) => match key.code {
                         KeyCode::Char(' ') | KeyCode::Right => {
                             form.cycle_response(true);
                             keep(self, form);
@@ -938,7 +1032,7 @@ impl TuiApp {
                         _ => keep(self, form),
                     },
                     // Alias text field (identifier characters only).
-                    1 => {
+                    Some(FormRow::Alias) => {
                         match key.code {
                             KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
                                 form.alias.push(c)
@@ -951,8 +1045,7 @@ impl TuiApp {
                         keep(self, form);
                     }
                     // A field checkbox.
-                    _ => {
-                        let fi = form.selected - REQUEST_FORM_HEAD_ROWS;
+                    Some(FormRow::Field(fi)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some(row) = form.fields.get_mut(fi)
                         {
@@ -960,14 +1053,14 @@ impl TuiApp {
                         }
                         keep(self, form);
                     }
+                    None => keep(self, form),
                 }
             }
         }
     }
 
-    /// Edit the selected node: request nodes reopen the request picker (to
-    /// change the name); every other node opens the "edit as line" prompt.
-    /// `Begin` opens the insert palette (there's nothing to edit).
+    /// `e` — edit the selected node's source line directly (the raw escape
+    /// hatch). `Begin` opens the insert palette (there's nothing to edit).
     fn edit_selected_node(&mut self, idx: usize) {
         let Ok(rows) = self.report_node_rows(idx) else {
             return;
@@ -981,51 +1074,7 @@ impl TuiApp {
             return;
         }
         let path = row.path.clone();
-        self.edit_node_at(idx, &path);
-    }
-
-    fn edit_node_at(&mut self, idx: usize, path: &[usize]) {
-        let report_id = self.reports[idx].report.id;
-        let (is_request, report_kind, current) = {
-            let Ok(flow) = self.reports[idx].report.flow() else {
-                return;
-            };
-            let Some(node) = node_at(&flow, path) else {
-                return;
-            };
-            let report_kind = matches!(node, FlowNode::Report(ReportStmt::Request { .. }));
-            (
-                node.request_name().is_some(),
-                report_kind,
-                node.request_name().map(str::to_string),
-            )
-        };
-        if is_request {
-            let titles = self.bound_request_titles(report_id);
-            if titles.is_empty() {
-                // Nothing to pick from — fall back to editing the line.
-                self.open_report_node_line_prompt(idx, path);
-                return;
-            }
-            let selected = current
-                .as_deref()
-                .and_then(|c| titles.iter().position(|t| t == c))
-                .unwrap_or(0);
-            self.overlay = Some(Overlay::ReportNodeMenu(Box::new(NodeMenu {
-                step: NodeMenuStep::PickRequest,
-                options: titles,
-                selected,
-                pos: InsertPos {
-                    parent: Vec::new(),
-                    index: 0,
-                },
-                report_id,
-                report_kind,
-                edit_path: Some(path.to_vec()),
-            })));
-        } else {
-            self.open_report_node_line_prompt(idx, path);
-        }
+        self.open_report_node_line_prompt(idx, &path);
     }
 
     /// Open the single-line "edit as source" prompt for the node at `path`.
