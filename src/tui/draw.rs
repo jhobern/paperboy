@@ -41,7 +41,7 @@ pub(crate) const SHADOW_ICON: &str = "!";
 /// wrapped line reads unambiguously as one line rather than several separate
 /// ones. Drawn dim so it never competes with the content. Built per-frame
 /// from the active theme (see `MultiSelectPanel::set_wrap_marker`).
-fn wrap_marker(th: &Theme) -> WrapMarker {
+pub(crate) fn wrap_marker(th: &Theme) -> WrapMarker {
     WrapMarker {
         glyph: '↵',
         style: Style::default().fg(th.dim),
@@ -122,6 +122,63 @@ pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
+/// Draw the report column-picker overlay: a scrollable checklist of candidate
+/// output columns. The selected row is highlighted; a renamed column shows its
+/// underlying source(s) dimmed after a `←`.
+fn draw_report_columns_overlay(
+    f: &mut Frame,
+    picker: &super::reports::ColumnPicker,
+    s: &Strings,
+    th: &Theme,
+) {
+    let title = format!("{}  ({})", s.report_columns_title, s.report_columns_hint);
+    let n = picker.rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    // Scroll just enough to keep the selected row inside the visible window.
+    let scroll = if picker.selected >= inner_h {
+        picker.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in picker.rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let mark = if row.included { "[x]" } else { "[ ]" };
+        let base = if i == picker.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if row.included {
+            Style::default().fg(th.text)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let mut spans = vec![Span::styled(format!("{mark} {}", row.header), base)];
+        let src = row.sources.join("|");
+        if src != row.header {
+            spans.push(Span::styled(
+                format!("  ← {src}"),
+                Style::default().fg(th.dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     let s = Strings::for_language(&app.language);
     let th = app.theme();
@@ -177,6 +234,25 @@ fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
     // bleed into a neighbouring panel or the rest of the terminal row.
     let mut cells = app.main_panel.highlight_regions(app.main_text_area);
     cells.extend(app.resp_panel.highlight_regions(app.resp_text_area));
+    // The full-screen report view has its own three panels (source /
+    // validation / results); paint their selections the same way. Only the
+    // active report tab's panels can be showing, and only the panes drawn this
+    // frame have a non-default area, so this is safe for every tab kind.
+    if let Some(rt) = app.active_report() {
+        use crate::tui::reports::ReportPane;
+        cells.extend(
+            rt.source_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Source.idx()]),
+        );
+        cells.extend(
+            rt.validation_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Validation.idx()]),
+        );
+        cells.extend(
+            rt.results_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Results.idx()]),
+        );
+    }
     let buf = f.buffer_mut();
     for (row, from, to) in cells {
         for col in from..to {
@@ -1978,6 +2054,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("d (report)", s.help_report_dry_run),
                             ("Tab / v (report)", s.help_report_view),
                             ("x (report)", s.help_report_export),
+                            ("c (report)", s.help_report_columns),
                             ("Esc (report)", s.help_report_leave_edit),
                             ("Ctrl+←/→ (report)", s.help_report_word_move),
                             ("→ (report)", s.help_report_complete),
@@ -2144,6 +2221,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("d", s.help_report_dry_run),
                         ("Tab / v", s.help_report_view),
                         ("x", s.help_report_export),
+                        ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),
                         ("Ctrl+←/→", s.help_report_word_move),
                         ("→", s.help_report_complete),
@@ -2159,6 +2237,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("KEY = value", s.help_grammar_assign),
                         ("REQUEST NAME", s.help_grammar_request),
                         ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
+                        ("REPORT REQUEST NAME SHOW(a, b)", s.help_grammar_show),
+                        ("Result", s.help_grammar_result),
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
                     ],
                 );
@@ -2275,6 +2355,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 };
                 draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
             }
+        }
+        Overlay::ReportColumns(picker) => {
+            draw_report_columns_overlay(f, picker, s, th);
         }
         Overlay::Prompt {
             kind,

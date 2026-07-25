@@ -171,12 +171,19 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .and_then(|f| f.get("PRELUDE_NO_MATCH_MARKER"))
         .cloned()
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
-    ReportResult {
+    let mut result = ReportResult {
         rows,
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+    };
+    // Collapse baseline/candidate rows into a `Result` diff when the flow
+    // configures an ENVS comparison (no-op otherwise). Done here, off the row
+    // model, so the CSV writer and the TUI grid both pick it up unchanged.
+    if let Some(roles) = super::compare::comparison_roles(flow) {
+        super::compare::apply(&mut result, &roles);
     }
+    result
 }
 
 /// Mutable interpreter state threaded through the walk.
@@ -475,8 +482,9 @@ impl<'a> Exec<'a> {
                 name,
                 alias,
                 response_fmt,
+                show,
                 with,
-            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, with),
+            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, show, with),
         }
     }
 
@@ -485,12 +493,15 @@ impl<'a> Exec<'a> {
     /// plus one column per `[Reports]`/`WITH` field, all namespaced by `alias`
     /// (default: the request's leaf name). Columns are emitted in a fixed order
     /// (intrinsics, then `[Reports]` fields, then `WITH` fields) so report output
-    /// is deterministic.
+    /// is deterministic. A non-empty `show` prunes the emitted columns to just
+    /// the listed field suffixes (in listed order) — the lever for dropping a
+    /// heavy `Response` from the report.
     fn eval_report_request(
         &mut self,
         name: &str,
         alias: Option<&str>,
         response_fmt: Option<ResponseFmt>,
+        show: &[String],
         with: &[WithItem],
     ) -> Vec<(String, String)> {
         let alias = alias
@@ -568,6 +579,21 @@ impl<'a> Exec<'a> {
         for (fname, query) in fields {
             let value = eval_field(&query, &eo).unwrap_or_default();
             cells.push((format!("{alias}.{fname}"), value));
+        }
+
+        // A `SHOW(...)` selector prunes and reorders the emitted columns to just
+        // the listed field suffixes (matched against the `alias.` namespace).
+        // A listed field that the request never produced is silently skipped
+        // (validation warns about it); this is what drops a heavy `Response`.
+        if !show.is_empty() {
+            let mut kept: Vec<(String, String)> = Vec::with_capacity(show.len());
+            for field in show {
+                let key = format!("{alias}.{field}");
+                if let Some((_, v)) = cells.iter().find(|(k, _)| *k == key) {
+                    kept.push((key, v.clone()));
+                }
+            }
+            cells = kept;
         }
 
         cells
@@ -835,6 +861,12 @@ fn asserts_summary(eo: &EntryOutcome) -> String {
     let passed = eo.asserts.iter().filter(|a| a.passed).count();
     format!("{passed}/{total}")
 }
+
+/// The intrinsic column suffixes every `REPORT REQUEST` emits (before any
+/// `[Reports]`/`WITH` fields), in their fixed emission order. Shared so
+/// validation of a `SHOW(...)` selector knows the always-present field names.
+pub(crate) const INTRINSIC_FIELDS: [&str; 5] =
+    ["HttpStatus", "Time", "Asserts", "Error", "Response"];
 
 /// Evaluate one `[Reports]`/`WITH` field query against an already-received
 /// response, *tolerantly*: a non-match (or an unsupported query type) returns
@@ -1139,6 +1171,59 @@ mod tests {
             res.rows[0].cells.get("me.HttpStatus"),
             Some(&"200".to_string())
         );
+    }
+
+    #[test]
+    fn show_selector_prunes_columns_to_listed_fields() {
+        // A heavy Response should be droppable while keeping small fields.
+        let fake = Fake::new(&[(
+            "me",
+            Canned {
+                status: 200,
+                raw_body: "{\"name\":\"jo\",\"blob\":\"AAAAAAAA\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("me", &[("name", "jsonpath \"$.name\"")])];
+        let res = run(
+            "REPORT REQUEST me SHOW(name, HttpStatus)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("me.name"), Some(&"jo".to_string()));
+        assert_eq!(cells.get("me.HttpStatus"), Some(&"200".to_string()));
+        // The whole-body Response (and the other intrinsics) are pruned away.
+        assert_eq!(cells.get("me.Response"), None);
+        assert_eq!(cells.get("me.Time"), None);
+        assert_eq!(cells.get("me.Asserts"), None);
+        // Column order follows SHOW order, and only the two survive.
+        assert_eq!(res.column_order, vec!["me.name", "me.HttpStatus"]);
+    }
+
+    #[test]
+    fn show_selector_skips_a_field_the_request_never_produces() {
+        let fake = Fake::new(&[(
+            "me",
+            Canned {
+                status: 200,
+                raw_body: "{}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("me", &[])];
+        // `bogus` isn't an intrinsic or a field → simply absent (no empty cell).
+        let res = run(
+            "REPORT REQUEST me SHOW(HttpStatus, bogus)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.column_order, vec!["me.HttpStatus"]);
+        assert_eq!(res.rows[0].cells.get("me.bogus"), None);
     }
 
     #[test]
@@ -1447,6 +1532,46 @@ mod tests {
     }
 
     #[test]
+    fn spaced_request_name_alias_flows_into_columns() {
+        // A request title with spaces must be quoted in the flow. Giving it a
+        // space-free `AS` alias keeps the produced column keys — and the
+        // `# columns:` references to them — clean identifiers.
+        let fake = Fake::new(&[(
+            "My Request",
+            Canned {
+                status: 201,
+                raw_body: "hello".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("My Request", &[])];
+        let src = "# columns: up.HttpStatus AS Status, up.Response AS Body\n\
+                   REPORT REQUEST \"My Request\" AS up\n";
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        // The alias namespaces the cells; the spaced title never leaks into a key.
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("up.HttpStatus"), Some(&"201".to_string()));
+        assert_eq!(cells.get("up.Response"), Some(&"hello".to_string()));
+        assert!(!cells.keys().any(|k| k.starts_with("My Request.")));
+
+        // `# columns:` resolves those alias keys into exactly two output columns.
+        let cols = res.resolved_columns(&flow.header);
+        let headers: Vec<&str> = cols.iter().map(|c| c.header.as_str()).collect();
+        assert_eq!(headers, vec!["Status", "Body"]);
+        assert_eq!(cols[0].value(&res.rows[0], "-"), "201");
+        assert_eq!(cols[1].value(&res.rows[0], "-"), "hello");
+    }
+
+    #[test]
     fn jsonpath_supports_nested_and_index() {
         let fake = Fake::new(&[(
             "p",
@@ -1554,7 +1679,10 @@ mod tests {
     }
 
     #[test]
-    fn envs_roles_run_baseline_first_then_comparisons() {
+    fn envs_roles_merge_baseline_into_candidate_rows() {
+        // A BASELINE/COMPARISON ENVS run collapses to one row per comparison
+        // env: the baseline (`prod`) is consumed as the reference and each
+        // candidate carries a `Result` (here `OK` — the empty responses match).
         let fake = Fake::new(&[(
             "send",
             Canned {
@@ -1571,9 +1699,93 @@ mod tests {
             &fake,
         );
         let targets: Vec<_> = res.rows.iter().filter_map(|r| r.target.clone()).collect();
-        assert_eq!(targets, vec!["prod", "stg1", "stg2"], "baseline runs first");
-        // The loop var is also bound as an ordinary variable.
-        assert_eq!(res.rows[0].cells.get("TARGET"), Some(&"prod".to_string()));
+        assert_eq!(
+            targets,
+            vec!["stg1", "stg2"],
+            "baseline consumed; candidates remain"
+        );
+        assert!(
+            res.rows
+                .iter()
+                .all(|r| r.cells.get(crate::report::compare::RESULT_COLUMN)
+                    == Some(&crate::report::compare::MATCH.to_string()))
+        );
+        // All three envs still executed (baseline runs first, as the reference).
+        assert_eq!(fake.call_count(), 3);
+    }
+
+    #[test]
+    fn comparison_diffs_reported_field_across_envs() {
+        // A per-env runner whose response echoes an env variable, so the reported
+        // `overall` field genuinely differs between baseline and candidate.
+        struct EchoEnv;
+        impl EntryRunner for EchoEnv {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let v = vars.get("VERDICT").cloned().unwrap_or_default();
+                let body = format!("{{\"overall\":\"{v}\"}}");
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: body.clone(),
+                        raw_body: body,
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+        let entries = [entry("proc", &[])];
+        let flow = parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    FOR FILE IN [\"a\", \"b\"]\n        REPORT REQUEST proc WITH\n            overall: jsonpath \"$.overall\"\n        END\n    END\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: [
+                (
+                    "prod".to_string(),
+                    [("VERDICT".to_string(), "CLEAR".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                (
+                    "staging".to_string(),
+                    [("VERDICT".to_string(), "REVIEW".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            root: None,
+            runner: &EchoEnv,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        // One candidate row per file (baseline consumed), showing candidate
+        // values and the field-level diff.
+        assert_eq!(res.rows.len(), 2);
+        for r in &res.rows {
+            assert_eq!(r.target.as_deref(), Some("staging"));
+            assert_eq!(r.cells.get("proc.overall"), Some(&"REVIEW".to_string()));
+            assert_eq!(
+                r.cells.get(crate::report::compare::RESULT_COLUMN),
+                Some(&"overall: CLEAR→REVIEW".to_string())
+            );
+        }
+        assert_eq!(
+            res.column_order.first(),
+            Some(&crate::report::compare::RESULT_COLUMN.to_string())
+        );
     }
 
     #[test]
@@ -1707,7 +1919,8 @@ mod tests {
 
     #[test]
     fn parallel_envs_loop_preserves_role_order() {
-        // `PARALLEL` on an ENVS loop still emits baseline first, then comparisons.
+        // `PARALLEL` on an ENVS comparison still merges deterministically:
+        // the baseline is consumed and the candidates stay in clause order.
         let fake = Fake::new(&[(
             "send",
             Canned {
@@ -1725,7 +1938,7 @@ mod tests {
             &fake,
         );
         let targets: Vec<_> = res.rows.iter().filter_map(|r| r.target.clone()).collect();
-        assert_eq!(targets, vec!["prod", "stg1", "stg2"]);
+        assert_eq!(targets, vec!["stg1", "stg2"]);
         assert!(
             fake.peak_concurrency() >= 2,
             "ENVS loop runs envs concurrently"

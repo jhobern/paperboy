@@ -53,17 +53,26 @@ pub(crate) enum FileAction {
     /// the Workspace folder pickers; a filename prompt (pre-filled with the
     /// chosen folder) follows, and the collection is written there.
     SaveCollectionChooseFolder,
+    /// Picking a DESTINATION FOLDER for "Export Report CSV". Confirms like the
+    /// other folder pickers (navigate to the folder, Tab to the filename
+    /// editor, Enter writes `dir/<name>.csv`); the filename is seeded from the
+    /// report's name. Replaces the old behaviour of silently writing the CSV
+    /// into the process working directory.
+    SaveReportCsvChooseFolder,
 }
 
 impl FileAction {
     /// Whether this browser action picks a destination FOLDER and then writes
     /// a file/folder named in the browser's inline filename editor (Tab to it,
-    /// Enter to save). The two "Save … As" folder pickers; not `OpenWorkspace`
-    /// (which loads an existing folder) or the plain file pickers.
+    /// Enter to save). The "Save … As" folder pickers and the report-CSV
+    /// export; not `OpenWorkspace` (which loads an existing folder) or the
+    /// plain file pickers.
     pub(crate) fn is_save_to_folder(&self) -> bool {
         matches!(
             self,
-            FileAction::SaveWorkspaceChooseFolder | FileAction::SaveCollectionChooseFolder
+            FileAction::SaveWorkspaceChooseFolder
+                | FileAction::SaveCollectionChooseFolder
+                | FileAction::SaveReportCsvChooseFolder
         )
     }
 }
@@ -382,6 +391,13 @@ pub(crate) enum Overlay {
     /// no-op runner (no HTTP). Opened with `d` in the Reports view; scrolls with
     /// Up/Down, closes with Esc/`q` (see [`crate::tui::reports::DryRunReport`]).
     ReportDryRun(Box<crate::tui::reports::DryRunReport>),
+    /// Column-picker overlay for a report tab: an interactive checklist of the
+    /// columns the last run produced (plus the flow's raw loop/assign
+    /// variables). Toggling/reordering writes back to the flow's `# columns:`
+    /// header directive. Opened with `c` in the Reports view; needs a prior run
+    /// (available columns come from its result). See
+    /// [`crate::tui::reports::ColumnPicker`].
+    ReportColumns(Box<crate::tui::reports::ColumnPicker>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -738,6 +754,21 @@ pub struct TuiApp {
     /// adjusting that panel's scroll even if the cursor briefly leaves the
     /// scrollbar's one-column-wide hit area. Cleared on `Up`.
     pub(crate) scrollbar_drag: Option<Pane>,
+    /// Screen text areas for the report view's three panels (Source,
+    /// Validation, Results), recorded during draw for mouse hit-testing
+    /// (selection begin/drag + scrollbar click/drag), analogous to
+    /// `main_text_area`/`resp_text_area` but for the full-screen report view.
+    /// Indexed by `ReportPane as usize`; `Rect::default()` (unhittable) for a
+    /// panel not drawn this frame (e.g. the results grid while the source view
+    /// is showing).
+    pub(crate) report_pane_areas: [Rect; 3],
+    /// The one-column scrollbar Rect for each report panel (same indexing as
+    /// `report_pane_areas`), for scrollbar click-to-jump / drag-to-scroll.
+    pub(crate) report_pane_bars: [Rect; 3],
+    /// Set while dragging a report panel's scrollbar thumb (which panel), so a
+    /// `Drag` keeps adjusting its scroll even if the cursor leaves the
+    /// one-column track. Cleared on `Up`.
+    pub(crate) report_scrollbar_drag: Option<crate::tui::reports::ReportPane>,
     /// The exact screen Rect the Raw Mode (Hurl) editor's text was last
     /// rendered into (see `draw::draw_overlay`'s `Overlay::Prompt` branch) —
     /// used to hit-test mouse clicks/drags for in-editor text selection,
@@ -776,6 +807,19 @@ pub struct TuiApp {
 
     /// Receivers for in-flight "Run All" (Alt+F5) passes over a whole collection.
     pub(crate) pending_batch_runs: Vec<Receiver<request::BatchRunUpdate>>,
+
+    /// Receivers for in-flight background report runs (one per running report),
+    /// each tagged with its report id, drained by
+    /// [`Self::poll_report_run_updates`]. A report runs on its own thread so the
+    /// whole app stays responsive during a long run.
+    pub(crate) pending_report_runs: Vec<(u64, Receiver<crate::tui::reports::ReportRunUpdate>)>,
+    /// Cancel flags for the reports currently running, keyed by report id (a
+    /// process-unique identity that survives tab reordering). The background
+    /// worker's runner checks this between requests and short-circuits when it
+    /// flips, so a run can be cancelled mid-flight; the delivered result is then
+    /// discarded. Presence of a key also gates a second run of the same report.
+    pub(crate) running_reports:
+        std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
     /// Folder the file browser last selected a file from; it reopens here.
     pub(crate) last_browse_dir: Option<PathBuf>,
@@ -941,6 +985,9 @@ impl Default for TuiApp {
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,
+            report_pane_areas: [Rect::default(); 3],
+            report_pane_bars: [Rect::default(); 3],
+            report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
             global_env_scroll_w: std::cell::Cell::new(0),
@@ -954,6 +1001,8 @@ impl Default for TuiApp {
             pending_env: Vec::new(),
             pending_captures: Vec::new(),
             pending_batch_runs: Vec::new(),
+            pending_report_runs: Vec::new(),
+            running_reports: std::collections::HashMap::new(),
             last_browse_dir: None,
             last_env_dir: None,
             browser_origin_dir: None,
@@ -989,7 +1038,16 @@ impl TuiApp {
     /// (`main_panel`) or Response (`resp_panel`) body, active or finalized.
     /// Used to gate the `y`/Esc shortcuts.
     pub(crate) fn has_any_selection(&self) -> bool {
-        self.main_panel.has_selection() || self.resp_panel.has_selection()
+        self.main_panel.has_selection()
+            || self.resp_panel.has_selection()
+            || self
+                .active_report()
+                .map(|rt| {
+                    rt.source_panel.has_selection()
+                        || rt.validation_panel.has_selection()
+                        || rt.results_panel.has_selection()
+                })
+                .unwrap_or(false)
     }
 
     /// Whether pressing `y` right now would actually copy anything: either
@@ -1609,6 +1667,10 @@ impl TuiApp {
             // `input.rs`), which then routes the real write through
             // `FileAction::SaveCollection`, so this never reaches here.
             FileAction::SaveCollectionChooseFolder => {}
+            // Like the folder pickers above: the report-CSV export confirms its
+            // destination in `input.rs` (`browser_commit_save`), which writes
+            // through `write_active_report_csv`, so this never reaches here.
+            FileAction::SaveReportCsvChooseFolder => {}
         }
     }
 

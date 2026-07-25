@@ -27,11 +27,65 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
-use crate::report::flow::{FlowNode, Producer};
-use crate::report::model::ReportResult;
+use crate::report::flow::{FlowNode, Header, Producer, ReportFlow};
+use crate::report::model::{ReportResult, TARGET_COLUMN, parse_columns};
 use crate::report::run::{DryRunner, EntryRunner, LiveRunner, RunContext, run_flow};
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
 use crate::report::writer::{CsvWriter, ReportWriter};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The result of a finished background report run, delivered from the worker
+/// thread back to the event loop (see [`TuiApp::poll_report_run_updates`]).
+/// Keyed by the report's process-unique `report_id` so the result lands on the
+/// right tab even if tabs were reordered or closed while it ran.
+pub(crate) struct ReportRunUpdate {
+    pub(crate) report_id: u64,
+    pub(crate) result: ReportResult,
+}
+
+/// Everything a report run needs, owned (no borrow of `TuiApp`), so the whole
+/// run can be moved onto a background thread. Assembled on the main thread by
+/// [`TuiApp::build_report_run_inputs`]; the worker rebuilds a [`RunContext`]
+/// that borrows these.
+struct ReportRunInputs {
+    flow: ReportFlow,
+    entries: Vec<crate::hurl::HurlEntry>,
+    base_vars: HashMap<String, String>,
+    named_envs: HashMap<String, HashMap<String, String>>,
+    root: Option<PathBuf>,
+    file_root: Option<PathBuf>,
+}
+
+/// Wraps a real [`EntryRunner`] with a cancel flag so a running report can be
+/// stopped mid-flight: once `cancel` flips, every subsequent request returns a
+/// benign "cancelled" outcome instead of hitting the network, so the flow winds
+/// down quickly (an in-flight request still finishes, but no new ones start).
+/// The delivered result is discarded by the poller when the run was cancelled.
+/// Generic over the inner runner so tests can wrap a fake instead of a
+/// [`LiveRunner`].
+struct CancellableRunner<R: EntryRunner> {
+    inner: R,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<R: EntryRunner> EntryRunner for CancellableRunner<R> {
+    fn run(
+        &self,
+        base: &crate::hurl::HurlEntry,
+        vars: &HashMap<String, String>,
+    ) -> crate::hurl::RunOutput {
+        if self.cancel.load(Ordering::Relaxed) {
+            return crate::hurl::RunOutput {
+                entries: Vec::new(),
+                error: Some("cancelled".to_string()),
+            };
+        }
+        self.inner.run(base, vars)
+    }
+}
 
 /// A report tab: the owned [`Report`] plus TUI-only view state (cached
 /// diagnostics and, when the source fails to parse, the parser message). The
@@ -79,6 +133,33 @@ pub(crate) enum ReportView {
     Source,
     /// The grid of rows produced by the last run.
     Results,
+}
+
+/// The three text panels of the full-screen report view, used to index
+/// [`TuiApp::report_pane_areas`]/`report_pane_bars` for mouse hit-testing
+/// (text selection + scrollbar drag). Source and Validation are both shown in
+/// [`ReportView::Source`]; Results is shown in [`ReportView::Results`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReportPane {
+    Source,
+    Validation,
+    Results,
+}
+
+impl ReportPane {
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            ReportPane::Source => 0,
+            ReportPane::Validation => 1,
+            ReportPane::Results => 2,
+        }
+    }
+
+    pub(crate) const ALL: [ReportPane; 3] = [
+        ReportPane::Source,
+        ReportPane::Validation,
+        ReportPane::Results,
+    ];
 }
 
 impl ReportTab {
@@ -169,19 +250,34 @@ impl TuiApp {
             match rt.report.flow() {
                 Err(e) => (Some(e.to_string()), Some(e.line), Vec::new()),
                 Ok(flow) => {
-                    let titles: Option<Vec<String>> =
-                        self.resolve_bound_collection(&rt.report).map(|ci| {
-                            self.collections[ci]
-                                .entries
-                                .iter()
-                                .map(|e| e.title.clone())
-                                .collect()
-                        });
+                    let bound = self.resolve_bound_collection(&rt.report);
+                    let titles: Option<Vec<String>> = bound.map(|ci| {
+                        self.collections[ci]
+                            .entries
+                            .iter()
+                            .map(|e| e.title.clone())
+                            .collect()
+                    });
+                    // Each entry's [Reports] field names, so a SHOW(...) selector
+                    // can be validated against what the request can produce.
+                    let fields: Option<Vec<(String, Vec<String>)>> = bound.map(|ci| {
+                        self.collections[ci]
+                            .entries
+                            .iter()
+                            .map(|e| {
+                                (
+                                    e.title.clone(),
+                                    e.reports.iter().map(|(n, _)| n.clone()).collect(),
+                                )
+                            })
+                            .collect()
+                    });
                     let env_names: Vec<String> =
                         self.global_envs.iter().map(|e| e.name.clone()).collect();
                     let ctx = Context {
                         request_titles: titles.as_deref(),
                         env_names: Some(&env_names),
+                        request_fields: fields.as_deref(),
                     };
                     (None, None, validate(&flow, &ctx))
                 }
@@ -218,7 +314,9 @@ impl TuiApp {
     /// [`ReportResult`]. The `runner` seam lets tests drive a fake without a
     /// network; production passes a [`LiveRunner`]. Returns `Err` with a
     /// user-facing reason when the report isn't runnable (see
-    /// [`Self::report_run_blocker`]).
+    /// [`Self::report_run_blocker`]). Test-only: production runs go through the
+    /// threaded [`Self::run_active_report`].
+    #[cfg(test)]
     pub(crate) fn run_report_flow(
         &self,
         idx: usize,
@@ -254,6 +352,24 @@ impl TuiApp {
     /// `runner`. Assumes the report parses and is bound (the callers gate that);
     /// see them for the differing pre-run checks.
     fn flow_result(&self, idx: usize, runner: &dyn EntryRunner) -> Result<ReportResult, String> {
+        let inputs = self.build_report_run_inputs(idx)?;
+        let ctx = RunContext {
+            entries: &inputs.entries,
+            base_vars: inputs.base_vars,
+            named_envs: inputs.named_envs,
+            root: inputs.root,
+            runner,
+        };
+        Ok(run_flow(&inputs.flow, &ctx))
+    }
+
+    /// Assemble the fully-owned [`ReportRunInputs`] for report `idx` — the flow,
+    /// a clone of the bound collection's entries, the resolved base/named
+    /// environment layers, the producer-path root and the runner's file root —
+    /// so a run can be handed to a background thread with no borrow of `self`.
+    /// Shared by the synchronous [`Self::flow_result`] (dry runs / tests) and
+    /// the threaded [`Self::run_active_report`].
+    fn build_report_run_inputs(&self, idx: usize) -> Result<ReportRunInputs, String> {
         let s = Strings::for_language(&self.language);
         let rt = self.reports.get(idx).ok_or(s.report_run_unbound)?;
         let flow = rt.report.flow().map_err(|e| e.to_string())?;
@@ -303,41 +419,184 @@ impl TuiApp {
             Some(r) if !r.trim().is_empty() => Some(resolve_ref_path(rt.report.path.as_deref(), r)),
             _ => report_dir,
         };
-
-        let ctx = RunContext {
-            entries: &self.collections[ci].entries,
-            base_vars,
-            named_envs,
-            root,
-            runner,
-        };
-        Ok(run_flow(&flow, &ctx))
-    }
-
-    /// Run the active report against its bound collection and show the results
-    /// grid. Runs synchronously for now (the MVP cut); a run that fails to even
-    /// start reports why in the status bar and the source view is kept.
-    pub(crate) fn run_active_report(&mut self) {
-        let Some(idx) = self.active_report_index() else {
-            return;
-        };
         // The live runner is rooted at the bound collection's directory so
         // relative form-file paths in its requests resolve as they would when
         // the request is sent by hand.
-        let file_root = self
-            .resolve_bound_collection(&self.reports[idx].report)
-            .and_then(|ci| self.collections[ci].path.as_deref())
+        let file_root = self.collections[ci]
+            .path
+            .as_deref()
             .and_then(|p| p.parent())
             .map(std::path::Path::to_path_buf);
-        let runner = LiveRunner { file_root };
-        self.apply_report_run(idx, &runner);
+
+        Ok(ReportRunInputs {
+            flow,
+            entries: self.collections[ci].entries.clone(),
+            base_vars,
+            named_envs,
+            root,
+            file_root,
+        })
+    }
+
+    /// Run the active report against its bound collection on a **background
+    /// thread** so the UI stays responsive during a long run (previously this
+    /// ran inline and froze the whole app). Pressing `r` again while a run is in
+    /// flight cancels it. A run that can't even start (parse error / unbound /
+    /// validation errors) reports why in the status bar and keeps the source
+    /// view; the delivered result is folded in by [`Self::poll_report_run_updates`].
+    pub(crate) fn run_active_report(&mut self) {
+        if let Some((report_id, inputs)) = self.prepare_report_run() {
+            self.spawn_report_run(report_id, inputs, |file_root| LiveRunner { file_root });
+        }
+    }
+
+    /// Test seam: start a background run of the active report with an injected
+    /// runner (so tests exercise the real thread + poll plumbing without a
+    /// network). Mirrors [`Self::run_active_report`] but for a fake runner.
+    #[cfg(test)]
+    pub(crate) fn start_report_run_faked<R, F>(&mut self, make_runner: F)
+    where
+        R: EntryRunner + Send + Sync + 'static,
+        F: FnOnce(Option<PathBuf>) -> R + Send + 'static,
+    {
+        if let Some((report_id, inputs)) = self.prepare_report_run() {
+            self.spawn_report_run(report_id, inputs, make_runner);
+        }
+    }
+
+    /// Shared pre-flight for a background run: handle a re-run-while-running as a
+    /// cancel, gate on run blockers, and assemble the owned run inputs. Returns
+    /// `None` (having set the appropriate status) when the run shouldn't start.
+    fn prepare_report_run(&mut self) -> Option<(u64, ReportRunInputs)> {
+        let idx = self.active_report_index()?;
+        let report_id = self.reports[idx].report.id;
+        // A second `r` while running is a cancel: flip the flag the worker's
+        // runner checks between requests, so it winds down and its result is
+        // discarded on arrival.
+        if let Some(cancel) = self.running_reports.get(&report_id) {
+            cancel.store(true, Ordering::Relaxed);
+            self.status = Some(Status::ReportRunCancelled);
+            return None;
+        }
+        if let Some(reason) = self.report_run_blocker(idx) {
+            self.status = Some(Status::ReportRunBlocked(reason));
+            return None;
+        }
+        match self.build_report_run_inputs(idx) {
+            Ok(inputs) => Some((report_id, inputs)),
+            Err(reason) => {
+                self.status = Some(Status::ReportRunBlocked(reason));
+                None
+            }
+        }
+    }
+
+    /// Spawn the worker thread for a prepared run: build a [`CancellableRunner`]
+    /// around `make_runner`'s runner, run the whole flow, and send the result
+    /// back over a channel drained by [`Self::poll_report_run_updates`]. Records
+    /// the cancel flag + receiver and sets the "running" status.
+    fn spawn_report_run<R, F>(&mut self, report_id: u64, inputs: ReportRunInputs, make_runner: F)
+    where
+        R: EntryRunner + Send + Sync + 'static,
+        F: FnOnce(Option<PathBuf>) -> R + Send + 'static,
+    {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ReportRunInputs {
+                flow,
+                entries,
+                base_vars,
+                named_envs,
+                root,
+                file_root,
+            } = inputs;
+            let runner = CancellableRunner {
+                inner: make_runner(file_root),
+                cancel: cancel_worker,
+            };
+            let ctx = RunContext {
+                entries: &entries,
+                base_vars,
+                named_envs,
+                root,
+                runner: &runner,
+            };
+            let result = run_flow(&flow, &ctx);
+            // A closed receiver (the tab was closed mid-run) is fine to ignore.
+            let _ = tx.send(ReportRunUpdate { report_id, result });
+        });
+        self.running_reports.insert(report_id, cancel);
+        self.pending_report_runs.push((report_id, rx));
+        self.status = Some(Status::ReportRunning);
+    }
+
+    /// Drain any finished background report runs and fold each result into its
+    /// tab (matched by `report_id`, so a reordered/kept tab still gets it). A
+    /// result whose run was cancelled is discarded (the cancel status already
+    /// stands). A worker that dropped its sender without a result (a panic) has
+    /// its "running" flag cleared so the indicator can't wedge on. Called once
+    /// per event-loop iteration.
+    pub(crate) fn poll_report_run_updates(&mut self) {
+        if self.pending_report_runs.is_empty() {
+            return;
+        }
+        let mut still = Vec::new();
+        for (report_id, rx) in std::mem::take(&mut self.pending_report_runs) {
+            match rx.try_recv() {
+                Ok(update) => self.apply_report_run_update(update),
+                Err(std::sync::mpsc::TryRecvError::Empty) => still.push((report_id, rx)),
+                // Worker panicked / dropped the sender without a result: clear
+                // the running flag so the "running" state can't wedge forever.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.running_reports.remove(&report_id);
+                }
+            }
+        }
+        self.pending_report_runs = still;
+    }
+
+    /// Apply one finished background run: clear its running flag and, unless it
+    /// was cancelled, store the result on the matching tab, switch to the grid
+    /// and report the row/error counts.
+    fn apply_report_run_update(&mut self, update: ReportRunUpdate) {
+        let cancelled = self
+            .running_reports
+            .remove(&update.report_id)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if cancelled {
+            return;
+        }
+        let Some(idx) = self
+            .reports
+            .iter()
+            .position(|rt| rt.report.id == update.report_id)
+        else {
+            return;
+        };
+        let rows = update.result.rows.len();
+        let errors = update.result.errors.len();
+        let rt = &mut self.reports[idx];
+        rt.result = Some(update.result);
+        // Don't yank the user out of an in-progress source edit that they
+        // started while the run was in flight; just store the result (they can
+        // flip to the grid with `v`/Tab). Otherwise show the grid as usual.
+        if rt.editor.is_none() {
+            rt.view = ReportView::Results;
+            rt.results_panel.set_scroll(0);
+        }
+        self.status = Some(Status::ReportRunDone { rows, errors });
     }
 
     /// Run report `idx` via `runner` and fold the outcome into the tab: on
     /// success, store the result, switch to the grid and report the row/error
-    /// counts; on a blocked run, keep the source view and report why. Split out
-    /// so tests can drive the full store/switch/status path with a fake runner
-    /// (no network).
+    /// counts; on a blocked run, keep the source view and report why. Test-only:
+    /// it drives the full store/switch/status path *synchronously* with a fake
+    /// runner (no network); the production path is the threaded
+    /// [`Self::run_active_report`] + [`Self::poll_report_run_updates`].
+    #[cfg(test)]
     pub(crate) fn apply_report_run(&mut self, idx: usize, runner: &dyn EntryRunner) {
         match self.run_report_flow(idx, runner) {
             Ok(result) => {
@@ -365,10 +624,49 @@ impl TuiApp {
         }
     }
 
-    /// Export the active report's last run to a CSV file next to the report (or
-    /// in the current directory for an unsaved scratch report), reporting the
-    /// path — or the reason nothing was written — in the status bar.
+    /// Export the active report's last run to CSV. Opens the folder picker
+    /// (seeded with a `<report>.csv` filename and the report's own directory)
+    /// so the user chooses where it lands, rather than silently writing into
+    /// the process working directory. Reports why nothing can be written (no
+    /// run yet) in the status bar.
     pub(crate) fn export_active_report_csv(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        if self.reports[idx].result.is_none() {
+            self.status = Some(Status::ReportRunBlocked(
+                s.report_export_no_result.to_string(),
+            ));
+            return;
+        }
+        self.open_browser(super::app::FileAction::SaveReportCsvChooseFolder);
+    }
+
+    /// The default filename offered when exporting the active report's CSV: the
+    /// saved report's stem (or its tab name) with a `.csv` extension.
+    pub(crate) fn default_report_csv_filename(&self) -> String {
+        match self.active_report_index() {
+            Some(idx) => csv_export_path(&self.reports[idx].report)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "report.csv".to_string()),
+            None => "report.csv".to_string(),
+        }
+    }
+
+    /// The directory the active report's relative paths resolve against (its
+    /// own folder, its `# root:`, or the process working directory) — used to
+    /// seed the CSV-export folder picker.
+    pub(crate) fn active_report_base_dir(&self) -> Option<std::path::PathBuf> {
+        self.active_report_index()
+            .map(|idx| report_base_dir(&self.reports[idx].report).0)
+    }
+
+    /// Write the active report's last run to `path` as CSV, reporting the
+    /// destination — or the failure — in the status bar. Called by the folder
+    /// picker once a destination is chosen.
+    pub(crate) fn write_active_report_csv(&mut self, path: &std::path::Path) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
@@ -385,8 +683,7 @@ impl TuiApp {
         // fall back to the produced order just in case.
         let header = rt.report.flow().map(|f| f.header).unwrap_or_default();
         let bytes = CsvWriter.write(result, &header);
-        let path = csv_export_path(&rt.report);
-        match std::fs::write(&path, bytes) {
+        match std::fs::write(path, bytes) {
             Ok(()) => self.status = Some(Status::ReportExported(path.display().to_string())),
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
         }
@@ -462,6 +759,106 @@ impl TuiApp {
         }
     }
 
+    /// Open the column-picker overlay for the active report. Available columns
+    /// come from the last run, so a report must have been run first; otherwise
+    /// a hint is shown. A parse error (which can't normally coexist with a
+    /// result) falls back to that hint too.
+    pub(crate) fn open_report_columns(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let rt = &self.reports[idx];
+        let Some(result) = &rt.result else {
+            self.status = Some(Status::ReportColumnsNeedRun);
+            return;
+        };
+        let Ok(flow) = rt.report.flow() else {
+            self.status = Some(Status::ReportColumnsNeedRun);
+            return;
+        };
+        let picker = ColumnPicker::build(&flow.header, result);
+        self.overlay = Some(Overlay::ReportColumns(Box::new(picker)));
+    }
+
+    /// Key handling for the column-picker overlay ([`Overlay::ReportColumns`]).
+    /// Up/Down move the cursor; Space (or `x`) toggles inclusion; Shift+Up/Down
+    /// reorder the selected column; Enter applies the selection to the flow's
+    /// `# columns:` directive and closes; Esc/`q` cancels. The overlay was
+    /// already `take`n by the dispatcher, so closing is just not putting it back.
+    pub(crate) fn report_columns_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut picker: Box<ColumnPicker>,
+    ) {
+        let keep = |app: &mut TuiApp, picker| {
+            app.overlay = Some(Overlay::ReportColumns(picker));
+        };
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let last = picker.rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up if shift => {
+                // Move the selected column up one place.
+                if picker.selected > 0 {
+                    picker.rows.swap(picker.selected, picker.selected - 1);
+                    picker.selected -= 1;
+                }
+                keep(self, picker);
+            }
+            KeyCode::Down if shift => {
+                if picker.selected < last {
+                    picker.rows.swap(picker.selected, picker.selected + 1);
+                    picker.selected += 1;
+                }
+                keep(self, picker);
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+                keep(self, picker);
+            }
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(last);
+                keep(self, picker);
+            }
+            KeyCode::Home => {
+                picker.selected = 0;
+                keep(self, picker);
+            }
+            KeyCode::End => {
+                picker.selected = last;
+                keep(self, picker);
+            }
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                if let Some(row) = picker.rows.get_mut(picker.selected) {
+                    row.included = !row.included;
+                }
+                keep(self, picker);
+            }
+            KeyCode::Enter => self.apply_report_columns(picker),
+            // Esc / q / any other key: cancel (overlay stays taken).
+            _ => {}
+        }
+    }
+
+    /// Write the picker's selection back to the active report's `# columns:`
+    /// directive (a surgical text edit), then revalidate and persist. With
+    /// nothing included the directive is left untouched, a hint is shown, and
+    /// the overlay stays open so the user can pick something.
+    fn apply_report_columns(&mut self, picker: Box<ColumnPicker>) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let Some(spec) = picker.spec() else {
+            self.status = Some(Status::ReportColumnsNoneSelected);
+            self.overlay = Some(Overlay::ReportColumns(picker));
+            return;
+        };
+        let new_text = set_flow_columns_directive(&self.reports[idx].report.text, &spec);
+        self.reports[idx].report.text = new_text;
+        self.revalidate_report(idx);
+        self.save_state();
+        self.status = Some(Status::ReportColumnsApplied);
+    }
+
     /// Give the active report tab's source panel edit focus, seeding an
     /// [`Editor`] from the current source text. While focused, keystrokes type
     /// directly into the panel (see [`TuiApp::on_key_report_editing`]).
@@ -526,6 +923,18 @@ impl TuiApp {
             KeyCode::Right if ctrl && shift => self.move_active_tab(true),
             KeyCode::Left if ctrl => self.cycle_tab(false),
             KeyCode::Right if ctrl => self.cycle_tab(true),
+            // Shift+Arrow adjusts the end of a mouse-started panel selection
+            // (same as the collection view's body panels).
+            KeyCode::Left if shift => self.extend_report_selection(KeyCode::Left),
+            KeyCode::Right if shift => self.extend_report_selection(KeyCode::Right),
+            KeyCode::Up if shift => self.extend_report_selection(KeyCode::Up),
+            KeyCode::Down if shift => self.extend_report_selection(KeyCode::Down),
+            // Plain Left/Right also move across tabs: the report view is
+            // full-screen (no left/right panes to traverse), so — unlike the
+            // collection view — arrows are free to drive tab navigation, and
+            // users expect them to move *past* a report tab in the bar.
+            KeyCode::Left => self.cycle_tab(false),
+            KeyCode::Right => self.cycle_tab(true),
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // Global menus, unchanged from the collection view.
@@ -543,10 +952,16 @@ impl TuiApp {
             KeyCode::Char('r') | KeyCode::F(5) => self.run_active_report(),
             // Dry-run: preview the projected rows/bindings without sending HTTP.
             KeyCode::Char('d') => self.open_report_dry_run(),
+            // Column picker: choose/reorder which columns the report outputs.
+            KeyCode::Char('c') => self.open_report_columns(),
             // Flip between the source and the last run's results grid.
             KeyCode::Tab | KeyCode::Char('v') => self.toggle_report_view(),
             // Export the last run to CSV next to the report.
             KeyCode::Char('x') => self.export_active_report_csv(),
+            // Copy the active panel selection (or, with nothing selected, the
+            // whole visible panel) to the clipboard — parity with the
+            // collection view's `y`.
+            KeyCode::Char('y') => self.copy_report_selection_to_clipboard(),
             // Scroll the visible panel (source or results grid). Edit focus uses
             // these to move the cursor instead. Overshoot is clamped on draw.
             KeyCode::Up => self.scroll_report(-1),
@@ -583,11 +998,12 @@ impl TuiApp {
     fn on_key_report_editing(&mut self, key: KeyEvent, idx: usize) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        // A pending ghost completion (only for a plain Right-arrow accept). This
-        // is computed *before* the `&mut editor` borrow below, since it needs an
-        // immutable borrow of `self` (the bound collection's request names).
-        let completion = if key.code == KeyCode::Right && !ctrl && !shift {
-            self.report_request_completion(idx)
+        // A pending ghost completion (accepted with a plain Right-arrow or Tab).
+        // This is computed *before* the `&mut editor` borrow below, since it
+        // needs an immutable borrow of `self` (the bound collection's request
+        // names).
+        let completion = if matches!(key.code, KeyCode::Right | KeyCode::Tab) && !ctrl && !shift {
+            self.report_completion(idx)
         } else {
             None
         };
@@ -623,19 +1039,47 @@ impl TuiApp {
                     word_right(editor);
                     None
                 }
-                // Right arrow at end of a `REQUEST` line fills in the completion
-                // (auto-quoting the name when it contains spaces).
-                KeyCode::Right if completion.is_some() => {
+                // Right arrow / Tab at end of a `REQUEST` line fills in the
+                // completion (auto-quoting the name when it contains spaces).
+                KeyCode::Right | KeyCode::Tab if completion.is_some() => {
                     accept_request_completion(editor, completion.as_ref().unwrap());
                     Some(editor.text())
                 }
+                // Enter keeps the current line's indentation on the new line
+                // (and adds one level after a `FOR` that opens a block), so
+                // nested regions stay visually aligned. Only auto-indents when
+                // the cursor is at the line end (the normal typing flow); a
+                // mid-line split stays a plain newline.
+                KeyCode::Enter if !ctrl && !shift => {
+                    let line = &editor.lines[editor.row];
+                    if editor.col == line.chars().count() {
+                        let mut new_indent = leading_ws(line);
+                        if opens_block(line) {
+                            new_indent.push_str(INDENT_UNIT);
+                        }
+                        editor.newline();
+                        editor.insert_str(&new_indent);
+                        Some(editor.text())
+                    } else {
+                        let resp = apply_edit_key_full(editor, key);
+                        copy = resp.copy;
+                        if resp.changed {
+                            Some(editor.text())
+                        } else {
+                            None
+                        }
+                    }
+                }
                 // Everything else goes to the shared multi-line key handler,
                 // which reports whether the text changed and any selection the
-                // host should copy.
+                // host should copy. After the edit, a line that now reads `END`
+                // is snapped back to its matching `FOR`'s indent (so finishing a
+                // block dedents one level, per the grammar's cosmetic layout).
                 _ => {
                     let resp = apply_edit_key_full(editor, key);
                     copy = resp.copy;
                     if resp.changed {
+                        reindent_end_line(editor);
                         Some(editor.text())
                     } else {
                         None
@@ -662,27 +1106,24 @@ impl TuiApp {
         }
     }
 
-    /// The ghost suffix to offer while typing a `REQUEST <name>` (or
-    /// `REPORT REQUEST <name>`) line in the source editor: the remainder of the
-    /// first request title in the bound collection that the partially-typed
-    /// The request-name completion to offer while typing a `REQUEST <name>` (or
-    /// `REPORT REQUEST <name>`) line in the source editor: the first request
-    /// title in the bound collection that the partially-typed name is a prefix
-    /// of. `None` unless the cursor is at the end of such a line and a match
-    /// exists. The report view can't show the collection's request list (it
-    /// takes the whole body), so this keeps request names discoverable and
-    /// correct.
+    /// The completion to offer while typing a name in the source editor — a
+    /// request name on a `REQUEST` / `REPORT REQUEST` line, or an environment
+    /// name on a `FOR … ENVS` clause (including inside `BASELINE(…)` /
+    /// `COMPARISON(…)`). `None` unless the cursor is at the end of such a line
+    /// and a candidate matches. The report view can't show the collection's
+    /// request list or the loaded-env list (the flow takes the whole body), so
+    /// this keeps both discoverable and correctly spelled.
     ///
-    /// PaperTrail requires a name that contains spaces to be quoted
-    /// (`REQUEST "Two Words"`), so completion is quote-aware and always yields a
+    /// PaperTrail requires a spaced request name to be quoted, and *every* env
+    /// name to be quoted, so completion is quote-aware and always yields a
     /// parseable line:
-    /// - a bare fragment matching a space-free title completes bare;
-    /// - a bare fragment matching a title *with* spaces auto-quotes it (the
-    ///   opening quote is inserted before the fragment on accept, so typing
-    ///   `Up` completes to `"Upload document"`);
-    /// - inside an opened quote, any title completes and the closing quote is
-    ///   appended.
-    pub(crate) fn report_request_completion(&self, idx: usize) -> Option<RequestCompletion> {
+    /// - a bare request fragment matching a space-free title completes bare;
+    /// - a bare fragment matching a spaced title (or any env name) auto-quotes
+    ///   it — the opening quote is inserted before the fragment on accept, so
+    ///   typing `Up` completes to `"Upload document"` and `pr` to `"prod"`;
+    /// - inside an opened quote, any candidate completes and the closing quote
+    ///   is appended.
+    pub(crate) fn report_completion(&self, idx: usize) -> Option<RequestCompletion> {
         let rt = self.reports.get(idx)?;
         let editor = rt.editor.as_ref()?;
         let line = editor.lines.get(editor.row)?;
@@ -690,45 +1131,61 @@ impl TuiApp {
         if editor.col != line.chars().count() {
             return None;
         }
-        let ci = self.resolve_bound_collection(&rt.report)?;
-        let mut titles = self.collections[ci]
-            .entries
-            .iter()
-            .map(|e| e.title.as_str());
-        match request_name_partial(line)? {
-            // Bare token: match any title (an exact match has nothing to add, so
-            // require strictly longer), auto-quoting one that contains spaces.
-            NamePartial::Bare(p) => {
-                let t = titles.find(|t| t.len() > p.len() && t.starts_with(&p))?;
-                let suffix = t[p.len()..].to_string();
-                if t.chars().any(char::is_whitespace) {
-                    // Show the plain suffix (so the ghost stays visually
-                    // balanced); on accept, wrap the whole token in quotes.
-                    Some(RequestCompletion {
-                        ghost: suffix.clone(),
-                        insert: format!("{suffix}\""),
-                        wrap_quote: true,
-                    })
-                } else {
-                    Some(RequestCompletion {
-                        ghost: suffix.clone(),
-                        insert: suffix,
-                        wrap_quote: false,
-                    })
-                }
-            }
-            // Inside an opened quote: any title is fair game (spaces are fine),
-            // and the completion appends the closing quote. An exact match still
-            // completes — to just the closing quote.
-            NamePartial::Quoted(p) => {
-                let t = titles.find(|t| t.len() >= p.len() && t.starts_with(&p))?;
-                let ghost = format!("{}\"", &t[p.len()..]);
+        // Request names on a REQUEST / REPORT REQUEST line (bare or quoted).
+        if let Some(partial) = request_name_partial(line) {
+            let ci = self.resolve_bound_collection(&rt.report)?;
+            let titles = self.collections[ci].entries.iter().map(|e| e.title.clone());
+            return complete_name(&partial, titles, false);
+        }
+        // Environment names on a FOR … ENVS clause (always quoted).
+        if let Some(partial) = env_name_partial(line) {
+            let envs = self.global_envs.iter().map(|e| e.name.clone());
+            return complete_name(&partial, envs, true);
+        }
+        None
+    }
+}
+
+/// Build a [`RequestCompletion`] for `partial` against the first matching
+/// `candidate`. When `always_quote` is set (env names, which must be quoted) or
+/// the matched candidate contains whitespace, a bare fragment is auto-quoted:
+/// the opening quote is inserted at the fragment's start column on accept and a
+/// closing quote is appended. Inside an already-opened quote the closing quote
+/// alone is appended.
+fn complete_name(
+    partial: &NamePartial,
+    mut candidates: impl Iterator<Item = String>,
+    always_quote: bool,
+) -> Option<RequestCompletion> {
+    match partial {
+        NamePartial::Bare { text: p, start } => {
+            let t = candidates.find(|t| t.len() > p.len() && t.starts_with(p.as_str()))?;
+            let suffix = t[p.len()..].to_string();
+            if always_quote || t.chars().any(char::is_whitespace) {
+                // Show the plain suffix (so the ghost stays visually balanced);
+                // on accept, wrap the whole name in quotes by inserting the
+                // opening quote at its start column.
                 Some(RequestCompletion {
-                    insert: ghost.clone(),
-                    ghost,
-                    wrap_quote: false,
+                    ghost: suffix.clone(),
+                    insert: format!("{suffix}\""),
+                    quote_at: Some(*start),
+                })
+            } else {
+                Some(RequestCompletion {
+                    ghost: suffix.clone(),
+                    insert: suffix,
+                    quote_at: None,
                 })
             }
+        }
+        NamePartial::Quoted(p) => {
+            let t = candidates.find(|t| t.len() >= p.len() && t.starts_with(p.as_str()))?;
+            let ghost = format!("{}\"", &t[p.len()..]);
+            Some(RequestCompletion {
+                insert: ghost.clone(),
+                ghost,
+                quote_at: None,
+            })
         }
     }
 }
@@ -740,26 +1197,20 @@ pub(crate) struct RequestCompletion {
     /// The text inserted at the cursor when the completion is accepted (may add
     /// a closing quote the ghost doesn't show, for the auto-quote case).
     pub(crate) insert: String,
-    /// When set, an opening quote is inserted before the current bare name token
-    /// on accept (auto-quoting a spaced name).
-    pub(crate) wrap_quote: bool,
+    /// When `Some(col)`, an opening quote is inserted at this character column
+    /// (the start of the bare name) on accept — auto-quoting a name that
+    /// contains spaces so the completed line stays grammar-valid.
+    pub(crate) quote_at: Option<usize>,
 }
 
 /// Apply `comp` to `ed`: optionally wrap the current bare name token in an
-/// opening quote, then insert the completion text at the cursor.
+/// opening quote (at the recorded name-start column), then insert the
+/// completion text at the cursor.
 fn accept_request_completion(ed: &mut Editor, comp: &RequestCompletion) {
     ed.clear_selection();
-    if comp.wrap_quote {
-        // Find the start of the bare token under the cursor (scan left over
-        // non-whitespace) and insert the opening quote there.
-        let row = ed.row;
-        let chars: Vec<char> = ed.lines[row].chars().collect();
-        let mut start = ed.col;
-        while start > 0 && !chars[start - 1].is_whitespace() && chars[start - 1] != '"' {
-            start -= 1;
-        }
-        let byte = Editor::byte_idx(&ed.lines[row], start);
-        ed.lines[row].insert(byte, '"');
+    if let Some(col) = comp.quote_at {
+        let byte = Editor::byte_idx(&ed.lines[ed.row], col);
+        ed.lines[ed.row].insert(byte, '"');
         ed.col += 1;
     }
     ed.insert_str(&comp.insert);
@@ -768,8 +1219,9 @@ fn accept_request_completion(ed: &mut Editor, comp: &RequestCompletion) {
 /// The partially-typed request name on a `REQUEST`/`REPORT REQUEST` line, and
 /// whether the author has opened a quote (so a spaced name is being written).
 enum NamePartial {
-    /// A bare token with no quote and no internal whitespace.
-    Bare(String),
+    /// A bare (unquoted) token, along with the character column in the source
+    /// line where the name begins (used to auto-quote a spaced completion).
+    Bare { text: String, start: usize },
     /// The text after an as-yet-unclosed opening quote (may contain spaces).
     Quoted(String),
 }
@@ -814,6 +1266,58 @@ fn word_right(ed: &mut Editor) {
     ed.col = c;
 }
 
+/// One level of source indentation (matches the flow serializer's four spaces).
+const INDENT_UNIT: &str = "    ";
+
+/// The leading whitespace of `line`, as an owned string (used to inherit the
+/// current line's indentation onto a freshly-inserted newline).
+fn leading_ws(line: &str) -> String {
+    line.chars().take_while(|c| c.is_whitespace()).collect()
+}
+
+/// Whether `line` opens a nested block — i.e. begins (after indentation) with
+/// the `FOR` keyword. A newline after such a line gets one extra indent level.
+fn opens_block(line: &str) -> bool {
+    let t = line.trim_start();
+    strip_keyword(t, "FOR").is_some()
+}
+
+/// If the editor's current line now reads exactly `END` (ignoring case and
+/// surrounding whitespace), snap its indentation to that of the `FOR` it
+/// closes, so finishing a block dedents one level. Idempotent: an `END` already
+/// aligned to its `FOR` is left untouched. Does nothing when the `FOR`/`END`
+/// nesting is unbalanced above the cursor. The cursor stays at the line end.
+fn reindent_end_line(ed: &mut Editor) {
+    let row = ed.row;
+    let Some(line) = ed.lines.get(row) else {
+        return;
+    };
+    if !line.trim().eq_ignore_ascii_case("END") {
+        return;
+    }
+    // Walk upward tracking FOR/END balance to find the matching FOR.
+    let mut depth = 0i32;
+    let mut target: Option<String> = None;
+    for prev in ed.lines[..row].iter().rev() {
+        let t = prev.trim_start();
+        if t.trim().eq_ignore_ascii_case("END") {
+            depth += 1;
+        } else if strip_keyword(t, "FOR").is_some() {
+            if depth == 0 {
+                target = Some(leading_ws(prev));
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let Some(indent) = target else {
+        return;
+    };
+    let trimmed = ed.lines[row].trim_start().to_string();
+    ed.lines[row] = format!("{indent}{trimmed}");
+    ed.col = ed.lines[row].chars().count();
+}
+
 /// If `s` (ignoring case) starts with the keyword `kw` followed by whitespace,
 /// return the remainder with that leading whitespace trimmed; else `None`.
 fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
@@ -841,12 +1345,75 @@ fn request_name_partial(line: &str) -> Option<NamePartial> {
             return None; // already closed — the name is finished
         }
         Some(NamePartial::Quoted(inner.to_string()))
-    } else if name.is_empty() || name.chars().any(char::is_whitespace) {
-        // Empty, or a bare token that already has spaces (unquoted → will fail
-        // validation; don't paper over it with a completion).
+    } else if name.is_empty() {
         None
     } else {
-        Some(NamePartial::Bare(name.to_string()))
+        // A bare token — possibly already containing spaces once the user has
+        // typed past one (autocomplete keeps working and auto-quotes on
+        // accept). `name` is a subslice of `line`, and every byte before it
+        // (indentation + keywords) is ASCII, so its byte offset equals its
+        // character column.
+        let start = name.as_ptr() as usize - line.as_ptr() as usize;
+        Some(NamePartial::Bare {
+            text: name.to_string(),
+            start,
+        })
+    }
+}
+
+/// Byte index just past the first standalone occurrence of the keyword `kw`
+/// (matched case-insensitively, bounded by non-word characters) in `line`, or
+/// `None`. Used to find where an `ENVS` clause's env-name list begins. Only
+/// ASCII letters change case under `to_ascii_uppercase`, so the returned index
+/// is a valid byte offset into `line`.
+fn keyword_word_end(line: &str, kw: &str) -> Option<usize> {
+    let up = line.to_ascii_uppercase();
+    let kwu = kw.to_ascii_uppercase();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = up.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = up[from..].find(&kwu) {
+        let s = from + rel;
+        let e = s + kwu.len();
+        let before_ok = s == 0 || !is_word(bytes[s - 1]);
+        let after_ok = e == bytes.len() || !is_word(bytes[e]);
+        if before_ok && after_ok {
+            return Some(e);
+        }
+        from = e;
+    }
+    None
+}
+
+/// Extract the partially-typed environment name from a source line, if it is a
+/// `FOR … ENVS …` clause whose trailing token (after the last `,`/`(`, or after
+/// the `ENVS` keyword) is still being typed. Mirrors [`request_name_partial`]:
+/// distinguishes a bare token from an opened-quote fragment. The caller checks
+/// the cursor is at the line end, so the trailing token runs to the line end.
+fn env_name_partial(line: &str) -> Option<NamePartial> {
+    let envs_end = keyword_word_end(line, "ENVS")?;
+    // The current token starts after the last list separator, or after ENVS.
+    let region_start = match line.rfind([',', '(']) {
+        Some(pos) if pos + 1 > envs_end => pos + 1,
+        _ => envs_end,
+    };
+    let region = &line[region_start..];
+    let lead = region.len() - region.trim_start().len();
+    let token_byte = region_start + lead;
+    let token = &line[token_byte..];
+    let start = line[..token_byte].chars().count();
+    if let Some(inner) = token.strip_prefix('"') {
+        if inner.contains('"') {
+            return None; // this env name is already closed
+        }
+        Some(NamePartial::Quoted(inner.to_string()))
+    } else if token.is_empty() {
+        None
+    } else {
+        Some(NamePartial::Bare {
+            text: token.to_string(),
+            start,
+        })
     }
 }
 
@@ -1095,6 +1662,178 @@ fn collect_producer_names(producer: &Producer, out: &mut std::collections::HashS
     }
 }
 
+/// One candidate output column in the column-picker overlay: a coalesced set of
+/// `sources` (usually one) with a display `header` and whether it is currently
+/// `included`. The picker's row order is the output column order it writes back
+/// to the flow's `# columns:` directive.
+pub(crate) struct ColumnChoice {
+    pub(crate) header: String,
+    pub(crate) sources: Vec<String>,
+    pub(crate) included: bool,
+}
+
+impl ColumnChoice {
+    /// The `# columns:` fragment for this column: `a|b`, plus ` AS <header>`
+    /// when the header differs from the (default) first source. The header is
+    /// quoted when it isn't a bare source token (spaces/commas/`|`).
+    fn to_spec(&self) -> String {
+        let src = self.sources.join("|");
+        if self.header == self.sources.first().map(String::as_str).unwrap_or("") {
+            src
+        } else {
+            format!("{src} AS {}", quote_header(&self.header))
+        }
+    }
+}
+
+/// Quote a `columns:` header only when it needs it (contains whitespace, comma,
+/// pipe or a quote) — otherwise emit it bare so simple renames stay readable.
+fn quote_header(h: &str) -> String {
+    if h.is_empty()
+        || h.chars()
+            .any(|c| c.is_whitespace() || matches!(c, ',' | '|' | '"'))
+    {
+        let escaped = h.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        h.to_string()
+    }
+}
+
+/// The column-picker overlay ([`Overlay::ReportColumns`]): an interactive
+/// checklist of every column a run produced (plus the flow's raw loop/assign
+/// variables), whose include/exclude/reorder state is written back to the
+/// report's `# columns:` header directive. Backed by a run's [`ReportResult`]
+/// so "available columns" is exactly what the last run emitted.
+pub(crate) struct ColumnPicker {
+    pub(crate) rows: Vec<ColumnChoice>,
+    pub(crate) selected: usize,
+}
+
+impl ColumnPicker {
+    /// Build the picker from the flow header's current `columns:` directive (if
+    /// any) and the columns a run produced. Existing directive columns come
+    /// first (included, in their authored order); every other available source
+    /// is appended unchecked so it can be added with a keystroke.
+    pub(crate) fn build(header: &Header, result: &ReportResult) -> Self {
+        // The available source keys: produced cells (first-seen order, includes
+        // `Result`), then the special `TARGET` if any row carried one.
+        let mut available: Vec<String> = result.column_order.clone();
+        if result.rows.iter().any(|r| r.target.is_some())
+            && !available.iter().any(|k| k == TARGET_COLUMN)
+        {
+            available.push(TARGET_COLUMN.to_string());
+        }
+
+        let mut rows: Vec<ColumnChoice> = Vec::new();
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        match header.columns() {
+            Some(spec) => {
+                // Seed from the directive: each spec is an included column.
+                for col in parse_columns(spec) {
+                    for s in &col.sources {
+                        covered.insert(s.clone());
+                    }
+                    rows.push(ColumnChoice {
+                        header: col.header,
+                        sources: col.sources,
+                        included: true,
+                    });
+                }
+            }
+            None => {
+                // No directive: the default output is every produced column, so
+                // seed those as included (raw vars remain available-to-add).
+                for key in &available {
+                    covered.insert(key.clone());
+                    rows.push(ColumnChoice {
+                        header: key.clone(),
+                        sources: vec![key.clone()],
+                        included: true,
+                    });
+                }
+            }
+        }
+
+        // Append any remaining available source not already covered, unchecked.
+        for key in available {
+            if !covered.contains(&key) {
+                covered.insert(key.clone());
+                rows.push(ColumnChoice {
+                    header: key.clone(),
+                    sources: vec![key.clone()],
+                    included: false,
+                });
+            }
+        }
+
+        ColumnPicker { rows, selected: 0 }
+    }
+
+    /// The `# columns:` directive value for the current included rows in order,
+    /// or `None` when nothing is included (the caller then leaves the report's
+    /// output at its default).
+    fn spec(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|c| c.included)
+            .map(ColumnChoice::to_spec)
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+}
+
+/// Insert or replace the `# columns:` header directive in raw flow `text`,
+/// preserving the body verbatim (a surgical edit rather than a full
+/// re-serialize, so the user's own formatting/comments survive). An existing
+/// `# columns:` line is rewritten in place; otherwise the directive is appended
+/// to the leading comment block (or the top of the file).
+fn set_flow_columns_directive(text: &str, spec: &str) -> String {
+    let new_line = format!("# columns: {spec}");
+    let trailing_nl = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+
+    // Rewrite an existing `# columns:` directive if present.
+    for line in &mut lines {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix('#') {
+            let rest = rest.trim_start();
+            if rest.len() >= "columns:".len()
+                && rest[.."columns:".len()].eq_ignore_ascii_case("columns:")
+            {
+                *line = new_line.clone();
+                return rejoin(lines, trailing_nl);
+            }
+        }
+    }
+
+    // No directive yet: insert after the contiguous leading `#` comment block.
+    let mut insert_at = 0;
+    for line in &lines {
+        if line.trim_start().starts_with('#') {
+            insert_at += 1;
+        } else {
+            break;
+        }
+    }
+    lines.insert(insert_at, new_line);
+    rejoin(lines, trailing_nl)
+}
+
+fn rejoin(lines: Vec<String>, trailing_nl: bool) -> String {
+    let mut out = lines.join("\n");
+    if trailing_nl {
+        out.push('\n');
+    }
+    out
+}
+
 /// Draw a report tab's full-screen body: the binding status, the flow source
 /// (syntax-highlighted, editable in place), and the live validation panel.
 pub(crate) fn draw_report_body(
@@ -1108,10 +1847,16 @@ pub(crate) fn draw_report_body(
         return;
     };
 
+    // Reset the mouse hit-test areas each frame; the specific panel draws below
+    // record the ones actually shown (a panel not drawn this frame stays
+    // `Rect::default()`, so it can never be hit).
+    app.report_pane_areas = [Rect::default(); 3];
+    app.report_pane_bars = [Rect::default(); 3];
+
     // The results grid is shown full-height (below the binding row) when the
     // user has flipped to it; otherwise the source + validation split.
     if app.reports[idx].view == ReportView::Results {
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
+        let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(area);
         draw_report_binding(f, rows[0], app, idx, s, th);
         draw_report_results(f, rows[1], app, idx, s, th);
         return;
@@ -1130,7 +1875,7 @@ pub(crate) fn draw_report_body(
     let diag_h = (diag_count as u16 + 2).min(10);
 
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(3),
         Constraint::Length(diag_h),
     ])
@@ -1185,7 +1930,7 @@ fn draw_report_results(
         }
     };
     let block = panel(title, true, th);
-    draw_report_panel(
+    let (inner, bar) = draw_report_panel(
         f,
         area,
         block,
@@ -1193,6 +1938,8 @@ fn draw_report_results(
         &lines,
         th,
     );
+    app.report_pane_areas[ReportPane::Results.idx()] = inner;
+    app.report_pane_bars[ReportPane::Results.idx()] = bar;
 }
 
 /// Build the grid's styled lines: a bold header row of the resolved column
@@ -1288,7 +2035,9 @@ fn flatten_cell(value: &str) -> String {
 
 /// Render styled `lines` into `block`'s inner area through `panel`, so the read
 /// content wraps, scrolls and shows a scrollbar exactly like the collection
-/// view's panels.
+/// view's panels. Returns the inner text Rect and the scrollbar Rect (the
+/// latter `Rect::default()` when no scrollbar is needed) so the caller can
+/// record them for mouse hit-testing (text selection + scrollbar drag).
 fn draw_report_panel(
     f: &mut Frame,
     area: Rect,
@@ -1296,12 +2045,15 @@ fn draw_report_panel(
     panel: &mut MultiSelectPanel,
     lines: &[Line<'static>],
     th: &Theme,
-) {
+) -> (Rect, Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return (Rect::default(), Rect::default());
     }
+    // Soft-wrapped logical lines get the same dim ↵ marker as the collection
+    // view's panels (a no-op for a Clip-mode grid panel, which never wraps).
+    panel.set_wrap_marker(Some(super::draw::wrap_marker(th)));
     panel.set_styled_content(lines, inner.width as usize);
     panel.clamp_scroll(inner.height);
     let visible = panel.visible_rows(inner.height);
@@ -1309,6 +2061,7 @@ fn draw_report_panel(
         Paragraph::new(visible).style(Style::default().fg(th.text)),
         inner,
     );
+    let mut bar_area = Rect::default();
     if panel.max_scroll(inner.height) > 0 {
         let total = panel.total_rows().min(u16::MAX as u32) as usize;
         let bar = Rect {
@@ -1325,7 +2078,9 @@ fn draw_report_panel(
             panel.scroll() as usize,
             th,
         );
+        bar_area = bar;
     }
+    (inner, bar_area)
 }
 
 /// Draw the ghost completion `ghost` as dim text starting at the editor's
@@ -1363,6 +2118,24 @@ fn draw_editor_ghost(f: &mut Frame, area: Rect, ed: &Editor, ghost: &str, th: &T
     );
 }
 
+/// The directory that a report's relative producer paths (`FILES`, `FOLDERS`,
+/// `TUPLES FROM`) resolve against, plus whether it is *anchored* (a saved
+/// report file or an explicit `# root:`). When unanchored — a never-saved
+/// scratch report with no `# root:` — paths resolve against the process working
+/// directory, which the UI flags so the user knows to save or set `# root:`.
+fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
+    if let Ok(flow) = report.flow()
+        && let Some(r) = flow.header.root()
+        && !r.trim().is_empty()
+    {
+        return (resolve_ref_path(report.path.as_deref(), r), true);
+    }
+    if let Some(dir) = report.path.as_deref().and_then(|p| p.parent()) {
+        return (dir.to_path_buf(), true);
+    }
+    (std::env::current_dir().unwrap_or_default(), false)
+}
+
 fn draw_report_binding(
     f: &mut Frame,
     area: Rect,
@@ -1372,7 +2145,7 @@ fn draw_report_binding(
     th: &Theme,
 ) {
     let rt = &app.reports[idx];
-    let line = match app.resolve_bound_collection(&rt.report) {
+    let binding = match app.resolve_bound_collection(&rt.report) {
         Some(ci) => {
             let mut spans = vec![
                 Span::styled(s.report_bound_prefix, Style::default().fg(th.dim)),
@@ -1417,9 +2190,38 @@ fn draw_report_binding(
             Line::from(Span::styled(msg, Style::default().fg(th.pending)))
         }
     };
+    // A second line names the directory relative producer paths resolve
+    // against, so the user can write relative `FILES`/`FOLDERS` paths with
+    // confidence (and knows when an unsaved report falls back to the process
+    // working directory).
+    let (base, anchored) = report_base_dir(&rt.report);
+    let mut dir_spans = vec![
+        Span::styled(s.report_base_dir_prefix, Style::default().fg(th.dim)),
+        Span::raw(" "),
+        Span::styled(
+            base.display().to_string(),
+            Style::default().fg(if anchored { th.text } else { th.pending }),
+        ),
+    ];
+    if !anchored {
+        dir_spans.push(Span::raw(" "));
+        dir_spans.push(Span::styled(
+            s.report_base_dir_unsaved,
+            Style::default().fg(th.pending),
+        ));
+    }
+    let lines = vec![binding, Line::from(dir_spans)];
+    let title = if app.running_reports.contains_key(&rt.report.id) {
+        format!(
+            "{} — {}",
+            s.report_binding_heading, s.report_running_indicator
+        )
+    } else {
+        s.report_binding_heading.to_string()
+    };
     f.render_widget(
-        Paragraph::new(line)
-            .block(panel(s.report_binding_heading.to_string(), false, th))
+        Paragraph::new(lines)
+            .block(panel(title, false, th))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -1447,7 +2249,16 @@ fn draw_report_source(
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
     let block = panel(title, true, th);
-    let error_line = app.reports[idx].parse_error_line;
+    // Context so the highlighter can colour the `# collection:`/`# environment:`
+    // references (and `ENVS` names) by whether they currently resolve. Built
+    // before any `&mut app` borrow below.
+    let ctx = super::report_highlight::HlCtx {
+        error_line: app.reports[idx].parse_error_line,
+        collection_resolves: app
+            .resolve_bound_collection(&app.reports[idx].report)
+            .is_some(),
+        loaded_envs: app.global_envs.iter().map(|e| e.name.clone()).collect(),
+    };
 
     if editing {
         // Edit focus: render the live editor (with cursor) inside the panel,
@@ -1455,10 +2266,10 @@ fn draw_report_source(
         let inner = block.inner(area);
         f.render_widget(block, area);
         // A pending `REQUEST`-name completion, drawn dim after the cursor.
-        let completion = app.report_request_completion(idx);
+        let completion = app.report_completion(idx);
         if let Some(editor) = app.reports[idx].editor.as_ref() {
             render_editor_highlighted(f, inner, editor, th, |row, line| {
-                super::report_highlight::highlight_row(row, line, error_line, th)
+                super::report_highlight::highlight_row(row, line, &ctx, th)
             });
             if let Some(completion) = completion {
                 draw_editor_ghost(f, inner, editor, &completion.ghost, th);
@@ -1475,9 +2286,9 @@ fn draw_report_source(
             Style::default().fg(th.dim),
         ))]
     } else {
-        super::report_highlight::highlight_source(trimmed, error_line, th)
+        super::report_highlight::highlight_source(trimmed, &ctx, th)
     };
-    draw_report_panel(
+    let (inner, bar) = draw_report_panel(
         f,
         area,
         block,
@@ -1485,6 +2296,8 @@ fn draw_report_source(
         &lines,
         th,
     );
+    app.report_pane_areas[ReportPane::Source.idx()] = inner;
+    app.report_pane_bars[ReportPane::Source.idx()] = bar;
 }
 
 fn draw_report_validation(
@@ -1524,7 +2337,7 @@ fn draw_report_validation(
         }
     };
     let block = panel(s.report_validation_heading.to_string(), false, th);
-    draw_report_panel(
+    let (inner, bar) = draw_report_panel(
         f,
         area,
         block,
@@ -1532,4 +2345,6 @@ fn draw_report_validation(
         &lines,
         th,
     );
+    app.report_pane_areas[ReportPane::Validation.idx()] = inner;
+    app.report_pane_bars[ReportPane::Validation.idx()] = bar;
 }

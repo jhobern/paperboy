@@ -420,6 +420,7 @@ strings! {
     help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
+    help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
     help_reports_about_1 => "A report is a saved flow that drives a bound collection against ranges of files or environments and collects the results into a table.", "Un rapport est un flux enregistré qui exécute une collection liée sur des ensembles de fichiers ou d'environnements et rassemble les résultats dans un tableau.", "En rapport er et gemt flow, der kører en bundet samling mod intervaller af filer eller miljøer og samler resultaterne i en tabel.";
@@ -432,6 +433,7 @@ strings! {
     help_grammar_assign => "set a variable, used elsewhere as {{KEY}}", "définir une variable, utilisée ailleurs comme {{KEY}}", "sæt en variabel, brugt andre steder som {{KEY}}";
     help_grammar_request => "send a request by name (no output row)", "envoyer une requête par son nom (sans ligne de sortie)", "send en anmodning ved navn (ingen outputrække)";
     help_grammar_report => "send a request and add its fields as columns", "envoyer une requête et ajouter ses champs comme colonnes", "send en anmodning og tilføj dens felter som kolonner";
+    help_grammar_show => "keep only these response fields (drop a heavy Response)", "ne garder que ces champs de réponse (retirer une réponse volumineuse)", "behold kun disse svarfelter (drop et tungt Response)";
     help_grammar_parallel => "prefix a FOR to run its iterations concurrently", "préfixer un FOR pour exécuter ses itérations en parallèle", "sæt foran et FOR for at køre dets gentagelser samtidigt";
     help_grammar_for => "loop over a source, binding VAR each pass; END closes it", "boucler sur une source, en liant VAR à chaque passage ; END la ferme", "gennemløb en kilde og bind VAR hver gang; END lukker den";
     help_grammar_for_tuple => "destructure each tuple into several variables", "décomposer chaque tuple en plusieurs variables", "udpak hver tuple i flere variabler";
@@ -443,6 +445,7 @@ strings! {
     help_grammar_tuples => "rows from a .csv/.tsv/.json file (headers name fields)", "lignes d'un fichier .csv/.tsv/.json (les en-têtes nomment les champs)", "rækker fra en .csv/.tsv/.json-fil (overskrifter navngiver felter)";
     help_grammar_zip => "pair sources positionally (must be equal length)", "apparier les sources par position (longueurs égales)", "par kilder positionelt (skal have samme længde)";
     help_grammar_envs => "loop over environments (BASELINE/COMPARISON to diff)", "boucler sur des environnements (BASELINE/COMPARISON pour comparer)", "gennemløb miljøer (BASELINE/COMPARISON for at sammenligne)";
+    help_grammar_result => "diff column: candidate vs baseline env, per reported field", "colonne de différence : candidat vs référence, par champ rapporté", "forskelskolonne: kandidat vs. reference, pr. rapporteret felt";
     new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-6 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-6 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-6 hop til · ^Enter/F2 opret · Esc annuller";
     edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-6 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-6 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-6 hop til · ^Enter/F2 gem · Esc annuller";
     raw_mode_hint => "Edit the raw Hurl text · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le texte Hurl brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå Hurl-tekst · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
@@ -465,6 +468,8 @@ strings! {
     report_bound_prefix => "Bound collection:", "Collection liée :", "Bundet samling:";
     report_env_prefix => "Environment:", "Environnement :", "Miljø:";
     report_env_not_loaded => "(not loaded)", "(non chargé)", "(ikke indlæst)";
+    report_base_dir_prefix => "Files resolve under:", "Les fichiers se résolvent sous :", "Filer opløses under:";
+    report_base_dir_unsaved => "(save the report to anchor relative paths)", "(enregistrez le rapport pour ancrer les chemins relatifs)", "(gem rapporten for at forankre relative stier)";
     report_unbound => "No collection bound — edit the report's '# collection:' header to bind one.", "Aucune collection liée — modifiez l'en-tête « # collection: » du rapport pour en lier une.", "Ingen samling bundet — rediger rapportens « # collection: »-header for at binde en.";
     report_collection_missing => "Bound collection is not loaded — open it as a tab so its requests can be validated.", "La collection liée n'est pas chargée — ouvrez-la dans un onglet pour valider ses requêtes.", "Den bundne samling er ikke indlæst — åbn den som en fane, så dens anmodninger kan valideres.";
     report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
@@ -480,6 +485,7 @@ strings! {
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
     report_run_has_errors => "Fix the validation errors before running.", "Corrigez les erreurs de validation avant l'exécution.", "Ret valideringsfejlene før kørsel.";
     report_export_no_result => "Run the report before exporting.", "Exécutez le rapport avant l'exportation.", "Kør rapporten før eksport.";
+    report_export_csv_folder => "Export Report CSV — Choose Destination Folder", "Exporter le CSV du rapport — Choisir le dossier de destination", "Eksportér rapport-CSV — Vælg destinationsmappe";
     report_run_complete => "Report run complete:", "Exécution du rapport terminée :", "Rapportkørsel fuldført:";
     report_status_rows => "rows", "lignes", "rækker";
     report_status_errors => "errors", "erreurs", "fejl";
@@ -494,6 +500,14 @@ strings! {
     report_dry_run_problems_heading => "Problems", "Problèmes", "Problemer";
     report_dry_run_no_problems => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
     report_dry_run_hint => "↑/↓ scroll · Esc close", "↑/↓ défiler · Échap fermer", "↑/↓ rul · Esc luk";
+    report_columns_title => "Columns", "Colonnes", "Kolonner";
+    report_columns_hint => "Space toggle · Shift+↑/↓ move · Enter apply · Esc cancel", "Espace bascule · Maj+↑/↓ déplacer · Entrée appliquer · Échap annuler", "Mellemrum skift · Skift+↑/↓ flyt · Enter anvend · Esc annuller";
+    report_columns_need_run => "Run the report first so its columns are known", "Exécutez d'abord le rapport pour connaître ses colonnes", "Kør rapporten først, så dens kolonner kendes";
+    report_columns_none_selected => "Select at least one column", "Sélectionnez au moins une colonne", "Vælg mindst én kolonne";
+    report_columns_applied => "Columns updated", "Colonnes mises à jour", "Kolonner opdateret";
+    report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
+    report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
+    report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
 }
 
 /// A language-independent status / notification message. It stores *what*
@@ -614,6 +628,18 @@ pub enum Status {
     ReportRunBlocked(String),
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
+    /// The column picker was opened without a prior run (columns unknown).
+    ReportColumnsNeedRun,
+    /// The column picker was applied with nothing selected.
+    ReportColumnsNoneSelected,
+    /// The column picker's selection was written to the flow's `columns:`.
+    ReportColumnsApplied,
+    /// A report run has been started on a background thread (non-blocking); the
+    /// app stays responsive while it runs. Cleared by the completion status.
+    ReportRunning,
+    /// A running report was cancelled by the user before it finished; any
+    /// partial result is discarded.
+    ReportRunCancelled,
 }
 
 impl Status {
@@ -639,6 +665,7 @@ impl Status {
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
                     | Status::ReportExported(_)
+                    | Status::ReportColumnsApplied
             ),
         }
     }
@@ -725,6 +752,11 @@ impl Status {
             }
             Status::ReportRunBlocked(reason) => reason.clone(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
+            Status::ReportColumnsNeedRun => s.report_columns_need_run.to_string(),
+            Status::ReportColumnsNoneSelected => s.report_columns_none_selected.to_string(),
+            Status::ReportColumnsApplied => s.report_columns_applied.to_string(),
+            Status::ReportRunning => s.report_running.to_string(),
+            Status::ReportRunCancelled => s.report_run_cancelled.to_string(),
         }
     }
 }

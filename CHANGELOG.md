@@ -36,26 +36,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `MultiSelectPanel`s (with a scrollbar) for a consistent feel with the rest of
   the app — scroll the source with the arrow keys (Home/End jump to the
   top/bottom) when it isn't in edit focus.
-- **Report source editor: word-wise cursor movement and request-name
-  completion.** While editing a flow, **Ctrl+←/→** now moves the cursor one word
-  at a time (instead of jumping to the line ends), and typing a `REQUEST`
-  (or `REPORT REQUEST`) name shows a dim inline suggestion of a matching request
-  from the bound collection that **→** fills in — so request names stay correct
-  and discoverable even though the report view can't show the collection list.
-  Completion is quote-aware: a matching name that contains spaces is
-  auto-quoted on accept (typing `Up` completes to `"Upload document"`), and
-  completing inside an already-opened `"` fills the rest of the name and appends
-  the closing quote — so an accepted completion always parses.
+- **Report source editor: word-wise cursor movement and name completion.**
+  While editing a flow, **Ctrl+←/→** now moves the cursor one word at a time
+  (instead of jumping to the line ends), and typing a `REQUEST` (or `REPORT
+  REQUEST`) name — or an environment name on a `FOR … IN ENVS` clause — shows a
+  dim inline suggestion of a matching name that **→** or **Tab** fills in, so
+  names stay correct and discoverable even though the report view can't show the
+  collection or environment lists. Completion is quote-aware: a matching name
+  that contains spaces is auto-quoted on accept (typing `Up` completes to
+  `"Upload document"`), completion keeps matching even after you type one of the
+  name's spaces, and completing inside an already-opened `"` fills the rest of
+  the name and appends the closing quote — so an accepted completion always
+  parses.
 - **Run a report and export its results to CSV.** A bound report can now be
   **run** (**`r`**/F5): PaperBoy drives the flow against its bound collection and
   shows the produced rows in a results **grid** (columns follow the flow's
   `columns:` directive, else the reported fields in first-seen order). **Tab**
   (or **`v`**) flips between the flow source and the grid, and **`x`** exports the
-  last run to a CSV file next to the report (RFC 4180, so multi-line response
-  bodies are preserved). A report that isn't ready to run — unbound, unparseable,
-  or with validation errors — says why in the status bar instead of running. The
-  run is synchronous for now; background execution with live per-row updates and
-  cancellation follows in a later update.
+  last run to a CSV file — chosen through the regular **file picker** (browse to
+  a folder and confirm the name) rather than being dropped into the app's
+  working directory — as RFC 4180, so multi-line response bodies are preserved.
+  A report that isn't ready to run — unbound, unparseable, or with validation
+  errors — says why in the status bar instead of running. The run happens on a
+  **background thread** so the UI stays responsive; a `⏳ Running…` indicator
+  shows in the binding panel and pressing **`r`** again **cancels** the in-flight
+  run (an already-issued request finishes, but no further ones start).
 - **Dry-run preview (`d`).** Before firing any requests, press **`d`** in the
   Reports view to expand the flow with a no-op runner and preview the result: the
   projected **row count**, a sample of the first iterations' resolved variable
@@ -72,6 +77,45 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   Naming an environment that isn't loaded is a validation error (mirroring
   `ENVS`), and the report's binding panel shows the chosen environment. Multi
   environment comparison still uses a `FOR … IN ENVS` loop.
+- **Environment comparison — the `Result` column.** A report that loops over
+  environments with roles — `FOR TARGET IN ENVS BASELINE("prod"),
+  COMPARISON("staging")` — now collapses each document's baseline and candidate
+  runs into a single output row (the row key excludes the environment axis, so
+  the two align) and adds a reserved **`Result`** column describing the diff.
+  The candidate's values are shown; `Result` reads `OK` when every reported
+  field matches the baseline, or a `field: baseline→candidate` summary of each
+  field that changed (falling back to the whole `Response` for a request that
+  declares no `[Reports]`/`WITH` fields). Multiple comparisons are grouped per
+  document, and an unmatched row still appears (`no baseline` / `no candidate`).
+  `Result` is shown by default and can be renamed/reordered like any column via
+  `# columns:` (e.g. `# columns: FILE as Name, Result, proc.status as Status`).
+- **Choose which response fields a request contributes — `SHOW(...)`.** A
+  `REPORT REQUEST` can now be followed by `SHOW(field, field, …)` to emit only
+  the listed fields (in that order) instead of every intrinsic and `[Reports]`
+  field. This is the lever for keeping a heavy body — a base64 image, say — out
+  of the report: `REPORT REQUEST process AS proc SHOW(status, score)` drops the
+  whole-body `proc.Response` column entirely while keeping the small extracted
+  fields. Listing a field the request can't produce is a validation warning.
+- **Column picker overlay (`c`).** In the Reports view, `c` opens an interactive
+  checklist of every column the last run produced (plus the flow's loop/assign
+  variables). Space toggles a column in or out, Shift+↑/↓ reorders, and Enter
+  writes the selection back to the flow's `# columns:` directive — so a
+  non-programmer can shape the output without editing the directive by hand.
+  (Run the report once first, so its available columns are known.)
+- **Reports view editing and results refinements.** A batch of usability
+  improvements to the Reports view: the results grid, source and validation
+  panels all support **mouse selection, copy** (drag to select, **`y`** copies
+  the selection or the whole panel) and show the **line-wrap** indicator, like
+  the response view. Syntax highlighting now also colours the `# collection:`
+  and `# environment:` header references and `FOR … IN ENVS` names by whether
+  they currently resolve (loaded/found vs missing). In the source editor,
+  pressing **Enter** keeps the current line's indentation — and adds one level
+  after a `FOR` — while typing `END` snaps the line back to its matching `FOR`'s
+  indent, so nested blocks stay aligned without manual spacing. The binding
+  panel now names the **base directory** that relative `FILES`/`FOLDERS` paths
+  resolve against (the report's own folder once saved, else the working
+  directory, flagged as a fallback). Plain **←/→** arrows on the tab bar now move
+  across report tabs too (previously only Ctrl+←/→ and `[`/`]` did).
 
 
 ## [0.1.6] - 2026-07-18

@@ -23,6 +23,7 @@ use super::clipboard::copy_to_clipboard;
 use super::editor::*;
 use super::new_request::*;
 use super::remote::*;
+use super::reports::ReportPane;
 use super::selection;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
@@ -78,6 +79,12 @@ impl TuiApp {
             return;
         }
         if self.overlay.is_some() {
+            return;
+        }
+        // The full-screen report view has its own three panels (source /
+        // validation / results) with their own recorded hit-test areas.
+        if self.active_is_report() {
+            self.on_mouse_report(ev);
             return;
         }
         let point = Position::new(ev.column, ev.row);
@@ -216,6 +223,201 @@ impl TuiApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ===== Report view: mouse selection + scrollbar (full-screen panels) =====
+
+    /// Mouse handling for the full-screen report view. Mirrors [`on_mouse`]'s
+    /// Main/Response behaviour, but over the report tab's own three panels
+    /// (source / validation / results) using the areas recorded during draw
+    /// (`report_pane_areas`/`report_pane_bars`). Selection is offered in
+    /// navigation mode only — while the source panel has edit focus, the inline
+    /// editor owns keystrokes and the panel isn't the live view.
+    fn on_mouse_report(&mut self, ev: MouseEvent) {
+        // In edit mode the source isn't rendered through `source_panel`, so
+        // there's nothing to select; ignore mouse then.
+        if self
+            .active_report_index()
+            .is_some_and(|i| self.reports[i].editor.is_some())
+        {
+            return;
+        }
+        let point = Position::new(ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pane) = self.report_scrollbar_pane_at(point) {
+                    self.report_scrollbar_drag = Some(pane);
+                    self.set_report_scroll_for_row(pane, ev.row);
+                    return;
+                }
+                let pane = self.report_pane_at(point);
+                if ev.modifiers.contains(KeyModifiers::ALT) {
+                    // Alt+Click adds a region: finalize the live one first.
+                    if let Some(active) = self.active_report_selection_pane()
+                        && let Some(panel) = self.report_panel_mut(active)
+                    {
+                        panel.finalize_active();
+                    }
+                } else {
+                    self.clear_report_selections();
+                }
+                if let Some(pane) = pane {
+                    let area = self.report_pane_area(pane);
+                    if let Some(panel) = self.report_panel_mut(pane) {
+                        panel.begin(area, (ev.column, ev.row));
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pane) = self.report_scrollbar_drag {
+                    self.set_report_scroll_for_row(pane, ev.row);
+                    return;
+                }
+                self.drag_report_selection_to((ev.column, ev.row));
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.report_scrollbar_drag.take().is_some() {
+                    return;
+                }
+                self.end_report_drags();
+                self.copy_report_selection_to_clipboard();
+            }
+            _ => {}
+        }
+    }
+
+    /// Which report panel (if any) has `point` inside its recorded text area.
+    fn report_pane_at(&self, point: Position) -> Option<ReportPane> {
+        ReportPane::ALL
+            .into_iter()
+            .find(|p| self.report_pane_areas[p.idx()].contains(point))
+    }
+
+    /// Which report panel (if any) has its scrollbar under `point`.
+    fn report_scrollbar_pane_at(&self, point: Position) -> Option<ReportPane> {
+        ReportPane::ALL
+            .into_iter()
+            .find(|p| self.report_pane_bars[p.idx()].contains(point))
+    }
+
+    fn report_pane_area(&self, pane: ReportPane) -> Rect {
+        self.report_pane_areas[pane.idx()]
+    }
+
+    /// The active report tab's `MultiSelectPanel` for `pane` (mutable).
+    fn report_panel_mut(&mut self, pane: ReportPane) -> Option<&mut MultiSelectPanel> {
+        let idx = self.active_report_index()?;
+        let rt = self.reports.get_mut(idx)?;
+        Some(match pane {
+            ReportPane::Source => &mut rt.source_panel,
+            ReportPane::Validation => &mut rt.validation_panel,
+            ReportPane::Results => &mut rt.results_panel,
+        })
+    }
+
+    /// Which report panel currently holds the live (still-draggable /
+    /// -extendable) selection, if any.
+    fn active_report_selection_pane(&self) -> Option<ReportPane> {
+        let idx = self.active_report_index()?;
+        let rt = self.reports.get(idx)?;
+        if rt.source_panel.active_selection().is_some() {
+            Some(ReportPane::Source)
+        } else if rt.validation_panel.active_selection().is_some() {
+            Some(ReportPane::Validation)
+        } else if rt.results_panel.active_selection().is_some() {
+            Some(ReportPane::Results)
+        } else {
+            None
+        }
+    }
+
+    fn clear_report_selections(&mut self) {
+        if let Some(idx) = self.active_report_index() {
+            let rt = &mut self.reports[idx];
+            rt.source_panel.clear();
+            rt.validation_panel.clear();
+            rt.results_panel.clear();
+        }
+    }
+
+    fn drag_report_selection_to(&mut self, point: (u16, u16)) {
+        let Some(pane) = self.active_report_selection_pane() else {
+            return;
+        };
+        let area = self.report_pane_area(pane);
+        if let Some(panel) = self.report_panel_mut(pane) {
+            panel.drag(area, point);
+        }
+    }
+
+    fn end_report_drags(&mut self) {
+        if let Some(idx) = self.active_report_index() {
+            let rt = &mut self.reports[idx];
+            rt.source_panel.end_drag();
+            rt.validation_panel.end_drag();
+            rt.results_panel.end_drag();
+        }
+    }
+
+    fn set_report_scroll_for_row(&mut self, pane: ReportPane, row: u16) {
+        let area = self.report_pane_bars[pane.idx()];
+        if let Some(panel) = self.report_panel_mut(pane) {
+            panel.scroll_to_track_row(area, row);
+        }
+    }
+
+    /// Shift+Arrow in the report view: move the end of the active report-panel
+    /// selection by a character / line, mirroring [`extend_selection`] for the
+    /// Main/Response panels.
+    pub(crate) fn extend_report_selection(&mut self, dir: KeyCode) {
+        let motion = match dir {
+            KeyCode::Left => Motion::Left,
+            KeyCode::Right => Motion::Right,
+            KeyCode::Up => Motion::Up,
+            KeyCode::Down => Motion::Down,
+            _ => return,
+        };
+        let Some(pane) = self.active_report_selection_pane() else {
+            return;
+        };
+        let area = self.report_pane_area(pane);
+        if let Some(panel) = self.report_panel_mut(pane) {
+            panel.extend(motion, area);
+        }
+    }
+
+    /// Copy every active report-panel selection region to the clipboard,
+    /// falling back — with nothing selected — to the whole text of whichever
+    /// panel the current view primarily shows (results grid in the results
+    /// view, else the flow source). Bound to `y` and the mouse-release handler,
+    /// mirroring [`copy_selection_to_clipboard`].
+    pub(crate) fn copy_report_selection_to_clipboard(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let parts: Vec<String> = {
+            let rt = &self.reports[idx];
+            let mut parts = rt.source_panel.selected_parts(None);
+            parts.extend(rt.validation_panel.selected_parts(None));
+            parts.extend(rt.results_panel.selected_parts(None));
+            parts
+        };
+        if !parts.is_empty() {
+            copy_to_clipboard(&parts.join("\n\n"));
+            self.status = Some(Status::Copied);
+            return;
+        }
+        let rt = &self.reports[idx];
+        let whole = match rt.view {
+            crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
+            crate::tui::reports::ReportView::Source => rt.source_panel.whole_text(),
+        };
+        if let Some(text) = whole
+            && !text.is_empty()
+        {
+            copy_to_clipboard(text);
+            self.status = Some(Status::Copied);
         }
     }
 
@@ -468,6 +670,7 @@ impl TuiApp {
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
             Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
+            Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
         }
     }
 
@@ -1840,6 +2043,14 @@ impl TuiApp {
                 let path = dir.join(file).to_string_lossy().into_owned();
                 self.save_as_path(FileAction::SaveCollection, &path);
             }
+            FileAction::SaveReportCsvChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("csv");
+                }
+                let path = dir.join(file);
+                self.write_active_report_csv(&path);
+            }
             _ => {}
         }
     }
@@ -2230,13 +2441,16 @@ impl TuiApp {
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
             FileAction::SaveCollectionChooseFolder => s.save_collection_folder,
+            FileAction::SaveReportCsvChooseFolder => s.report_export_csv_folder,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
-            FileAction::SaveCollectionChooseFolder => s.browser_hint_collection_save,
+            FileAction::SaveCollectionChooseFolder | FileAction::SaveReportCsvChooseFolder => {
+                s.browser_hint_collection_save
+            }
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
@@ -2269,10 +2483,17 @@ impl TuiApp {
             Ok(mut ex) => {
                 // Reopen in the last-used folder when it still exists. The
                 // environment picker prefers the folder its own last file came
-                // from, falling back to the shared last-browsed folder.
+                // from; the report-CSV export prefers the report's own
+                // directory; both fall back to the shared last-browsed folder.
+                let report_dir = (action == FileAction::SaveReportCsvChooseFolder)
+                    .then(|| self.active_report_base_dir())
+                    .flatten();
                 let reopen = match action {
                     FileAction::LoadEnv => {
                         self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref())
+                    }
+                    FileAction::SaveReportCsvChooseFolder => {
+                        report_dir.as_ref().or(self.last_browse_dir.as_ref())
                     }
                     _ => self.last_browse_dir.as_ref(),
                 };
@@ -2296,6 +2517,7 @@ impl TuiApp {
                             .as_ref()
                             .map(|p| p.default_name.clone())
                             .unwrap_or_default(),
+                        FileAction::SaveReportCsvChooseFolder => self.default_report_csv_filename(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);

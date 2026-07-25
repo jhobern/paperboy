@@ -343,6 +343,7 @@ fn parse_report(
         let name = cur.expect_name("a request name after REPORT REQUEST")?;
         let mut alias = None;
         let mut response_fmt = None;
+        let mut show = Vec::new();
         let mut has_with = false;
         loop {
             if cur.peek_word_is("AS") {
@@ -351,6 +352,9 @@ fn parse_report(
             } else if cur.peek_word_is("RESPONSE") {
                 cur.next();
                 response_fmt = Some(parse_response_fmt(&mut cur)?);
+            } else if cur.peek_word_is("SHOW") {
+                cur.next();
+                show = parse_show_list(&mut cur)?;
             } else if cur.peek_word_is("WITH") {
                 cur.next();
                 has_with = true;
@@ -369,6 +373,7 @@ fn parse_report(
             name,
             alias,
             response_fmt,
+            show,
             with,
         })
     } else if cur.peek_is(&Tok::LParen) {
@@ -456,6 +461,24 @@ fn parse_with_block(
 
 fn parse_response_fmt(cur: &mut Cursor) -> Result<ResponseFmt, ParseError> {
     parse_response_fmt_word(cur)
+}
+
+/// Parse a `SHOW(field, field, …)` field selector: at least one field name,
+/// comma-separated, inside parentheses. Field names are bare identifiers (an
+/// intrinsic like `Time` or a `[Reports]`/`WITH` field name).
+fn parse_show_list(cur: &mut Cursor) -> Result<Vec<String>, ParseError> {
+    cur.expect(&Tok::LParen, "'(' after SHOW")?;
+    let mut fields = Vec::new();
+    loop {
+        fields.push(cur.expect_ident("a field name in SHOW(...)")?);
+        if cur.peek_is(&Tok::Comma) {
+            cur.next();
+            continue;
+        }
+        break;
+    }
+    cur.expect(&Tok::RParen, "')' after SHOW fields")?;
+    Ok(fields)
 }
 
 fn parse_response_fmt_word(cur: &mut Cursor) -> Result<ResponseFmt, ParseError> {
@@ -1160,6 +1183,23 @@ mod tests {
         } else {
             panic!("expected ForEach");
         }
+    }
+
+    #[test]
+    fn show_selector_round_trips_and_parses_fields() {
+        let flow =
+            assert_round_trips("REPORT REQUEST process AS proc RESPONSE RAW SHOW(status, Time)\n");
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { show, .. }) => {
+                assert_eq!(show, &vec!["status".to_string(), "Time".to_string()]);
+            }
+            other => panic!("expected report request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_show_selector_is_a_parse_error() {
+        assert!(parse_flow("REPORT REQUEST process SHOW()\n").is_err());
     }
 
     #[test]

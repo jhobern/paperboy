@@ -142,11 +142,17 @@ pub struct ParallelSpec {
 /// The column-emitting `REPORT` statement in its three forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportStmt {
-    /// `REPORT REQUEST <name> [AS <alias>] [RESPONSE …] [WITH … END]`.
+    /// `REPORT REQUEST <name> [AS <alias>] [RESPONSE …] [SHOW(…)] [WITH … END]`.
     Request {
         name: String,
         alias: Option<String>,
         response_fmt: Option<ResponseFmt>,
+        /// The per-statement field selector `SHOW(a, b, …)`: when non-empty,
+        /// only these field suffixes (intrinsics like `Time` and/or
+        /// `[Reports]`/`WITH` field names) are emitted, in listed order — so a
+        /// noisy `Response` (e.g. a base64 blob) can be dropped. Empty = no
+        /// `SHOW` clause, i.e. emit every field (the default).
+        show: Vec<String>,
         with: Vec<WithItem>,
     },
     /// `REPORT <var>` / `REPORT (<v1>, <v2>, …)` — one column per variable.
@@ -355,6 +361,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             name,
             alias,
             response_fmt,
+            show,
             with,
         } => {
             let _ = write!(out, "REPORT REQUEST {}", name_text(name));
@@ -363,6 +370,9 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             }
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
+            }
+            if !show.is_empty() {
+                let _ = write!(out, " SHOW({})", show.join(", "));
             }
             if with.is_empty() {
                 out.push('\n');

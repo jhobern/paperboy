@@ -19,8 +19,26 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::HashSet;
 
 use super::theme::Theme;
+
+/// Context the highlighter needs to colour *references* by whether they
+/// currently resolve: the parser's rejected line, whether the report's
+/// `# collection:` directive binds to a loaded collection, and the set of
+/// loaded global-environment names (so `# environment:` and `ENVS`/`BASELINE`/
+/// `COMPARISON` env names light up green when loaded, amber when not). Built
+/// fresh each draw from `TuiApp`; `Default` (nothing resolves) is used by the
+/// unit tests.
+#[derive(Default)]
+pub(crate) struct HlCtx {
+    /// 1-based line the parser rejected, recoloured to the error style.
+    pub error_line: Option<usize>,
+    /// Whether the report's `# collection:` reference resolves to a loaded tab.
+    pub collection_resolves: bool,
+    /// Names of every currently-loaded global environment.
+    pub loaded_envs: HashSet<String>,
+}
 
 /// Every PaperTrail keyword (matched case-insensitively), including the two
 /// reserved-but-unimplemented ones (`JOIN`/`ON`) so a flow that reaches for
@@ -63,16 +81,21 @@ fn is_keyword(word: &str) -> bool {
 /// Tokenise one source line into styled spans that tile the whole line (their
 /// character lengths sum to the line's length), so it can be clipped by the
 /// editor's horizontal-scroll window without misaligning.
-pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
-    // A whole-line comment/directive: dim the entire line (leading indentation
-    // included) so it recedes behind the statements.
+pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'static>> {
+    // A whole-line comment/directive. `# collection:` / `# environment:` get
+    // their value recoloured by whether it resolves; every other comment is
+    // dimmed wholesale so it recedes behind the statements.
     if line.trim_start().starts_with('#') {
-        return vec![Span::styled(line.to_string(), Style::default().fg(th.dim))];
+        return highlight_comment(line, ctx, th);
     }
 
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut spans: Vec<Span<'static>> = Vec::new();
+    // Set once an `ENVS`/`BASELINE`/`COMPARISON` keyword has appeared on the
+    // line: subsequent string literals name environments, so they are coloured
+    // by whether that environment is loaded rather than left plain.
+    let mut env_names = false;
     let mut i = 0;
     while i < n {
         let c = chars[i];
@@ -90,7 +113,9 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
         }
         // A `"…"` string literal: never keyword-highlight its contents (a
         // request name like `"Upload for document"` must not light up `for`),
-        // but still surface any `{{ … }}` substitution inside it.
+        // but still surface any `{{ … }}` substitution inside it. When the line
+        // is an environment clause, the literal names an env and is coloured by
+        // whether that env is loaded.
         if c == '"' {
             let start = i;
             i += 1;
@@ -107,7 +132,20 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
                 }
                 i += 1;
             }
-            push_string_spans(&mut spans, &chars[start..i], th);
+            if env_names {
+                let name = unquote_literal(&chars[start..i]);
+                let colour = if ctx.loaded_envs.contains(&name) {
+                    th.ok
+                } else {
+                    th.pending
+                };
+                spans.push(Span::styled(
+                    chars[start..i].iter().collect::<String>(),
+                    Style::default().fg(colour),
+                ));
+            } else {
+                push_string_spans(&mut spans, &chars[start..i], th);
+            }
             continue;
         }
         if is_word_char(c) {
@@ -117,6 +155,10 @@ pub(crate) fn highlight_line(line: &str, th: &Theme) -> Vec<Span<'static>> {
             }
             let word: String = chars[start..i].iter().collect();
             let style = if is_keyword(&word) {
+                let upper = word.to_ascii_uppercase();
+                if matches!(upper.as_str(), "ENVS" | "BASELINE" | "COMPARISON") {
+                    env_names = true;
+                }
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(th.text)
@@ -182,6 +224,74 @@ fn push_string_spans(spans: &mut Vec<Span<'static>>, s: &[char], th: &Theme) {
     }
 }
 
+/// Highlight a whole-line comment. A `# collection: <ref>` or
+/// `# environment: <name>` directive keeps its label dim but recolours the
+/// value: green when it resolves (the collection is loaded / the env is
+/// loaded), amber (`pending`) when it doesn't — so a mistyped or unloaded
+/// reference is obvious at a glance. Any other comment is dimmed wholesale. The
+/// returned spans tile the line exactly.
+fn highlight_comment(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(th.dim);
+    let whole = || vec![Span::styled(line.to_string(), dim)];
+    let Some(hash) = line.find('#') else {
+        return whole();
+    };
+    let Some(rel_colon) = line[hash + 1..].find(':') else {
+        return whole();
+    };
+    let colon = hash + 1 + rel_colon;
+    let key = line[hash + 1..colon].trim().to_ascii_lowercase();
+    let value_full = &line[colon + 1..];
+    let value = value_full.trim();
+    let colour = match key.as_str() {
+        "collection" if ctx.collection_resolves => th.ok,
+        "collection" => th.pending,
+        "environment" if ctx.loaded_envs.contains(value) => th.ok,
+        "environment" => th.pending,
+        _ => return whole(),
+    };
+    if value.is_empty() {
+        return whole();
+    }
+    // Split the line into: dim prefix (`# collection:`), dim leading space,
+    // coloured value, dim trailing — all byte-contiguous slices of `line`.
+    let ws_len = value_full.len() - value_full.trim_start().len();
+    let value_start = colon + 1 + ws_len;
+    let value_end = value_start + value.len();
+    let mut spans = vec![Span::styled(line[..value_start].to_string(), dim)];
+    spans.push(Span::styled(
+        value.to_string(),
+        Style::default().fg(colour).add_modifier(Modifier::BOLD),
+    ));
+    if value_end < line.len() {
+        spans.push(Span::styled(line[value_end..].to_string(), dim));
+    }
+    spans
+}
+
+/// The inner text of a `"…"` string literal (given as its chars, quotes
+/// included), with `\"`/`\\` escapes resolved — used to test an env name
+/// against the set of loaded environments.
+fn unquote_literal(s: &[char]) -> String {
+    let inner = s
+        .strip_prefix(&['"'])
+        .unwrap_or(s)
+        .strip_suffix(&['"'])
+        .unwrap_or(s);
+    let mut out = String::with_capacity(inner.len());
+    let mut it = inner.iter();
+    while let Some(&c) = it.next() {
+        if c == '\\' {
+            if let Some(&next) = it.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Apply the error highlight (error colour + underline) to a line's spans in
 /// place — used for the one line the parser rejected.
 fn mark_error(spans: &mut [Span<'static>], th: &Theme) {
@@ -191,32 +301,22 @@ fn mark_error(spans: &mut [Span<'static>], th: &Theme) {
 }
 
 /// Highlight one source row and apply the error style when it is the parser's
-/// rejected line (`error_line` is 1-based). Shared by the read view and the
+/// rejected line (`ctx.error_line` is 1-based). Shared by the read view and the
 /// live editor so both look identical.
-pub(crate) fn highlight_row(
-    row: usize,
-    line: &str,
-    error_line: Option<usize>,
-    th: &Theme,
-) -> Vec<Span<'static>> {
-    let mut spans = highlight_line(line, th);
-    if error_line == Some(row + 1) {
+pub(crate) fn highlight_row(row: usize, line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'static>> {
+    let mut spans = highlight_line(line, ctx, th);
+    if ctx.error_line == Some(row + 1) {
         mark_error(&mut spans, th);
     }
     spans
 }
 
-/// Highlight a whole report source into styled [`Line`]s. When `error_line` is
-/// `Some(n)` (a 1-based parser error line), that line is recoloured to the
-/// error style so a malformed script stands out.
-pub(crate) fn highlight_source(
-    text: &str,
-    error_line: Option<usize>,
-    th: &Theme,
-) -> Vec<Line<'static>> {
+/// Highlight a whole report source into styled [`Line`]s, recolouring the
+/// parser's rejected line (when `ctx.error_line` is set) to the error style.
+pub(crate) fn highlight_source(text: &str, ctx: &HlCtx, th: &Theme) -> Vec<Line<'static>> {
     text.split('\n')
         .enumerate()
-        .map(|(i, line)| Line::from(highlight_row(i, line, error_line, th)))
+        .map(|(i, line)| Line::from(highlight_row(i, line, ctx, th)))
         .collect()
 }
 
@@ -228,6 +328,10 @@ mod tests {
 
     fn th() -> Theme {
         theme(&Language::English)
+    }
+
+    fn ctx() -> HlCtx {
+        HlCtx::default()
     }
 
     /// The spans a line is broken into must tile it exactly (their character
@@ -242,7 +346,7 @@ mod tests {
     fn keywords_are_accented_and_bold() {
         let th = th();
         let line = "REPORT REQUEST upload";
-        let spans = highlight_line(line, &th);
+        let spans = highlight_line(line, &ctx(), &th);
         assert_tiles(line, &spans);
         let report = spans.iter().find(|s| s.content == "REPORT").unwrap();
         assert_eq!(report.style.fg, Some(th.accent));
@@ -256,7 +360,7 @@ mod tests {
     #[test]
     fn keywords_match_case_insensitively() {
         let th = th();
-        let spans = highlight_line("report request x", &th);
+        let spans = highlight_line("report request x", &ctx(), &th);
         let report = spans.iter().find(|s| s.content == "report").unwrap();
         assert_eq!(report.style.fg, Some(th.accent));
     }
@@ -265,20 +369,71 @@ mod tests {
     fn substitution_placeholders_use_the_subst_colour() {
         let th = th();
         let line = "URL={{ base }}/api";
-        let spans = highlight_line(line, &th);
+        let spans = highlight_line(line, &ctx(), &th);
         assert_tiles(line, &spans);
         let var = spans.iter().find(|s| s.content == "{{ base }}").unwrap();
         assert_eq!(var.style.fg, Some(th.subst));
     }
 
     #[test]
-    fn comment_lines_are_dimmed_wholesale() {
+    fn plain_comment_lines_are_dimmed_wholesale() {
         let th = th();
-        let line = "  # collection: ./x.hurl";
-        let spans = highlight_line(line, &th);
+        let line = "  # just a note";
+        let spans = highlight_line(line, &ctx(), &th);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, line);
         assert_eq!(spans[0].style.fg, Some(th.dim));
+    }
+
+    #[test]
+    fn collection_directive_value_is_green_when_bound_and_amber_when_not() {
+        let th = th();
+        let line = "# collection: ./x.hurl";
+        // Unbound: the value is amber (`pending`), the label stays dim.
+        let spans = highlight_line(line, &ctx(), &th);
+        assert_tiles(line, &spans);
+        let val = spans.iter().find(|s| s.content == "./x.hurl").unwrap();
+        assert_eq!(val.style.fg, Some(th.pending));
+        // Bound: the value is green.
+        let bound = HlCtx {
+            collection_resolves: true,
+            ..Default::default()
+        };
+        let spans = highlight_line(line, &bound, &th);
+        let val = spans.iter().find(|s| s.content == "./x.hurl").unwrap();
+        assert_eq!(val.style.fg, Some(th.ok));
+    }
+
+    #[test]
+    fn environment_directive_value_tracks_whether_the_env_is_loaded() {
+        let th = th();
+        let line = "# environment: staging";
+        let spans = highlight_line(line, &ctx(), &th);
+        let val = spans.iter().find(|s| s.content == "staging").unwrap();
+        assert_eq!(val.style.fg, Some(th.pending));
+        let loaded = HlCtx {
+            loaded_envs: HashSet::from(["staging".to_string()]),
+            ..Default::default()
+        };
+        let spans = highlight_line(line, &loaded, &th);
+        let val = spans.iter().find(|s| s.content == "staging").unwrap();
+        assert_eq!(val.style.fg, Some(th.ok));
+    }
+
+    #[test]
+    fn envs_clause_names_are_coloured_by_loaded_state() {
+        let th = th();
+        let line = "FOR TARGET IN ENVS \"prod\", \"staging\"";
+        let loaded = HlCtx {
+            loaded_envs: HashSet::from(["prod".to_string()]),
+            ..Default::default()
+        };
+        let spans = highlight_line(line, &loaded, &th);
+        assert_tiles(line, &spans);
+        let prod = spans.iter().find(|s| s.content == "\"prod\"").unwrap();
+        assert_eq!(prod.style.fg, Some(th.ok), "loaded env is green");
+        let staging = spans.iter().find(|s| s.content == "\"staging\"").unwrap();
+        assert_eq!(staging.style.fg, Some(th.pending), "unloaded env is amber");
     }
 
     #[test]
@@ -286,7 +441,7 @@ mod tests {
         let th = th();
         // The request name contains the keyword-looking word "for".
         let line = "REQUEST \"Upload for document\"";
-        let spans = highlight_line(line, &th);
+        let spans = highlight_line(line, &ctx(), &th);
         assert_tiles(line, &spans);
         // The leading REQUEST keyword is still accented…
         let kw = spans.iter().find(|s| s.content == "REQUEST").unwrap();
@@ -309,7 +464,7 @@ mod tests {
     fn substitutions_inside_a_string_literal_still_highlight() {
         let th = th();
         let line = "FILES \"dir/{{NAME}}\"";
-        let spans = highlight_line(line, &th);
+        let spans = highlight_line(line, &ctx(), &th);
         assert_tiles(line, &spans);
         let var = spans.iter().find(|s| s.content == "{{NAME}}").unwrap();
         assert_eq!(var.style.fg, Some(th.subst));
@@ -319,13 +474,17 @@ mod tests {
     fn the_error_row_is_recoloured_and_underlined() {
         let th = th();
         // error_line is 1-based; row 0 is line 1.
-        let spans = highlight_row(0, "REQUEST bad", Some(1), &th);
+        let err = HlCtx {
+            error_line: Some(1),
+            ..Default::default()
+        };
+        let spans = highlight_row(0, "REQUEST bad", &err, &th);
         for sp in &spans {
             assert_eq!(sp.style.fg, Some(th.err));
             assert!(sp.style.add_modifier.contains(Modifier::UNDERLINED));
         }
         // A different row keeps its normal highlighting.
-        let ok = highlight_row(1, "REQUEST good", Some(1), &th);
+        let ok = highlight_row(1, "REQUEST good", &err, &th);
         let kw = ok.iter().find(|s| s.content == "REQUEST").unwrap();
         assert_eq!(kw.style.fg, Some(th.accent));
     }
@@ -333,7 +492,7 @@ mod tests {
     #[test]
     fn highlight_source_yields_one_line_per_row() {
         let th = th();
-        let lines = highlight_source("REQUEST a\nEND", None, &th);
+        let lines = highlight_source("REQUEST a\nEND", &ctx(), &th);
         assert_eq!(lines.len(), 2);
     }
 }

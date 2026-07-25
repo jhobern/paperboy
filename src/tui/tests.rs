@@ -14548,9 +14548,7 @@ fn report_editor_ghost_completes_a_request_name() {
     press(&mut app, KeyCode::Char('e')); // edit focus; cursor at end of "REQUEST Oau"
 
     assert_eq!(
-        app.report_request_completion(idx)
-            .map(|c| c.ghost)
-            .as_deref(),
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("th"),
         "the remainder of the matching request name is offered"
     );
@@ -14566,7 +14564,7 @@ fn report_editor_ghost_completes_a_request_name() {
         "Right arrow fills the ghost in"
     );
     // With the name complete, there's no longer a ghost.
-    assert!(app.report_request_completion(idx).is_none());
+    assert!(app.report_completion(idx).is_none());
 }
 
 /// The ghost only appears at the end of a `REQUEST`/`REPORT REQUEST` line with
@@ -14589,7 +14587,7 @@ fn report_editor_ghost_is_scoped_to_request_lines() {
         .report
         .set_text("# collection: api\nURL=Oau");
     press(&mut app, KeyCode::Char('e'));
-    assert!(app.report_request_completion(idx).is_none());
+    assert!(app.report_completion(idx).is_none());
     press(&mut app, KeyCode::Esc);
 
     // A REPORT REQUEST line does complete.
@@ -14598,9 +14596,7 @@ fn report_editor_ghost_is_scoped_to_request_lines() {
         .set_text("# collection: api\nREPORT REQUEST Oa");
     press(&mut app, KeyCode::Char('e'));
     assert_eq!(
-        app.report_request_completion(idx)
-            .map(|c| c.ghost)
-            .as_deref(),
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("uth")
     );
 }
@@ -14628,9 +14624,7 @@ fn report_editor_ghost_quotes_names_with_spaces() {
         .set_text("# collection: api\nREQUEST Cre");
     press(&mut app, KeyCode::Char('e'));
     assert_eq!(
-        app.report_request_completion(idx)
-            .map(|c| c.ghost)
-            .as_deref(),
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("ate Session"),
         "the ghost shows the plain remainder (quotes added on accept)"
     );
@@ -14658,9 +14652,7 @@ fn report_editor_ghost_quotes_names_with_spaces() {
         .set_text("# collection: api\nREQUEST \"Create Ses");
     press(&mut app, KeyCode::Char('e'));
     assert_eq!(
-        app.report_request_completion(idx)
-            .map(|c| c.ghost)
-            .as_deref(),
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("sion\""),
         "quoted completion fills the rest and appends the closing quote"
     );
@@ -14693,14 +14685,165 @@ fn report_editor_ghost_closes_an_opened_quote() {
         .set_text("# collection: api\nREQUEST \"Oauth");
     press(&mut app, KeyCode::Char('e'));
     assert_eq!(
-        app.report_request_completion(idx)
-            .map(|c| c.ghost)
-            .as_deref(),
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("\"")
     );
 }
 
-/// Tab cycling visits report tabs alongside collection tabs (unified index).
+/// Item 7 (rep-autocomplete-spaces): a bare request-name fragment keeps
+/// matching after the user types one of the name's spaces, so a spaced title
+/// can be completed without first opening a quote.
+#[test]
+fn report_editor_autocompletes_through_a_typed_space() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Create Session".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Create Ses");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
+        Some("sion"),
+        "autocomplete keeps matching across a space typed into a bare name"
+    );
+    // Accepting still wraps the whole spaced name in quotes.
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("REQUEST \"Create Session\""),
+    );
+}
+
+/// Item 8 (rep-envs-autocomplete): environment names complete on a
+/// `FOR … IN ENVS` clause, mirroring request-name completion. A bare fragment
+/// auto-quotes on accept (env names must be quoted).
+#[test]
+fn report_editor_completes_environment_names() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    add_empty_global_env(&mut app, "staging-au");
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Inside an opened quote the rest of the name plus the closing quote.
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR T IN ENVS \"stag");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
+        Some("ing-au\""),
+        "an env name completes inside a FOR … ENVS clause"
+    );
+    press(&mut app, KeyCode::Esc);
+    // A bare fragment auto-quotes the whole env name on accept.
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR T IN ENVS stag");
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
+        Some("ing-au"),
+    );
+    press(&mut app, KeyCode::Right);
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("FOR T IN ENVS \"staging-au\""),
+        "accepting a bare env name auto-quotes it"
+    );
+}
+
+/// Item 4 (rep-editor-indent): pressing Enter after a `FOR` line adds one
+/// indent level and a following line keeps it, while typing `END` snaps the
+/// line back to its matching `FOR`'s indent (dedent).
+#[test]
+fn report_editor_newline_indents_in_a_for_block_and_end_dedents() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: c.hurl\nFOR F IN FILES \"docs\"");
+    press(&mut app, KeyCode::Char('e')); // enter edit, cursor at line end
+    press(&mut app, KeyCode::Enter); // newline after FOR → one extra indent
+    for c in "REQUEST Oauth".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter); // keeps the indent
+    for c in "END".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let text = app.active_report().unwrap().report.text.clone();
+    assert!(
+        text.contains("\n    REQUEST Oauth"),
+        "a newline after FOR indents one level: {text:?}"
+    );
+    assert!(
+        text.contains("\nEND") && !text.contains("\n    END"),
+        "typing END snaps back to the FOR's indent: {text:?}"
+    );
+}
+
+/// Item 9 (rep-cwd-indicator): the binding panel names the directory relative
+/// producer paths resolve against — the report's own folder once saved, else
+/// the process working directory (flagged as a fallback).
+#[test]
+fn report_binding_panel_shows_the_base_directory() {
+    use crate::i18n::Strings;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+    let s = Strings::for_language(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains(s.report_base_dir_prefix) && text.contains("/tmp/reports"),
+        "the base-dir indicator names the report's directory: {text:?}"
+    );
+}
+
+/// Item 10 (rep-tab-arrows): plain Left/Right arrows on the tab bar move across
+/// report tabs, not just collection tabs (Ctrl+Left/Right already did).
+#[test]
+fn plain_arrow_keys_cycle_across_report_tabs() {
+    let mut app = TuiApp::default();
+    app.new_report_tab(); // collections=1, reports=1, active on the report tab
+    app.focus = Pane::Tabs;
+    app.active_tab = 0; // start on the collection tab
+    assert!(!app.active_is_report());
+    press(&mut app, KeyCode::Right); // plain Right advances onto the report tab
+    assert!(
+        app.active_is_report(),
+        "a plain Right arrow reaches the report tab"
+    );
+    press(&mut app, KeyCode::Left); // plain Left steps back
+    assert!(!app.active_is_report());
+}
+
 #[test]
 fn cycle_tab_reaches_report_tabs() {
     let mut app = TuiApp::default();
@@ -14948,6 +15091,104 @@ fn running_switches_to_the_results_view_and_toggles_back() {
     assert_eq!(app.reports[idx].view, ReportView::Results);
 }
 
+/// A background run (via the real thread + poll plumbing, using a fake runner)
+/// leaves the app responsive: it reports "running" immediately, then the poll
+/// folds in the delivered result — switching to the grid and reporting the row
+/// count — once the worker thread finishes.
+#[test]
+fn background_report_run_delivers_a_result_via_poll() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let body = "{\"status\":\"ok\"}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    // The run is in flight: running status + tracked, no result yet.
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunning)
+    ));
+    assert!(app.running_reports.contains_key(&report_id));
+
+    // Drive the poll until the worker delivers (bounded so a bug can't hang).
+    let mut done = false;
+    for _ in 0..200 {
+        app.poll_report_run_updates();
+        if app.running_reports.is_empty() {
+            done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(done, "the background run should complete and be polled in");
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+    assert!(app.reports[idx].result.is_some());
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunDone { rows: 1, errors: 0 })
+    ));
+    assert!(app.pending_report_runs.is_empty());
+}
+
+/// A cancelled background run's delivered result is discarded (not stored on the
+/// tab), and the running flag is cleared.
+#[test]
+fn cancelled_background_report_run_discards_its_result() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    // Cancel it before polling: the poller must discard the arriving result.
+    app.running_reports
+        .get(&report_id)
+        .unwrap()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    for _ in 0..200 {
+        app.poll_report_run_updates();
+        if app.pending_report_runs.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.running_reports.is_empty(), "cancel clears the run flag");
+    assert!(
+        app.reports[idx].result.is_none(),
+        "a cancelled run's result is discarded"
+    );
+}
+
 /// An unbound report can't run: `run_report_flow` returns a reason and
 /// `apply_report_run` keeps the source view with a blocked status.
 #[test]
@@ -15006,7 +15247,24 @@ fn report_export_writes_a_csv_next_to_the_report() {
         body: "{}".to_string(),
     };
     app.apply_report_run(idx, &runner);
+
+    // Export now routes through the folder picker (like "Save Collection As")
+    // rather than silently writing into the process cwd: it opens a Browser
+    // overlay whose commit writes the CSV to the chosen folder + filename.
     app.export_active_report_csv();
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::SaveReportCsvChooseFolder, _))
+        ),
+        "export should open the report-CSV folder picker"
+    );
+    app.overlay = None;
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
 
     let csv_path = report_path.with_extension("csv");
     let csv = std::fs::read_to_string(&csv_path).unwrap();
@@ -15017,6 +15275,35 @@ fn report_export_writes_a_csv_next_to_the_report() {
     ));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Exporting before a run reports why nothing can be written and does NOT open
+/// the folder picker.
+#[test]
+fn report_export_without_a_run_is_blocked() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    app.export_active_report_csv();
+    assert!(app.overlay.is_none(), "no run yet → no folder picker");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunBlocked(_))
+    ));
 }
 
 /// The results grid draws a bold header row (in the accent colour) after a run.
@@ -15065,6 +15352,112 @@ fn report_results_grid_draws_a_header_row() {
     assert!(
         found_header,
         "the results grid should draw its column headers in bold accent"
+    );
+}
+
+/// The report results grid supports mouse text selection + copy, exactly like
+/// the collection view's body panels: a click-drag over the grid selects text,
+/// and releasing copies it (setting the Copied status).
+#[test]
+fn report_results_grid_supports_mouse_selection_and_copy() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // Draw so the results panel's hit-test area is recorded.
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    assert!(
+        area.width > 0 && area.height > 1,
+        "results area must render"
+    );
+
+    // Click-drag across the header row, then release.
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + area.width - 1,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.has_any_selection(),
+        "dragging over the grid starts a text selection"
+    );
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + area.width - 1,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::Copied)),
+        "releasing the drag copies the selection"
+    );
+}
+
+/// With nothing selected, `y` in the report view copies the whole visible
+/// panel (here the results grid) — the same fallback the collection view uses.
+#[test]
+fn report_view_y_copies_the_whole_panel_when_nothing_selected() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // Draw so the results panel caches its content (whole_text needs it).
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    assert!(!app.has_any_selection());
+    press(&mut app, KeyCode::Char('y'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::Copied)),
+        "`y` with no selection copies the whole results panel"
     );
 }
 
@@ -15212,6 +15605,169 @@ fn dry_run_overlay_scrolls_and_closes() {
     assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
     press(&mut app, KeyCode::Esc);
     assert!(app.overlay.is_none(), "Esc closes the dry-run overlay");
+}
+
+/// Build a report tab bound to `api` with the given flow `text` and a synthetic
+/// last-run result whose produced columns are `column_order` — so the column
+/// picker (which reads the last result) can be exercised without a network run.
+fn report_with_result(text: &str, column_order: &[&str]) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Upload".to_string(),
+            method: "POST".to_string(),
+            url: "http://example/upload".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(text);
+    app.revalidate_report(idx);
+    let mut row = crate::report::model::ReportRow::default();
+    for (i, c) in column_order.iter().enumerate() {
+        row.cells.insert(c.to_string(), format!("v{i}"));
+    }
+    app.reports[idx].result = Some(crate::report::model::ReportResult {
+        rows: vec![row],
+        column_order: column_order.iter().map(|c| c.to_string()).collect(),
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+    });
+    (app, idx)
+}
+
+/// `c` opens the column picker, listing every produced column as an included
+/// row (when the flow has no `# columns:` directive yet).
+#[test]
+fn column_picker_lists_produced_columns() {
+    let (mut app, _idx) = report_with_result(
+        "# collection: api\nREPORT REQUEST Upload\n",
+        &["Upload.HttpStatus", "Upload.status", "Upload.Response"],
+    );
+    press(&mut app, KeyCode::Char('c'));
+    match app.overlay.as_ref() {
+        Some(Overlay::ReportColumns(p)) => {
+            let headers: Vec<&str> = p.rows.iter().map(|r| r.header.as_str()).collect();
+            assert_eq!(
+                headers,
+                vec!["Upload.HttpStatus", "Upload.status", "Upload.Response"]
+            );
+            assert!(p.rows.iter().all(|r| r.included), "all included by default");
+        }
+        _ => panic!("`c` should open the column picker"),
+    }
+    // Drawing the overlay must not panic.
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+}
+
+/// Toggling a column off and pressing Enter writes a `# columns:` directive
+/// that omits it, and the surgical edit keeps the rest of the flow intact.
+#[test]
+fn column_picker_apply_writes_columns_directive() {
+    let (mut app, idx) = report_with_result(
+        "# collection: api\nREPORT REQUEST Upload\n",
+        &["Upload.HttpStatus", "Upload.status", "Upload.Response"],
+    );
+    press(&mut app, KeyCode::Char('c'));
+    // Move to the third row (Upload.Response) and toggle it off.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none(), "Enter closes the picker");
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("# columns: Upload.HttpStatus, Upload.status"),
+        "columns directive should omit the toggled-off Response: {text:?}"
+    );
+    assert!(
+        !text.contains("Upload.Response"),
+        "Response was excluded: {text:?}"
+    );
+    assert!(text.contains("REPORT REQUEST Upload"), "body preserved");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportColumnsApplied)
+    ));
+}
+
+/// Shift+↓ reorders the selected column; the written directive follows the new
+/// order.
+#[test]
+fn column_picker_reorders_with_shift_arrows() {
+    let (mut app, idx) =
+        report_with_result("# collection: api\nREPORT REQUEST Upload\n", &["a", "b"]);
+    press(&mut app, KeyCode::Char('c'));
+    // Move the first row ("a") down past "b".
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("# columns: b, a"),
+        "reordered directive: {text:?}"
+    );
+}
+
+/// An existing `# columns:` directive seeds the picker (keeping its `AS`
+/// renames) and is rewritten in place rather than duplicated.
+#[test]
+fn column_picker_rewrites_existing_directive() {
+    let (mut app, idx) = report_with_result(
+        "# collection: api\n# columns: Upload.status AS Status\nREPORT REQUEST Upload\n",
+        &["Upload.HttpStatus", "Upload.status"],
+    );
+    press(&mut app, KeyCode::Char('c'));
+    match app.overlay.as_ref() {
+        Some(Overlay::ReportColumns(p)) => {
+            assert_eq!(p.rows[0].header, "Status");
+            assert_eq!(p.rows[0].sources, vec!["Upload.status".to_string()]);
+            assert!(p.rows[0].included);
+            assert!(
+                p.rows
+                    .iter()
+                    .any(|r| r.header == "Upload.HttpStatus" && !r.included)
+            );
+        }
+        _ => panic!("expected the column picker"),
+    }
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert_eq!(text.matches("# columns:").count(), 1, "rewritten in place");
+    assert!(
+        text.contains("# columns: Upload.status AS Status"),
+        "{text:?}"
+    );
+}
+
+/// Opening the picker without a prior run shows a hint and no overlay.
+#[test]
+fn column_picker_needs_a_run_first() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Upload".to_string(),
+            method: "POST".to_string(),
+            url: "http://example/upload".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Upload\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.overlay.is_none());
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportColumnsNeedRun)
+    ));
 }
 
 /// A `# environment:` header selects one loaded global environment as the

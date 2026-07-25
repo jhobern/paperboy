@@ -64,6 +64,9 @@ pub fn run() -> io::Result<()> {
         app.poll_git_save_updates();
         // Apply completed "Run All" (Alt+F5) results (captures + pass/fail markers).
         app.poll_batch_run_updates();
+        // Apply a finished background report run (non-blocking; the app stayed
+        // responsive while it ran).
+        app.poll_report_run_updates();
         match event::poll(Duration::from_millis(120)) {
             Ok(true) => {
                 // Terminal (column, row) bounds to clamp every incoming

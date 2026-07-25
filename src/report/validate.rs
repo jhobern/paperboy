@@ -55,6 +55,11 @@ pub struct Context<'a> {
     pub request_titles: Option<&'a [String]>,
     /// Names of environments currently loaded (for `ENVS` resolution).
     pub env_names: Option<&'a [String]>,
+    /// Each bound-collection entry's full title paired with its `[Reports]`
+    /// field names — used to validate a `SHOW(...)` selector's field list
+    /// against the fields the request can actually produce. `None` when no
+    /// collection is bound (the check is then skipped).
+    pub request_fields: Option<&'a [(String, Vec<String>)]>,
 }
 
 /// Validate `flow` against `ctx`, returning all diagnostics (errors + warnings).
@@ -152,8 +157,65 @@ fn walk(
 }
 
 fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
-    if let ReportStmt::Request { name, .. } = stmt {
+    if let ReportStmt::Request {
+        name, show, with, ..
+    } = stmt
+    {
         check_request_name(name, ctx, diags);
+        check_show_fields(name, show, with, ctx, diags);
+    }
+}
+
+/// Warn when a `SHOW(...)` field can't be produced by the request: it is
+/// neither an intrinsic (`HttpStatus`/`Time`/`Asserts`/`Error`/`Response`), a
+/// `WITH` field on this statement, nor a `[Reports]` field of the resolved
+/// request. Skipped when the collection isn't bound (the field set is unknown),
+/// so it never false-warns on a real `[Reports]` field we can't see.
+fn check_show_fields(
+    name: &str,
+    show: &[String],
+    with: &[super::flow::WithItem],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if show.is_empty() {
+        return;
+    }
+    let Some(entries) = ctx.request_fields else {
+        return;
+    };
+    // Resolve the request's `[Reports]` field names: exact full-title, then a
+    // unique leaf match (mirroring `check_request_name`). An unresolved name is
+    // already reported by `check_request_name`, so bail quietly here.
+    let by_exact = entries.iter().find(|(t, _)| t == name);
+    let resolved = by_exact.or_else(|| {
+        let mut leaves = entries
+            .iter()
+            .filter(|(t, _)| t.rsplit('/').next() == Some(name));
+        match (leaves.next(), leaves.next()) {
+            (Some(hit), None) => Some(hit),
+            _ => None,
+        }
+    });
+    let Some((_, report_fields)) = resolved else {
+        return;
+    };
+    let with_fields: Vec<&str> = with
+        .iter()
+        .filter_map(|w| match w {
+            super::flow::WithItem::Field { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for field in show {
+        let known = super::run::INTRINSIC_FIELDS.contains(&field.as_str())
+            || with_fields.contains(&field.as_str())
+            || report_fields.iter().any(|f| f == field);
+        if !known {
+            diags.push(Diagnostic::warning(format!(
+                "SHOW field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — that column will be empty"
+            )));
+        }
     }
 }
 
@@ -331,6 +393,7 @@ mod tests {
         let ctx = Context {
             request_titles: titles,
             env_names: envs,
+            ..Default::default()
         };
         validate(&flow, &ctx)
     }
@@ -361,6 +424,66 @@ mod tests {
             "upload/process_file".into(),
             "finalise_session".into(),
         ]
+    }
+
+    /// Warnings from validating `src` with a bound collection whose entries
+    /// expose the given `[Reports]` field names (title → fields).
+    fn warnings_with_fields(src: &str, fields: &[(&str, &[&str])]) -> Vec<String> {
+        let flow = parse_flow(src).expect("test source should parse");
+        let titles: Vec<String> = fields.iter().map(|(t, _)| t.to_string()).collect();
+        let field_map: Vec<(String, Vec<String>)> = fields
+            .iter()
+            .map(|(t, fs)| (t.to_string(), fs.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_fields: Some(&field_map),
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn show_unknown_field_warns_but_known_fields_do_not() {
+        // `Response`/`Time` are intrinsics; `status` is a [Reports] field —
+        // all fine. `bogus` is none of those → one warning.
+        let warns = warnings_with_fields(
+            "REPORT REQUEST process SHOW(Response, Time, status, bogus)\n",
+            &[("process", &["status", "overall"])],
+        );
+        assert_eq!(warns.len(), 1, "only 'bogus' should warn: {warns:?}");
+        assert!(warns[0].contains("bogus"));
+    }
+
+    #[test]
+    fn show_with_field_counts_as_known() {
+        // A field provided only by this statement's WITH block is known.
+        let warns = warnings_with_fields(
+            "REPORT REQUEST process SHOW(extra) WITH\n    extra: jsonpath \"$.x\"\nEND\n",
+            &[("process", &[])],
+        );
+        assert!(
+            warns.iter().all(|w| !w.contains("extra")),
+            "WITH field should not warn: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn show_is_not_validated_without_a_bound_collection() {
+        // No request_fields context → the field set is unknown, so no warning
+        // (never false-warn on a real [Reports] field we can't see).
+        let flow = parse_flow("REPORT REQUEST process SHOW(bogus)\n").unwrap();
+        let ctx = Context::default();
+        let warns: Vec<_> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .filter(|d| d.message.contains("SHOW"))
+            .collect();
+        assert!(warns.is_empty(), "unbound flow shouldn't warn: {warns:?}");
     }
 
     #[test]
