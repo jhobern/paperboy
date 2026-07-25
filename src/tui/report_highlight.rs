@@ -58,6 +58,7 @@ const KEYWORDS: &[&str] = &[
     "TUPLES",
     "FROM",
     "ZIP",
+    "CONCAT",
     "MATCH",
     "WITH",
     "LIST",

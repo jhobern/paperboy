@@ -279,6 +279,35 @@ pub fn zip_items(lists: Vec<Vec<ProducerItem>>) -> Result<Vec<ProducerItem>, Str
     Ok(items)
 }
 
+/// Concatenate already-expanded producer item-lists end-to-end into one longer
+/// stream (the runtime side of `CONCAT(a, b, …)`). Unlike [`zip_items`], the
+/// inputs need not be equal length — they are appended in order — but every
+/// item must share the same positional arity (so the loop's destructuring
+/// pattern and row key stay well-defined). A mismatch is a hard error. Each
+/// item keeps its own `named` fields; the output layer unions differing field
+/// sets across inputs (blank where absent).
+pub fn concat_items(lists: Vec<Vec<ProducerItem>>) -> Result<Vec<ProducerItem>, String> {
+    let mut items: Vec<ProducerItem> = Vec::new();
+    let mut arity: Option<usize> = None;
+    for list in lists {
+        for item in list {
+            match arity {
+                None => arity = Some(item.values.len()),
+                Some(a) if a != item.values.len() => {
+                    return Err(format!(
+                        "CONCAT inputs have mismatched arity ({a} vs {}); all inputs \
+                         must yield the same number of values per item",
+                        item.values.len()
+                    ));
+                }
+                Some(_) => {}
+            }
+            items.push(item);
+        }
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +419,33 @@ mod tests {
         let short = vec![ProducerItem::scalar("x")];
         let long = vec![ProducerItem::scalar("y1"), ProducerItem::scalar("y2")];
         assert!(zip_items(vec![short, long]).is_err());
+    }
+
+    #[test]
+    fn concat_appends_items_in_order() {
+        let a = vec![ProducerItem::scalar("a1"), ProducerItem::scalar("a2")];
+        let b = vec![ProducerItem::scalar("b1")];
+        let c = concat_items(vec![a, b]).unwrap();
+        let flat: Vec<&str> = c.iter().map(|i| i.values[0].as_str()).collect();
+        assert_eq!(flat, vec!["a1", "a2", "b1"]);
+    }
+
+    #[test]
+    fn concat_allows_unequal_lengths_and_empty_inputs() {
+        let a = vec![ProducerItem::scalar("only")];
+        let empty: Vec<ProducerItem> = Vec::new();
+        let c = concat_items(vec![empty.clone(), a, empty]).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].values, vec!["only"]);
+    }
+
+    #[test]
+    fn concat_rejects_mismatched_arity() {
+        let ones = vec![ProducerItem::scalar("a")];
+        let pairs = vec![ProducerItem {
+            values: vec!["x".into(), "y".into()],
+            named: Vec::new(),
+        }];
+        assert!(concat_items(vec![ones, pairs]).is_err());
     }
 }

@@ -2476,6 +2476,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("FOLDERS \"dir\" [WITH r=\"g\"]", s.help_grammar_folders),
                         ("TUPLES FROM \"data.csv\"", s.help_grammar_tuples),
                         ("ZIP(a, b, …)", s.help_grammar_zip),
+                        ("CONCAT(a, b, …)", s.help_grammar_concat),
                         ("ENVS \"au\", \"eu\"", s.help_grammar_envs),
                     ],
                 );

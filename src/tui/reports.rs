@@ -2017,6 +2017,7 @@ fn collect_producer_names(producer: &Producer, out: &mut std::collections::HashS
             }
         }
         Producer::Zip(inner) => inner.iter().for_each(|p| collect_producer_names(p, out)),
+        Producer::Concat(inner) => inner.iter().for_each(|p| collect_producer_names(p, out)),
         _ => {}
     }
 }

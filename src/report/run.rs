@@ -843,6 +843,11 @@ impl<'a> Exec<'a> {
                     parts.iter().map(|p| self.expand_producer(p)).collect();
                 producers::zip_items(lists?)
             }
+            Producer::Concat(parts) => {
+                let lists: Result<Vec<Vec<ProducerItem>>, String> =
+                    parts.iter().map(|p| self.expand_producer(p)).collect();
+                producers::concat_items(lists?)
+            }
         }
     }
 

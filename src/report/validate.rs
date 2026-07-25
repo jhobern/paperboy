@@ -306,6 +306,22 @@ fn producer_arity(p: &Producer, scopes: &[HashMap<String, Producer>]) -> Option<
         // A folder path (roles are accessed by name, not destructured).
         Producer::Files { .. } | Producer::Folders { .. } => Some(1),
         Producer::Zip(ps) => Some(ps.len()),
+        Producer::Concat(ps) => {
+            // CONCAT preserves arity: it appends items, it doesn't widen them.
+            // The whole is knowable only when every input's arity is known and
+            // they all agree (a disagreement is reported by check_producer).
+            let arities: Vec<usize> = ps
+                .iter()
+                .filter_map(|p| producer_arity(p, scopes))
+                .collect();
+            if arities.len() != ps.len() {
+                return None;
+            }
+            match arities.first() {
+                Some(&first) if arities.iter().all(|&a| a == first) => Some(first),
+                _ => None,
+            }
+        }
         Producer::Tuples { .. } => None,
         Producer::List(elems) => {
             let arities: Vec<usize> = elems
@@ -389,6 +405,26 @@ fn check_producer(
     if let Producer::Zip(ps) = producer {
         for p in ps {
             check_producer(p, _ctx, scopes, diags);
+        }
+    }
+    if let Producer::Concat(ps) = producer {
+        for p in ps {
+            check_producer(p, _ctx, scopes, diags);
+        }
+        // All inputs must yield items of the same arity, else the loop pattern
+        // can't destructure them uniformly. Only flag when statically knowable.
+        let arities: Vec<usize> = ps
+            .iter()
+            .filter_map(|p| producer_arity(p, scopes))
+            .collect();
+        if let Some(&first) = arities.first()
+            && arities.len() == ps.len()
+            && !arities.iter().all(|&a| a == first)
+        {
+            diags.push(Diagnostic::error(
+                "CONCAT inputs have inconsistent arity (every input must yield the \
+                 same number of values per item)",
+            ));
         }
     }
 }
@@ -758,6 +794,28 @@ mod tests {
             Some(&t),
             None,
             "binds"
+        ));
+    }
+
+    #[test]
+    fn concat_of_same_arity_sources_is_ok() {
+        let t = titles();
+        assert!(!has_err(
+            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", FILES \"y\", FOLDERS \"z\")\n  REQUEST Oauth\nEND\n",
+            Some(&t),
+            None,
+            "arity"
+        ));
+    }
+
+    #[test]
+    fn concat_of_mismatched_arity_is_an_error() {
+        let t = titles();
+        assert!(has_err(
+            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", ZIP(FILES \"a\", FILES \"b\"))\n  REQUEST Oauth\nEND\n",
+            Some(&t),
+            None,
+            "inconsistent arity"
         ));
     }
 

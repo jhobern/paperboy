@@ -125,6 +125,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   identically. A live `ENVS BASELINE/COMPARISON` clause takes precedence; the
   directive is flagged as ignored when both are present, and a missing/invalid
   snapshot is a non-fatal run error (rows are still produced).
+- **Chain loop sources end-to-end — `CONCAT(...)`.** A new producer,
+  `CONCAT(a, b, …)`, appends the items of each input into one longer stream, so
+  a single `FOR` body can run the same requests over documents gathered from
+  several unrelated folders without duplicating the loop —
+  `FOR DOC IN CONCAT(FILES "batch-jan", FILES "batch-feb", FILES "rescans")`.
+  Unlike `ZIP` (which pairs positionally and needs equal lengths), `CONCAT`
+  inputs may be different lengths and an empty input contributes nothing; every
+  input must share the same arity (mixing e.g. a `FILES` with a `ZIP(...)` is a
+  validation error). `CONCAT` composes with the other producers and can be
+  named with `LIST`.
 - **Choose which response fields a request contributes — `SHOW(...)`.** A
   `REPORT REQUEST` can now be followed by `SHOW(field, field, …)` to emit only
   the listed fields (in that order) instead of every intrinsic and `[Reports]`

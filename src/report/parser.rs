@@ -587,18 +587,11 @@ fn parse_producer(cur: &mut Cursor) -> Result<Producer, ParseError> {
         }
         "ZIP" => {
             cur.next();
-            cur.expect(&Tok::LParen, "'(' after ZIP")?;
-            let mut ps = Vec::new();
-            loop {
-                ps.push(parse_producer(cur)?);
-                if cur.peek_is(&Tok::Comma) {
-                    cur.next();
-                    continue;
-                }
-                break;
-            }
-            cur.expect(&Tok::RParen, "')' to close ZIP")?;
-            Ok(Producer::Zip(ps))
+            Ok(Producer::Zip(parse_producer_list(cur, "ZIP")?))
+        }
+        "CONCAT" => {
+            cur.next();
+            Ok(Producer::Concat(parse_producer_list(cur, "CONCAT")?))
         }
         "JOIN" => Err(cur.err("JOIN is reserved but not yet supported")),
         "ENVS" => Err(cur.err("ENVS can only be used as 'FOR <var> IN ENVS …'")),
@@ -608,6 +601,23 @@ fn parse_producer(cur: &mut Cursor) -> Result<Producer, ParseError> {
             Ok(Producer::Named(name))
         }
     }
+}
+
+/// Parse a parenthesised, comma-separated producer list — the shared body of
+/// `ZIP(…)` and `CONCAT(…)`. `kw` names the enclosing keyword for error text.
+fn parse_producer_list(cur: &mut Cursor, kw: &str) -> Result<Vec<Producer>, ParseError> {
+    cur.expect(&Tok::LParen, &format!("'(' after {kw}"))?;
+    let mut ps = Vec::new();
+    loop {
+        ps.push(parse_producer(cur)?);
+        if cur.peek_is(&Tok::Comma) {
+            cur.next();
+            continue;
+        }
+        break;
+    }
+    cur.expect(&Tok::RParen, &format!("')' to close {kw}"))?;
+    Ok(ps)
 }
 
 fn parse_list_literal(cur: &mut Cursor) -> Result<Producer, ParseError> {
@@ -1126,6 +1136,25 @@ mod tests {
             "LIST PAIRS = ZIP(FILES \"fronts\" MATCH \"*.jpg\", FILES \"backs\")\nFOR (F, B) IN PAIRS\n    REQUEST r\nEND\n",
         );
         assert_round_trips("FOR ROW IN TUPLES FROM \"m.csv\"\n    REQUEST r\nEND\n");
+    }
+
+    #[test]
+    fn concat_producer_round_trips() {
+        let flow = assert_round_trips(
+            "FOR F IN CONCAT(FILES \"a\" MATCH \"*.jpg\", FILES \"b\", FOLDERS \"c\")\n    REQUEST r\nEND\n",
+        );
+        if let FlowNode::ForEach { producer, .. } = &flow.nodes[0] {
+            match producer {
+                Producer::Concat(ps) => assert_eq!(ps.len(), 3),
+                other => panic!("expected CONCAT, got {other:?}"),
+            }
+        } else {
+            panic!("expected ForEach");
+        }
+        // Also valid as a named LIST and nestable with ZIP.
+        assert_round_trips(
+            "LIST ALL = CONCAT(FILES \"x\", ZIP(FILES \"p\", FILES \"q\"))\nFOR ROW IN ALL\n    REQUEST r\nEND\n",
+        );
     }
 
     #[test]

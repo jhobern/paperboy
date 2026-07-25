@@ -206,6 +206,9 @@ pub enum Producer {
     Tuples { path: String },
     /// `ZIP(a, b, …)`.
     Zip(Vec<Producer>),
+    /// `CONCAT(a, b, …)` — the items of each input appended end-to-end into one
+    /// longer stream (all inputs must share the same arity).
+    Concat(Vec<Producer>),
     /// A previously declared `LIST` referenced by name.
     Named(String),
 }
@@ -467,6 +470,10 @@ fn producer_text(p: &Producer) -> String {
         Producer::Zip(ps) => {
             let items: Vec<String> = ps.iter().map(producer_text).collect();
             format!("ZIP({})", items.join(", "))
+        }
+        Producer::Concat(ps) => {
+            let items: Vec<String> = ps.iter().map(producer_text).collect();
+            format!("CONCAT({})", items.join(", "))
         }
         Producer::Named(n) => n.clone(),
     }
