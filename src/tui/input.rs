@@ -675,6 +675,7 @@ impl TuiApp {
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
+            Overlay::ReportNodeShow(picker) => self.report_node_show_key_handler(key, picker),
         }
     }
 

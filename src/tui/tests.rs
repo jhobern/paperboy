@@ -16786,3 +16786,147 @@ fn report_node_folder_key_falls_through_on_non_loop_nodes() {
     );
     assert!(app.pending_node_folder.is_none());
 }
+
+/// Build a node-editor app whose single bound request (`upload`) carries the
+/// given `[Reports]` field names, and whose flow reports it.
+fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".to_string(),
+        method: "POST".to_string(),
+        url: "http://example/x".to_string(),
+        reports: fields
+            .iter()
+            .map(|f| ((*f).to_string(), format!("jsonpath \"$.{f}\"")))
+            .collect(),
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".to_string(), vec![entry]));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST upload\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('n')); // Source -> Nodes
+    (app, idx)
+}
+
+/// `f` on a `REPORT REQUEST` node opens the field (SHOW) picker, whose rows are
+/// the request's intrinsics plus its `[Reports]` fields, all ticked when the
+/// node has no `SHOW` clause yet (emit everything).
+#[test]
+fn report_node_show_key_opens_the_field_picker() {
+    let (mut app, _idx) = node_show_app(&["status", "overall"]);
+    press(&mut app, KeyCode::Down); // select REPORT REQUEST upload
+    press(&mut app, KeyCode::Char('f'));
+    let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+        panic!("f opens the SHOW field picker on a REPORT REQUEST node");
+    };
+    let names: Vec<&str> = picker.rows.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&"status"),
+        "shows a [Reports] field: {names:?}"
+    );
+    assert!(
+        names.contains(&"overall"),
+        "shows a [Reports] field: {names:?}"
+    );
+    assert!(names.contains(&"Response"), "shows an intrinsic: {names:?}");
+    assert!(names.contains(&"Time"), "shows an intrinsic: {names:?}");
+    assert!(
+        picker.rows.iter().all(|r| r.included),
+        "no SHOW clause ⇒ every field ticked"
+    );
+}
+
+/// Un-ticking a field and applying writes a `SHOW(…)` clause that omits it —
+/// the way to drop a noisy field (e.g. a base64 `Response`) from the report.
+#[test]
+fn report_node_show_apply_writes_a_show_clause_omitting_unticked() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('f'));
+    // Canonical row order: HttpStatus, Time, Asserts, Error, Response, status.
+    // Move to Response (index 4) and untick it, then apply.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Char(' ')); // untick Response
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("SHOW("), "a SHOW clause is written: {text:?}");
+    assert!(
+        !text.contains("Response"),
+        "the un-ticked field is omitted: {text:?}"
+    );
+    assert!(text.contains("status"), "kept fields remain: {text:?}");
+    assert!(app.overlay.is_none(), "the picker closes on apply");
+}
+
+/// Applying with every field ticked writes no `SHOW` clause (the "emit all"
+/// default), and clears any pre-existing one.
+#[test]
+fn report_node_show_all_ticked_removes_the_clause() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST upload SHOW(status)\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('f'));
+    // The current SHOW(status) preselects only `status`; tick everything else.
+    {
+        let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+            panic!("picker open");
+        };
+        let ticked = picker.rows.iter().filter(|r| r.included).count();
+        assert_eq!(ticked, 1, "only the SHOW(status) field is preselected");
+    }
+    // Tick every row, then apply.
+    let total = {
+        let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+            unreachable!()
+        };
+        picker.rows.len()
+    };
+    for i in 0..total {
+        // Ensure each row ends up ticked: toggle only the unticked ones.
+        let unticked = {
+            let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+                unreachable!()
+            };
+            !picker.rows[i].included
+        };
+        if unticked {
+            press(&mut app, KeyCode::Char(' '));
+        }
+        if i + 1 < total {
+            press(&mut app, KeyCode::Down);
+        }
+    }
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        !text.contains("SHOW("),
+        "all ticked ⇒ the SHOW clause is removed: {text:?}"
+    );
+}
+
+/// `f` on a plain `REQUEST` node (not `REPORT REQUEST`) doesn't open the field
+/// picker — it falls through to the shared File menu.
+#[test]
+fn report_node_show_key_ignores_plain_request_nodes() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select REQUEST Oauth
+    press(&mut app, KeyCode::Char('f'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(_))),
+        "f on a plain REQUEST falls through to the File menu"
+    );
+}

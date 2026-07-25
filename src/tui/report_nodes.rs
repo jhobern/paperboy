@@ -27,7 +27,9 @@ use super::editor::Editor;
 use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
-use crate::report::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt};
+use crate::report::flow::{
+    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, WithItem,
+};
 use crate::report::parse_flow;
 
 // ---------------------------------------------------------------------------
@@ -175,10 +177,10 @@ fn loop_body(node: &FlowNode) -> Option<&Vec<FlowNode>> {
 /// other node (only these two producers carry a browsable folder).
 fn loop_producer_dir(node: &FlowNode) -> Option<&str> {
     match node {
-        FlowNode::ForEach { producer, .. } => match producer {
-            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir),
-            _ => None,
-        },
+        FlowNode::ForEach {
+            producer: Producer::Files { dir, .. } | Producer::Folders { dir, .. },
+            ..
+        } => Some(dir),
         _ => None,
     }
 }
@@ -186,10 +188,10 @@ fn loop_producer_dir(node: &FlowNode) -> Option<&str> {
 /// Mutable counterpart to [`loop_producer_dir`].
 fn loop_producer_dir_mut(node: &mut FlowNode) -> Option<&mut String> {
     match node {
-        FlowNode::ForEach { producer, .. } => match producer {
-            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir),
-            _ => None,
-        },
+        FlowNode::ForEach {
+            producer: Producer::Files { dir, .. } | Producer::Folders { dir, .. },
+            ..
+        } => Some(dir),
         _ => None,
     }
 }
@@ -441,6 +443,95 @@ impl NodeMenu {
     }
 }
 
+/// One field in the SHOW-field picker.
+pub(crate) struct ShowRow {
+    pub(crate) name: String,
+    pub(crate) included: bool,
+}
+
+/// The SHOW-field picker overlay ([`Overlay::ReportNodeShow`]) for a
+/// `REPORT REQUEST` node: a checklist of every field the request can emit
+/// (intrinsics, its `[Reports]` fields and the node's own `WITH` fields) whose
+/// ticked subset is written back as the node's `SHOW(…)` clause. All ticked ⇒
+/// no `SHOW` clause (emit everything, the default). Lets a report drop a noisy
+/// field (e.g. a base64 `Response` blob) without editing the request.
+pub(crate) struct ShowPicker {
+    /// The report being edited (looked up by id, resilient to tab reorder).
+    pub(crate) report_id: u64,
+    /// Path of the `REPORT REQUEST` node whose `show` list this edits.
+    pub(crate) path: Vec<usize>,
+    /// The request name (shown in the overlay title).
+    pub(crate) request: String,
+    pub(crate) rows: Vec<ShowRow>,
+    pub(crate) selected: usize,
+}
+
+impl ShowPicker {
+    /// Build the picker for a `REPORT REQUEST` node. Rows are the fields the
+    /// request can emit, in the canonical output order (intrinsics, then its
+    /// `[Reports]` fields, then the node's `WITH` fields), de-duplicated. A row
+    /// is ticked when the current `show` is empty (no clause ⇒ all emitted) or
+    /// names it. Any `show` entry not in that set (a user-typed unknown) is kept
+    /// as a ticked row so applying can't silently drop it.
+    fn build(
+        report_id: u64,
+        path: Vec<usize>,
+        request: String,
+        current_show: &[String],
+        report_fields: &[String],
+        with_fields: &[String],
+    ) -> Self {
+        let mut names: Vec<String> = Vec::new();
+        let push = |name: &str, names: &mut Vec<String>| {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        };
+        for f in crate::report::run::INTRINSIC_FIELDS {
+            push(f, &mut names);
+        }
+        for f in report_fields {
+            push(f, &mut names);
+        }
+        for f in with_fields {
+            push(f, &mut names);
+        }
+        // Preserve any unknown SHOW entry so applying can't drop it.
+        for f in current_show {
+            push(f, &mut names);
+        }
+        let all = current_show.is_empty();
+        let rows = names
+            .into_iter()
+            .map(|name| {
+                let included = all || current_show.iter().any(|s| s == &name);
+                ShowRow { name, included }
+            })
+            .collect();
+        ShowPicker {
+            report_id,
+            path,
+            request,
+            rows,
+            selected: 0,
+        }
+    }
+
+    /// The `SHOW(…)` field list for the ticked rows, in row order. When every
+    /// row is ticked it returns empty (⇒ no `SHOW` clause, the "emit all"
+    /// default), so leaving everything on removes any existing clause.
+    fn selection(&self) -> Vec<String> {
+        if self.rows.iter().all(|r| r.included) {
+            return Vec::new();
+        }
+        self.rows
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TuiApp integration
 // ---------------------------------------------------------------------------
@@ -510,10 +601,12 @@ impl TuiApp {
             KeyCode::End => self.reports[idx].node_selected = last,
             KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
             KeyCode::Enter | KeyCode::Char('e') => self.edit_selected_node(idx),
-            // `f` chooses the source folder for a FOR FILES/FOLDERS loop via the
-            // file browser; on any other node it falls through so the shared
-            // `f` (File menu) still works.
-            KeyCode::Char('f') => return self.open_report_node_folder(idx),
+            // `f` configures the selected node's main detail: for a FOR
+            // FILES/FOLDERS loop it chooses the source folder via the file
+            // browser; for a REPORT REQUEST it opens the field (SHOW) picker.
+            // On any other node it falls through so the shared `f` (File menu)
+            // still works.
+            KeyCode::Char('f') => return self.open_report_node_detail(idx),
             KeyCode::Delete | KeyCode::Backspace => self.delete_selected_node(idx),
             _ => return false,
         }
@@ -621,6 +714,148 @@ impl TuiApp {
         self.revalidate_report(idx);
         self.select_node_path(idx, &path);
         self.save_state();
+    }
+
+    /// The `f` key on a node: configure its main detail. A `FOR FILES/FOLDERS`
+    /// loop opens the folder browser; a `REPORT REQUEST` opens the field (SHOW)
+    /// picker. Returns `true` when it handled the node, `false` otherwise so the
+    /// caller falls through to the shared `f` (File menu).
+    fn open_report_node_detail(&mut self, idx: usize) -> bool {
+        // `open_report_node_folder` reads-only and returns false (no side
+        // effects) when the node isn't a FILES/FOLDERS loop, so it's safe to
+        // try first and fall through to the SHOW picker.
+        self.open_report_node_folder(idx) || self.open_report_node_show(idx)
+    }
+
+    /// Open the field (SHOW) picker for the selected `REPORT REQUEST` node: a
+    /// checklist of every field the request can emit (intrinsics, its
+    /// `[Reports]` fields and the node's own `WITH` fields) whose ticked subset
+    /// becomes the node's `SHOW(…)` clause. Returns `true` when the selection is
+    /// such a node, `false` otherwise so the caller can fall through.
+    fn open_report_node_show(&mut self, idx: usize) -> bool {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return false;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else {
+            return false;
+        };
+        let path = row.path.clone();
+        let report_id = self.reports[idx].report.id;
+        let (name, current_show, with_fields) = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return false;
+            };
+            match node_at(&flow, &path) {
+                Some(FlowNode::Report(ReportStmt::Request {
+                    name, show, with, ..
+                })) => {
+                    let with_names: Vec<String> = with
+                        .iter()
+                        .filter_map(|w| match w {
+                            WithItem::Field { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    (name.clone(), show.clone(), with_names)
+                }
+                _ => return false, // not a REPORT REQUEST node
+            }
+        };
+        let report_fields = self.request_report_fields(report_id, &name);
+        let picker = ShowPicker::build(
+            report_id,
+            path,
+            name,
+            &current_show,
+            &report_fields,
+            &with_fields,
+        );
+        self.overlay = Some(Overlay::ReportNodeShow(Box::new(picker)));
+        true
+    }
+
+    /// The `[Reports]` field names of the request `name` resolves to in the
+    /// report's bound collection, empty when unbound/unresolved.
+    fn request_report_fields(&self, report_id: u64, name: &str) -> Vec<String> {
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return Vec::new();
+        };
+        let rt = &self.reports[idx];
+        let Some(ci) = self.resolve_bound_collection(&rt.report) else {
+            return Vec::new();
+        };
+        crate::report::run::resolve_title(&self.collections[ci].entries, name)
+            .map(|e| e.reports.iter().map(|(f, _)| f.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Finish a [`ShowPicker`]: write its ticked subset back as the node's
+    /// `SHOW(…)` clause (empty clause when everything is ticked — the "emit all"
+    /// default), re-serialize, revalidate and persist.
+    pub(crate) fn apply_report_node_show(&mut self, picker: ShowPicker) {
+        let Some(idx) = self.report_index_by_id(picker.report_id) else {
+            return;
+        };
+        let show = picker.selection();
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            let Some(FlowNode::Report(ReportStmt::Request { show: slot, .. })) =
+                node_at_mut(&mut flow, &picker.path)
+            else {
+                return;
+            };
+            *slot = show;
+            let text = flow.to_text();
+            rt.report.set_text(text);
+        }
+        self.revalidate_report(idx);
+        self.select_node_path(idx, &picker.path);
+        self.save_state();
+    }
+
+    /// Key handling for the SHOW-field picker overlay
+    /// ([`Overlay::ReportNodeShow`]). Up/Down move; Space/`x` toggle; Enter
+    /// applies and closes; Esc/`q`/any other key cancels (the overlay was
+    /// already `take`n by the dispatcher).
+    pub(crate) fn report_node_show_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut picker: Box<ShowPicker>,
+    ) {
+        let last = picker.rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(last);
+                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            }
+            KeyCode::Home => {
+                picker.selected = 0;
+                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            }
+            KeyCode::End => {
+                picker.selected = last;
+                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            }
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                if let Some(row) = picker.rows.get_mut(picker.selected) {
+                    row.included = !row.included;
+                }
+                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            }
+            KeyCode::Enter => self.apply_report_node_show(*picker),
+            // Esc / q / any other key: cancel (overlay stays taken).
+            _ => {}
+        }
     }
 
     /// Edit the selected node: request nodes reopen the request picker (to

@@ -23,8 +23,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   green when the name resolves, amber when it doesn't). **`e`**/Enter edits the
   selected node (request nodes reopen the picker; other nodes open an
   "edit as line" prompt), **`f`** opens a **folder browser** to choose a
-  `FOR … IN FILES/FOLDERS` loop's source directory (no path typing),
-  **Del**/Backspace removes it, and **Shift+↑/↓** (or `K`/`J`) moves it among
+  `FOR … IN FILES/FOLDERS` loop's source directory (no path typing) or, on a
+  `REPORT REQUEST` node, a **field (SHOW) picker** — a checklist of the fields
+  that request can emit (its intrinsics, `[Reports]` fields and any `WITH`
+  fields) whose ticked subset becomes the node's `SHOW(…)` clause, so a noisy
+  field (e.g. a base64 `Response`) can be dropped without editing text (leaving
+  everything ticked emits them all). **Del**/Backspace removes the node, and
+  **Shift+↑/↓** (or `K`/`J`) moves it among
   its siblings. Both editors are views over the same
   flow AST — every structural edit re-serializes back to the source text — so
   you can freely switch between them, and the logic is front-end agnostic for a

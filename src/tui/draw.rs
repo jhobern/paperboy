@@ -179,6 +179,61 @@ fn draw_report_columns_overlay(
     }
 }
 
+/// Draw the report node SHOW-field picker overlay
+/// ([`Overlay::ReportNodeShow`]): a scrollable checklist of the fields the
+/// selected `REPORT REQUEST` node can emit. The selected row is highlighted;
+/// ticked rows are kept, unticked ones are dropped from the node's `SHOW(…)`.
+fn draw_report_node_show_overlay(
+    f: &mut Frame,
+    picker: &super::report_nodes::ShowPicker,
+    s: &Strings,
+    th: &Theme,
+) {
+    let title = format!(
+        "{} {}  ({})",
+        s.report_node_show_title, picker.request, s.report_node_show_hint
+    );
+    let n = picker.rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = if picker.selected >= inner_h {
+        picker.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in picker.rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let mark = if row.included { "[x]" } else { "[ ]" };
+        let base = if i == picker.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if row.included {
+            Style::default().fg(th.text)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark} {}", row.name),
+            base,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 /// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
 /// simple selectable list of the open collections, each showing its display
 /// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
@@ -2492,6 +2547,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th);
+        }
+        Overlay::ReportNodeShow(picker) => {
+            draw_report_node_show_overlay(f, picker, s, th);
         }
         Overlay::Prompt {
             kind,
