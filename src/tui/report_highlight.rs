@@ -38,6 +38,10 @@ pub(crate) struct HlCtx {
     pub collection_resolves: bool,
     /// Names of every currently-loaded global environment.
     pub loaded_envs: HashSet<String>,
+    /// Titles of every request in the bound collection, so a `REQUEST`
+    /// (or `REPORT REQUEST`) name lights up green when it resolves to a real
+    /// request and amber when it doesn't (mirroring env-name colouring).
+    pub request_names: HashSet<String>,
 }
 
 /// Every PaperTrail keyword (matched case-insensitively), including the two
@@ -96,6 +100,11 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
     // line: subsequent string literals name environments, so they are coloured
     // by whether that environment is loaded rather than left plain.
     let mut env_names = false;
+    // Set the moment a `REQUEST` keyword is emitted: the very next name token
+    // (bare word or quoted string) is a request name, coloured by whether it
+    // resolves against the bound collection. Cleared once that token is seen
+    // (or another keyword intervenes).
+    let mut expect_request_name = false;
     let mut i = 0;
     while i < n {
         let c = chars[i];
@@ -143,6 +152,18 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
                     chars[start..i].iter().collect::<String>(),
                     Style::default().fg(colour),
                 ));
+            } else if expect_request_name {
+                expect_request_name = false;
+                let name = unquote_literal(&chars[start..i]);
+                let colour = if ctx.request_names.contains(&name) {
+                    th.ok
+                } else {
+                    th.pending
+                };
+                spans.push(Span::styled(
+                    chars[start..i].iter().collect::<String>(),
+                    Style::default().fg(colour),
+                ));
             } else {
                 push_string_spans(&mut spans, &chars[start..i], th);
             }
@@ -159,7 +180,18 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
                 if matches!(upper.as_str(), "ENVS" | "BASELINE" | "COMPARISON") {
                     env_names = true;
                 }
+                // The token after a `REQUEST` keyword is a request name; any
+                // other keyword ends that expectation.
+                expect_request_name = upper == "REQUEST";
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            } else if expect_request_name {
+                expect_request_name = false;
+                let colour = if ctx.request_names.contains(&word) {
+                    th.ok
+                } else {
+                    th.pending
+                };
+                Style::default().fg(colour)
             } else {
                 Style::default().fg(th.text)
             };
@@ -351,9 +383,10 @@ mod tests {
         let report = spans.iter().find(|s| s.content == "REPORT").unwrap();
         assert_eq!(report.style.fg, Some(th.accent));
         assert!(report.style.add_modifier.contains(Modifier::BOLD));
-        // A non-keyword identifier is plain text, not accented.
+        // A non-keyword identifier is not keyword-accented (here it's a
+        // request name, coloured by resolution — never bold like a keyword).
         let ident = spans.iter().find(|s| s.content == "upload").unwrap();
-        assert_eq!(ident.style.fg, Some(th.text));
+        assert_ne!(ident.style.fg, Some(th.accent));
         assert!(!ident.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -446,18 +479,72 @@ mod tests {
         // The leading REQUEST keyword is still accented…
         let kw = spans.iter().find(|s| s.content == "REQUEST").unwrap();
         assert_eq!(kw.style.fg, Some(th.accent));
-        // …but nothing inside the quoted string is accent-coloured (so "for"
-        // reads as part of the name, not a keyword).
+        // …but nothing inside the quoted string is accent-coloured or bold (so
+        // "for" reads as part of the name, not a keyword). The whole literal is
+        // coloured as one request-name span, not tokenised into keywords.
         for sp in &spans {
             if sp.content.contains("for") || sp.content.contains("Upload") {
-                assert_eq!(
+                assert_ne!(
                     sp.style.fg,
-                    Some(th.text),
-                    "string-literal content stays plain text"
+                    Some(th.accent),
+                    "string-literal content is not keyword-accented"
                 );
                 assert!(!sp.style.add_modifier.contains(Modifier::BOLD));
             }
         }
+    }
+
+    #[test]
+    fn request_names_are_coloured_by_whether_they_resolve() {
+        let th = th();
+        let line = "REQUEST Oauth";
+        // Unbound / unknown request → amber (pending).
+        let spans = highlight_line(line, &ctx(), &th);
+        assert_tiles(line, &spans);
+        let name = spans.iter().find(|s| s.content == "Oauth").unwrap();
+        assert_eq!(name.style.fg, Some(th.pending), "unknown request is amber");
+        // Known request → green.
+        let bound = HlCtx {
+            request_names: HashSet::from(["Oauth".to_string()]),
+            ..Default::default()
+        };
+        let spans = highlight_line(line, &bound, &th);
+        let name = spans.iter().find(|s| s.content == "Oauth").unwrap();
+        assert_eq!(name.style.fg, Some(th.ok), "resolved request is green");
+    }
+
+    #[test]
+    fn quoted_request_name_after_report_request_is_coloured() {
+        let th = th();
+        let bound = HlCtx {
+            request_names: HashSet::from(["Upload document".to_string()]),
+            ..Default::default()
+        };
+        let line = "REPORT REQUEST \"Upload document\"";
+        let spans = highlight_line(line, &bound, &th);
+        assert_tiles(line, &spans);
+        let name = spans
+            .iter()
+            .find(|s| s.content == "\"Upload document\"")
+            .unwrap();
+        assert_eq!(name.style.fg, Some(th.ok));
+    }
+
+    #[test]
+    fn only_the_first_token_after_request_is_a_name() {
+        // In `REQUEST proc AS result`, only `proc` is the request name; the
+        // `AS` alias is a plain identifier, not coloured as a request.
+        let th = th();
+        let bound = HlCtx {
+            request_names: HashSet::from(["proc".to_string()]),
+            ..Default::default()
+        };
+        let line = "REQUEST proc AS result";
+        let spans = highlight_line(line, &bound, &th);
+        let name = spans.iter().find(|s| s.content == "proc").unwrap();
+        assert_eq!(name.style.fg, Some(th.ok));
+        let alias = spans.iter().find(|s| s.content == "result").unwrap();
+        assert_eq!(alias.style.fg, Some(th.text), "the alias stays plain text");
     }
 
     #[test]

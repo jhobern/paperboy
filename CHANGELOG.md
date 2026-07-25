@@ -116,6 +116,37 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   resolve against (the report's own folder once saved, else the working
   directory, flagged as a fallback). Plain **←/→** arrows on the tab bar now move
   across report tabs too (previously only Ctrl+←/→ and `[`/`]` did).
+- **Request names are highlighted in report scripts.** The name on a `REQUEST`
+  (or `REPORT REQUEST`) line now lights up green when it resolves to a request
+  in the bound collection and amber when it doesn't — mirroring how `# collection:`,
+  `# environment:` and `ENVS` names are coloured — so a mistyped or unbound
+  request name is obvious at a glance. Both bare (`REQUEST Oauth`) and quoted
+  (`REPORT REQUEST "Upload document"`) names are coloured, and keyword-looking
+  words inside a quoted name (e.g. a name containing `for`) are still left alone.
+- **Undo and word-delete in every text editor (Ctrl+Z / Ctrl+Backspace).** All
+  of PaperBoy's text fields and multi-line editors — the request wizard cells,
+  the report source editor, git/save prompts, and so on — gain **Ctrl+Z** to
+  undo (and **Ctrl+Shift+Z** to redo) and **Ctrl+Backspace** to delete the
+  previous word. A run of typing collapses into a single undo step, and
+  Ctrl+Backspace removes a whole `"…"` quoted token in one go, so a quoted
+  request name deletes as a unit. (Implemented in the shared `tui-line-editor`
+  crate, so it applies everywhere consistently.)
+- **Report view: Tab cycles focus across the editor, results and tab bar.**
+  In the report view, **Tab** now rotates focus **editor → results grid → tab
+  list → editor** (Shift+Tab reverses it; the results stop is skipped until the
+  report has been run), so the tab bar is reachable from the keyboard without
+  leaving the report. The focused area is highlighted (and the unfocused body
+  dimmed). The plain **`v`** key still simply flips between the source and the
+  results grid.
+
+### Fixed
+
+- **Ctrl+Backspace (word-delete) now works on terminals without the
+  keyboard-enhancement protocol.** Such terminals report Ctrl+Backspace as a
+  bare **Ctrl+H**, which previously did nothing (or inserted a stray character)
+  in the report editor and other text fields; it is now accepted as an alias for
+  Ctrl+Backspace, so word-delete works everywhere regardless of terminal
+  support.
 
 
 ## [0.1.6] - 2026-07-18

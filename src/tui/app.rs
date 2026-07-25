@@ -765,6 +765,12 @@ pub struct TuiApp {
     /// The one-column scrollbar Rect for each report panel (same indexing as
     /// `report_pane_areas`), for scrollbar click-to-jump / drag-to-scroll.
     pub(crate) report_pane_bars: [Rect; 3],
+    /// In the full-screen report view (view mode, not editing), `true` when the
+    /// *tab bar* is the focused area rather than the report body. `Tab` rotates
+    /// focus Editor → Results → Tab List → Editor; this flag marks the "Tab
+    /// List" stop (so the tab bar is highlighted and the body panels dimmed).
+    /// It is otherwise ignored — the collection view uses `focus` instead.
+    pub(crate) report_tabbar_focus: bool,
     /// Set while dragging a report panel's scrollbar thumb (which panel), so a
     /// `Drag` keeps adjusting its scroll even if the cursor leaves the
     /// one-column track. Cleared on `Up`.
@@ -987,6 +993,7 @@ impl Default for TuiApp {
             scrollbar_drag: None,
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
+            report_tabbar_focus: false,
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),

@@ -419,6 +419,7 @@ strings! {
     help_report_run => "run the report and show its results grid", "exécuter le rapport et afficher sa grille de résultats", "kør rapporten og vis resultatgitteret";
     help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
+    help_report_focus_cycle => "cycle focus: editor → results → tab list → editor", "faire défiler le focus : éditeur → résultats → liste des onglets → éditeur", "skift fokus: editor → resultater → faneliste → editor";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
     help_tab_reports => "Reports", "Rapports", "Rapporter";

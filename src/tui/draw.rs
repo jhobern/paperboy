@@ -334,7 +334,14 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
 }
 
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    let focused = app.focus == Pane::Tabs;
+    // In the report view `focus` is pinned to `Pane::Tabs`, so the tab-bar
+    // highlight follows the report's own focus flag instead: it's lit only when
+    // `Tab` has rotated focus onto the tab list.
+    let focused = if app.active_is_report() {
+        app.report_tabbar_focus
+    } else {
+        app.focus == Pane::Tabs
+    };
     let mk = |label: String, active: bool| -> Span {
         if active {
             Span::styled(
@@ -2052,7 +2059,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("e / Enter", s.help_report_edit),
                             ("r / F5 (report)", s.help_report_run),
                             ("d (report)", s.help_report_dry_run),
-                            ("Tab / v (report)", s.help_report_view),
+                            ("v (report)", s.help_report_view),
+                            ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("x (report)", s.help_report_export),
                             ("c (report)", s.help_report_columns),
                             ("Esc (report)", s.help_report_leave_edit),
@@ -2219,7 +2227,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("e / Enter", s.help_report_edit),
                         ("r / F5", s.help_report_run),
                         ("d", s.help_report_dry_run),
-                        ("Tab / v", s.help_report_view),
+                        ("v", s.help_report_view),
+                        ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("x", s.help_report_export),
                         ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),

@@ -14826,6 +14826,120 @@ fn report_binding_panel_shows_the_base_directory() {
     );
 }
 
+/// Ctrl+Backspace in the report editor deletes the previous word (via the
+/// shared `tui-line-editor`), and Ctrl+Z undoes the deletion.
+#[test]
+fn report_editor_ctrl_backspace_deletes_a_word_and_ctrl_z_undoes() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("REQUEST Oauth");
+    press(&mut app, KeyCode::Char('e')); // enter edit, cursor at end
+    app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "REQUEST ",
+        "Ctrl+Backspace deletes the word to the left"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "REQUEST Oauth",
+        "Ctrl+Z restores the deleted word"
+    );
+}
+
+/// Ctrl+Backspace deletes a whole quoted request name in one step, so a
+/// spaced name doesn't have to be erased word by word.
+#[test]
+fn report_editor_ctrl_backspace_deletes_a_whole_quoted_request_name() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("REPORT REQUEST \"Upload document\"");
+    press(&mut app, KeyCode::Char('e'));
+    app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "REPORT REQUEST ",
+        "the whole \"Upload document\" token is removed at once"
+    );
+}
+
+/// On terminals without the keyboard-enhancement protocol, Ctrl+Backspace
+/// arrives as Ctrl+H; the report editor must still word-delete for it.
+#[test]
+fn report_editor_ctrl_h_deletes_a_word_like_ctrl_backspace() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("REQUEST Oauth");
+    press(&mut app, KeyCode::Char('e')); // enter edit, cursor at end
+    app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "REQUEST ",
+        "Ctrl+H is treated as Ctrl+Backspace (word-delete) on legacy terminals"
+    );
+}
+
+/// Tab in the report view rotates focus editor → tab list → editor when the
+/// report has no results grid yet (the results stop is skipped).
+#[test]
+fn report_tab_cycles_focus_to_the_tab_list_and_back() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    assert!(!app.report_tabbar_focus);
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    press(&mut app, KeyCode::Tab); // Editor -> Tab List (no grid to visit)
+    assert!(app.report_tabbar_focus, "Tab focuses the tab list");
+    press(&mut app, KeyCode::Tab); // Tab List -> Editor
+    assert!(!app.report_tabbar_focus);
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+}
+
+/// With a results grid available, Tab visits it between the editor and the tab
+/// list: editor → results → tab list → editor.
+#[test]
+fn report_tab_focus_cycle_visits_the_results_grid() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner); // lands on the results grid
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+    assert!(!app.report_tabbar_focus);
+
+    press(&mut app, KeyCode::Tab); // Results -> Tab List
+    assert!(app.report_tabbar_focus);
+    press(&mut app, KeyCode::Tab); // Tab List -> Editor (source)
+    assert!(!app.report_tabbar_focus);
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    press(&mut app, KeyCode::Tab); // Editor -> Results
+    assert!(!app.report_tabbar_focus);
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+}
+
 /// Item 10 (rep-tab-arrows): plain Left/Right arrows on the tab bar move across
 /// report tabs, not just collection tabs (Ctrl+Left/Right already did).
 #[test]

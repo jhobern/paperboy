@@ -215,6 +215,7 @@ impl TuiApp {
         self.reports.push(ReportTab::new(report));
         self.active_tab = self.collections.len() + self.reports.len() - 1;
         self.focus = Pane::Tabs;
+        self.report_tabbar_focus = false;
         let idx = self.reports.len() - 1;
         self.revalidate_report(idx);
         self.save_state();
@@ -586,6 +587,7 @@ impl TuiApp {
         if rt.editor.is_none() {
             rt.view = ReportView::Results;
             rt.results_panel.set_scroll(0);
+            self.report_tabbar_focus = false;
         }
         self.status = Some(Status::ReportRunDone { rows, errors });
     }
@@ -606,6 +608,7 @@ impl TuiApp {
                 rt.result = Some(result);
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
+                self.report_tabbar_focus = false;
                 self.status = Some(Status::ReportRunDone { rows, errors });
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
@@ -621,6 +624,50 @@ impl TuiApp {
                 ReportView::Source if rt.result.is_some() => ReportView::Results,
                 _ => ReportView::Source,
             };
+        }
+        // `v` always lands on the body (the tab bar is only reached via `Tab`).
+        self.report_tabbar_focus = false;
+    }
+
+    /// Rotate keyboard focus across the report view's three areas: the source
+    /// editor, the results grid, and the tab bar ("Tab List"). Forward order is
+    /// Editor → Results → Tab List → Editor; `forward == false` reverses it.
+    /// The results stop is skipped when the report hasn't produced a grid yet.
+    /// The body shown (`ReportView`) is kept in step with the focused body area
+    /// so flipping to the grid and back is one continuous cycle; while the tab
+    /// bar is focused the body keeps showing whatever it last did.
+    pub(crate) fn cycle_report_focus(&mut self, forward: bool) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let has_results = self.reports[idx].result.is_some();
+        if self.report_tabbar_focus {
+            // Leaving the tab bar returns to the body: the source when moving
+            // forward (wrapping to Editor), the results when moving back.
+            self.report_tabbar_focus = false;
+            self.reports[idx].view = if forward || !has_results {
+                ReportView::Source
+            } else {
+                ReportView::Results
+            };
+            return;
+        }
+        match self.reports[idx].view {
+            ReportView::Source => {
+                if forward && has_results {
+                    self.reports[idx].view = ReportView::Results;
+                } else {
+                    // Source → Tab List (forward with no grid, or backward).
+                    self.report_tabbar_focus = true;
+                }
+            }
+            ReportView::Results => {
+                if forward {
+                    self.report_tabbar_focus = true;
+                } else {
+                    self.reports[idx].view = ReportView::Source;
+                }
+            }
         }
     }
 
@@ -870,6 +917,8 @@ impl TuiApp {
             let text = self.reports[idx].report.text.clone();
             self.reports[idx].editor = Some(Editor::new(&text, true));
         }
+        // Editing focuses the body, so drop any tab-bar focus.
+        self.report_tabbar_focus = false;
     }
 
     /// Close the active report tab, remembering it for reopen (`u`) and moving
@@ -955,7 +1004,13 @@ impl TuiApp {
             // Column picker: choose/reorder which columns the report outputs.
             KeyCode::Char('c') => self.open_report_columns(),
             // Flip between the source and the last run's results grid.
-            KeyCode::Tab | KeyCode::Char('v') => self.toggle_report_view(),
+            KeyCode::Char('v') => self.toggle_report_view(),
+            // Tab rotates focus across the report's areas — Editor (source) →
+            // Results grid → Tab List (the tab bar) → Editor — so the tab bar
+            // is reachable from the keyboard without leaving the report. Shift+
+            // Tab rotates the other way.
+            KeyCode::Tab => self.cycle_report_focus(true),
+            KeyCode::BackTab => self.cycle_report_focus(false),
             // Export the last run to CSV next to the report.
             KeyCode::Char('x') => self.export_active_report_csv(),
             // Copy the active panel selection (or, with nothing selected, the
@@ -1042,6 +1097,7 @@ impl TuiApp {
                 // Right arrow / Tab at end of a `REQUEST` line fills in the
                 // completion (auto-quoting the name when it contains spaces).
                 KeyCode::Right | KeyCode::Tab if completion.is_some() => {
+                    editor.checkpoint();
                     accept_request_completion(editor, completion.as_ref().unwrap());
                     Some(editor.text())
                 }
@@ -1057,6 +1113,7 @@ impl TuiApp {
                         if opens_block(line) {
                             new_indent.push_str(INDENT_UNIT);
                         }
+                        editor.checkpoint();
                         editor.newline();
                         editor.insert_str(&new_indent);
                         Some(editor.text())
@@ -1929,7 +1986,8 @@ fn draw_report_results(
             }
         }
     };
-    let block = panel(title, true, th);
+    // Dim the grid's border while the tab bar holds focus (Tab-list stop).
+    let block = panel(title, !app.report_tabbar_focus, th);
     let (inner, bar) = draw_report_panel(
         f,
         area,
@@ -2248,7 +2306,9 @@ fn draw_report_source(
         )
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
-    let block = panel(title, true, th);
+    // Dim the source panel's border when the tab bar has focus (Tab-list stop),
+    // so the focused area is unambiguous; editing always keeps it lit.
+    let block = panel(title, editing || !app.report_tabbar_focus, th);
     // Context so the highlighter can colour the `# collection:`/`# environment:`
     // references (and `ENVS` names) by whether they currently resolve. Built
     // before any `&mut app` borrow below.
@@ -2258,6 +2318,16 @@ fn draw_report_source(
             .resolve_bound_collection(&app.reports[idx].report)
             .is_some(),
         loaded_envs: app.global_envs.iter().map(|e| e.name.clone()).collect(),
+        request_names: app
+            .resolve_bound_collection(&app.reports[idx].report)
+            .map(|ci| {
+                app.collections[ci]
+                    .entries
+                    .iter()
+                    .map(|e| e.title.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     if editing {
