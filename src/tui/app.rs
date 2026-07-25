@@ -59,6 +59,24 @@ pub(crate) enum FileAction {
     /// report's name. Replaces the old behaviour of silently writing the CSV
     /// into the process working directory.
     SaveReportCsvChooseFolder,
+    /// Picking a DESTINATION FOLDER for "Save Report Baseline". Confirms like the
+    /// other folder pickers; Enter writes `dir/<name>.baseline` (a JSON snapshot
+    /// of the active report's last run, seeded from the report's name). The
+    /// saved file is referenced by a `# baseline:` header directive so later
+    /// runs diff against it (PaperTrail "Source B" comparison).
+    SaveReportBaselineChooseFolder,
+    /// Loading a PaperTrail `.report` document from a local file into a new
+    /// report tab (see [`crate::report::Report`]). Local-only, so — like
+    /// `LoadRequest` — it skips the local-vs-git source step.
+    OpenReport,
+    /// Writing the active report tab's `.report` source back to its own file
+    /// (the "Save" destination); the target path is the report's remembered
+    /// path (else a "Save As" folder pick precedes it).
+    SaveReport,
+    /// Picking a DESTINATION FOLDER for "Save Report As". Confirms like the
+    /// other folder pickers; Enter writes `dir/<name>.report` (extension added
+    /// when missing), seeded with the report's name.
+    SaveReportChooseFolder,
 }
 
 impl FileAction {
@@ -73,6 +91,8 @@ impl FileAction {
             FileAction::SaveWorkspaceChooseFolder
                 | FileAction::SaveCollectionChooseFolder
                 | FileAction::SaveReportCsvChooseFolder
+                | FileAction::SaveReportBaselineChooseFolder
+                | FileAction::SaveReportChooseFolder
         )
     }
 }
@@ -398,6 +418,11 @@ pub(crate) enum Overlay {
     /// (available columns come from its result). See
     /// [`crate::tui::reports::ColumnPicker`].
     ReportColumns(Box<crate::tui::reports::ColumnPicker>),
+    /// Collection-binding picker for a report tab: a list of the currently-open
+    /// collection tabs; choosing one re-points the report's `# collection:`
+    /// header at it (relative path preferred). Opened with `b` in the Reports
+    /// view. See [`crate::tui::reports::ReportBindPicker`].
+    ReportBind(Box<crate::tui::reports::ReportBindPicker>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -523,6 +548,10 @@ pub(crate) enum FileKind {
     Collection,
     Environment,
     Workspace,
+    /// A PaperTrail `.report` document (see [`crate::report::Report`]). Loaded
+    /// into / saved from a report tab, and — unlike the other kinds — has no
+    /// git destination yet (local only for now; git is a fast-follow).
+    Report,
 }
 
 impl FileKind {
@@ -532,6 +561,7 @@ impl FileKind {
             FileKind::Collection => s.file_kind_collection,
             FileKind::Environment => s.file_kind_environment,
             FileKind::Workspace => s.file_kind_workspace,
+            FileKind::Report => s.file_kind_report,
         }
     }
 }
@@ -543,6 +573,7 @@ pub(crate) fn file_load_kind_index(kind: FileKind) -> usize {
         FileKind::Collection => 1,
         FileKind::Environment => 2,
         FileKind::Workspace => 3,
+        FileKind::Report => 4,
     }
 }
 
@@ -553,26 +584,29 @@ pub(crate) fn file_save_kind_index(kind: FileKind) -> usize {
         FileKind::Collection => 1,
         FileKind::Environment => 2,
         FileKind::Workspace => 3,
+        FileKind::Report => 4,
     }
 }
 
-/// The 4 kinds of the File menu's "Load" submenu.
-pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 4] {
+/// The 5 kinds of the File menu's "Load" submenu.
+pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 5] {
     [
         s.file_load_item_request,
         s.file_load_item_collection,
         s.file_load_item_environment,
         s.file_load_item_workspace,
+        s.file_load_item_report,
     ]
 }
 
-/// The 5 kinds of the File menu's "Save" submenu.
-pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 5] {
+/// The 6 kinds of the File menu's "Save" submenu.
+pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 6] {
     [
         s.file_save_item_request,
         s.file_save_item_collection,
         s.file_save_item_environment,
         s.file_save_item_workspace,
+        s.file_save_item_report,
         s.file_save_item_response,
     ]
 }
@@ -591,6 +625,8 @@ pub(crate) fn file_save_dest_items(kind: FileKind, s: &Strings) -> Vec<&'static 
         FileKind::Collection => vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git],
         FileKind::Environment => vec![s.file_dest_save, s.file_dest_save_as],
         FileKind::Workspace => vec![s.file_dest_save_as, s.file_dest_git],
+        // Reports save locally only for now (git is a fast-follow).
+        FileKind::Report => vec![s.file_dest_save, s.file_dest_save_as],
     }
 }
 
@@ -1678,6 +1714,33 @@ impl TuiApp {
             // destination in `input.rs` (`browser_commit_save`), which writes
             // through `write_active_report_csv`, so this never reaches here.
             FileAction::SaveReportCsvChooseFolder => {}
+            // Like the report-CSV export: the baseline-snapshot save confirms
+            // its destination in `input.rs` (`browser_commit_save`), which
+            // writes through `write_active_report_baseline`, so this never
+            // reaches here.
+            FileAction::SaveReportBaselineChooseFolder => {}
+            FileAction::OpenReport => match crate::report::Report::load_local(path) {
+                Ok(report) => self.open_loaded_report(report),
+                Err(e) => self.status = Some(Status::Error(e)),
+            },
+            FileAction::SaveReport => {
+                let Some(idx) = self.active_report_index() else {
+                    self.status = Some(Status::NotReport);
+                    return;
+                };
+                match self.reports[idx].report.save_local(path) {
+                    Ok(()) => {
+                        self.save_state();
+                        self.status = Some(Status::Saved);
+                    }
+                    Err(e) => self.status = Some(Status::Error(e)),
+                }
+            }
+            // Like the folder pickers above: the report "Save As" destination is
+            // confirmed in `input.rs` (`browser_commit_save`), which routes the
+            // real write through `FileAction::SaveReport`, so this never reaches
+            // here.
+            FileAction::SaveReportChooseFolder => {}
         }
     }
 

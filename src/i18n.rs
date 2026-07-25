@@ -100,6 +100,7 @@ strings! {
     confirm_clear_q => "Close all collections? This removes all tabs and requests.", "Fermer toutes les collections\u{a0}? Cela supprime tous les onglets et requêtes.", "Luk alle samlinger? Dette fjerner alle faner og anmodninger.";
     confirm_save_collection_q => "There are {r} new or modified request entries. Saving will overwrite the original collection file. Proceed?", "Il y a {r} requête(s) nouvelle(s) ou modifiée(s). L'enregistrement écrasera le fichier de collection d'origine. Continuer\u{a0}?", "Der er {r} nye eller ændrede anmodninger. Gemning vil overskrive den oprindelige samlingsfil. Fortsæt?";
     confirm_save_env_q => "There are {e} new or modified environment entries. Saving will overwrite the original environment file. Proceed?", "Il y a {e} variable(s) d'environnement nouvelle(s) ou modifiée(s). L'enregistrement écrasera le fichier d'environnement d'origine. Continuer\u{a0}?", "Der er {e} nye eller ændrede miljøvariabler. Gemning vil overskrive den oprindelige miljøfil. Fortsæt?";
+    confirm_save_report_q => "This report has unsaved edits. Saving will overwrite the original report file. Proceed?", "Ce rapport a des modifications non enregistrées. L'enregistrement écrasera le fichier de rapport d'origine. Continuer\u{a0}?", "Denne rapport har ugemte ændringer. Gemning vil overskrive den oprindelige rapportfil. Fortsæt?";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_yes => "Yes", "Oui", "Ja";
     confirm_no => "No", "Non", "Nej";
@@ -112,6 +113,7 @@ strings! {
     file_kind_collection => "Collection", "Collection", "Samling";
     file_kind_environment => "Environment", "Environnement", "Miljø";
     file_kind_workspace => "Workspace", "Workspace", "Workspace";
+    file_kind_report => "Report", "Rapport", "Rapport";
     file_source_local => "(L)ocal file…", "Fichier (l)ocal…", "(L)okal fil…";
     file_source_git => "From (G)it…", "Depuis (G)it…", "Fra (G)it…";
     file_dest_save => "(S)ave", "(E)nregistrer", "(G)em";
@@ -121,14 +123,18 @@ strings! {
     file_load_item_collection => "(C)ollection…", "(C)ollection…", "(S)amling…";
     file_load_item_environment => "(E)nvironment…", "(E)nvironnement…", "(M)iljø…";
     file_load_item_workspace => "(W)orkspace…", "(W)orkspace…", "(W)orkspace…";
+    file_load_item_report => "Repor(t)…", "Rappor(t)…", "Rappor(t)…";
     file_save_item_request => "(R)equest…", "(R)equête…", "(A)nmodning…";
     file_save_item_collection => "(C)ollection…", "(C)ollection…", "(S)amling…";
     file_save_item_environment => "(E)nvironment…", "(E)nvironnement…", "(M)iljø…";
     file_save_item_workspace => "(W)orkspace…", "(W)orkspace…", "(W)orkspace…";
+    file_save_item_report => "Repor(t)…", "Rappor(t)…", "Rappor(t)…";
     file_save_item_response => "Res(p)onse…", "Ré(p)onse…", "S(v)ar…";
     save_request => "Save Request…", "Enregistrer la requête…", "Gem anmodning…";
     load_request => "Load Request…", "Charger une requête…", "Indlæs anmodning…";
     open_collection => "Load Collection…", "Charger une collection…", "Indlæs samling…";
+    open_report => "Load Report…", "Charger un rapport…", "Indlæs rapport…";
+    save_report_folder => "Save Report — Choose Destination Folder", "Enregistrer le rapport — Choisir le dossier de destination", "Gem rapport — Vælg destinationsmappe";
     save_environment => "Save Environment…", "Enregistrer l'environnement…", "Gem miljø…";
     save_response => "Save Response…", "Enregistrer la réponse…", "Gem svar…";
     file_saved => "Saved.", "Enregistré.", "Gemt.";
@@ -184,6 +190,7 @@ strings! {
     field_body => "Body", "Corps", "Brødtekst";
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
+    field_reports => "Reports", "Rapports", "Rapporter";
     tab_all => "All", "Tout", "Alle";
     hdr_key => "Key", "Clé", "Nøgle";
     hdr_value => "Value", "Valeur", "Værdi";
@@ -205,8 +212,11 @@ strings! {
     add_form_field => "\u{FF0B} Add field", "\u{FF0B} Ajouter un champ", "\u{FF0B} Tilføj felt";
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
+    add_report => "\u{FF0B} Add report field", "\u{FF0B} Ajouter un champ de rapport", "\u{FF0B} Tilføj rapportfelt";
     cap_name => "Name", "Nom", "Navn";
     cap_expr => "Expression", "Expression", "Udtryk";
+    report_name => "Name", "Nom", "Navn";
+    report_expr => "Expression", "Expression", "Udtryk";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
@@ -421,7 +431,9 @@ strings! {
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
     help_report_focus_cycle => "cycle focus: editor → results → tab list → editor", "faire défiler le focus : éditeur → résultats → liste des onglets → éditeur", "skift fokus: editor → resultater → faneliste → editor";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
+    help_report_baseline => "save the last run as a .baseline snapshot to compare future runs against", "enregistrer la dernière exécution comme instantané .baseline pour comparer les exécutions futures", "gem den seneste kørsel som et .baseline-øjebliksbillede at sammenligne fremtidige kørsler med";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
+    help_report_bind => "bind the report to one of the open collections", "lier le rapport à l'une des collections ouvertes", "bind rapporten til en af de åbne samlinger";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
     help_reports_about_1 => "A report is a saved flow that drives a bound collection against ranges of files or environments and collects the results into a table.", "Un rapport est un flux enregistré qui exécute une collection liée sur des ensembles de fichiers ou d'environnements et rassemble les résultats dans un tableau.", "En rapport er et gemt flow, der kører en bundet samling mod intervaller af filer eller miljøer og samler resultaterne i en tabel.";
@@ -462,6 +474,8 @@ strings! {
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
+    status_not_report => "The active tab is not a report.", "L'onglet actif n'est pas un rapport.", "Den aktive fane er ikke en rapport.";
+    report_bound_status => "Report bound to", "Rapport lié à", "Rapport bundet til";
     report_tab_icon => "▤ ", "▤ ", "▤ ";
     report_source_heading => "Report Source", "Source du rapport", "Rapportkilde";
     report_validation_heading => "Validation", "Validation", "Validering";
@@ -480,18 +494,22 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Tab source · x csv", "Tab source · x csv", "Tab kilde · x csv";
+    report_hint_results => "Tab source · x csv · B baseline", "Tab source · x csv · B référence", "Tab kilde · x csv · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
     report_run_has_errors => "Fix the validation errors before running.", "Corrigez les erreurs de validation avant l'exécution.", "Ret valideringsfejlene før kørsel.";
     report_export_no_result => "Run the report before exporting.", "Exécutez le rapport avant l'exportation.", "Kør rapporten før eksport.";
     report_export_csv_folder => "Export Report CSV — Choose Destination Folder", "Exporter le CSV du rapport — Choisir le dossier de destination", "Eksportér rapport-CSV — Vælg destinationsmappe";
+    report_save_baseline_folder => "Save Report Baseline — Choose Destination Folder", "Enregistrer la référence du rapport — Choisir le dossier de destination", "Gem rapport-basislinje — Vælg destinationsmappe";
     report_run_complete => "Report run complete:", "Exécution du rapport terminée :", "Rapportkørsel fuldført:";
     report_status_rows => "rows", "lignes", "rækker";
     report_status_errors => "errors", "erreurs", "fejl";
     report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
+    report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
+    report_baseline_no_result => "Run the report before saving a baseline.", "Exécutez le rapport avant d'enregistrer une référence.", "Kør rapporten før du gemmer en basislinje.";
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
+    report_hint_bind => "b bind", "b lier", "b bind";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
     report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";
@@ -506,6 +524,10 @@ strings! {
     report_columns_need_run => "Run the report first so its columns are known", "Exécutez d'abord le rapport pour connaître ses colonnes", "Kør rapporten først, så dens kolonner kendes";
     report_columns_none_selected => "Select at least one column", "Sélectionnez au moins une colonne", "Vælg mindst én kolonne";
     report_columns_applied => "Columns updated", "Colonnes mises à jour", "Kolonner opdateret";
+    report_bind_title => "Bind Collection", "Lier la collection", "Bind samling";
+    report_bind_hint => "↑/↓ select · Enter bind · Esc cancel", "↑/↓ sélectionner · Entrée lier · Échap annuler", "↑/↓ vælg · Enter bind · Esc annuller";
+    report_bind_unsaved => "(unsaved)", "(non enregistré)", "(ikke gemt)";
+    report_bind_no_collections => "Open a collection tab first, then bind the report to it", "Ouvrez d'abord un onglet de collection, puis liez-y le rapport", "Åbn først en samlingsfane, og bind derefter rapporten til den";
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
@@ -522,6 +544,14 @@ pub enum Status {
     NoResponse,
     NotCollection,
     NotEnvironment,
+    /// The active tab isn't a report, so a report-only action (Save Report,
+    /// BIND) can't proceed.
+    NotReport,
+    /// A report was (re)bound to a loaded collection; holds the collection's
+    /// display name.
+    ReportBound(String),
+    /// BIND was invoked with no collections open (nothing to bind to).
+    ReportBindNoCollections,
     /// Text was copied to the clipboard (a selection or a whole-panel copy).
     Copied,
     /// The active collection has no remembered git origin, so "Save to Git"
@@ -629,6 +659,8 @@ pub enum Status {
     ReportRunBlocked(String),
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
+    /// A report's last run was saved as a `.baseline` snapshot; holds its path.
+    ReportBaselineSaved(String),
     /// The column picker was opened without a prior run (columns unknown).
     ReportColumnsNeedRun,
     /// The column picker was applied with nothing selected.
@@ -666,7 +698,9 @@ impl Status {
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
                     | Status::ReportExported(_)
+                    | Status::ReportBaselineSaved(_)
                     | Status::ReportColumnsApplied
+                    | Status::ReportBound(_)
             ),
         }
     }
@@ -681,6 +715,9 @@ impl Status {
             Status::NoResponse => s.file_no_response.to_string(),
             Status::NotCollection => s.file_not_collection.to_string(),
             Status::NotEnvironment => s.file_not_environment.to_string(),
+            Status::NotReport => s.status_not_report.to_string(),
+            Status::ReportBound(name) => format!("{} {name}", s.report_bound_status),
+            Status::ReportBindNoCollections => s.report_bind_no_collections.to_string(),
             Status::NoGitOrigin => s.git_no_origin.to_string(),
             Status::GitSaved => s.git_save_success.to_string(),
             Status::WaitingSecrets(keys) => {
@@ -753,6 +790,9 @@ impl Status {
             }
             Status::ReportRunBlocked(reason) => reason.clone(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
+            Status::ReportBaselineSaved(path) => {
+                format!("{} {path}", s.report_baseline_saved_prefix)
+            }
             Status::ReportColumnsNeedRun => s.report_columns_need_run.to_string(),
             Status::ReportColumnsNoneSelected => s.report_columns_none_selected.to_string(),
             Status::ReportColumnsApplied => s.report_columns_applied.to_string(),

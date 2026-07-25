@@ -2276,6 +2276,7 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             file_save_dest_items(FileKind::Collection, &s),
             file_save_dest_items(FileKind::Environment, &s),
             file_save_dest_items(FileKind::Workspace, &s),
+            file_save_dest_items(FileKind::Report, &s),
         ] {
             let mnemonics: Vec<char> = items
                 .iter()
@@ -2604,9 +2605,10 @@ fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
 
-    // The Load kind list is now just the four kinds (no per-kind git twin).
+    // The Load kind list now has five kinds (Request, Collection, Environment,
+    // Workspace, Report); Workspace stays at row 3.
     let items = file_load_items(&s);
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
     assert_eq!(file_load_kind_index(FileKind::Workspace), 3);
 
     // Picking Workspace opens the local-vs-git source step…
@@ -9696,7 +9698,7 @@ fn wizard_tab_bar_renders_every_section_label() {
         .unwrap();
     let out = buffer_text(term.backend().buffer());
     for label in [
-        "All", "Headers", "Cookies", "Form", "Body", "Asserts", "Captures",
+        "All", "Headers", "Cookies", "Form", "Body", "Asserts", "Captures", "Reports",
     ] {
         assert!(out.contains(label), "tab bar should show '{label}':\n{out}");
     }
@@ -10179,9 +10181,21 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         "captures start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddReport,
+        "reports start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(new_focus(&app), NewField::Name, "wraps back to the top");
 
     // And Ctrl+Up walks the same chain backward.
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddReport,
+        "reports start empty, so the entry point is the Add row"
+    );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
@@ -15420,6 +15434,105 @@ fn report_export_without_a_run_is_blocked() {
     ));
 }
 
+/// Saving a baseline (Shift+B in the results view) routes through the folder
+/// picker and writes a `.baseline` JSON snapshot of the last run that reloads
+/// via [`Baseline::load`], so a later `# baseline:` run can diff against it.
+#[test]
+fn report_baseline_save_writes_a_snapshot_next_to_the_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-baseline-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.report");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // The `B` key opens the baseline folder picker (seeded `<report>.baseline`).
+    app.save_active_report_baseline();
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(
+                FileAction::SaveReportBaselineChooseFolder,
+                _
+            ))
+        ),
+        "save-baseline should open the baseline folder picker"
+    );
+    assert_eq!(app.default_report_baseline_filename(), "smoke.baseline");
+    app.overlay = None;
+    app.browser_commit_save(
+        FileAction::SaveReportBaselineChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
+
+    let snap_path = report_path.with_extension("baseline");
+    let baseline = crate::report::Baseline::load(&snap_path).expect("snapshot reloads");
+    assert_eq!(baseline.rows.len(), 1);
+    assert_eq!(
+        baseline.rows[0].cells.get("Oauth.HttpStatus"),
+        Some(&"200".to_string())
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportBaselineSaved(_))
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Saving a baseline before a run reports why nothing can be written and does
+/// NOT open the folder picker.
+#[test]
+fn report_baseline_save_without_a_run_is_blocked() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    app.save_active_report_baseline();
+    assert!(app.overlay.is_none(), "no run yet → no folder picker");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportRunBlocked(_))
+    ));
+}
+
 /// The results grid draws a bold header row (in the accent colour) after a run.
 #[test]
 fn report_results_grid_draws_a_header_row() {
@@ -15961,5 +16074,454 @@ fn without_environment_header_the_active_env_is_used() {
         result.rows[0].vars.get("REGION"),
         Some(&"active".to_string()),
         "with no '# environment:' the active env supplies the base vars"
+    );
+}
+
+// ---- P8: .report file load/save via the File menu + BIND ----
+
+/// A helper temp dir unique to each P8 test.
+fn p8_temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-p8-{tag}-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn file_load_report_item_opens_the_local_browser() {
+    let mut app = TuiApp::default();
+    // Row 4 of the Load kind list is the new "Report" item; it is local-only,
+    // so it skips the source step and opens the file browser directly.
+    app.activate_file_load_item(4);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Browser(FileAction::OpenReport, _))
+    ));
+}
+
+#[test]
+fn file_save_report_item_opens_the_report_destination_step() {
+    let mut app = TuiApp::default();
+    app.activate_file_save_item(4);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::FileSaveDest(FileKind::Report, 0))
+    ));
+}
+
+#[test]
+fn report_save_dest_items_are_local_only() {
+    use crate::i18n::Strings;
+    let s = Strings::for_language(&Language::English);
+    let items = file_save_dest_items(FileKind::Report, &s);
+    assert_eq!(items, vec![s.file_dest_save, s.file_dest_save_as]);
+    assert_eq!(file_save_kind_index(FileKind::Report), 4);
+}
+
+#[test]
+fn report_load_opens_a_new_tab_from_a_report_file() {
+    let dir = p8_temp_dir("load");
+    let path = dir.join("smoke.report");
+    std::fs::write(
+        &path,
+        "# name: Nightly\n# collection: api.hurl\nREQUEST Oauth\n",
+    )
+    .unwrap();
+
+    let mut app = TuiApp::default();
+    let before = app.reports.len();
+    app.do_file_action(FileAction::OpenReport, &path.to_string_lossy());
+
+    assert_eq!(app.reports.len(), before + 1);
+    let idx = app
+        .active_report_index()
+        .expect("active is the loaded report");
+    assert_eq!(app.reports[idx].report.name, "Nightly");
+    assert_eq!(
+        app.reports[idx].report.path.as_deref(),
+        Some(path.as_path())
+    );
+    assert!(!app.reports[idx].report.dirty);
+    assert!(matches!(app.status, Some(crate::i18n::Status::Loaded)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn report_save_as_writes_a_report_file_via_the_folder_picker() {
+    let dir = p8_temp_dir("saveas");
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api.hurl\nREQUEST Oauth\n");
+
+    // "Save Report As" opens the destination-folder browser (like collections).
+    app.begin_save_as(FileAction::SaveReport);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Browser(FileAction::SaveReportChooseFolder, _))
+    ));
+    app.overlay = None;
+
+    // Committing the folder pick writes `<dir>/nightly.report` and records it.
+    app.browser_commit_save(
+        FileAction::SaveReportChooseFolder,
+        dir.clone(),
+        "nightly".to_string(),
+    );
+    let path = dir.join("nightly.report");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("REQUEST Oauth"));
+
+    let idx = app.active_report_index().unwrap();
+    assert_eq!(
+        app.reports[idx].report.path.as_deref(),
+        Some(path.as_path())
+    );
+    assert!(!app.reports[idx].report.dirty, "save clears dirty");
+    assert!(matches!(app.status, Some(crate::i18n::Status::Saved)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn report_save_writes_back_and_clears_dirty() {
+    let dir = p8_temp_dir("save");
+    let path = dir.join("smoke.report");
+    std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
+
+    let mut app = TuiApp::default();
+    app.do_file_action(FileAction::OpenReport, &path.to_string_lossy());
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api.hurl\nREQUEST Oauth\nREQUEST Logout\n");
+    assert!(app.reports[idx].report.dirty);
+
+    app.do_file_action(FileAction::SaveReport, &path.to_string_lossy());
+    assert!(!app.reports[idx].report.dirty);
+    assert!(std::fs::read_to_string(&path).unwrap().contains("Logout"));
+    assert!(matches!(app.status, Some(crate::i18n::Status::Saved)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn report_save_on_a_dirty_report_confirms_overwrite() {
+    let dir = p8_temp_dir("saveconfirm");
+    let path = dir.join("smoke.report");
+    std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
+
+    let mut app = TuiApp::default();
+    app.do_file_action(FileAction::OpenReport, &path.to_string_lossy());
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api.hurl\nREQUEST Changed\n");
+
+    // A dirty report asks before overwriting the original file.
+    app.begin_save(FileAction::SaveReport);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Confirm {
+            action: ConfirmAction::Save(FileAction::SaveReport),
+            ..
+        })
+    ));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn report_save_without_a_path_falls_back_to_save_as() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    // A never-saved (scratch) report has no path, so "Save" becomes "Save As".
+    app.begin_save(FileAction::SaveReport);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Browser(FileAction::SaveReportChooseFolder, _))
+    ));
+}
+
+#[test]
+fn report_bind_repoints_the_collection_header_by_name() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "payments".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection:\nREQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    app.open_report_bind();
+    let Some(Overlay::ReportBind(mut picker)) = app.overlay.take() else {
+        panic!("bind picker should open");
+    };
+    picker.selected = picker
+        .options
+        .iter()
+        .position(|o| o.name == "payments")
+        .unwrap();
+    app.report_bind_key_handler(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), picker);
+
+    let idx = app.active_report_index().unwrap();
+    // A path-less (scratch) collection binds by name so name-based resolution
+    // still finds it.
+    assert_eq!(
+        app.reports[idx].report.collection_ref(),
+        Some("payments".to_string())
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportBound(_))
+    ));
+    // And the report now resolves to that collection.
+    assert!(
+        app.resolve_bound_collection(&app.reports[idx].report)
+            .is_some()
+    );
+}
+
+#[test]
+fn report_bind_prefers_a_relative_path() {
+    let dir = p8_temp_dir("bindrel");
+    let col_path = dir.join("api.hurl");
+    std::fs::write(&col_path, "GET http://example/oauth\n").unwrap();
+    let report_path = dir.join("smoke.report");
+    std::fs::write(&report_path, "# collection:\n").unwrap();
+
+    let mut app = TuiApp::default();
+    let mut col = Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    );
+    col.path = Some(col_path.clone());
+    app.collections.push(col);
+
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx]
+        .report
+        .set_text("# collection:\nREQUEST Oauth\n");
+
+    app.open_report_bind();
+    let Some(Overlay::ReportBind(mut picker)) = app.overlay.take() else {
+        panic!("bind picker should open");
+    };
+    picker.selected = picker.options.iter().position(|o| o.name == "api").unwrap();
+    app.report_bind_key_handler(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), picker);
+
+    let idx = app.active_report_index().unwrap();
+    // Same directory → the stored ref is just the collection's file name.
+    assert_eq!(
+        app.reports[idx].report.collection_ref(),
+        Some("api.hurl".to_string())
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn report_bind_without_collections_is_blocked() {
+    let mut app = TuiApp::default();
+    app.collections.clear();
+    app.new_report_tab();
+    app.open_report_bind();
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportBindNoCollections)
+    ));
+    assert!(app.overlay.is_none());
+}
+
+// ---- P1b: [Reports] section authoring in the request wizard ----
+
+#[test]
+fn a_new_request_starts_with_no_report_rows() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    assert!(
+        form_ref(&app).reports.is_empty(),
+        "no default blank report row"
+    );
+}
+
+#[test]
+fn tab_reaches_the_reports_section_after_captures() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // Name -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddFormField
+    press(&mut app, KeyCode::Tab); // -> Body
+    press(&mut app, KeyCode::Tab); // -> AddAssert
+    press(&mut app, KeyCode::Tab); // -> AddCapture
+    press(&mut app, KeyCode::Tab); // -> AddReport
+    assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::Tab); // wraps back to Name
+    assert_eq!(new_focus(&app), NewField::Name);
+    press(&mut app, KeyCode::BackTab); // Shift+Tab returns to AddReport
+    assert_eq!(new_focus(&app), NewField::AddReport);
+}
+
+#[test]
+fn alt_8_jumps_to_the_reports_section() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    app.on_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::ALT));
+    assert_eq!(new_focus(&app), NewField::AddReport);
+}
+
+#[test]
+fn pagedown_cycles_to_the_reports_tab() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..8 {
+        press(&mut app, KeyCode::PageDown);
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
+    assert_eq!(new_focus(&app), NewField::AddReport);
+}
+
+#[test]
+fn creating_a_request_with_a_report_field_via_the_table() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    for ch in "http://h/x".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddFormField
+    press(&mut app, KeyCode::Tab); // -> Body
+    press(&mut app, KeyCode::Tab); // -> AddAssert
+    press(&mut app, KeyCode::Tab); // -> AddCapture
+    press(&mut app, KeyCode::Tab); // -> AddReport
+    press(&mut app, KeyCode::Enter); // -> Report(0, Name)
+    for ch in "status".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> Report(0, Expr)
+    for ch in "jsonpath \"$.status\"".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let e = &app.collections[0].entries;
+    assert_eq!(e.len(), 1);
+    assert_eq!(
+        e[0].reports,
+        vec![("status".to_string(), "jsonpath \"$.status\"".to_string())]
+    );
+}
+
+#[test]
+fn deleting_the_last_report_row_leaves_the_section_empty() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..8 {
+        press(&mut app, KeyCode::PageDown); // -> Reports
+    }
+    assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::Enter); // adds a blank row
+    assert_eq!(new_focus(&app), NewField::Report(0, CapCol::Name));
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddReport,
+        "back to empty, not re-seeded"
+    );
+    assert!(form_ref(&app).reports.is_empty());
+}
+
+#[test]
+fn editing_a_request_populates_and_renders_the_reports_section() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.reports = vec![(
+        "overall".to_string(),
+        "jsonpath \"$.overall_result\"".to_string(),
+    )];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+
+    // The data is populated from entry.reports.
+    {
+        let form = form_ref(&app);
+        assert_eq!(form.reports.len(), 1);
+        assert_eq!(form.reports[0].name.text(), "overall");
+        assert_eq!(form.reports[0].expr.text(), "jsonpath \"$.overall_result\"");
+    }
+
+    // Switch to the Reports section tab (full-body) and confirm it renders.
+    for _ in 0..8 {
+        press(&mut app, KeyCode::PageDown);
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
+    let form = form_ref(&app);
+    let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    term.draw(|f| super::new_request::draw_new_request(f, form, &s, &th, true))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("overall") && out.contains("overall_result"),
+        "the report row should render:\n{out}"
+    );
+}
+
+#[test]
+fn report_fields_survive_an_edit_that_changes_nothing_else() {
+    // Editing a request and pressing Ctrl+Enter without touching the Reports
+    // section must preserve its rows (they participate in the change check and
+    // the write-back).
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.reports = vec![("status".to_string(), "jsonpath \"$.status\"".to_string())];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)); // commit unchanged
+
+    let e = &app.collections[0].entries;
+    assert_eq!(
+        e[0].reports,
+        vec![("status".to_string(), "jsonpath \"$.status\"".to_string())]
     );
 }

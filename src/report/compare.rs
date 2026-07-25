@@ -169,7 +169,7 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
 /// Compare `cand` against its `baseline`, returning the `Result` cell: a
 /// `field: base→cand` summary of every differing compared field (joined by
 /// `; `), [`MATCH`] when all agree, or [`NO_BASELINE`] when there is no baseline.
-fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
+pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
     let Some(base) = baseline else {
         return NO_BASELINE.to_string();
     };
@@ -194,7 +194,7 @@ fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
 /// any reported request that declared *no* fields (so a field-less `REPORT
 /// REQUEST` still contributes its body to the diff). Returned in a stable order
 /// so the `Result` summary is deterministic.
-fn comparable_keys(a: &ReportRow, b: &ReportRow) -> Vec<String> {
+pub(super) fn comparable_keys(a: &ReportRow, b: &ReportRow) -> Vec<String> {
     let mut fields: BTreeSet<String> = BTreeSet::new();
     let mut aliases_with_fields: HashSet<String> = HashSet::new();
     let mut responses: BTreeSet<String> = BTreeSet::new();

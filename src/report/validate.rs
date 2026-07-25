@@ -98,6 +98,18 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         }
     }
 
+    // A `# baseline:` snapshot diff and a live `ENVS BASELINE/COMPARISON`
+    // clause both fill the `Result` column; the live comparison takes
+    // precedence (see `run::run_flow`), so flag the directive as ignored rather
+    // than let it silently do nothing.
+    if flow.header.baseline().is_some_and(|b| !b.trim().is_empty())
+        && super::compare::comparison_roles(flow).is_some()
+    {
+        diags.push(Diagnostic::warning(
+            "'# baseline:' is ignored because the flow already has an ENVS BASELINE/COMPARISON comparison",
+        ));
+    }
+
     if ctx.request_titles.is_none() {
         diags.push(Diagnostic::warning(
             "collection not loaded — request names can't be validated until it's bound",
@@ -660,6 +672,47 @@ mod tests {
             None,
             "at most one BASELINE"
         ));
+    }
+
+    #[test]
+    fn baseline_directive_with_envs_comparison_warns_it_is_ignored() {
+        // Both a `# baseline:` snapshot diff and a live ENVS comparison target
+        // the `Result` column; the live comparison wins, so the directive is
+        // flagged as ignored rather than silently doing nothing.
+        let t = titles();
+        let warns: Vec<String> = diags_for(
+            "# collection: ./c.hurl\n# baseline: prev.baseline\nFOR T IN ENVS BASELINE(\"a\"), COMPARISON(\"b\")\n  REQUEST Oauth\nEND\n",
+            Some(&t),
+            None,
+        )
+        .into_iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .map(|d| d.message)
+        .collect();
+        assert!(
+            warns.iter().any(|m| m.contains("'# baseline:' is ignored")),
+            "expected the ignored-baseline warning: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn baseline_directive_without_envs_comparison_does_not_warn() {
+        // A plain snapshot diff (no ENVS roles) is the normal Source-B path — no
+        // warning.
+        let t = titles();
+        let warns: Vec<String> = diags_for(
+            "# collection: ./c.hurl\n# baseline: prev.baseline\nREPORT REQUEST Oauth\n",
+            Some(&t),
+            None,
+        )
+        .into_iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .map(|d| d.message)
+        .collect();
+        assert!(
+            !warns.iter().any(|m| m.contains("'# baseline:'")),
+            "a plain baseline diff should not warn: {warns:?}"
+        );
     }
 
     #[test]

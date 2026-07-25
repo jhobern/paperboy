@@ -182,6 +182,24 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     // model, so the CSV writer and the TUI grid both pick it up unchanged.
     if let Some(roles) = super::compare::comparison_roles(flow) {
         super::compare::apply(&mut result, &roles);
+    } else if let Some(rel) = flow
+        .header
+        .baseline()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        // No live ENVS comparison, but the report references a saved snapshot
+        // (`# baseline:`): diff the run against it (PaperTrail "Source B"). The
+        // path resolves like producer paths — relative to `# root:`/the report
+        // dir. A missing/invalid snapshot is a non-fatal run error (rows still
+        // produced, just without a `Result` verdict).
+        let path = super::producers::resolve_path(ctx.root.as_deref(), rel);
+        match super::baseline::Baseline::load(&path) {
+            Ok(baseline) => super::baseline::apply(&mut result, &baseline),
+            Err(e) => result
+                .errors
+                .push(format!("baseline {}: {e}", path.display())),
+        }
     }
     result
 }
@@ -1785,6 +1803,156 @@ mod tests {
         assert_eq!(
             res.column_order.first(),
             Some(&crate::report::compare::RESULT_COLUMN.to_string())
+        );
+    }
+
+    #[test]
+    fn baseline_directive_diffs_run_against_saved_snapshot() {
+        use crate::report::baseline::Baseline;
+        use crate::report::compare::RESULT_COLUMN;
+
+        // A per-run runner whose reported `overall` field comes from a variable,
+        // so we can save a first run as a snapshot then re-run with a different
+        // value and see the `# baseline:` directive produce a `Result` diff.
+        struct Echo;
+        impl EntryRunner for Echo {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let v = vars.get("VERDICT").cloned().unwrap_or_default();
+                let body = format!("{{\"overall\":\"{v}\"}}");
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: body.clone(),
+                        raw_body: body,
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+
+        let dir = tmpdir("baseline");
+        let entries = [entry("proc", &[])];
+        let flow_src = "FOR FILE IN [\"a\", \"b\"]\n    REPORT REQUEST proc WITH\n        overall: jsonpath \"$.overall\"\n    END\nEND\n";
+        let flow = parse_flow(flow_src).unwrap();
+
+        // First run (VERDICT=CLEAR) → save as a `.baseline` snapshot.
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
+                .into_iter()
+                .collect(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &Echo,
+        };
+        let first = run_flow(&flow, &ctx);
+        let snap_path = dir.join("proc.baseline");
+        Baseline::from_result(&first).save(&snap_path).unwrap();
+
+        // Second run (VERDICT=REVIEW) with a `# baseline:` directive pointing at
+        // the snapshot — file "a" matches the key, "b" diffs the field.
+        let flow2 = parse_flow(&format!("# baseline: proc.baseline\n{flow_src}")).unwrap();
+        let ctx2 = RunContext {
+            entries: &entries,
+            base_vars: [("VERDICT".to_string(), "REVIEW".to_string())]
+                .into_iter()
+                .collect(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &Echo,
+        };
+        let second = run_flow(&flow2, &ctx2);
+
+        assert_eq!(
+            second.column_order.first(),
+            Some(&RESULT_COLUMN.to_string()),
+            "Result column surfaced"
+        );
+        assert_eq!(second.rows.len(), 2);
+        for r in &second.rows {
+            assert_eq!(
+                r.cells.get(RESULT_COLUMN),
+                Some(&"overall: CLEAR→REVIEW".to_string()),
+                "every row differs from its snapshot sibling"
+            );
+        }
+        assert!(second.errors.is_empty(), "no baseline load error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_directive_matches_when_unchanged() {
+        use crate::report::baseline::Baseline;
+        use crate::report::compare::{MATCH, RESULT_COLUMN};
+
+        let dir = tmpdir("baseline_match");
+        let fake = Fake::new(&[(
+            "proc",
+            Canned {
+                status: 200,
+                raw_body: "{\"overall\":\"CLEAR\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("proc", &[])];
+        let flow_src = "FOR FILE IN [\"a\"]\n    REPORT REQUEST proc WITH\n        overall: jsonpath \"$.overall\"\n    END\nEND\n";
+
+        let flow = parse_flow(flow_src).unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+        };
+        let first = run_flow(&flow, &ctx);
+        let snap_path = dir.join("proc.baseline");
+        Baseline::from_result(&first).save(&snap_path).unwrap();
+
+        let flow2 = parse_flow(&format!("# baseline: proc.baseline\n{flow_src}")).unwrap();
+        let second = run_flow(&flow2, &ctx);
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(
+            second.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_directive_missing_file_is_a_run_error() {
+        let fake = Fake::new(&[(
+            "proc",
+            Canned {
+                status: 200,
+                raw_body: "{}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("proc", &[])];
+        let flow = parse_flow("# baseline: nope.baseline\nREPORT REQUEST proc\n").unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(std::env::temp_dir()),
+            runner: &fake,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(res.rows.len(), 1, "rows still produced");
+        assert!(
+            res.errors.iter().any(|e| e.starts_with("baseline ")),
+            "missing snapshot recorded as a run error: {:?}",
+            res.errors
         );
     }
 

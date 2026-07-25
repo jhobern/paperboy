@@ -13,6 +13,7 @@
 //! - [`parser`]: PaperTrail text → [`ReportFlow`].
 //! - [`validate`]: static checks over a flow (+ bound collection / loaded envs).
 
+pub mod baseline;
 pub mod compare;
 pub mod flow;
 pub mod model;
@@ -28,6 +29,7 @@ pub mod run;
 pub mod validate;
 pub mod writer;
 
+pub use baseline::Baseline;
 pub use compare::RESULT_COLUMN;
 pub use flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, Pattern, Producer, ReportFlow,

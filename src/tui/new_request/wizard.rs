@@ -282,6 +282,36 @@ impl AssertRow {
     }
 }
 
+/// One editable `[Reports]` row: `name: <hurl query>`, identical in shape to a
+/// [`CaptureRow`] (it reuses [`CapCol`] for its two columns). Where a capture
+/// binds a variable for later requests, a report field's query is evaluated
+/// against the response purely to pull a value into the generated report. A
+/// request with no `[Reports]` rows contributes its whole response instead.
+pub(crate) struct ReportRow {
+    pub(crate) name: Editor,
+    pub(crate) expr: Editor,
+}
+
+impl ReportRow {
+    pub(crate) fn new() -> Self {
+        Self {
+            name: Editor::blank(),
+            expr: Editor::blank(),
+        }
+    }
+
+    pub(crate) fn is_blank(&self) -> bool {
+        self.name.text().is_empty() && self.expr.text().is_empty()
+    }
+
+    pub(crate) fn cell_mut(&mut self, col: CapCol) -> &mut Editor {
+        match col {
+            CapCol::Name => &mut self.name,
+            CapCol::Expr => &mut self.expr,
+        }
+    }
+}
+
 /// Which field of the New/Edit Request form is focused.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum NewField {
@@ -301,6 +331,10 @@ pub(crate) enum NewField {
     AddAssert,
     Capture(usize, CapCol),
     AddCapture,
+    /// A focused cell of a `[Reports]` row (name or expression column).
+    Report(usize, CapCol),
+    /// The "+ Add report field" row of the `[Reports]` section.
+    AddReport,
 }
 
 impl NewField {
@@ -317,6 +351,7 @@ impl NewField {
             NewField::Body => Some(WizardTab::Body),
             NewField::Assert(..) | NewField::AddAssert => Some(WizardTab::Asserts),
             NewField::Capture(..) | NewField::AddCapture => Some(WizardTab::Captures),
+            NewField::Report(..) | NewField::AddReport => Some(WizardTab::Reports),
         }
     }
 }
@@ -336,12 +371,13 @@ pub(crate) enum WizardTab {
     Body,
     Asserts,
     Captures,
+    Reports,
 }
 
 impl WizardTab {
     /// All tabs, in their default display order — used to initialize a
     /// fresh `NewReq::tab_order` (which the user may subsequently reorder).
-    pub(crate) const ALL: [WizardTab; 8] = [
+    pub(crate) const ALL: [WizardTab; 9] = [
         WizardTab::All,
         WizardTab::Headers,
         WizardTab::Cookies,
@@ -350,6 +386,7 @@ impl WizardTab {
         WizardTab::Body,
         WizardTab::Asserts,
         WizardTab::Captures,
+        WizardTab::Reports,
     ];
 
     pub(crate) fn label(self, s: &Strings) -> &'static str {
@@ -362,6 +399,7 @@ impl WizardTab {
             WizardTab::Body => s.field_body,
             WizardTab::Asserts => s.field_asserts,
             WizardTab::Captures => s.field_captures,
+            WizardTab::Reports => s.field_reports,
         }
     }
 
@@ -381,6 +419,7 @@ impl WizardTab {
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::Assert(0),
             WizardTab::Captures => NewField::Capture(0, CapCol::Name),
+            WizardTab::Reports => NewField::Report(0, CapCol::Name),
         }
     }
 
@@ -396,6 +435,7 @@ impl WizardTab {
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::AddAssert,
             WizardTab::Captures => NewField::AddCapture,
+            WizardTab::Reports => NewField::AddReport,
         }
     }
 }
@@ -411,6 +451,7 @@ pub(crate) struct NewReq {
     pub(crate) body: Editor,
     pub(crate) asserts: Vec<AssertRow>,
     pub(crate) captures: Vec<CaptureRow>,
+    pub(crate) reports: Vec<ReportRow>,
     pub(crate) method_idx: usize,
     pub(crate) focus: NewField,
     /// Target collection tab (index) the request will be added to, and the
@@ -461,6 +502,7 @@ pub(crate) struct NewReq {
     pub(crate) form_scroll: std::cell::Cell<usize>,
     pub(crate) assert_scroll: std::cell::Cell<usize>,
     pub(crate) capture_scroll: std::cell::Cell<usize>,
+    pub(crate) report_scroll: std::cell::Cell<usize>,
     /// Directory Form file paths are resolved against for the existence check
     /// (the saved collection's own directory, per Hurl's "relative to the
     /// input Hurl file" rule); `None` (Scratch Space, unsaved) resolves
@@ -500,6 +542,7 @@ impl NewReq {
             body: Editor::new("", true),
             asserts: Vec::new(),
             captures: Vec::new(),
+            reports: Vec::new(),
             method_idx: 0,
             focus: NewField::Name,
             target_idx: target_idx.min(target_names.len().saturating_sub(1)),
@@ -519,6 +562,7 @@ impl NewReq {
             form_scroll: std::cell::Cell::new(0),
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
+            report_scroll: std::cell::Cell::new(0),
             file_root,
             editing: None,
             view_tab: WizardTab::All,
@@ -596,6 +640,16 @@ impl NewReq {
                 row
             })
             .collect();
+        let reports = entry
+            .reports
+            .iter()
+            .map(|(n, e)| {
+                let mut row = ReportRow::new();
+                row.name = Editor::new(n, false);
+                row.expr = Editor::new(e, false);
+                row
+            })
+            .collect();
         Self {
             name: Editor::new(&entry.title, false),
             url: Editor::new(&entry.url, false),
@@ -606,6 +660,7 @@ impl NewReq {
             body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
             asserts,
             captures,
+            reports,
             method_idx,
             focus: NewField::Name,
             target_idx: ci.min(target_names.len().saturating_sub(1)),
@@ -625,6 +680,7 @@ impl NewReq {
             form_scroll: std::cell::Cell::new(0),
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
+            report_scroll: std::cell::Cell::new(0),
             file_root,
             editing: Some((ci, ei)),
             view_tab: WizardTab::All,
@@ -853,6 +909,7 @@ impl NewReq {
             }
             NewField::Assert(i) => self.asserts.get_mut(i).map(|r| &mut r.expr),
             NewField::Capture(i, col) => self.captures.get_mut(i).map(|r| r.cell_mut(col)),
+            NewField::Report(i, col) => self.reports.get_mut(i).map(|r| r.cell_mut(col)),
             NewField::Method
             | NewField::Target
             | NewField::AddKvd(KvdKind::Header)
@@ -860,7 +917,8 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Query)
             | NewField::AddFormField
             | NewField::AddAssert
-            | NewField::AddCapture => None,
+            | NewField::AddCapture
+            | NewField::AddReport => None,
         }
     }
 
@@ -876,6 +934,12 @@ impl NewReq {
     /// when tabbing between `[Asserts]` and Name.
     pub(crate) fn captures_blank(&self) -> bool {
         self.captures.iter().all(CaptureRow::is_blank)
+    }
+
+    /// True when every `[Reports]` row is blank — the section is then skipped
+    /// when tabbing between `[Captures]` and Name.
+    pub(crate) fn reports_blank(&self) -> bool {
+        self.reports.iter().all(ReportRow::is_blank)
     }
 
     /// The field that represents "arriving at the `[Asserts]` section for the
@@ -896,6 +960,15 @@ impl NewReq {
             NewField::AddCapture
         } else {
             NewField::Capture(0, CapCol::Name)
+        }
+    }
+
+    /// Like [`Self::assert_entry`], but for `[Reports]`.
+    pub(crate) fn report_entry(&self) -> NewField {
+        if self.reports.is_empty() {
+            NewField::AddReport
+        } else {
+            NewField::Report(0, CapCol::Name)
         }
     }
 
@@ -953,6 +1026,14 @@ impl NewReq {
                     NewField::Capture(i.min(self.captures.len() - 1), CapCol::Name)
                 }
             }
+            NewField::Report(i, _) if i < self.reports.len() => {
+                self.reports.remove(i);
+                if self.reports.is_empty() {
+                    NewField::AddReport
+                } else {
+                    NewField::Report(i.min(self.reports.len() - 1), CapCol::Name)
+                }
+            }
             other => other,
         };
     }
@@ -995,6 +1076,17 @@ impl NewReq {
             NewField::AddAssert
         } else {
             NewField::Assert(self.asserts.len() - 1)
+        }
+    }
+
+    /// Like [`Self::up_into_asserts`], but for leaving the first Report row
+    /// upward into Captures: lands on the last Capture row, or "+ Add Capture"
+    /// when Captures is empty.
+    pub(crate) fn up_into_captures(&self) -> NewField {
+        if self.captures.is_empty() {
+            NewField::AddCapture
+        } else {
+            NewField::Capture(self.captures.len() - 1, CapCol::Name)
         }
     }
 
@@ -1139,6 +1231,8 @@ impl NewReq {
             NewField::AddAssert => (9, usize::MAX, 0),
             NewField::Capture(i, c) => (10, i, if c == CapCol::Name { 0 } else { 1 }),
             NewField::AddCapture => (10, usize::MAX, 0),
+            NewField::Report(i, c) => (11, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddReport => (11, usize::MAX, 0),
         }
     }
 
@@ -1191,6 +1285,15 @@ impl NewReq {
                 v.push(NewField::Capture(i, CapCol::Expr));
             }
             v.push(NewField::AddCapture);
+        }
+        if self.reports_blank() {
+            v.push(self.report_entry());
+        } else {
+            for i in 0..self.reports.len() {
+                v.push(NewField::Report(i, CapCol::Name));
+                v.push(NewField::Report(i, CapCol::Expr));
+            }
+            v.push(NewField::AddReport);
         }
         v
     }
@@ -1256,7 +1359,8 @@ impl NewReq {
             NewField::FormField(..) | NewField::AddFormField => NewField::Body,
             NewField::Body => self.assert_entry(),
             NewField::Assert(..) | NewField::AddAssert => self.capture_entry(),
-            NewField::Capture(..) | NewField::AddCapture => NewField::Name,
+            NewField::Capture(..) | NewField::AddCapture => self.report_entry(),
+            NewField::Report(..) | NewField::AddReport => NewField::Name,
         }
     }
 
@@ -1266,8 +1370,8 @@ impl NewReq {
     pub(crate) fn jump_backward(&self) -> NewField {
         match self.focus {
             // Wrapping backward past the first field lands on the last section,
-            // matching jump_forward's `Capture -> Name` wrap.
-            NewField::Name => self.capture_entry(),
+            // matching jump_forward's `Report -> Name` wrap.
+            NewField::Name => self.report_entry(),
             NewField::Target | NewField::Method | NewField::Url => self.next_backward(true),
             NewField::Kvd(KvdKind::Header, ..) | NewField::AddKvd(KvdKind::Header) => NewField::Url,
             NewField::Kvd(KvdKind::Cookie, ..) | NewField::AddKvd(KvdKind::Cookie) => {
@@ -1280,6 +1384,7 @@ impl NewReq {
             NewField::Body => self.form_entry(),
             NewField::Assert(..) | NewField::AddAssert => NewField::Body,
             NewField::Capture(..) | NewField::AddCapture => self.assert_entry(),
+            NewField::Report(..) | NewField::AddReport => self.capture_entry(),
         }
     }
 
@@ -1295,6 +1400,7 @@ impl NewReq {
             WizardTab::Form => self.form_entry(),
             WizardTab::Asserts => self.assert_entry(),
             WizardTab::Captures => self.capture_entry(),
+            WizardTab::Reports => self.report_entry(),
             other => other.first_field(),
         }
     }
@@ -1306,7 +1412,7 @@ impl NewReq {
     pub(crate) fn focus_is_text_entry(&self) -> bool {
         match self.focus {
             NewField::Name | NewField::Url | NewField::Body => true,
-            NewField::Assert(_) | NewField::Capture(..) => true,
+            NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
             | NewField::Kvd(KvdKind::Cookie, _, col)
             | NewField::Kvd(KvdKind::Query, _, col) => {
@@ -1323,7 +1429,8 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Query)
             | NewField::AddFormField
             | NewField::AddAssert
-            | NewField::AddCapture => false,
+            | NewField::AddCapture
+            | NewField::AddReport => false,
         }
     }
 
@@ -1552,6 +1659,8 @@ pub(crate) fn draw_new_request(
             Constraint::Length(section_height(0, form.asserts.len())),     // asserts table
             Constraint::Length(1),                                         // captures label
             Constraint::Length(section_height(1, form.captures.len())),    // captures table
+            Constraint::Length(1),                                         // reports label
+            Constraint::Length(section_height(1, form.reports.len())),     // reports table
         ])
         .split(rows[5]);
 
@@ -1562,6 +1671,7 @@ pub(crate) fn draw_new_request(
         draw_body_section(f, sub[8], sub[9], form, s, th);
         draw_asserts_section(f, sub[10], sub[11], form, s, th);
         draw_captures_section(f, sub[12], sub[13], form, s, th);
+        draw_reports_section(f, sub[14], sub[15], form, s, th);
     } else {
         // A single section tab is active: give it essentially the whole
         // remaining dialog body instead of a fixed sliver, so long lists are
@@ -1581,6 +1691,7 @@ pub(crate) fn draw_new_request(
             WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Captures => draw_captures_section(f, sub[0], sub[1], form, s, th),
+            WizardTab::Reports => draw_reports_section(f, sub[0], sub[1], form, s, th),
         }
     }
 
@@ -1779,6 +1890,29 @@ fn draw_captures_section(
         label,
     );
     draw_capture_table(f, table, form, s, th);
+}
+
+/// Draw the Reports label + table into the given (label, table) rects.
+fn draw_reports_section(
+    f: &mut Frame,
+    label: Rect,
+    table: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+) {
+    let rep_focused =
+        matches!(form.focus, NewField::Report(..)) || form.focus == NewField::AddReport;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            s.field_reports.to_string(),
+            Style::default()
+                .fg(if rep_focused { th.accent } else { th.dim })
+                .add_modifier(Modifier::BOLD),
+        )),
+        label,
+    );
+    draw_report_table(f, table, form, s, th);
 }
 
 /// Draw the Text/File dropdown beneath the focused Form Kind cell, with the
@@ -2809,8 +2943,94 @@ pub(crate) fn draw_capture_table(
     }
 }
 
-/// URL row that shows the Base URL as a light-grey ghost while the field is
-/// empty; Right arrow (handled in the key loop) commits it.
+/// Draw the `[Reports]` table: `Name | Expression` columns, plus an "Add
+/// report field" hint line. Structurally identical to [`draw_capture_table`]
+/// (a report field is authored just like a capture: `name: <hurl query>`).
+pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+    let focused_idx = match form.focus {
+        NewField::Report(i, _) => Some(i),
+        _ => None,
+    };
+    let Some((table_area, header_rect, data_rects, add_rect, scrolling, start)) =
+        windowed_table_rows(
+            area,
+            true,
+            form.reports.len(),
+            &form.report_scroll,
+            focused_idx,
+        )
+    else {
+        return;
+    };
+
+    let name_w = 18u16.min(table_area.width.saturating_sub(4)).max(4);
+    let cell_rects = |row_area: Rect| {
+        Layout::horizontal([Constraint::Length(name_w), Constraint::Min(1)])
+            .spacing(1)
+            .split(row_area)
+    };
+    let lbl = |t: &str| {
+        Paragraph::new(Span::styled(
+            t.to_string(),
+            Style::default().fg(th.dim).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    if let Some(hrect) = header_rect {
+        let hcells = cell_rects(hrect);
+        f.render_widget(lbl(s.report_name), hcells[0]);
+        f.render_widget(lbl(s.report_expr), hcells[1]);
+    }
+
+    for (slot, row_area) in data_rects.iter().enumerate() {
+        let i = start + slot;
+        let row = &form.reports[i];
+        let cells = cell_rects(*row_area);
+        draw_header_cell(
+            f,
+            cells[0],
+            &row.name,
+            form.focus == NewField::Report(i, CapCol::Name),
+            th,
+        );
+        draw_header_cell(
+            f,
+            cells[1],
+            &row.expr,
+            form.focus == NewField::Report(i, CapCol::Expr),
+            th,
+        );
+    }
+
+    let add_focused = form.focus == NewField::AddReport;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            s.add_report.to_string(),
+            Style::default()
+                .fg(if add_focused { th.accent } else { th.dim })
+                .add_modifier(Modifier::BOLD),
+        )),
+        add_rect,
+    );
+
+    if scrolling {
+        let header_h = 1u16;
+        let bar_area = Rect {
+            x: area.x,
+            y: table_area.y + header_h,
+            width: 1,
+            height: table_area.height.saturating_sub(header_h),
+        };
+        draw_scrollbar(
+            f,
+            bar_area,
+            form.reports.len(),
+            data_rects.len().max(1),
+            start,
+            th,
+        );
+    }
+}
 pub(crate) fn draw_url_row(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
     let focused = form.focus == NewField::Url;
     let cols = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).split(area);

@@ -671,6 +671,7 @@ impl TuiApp {
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
             Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
+            Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
         }
     }
 
@@ -1615,6 +1616,15 @@ impl TuiApp {
                 (!n.is_empty() && !e.is_empty()).then_some((n, e))
             })
             .collect();
+        let reports: Vec<(String, String)> = form
+            .reports
+            .iter()
+            .filter_map(|r| {
+                let n = r.name.text().trim().to_string();
+                let e = r.expr.text().trim().to_string();
+                (!n.is_empty() && !e.is_empty()).then_some((n, e))
+            })
+            .collect();
 
         if let Some((ci, ei)) = form.editing {
             let Some(col) = self.collections.get_mut(ci) else {
@@ -1639,7 +1649,8 @@ impl TuiApp {
                 || entry.form_fields != form_fields
                 || entry.body != body
                 || entry.asserts != asserts
-                || entry.captures != captures;
+                || entry.captures != captures
+                || entry.reports != reports;
             if changed {
                 entry.title = name;
                 entry.method = method;
@@ -1651,6 +1662,7 @@ impl TuiApp {
                 entry.body = body;
                 entry.asserts = asserts;
                 entry.captures = captures;
+                entry.reports = reports;
                 entry.modified = true;
             }
             col.invalidate_request_json();
@@ -1669,6 +1681,7 @@ impl TuiApp {
         entry.form_fields = form_fields;
         entry.asserts = asserts;
         entry.captures = captures;
+        entry.reports = reports;
         let target = form.target_idx.min(self.collections.len() - 1);
         // Requests added to a real collection (not the Scratch Space, tab 0) are
         // marked so they're distinguishable from those loaded from the file.
@@ -1925,6 +1938,10 @@ impl TuiApp {
                     .path
                     .as_ref()
             }
+            FileAction::SaveReport => {
+                let idx = self.active_report_index()?;
+                self.reports.get(idx)?.report.path.as_ref()
+            }
             _ => None,
         }?;
         Some(p.to_string_lossy().into_owned())
@@ -1938,12 +1955,23 @@ impl TuiApp {
             self.status = Some(Status::NotEnvironment);
             return;
         }
+        if action == FileAction::SaveReport && self.active_report_index().is_none() {
+            self.status = Some(Status::NotReport);
+            return;
+        }
         match self.original_save_path(action) {
             Some(path) => {
                 let changes = match action {
                     FileAction::SaveEnv => self
                         .current_env_id()
                         .map(|id| self.changed_env_count(id))
+                        .unwrap_or(0),
+                    // A report's "changes" is just its dirty flag (its source is
+                    // a single text buffer, not a set of per-request markers).
+                    FileAction::SaveReport => self
+                        .active_report_index()
+                        .filter(|&i| self.reports[i].report.dirty)
+                        .map(|_| 1)
                         .unwrap_or(0),
                     _ => self.changed_request_count(self.active_tab),
                 };
@@ -1969,6 +1997,10 @@ impl TuiApp {
             self.status = Some(Status::NotEnvironment);
             return;
         }
+        if action == FileAction::SaveReport && self.active_report_index().is_none() {
+            self.status = Some(Status::NotReport);
+            return;
+        }
         let s = Strings::for_language(&self.language);
         let ci = self.active_tab;
         match action {
@@ -1983,6 +2015,9 @@ impl TuiApp {
                 });
                 self.open_path_prompt(action, s.save_environment, &default);
             }
+            // Reports pick a destination folder like collections, but write a
+            // `.report` file (the real write routes through `SaveReport`).
+            FileAction::SaveReport => self.open_browser(FileAction::SaveReportChooseFolder),
             // Collections (including the Scratch Space) pick a destination
             // folder in the file browser first — the filename is entered in a
             // follow-up prompt seeded with that folder (see the browser's
@@ -2009,6 +2044,27 @@ impl TuiApp {
                 let name = self.collections[ci].name.trim();
                 let base = if name.is_empty() { "collection" } else { name };
                 format!("{base}.hurl")
+            })
+    }
+
+    /// A sensible default file name for "Save Report As": the report's current
+    /// file name when it has one, otherwise `<name>.report` from its display
+    /// name (a scratch report lands here). Shown in the folder browser's inline
+    /// filename editor.
+    pub(crate) fn default_save_report_filename(&self) -> String {
+        let Some(idx) = self.active_report_index() else {
+            return "report.report".to_string();
+        };
+        let report = &self.reports[idx].report;
+        report
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                let name = report.name.trim();
+                let base = if name.is_empty() { "report" } else { name };
+                format!("{base}.report")
             })
     }
 
@@ -2051,13 +2107,34 @@ impl TuiApp {
                 let path = dir.join(file);
                 self.write_active_report_csv(&path);
             }
+            FileAction::SaveReportBaselineChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("baseline");
+                }
+                let path = dir.join(file);
+                self.write_active_report_baseline(&path);
+            }
+            FileAction::SaveReportChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("report");
+                }
+                let path = dir.join(file).to_string_lossy().into_owned();
+                self.save_as_path(FileAction::SaveReport, &path);
+            }
             _ => {}
         }
     }
 
     pub(crate) fn save_as_path(&mut self, action: FileAction, path: &str) {
         let exists = !path.is_empty() && std::path::Path::new(path).exists();
-        if exists && matches!(action, FileAction::SaveCollection | FileAction::SaveEnv) {
+        if exists
+            && matches!(
+                action,
+                FileAction::SaveCollection | FileAction::SaveEnv | FileAction::SaveReport
+            )
+        {
             self.pending_save_path = Some(std::path::PathBuf::from(path));
             self.overlay = Some(Overlay::Confirm {
                 action: ConfirmAction::Overwrite(action),
@@ -2364,7 +2441,10 @@ impl TuiApp {
             0 => self.open_path_prompt(FileAction::LoadRequest, s.load_request, ""),
             1 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Collection, 0)),
             2 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 0)),
-            _ => self.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 0)),
+            3 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 0)),
+            // Reports are local-only for now (git is a fast-follow), so — like a
+            // Request — they skip the source step and open the file browser.
+            _ => self.open_browser(FileAction::OpenReport),
         }
     }
 
@@ -2378,6 +2458,9 @@ impl TuiApp {
             (FileKind::Environment, false) => self.open_remote_wizard(RemoteKind::Environment),
             (FileKind::Workspace, true) => self.open_browser(FileAction::OpenWorkspace),
             (FileKind::Workspace, false) => self.open_remote_wizard(RemoteKind::Workspace),
+            // Reports are local-only for now (they normally skip this source
+            // step); open the local browser regardless of the source choice.
+            (FileKind::Report, _) => self.open_browser(FileAction::OpenReport),
         }
     }
 
@@ -2390,6 +2473,7 @@ impl TuiApp {
             1 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Collection, 0)),
             2 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Environment, 0)),
             3 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
+            4 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Report, 0)),
             _ => self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json"),
         }
     }
@@ -2398,7 +2482,7 @@ impl TuiApp {
     /// list (and therefore `sel`) varies per kind — see
     /// [`crate::tui::app::file_save_dest_items`]:
     /// Collection = Save / Save As / To Git; Environment = Save / Save As;
-    /// Workspace = Save As / To Git.
+    /// Workspace = Save As / To Git; Report = Save / Save As.
     pub(crate) fn activate_file_save_dest(&mut self, kind: FileKind, sel: usize) {
         match kind {
             // "Save …" writes back to the original file (confirming only when
@@ -2415,6 +2499,10 @@ impl TuiApp {
             FileKind::Workspace => match sel {
                 0 => self.begin_save_workspace_as(),
                 _ => self.open_git_workspace_save_wizard(),
+            },
+            FileKind::Report => match sel {
+                0 => self.begin_save(FileAction::SaveReport),
+                _ => self.begin_save_as(FileAction::SaveReport),
             },
         }
     }
@@ -2442,15 +2530,19 @@ impl TuiApp {
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
             FileAction::SaveCollectionChooseFolder => s.save_collection_folder,
             FileAction::SaveReportCsvChooseFolder => s.report_export_csv_folder,
+            FileAction::SaveReportBaselineChooseFolder => s.report_save_baseline_folder,
+            FileAction::OpenReport => s.open_report,
+            FileAction::SaveReportChooseFolder => s.save_report_folder,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
-            FileAction::SaveCollectionChooseFolder | FileAction::SaveReportCsvChooseFolder => {
-                s.browser_hint_collection_save
-            }
+            FileAction::SaveCollectionChooseFolder
+            | FileAction::SaveReportCsvChooseFolder
+            | FileAction::SaveReportBaselineChooseFolder
+            | FileAction::SaveReportChooseFolder => s.browser_hint_collection_save,
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
@@ -2485,14 +2577,19 @@ impl TuiApp {
                 // environment picker prefers the folder its own last file came
                 // from; the report-CSV export prefers the report's own
                 // directory; both fall back to the shared last-browsed folder.
-                let report_dir = (action == FileAction::SaveReportCsvChooseFolder)
-                    .then(|| self.active_report_base_dir())
-                    .flatten();
+                let report_dir = matches!(
+                    action,
+                    FileAction::SaveReportCsvChooseFolder
+                        | FileAction::SaveReportBaselineChooseFolder
+                )
+                .then(|| self.active_report_base_dir())
+                .flatten();
                 let reopen = match action {
                     FileAction::LoadEnv => {
                         self.last_env_dir.as_ref().or(self.last_browse_dir.as_ref())
                     }
-                    FileAction::SaveReportCsvChooseFolder => {
+                    FileAction::SaveReportCsvChooseFolder
+                    | FileAction::SaveReportBaselineChooseFolder => {
                         report_dir.as_ref().or(self.last_browse_dir.as_ref())
                     }
                     _ => self.last_browse_dir.as_ref(),
@@ -2518,6 +2615,10 @@ impl TuiApp {
                             .map(|p| p.default_name.clone())
                             .unwrap_or_default(),
                         FileAction::SaveReportCsvChooseFolder => self.default_report_csv_filename(),
+                        FileAction::SaveReportBaselineChooseFolder => {
+                            self.default_report_baseline_filename()
+                        }
+                        FileAction::SaveReportChooseFolder => self.default_save_report_filename(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
@@ -3722,10 +3823,10 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='7') = key.code {
-            // Alt+1..6 jumps directly to a section by number
-            // (Headers/Cookies/Form/Body/Asserts/Captures), regardless
-            // of the current section-view tab — a direct-jump
+        } else if alt && let KeyCode::Char(c @ '1'..='8') = key.code {
+            // Alt+1..8 jumps directly to a section by number
+            // (Headers/Cookies/Queries/Form/Body/Asserts/Captures/Reports),
+            // regardless of the current section-view tab — a direct-jump
             // complement to Ctrl+Up/Down's sequential one. Alt (not
             // Ctrl) because Ctrl+<digit> has no standard control-code
             // encoding and most terminals only report it with a
@@ -3739,7 +3840,8 @@ impl TuiApp {
                 '4' => WizardTab::Form,
                 '5' => WizardTab::Body,
                 '6' => WizardTab::Asserts,
-                _ => WizardTab::Captures, // '7'
+                '7' => WizardTab::Captures,
+                _ => WizardTab::Reports, // '8'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -4016,6 +4118,64 @@ impl TuiApp {
                     KeyCode::Backspace => form.captures[i].cell_mut(col).backspace(),
                     KeyCode::Home => form.captures[i].cell_mut(col).home(),
                     KeyCode::End => form.captures[i].cell_mut(col).end(),
+                    _ => {}
+                },
+                NewField::AddReport => match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        form.reports.push(ReportRow::new());
+                        form.focus = NewField::Report(form.reports.len() - 1, CapCol::Name);
+                    }
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
+                NewField::Report(i, col) => match key.code {
+                    KeyCode::Up => {
+                        form.focus = if i > 0 {
+                            NewField::Report(i - 1, col)
+                        } else {
+                            form.up_into_captures()
+                        };
+                    }
+                    KeyCode::Down => {
+                        form.focus = if i + 1 < form.reports.len() {
+                            NewField::Report(i + 1, col)
+                        } else {
+                            NewField::AddReport
+                        };
+                    }
+                    KeyCode::Left => {
+                        let at_start = form.reports[i].cell_mut(col).col == 0;
+                        if !at_start {
+                            if ctrl {
+                                form.reports[i].cell_mut(col).home();
+                            } else {
+                                form.reports[i].cell_mut(col).left();
+                            }
+                        } else if let Some(prev) = form.prev_cap_col(col) {
+                            form.reports[i].cell_mut(prev).end();
+                            form.focus = NewField::Report(i, prev);
+                        }
+                    }
+                    KeyCode::Right => {
+                        let ed = form.reports[i].cell_mut(col);
+                        let at_end = ed.col >= ed.line_len(ed.row);
+                        if !at_end {
+                            if ctrl {
+                                form.reports[i].cell_mut(col).end();
+                            } else {
+                                form.reports[i].cell_mut(col).right();
+                            }
+                        } else if let Some(next) = form.next_cap_col(col) {
+                            form.reports[i].cell_mut(next).home();
+                            form.focus = NewField::Report(i, next);
+                        }
+                    }
+                    KeyCode::Enter => form.focus_next(true, true),
+                    KeyCode::Char(ch) => form.reports[i].cell_mut(col).insert(ch),
+                    KeyCode::Backspace => form.reports[i].cell_mut(col).backspace(),
+                    KeyCode::Home => form.reports[i].cell_mut(col).home(),
+                    KeyCode::End => form.reports[i].cell_mut(col).end(),
                     _ => {}
                 },
                 _ => {

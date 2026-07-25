@@ -62,6 +62,17 @@ impl Header {
     pub fn root(&self) -> Option<&str> {
         self.get("root")
     }
+    /// The saved-run snapshot (`baseline:` directive) to diff this run against —
+    /// PaperTrail's "Source B" comparison. Names a `.baseline` JSON file (a
+    /// previous run saved via the results grid) whose reported fields are diffed
+    /// against the current run to produce the `Result` column, exactly like an
+    /// `ENVS BASELINE/COMPARISON` clause but against stored values rather than a
+    /// live baseline environment. The path resolves like producer paths
+    /// (relative to `# root:` / the report's directory). Ignored when the flow
+    /// already configures an `ENVS` role comparison (that takes precedence).
+    pub fn baseline(&self) -> Option<&str> {
+        self.get("baseline")
+    }
     /// The single environment (`environment:` directive) to use as the report's
     /// base variable layer for a plain, no-comparison run. Names an
     /// *already-loaded* global environment (validation errors if it isn't

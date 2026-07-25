@@ -179,6 +179,62 @@ fn draw_report_columns_overlay(
     }
 }
 
+/// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
+/// simple selectable list of the open collections, each showing its display
+/// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
+/// re-points the active report's `# collection:` header at it.
+fn draw_report_bind_overlay(
+    f: &mut Frame,
+    picker: &super::reports::ReportBindPicker,
+    s: &Strings,
+    th: &Theme,
+) {
+    let title = format!("{}  ({})", s.report_bind_title, s.report_bind_hint);
+    let n = picker.options.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = if picker.selected >= inner_h {
+        picker.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, opt) in picker.options.iter().enumerate().skip(scroll).take(inner_h) {
+        let base = if i == picker.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let mut spans = vec![Span::styled(opt.name.clone(), base)];
+        let detail = opt
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.report_bind_unsaved.to_string());
+        spans.push(Span::styled(
+            format!("  {detail}"),
+            Style::default().fg(th.dim),
+        ));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     let s = Strings::for_language(&app.language);
     let th = app.theme();
@@ -1894,6 +1950,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .unwrap_or(0)
                         .to_string(),
                 ),
+                ConfirmAction::Save(FileAction::SaveReport) => s.confirm_save_report_q.to_string(),
                 ConfirmAction::Save(_) => s.confirm_save_collection_q.replace(
                     "{r}",
                     &app.changed_request_count(app.active_tab).to_string(),
@@ -2062,7 +2119,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("v (report)", s.help_report_view),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("x (report)", s.help_report_export),
+                            ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
+                            ("b (report)", s.help_report_bind),
                             ("Esc (report)", s.help_report_leave_edit),
                             ("Ctrl+←/→ (report)", s.help_report_word_move),
                             ("→ (report)", s.help_report_complete),
@@ -2230,6 +2289,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("v", s.help_report_view),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("x", s.help_report_export),
+                        ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),
                         ("Ctrl+←/→", s.help_report_word_move),
@@ -2367,6 +2427,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportColumns(picker) => {
             draw_report_columns_overlay(f, picker, s, th);
+        }
+        Overlay::ReportBind(picker) => {
+            draw_report_bind_overlay(f, picker, s, th);
         }
         Overlay::Prompt {
             kind,

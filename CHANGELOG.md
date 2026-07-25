@@ -89,6 +89,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   document, and an unmatched row still appears (`no baseline` / `no candidate`).
   `Result` is shown by default and can be renamed/reordered like any column via
   `# columns:` (e.g. `# columns: FILE as Name, Result, proc.status as Status`).
+- **Compare against a saved run — `.baseline` snapshots (`# baseline:`).** The
+  `Result` column now has a second source: instead of comparing two environments
+  in one run, a report can compare *this* run against a **saved snapshot of an
+  earlier accepted run** — the "did this release change anything?" workflow.
+  After a run, press **Shift+B** in the results view to save the run as a
+  `.baseline` JSON file (via the same folder picker as CSV export, seeded with
+  `<report>.baseline`). Add a **`# baseline: <path>`** header directive (the path
+  resolves like producer paths — relative to `# root:`/the report's folder) and
+  every subsequent run diffs its reported fields against the snapshot to fill the
+  same `Result` column (`OK`, a `field: was→now` summary, `no baseline`, or `no
+  candidate`), reusing the environment-comparison engine so the two read
+  identically. A live `ENVS BASELINE/COMPARISON` clause takes precedence; the
+  directive is flagged as ignored when both are present, and a missing/invalid
+  snapshot is a non-fatal run error (rows are still produced).
 - **Choose which response fields a request contributes — `SHOW(...)`.** A
   `REPORT REQUEST` can now be followed by `SHOW(field, field, …)` to emit only
   the listed fields (in that order) instead of every intrinsic and `[Reports]`
@@ -138,6 +152,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   leaving the report. The focused area is highlighted (and the unfocused body
   dimmed). The plain **`v`** key still simply flips between the source and the
   results grid.
+- **Load and save reports through the File menu, and re-point them with `b`.**
+  A report is now a first-class file: **File ▸ Load ▸ Report** opens a `.report`
+  flow into a new tab, and **File ▸ Save ▸ Report** writes the active report back
+  to its file (**Save As** opens a folder chooser seeded with `<name>.report`).
+  The Reports view also gains a **`b`** (bind) action that lists the open
+  collections and re-points the report's `# collection:` header at the chosen
+  one — preferring a path relative to the report file (so a report and its
+  collection committed together stay linked), then an absolute path, then the
+  collection's name for an unsaved scratch collection. Saving to a git remote
+  follows in a later update.
+- **Author a request's `[Reports]` fields in the request editor.** The New/Edit
+  Request wizard gains a **Reports** section (a tab beside Asserts and Captures,
+  reachable with **Alt+8**, PageDown, or Tab). Each row is a `name: <hurl query>`
+  pair — authored exactly like a Capture — that names a value to pull from the
+  response into a generated report (e.g. `status: jsonpath "$.status"`). The
+  section round-trips through collection save/load (stored as a spec-safe
+  `# [Reports]` comment block), and a request with no report fields contributes
+  its whole response to a report instead.
 
 ### Fixed
 

@@ -25,10 +25,3 @@ clap = { version = "4.6.1", features = ["derive"] }
 ratatui-explorer = "0.3.0"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
-
-# Local development override: use the in-tree tui-line-editor (0.1.4, adds
-# Ctrl+Z undo/redo and Ctrl+Backspace word-delete — plus Ctrl+H as its
-# legacy-terminal alias) until it is published to crates.io. Drop this patch
-# once 0.1.4 is on crates.io.
-[patch.crates-io]
-tui-line-editor = { path = "../../PaperBoyTUI/paperboy-tui/crates/tui-line-editor" }

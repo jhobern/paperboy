@@ -221,7 +221,20 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Find the loaded collection tab a report is bound to, by resolving the
+    /// Push an already-loaded [`Report`] (from a `.report` file or, later, git)
+    /// as a new report tab, make it active, validate it and persist. Mirrors
+    /// [`Self::new_report_tab`] but keeps the loaded report's provenance (path /
+    /// git origin) so a subsequent "Save" writes back in place.
+    pub(crate) fn open_loaded_report(&mut self, report: Report) {
+        self.reports.push(ReportTab::new(report));
+        self.active_tab = self.collections.len() + self.reports.len() - 1;
+        self.focus = Pane::Tabs;
+        self.report_tabbar_focus = false;
+        let idx = self.reports.len() - 1;
+        self.revalidate_report(idx);
+        self.save_state();
+        self.status = Some(Status::Loaded);
+    }
     /// report's `# collection:` reference (relative to the report's own path
     /// when possible, else as an absolute path) against each open collection's
     /// path. Falls back to matching a collection by *name* so a report bound
@@ -736,6 +749,58 @@ impl TuiApp {
         }
     }
 
+    /// Save the active report's last run as a `.baseline` JSON snapshot
+    /// (PaperTrail "Source B"). Opens the folder picker seeded with a
+    /// `<report>.baseline` filename and the report's own directory; a later run
+    /// diffs against it once its `# baseline:` header points at the file.
+    /// Reports why nothing can be saved (no run yet) in the status bar.
+    pub(crate) fn save_active_report_baseline(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        if self.reports[idx].result.is_none() {
+            self.status = Some(Status::ReportRunBlocked(
+                s.report_baseline_no_result.to_string(),
+            ));
+            return;
+        }
+        self.open_browser(super::app::FileAction::SaveReportBaselineChooseFolder);
+    }
+
+    /// The default filename offered when saving the active report's baseline:
+    /// the saved report's stem (or its tab name) with a `.baseline` extension.
+    pub(crate) fn default_report_baseline_filename(&self) -> String {
+        match self.active_report_index() {
+            Some(idx) => baseline_export_path(&self.reports[idx].report)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "report.baseline".to_string()),
+            None => "report.baseline".to_string(),
+        }
+    }
+
+    /// Write the active report's last run to `path` as a `.baseline` JSON
+    /// snapshot, reporting the destination — or the failure — in the status
+    /// bar. Called by the folder picker once a destination is chosen.
+    pub(crate) fn write_active_report_baseline(&mut self, path: &std::path::Path) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        let Some(result) = &self.reports[idx].result else {
+            self.status = Some(Status::ReportRunBlocked(
+                s.report_baseline_no_result.to_string(),
+            ));
+            return;
+        };
+        let baseline = crate::report::Baseline::from_result(result);
+        match baseline.save(path) {
+            Ok(()) => self.status = Some(Status::ReportBaselineSaved(path.display().to_string())),
+            Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
+        }
+    }
+
     /// Dry-run the active report: expand its flow with a no-op runner (no HTTP)
     /// and open a preview overlay summarising the projected row count, a sample
     /// of the first few iterations' resolved bindings, and any producer /
@@ -906,6 +971,93 @@ impl TuiApp {
         self.status = Some(Status::ReportColumnsApplied);
     }
 
+    /// Open the collection-binding picker for the active report. Lists every
+    /// open collection tab; a hint is shown (and the picker not opened) when
+    /// none are loaded, since there'd be nothing to bind to.
+    pub(crate) fn open_report_bind(&mut self) {
+        if self.active_report_index().is_none() {
+            self.status = Some(Status::NotReport);
+            return;
+        }
+        if self.collections.is_empty() {
+            self.status = Some(Status::ReportBindNoCollections);
+            return;
+        }
+        let options: Vec<BindOption> = self
+            .collections
+            .iter()
+            .map(|c| BindOption {
+                name: c.name.clone(),
+                path: c.path.clone(),
+            })
+            .collect();
+        // Preselect the currently-bound collection, if any, so re-binding lands
+        // on it first.
+        let selected = self
+            .active_report()
+            .and_then(|rt| self.resolve_bound_collection(&rt.report))
+            .unwrap_or(0)
+            .min(options.len().saturating_sub(1));
+        self.overlay = Some(Overlay::ReportBind(Box::new(ReportBindPicker {
+            options,
+            selected,
+        })));
+    }
+
+    /// Key handling for the collection-binding picker ([`Overlay::ReportBind`]).
+    /// Up/Down (and `j`/`k`, Home/End) move; Enter binds the selected
+    /// collection; Esc/`q` cancels. The overlay was already `take`n by the
+    /// dispatcher, so cancelling is just not putting it back.
+    pub(crate) fn report_bind_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut picker: Box<ReportBindPicker>,
+    ) {
+        let last = picker.options.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.overlay = Some(Overlay::ReportBind(picker));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(last);
+                self.overlay = Some(Overlay::ReportBind(picker));
+            }
+            KeyCode::Home => {
+                picker.selected = 0;
+                self.overlay = Some(Overlay::ReportBind(picker));
+            }
+            KeyCode::End => {
+                picker.selected = last;
+                self.overlay = Some(Overlay::ReportBind(picker));
+            }
+            KeyCode::Enter => self.apply_report_bind(*picker),
+            // Esc / q / any other key: cancel (overlay stays taken).
+            _ => {}
+        }
+    }
+
+    /// Re-point the active report's `# collection:` header at the picker's
+    /// selected collection (relative path preferred, then absolute, then the
+    /// collection's name), then revalidate and persist.
+    fn apply_report_bind(&mut self, picker: ReportBindPicker) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let Some(option) = picker.options.get(picker.selected) else {
+            return;
+        };
+        let report_path = self.reports[idx].report.path.clone();
+        let cref =
+            collection_ref_for_report(report_path.as_deref(), option.path.as_deref(), &option.name);
+        let name = option.name.clone();
+        let new_text = set_flow_directive(&self.reports[idx].report.text, "collection", &cref);
+        self.reports[idx].report.set_text(new_text);
+        self.revalidate_report(idx);
+        self.save_state();
+        self.status = Some(Status::ReportBound(name));
+    }
+
     /// Give the active report tab's source panel edit focus, seeding an
     /// [`Editor`] from the current source text. While focused, keystrokes type
     /// directly into the panel (see [`TuiApp::on_key_report_editing`]).
@@ -1003,6 +1155,8 @@ impl TuiApp {
             KeyCode::Char('d') => self.open_report_dry_run(),
             // Column picker: choose/reorder which columns the report outputs.
             KeyCode::Char('c') => self.open_report_columns(),
+            // Bind: (re)point the report at one of the open collections.
+            KeyCode::Char('b') => self.open_report_bind(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
             // Tab rotates focus across the report's areas — Editor (source) →
@@ -1013,6 +1167,9 @@ impl TuiApp {
             KeyCode::BackTab => self.cycle_report_focus(false),
             // Export the last run to CSV next to the report.
             KeyCode::Char('x') => self.export_active_report_csv(),
+            // Save the last run as a `.baseline` snapshot (Shift+B) — `b` is
+            // already BIND. A `# baseline:` directive later diffs runs against it.
+            KeyCode::Char('B') => self.save_active_report_baseline(),
             // Copy the active panel selection (or, with nothing selected, the
             // whole visible panel) to the clipboard — parity with the
             // collection view's `y`.
@@ -1498,6 +1655,67 @@ fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// Compute the `# collection:` reference to store when BINDing a report to a
+/// loaded collection, preferring a path **relative to the report's own
+/// directory** so a report + collection committed together stay linked when the
+/// repo is cloned elsewhere (the design's portability requirement). Falls back
+/// to the collection's absolute path when a relative form can't be computed
+/// (e.g. the report is an unsaved scratch with no directory yet), and to the
+/// collection's display *name* when it has no path at all (a scratch
+/// collection) so the existing name-based resolution in
+/// [`TuiApp::resolve_bound_collection`] still finds it.
+fn collection_ref_for_report(
+    report_path: Option<&std::path::Path>,
+    collection_path: Option<&std::path::Path>,
+    collection_name: &str,
+) -> String {
+    let Some(cpath) = collection_path else {
+        return collection_name.to_string();
+    };
+    if let Some(dir) = report_path.and_then(|rp| rp.parent())
+        && let Some(rel) = relative_path(dir, cpath)
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    cpath.to_string_lossy().into_owned()
+}
+
+/// Build a path to `to` relative to the directory `from_dir`, using `..`
+/// segments to climb to a common ancestor. Both are canonicalised first (so
+/// symlinks/`.`/`..` resolve consistently), which requires them to exist on
+/// disk; returns `None` when either can't be canonicalised or they share no
+/// common root (e.g. different drives), so the caller falls back to an absolute
+/// path.
+fn relative_path(from_dir: &std::path::Path, to: &std::path::Path) -> Option<std::path::PathBuf> {
+    let from = from_dir.canonicalize().ok()?;
+    let to = to.canonicalize().ok()?;
+    let from_comps: Vec<_> = from.components().collect();
+    let to_comps: Vec<_> = to.components().collect();
+
+    // A shared root component (the `/` or drive prefix) is required.
+    if from_comps.first() != to_comps.first() {
+        return None;
+    }
+    let common = from_comps
+        .iter()
+        .zip(&to_comps)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut rel = std::path::PathBuf::new();
+    for _ in common..from_comps.len() {
+        rel.push("..");
+    }
+    for comp in &to_comps[common..] {
+        rel.push(comp.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        None
+    } else {
+        Some(rel)
+    }
+}
+
 /// Flatten an [`Environment`](crate::environment::Environment) into a plain
 /// `KEY → value` map for the interpreter's variable layers.
 fn flatten_env(env: &crate::environment::Environment) -> std::collections::HashMap<String, String> {
@@ -1515,6 +1733,17 @@ fn csv_export_path(report: &Report) -> std::path::PathBuf {
     }
     let stem = sanitize_file_stem(&report.name);
     std::path::PathBuf::from(format!("{stem}.csv"))
+}
+
+/// The default `.baseline` snapshot path for `report`: its own file with a
+/// `.baseline` extension, or a sanitised `<name>.baseline` for a scratch report
+/// with no file yet. Mirrors [`csv_export_path`].
+fn baseline_export_path(report: &Report) -> std::path::PathBuf {
+    if let Some(path) = &report.path {
+        return path.with_extension("baseline");
+    }
+    let stem = sanitize_file_stem(&report.name);
+    std::path::PathBuf::from(format!("{stem}.baseline"))
 }
 
 /// Turn a display name into a safe single-segment file stem (replacing path
@@ -1767,6 +1996,22 @@ pub(crate) struct ColumnPicker {
     pub(crate) selected: usize,
 }
 
+/// One choice in the collection-binding picker: an open collection tab's
+/// display `name` and its local file `path` (if it has one — a scratch
+/// collection has none and is bound by name).
+pub(crate) struct BindOption {
+    pub(crate) name: String,
+    pub(crate) path: Option<std::path::PathBuf>,
+}
+
+/// The collection-binding picker overlay ([`Overlay::ReportBind`]): a list of
+/// the currently-open collection tabs, one of which the user selects to become
+/// the active report's bound collection (its `# collection:` header).
+pub(crate) struct ReportBindPicker {
+    pub(crate) options: Vec<BindOption>,
+    pub(crate) selected: usize,
+}
+
 impl ColumnPicker {
     /// Build the picker from the flow header's current `columns:` directive (if
     /// any) and the columns a run produced. Existing directive columns come
@@ -1852,18 +2097,27 @@ impl ColumnPicker {
 /// `# columns:` line is rewritten in place; otherwise the directive is appended
 /// to the leading comment block (or the top of the file).
 fn set_flow_columns_directive(text: &str, spec: &str) -> String {
-    let new_line = format!("# columns: {spec}");
+    set_flow_directive(text, "columns", spec)
+}
+
+/// Set (or insert) a `# <key>: <value>` header directive in a report's source,
+/// as a surgical text edit that preserves the rest of the flow verbatim. An
+/// existing directive with the same key (case-insensitive) is rewritten in
+/// place; otherwise a new line is inserted right after the contiguous leading
+/// `#` comment block (so it stays in the header). Used by the column picker
+/// (`columns:`) and BIND (`collection:`).
+fn set_flow_directive(text: &str, key: &str, value: &str) -> String {
+    let new_line = format!("# {key}: {value}");
+    let prefix = format!("{key}:");
     let trailing_nl = text.ends_with('\n');
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
 
-    // Rewrite an existing `# columns:` directive if present.
+    // Rewrite an existing `# key:` directive if present.
     for line in &mut lines {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix('#') {
             let rest = rest.trim_start();
-            if rest.len() >= "columns:".len()
-                && rest[.."columns:".len()].eq_ignore_ascii_case("columns:")
-            {
+            if rest.len() >= prefix.len() && rest[..prefix.len()].eq_ignore_ascii_case(&prefix) {
                 *line = new_line.clone();
                 return rejoin(lines, trailing_nl);
             }
@@ -2301,8 +2555,8 @@ fn draw_report_source(
         s.report_hint_leave.to_string()
     } else {
         format!(
-            "{} · {} · {}",
-            s.report_hint_edit, s.report_hint_run, s.report_hint_dry
+            "{} · {} · {} · {}",
+            s.report_hint_edit, s.report_hint_run, s.report_hint_dry, s.report_hint_bind
         )
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
