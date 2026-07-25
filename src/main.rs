@@ -78,9 +78,10 @@ struct Cli {
     dry_run: bool,
 
     /// With `-r`: where to write the report output. `-` writes CSV to stdout
-    /// (for piping); a path's extension selects the format (`.csv` only in v1);
-    /// omitted derives the file from the report's `# output:`/`# name:` headers
-    /// (next to the report file, honouring the `{time}` token).
+    /// (for piping); a path's extension selects the format (`.csv`, `.json`,
+    /// `.html` or `.xlsx`); omitted derives the file from the report's
+    /// `# output:`/`# name:` headers (next to the report file, honouring the
+    /// `{time}` token).
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<String>,
 }

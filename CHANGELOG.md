@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Reports export to JSON, HTML and Excel, not just CSV.** A report's results
+  can now be written in four formats, chosen by the output file's extension (or a
+  `# output:` header): **CSV**, **JSON** (a `{ columns, rows }` document),
+  **HTML** (a self-contained, styled page you can just double-click open in a
+  browser — ideal for handing a run to someone with no spreadsheet program), and
+  **`.xlsx`** (a real Excel workbook). The HTML and xlsx outputs colour-code
+  recognisable status/result cells (green = pass/`OK`, red = error, amber =
+  changed) so a large run is easy to scan, exactly like the hand-made reports
+  this feature replaces. In the report view, `x` (export) picks the format from
+  the filename you type; on the command line, `-o out.xlsx` (or `-o out.html` /
+  `-o out.json`) does the same, and omitting `-o` uses the report's `# output:`
+  format. (The `.xlsx` writer is pure Rust — no external tools required.)
+
 - **Turn a request into a reported one (or back) from the node editor.** The
   report node editor's per-node configure form now has a **Report** checkbox:
   tick it to promote a plain `REQUEST` into a `REPORT REQUEST` (which reveals

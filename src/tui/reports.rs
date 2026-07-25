@@ -33,7 +33,7 @@ use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RunContext, finalize, run_flow, run_flow_raw,
 };
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
-use crate::report::writer::{CsvWriter, ReportWriter};
+use crate::report::writer::{CsvWriter, writer_for_extension};
 use crate::report::{expand_output_tokens, name_has_output_token};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1329,7 +1329,8 @@ impl TuiApp {
             .map(|idx| report_base_dir(&self.reports[idx].report).0)
     }
 
-    /// Write the active report's last run to `path` as CSV, reporting the
+    /// Write the active report's last run to `path`, choosing the output format
+    /// from the file extension (csv/json/xlsx; unknown ⇒ CSV). Reports the
     /// destination — or the failure — in the status bar. Called by the folder
     /// picker once a destination is chosen.
     pub(crate) fn write_active_report_csv(&mut self, path: &std::path::Path) {
@@ -1348,7 +1349,19 @@ impl TuiApp {
         // error can't happen here (a result only exists after a good run) but
         // fall back to the produced order just in case.
         let header = rt.report.flow().map(|f| f.header).unwrap_or_default();
-        let bytes = CsvWriter.write(result, &header);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("csv")
+            .to_ascii_lowercase();
+        let writer = writer_for_extension(&ext).unwrap_or_else(|| Box::new(CsvWriter));
+        let bytes = match writer.write(result, &header) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = Some(Status::Error(format!("{}: {e}", path.display())));
+                return;
+            }
+        };
         match std::fs::write(path, bytes) {
             Ok(()) => self.status = Some(Status::ReportExported(path.display().to_string())),
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
@@ -2368,14 +2381,28 @@ fn flatten_env(env: &crate::environment::Environment) -> std::collections::HashM
 /// current directory for a scratch report), so repeated runs write distinct
 /// timestamped files rather than overwriting one export.
 fn csv_export_path(report: &Report) -> std::path::PathBuf {
-    if let Some(p) = tokened_output_path(report, "csv") {
+    let ext = report_output_extension(report);
+    if let Some(p) = tokened_output_path(report, &ext) {
         return p;
     }
     if let Some(path) = &report.path {
-        return path.with_extension("csv");
+        return path.with_extension(&ext);
     }
     let stem = sanitize_file_stem(&report.name);
-    std::path::PathBuf::from(format!("{stem}.csv"))
+    std::path::PathBuf::from(format!("{stem}.{ext}"))
+}
+
+/// The preferred output extension for `report`: its `# output:` header format
+/// when that names a supported writer (csv/json/xlsx), else `csv`. Used to seed
+/// the export picker so a report declaring `# output: xlsx` exports `.xlsx` by
+/// default (the user can still type another extension).
+fn report_output_extension(report: &Report) -> String {
+    report
+        .flow()
+        .ok()
+        .and_then(|f| f.header.output().map(|o| o.trim().to_ascii_lowercase()))
+        .filter(|ext| writer_for_extension(ext).is_some())
+        .unwrap_or_else(|| "csv".to_string())
 }
 
 /// The default `.baseline` snapshot path for `report`: its own file with a

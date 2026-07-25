@@ -23,6 +23,7 @@ use crate::report::producers::resolve_path;
 use crate::report::report::{expand_output_tokens, name_has_output_token};
 use crate::report::run::{DryRunner, LiveRunner, RunContext, finalize, run_flow_raw};
 use crate::report::validate::{Context, Severity, validate};
+use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
 use crate::report::{CsvWriter, Report, ReportResult, ReportRow, ReportWriter};
 
 /// Run a report headlessly. Returns an OS exit code (0 = success, 1 = a fatal
@@ -257,11 +258,11 @@ enum OutputTarget {
 
 /// Serialize `result` and write it to the chosen destination:
 /// - `Some("-")`  → stdout (clean CSV, for piping);
-/// - `Some(path)` → that file (its extension selects the format);
+/// - `Some(path)` → that file (its extension selects the format: csv/json/xlsx);
 /// - `None`       → a file derived from the header (`# output:` format,
 ///   `# name:`-derived stem honouring `{time}`, next to the report file).
 ///
-/// Only CSV is supported in v1; any other extension/format is an error.
+/// An unrecognised extension/format is an error naming the supported set.
 fn write_output(
     result: &ReportResult,
     header: &Header,
@@ -270,7 +271,10 @@ fn write_output(
 ) -> Result<OutputTarget, String> {
     match output {
         Some("-") => {
-            let bytes = CsvWriter.write(result, header);
+            // stdout is for piping text, so it always emits CSV (a binary xlsx
+            // to a terminal would be useless); write to a named file for other
+            // formats.
+            let bytes = CsvWriter.write(result, header)?;
             std::io::stdout()
                 .write_all(&bytes)
                 .map_err(|e| e.to_string())?;
@@ -280,53 +284,67 @@ fn write_output(
             let ext = Path::new(path)
                 .extension()
                 .and_then(|e| e.to_str())
-                .unwrap_or("")
+                .unwrap_or("csv")
                 .to_ascii_lowercase();
-            if !ext.is_empty() && ext != "csv" {
-                return Err(format!(
-                    "unsupported output extension '.{ext}' (only '.csv' is supported in v1)"
-                ));
-            }
-            let bytes = CsvWriter.write(result, header);
+            let writer = writer_for_extension(&ext).ok_or_else(|| unsupported_ext(&ext))?;
+            let bytes = writer.write(result, header)?;
             fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
             Ok(OutputTarget::File(PathBuf::from(path)))
         }
         None => {
-            // Honour a `# output:` format directive (csv only in v1).
-            if let Some(fmt) = header.output()
-                && !fmt.trim().is_empty()
-                && !fmt.trim().eq_ignore_ascii_case("csv")
-            {
-                return Err(format!(
-                    "unsupported '# output:' format '{}' (only 'csv' is supported in v1)",
-                    fmt.trim()
-                ));
-            }
-            let path = derived_output_path(report);
-            let bytes = CsvWriter.write(result, header);
+            // The format comes from a `# output:` directive (default csv).
+            let ext = output_extension_from_header(header)?;
+            let writer = writer_for_extension(&ext).ok_or_else(|| unsupported_ext(&ext))?;
+            let path = derived_output_path(report, &ext);
+            let bytes = writer.write(result, header)?;
             fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(OutputTarget::File(path))
         }
     }
 }
 
+/// The output extension implied by a `# output:` directive: its value lowercased
+/// and trimmed (empty ⇒ `csv`). Errors when the named format isn't supported.
+fn output_extension_from_header(header: &Header) -> Result<String, String> {
+    let ext = header
+        .output()
+        .map(|f| f.trim().to_ascii_lowercase())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| "csv".to_string());
+    if writer_for_extension(&ext).is_none() {
+        return Err(format!(
+            "unsupported '# output:' format '{ext}' (supported: {})",
+            OUTPUT_EXTENSIONS.join(", ")
+        ));
+    }
+    Ok(ext)
+}
+
+/// The error for an output extension PaperTrail can't write.
+fn unsupported_ext(ext: &str) -> String {
+    format!(
+        "unsupported output extension '.{ext}' (supported: {})",
+        OUTPUT_EXTENSIONS.join(", ")
+    )
+}
+
 /// The default output path when `-o` is omitted: alongside the report file with
-/// a `.csv` extension, unless the report *name* carries the `{time}` token, in
+/// the `ext` extension, unless the report *name* carries the `{time}` token, in
 /// which case the token-expanded, sanitised name wins (a distinct file per run)
 /// — placed in the report's own folder. Mirrors the TUI's `csv_export_path`.
-fn derived_output_path(report: &Report) -> PathBuf {
+fn derived_output_path(report: &Report, ext: &str) -> PathBuf {
     if name_has_output_token(&report.name) {
         let stem = sanitize_file_stem(&expand_output_tokens(&report.name));
-        let file = format!("{stem}.csv");
+        let file = format!("{stem}.{ext}");
         return match report.path.as_deref().and_then(Path::parent) {
             Some(dir) => dir.join(file),
             None => PathBuf::from(file),
         };
     }
     if let Some(path) = &report.path {
-        return path.with_extension("csv");
+        return path.with_extension(ext);
     }
-    PathBuf::from(format!("{}.csv", sanitize_file_stem(&report.name)))
+    PathBuf::from(format!("{}.{ext}", sanitize_file_stem(&report.name)))
 }
 
 /// Turn a display name into a safe single-segment file stem (path separators and
@@ -400,7 +418,7 @@ mod tests {
         let mut report = Report::from_text("nightly", "# name: nightly\n");
         report.path = Some(PathBuf::from("/reports/nightly.report"));
         assert_eq!(
-            derived_output_path(&report),
+            derived_output_path(&report, "csv"),
             PathBuf::from("/reports/nightly.csv")
         );
     }
@@ -409,7 +427,7 @@ mod tests {
     fn derived_output_path_expands_time_token_next_to_report() {
         let mut report = Report::from_text("run_{time}", "# name: run_{time}\n");
         report.path = Some(PathBuf::from("/reports/nightly.report"));
-        let out = derived_output_path(&report);
+        let out = derived_output_path(&report, "csv");
         let name = out.file_name().unwrap().to_string_lossy();
         // Token expanded (no literal "{time}") and placed in the report's dir.
         assert!(name.starts_with("run_"), "unexpected name: {name}");
@@ -422,7 +440,7 @@ mod tests {
     fn derived_output_path_pathless_report_sanitizes_name() {
         let report = Report::from_text("weird/name", "# name: weird/name\n");
         assert_eq!(
-            derived_output_path(&report),
+            derived_output_path(&report, "csv"),
             PathBuf::from("weird_name.csv")
         );
     }
@@ -496,10 +514,53 @@ mod tests {
             coll.to_string_lossy().into_owned(),
             None,
             report.to_string_lossy().into_owned(),
-            Some(dir.join("out.xlsx").to_string_lossy().into_owned()),
+            Some(dir.join("out.pdf").to_string_lossy().into_owned()),
             true,
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dry_run_writes_each_supported_output_format() {
+        let dir = temp_dir("fmts");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.report");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        for (ext, check) in [
+            (
+                "json",
+                &(|b: &[u8]| b.starts_with(b"{")) as &dyn Fn(&[u8]) -> bool,
+            ),
+            (
+                "html",
+                &(|b: &[u8]| b.starts_with(b"<!DOCTYPE html>")) as &dyn Fn(&[u8]) -> bool,
+            ),
+            (
+                "xlsx",
+                &(|b: &[u8]| b.starts_with(b"PK")) as &dyn Fn(&[u8]) -> bool,
+            ),
+        ] {
+            let out = dir.join(format!("out.{ext}"));
+            let code = run(
+                coll.to_string_lossy().into_owned(),
+                None,
+                report.to_string_lossy().into_owned(),
+                Some(out.to_string_lossy().into_owned()),
+                true, // dry-run: no HTTP
+            );
+            assert_eq!(code, 0, ".{ext} output should succeed");
+            let bytes = fs::read(&out).unwrap();
+            assert!(!bytes.is_empty(), ".{ext} is non-empty");
+            assert!(check(&bytes), ".{ext} has the expected magic/shape");
+        }
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -15514,6 +15514,70 @@ fn report_export_writes_a_csv_next_to_the_report() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The export filename's extension selects the output format: typing an
+/// `.xlsx`/`.json`/`.html` name writes that format, not CSV.
+#[test]
+fn report_export_format_follows_the_typed_extension() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-fmt-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.report");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // .xlsx → a ZIP container (starts with "PK").
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke.xlsx".to_string(),
+    );
+    let xlsx = std::fs::read(dir.join("smoke.xlsx")).unwrap();
+    assert_eq!(&xlsx[..2], b"PK", "xlsx is a ZIP");
+
+    // .json → a JSON document.
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke.json".to_string(),
+    );
+    let json = std::fs::read_to_string(dir.join("smoke.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["rows"][0]["Status"], "200");
+
+    // .html → a self-contained HTML page.
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke.html".to_string(),
+    );
+    let html = std::fs::read_to_string(dir.join("smoke.html")).unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Exporting before a run reports why nothing can be written and does NOT open
 /// the folder picker.
 #[test]

@@ -29,3 +29,8 @@ regex = "1"
 # system timezone via libc (robust in our multithreaded runner, unlike the
 # `time` crate's local-offset guard). Already in the tree via `hurl`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Pure-Rust `.xlsx` writer for report output (no C toolchain needed — its zlib
+# is the Rust `zlib-rs`), so it builds cleanly in this libcurl-`-dev`-less
+# environment. `default-features = false` drops the optional chrono/serde/polars
+# integrations we don't use, keeping the dependency tree small.
+rust_xlsxwriter = { version = "0.96.0", default-features = false }
