@@ -171,6 +171,29 @@ fn loop_body(node: &FlowNode) -> Option<&Vec<FlowNode>> {
     }
 }
 
+/// The source directory of a `FOR … IN FILES/FOLDERS` node, or `None` for any
+/// other node (only these two producers carry a browsable folder).
+fn loop_producer_dir(node: &FlowNode) -> Option<&str> {
+    match node {
+        FlowNode::ForEach { producer, .. } => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Mutable counterpart to [`loop_producer_dir`].
+fn loop_producer_dir_mut(node: &mut FlowNode) -> Option<&mut String> {
+    match node {
+        FlowNode::ForEach { producer, .. } => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Mutable reference to the body Vec addressed by `parent` (empty = top level).
 fn body_at_mut<'a>(flow: &'a mut ReportFlow, parent: &[usize]) -> Option<&'a mut Vec<FlowNode>> {
     let mut body = &mut flow.nodes;
@@ -487,6 +510,10 @@ impl TuiApp {
             KeyCode::End => self.reports[idx].node_selected = last,
             KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
             KeyCode::Enter | KeyCode::Char('e') => self.edit_selected_node(idx),
+            // `f` chooses the source folder for a FOR FILES/FOLDERS loop via the
+            // file browser; on any other node it falls through so the shared
+            // `f` (File menu) still works.
+            KeyCode::Char('f') => return self.open_report_node_folder(idx),
             KeyCode::Delete | KeyCode::Backspace => self.delete_selected_node(idx),
             _ => return false,
         }
@@ -517,6 +544,83 @@ impl TuiApp {
             report_kind: false,
             edit_path: None,
         })));
+    }
+
+    /// Open the file browser to choose the source folder for the selected
+    /// `FOR … IN FILES/FOLDERS` node. Returns `true` when it applied (the
+    /// selection is such a loop), `false` otherwise so the caller falls through
+    /// to the shared `f` (File menu) shortcut. The browser reopens at the
+    /// loop's current folder when it resolves, else the report's own directory;
+    /// the pick is finished on `Space` (see [`Self::commit_report_node_folder`]).
+    fn open_report_node_folder(&mut self, idx: usize) -> bool {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return false;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else {
+            return false;
+        };
+        let path = row.path.clone();
+        let current_dir = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return false;
+            };
+            match node_at(&flow, &path).and_then(loop_producer_dir) {
+                Some(dir) => dir.to_string(),
+                None => return false, // not a FILES/FOLDERS loop
+            }
+        };
+        // Reopen the browser at the loop's current folder when it resolves
+        // (absolute, or relative to the report), else the report's directory.
+        let start = {
+            let p = std::path::Path::new(&current_dir);
+            if !current_dir.is_empty() && p.is_dir() {
+                Some(p.to_path_buf())
+            } else if let Some(base) = self.active_report_base_dir() {
+                let joined = base.join(&current_dir);
+                Some(if joined.is_dir() { joined } else { base })
+            } else {
+                None
+            }
+        };
+        if let Some(dir) = start {
+            self.last_browse_dir = Some(dir);
+        }
+        self.pending_node_folder = Some((self.reports[idx].report.id, path));
+        self.open_browser(crate::tui::app::FileAction::PickReportNodeFolder);
+        true
+    }
+
+    /// Finish a [`crate::tui::app::FileAction::PickReportNodeFolder`] pick:
+    /// write `dir` into the parked loop node's producer, re-serialize,
+    /// revalidate and persist. Called from the browser's `Space` handler.
+    pub(crate) fn commit_report_node_folder(&mut self, dir: &str) {
+        let Some((report_id, path)) = self.pending_node_folder.take() else {
+            return;
+        };
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            let Some(node) = node_at_mut(&mut flow, &path) else {
+                return;
+            };
+            match loop_producer_dir_mut(node) {
+                Some(slot) => *slot = dir.to_string(),
+                None => return,
+            }
+            let text = flow.to_text();
+            rt.report.set_text(text);
+        }
+        self.revalidate_report(idx);
+        self.select_node_path(idx, &path);
+        self.save_state();
     }
 
     /// Edit the selected node: request nodes reopen the request picker (to

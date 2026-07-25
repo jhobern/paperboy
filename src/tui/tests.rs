@@ -16727,3 +16727,62 @@ fn report_node_editor_rejects_an_invalid_edited_line() {
         "the original assignment is untouched after a bad edit"
     );
 }
+
+/// `f` on a `FOR … IN FILES` node opens the folder browser (parking the node)
+/// so the source directory can be chosen without typing a path.
+#[test]
+fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR FILE IN FILES \"docs\"\n    REPORT REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the FOR head (row 1)
+    press(&mut app, KeyCode::Char('f'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
+        ),
+        "f opens the node folder picker"
+    );
+    assert!(app.pending_node_folder.is_some(), "the node is parked");
+}
+
+/// Confirming a folder pick writes the chosen directory into the loop's
+/// producer and re-serializes the flow.
+#[test]
+fn report_node_folder_commit_writes_into_the_loop_producer() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR FILE IN FILES \"old\"\n    REPORT REQUEST upload\nEND\n");
+    app.revalidate_report(idx);
+    app.pending_node_folder = Some((app.reports[idx].report.id, vec![0]));
+    app.commit_report_node_folder("/data/images");
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("/data/images"), "new dir written: {text:?}");
+    assert!(!text.contains("\"old\""), "old dir replaced: {text:?}");
+    assert!(
+        app.pending_node_folder.is_none(),
+        "the park slot is cleared"
+    );
+}
+
+/// `f` on a node that isn't a FILES/FOLDERS loop falls through to the shared
+/// File menu rather than opening the folder picker.
+#[test]
+fn report_node_folder_key_falls_through_on_non_loop_nodes() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select REQUEST Oauth
+    press(&mut app, KeyCode::Char('f'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(_))),
+        "f falls through to the File menu on a non-loop node"
+    );
+    assert!(app.pending_node_folder.is_none());
+}

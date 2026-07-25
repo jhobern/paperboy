@@ -2536,11 +2536,13 @@ impl TuiApp {
             FileAction::SaveReportBaselineChooseFolder => s.report_save_baseline_folder,
             FileAction::OpenReport => s.open_report,
             FileAction::SaveReportChooseFolder => s.save_report_folder,
+            FileAction::PickReportNodeFolder => s.report_node_folder_pick,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
+            FileAction::PickReportNodeFolder => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
             FileAction::SaveCollectionChooseFolder
             | FileAction::SaveReportCsvChooseFolder
@@ -3498,6 +3500,9 @@ impl TuiApp {
                     self.overlay = Some(Overlay::NewRequest(form));
                 } else if action == FileAction::SaveWorkspaceChooseFolder {
                     self.cancel_workspace_save();
+                } else if action == FileAction::PickReportNodeFolder {
+                    // Abandon the folder pick; the node keeps its current dir.
+                    self.pending_node_folder = None;
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -3567,6 +3572,14 @@ impl TuiApp {
                 let root = ex.cwd().clone();
                 self.last_browse_dir = Some(root.clone());
                 self.confirm_workspace_root(root);
+                self.save_state();
+            }
+            KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
+                // Confirm the current directory as the loop's source folder,
+                // writing it into the parked `FOR … IN FILES/FOLDERS` node.
+                let dir = ex.cwd().clone();
+                self.last_browse_dir = Some(dir.clone());
+                self.commit_report_node_folder(&dir.to_string_lossy());
                 self.save_state();
             }
             KeyCode::Char('r') if ctrl => {

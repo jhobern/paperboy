@@ -77,6 +77,13 @@ pub(crate) enum FileAction {
     /// other folder pickers; Enter writes `dir/<name>.report` (extension added
     /// when missing), seeded with the report's name.
     SaveReportChooseFolder,
+    /// Picking a SOURCE FOLDER for a `FOR … IN FILES/FOLDERS` node in the
+    /// structured report editor. Confirms on `Space` (the current directory,
+    /// like `OpenWorkspace`); the chosen path is written into the loop's
+    /// producer `dir`. The target node is parked in
+    /// [`TuiApp::pending_node_folder`] (`FileAction` stays `Copy`, so the node
+    /// path can't live in the variant).
+    PickReportNodeFolder,
 }
 
 impl FileAction {
@@ -974,6 +981,11 @@ pub struct TuiApp {
     /// Restored (with the picked path applied, on success) once the browser
     /// closes. Runtime-only (not persisted).
     pub(crate) parked_wizard: Option<Box<NewReq>>,
+    /// The target `FOR … IN FILES/FOLDERS` node whose source folder is being
+    /// chosen while a [`FileAction::PickReportNodeFolder`] browser is open:
+    /// `(report id, node path)`. The chosen directory is written into that
+    /// loop's producer `dir` on `Space`. Runtime-only (not persisted).
+    pub(crate) pending_node_folder: Option<(u64, Vec<usize>)>,
     /// The inline filename editor shown at the bottom of a "save to folder"
     /// browser (the two `*ChooseFolder` [`FileAction`]s): the file name for a
     /// collection, or the workspace's own subfolder name. Seeded with a
@@ -1081,6 +1093,7 @@ impl Default for TuiApp {
             recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
+            pending_node_folder: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             wizard_return_focus: Pane::List,
@@ -1760,6 +1773,10 @@ impl TuiApp {
             // real write through `FileAction::SaveReport`, so this never reaches
             // here.
             FileAction::SaveReportChooseFolder => {}
+            // Like the folder pickers above: the loop's source folder is
+            // confirmed with `Space` in `input.rs`
+            // (`commit_report_node_folder`), so a file-Enter never reaches here.
+            FileAction::PickReportNodeFolder => {}
         }
     }
 

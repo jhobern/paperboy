@@ -22,8 +22,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   collection's request titles, so names are never mistyped (rows are coloured
   green when the name resolves, amber when it doesn't). **`e`**/Enter edits the
   selected node (request nodes reopen the picker; other nodes open an
-  "edit as line" prompt), **Del**/Backspace removes it, and **Shift+↑/↓** (or
-  `K`/`J`) moves it among its siblings. Both editors are views over the same
+  "edit as line" prompt), **`f`** opens a **folder browser** to choose a
+  `FOR … IN FILES/FOLDERS` loop's source directory (no path typing),
+  **Del**/Backspace removes it, and **Shift+↑/↓** (or `K`/`J`) moves it among
+  its siblings. Both editors are views over the same
   flow AST — every structural edit re-serializes back to the source text — so
   you can freely switch between them, and the logic is front-end agnostic for a
   future GUI. `?` Help and the Reports page document the node keys.
