@@ -217,6 +217,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A file that disappears mid-run now names itself in the error.** When a
+  request loads a local file during a report run (a Base64 file body, or a
+  `[Form]`/`[Multipart]` file) and that file has been deleted since the run's
+  file list was built, the run still emits the row with a non-fatal error (as
+  before) — but the message now includes the missing file's path (e.g.
+  `Base64 file error: /photos/gone.png: No such file or directory`) instead of a
+  bare "No such file", so it's obvious *which* file vanished.
 - **Ctrl+Backspace (word-delete) now works on terminals without the
   keyboard-enhancement protocol.** Such terminals report Ctrl+Backspace as a
   bare **Ctrl+H**, which previously did nothing (or inserted a stray character)

@@ -90,7 +90,12 @@ pub fn stage_out_of_scope_form_files(
                     let name = unique_name(&base, &mut used_names);
                     if let Err(e) = std::fs::copy(&source, stage_dir.join(&name)) {
                         let _ = std::fs::remove_dir_all(&stage_dir);
-                        return Err(e);
+                        // Name the source path (a missing form file listed by a
+                        // loop is the common case); keep `ErrorKind` intact.
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("{}: {e}", source.display()),
+                        ));
                     }
                     staged.insert(source.clone(), name.clone());
                     name
@@ -149,7 +154,15 @@ pub fn expand_base64_form_fields(
                 } else {
                     root.join(raw)
                 };
-                STANDARD.encode(std::fs::read(&source)?)
+                // Name the path in the error (a bare `io::Error` doesn't):
+                // during a report run a file listed by a `FOR FILE` loop can be
+                // deleted between planning and the send, and the run surfaces
+                // this as a non-fatal per-row error — but only usefully if it
+                // says *which* file vanished. Preserve `ErrorKind` so callers
+                // can still detect `NotFound`.
+                let bytes = std::fs::read(&source)
+                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", source.display())))?;
+                STANDARD.encode(bytes)
             };
             f.value = format!("{prefix}{encoded}");
             f.kind = FormFieldKind::Text;
@@ -398,12 +411,53 @@ mod tests {
             missing.to_str().unwrap(),
         )])];
         let result = stage_out_of_scope_form_files(&mut entries, Some(&collection_dir));
+        let err = result
+            .expect_err("a missing source file must surface as an error, not be silently skipped");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the io ErrorKind must be preserved so callers can detect NotFound"
+        );
         assert!(
-            result.is_err(),
-            "a missing source file must surface as an error, not be silently skipped"
+            err.to_string().contains(missing.to_str().unwrap()),
+            "the error must name the missing file, got: {err}"
         );
 
         std::fs::remove_dir_all(&collection_dir).ok();
+    }
+
+    #[test]
+    fn a_missing_base64_file_errors_with_notfound_naming_the_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_stage_test_b64_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file that was listed (e.g. by a FOR FILE loop) but has since
+        // vanished before the send.
+        let gone = dir.join("vanished.png");
+
+        let mut entries = vec![entry_with_form(vec![FormField {
+            key: "image".to_string(),
+            value: gone.to_str().unwrap().to_string(),
+            kind: FormFieldKind::Base64File,
+            content_type: None,
+            base64_prefix: Some("data:image/png;base64,".to_string()),
+            enabled: true,
+        }])];
+        let err = expand_base64_form_fields(&mut entries, Some(&dir))
+            .expect_err("a missing base64 file must surface as a non-fatal error");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "ErrorKind must be preserved as NotFound"
+        );
+        assert!(
+            err.to_string().contains("vanished.png"),
+            "the error must name the missing file, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
