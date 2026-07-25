@@ -446,12 +446,12 @@ pub(crate) enum Overlay {
     /// collection. Opened with `a` (add) or `Enter`/`e` (edit a request node) in
     /// the node view. See [`crate::tui::report_nodes::NodeMenu`].
     ReportNodeMenu(Box<crate::tui::report_nodes::NodeMenu>),
-    /// The structured node editor's field (SHOW) picker
-    /// ([`Overlay::ReportNodeShow`]): a checklist of the fields a `REPORT
-    /// REQUEST` node can emit whose ticked subset becomes its `SHOW(…)` clause.
-    /// Opened with `f` on a `REPORT REQUEST` node. See
-    /// [`crate::tui::report_nodes::ShowPicker`].
-    ReportNodeShow(Box<crate::tui::report_nodes::ShowPicker>),
+    /// The structured node editor's reported-request detail form
+    /// ([`Overlay::ReportNodeRequest`]): configures a `REPORT REQUEST` node's
+    /// response format, `AS` alias and `SHOW(…)` field checklist. Opened with
+    /// `f` on a `REPORT REQUEST` node. See
+    /// [`crate::tui::report_nodes::RequestForm`].
+    ReportNodeRequest(Box<crate::tui::report_nodes::RequestForm>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see

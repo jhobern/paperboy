@@ -16813,18 +16813,18 @@ fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
     (app, idx)
 }
 
-/// `f` on a `REPORT REQUEST` node opens the field (SHOW) picker, whose rows are
+/// `f` on a `REPORT REQUEST` node opens the detail form, whose field rows are
 /// the request's intrinsics plus its `[Reports]` fields, all ticked when the
 /// node has no `SHOW` clause yet (emit everything).
 #[test]
-fn report_node_show_key_opens_the_field_picker() {
+fn report_node_request_form_opens_with_fields() {
     let (mut app, _idx) = node_show_app(&["status", "overall"]);
     press(&mut app, KeyCode::Down); // select REPORT REQUEST upload
     press(&mut app, KeyCode::Char('f'));
-    let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
-        panic!("f opens the SHOW field picker on a REPORT REQUEST node");
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("f opens the request detail form on a REPORT REQUEST node");
     };
-    let names: Vec<&str> = picker.rows.iter().map(|r| r.name.as_str()).collect();
+    let names: Vec<&str> = form.fields.iter().map(|r| r.name.as_str()).collect();
     assert!(
         names.contains(&"status"),
         "shows a [Reports] field: {names:?}"
@@ -16836,7 +16836,7 @@ fn report_node_show_key_opens_the_field_picker() {
     assert!(names.contains(&"Response"), "shows an intrinsic: {names:?}");
     assert!(names.contains(&"Time"), "shows an intrinsic: {names:?}");
     assert!(
-        picker.rows.iter().all(|r| r.included),
+        form.fields.iter().all(|r| r.included),
         "no SHOW clause ⇒ every field ticked"
     );
 }
@@ -16844,13 +16844,13 @@ fn report_node_show_key_opens_the_field_picker() {
 /// Un-ticking a field and applying writes a `SHOW(…)` clause that omits it —
 /// the way to drop a noisy field (e.g. a base64 `Response`) from the report.
 #[test]
-fn report_node_show_apply_writes_a_show_clause_omitting_unticked() {
+fn report_node_request_form_writes_show_omitting_unticked() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Char('f'));
-    // Canonical row order: HttpStatus, Time, Asserts, Error, Response, status.
-    // Move to Response (index 4) and untick it, then apply.
-    for _ in 0..4 {
+    // Rows: 0 response, 1 alias, then fields HttpStatus, Time, Asserts, Error,
+    // Response, status. Response is the 5th field ⇒ row index 2 + 4 = 6.
+    for _ in 0..6 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -16862,13 +16862,13 @@ fn report_node_show_apply_writes_a_show_clause_omitting_unticked() {
         "the un-ticked field is omitted: {text:?}"
     );
     assert!(text.contains("status"), "kept fields remain: {text:?}");
-    assert!(app.overlay.is_none(), "the picker closes on apply");
+    assert!(app.overlay.is_none(), "the form closes on apply");
 }
 
 /// Applying with every field ticked writes no `SHOW` clause (the "emit all"
 /// default), and clears any pre-existing one.
 #[test]
-fn report_node_show_all_ticked_removes_the_clause() {
+fn report_node_request_form_all_ticked_removes_show() {
     let (mut app, idx) = node_show_app(&["status"]);
     app.reports[idx]
         .report
@@ -16876,28 +16876,29 @@ fn report_node_show_all_ticked_removes_the_clause() {
     app.revalidate_report(idx);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Char('f'));
-    // The current SHOW(status) preselects only `status`; tick everything else.
+    // The current SHOW(status) preselects only `status`.
     {
-        let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
-            panic!("picker open");
+        let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+            panic!("form open");
         };
-        let ticked = picker.rows.iter().filter(|r| r.included).count();
+        let ticked = form.fields.iter().filter(|r| r.included).count();
         assert_eq!(ticked, 1, "only the SHOW(status) field is preselected");
     }
-    // Tick every row, then apply.
+    // Move to the first field row, then tick every unticked field.
+    press(&mut app, KeyCode::Down); // -> alias
+    press(&mut app, KeyCode::Down); // -> first field
     let total = {
-        let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+        let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
             unreachable!()
         };
-        picker.rows.len()
+        form.fields.len()
     };
     for i in 0..total {
-        // Ensure each row ends up ticked: toggle only the unticked ones.
         let unticked = {
-            let Some(Overlay::ReportNodeShow(picker)) = &app.overlay else {
+            let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
                 unreachable!()
             };
-            !picker.rows[i].included
+            !form.fields[i].included
         };
         if unticked {
             press(&mut app, KeyCode::Char(' '));
@@ -16914,10 +16915,41 @@ fn report_node_show_all_ticked_removes_the_clause() {
     );
 }
 
-/// `f` on a plain `REQUEST` node (not `REPORT REQUEST`) doesn't open the field
-/// picker — it falls through to the shared File menu.
+/// Typing on the alias row and applying writes an `AS <alias>` clause.
 #[test]
-fn report_node_show_key_ignores_plain_request_nodes() {
+fn report_node_request_form_sets_the_alias() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down); // row 0 (response) -> row 1 (alias)
+    for c in ['p', 'r', 'o', 'c'] {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("AS proc"), "alias is written: {text:?}");
+}
+
+/// Cycling the response row and applying writes a `RESPONSE RAW` clause.
+#[test]
+fn report_node_request_form_sets_the_response_format() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('f'));
+    // Selection starts on the response row; Space cycles Default -> RAW.
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("RESPONSE RAW"),
+        "response format is written: {text:?}"
+    );
+}
+
+/// `f` on a plain `REQUEST` node (not `REPORT REQUEST`) doesn't open the detail
+/// form — it falls through to the shared File menu.
+#[test]
+fn report_node_request_form_ignores_plain_request_nodes() {
     let (mut app, idx) = node_editor_app(&["Oauth"]);
     app.reports[idx]
         .report

@@ -28,7 +28,7 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, WithItem,
+    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, WithItem,
 };
 use crate::report::parse_flow;
 
@@ -443,40 +443,56 @@ impl NodeMenu {
     }
 }
 
-/// One field in the SHOW-field picker.
+/// One selectable field in the reported-request form's field checklist.
 pub(crate) struct ShowRow {
     pub(crate) name: String,
     pub(crate) included: bool,
 }
 
-/// The SHOW-field picker overlay ([`Overlay::ReportNodeShow`]) for a
-/// `REPORT REQUEST` node: a checklist of every field the request can emit
-/// (intrinsics, its `[Reports]` fields and the node's own `WITH` fields) whose
-/// ticked subset is written back as the node's `SHOW(…)` clause. All ticked ⇒
-/// no `SHOW` clause (emit everything, the default). Lets a report drop a noisy
-/// field (e.g. a base64 `Response` blob) without editing the request.
-pub(crate) struct ShowPicker {
+/// The number of fixed head rows (response toggle, alias field) that precede
+/// the field checklist in a [`RequestForm`].
+pub(crate) const REQUEST_FORM_HEAD_ROWS: usize = 2;
+
+/// The reported-request detail form ([`Overlay::ReportNodeRequest`]) for a
+/// `REPORT REQUEST` node: one place to shape how the request is reported without
+/// editing text — its response format (`RESPONSE RAW/PRETTY`), its column
+/// namespace (`AS <alias>`), and which of the fields it can emit are shown
+/// (`SHOW(…)`, e.g. to drop a noisy base64 `Response`).
+///
+/// Rows: index 0 = the response-format toggle, 1 = the alias text field, then
+/// one checkbox per emittable field (intrinsics, then the request's `[Reports]`
+/// fields, then the node's `WITH` fields).
+pub(crate) struct RequestForm {
     /// The report being edited (looked up by id, resilient to tab reorder).
     pub(crate) report_id: u64,
-    /// Path of the `REPORT REQUEST` node whose `show` list this edits.
+    /// Path of the `REPORT REQUEST` node this edits.
     pub(crate) path: Vec<usize>,
     /// The request name (shown in the overlay title).
     pub(crate) request: String,
-    pub(crate) rows: Vec<ShowRow>,
+    /// The `RESPONSE` override: `None` = default (no clause), else RAW/PRETTY.
+    pub(crate) response: Option<ResponseFmt>,
+    /// The `AS <alias>` namespace; empty = no alias (default = the request name).
+    pub(crate) alias: String,
+    /// The `SHOW(…)` field checklist.
+    pub(crate) fields: Vec<ShowRow>,
+    /// Selected row: 0 = response, 1 = alias, `REQUEST_FORM_HEAD_ROWS..` = fields.
     pub(crate) selected: usize,
 }
 
-impl ShowPicker {
-    /// Build the picker for a `REPORT REQUEST` node. Rows are the fields the
-    /// request can emit, in the canonical output order (intrinsics, then its
-    /// `[Reports]` fields, then the node's `WITH` fields), de-duplicated. A row
-    /// is ticked when the current `show` is empty (no clause ⇒ all emitted) or
-    /// names it. Any `show` entry not in that set (a user-typed unknown) is kept
-    /// as a ticked row so applying can't silently drop it.
+impl RequestForm {
+    /// Build the form for a `REPORT REQUEST` node. Field rows are the fields the
+    /// request can emit, in canonical output order (intrinsics, then its
+    /// `[Reports]` fields, then the node's `WITH` fields), de-duplicated. A
+    /// field is ticked when the current `show` is empty (no clause ⇒ all
+    /// emitted) or names it; any unknown `show` entry is kept as a ticked row so
+    /// applying can't silently drop it.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         report_id: u64,
         path: Vec<usize>,
         request: String,
+        alias: Option<String>,
+        response: Option<ResponseFmt>,
         current_show: &[String],
         report_fields: &[String],
         with_fields: &[String],
@@ -501,34 +517,69 @@ impl ShowPicker {
             push(f, &mut names);
         }
         let all = current_show.is_empty();
-        let rows = names
+        let fields = names
             .into_iter()
             .map(|name| {
                 let included = all || current_show.iter().any(|s| s == &name);
                 ShowRow { name, included }
             })
             .collect();
-        ShowPicker {
+        RequestForm {
             report_id,
             path,
             request,
-            rows,
+            response,
+            alias: alias.unwrap_or_default(),
+            fields,
             selected: 0,
         }
     }
 
+    /// The last selectable row index (the two head rows plus the field rows).
+    fn last_row(&self) -> usize {
+        (REQUEST_FORM_HEAD_ROWS + self.fields.len()).saturating_sub(1)
+    }
+
     /// The `SHOW(…)` field list for the ticked rows, in row order. When every
-    /// row is ticked it returns empty (⇒ no `SHOW` clause, the "emit all"
+    /// field is ticked it returns empty (⇒ no `SHOW` clause, the "emit all"
     /// default), so leaving everything on removes any existing clause.
-    fn selection(&self) -> Vec<String> {
-        if self.rows.iter().all(|r| r.included) {
+    fn show(&self) -> Vec<String> {
+        if self.fields.iter().all(|r| r.included) {
             return Vec::new();
         }
-        self.rows
+        self.fields
             .iter()
             .filter(|r| r.included)
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    /// The `AS <alias>` value, `None` when blank.
+    fn alias_opt(&self) -> Option<String> {
+        let a = self.alias.trim();
+        if a.is_empty() {
+            None
+        } else {
+            Some(a.to_string())
+        }
+    }
+
+    /// Cycle the response-format override: Default → RAW → PRETTY → Default
+    /// (reverse when `forward` is false).
+    fn cycle_response(&mut self, forward: bool) {
+        self.response = if forward {
+            match self.response {
+                None => Some(ResponseFmt::Raw),
+                Some(ResponseFmt::Raw) => Some(ResponseFmt::Pretty),
+                Some(ResponseFmt::Pretty) => None,
+            }
+        } else {
+            match self.response {
+                None => Some(ResponseFmt::Pretty),
+                Some(ResponseFmt::Pretty) => Some(ResponseFmt::Raw),
+                Some(ResponseFmt::Raw) => None,
+            }
+        };
     }
 }
 
@@ -717,22 +768,22 @@ impl TuiApp {
     }
 
     /// The `f` key on a node: configure its main detail. A `FOR FILES/FOLDERS`
-    /// loop opens the folder browser; a `REPORT REQUEST` opens the field (SHOW)
-    /// picker. Returns `true` when it handled the node, `false` otherwise so the
-    /// caller falls through to the shared `f` (File menu).
+    /// loop opens the folder browser; a `REPORT REQUEST` opens the request
+    /// detail form (response / alias / fields). Returns `true` when it handled
+    /// the node, `false` otherwise so the caller falls through to the shared
+    /// `f` (File menu).
     fn open_report_node_detail(&mut self, idx: usize) -> bool {
         // `open_report_node_folder` reads-only and returns false (no side
         // effects) when the node isn't a FILES/FOLDERS loop, so it's safe to
-        // try first and fall through to the SHOW picker.
-        self.open_report_node_folder(idx) || self.open_report_node_show(idx)
+        // try first and fall through to the request form.
+        self.open_report_node_folder(idx) || self.open_report_node_request(idx)
     }
 
-    /// Open the field (SHOW) picker for the selected `REPORT REQUEST` node: a
-    /// checklist of every field the request can emit (intrinsics, its
-    /// `[Reports]` fields and the node's own `WITH` fields) whose ticked subset
-    /// becomes the node's `SHOW(…)` clause. Returns `true` when the selection is
-    /// such a node, `false` otherwise so the caller can fall through.
-    fn open_report_node_show(&mut self, idx: usize) -> bool {
+    /// Open the detail form for the selected `REPORT REQUEST` node — its
+    /// response format, `AS` alias and `SHOW(…)` field checklist. Returns `true`
+    /// when the selection is such a node, `false` otherwise so the caller can
+    /// fall through.
+    fn open_report_node_request(&mut self, idx: usize) -> bool {
         let Ok(rows) = self.report_node_rows(idx) else {
             return false;
         };
@@ -744,13 +795,17 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (name, current_show, with_fields) = {
+        let (name, alias, response, current_show, with_fields) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
             match node_at(&flow, &path) {
                 Some(FlowNode::Report(ReportStmt::Request {
-                    name, show, with, ..
+                    name,
+                    alias,
+                    response_fmt,
+                    show,
+                    with,
                 })) => {
                     let with_names: Vec<String> = with
                         .iter()
@@ -759,21 +814,29 @@ impl TuiApp {
                             _ => None,
                         })
                         .collect();
-                    (name.clone(), show.clone(), with_names)
+                    (
+                        name.clone(),
+                        alias.clone(),
+                        *response_fmt,
+                        show.clone(),
+                        with_names,
+                    )
                 }
                 _ => return false, // not a REPORT REQUEST node
             }
         };
         let report_fields = self.request_report_fields(report_id, &name);
-        let picker = ShowPicker::build(
+        let form = RequestForm::build(
             report_id,
             path,
             name,
+            alias,
+            response,
             &current_show,
             &report_fields,
             &with_fields,
         );
-        self.overlay = Some(Overlay::ReportNodeShow(Box::new(picker)));
+        self.overlay = Some(Overlay::ReportNodeRequest(Box::new(form)));
         true
     }
 
@@ -792,69 +855,106 @@ impl TuiApp {
             .unwrap_or_default()
     }
 
-    /// Finish a [`ShowPicker`]: write its ticked subset back as the node's
-    /// `SHOW(…)` clause (empty clause when everything is ticked — the "emit all"
-    /// default), re-serialize, revalidate and persist.
-    pub(crate) fn apply_report_node_show(&mut self, picker: ShowPicker) {
-        let Some(idx) = self.report_index_by_id(picker.report_id) else {
+    /// Finish a [`RequestForm`]: write its response / alias / `SHOW(…)` back onto
+    /// the `REPORT REQUEST` node (a blank alias and all-ticked fields clear the
+    /// respective clauses), re-serialize, revalidate and persist.
+    pub(crate) fn apply_report_node_request(&mut self, form: RequestForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
             return;
         };
-        let show = picker.selection();
+        let show = form.show();
+        let alias = form.alias_opt();
+        let response = form.response;
         {
             let rt = &mut self.reports[idx];
             let Ok(mut flow) = rt.report.flow() else {
                 return;
             };
-            let Some(FlowNode::Report(ReportStmt::Request { show: slot, .. })) =
-                node_at_mut(&mut flow, &picker.path)
+            let Some(FlowNode::Report(ReportStmt::Request {
+                alias: alias_slot,
+                response_fmt,
+                show: show_slot,
+                ..
+            })) = node_at_mut(&mut flow, &form.path)
             else {
                 return;
             };
-            *slot = show;
+            *alias_slot = alias;
+            *response_fmt = response;
+            *show_slot = show;
             let text = flow.to_text();
             rt.report.set_text(text);
         }
         self.revalidate_report(idx);
-        self.select_node_path(idx, &picker.path);
+        self.select_node_path(idx, &form.path);
         self.save_state();
     }
 
-    /// Key handling for the SHOW-field picker overlay
-    /// ([`Overlay::ReportNodeShow`]). Up/Down move; Space/`x` toggle; Enter
-    /// applies and closes; Esc/`q`/any other key cancels (the overlay was
-    /// already `take`n by the dispatcher).
-    pub(crate) fn report_node_show_key_handler(
+    /// Key handling for the reported-request detail form
+    /// ([`Overlay::ReportNodeRequest`]). ↑/↓ (or Tab) move between rows; the
+    /// response row cycles with Space/←/→; the alias row takes typed
+    /// identifier characters and Backspace; field rows toggle with Space/`x`;
+    /// Enter applies and closes; Esc cancels (the overlay was already `take`n by
+    /// the dispatcher).
+    pub(crate) fn report_node_request_key_handler(
         &mut self,
         key: KeyEvent,
-        mut picker: Box<ShowPicker>,
+        mut form: Box<RequestForm>,
     ) {
-        let last = picker.rows.len().saturating_sub(1);
+        let last = form.last_row();
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeRequest(form));
+        };
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = picker.selected.saturating_sub(1);
-                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (picker.selected + 1).min(last);
-                self.overlay = Some(Overlay::ReportNodeShow(picker));
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
             }
-            KeyCode::Home => {
-                picker.selected = 0;
-                self.overlay = Some(Overlay::ReportNodeShow(picker));
-            }
-            KeyCode::End => {
-                picker.selected = last;
-                self.overlay = Some(Overlay::ReportNodeShow(picker));
-            }
-            KeyCode::Char(' ') | KeyCode::Char('x') => {
-                if let Some(row) = picker.rows.get_mut(picker.selected) {
-                    row.included = !row.included;
+            KeyCode::Enter => self.apply_report_node_request(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                match form.selected {
+                    // Response toggle.
+                    0 => match key.code {
+                        KeyCode::Char(' ') | KeyCode::Right => {
+                            form.cycle_response(true);
+                            keep(self, form);
+                        }
+                        KeyCode::Left => {
+                            form.cycle_response(false);
+                            keep(self, form);
+                        }
+                        _ => keep(self, form),
+                    },
+                    // Alias text field (identifier characters only).
+                    1 => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
+                                form.alias.push(c)
+                            }
+                            KeyCode::Backspace => {
+                                form.alias.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    // A field checkbox.
+                    _ => {
+                        let fi = form.selected - REQUEST_FORM_HEAD_ROWS;
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some(row) = form.fields.get_mut(fi)
+                        {
+                            row.included = !row.included;
+                        }
+                        keep(self, form);
+                    }
                 }
-                self.overlay = Some(Overlay::ReportNodeShow(picker));
             }
-            KeyCode::Enter => self.apply_report_node_show(*picker),
-            // Esc / q / any other key: cancel (overlay stays taken).
-            _ => {}
         }
     }
 

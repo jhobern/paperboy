@@ -179,48 +179,85 @@ fn draw_report_columns_overlay(
     }
 }
 
-/// Draw the report node SHOW-field picker overlay
-/// ([`Overlay::ReportNodeShow`]): a scrollable checklist of the fields the
-/// selected `REPORT REQUEST` node can emit. The selected row is highlighted;
-/// ticked rows are kept, unticked ones are dropped from the node's `SHOW(…)`.
-fn draw_report_node_show_overlay(
+/// Draw the reported-request detail form overlay
+/// ([`Overlay::ReportNodeRequest`]): a scrollable form for a `REPORT REQUEST`
+/// node — the response-format toggle and alias field on top, then a checklist
+/// of the fields the request can emit. The selected row is highlighted; ticked
+/// fields are kept, unticked ones are dropped from the node's `SHOW(…)`.
+fn draw_report_node_request_overlay(
     f: &mut Frame,
-    picker: &super::report_nodes::ShowPicker,
+    form: &super::report_nodes::RequestForm,
     s: &Strings,
     th: &Theme,
 ) {
+    use super::report_nodes::REQUEST_FORM_HEAD_ROWS;
     let title = format!(
         "{} {}  ({})",
-        s.report_node_show_title, picker.request, s.report_node_show_hint
+        s.report_node_request_title, form.request, s.report_node_request_hint
     );
-    let n = picker.rows.len();
+    let n = REQUEST_FORM_HEAD_ROWS + form.fields.len();
     let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
     let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
     let area = centered_rect(box_w, box_h, f.area());
     f.render_widget(Clear, area);
     let inner_h = area.height.saturating_sub(2) as usize;
-    let scroll = if picker.selected >= inner_h {
-        picker.selected + 1 - inner_h
+    let scroll = if form.selected >= inner_h {
+        form.selected + 1 - inner_h
     } else {
         0
     };
+    // Row 0 = response toggle, row 1 = alias, rows 2.. = field checkboxes.
+    let response_label = match form.response {
+        None => s.report_node_response_default,
+        Some(crate::report::flow::ResponseFmt::Raw) => "RAW",
+        Some(crate::report::flow::ResponseFmt::Pretty) => "PRETTY",
+    };
+    let alias_shown = if form.alias.is_empty() {
+        s.report_node_alias_none
+    } else {
+        form.alias.as_str()
+    };
+    let head = [
+        format!("{}: ‹{}›", s.report_node_response_label, response_label),
+        format!("{}: {}", s.report_node_alias_label, alias_shown),
+    ];
     let mut lines: Vec<Line> = Vec::new();
-    for (i, row) in picker.rows.iter().enumerate().skip(scroll).take(inner_h) {
-        let mark = if row.included { "[x]" } else { "[ ]" };
-        let base = if i == picker.selected {
+    for i in scroll..n.min(scroll + inner_h) {
+        let selected = i == form.selected;
+        let base = if selected {
             Style::default()
                 .fg(th.bg)
                 .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.included {
-            Style::default().fg(th.text)
         } else {
-            Style::default().fg(th.dim)
+            Style::default().fg(th.text)
         };
-        lines.push(Line::from(Span::styled(
-            format!("{mark} {}", row.name),
-            base,
-        )));
+        match head.get(i) {
+            Some(text) => {
+                // A head row (response toggle / alias field): show a text cursor
+                // on the alias field when it's selected.
+                let mut text = text.clone();
+                if selected && i == 1 {
+                    text.push('▏');
+                }
+                lines.push(Line::from(Span::styled(text, base)));
+            }
+            None => {
+                let row = &form.fields[i - REQUEST_FORM_HEAD_ROWS];
+                let mark = if row.included { "[x]" } else { "[ ]" };
+                let style = if selected {
+                    base
+                } else if row.included {
+                    Style::default().fg(th.text)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{mark} {}", row.name),
+                    style,
+                )));
+            }
+        }
     }
     f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
     if n > inner_h {
@@ -2548,8 +2585,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th);
         }
-        Overlay::ReportNodeShow(picker) => {
-            draw_report_node_show_overlay(f, picker, s, th);
+        Overlay::ReportNodeRequest(form) => {
+            draw_report_node_request_overlay(f, form, s, th);
         }
         Overlay::Prompt {
             kind,
