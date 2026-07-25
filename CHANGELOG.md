@@ -12,6 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Undo in the structured node editor (Ctrl+Z).** The node editor now keeps a
+  per-report undo stack: every structural edit (insert, replace/edit, delete,
+  move, folder pick, and the REPORT REQUEST detail form) snapshots the flow
+  first, so **Ctrl+Z** takes back an accidental change — restoring both the
+  source and the node selection — and can be pressed repeatedly to step back
+  through the session's edits. It mirrors the source editor's Ctrl+Z, and a
+  brief status confirms each undo (or notes when there's nothing left to undo).
+
 - **PaperTrail reports — structured node editor.** Press **`n`** in a report to
   switch the flow between the source text and a new keyboard-driven *node*
   editor: the flow is shown as a navigable outline (a "Begin" root, one row per

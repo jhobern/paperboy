@@ -125,6 +125,12 @@ pub(crate) struct ReportTab {
     /// flattened node rows; clamped on draw). Structural edits move it to track
     /// the affected node.
     pub(crate) node_selected: usize,
+    /// Undo stack for the structured node editor. Every structural node edit
+    /// snapshots the pre-edit source text + node selection here (via
+    /// [`ReportTab::set_text_undoable`]) so **Ctrl+Z** can restore the previous
+    /// state exactly — the node editor's counterpart to the source editor's
+    /// in-buffer undo. In-memory and per-tab (not persisted), like text undo.
+    pub(crate) node_undo: Vec<NodeUndo>,
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
@@ -132,6 +138,21 @@ pub(crate) struct ReportTab {
     /// row stays on one line and columns line up, like program output).
     pub(crate) results_panel: MultiSelectPanel,
 }
+
+/// One entry on a report's node-editor undo stack: a full snapshot of the
+/// source text plus the node-outline selection, captured immediately before a
+/// structural edit so [`TuiApp::undo_report_node`] can restore both. Whole-text
+/// snapshots keep undo trivially correct (every restored state is a valid flow)
+/// at the cost of a little memory — fine for the handful of edits in a report.
+#[derive(Clone)]
+pub(crate) struct NodeUndo {
+    pub(crate) text: String,
+    pub(crate) node_selected: usize,
+}
+
+/// The most snapshots a single report keeps for node-editor undo. Generous for
+/// interactive editing while bounding memory on a long session.
+const NODE_UNDO_LIMIT: usize = 200;
 
 /// Which pane a report tab's body shows.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -202,9 +223,27 @@ impl ReportTab {
             view: ReportView::Source,
             editor_view: ReportView::Source,
             node_selected: 0,
+            node_undo: Vec::new(),
             result: None,
             results_panel,
         }
+    }
+
+    /// Snapshot the current source text + node selection onto the node-editor
+    /// undo stack, then swap in `new_text`. The single choke point every
+    /// structural node edit routes its re-serialized flow through, so
+    /// [`TuiApp::undo_report_node`] (Ctrl+Z) can revert the prior state exactly.
+    /// The stack is bounded to [`NODE_UNDO_LIMIT`].
+    pub(crate) fn set_text_undoable(&mut self, new_text: String) {
+        self.node_undo.push(NodeUndo {
+            text: self.report.text.clone(),
+            node_selected: self.node_selected,
+        });
+        if self.node_undo.len() > NODE_UNDO_LIMIT {
+            let overflow = self.node_undo.len() - NODE_UNDO_LIMIT;
+            self.node_undo.drain(0..overflow);
+        }
+        self.report.set_text(new_text);
     }
 }
 

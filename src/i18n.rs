@@ -430,7 +430,7 @@ strings! {
     help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
     help_report_nodes => "toggle between the source text and the structured node editor", "basculer entre le texte source et l'éditeur de nœuds structuré", "skift mellem kildeteksten og den strukturerede node-editor";
-    help_report_nodes_edit => "in the node editor: a add · e/Enter edit · f folder/detail · Del remove · Shift+↑/↓ move", "dans l'éditeur de nœuds : a ajouter · e/Entrée modifier · f dossier/détail · Suppr retirer · Maj+↑/↓ déplacer", "i node-editoren: a tilføj · e/Enter rediger · f mappe/detalje · Del fjern · Skift+↑/↓ flyt";
+    help_report_nodes_edit => "in the node editor: a add · e/Enter edit · f folder/detail · Del remove · Shift+↑/↓ move · Ctrl+Z undo", "dans l'éditeur de nœuds : a ajouter · e/Entrée modifier · f dossier/détail · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler", "i node-editoren: a tilføj · e/Enter rediger · f mappe/detalje · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd";
     help_report_focus_cycle => "cycle focus: editor → results → tab list → editor", "faire défiler le focus : éditeur → résultats → liste des onglets → éditeur", "skift fokus: editor → resultater → faneliste → editor";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_report_baseline => "save the last run as a .baseline snapshot to compare future runs against", "enregistrer la dernière exécution comme instantané .baseline pour comparer les exécutions futures", "gem den seneste kørsel som et .baseline-øjebliksbillede at sammenligne fremtidige kørsler med";
@@ -536,7 +536,7 @@ strings! {
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
-    report_nodes_hint => "a add · e edit · f folder/detail · Del remove · Shift+↑/↓ move · n source", "a ajouter · e modifier · f dossier/détail · Suppr retirer · Maj+↑/↓ déplacer · n source", "a tilføj · e rediger · f mappe/detalje · Del fjern · Skift+↑/↓ flyt · n kilde";
+    report_nodes_hint => "a add · e edit · f folder/detail · Del remove · Shift+↑/↓ move · Ctrl+Z undo · n source", "a ajouter · e modifier · f dossier/détail · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · n source", "a tilføj · e rediger · f mappe/detalje · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · n kilde";
     report_nodes_parse_error => "Fix the source before editing as nodes", "Corrigez la source avant de modifier en nœuds", "Ret kilden før redigering som noder";
     report_node_begin => "Begin", "Début", "Start";
     node_menu_title => "Add Node", "Ajouter un nœud", "Tilføj node";
@@ -555,6 +555,8 @@ strings! {
     report_node_edit_title => "Edit Node Line", "Modifier la ligne du nœud", "Rediger nodelinje";
     report_node_edit_hint => "Enter apply · Esc cancel", "Entrée appliquer · Échap annuler", "Enter anvend · Esc annuller";
     report_node_line_invalid => "Not a valid statement", "Instruction non valide", "Ikke en gyldig sætning";
+    report_node_undone => "Undid last node change", "Dernière modification de nœud annulée", "Fortrød sidste nodeændring";
+    report_node_undo_empty => "Nothing to undo", "Rien à annuler", "Intet at fortryde";
     report_node_folder_pick => "Choose loop folder", "Choisir le dossier de la boucle", "Vælg løkkemappe";
     report_node_request_title => "Reported request:", "Requête rapportée :", "Rapporteret forespørgsel:";
     report_node_request_hint => "↑↓ move · Space toggle/cycle · type alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum skift/skift · skriv alias · Enter anvend · Esc annuller";
@@ -688,6 +690,10 @@ pub enum Status {
     /// A report couldn't be run or exported; holds an already-translated reason
     /// (built from [`Strings`] at the call site).
     ReportRunBlocked(String),
+    /// A structural node edit was reverted with Ctrl+Z (node-editor undo).
+    ReportNodeUndone(String),
+    /// Ctrl+Z was pressed in the node editor with an empty undo stack.
+    ReportNodeNothingToUndo(String),
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
     /// A report's last run was saved as a `.baseline` snapshot; holds its path.
@@ -732,6 +738,7 @@ impl Status {
                     | Status::ReportBaselineSaved(_)
                     | Status::ReportColumnsApplied
                     | Status::ReportBound(_)
+                    | Status::ReportNodeUndone(_)
             ),
         }
     }
@@ -820,6 +827,8 @@ impl Status {
                 }
             }
             Status::ReportRunBlocked(reason) => reason.clone(),
+            Status::ReportNodeUndone(msg) => msg.clone(),
+            Status::ReportNodeNothingToUndo(msg) => msg.clone(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
             Status::ReportBaselineSaved(path) => {
                 format!("{} {path}", s.report_baseline_saved_prefix)

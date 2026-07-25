@@ -638,6 +638,13 @@ impl TuiApp {
         self.reports[idx].node_selected = sel;
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Ctrl+Z reverts the last structural edit (insert/replace/delete/
+            // move/folder/detail) — the node editor's undo, mirroring the source
+            // editor's in-buffer Ctrl+Z so an accidental change is easy to take
+            // back.
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.undo_report_node(idx)
+            }
             KeyCode::Up if shift => self.move_selected_node(idx, true),
             KeyCode::Down if shift => self.move_selected_node(idx, false),
             KeyCode::Char('K') => self.move_selected_node(idx, true),
@@ -760,7 +767,7 @@ impl TuiApp {
                 None => return,
             }
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
         }
         self.revalidate_report(idx);
         self.select_node_path(idx, &path);
@@ -883,7 +890,7 @@ impl TuiApp {
             *response_fmt = response;
             *show_slot = show;
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
         }
         self.revalidate_report(idx);
         self.select_node_path(idx, &form.path);
@@ -1138,7 +1145,7 @@ impl TuiApp {
             };
             insert_node(&mut flow, pos, node);
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
         }
         self.revalidate_report(idx);
         self.select_node_path(idx, &path);
@@ -1158,7 +1165,7 @@ impl TuiApp {
                 return;
             }
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
         }
         self.revalidate_report(idx);
         self.select_node_path(idx, path);
@@ -1186,7 +1193,7 @@ impl TuiApp {
                 return;
             }
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
         }
         self.revalidate_report(idx);
         // Selection stays at `sel`; the draw pass clamps it to the new length.
@@ -1214,12 +1221,35 @@ impl TuiApp {
                 return; // at a boundary — nothing to do
             };
             let text = flow.to_text();
-            rt.report.set_text(text);
+            rt.set_text_undoable(text);
             np
         };
         self.revalidate_report(idx);
         self.select_node_path(idx, &new_path);
         self.save_state();
+    }
+
+    /// Undo the last structural node edit (Ctrl+Z in the node editor): pop the
+    /// most recent snapshot off this report's [`node_undo`](crate::tui::reports::ReportTab::node_undo)
+    /// stack and restore its source text and node selection, then revalidate and
+    /// persist. Does nothing (with a brief status) when the stack is empty.
+    fn undo_report_node(&mut self, idx: usize) {
+        let Some(snap) = self.reports[idx].node_undo.pop() else {
+            let s = Strings::for_language(&self.language);
+            self.status = Some(Status::ReportNodeNothingToUndo(
+                s.report_node_undo_empty.to_string(),
+            ));
+            return;
+        };
+        {
+            let rt = &mut self.reports[idx];
+            rt.report.set_text(snap.text);
+            rt.node_selected = snap.node_selected;
+        }
+        self.revalidate_report(idx);
+        self.save_state();
+        let s = Strings::for_language(&self.language);
+        self.status = Some(Status::ReportNodeUndone(s.report_node_undone.to_string()));
     }
 
     /// Commit an edited node line (from [`PromptKind::ReportNodeLine`]): re-parse

@@ -16649,6 +16649,73 @@ fn report_node_editor_deletes_the_selected_node() {
     assert!(text.contains("REQUEST Second"), "sibling kept: {text:?}");
 }
 
+/// Ctrl+Z in the node editor reverts the last structural edit (here a delete),
+/// restoring both the source text and the node selection.
+#[test]
+fn report_node_editor_ctrl_z_undoes_a_delete() {
+    let (mut app, idx) = node_editor_app(&["Oauth", "Second"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\nREQUEST Second\n");
+    app.revalidate_report(idx);
+    let before = app.reports[idx].report.text.clone();
+    // Delete the first statement.
+    press(&mut app, KeyCode::Down);
+    let sel_before = app.reports[idx].node_selected;
+    press(&mut app, KeyCode::Delete);
+    assert!(!app.reports[idx].report.text.contains("REQUEST Oauth"));
+    // Ctrl+Z brings it back exactly, and restores the selection.
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].report.text, before,
+        "undo restores the pre-delete source"
+    );
+    assert_eq!(
+        app.reports[idx].node_selected, sel_before,
+        "undo restores the node selection"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportNodeUndone(_))
+    ));
+}
+
+/// Ctrl+Z undoes successive edits in reverse order, then reports an empty
+/// stack once there is nothing left to undo.
+#[test]
+fn report_node_editor_ctrl_z_is_multi_level() {
+    let (mut app, idx) = node_editor_app(&["First", "Second"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST First\nREQUEST Second\n");
+    app.revalidate_report(idx);
+    let start = app.reports[idx].report.text.clone();
+    // Two deletes in a row.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Delete); // removes First
+    press(&mut app, KeyCode::Delete); // removes Second
+    let after_two = app.reports[idx].report.text.clone();
+    assert!(!after_two.contains("REQUEST First"));
+    assert!(!after_two.contains("REQUEST Second"));
+    // Undo twice returns to the starting text.
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].report.text, start,
+        "two undos restore start"
+    );
+    // A third undo has nothing to revert.
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReportNodeNothingToUndo(_))
+    ));
+    assert_eq!(
+        app.reports[idx].report.text, start,
+        "text unchanged when empty"
+    );
+}
+
 /// Shift+Down moves the selected node past its next sibling (reordering the
 /// flow).
 #[test]
