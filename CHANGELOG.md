@@ -12,6 +12,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Reports warn up front when a `# baseline:` snapshot is missing.** If a
+  report references a saved `.baseline` snapshot that isn't on disk, the report
+  view (and the CLI) now flag it as a warning while you edit — instead of only
+  finding out mid-run that there's nothing to compare against.
+
 - **Reports export to JSON, HTML and Excel, not just CSV.** A report's results
   can now be written in four formats, chosen by the output file's extension (or a
   `# output:` header): **CSV**, **JSON** (a `{ columns, rows }` document),

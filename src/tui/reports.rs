@@ -556,10 +556,16 @@ impl TuiApp {
                     });
                     let env_names: Vec<String> =
                         self.global_envs.iter().map(|e| e.name.clone()).collect();
+                    // Anchor the filesystem checks (e.g. the `# baseline:`
+                    // snapshot existence warning) at the report's resolved base
+                    // directory, but only when it's anchored (saved / `# root:`)
+                    // so a scratch report doesn't warn against the CWD.
+                    let (base_dir, anchored) = report_base_dir(&rt.report);
                     let ctx = Context {
                         request_titles: titles.as_deref(),
                         env_names: Some(&env_names),
                         request_fields: fields.as_deref(),
+                        root: anchored.then_some(base_dir.as_path()),
                     };
                     (None, None, validate(&flow, &ctx))
                 }

@@ -60,6 +60,11 @@ pub struct Context<'a> {
     /// against the fields the request can actually produce. `None` when no
     /// collection is bound (the check is then skipped).
     pub request_fields: Option<&'a [(String, Vec<String>)]>,
+    /// The directory relative paths resolve against (the report's folder or a
+    /// `# root:` override). When present, a `# baseline:` snapshot that doesn't
+    /// exist on disk is flagged so the user finds out before running rather
+    /// than after. `None` skips the filesystem check (e.g. an unsaved report).
+    pub root: Option<&'a std::path::Path>,
 }
 
 /// Validate `flow` against `ctx`, returning all diagnostics (errors + warnings).
@@ -74,12 +79,18 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error("'# collection:' is empty")),
         Some(_) => {}
     }
-    if let Some(out) = flow.header.output()
-        && !out.trim().eq_ignore_ascii_case("csv")
-    {
-        diags.push(Diagnostic::error(format!(
-            "unsupported output format '{out}' (only 'csv' is supported in v1)"
-        )));
+    if let Some(out) = flow.header.output() {
+        let out = out.trim();
+        if !out.is_empty()
+            && !super::writer::OUTPUT_EXTENSIONS
+                .iter()
+                .any(|e| out.eq_ignore_ascii_case(e))
+        {
+            diags.push(Diagnostic::error(format!(
+                "unsupported output format '{out}' (supported: {})",
+                super::writer::OUTPUT_EXTENSIONS.join(", ")
+            )));
+        }
     }
     // An optional `# environment:` names a single already-loaded environment to
     // use as the report's base variable layer (the plain, no-comparison run).
@@ -108,6 +119,23 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         diags.push(Diagnostic::warning(
             "'# baseline:' is ignored because the flow already has an ENVS BASELINE/COMPARISON comparison",
         ));
+    } else if let Some(rel) = flow
+        .header
+        .baseline()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        && let Some(root) = ctx.root
+    {
+        // The snapshot will be diffed against at finalize time; a missing file
+        // there is only a non-fatal run error, so warn up front (once the
+        // report is anchored) that the referenced snapshot can't be found.
+        let path = super::producers::resolve_path(Some(root), rel);
+        if !path.exists() {
+            diags.push(Diagnostic::warning(format!(
+                "baseline snapshot '{rel}' was not found ({})",
+                path.display()
+            )));
+        }
     }
 
     if ctx.request_titles.is_none() {
@@ -565,7 +593,7 @@ mod tests {
     fn unsupported_output_format_is_an_error() {
         let t = titles();
         assert!(has_err(
-            "# collection: ./c.hurl\n# output: xlsx\nREQUEST Oauth\n",
+            "# collection: ./c.hurl\n# output: pdf\nREQUEST Oauth\n",
             Some(&t),
             None,
             "unsupported output format"
@@ -581,6 +609,22 @@ mod tests {
             None,
             "unsupported"
         ));
+    }
+
+    #[test]
+    fn xlsx_json_html_outputs_are_accepted() {
+        let t = titles();
+        for fmt in ["xlsx", "json", "html"] {
+            assert!(
+                !has_err(
+                    &format!("# collection: ./c.hurl\n# output: {fmt}\nREQUEST Oauth\n"),
+                    Some(&t),
+                    None,
+                    "unsupported"
+                ),
+                "format {fmt} should be accepted"
+            );
+        }
     }
 
     #[test]
@@ -749,6 +793,60 @@ mod tests {
             !warns.iter().any(|m| m.contains("'# baseline:'")),
             "a plain baseline diff should not warn: {warns:?}"
         );
+    }
+
+    #[test]
+    fn missing_baseline_snapshot_warns_when_anchored() {
+        // With a known base directory, a `# baseline:` naming a file that isn't
+        // there is surfaced as a warning up front (not silently at run time).
+        let dir = std::env::temp_dir().join(format!("pb-vbl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flow = parse_flow(
+            "# collection: ./c.hurl\n# baseline: missing.baseline\nREPORT REQUEST Oauth\n",
+        )
+        .unwrap();
+        let t = titles();
+        let ctx = Context {
+            request_titles: Some(&t),
+            root: Some(dir.as_path()),
+            ..Default::default()
+        };
+        let warns: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            warns.iter().any(|m| m.contains("was not found")),
+            "expected a missing-snapshot warning: {warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn present_baseline_snapshot_does_not_warn() {
+        let dir = std::env::temp_dir().join(format!("pb-vbl-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prev.baseline"), "{}").unwrap();
+        let flow =
+            parse_flow("# collection: ./c.hurl\n# baseline: prev.baseline\nREPORT REQUEST Oauth\n")
+                .unwrap();
+        let t = titles();
+        let ctx = Context {
+            request_titles: Some(&t),
+            root: Some(dir.as_path()),
+            ..Default::default()
+        };
+        let warns: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !warns.iter().any(|m| m.contains("was not found")),
+            "an existing snapshot should not warn: {warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

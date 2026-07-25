@@ -126,10 +126,19 @@ pub fn run(
         })
         .collect();
     let env_names: Vec<String> = named_envs.keys().cloned().collect();
+    // Relative producer paths (and the `# baseline:` snapshot) resolve against
+    // `# root:` if set, else the report file's own directory. Computed here so
+    // validation's baseline-existence check and the run context agree.
+    let report_dir = report.path.as_deref().and_then(Path::parent);
+    let root: Option<PathBuf> = match flow.header.root() {
+        Some(r) if !r.trim().is_empty() => Some(resolve_path(report_dir, r)),
+        _ => report_dir.map(Path::to_path_buf),
+    };
     let ctx = Context {
         request_titles: Some(&titles),
         env_names: Some(&env_names),
         request_fields: Some(&fields),
+        root: root.as_deref(),
     };
     let diags = validate(&flow, &ctx);
     let has_error = diags.iter().any(|d| d.severity == Severity::Error);
@@ -146,13 +155,6 @@ pub fn run(
     }
 
     // --- run context -----------------------------------------------------
-    let report_dir = report.path.as_deref().and_then(Path::parent);
-    // Relative producer paths resolve against `# root:` if set, else the report
-    // file's own directory.
-    let root: Option<PathBuf> = match flow.header.root() {
-        Some(r) if !r.trim().is_empty() => Some(resolve_path(report_dir, r)),
-        _ => report_dir.map(Path::to_path_buf),
-    };
     // Live requests are rooted at the collection's directory so relative
     // form-file paths resolve as they would when sent by hand.
     let file_root = Path::new(&collection_path).parent().map(Path::to_path_buf);
