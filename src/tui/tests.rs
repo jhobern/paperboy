@@ -16525,3 +16525,205 @@ fn report_fields_survive_an_edit_that_changes_nothing_else() {
         vec![("status".to_string(), "jsonpath \"$.status\"".to_string())]
     );
 }
+
+// ---------------------------------------------------------------------------
+// P12 — the structured ("node") report editor
+// ---------------------------------------------------------------------------
+
+/// Build an app with one collection ("api") holding the named requests and a
+/// report bound to it, left on the node view. Returns the `self.reports` index.
+fn node_editor_app(requests: &[&str]) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let entries = requests
+        .iter()
+        .map(|name| HurlEntry {
+            title: (*name).to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        })
+        .collect();
+    app.collections
+        .push(Collection::new("api".to_string(), entries));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("# collection: api\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('n')); // Source -> Nodes
+    (app, idx)
+}
+
+/// `n` flips the report between the source text editor and the structured node
+/// editor, and back.
+#[test]
+fn report_n_key_toggles_the_node_view() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.reports[idx].view, ReportView::Nodes);
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+}
+
+/// A flow flattens to a Begin root plus one row per statement, with a loop
+/// rendered as a `FOR` head, its nested body, and a synthetic `END` row.
+#[test]
+fn report_node_rows_flatten_a_flow_into_an_outline() {
+    use super::report_nodes::RowKind;
+    let (mut app, idx) = node_editor_app(&["Oauth", "upload"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREQUEST Oauth\nFOR FILE IN FILES \"/docs\"\n    REPORT REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("flow parses");
+    let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            RowKind::Begin,
+            RowKind::Leaf,     // REQUEST Oauth
+            RowKind::LoopHead, // FOR FILE IN FILES
+            RowKind::Leaf,     // REPORT REQUEST upload (nested)
+            RowKind::LoopEnd,  // END
+        ]
+    );
+    // The nested report row is one level deeper than the loop head.
+    assert_eq!(rows[3].depth, rows[2].depth + 1);
+    // `upload` resolves in the bound collection (green); the loop head has no
+    // request name.
+    assert_eq!(rows[3].req_ok, Some(true));
+    assert_eq!(rows[2].req_ok, None);
+}
+
+/// A request-row's colour flag reflects whether the name resolves in the bound
+/// collection (green when found, amber when not).
+#[test]
+fn report_node_rows_flag_unresolved_request_names() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\nREQUEST Missing\n");
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).unwrap();
+    assert_eq!(rows[1].req_ok, Some(true), "Oauth resolves");
+    assert_eq!(rows[2].req_ok, Some(false), "Missing does not resolve");
+}
+
+/// Inserting a REQUEST node: `a` opens the palette (kind 0 = REQUEST), Enter
+/// advances to the request picker, Enter commits the first request into the
+/// flow text.
+#[test]
+fn report_node_editor_inserts_a_request_via_the_picker() {
+    let (mut app, idx) = node_editor_app(&["Oauth", "CreateSession"]);
+    // Selection starts on Begin (row 0); `a` opens the insert palette.
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
+    // Kind 0 = REQUEST; Enter advances to the request picker.
+    press(&mut app, KeyCode::Enter);
+    // Pick the first request (Oauth) and commit.
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none(), "committing closes the palette");
+    assert!(
+        app.reports[idx].report.text.contains("REQUEST Oauth"),
+        "the picked request is written into the flow: {:?}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Deleting the selected node removes its statement from the flow.
+#[test]
+fn report_node_editor_deletes_the_selected_node() {
+    let (mut app, idx) = node_editor_app(&["Oauth", "Second"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST Oauth\nREQUEST Second\n");
+    app.revalidate_report(idx);
+    // Move onto the first statement (row 1) and delete it.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Delete);
+    let text = &app.reports[idx].report.text;
+    assert!(!text.contains("REQUEST Oauth"), "deleted: {text:?}");
+    assert!(text.contains("REQUEST Second"), "sibling kept: {text:?}");
+}
+
+/// Shift+Down moves the selected node past its next sibling (reordering the
+/// flow).
+#[test]
+fn report_node_editor_moves_a_node_down() {
+    let (mut app, idx) = node_editor_app(&["First", "Second"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST First\nREQUEST Second\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select row 1 (REQUEST First)
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)); // move it down
+    let flow = app.reports[idx].report.flow().unwrap();
+    let names: Vec<Option<&str>> = flow.nodes.iter().map(|n| n.request_name()).collect();
+    assert_eq!(
+        names,
+        vec![Some("Second"), Some("First")],
+        "First moved below Second"
+    );
+}
+
+/// Editing a non-request node "as a line" (Enter on an assignment) opens the
+/// prompt seeded with the node's source; committing edited text re-parses it
+/// back into the flow.
+#[test]
+fn report_node_editor_edits_a_line_and_roundtrips() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nURL=old\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the assignment row
+    press(&mut app, KeyCode::Enter); // open the "edit as line" prompt
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::ReportNodeLine { .. },
+                ..
+            })
+        ),
+        "Enter on an assignment opens the line prompt"
+    );
+    // Replace the whole line with a new assignment.
+    if let Some(Overlay::Prompt { editor, .. }) = app.overlay.as_mut() {
+        *editor = super::editor::Editor::new("URL=new.example", false);
+    }
+    press(&mut app, KeyCode::Enter); // commit
+    assert!(app.overlay.is_none());
+    let flow = app.reports[idx].report.flow().unwrap();
+    assert!(
+        matches!(&flow.nodes[0], crate::report::flow::FlowNode::Assign { key, value } if key == "URL" && value == "new.example"),
+        "the edited assignment is parsed back: {:?}",
+        flow.nodes
+    );
+}
+
+/// An invalid edited line is rejected (statement unchanged) and reports the
+/// problem instead of corrupting the flow.
+#[test]
+fn report_node_editor_rejects_an_invalid_edited_line() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nURL=keep\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    if let Some(Overlay::Prompt { editor, .. }) = app.overlay.as_mut() {
+        // A dangling FOR with no END never yields a single statement.
+        *editor = super::editor::Editor::new("FOR", false);
+    }
+    press(&mut app, KeyCode::Enter);
+    let flow = app.reports[idx].report.flow().unwrap();
+    assert!(
+        matches!(&flow.nodes[0], crate::report::flow::FlowNode::Assign { key, .. } if key == "URL"),
+        "the original assignment is untouched after a bad edit"
+    );
+}

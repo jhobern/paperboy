@@ -429,6 +429,8 @@ strings! {
     help_report_run => "run the report and show its results grid", "exécuter le rapport et afficher sa grille de résultats", "kør rapporten og vis resultatgitteret";
     help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
+    help_report_nodes => "toggle between the source text and the structured node editor", "basculer entre le texte source et l'éditeur de nœuds structuré", "skift mellem kildeteksten og den strukturerede node-editor";
+    help_report_nodes_edit => "in the node editor: a add · e/Enter edit · Del remove · Shift+↑/↓ move", "dans l'éditeur de nœuds : a ajouter · e/Entrée modifier · Suppr retirer · Maj+↑/↓ déplacer", "i node-editoren: a tilføj · e/Enter rediger · Del fjern · Skift+↑/↓ flyt";
     help_report_focus_cycle => "cycle focus: editor → results → tab list → editor", "faire défiler le focus : éditeur → résultats → liste des onglets → éditeur", "skift fokus: editor → resultater → faneliste → editor";
     help_report_export => "export the last run to a CSV file", "exporter la dernière exécution vers un fichier CSV", "eksportér den seneste kørsel til en CSV-fil";
     help_report_baseline => "save the last run as a .baseline snapshot to compare future runs against", "enregistrer la dernière exécution comme instantané .baseline pour comparer les exécutions futures", "gem den seneste kørsel som et .baseline-øjebliksbillede at sammenligne fremtidige kørsler med";
@@ -510,6 +512,7 @@ strings! {
     report_baseline_no_result => "Run the report before saving a baseline.", "Exécutez le rapport avant d'enregistrer une référence.", "Kør rapporten før du gemmer en basislinje.";
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
+    report_hint_nodes => "n nodes", "n nœuds", "n noder";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
     report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";
@@ -531,6 +534,26 @@ strings! {
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
+    report_nodes_heading => "Structure", "Structure", "Struktur";
+    report_nodes_hint => "a add · e edit · Del remove · Shift+↑/↓ move · n source", "a ajouter · e modifier · Suppr retirer · Maj+↑/↓ déplacer · n source", "a tilføj · e rediger · Del fjern · Skift+↑/↓ flyt · n kilde";
+    report_nodes_parse_error => "Fix the source before editing as nodes", "Corrigez la source avant de modifier en nœuds", "Ret kilden før redigering som noder";
+    report_node_begin => "Begin", "Début", "Start";
+    node_menu_title => "Add Node", "Ajouter un nœud", "Tilføj node";
+    node_menu_hint => "↑/↓ select · Enter add · Esc cancel", "↑/↓ sélectionner · Entrée ajouter · Échap annuler", "↑/↓ vælg · Enter tilføj · Esc annuller";
+    node_pick_request_title => "Choose Request", "Choisir une requête", "Vælg forespørgsel";
+    node_pick_request_hint => "↑/↓ select · Enter choose · Esc cancel", "↑/↓ sélectionner · Entrée choisir · Échap annuler", "↑/↓ vælg · Enter vælg · Esc annuller";
+    node_pick_request_none => "No requests in the bound collection", "Aucune requête dans la collection liée", "Ingen forespørgsler i den bundne samling";
+    node_kind_request => "REQUEST — send a request", "REQUEST — envoyer une requête", "REQUEST — send en forespørgsel";
+    node_kind_report_request => "REPORT REQUEST — send and report its fields", "REPORT REQUEST — envoyer et rapporter ses champs", "REPORT REQUEST — send og rapportér dens felter";
+    node_kind_report_var => "REPORT — report a variable", "REPORT — rapporter une variable", "REPORT — rapportér en variabel";
+    node_kind_assign => "SET — assign a variable", "SET — affecter une variable", "SET — tildel en variabel";
+    node_kind_for_files => "FOR … IN FILES — loop over files", "FOR … IN FILES — boucler sur des fichiers", "FOR … IN FILES — løkke over filer";
+    node_kind_for_folders => "FOR … IN FOLDERS — loop over folders", "FOR … IN FOLDERS — boucler sur des dossiers", "FOR … IN FOLDERS — løkke over mapper";
+    node_kind_for_envs => "FOR … IN ENVS — loop over environments", "FOR … IN ENVS — boucler sur des environnements", "FOR … IN ENVS — løkke over miljøer";
+    node_kind_list => "LIST — declare a list", "LIST — déclarer une liste", "LIST — erklær en liste";
+    report_node_edit_title => "Edit Node Line", "Modifier la ligne du nœud", "Rediger nodelinje";
+    report_node_edit_hint => "Enter apply · Esc cancel", "Entrée appliquer · Échap annuler", "Enter anvend · Esc annuller";
+    report_node_line_invalid => "Not a valid statement", "Instruction non valide", "Ikke en gyldig sætning";
 }
 
 /// A language-independent status / notification message. It stores *what*

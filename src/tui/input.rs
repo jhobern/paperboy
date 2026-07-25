@@ -412,6 +412,8 @@ impl TuiApp {
         let whole = match rt.view {
             crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
             crate::tui::reports::ReportView::Source => rt.source_panel.whole_text(),
+            // The node outline isn't a text panel; `y` there is a no-op.
+            crate::tui::reports::ReportView::Nodes => None,
         };
         if let Some(text) = whole
             && !text.is_empty()
@@ -672,6 +674,7 @@ impl TuiApp {
             Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
+            Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
         }
     }
 

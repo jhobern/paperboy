@@ -117,6 +117,14 @@ pub(crate) struct ReportTab {
     /// [`result`](Self::result) is retained when the user flips back to the
     /// source to tweak the flow.
     pub(crate) view: ReportView,
+    /// Which of the two *editor* views (`Source` or `Nodes`) to restore when
+    /// flipping back from the results grid — so `Tab`/`v` return to whichever
+    /// editor the user last used rather than always the source.
+    pub(crate) editor_view: ReportView,
+    /// The selected row in the [`ReportView::Nodes`] outline (index into the
+    /// flattened node rows; clamped on draw). Structural edits move it to track
+    /// the affected node.
+    pub(crate) node_selected: usize,
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
@@ -131,8 +139,23 @@ pub(crate) enum ReportView {
     /// The PaperTrail flow source (editable) plus its live validation.
     #[default]
     Source,
+    /// The structured node editor: the flow rendered as a navigable outline of
+    /// nodes ("Begin" → statements → `FOR` blocks), edited by inserting/removing/
+    /// moving nodes rather than typing text. The TUI-native realisation of the
+    /// "Scratch-like" authoring goal; shares the [`ReportFlow`] AST with the
+    /// source view (both round-trip through the text).
+    Nodes,
     /// The grid of rows produced by the last run.
     Results,
+}
+
+impl ReportView {
+    /// Whether this is one of the two *editor* views (source or nodes) as
+    /// opposed to the results grid — used to remember which editor to return to
+    /// after flipping to the grid and back.
+    pub(crate) fn is_editor(self) -> bool {
+        matches!(self, ReportView::Source | ReportView::Nodes)
+    }
 }
 
 /// The three text panels of the full-screen report view, used to index
@@ -177,6 +200,8 @@ impl ReportTab {
             source_panel: MultiSelectPanel::new(),
             validation_panel: MultiSelectPanel::new(),
             view: ReportView::Source,
+            editor_view: ReportView::Source,
+            node_selected: 0,
             result: None,
             results_panel,
         }
@@ -628,57 +653,88 @@ impl TuiApp {
         }
     }
 
-    /// Toggle the active report between the source view and the results grid.
-    /// Flipping to the results view is a no-op when there's nothing to show.
+    /// Toggle the active report between its current *editor* view and the
+    /// results grid. Flipping to the results view is a no-op when there's
+    /// nothing to show; flipping back restores whichever editor (source or
+    /// nodes) was last used.
     pub(crate) fn toggle_report_view(&mut self) {
         if let Some(idx) = self.active_report_index() {
             let rt = &mut self.reports[idx];
             rt.view = match rt.view {
-                ReportView::Source if rt.result.is_some() => ReportView::Results,
-                _ => ReportView::Source,
+                v if v.is_editor() && rt.result.is_some() => {
+                    rt.editor_view = v;
+                    ReportView::Results
+                }
+                ReportView::Results => rt.editor_view,
+                v => v,
             };
         }
         // `v` always lands on the body (the tab bar is only reached via `Tab`).
         self.report_tabbar_focus = false;
     }
 
-    /// Rotate keyboard focus across the report view's three areas: the source
-    /// editor, the results grid, and the tab bar ("Tab List"). Forward order is
-    /// Editor → Results → Tab List → Editor; `forward == false` reverses it.
-    /// The results stop is skipped when the report hasn't produced a grid yet.
-    /// The body shown (`ReportView`) is kept in step with the focused body area
-    /// so flipping to the grid and back is one continuous cycle; while the tab
-    /// bar is focused the body keeps showing whatever it last did.
+    /// Toggle the active report between the source (text) editor and the
+    /// structured node editor — the `n` key. Both are "editor" views over the
+    /// same flow, so switching just re-renders the same AST a different way.
+    pub(crate) fn toggle_report_nodes_view(&mut self) {
+        if let Some(idx) = self.active_report_index() {
+            // Committing any in-progress text edit first, so the node view sees
+            // the latest source.
+            if self.reports[idx].editor.is_some() {
+                self.reports[idx].editor = None;
+            }
+            let rt = &mut self.reports[idx];
+            rt.view = match rt.view {
+                ReportView::Nodes => ReportView::Source,
+                _ => ReportView::Nodes,
+            };
+            rt.editor_view = rt.view;
+        }
+        self.report_tabbar_focus = false;
+    }
+
+    /// Rotate keyboard focus across the report view's three areas: the active
+    /// editor (source or nodes), the results grid, and the tab bar ("Tab
+    /// List"). Forward order is Editor → Results → Tab List → Editor; `forward
+    /// == false` reverses it. The results stop is skipped when the report
+    /// hasn't produced a grid yet. The body shown (`ReportView`) is kept in
+    /// step with the focused body area so flipping to the grid and back is one
+    /// continuous cycle; while the tab bar is focused the body keeps showing
+    /// whatever it last did.
     pub(crate) fn cycle_report_focus(&mut self, forward: bool) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
         let has_results = self.reports[idx].result.is_some();
+        let editor_view = self.reports[idx].editor_view;
         if self.report_tabbar_focus {
-            // Leaving the tab bar returns to the body: the source when moving
+            // Leaving the tab bar returns to the body: the editor when moving
             // forward (wrapping to Editor), the results when moving back.
             self.report_tabbar_focus = false;
             self.reports[idx].view = if forward || !has_results {
-                ReportView::Source
+                editor_view
             } else {
                 ReportView::Results
             };
             return;
         }
         match self.reports[idx].view {
-            ReportView::Source => {
-                if forward && has_results {
-                    self.reports[idx].view = ReportView::Results;
-                } else {
-                    // Source → Tab List (forward with no grid, or backward).
-                    self.report_tabbar_focus = true;
-                }
-            }
             ReportView::Results => {
                 if forward {
                     self.report_tabbar_focus = true;
                 } else {
-                    self.reports[idx].view = ReportView::Source;
+                    self.reports[idx].view = editor_view;
+                }
+            }
+            // Any editor view (Source or Nodes): remember which one, then
+            // advance to the grid (forward, if a run exists) or the tab bar.
+            v => {
+                self.reports[idx].editor_view = v;
+                if forward && has_results {
+                    self.reports[idx].view = ReportView::Results;
+                } else {
+                    // Editor → Tab List (forward with no grid, or backward).
+                    self.report_tabbar_focus = true;
                 }
             }
         }
@@ -1113,6 +1169,17 @@ impl TuiApp {
             self.on_key_report_editing(key, idx);
             return;
         }
+        // In the structured node editor, most keys drive node navigation/editing
+        // (see `on_key_report_nodes`); it returns `true` when it consumed the
+        // key, otherwise we fall through to the shared shortcuts below (global
+        // menus, tab navigation, run, the `n` toggle, …).
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].view == ReportView::Nodes
+            && !self.report_tabbar_focus
+            && self.on_key_report_nodes(key, idx)
+        {
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -1149,6 +1216,9 @@ impl TuiApp {
             KeyCode::Char('R') => self.new_report_tab(),
             // Report-specific: give the source panel edit focus.
             KeyCode::Char('e') | KeyCode::Enter => self.enter_report_edit(),
+            // Toggle between the text (source) editor and the structured node
+            // editor — two ways to edit the same flow.
+            KeyCode::Char('n') => self.toggle_report_nodes_view(),
             // Run the report against its bound collection and show the grid.
             KeyCode::Char('r') | KeyCode::F(5) => self.run_active_report(),
             // Dry-run: preview the projected rows/bindings without sending HTTP.
@@ -1194,6 +1264,9 @@ impl TuiApp {
             let panel = match rt.view {
                 ReportView::Results => &mut rt.results_panel,
                 ReportView::Source => &mut rt.source_panel,
+                // The node outline scrolls to follow its selection cursor (moved
+                // by Up/Down in the node handler), not a free scroll offset.
+                ReportView::Nodes => return,
             };
             let next = (panel.scroll() as i32).saturating_add(delta).max(0);
             panel.set_scroll(next.min(u16::MAX as i32) as u16);
@@ -2193,7 +2266,11 @@ pub(crate) fn draw_report_body(
     .split(area);
 
     draw_report_binding(f, rows[0], app, idx, s, th);
-    draw_report_source(f, rows[1], app, idx, s, th);
+    if app.reports[idx].view == ReportView::Nodes {
+        super::report_nodes::draw_report_nodes(f, rows[1], app, idx, s, th);
+    } else {
+        draw_report_source(f, rows[1], app, idx, s, th);
+    }
     draw_report_validation(f, rows[2], app, idx, s, th);
 }
 
@@ -2555,8 +2632,12 @@ fn draw_report_source(
         s.report_hint_leave.to_string()
     } else {
         format!(
-            "{} · {} · {} · {}",
-            s.report_hint_edit, s.report_hint_run, s.report_hint_dry, s.report_hint_bind
+            "{} · {} · {} · {} · {}",
+            s.report_hint_edit,
+            s.report_hint_run,
+            s.report_hint_dry,
+            s.report_hint_bind,
+            s.report_hint_nodes
         )
     };
     let title = format!("{} — {}", s.report_source_heading, hint);

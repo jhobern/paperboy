@@ -97,7 +97,7 @@ impl FileAction {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum PromptKind {
     BaseUrl,
     /// Editing one variable's value in the environment-entries popup:
@@ -126,6 +126,16 @@ pub(crate) enum PromptKind {
     /// `.hurl` extension is defaulted. Reached via `n` in the workspace
     /// destination picker.
     NewWorkspaceCollection(usize),
+    /// Editing one report-flow node "as a line" in the structured node editor:
+    /// the prompt is seeded with the node's single-line source form and, on
+    /// commit, that text is re-parsed and swapped back into the flow at `path`
+    /// (a loop node keeps its body). The report is addressed by `report_id`
+    /// (not index) so a tab reorder can't misroute the edit. See
+    /// [`crate::tui::report_nodes`].
+    ReportNodeLine {
+        report_id: u64,
+        path: Vec<usize>,
+    },
 }
 
 impl PromptKind {
@@ -423,6 +433,12 @@ pub(crate) enum Overlay {
     /// header at it (relative path preferred). Opened with `b` in the Reports
     /// view. See [`crate::tui::reports::ReportBindPicker`].
     ReportBind(Box<crate::tui::reports::ReportBindPicker>),
+    /// The structured node editor's insert/pick menu ([`Overlay::ReportNodeMenu`]):
+    /// a two-step palette that first picks a node *kind* to add, then — for a
+    /// `REQUEST` / `REPORT REQUEST` — picks a request name from the bound
+    /// collection. Opened with `a` (add) or `Enter`/`e` (edit a request node) in
+    /// the node view. See [`crate::tui::report_nodes::NodeMenu`].
+    ReportNodeMenu(Box<crate::tui::report_nodes::NodeMenu>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -1484,6 +1500,9 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
+            PromptKind::ReportNodeLine { report_id, path } => {
+                self.commit_report_node_line(report_id, &path, text)
+            }
         }
     }
 

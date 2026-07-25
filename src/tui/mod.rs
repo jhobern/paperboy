@@ -12,6 +12,7 @@ mod input;
 mod new_request;
 pub(crate) mod remote;
 mod report_highlight;
+mod report_nodes;
 mod reports;
 mod selection;
 #[cfg(test)]

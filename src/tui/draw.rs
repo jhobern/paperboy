@@ -235,6 +235,61 @@ fn draw_report_bind_overlay(
     }
 }
 
+/// Draw the node editor's insert / request-pick palette
+/// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
+/// adding, request titles when choosing a request name.
+fn draw_report_node_menu_overlay(
+    f: &mut Frame,
+    menu: &super::report_nodes::NodeMenu,
+    s: &Strings,
+    th: &Theme,
+) {
+    let hint = match menu.step {
+        super::report_nodes::NodeMenuStep::PickKind => s.node_menu_hint,
+        super::report_nodes::NodeMenuStep::PickRequest => s.node_pick_request_hint,
+    };
+    let title = format!("{}  ({})", menu.title(s), hint);
+    let n = menu.options.len().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = if menu.selected >= inner_h {
+        menu.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if menu.options.is_empty() {
+        lines.push(Line::from(Span::styled(
+            s.node_pick_request_none.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    for (i, opt) in menu.options.iter().enumerate().skip(scroll).take(inner_h) {
+        let style = if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        lines.push(Line::from(Span::styled(opt.clone(), style)));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     let s = Strings::for_language(&app.language);
     let th = app.theme();
@@ -2117,6 +2172,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("r / F5 (report)", s.help_report_run),
                             ("d (report)", s.help_report_dry_run),
                             ("v (report)", s.help_report_view),
+                            ("n (report)", s.help_report_nodes),
+                            ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("x (report)", s.help_report_export),
                             ("B (report)", s.help_report_baseline),
@@ -2287,6 +2344,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("r / F5", s.help_report_run),
                         ("d", s.help_report_dry_run),
                         ("v", s.help_report_view),
+                        ("n", s.help_report_nodes),
+                        ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("x", s.help_report_export),
                         ("B", s.help_report_baseline),
@@ -2430,6 +2489,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportBind(picker) => {
             draw_report_bind_overlay(f, picker, s, th);
+        }
+        Overlay::ReportNodeMenu(menu) => {
+            draw_report_node_menu_overlay(f, menu, s, th);
         }
         Overlay::Prompt {
             kind,

@@ -12,6 +12,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **PaperTrail reports — structured node editor.** Press **`n`** in a report to
+  switch the flow between the source text and a new keyboard-driven *node*
+  editor: the flow is shown as a navigable outline (a "Begin" root, one row per
+  statement, `FOR …` loops with their nested body and an `END` row) that you
+  build by inserting, removing and moving whole nodes instead of typing text.
+  **`a`** (or Insert) opens an insert palette of node kinds; choosing `REQUEST`
+  / `REPORT REQUEST` opens a request picker prepopulated from the bound
+  collection's request titles, so names are never mistyped (rows are coloured
+  green when the name resolves, amber when it doesn't). **`e`**/Enter edits the
+  selected node (request nodes reopen the picker; other nodes open an
+  "edit as line" prompt), **Del**/Backspace removes it, and **Shift+↑/↓** (or
+  `K`/`J`) moves it among its siblings. Both editors are views over the same
+  flow AST — every structural edit re-serializes back to the source text — so
+  you can freely switch between them, and the logic is front-end agnostic for a
+  future GUI. `?` Help and the Reports page document the node keys.
 - **PaperTrail reports — new Reports view (work in progress).** A report is a
   new kind of tab, opened with **Shift+R**, that lives alongside the collection
   tabs but takes the whole body (no list / environment / response panels, so it

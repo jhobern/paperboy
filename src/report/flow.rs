@@ -517,6 +517,144 @@ fn name_text(name: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single-node views (for the structured node editor)
+// ---------------------------------------------------------------------------
+
+impl FlowNode {
+    /// A concise, human-readable one-line label for this node — what the
+    /// structured ("node") editor shows for it in the outline. For a loop this
+    /// is only the `FOR … IN …` opener (its body and `END` are separate rows);
+    /// a `REPORT REQUEST … WITH …` is summarised with a trailing `WITH …`.
+    pub fn label(&self) -> String {
+        match self {
+            FlowNode::Assign { key, value } => format!("{key} = {value}"),
+            FlowNode::ListDecl { name, producer } => {
+                format!("LIST {name} = {}", producer_text(producer))
+            }
+            FlowNode::Request { name } => format!("REQUEST {name}"),
+            FlowNode::Report(stmt) => report_label(stmt),
+            FlowNode::ForEach {
+                pattern,
+                producer,
+                parallel,
+                ..
+            } => format!(
+                "{}FOR {} IN {}",
+                parallel_prefix(parallel),
+                pattern_text(pattern),
+                producer_text(producer)
+            ),
+            FlowNode::ForEnvs {
+                var,
+                clause,
+                parallel,
+                ..
+            } => format!(
+                "{}FOR {var} IN ENVS {}",
+                parallel_prefix(parallel),
+                env_clause_text(clause)
+            ),
+        }
+    }
+
+    /// The re-parseable single-line source form of this node's *header* — the
+    /// node itself for leaf statements, or the `FOR … IN …` opener for a loop
+    /// (its body and `END` excluded). Used by the node editor's "edit as line"
+    /// prompt: the returned text, followed by `END` for a loop, round-trips
+    /// through [`super::parser::parse_flow`]. A `REPORT REQUEST … WITH …` block
+    /// is *not* representable on one line, so its `WITH` items are dropped here
+    /// (request nodes are edited via the request picker, not this line form).
+    pub fn header_line(&self) -> String {
+        match self {
+            FlowNode::Report(ReportStmt::Request {
+                name,
+                alias,
+                response_fmt,
+                show,
+                ..
+            }) => {
+                let mut out = format!("REPORT REQUEST {}", name_text(name));
+                if let Some(a) = alias {
+                    let _ = write!(out, " AS {a}");
+                }
+                if let Some(fmt) = response_fmt {
+                    let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
+                }
+                if !show.is_empty() {
+                    let _ = write!(out, " SHOW({})", show.join(", "));
+                }
+                out
+            }
+            _ => self.label(),
+        }
+    }
+
+    /// The request title this node references, if it is a `REQUEST` or
+    /// `REPORT REQUEST` node — used by the node editor to colour the row by
+    /// whether the name resolves in the bound collection.
+    pub fn request_name(&self) -> Option<&str> {
+        match self {
+            FlowNode::Request { name } => Some(name),
+            FlowNode::Report(ReportStmt::Request { name, .. }) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether this node opens a loop block (`FOR …`), i.e. it carries a body
+    /// and closes with an `END`. The node editor renders these with a matching
+    /// `END` row and nests their body one level deeper.
+    pub fn is_loop(&self) -> bool {
+        matches!(self, FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. })
+    }
+
+    /// The loop body of a `FOR …` node (mutable), or `None` for a leaf node.
+    pub fn body_mut(&mut self) -> Option<&mut Vec<FlowNode>> {
+        match self {
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+}
+
+/// The label for a [`ReportStmt`] (see [`FlowNode::label`]).
+fn report_label(stmt: &ReportStmt) -> String {
+    match stmt {
+        ReportStmt::Request {
+            name,
+            alias,
+            response_fmt,
+            show,
+            with,
+        } => {
+            let mut out = format!("REPORT REQUEST {name}");
+            if let Some(a) = alias {
+                let _ = write!(out, " AS {a}");
+            }
+            if let Some(fmt) = response_fmt {
+                let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
+            }
+            if !show.is_empty() {
+                let _ = write!(out, " SHOW({})", show.join(", "));
+            }
+            if !with.is_empty() {
+                out.push_str(" WITH …");
+            }
+            out
+        }
+        ReportStmt::Vars(vars) => {
+            if vars.len() == 1 {
+                format!("REPORT {}", vars[0])
+            } else {
+                format!("REPORT ({})", vars.join(", "))
+            }
+        }
+        ReportStmt::Computed { template, name } => {
+            format!("REPORT {} AS {name}", quote(template))
+        }
+    }
+}
+
 /// Double-quote a string, escaping `\` and `"`.
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
