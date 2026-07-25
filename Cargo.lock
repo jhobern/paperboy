@@ -1471,6 +1471,7 @@ name = "paperboy"
 version = "0.1.6"
 dependencies = [
  "base64",
+ "chrono",
  "clap",
  "hurl",
  "hurl_core",

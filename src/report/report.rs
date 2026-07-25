@@ -147,6 +147,33 @@ fn header_name(text: &str) -> Option<String> {
     header_directive(text, "name").filter(|v| !v.is_empty())
 }
 
+/// The placeholder a report name may carry to stamp each written output file
+/// with the moment it was produced (so repeated runs don't overwrite one
+/// another): `report_{time}` → `report_2026-07-26-204500`.
+pub const OUTPUT_TIME_TOKEN: &str = "{time}";
+
+/// Whether `name` carries an output placeholder (currently just
+/// [`OUTPUT_TIME_TOKEN`]). When it does, the *expanded* name drives the export
+/// filename even for a saved report whose own file name would otherwise be used
+/// — that's the whole point of the token (a distinct file per run).
+pub fn name_has_output_token(name: &str) -> bool {
+    name.contains(OUTPUT_TIME_TOKEN)
+}
+
+/// Expand output-name placeholders in a report name for a file about to be
+/// written. Currently the single `{time}` token, replaced with the **local**
+/// timestamp `YYYY-MM-DD-HHMMSS` captured at the moment of the call, so a name
+/// like `report_{time}` yields a distinct file each run. All other text is left
+/// untouched. Only ever applied when deriving an output path — the report's
+/// source and display name keep the literal template.
+pub fn expand_output_tokens(name: &str) -> String {
+    if !name.contains(OUTPUT_TIME_TOKEN) {
+        return name.to_string();
+    }
+    let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    name.replace(OUTPUT_TIME_TOKEN, &stamp)
+}
+
 /// Scan the comment header for a `# key: value` directive, without a full parse
 /// (so a body with syntax errors still yields its header). Only scans the
 /// leading run of comment/blank lines — the header ends at the first statement,
@@ -248,5 +275,30 @@ mod tests {
         assert_eq!(loaded.name, "my-report");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn output_token_detection_and_expansion() {
+        assert!(name_has_output_token("report_{time}"));
+        assert!(!name_has_output_token("report"));
+
+        // A name without the token is returned verbatim.
+        assert_eq!(expand_output_tokens("nightly"), "nightly");
+
+        // `{time}` expands to a local YYYY-MM-DD-HHMMSS stamp.
+        let out = expand_output_tokens("report_{time}");
+        assert!(!out.contains("{time}"), "the token must be replaced: {out}");
+        let stamp = out.strip_prefix("report_").expect("prefix preserved");
+        // Shape check: 4-2-2-6 digits joined by dashes (date-date-time).
+        let parts: Vec<&str> = stamp.split('-').collect();
+        assert_eq!(parts.len(), 4, "expected YYYY-MM-DD-HHMMSS, got {stamp}");
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 2);
+        assert_eq!(parts[2].len(), 2);
+        assert_eq!(parts[3].len(), 6);
+        assert!(
+            parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+            "all stamp segments must be digits: {stamp}"
+        );
     }
 }

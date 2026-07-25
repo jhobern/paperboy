@@ -32,6 +32,7 @@ use crate::report::model::{ReportResult, TARGET_COLUMN, parse_columns};
 use crate::report::run::{DryRunner, EntryRunner, LiveRunner, RunContext, run_flow};
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
 use crate::report::writer::{CsvWriter, ReportWriter};
+use crate::report::{expand_output_tokens, name_has_output_token};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1839,7 +1840,14 @@ fn flatten_env(env: &crate::environment::Environment) -> std::collections::HashM
 
 /// Where an exported CSV lands: alongside a saved report (same stem, `.csv`
 /// extension), else `<name>.csv` in the current directory for a scratch report.
+/// When the report *name* carries an output token (`{time}`), the expanded name
+/// wins — even for a saved report — and lands in the report's own folder (or the
+/// current directory for a scratch report), so repeated runs write distinct
+/// timestamped files rather than overwriting one export.
 fn csv_export_path(report: &Report) -> std::path::PathBuf {
+    if let Some(p) = tokened_output_path(report, "csv") {
+        return p;
+    }
     if let Some(path) = &report.path {
         return path.with_extension("csv");
     }
@@ -1849,13 +1857,34 @@ fn csv_export_path(report: &Report) -> std::path::PathBuf {
 
 /// The default `.baseline` snapshot path for `report`: its own file with a
 /// `.baseline` extension, or a sanitised `<name>.baseline` for a scratch report
-/// with no file yet. Mirrors [`csv_export_path`].
+/// with no file yet. Mirrors [`csv_export_path`] (including the `{time}` token).
 fn baseline_export_path(report: &Report) -> std::path::PathBuf {
+    if let Some(p) = tokened_output_path(report, "baseline") {
+        return p;
+    }
     if let Some(path) = &report.path {
         return path.with_extension("baseline");
     }
     let stem = sanitize_file_stem(&report.name);
     std::path::PathBuf::from(format!("{stem}.baseline"))
+}
+
+/// The output path when the report name carries an output token (`{time}`): the
+/// token-expanded, sanitised name as the file stem with extension `ext`, placed
+/// in the saved report's own folder (or the current directory for a scratch
+/// report). `None` when the name has no token, so callers fall back to their
+/// normal (file-stem-based) derivation.
+fn tokened_output_path(report: &Report, ext: &str) -> Option<std::path::PathBuf> {
+    if !name_has_output_token(&report.name) {
+        return None;
+    }
+    let stem = sanitize_file_stem(&expand_output_tokens(&report.name));
+    let file = format!("{stem}.{ext}");
+    let dir = report.path.as_ref().and_then(|p| p.parent());
+    Some(match dir {
+        Some(d) => d.join(file),
+        None => std::path::PathBuf::from(file),
+    })
 }
 
 /// Turn a display name into a safe single-segment file stem (replacing path
@@ -2792,4 +2821,40 @@ fn draw_report_validation(
     );
     app.report_pane_areas[ReportPane::Validation.idx()] = inner;
     app.report_pane_bars[ReportPane::Validation.idx()] = bar;
+}
+
+#[cfg(test)]
+mod export_path_tests {
+    use super::*;
+
+    #[test]
+    fn time_token_name_overrides_a_saved_report_filename_and_stays_in_its_folder() {
+        // A saved report whose file is `dfa.report` but whose name carries the
+        // `{time}` token: the export must use the expanded name (not `dfa`) and
+        // land next to the report file.
+        let mut report = Report::from_text("dfa", "# name: run_{time}\n# collection: c.hurl\n");
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+
+        let csv = csv_export_path(&report);
+        assert_eq!(csv.parent(), Some(std::path::Path::new("/tmp/reports")));
+        let file = csv.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(file.starts_with("run_"), "expanded name used: {file}");
+        assert!(file.ends_with(".csv"));
+        assert!(!file.contains("{time}"), "token expanded: {file}");
+        assert!(
+            !file.starts_with("dfa"),
+            "name wins over the file stem: {file}"
+        );
+    }
+
+    #[test]
+    fn without_a_token_a_saved_report_keeps_its_own_stem() {
+        let mut report = Report::from_text("dfa", "# name: My Report\n# collection: c.hurl\n");
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+        assert_eq!(
+            csv_export_path(&report),
+            std::path::PathBuf::from("/tmp/reports/dfa.csv"),
+            "unchanged behaviour when the name has no token"
+        );
+    }
 }

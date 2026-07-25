@@ -444,6 +444,7 @@ strings! {
     help_reports_grammar_heading => "Flow language", "Langage de flux", "Flow-sprog";
     help_reports_loops_heading => "Loops & producers", "Boucles et sources", "Løkker og kilder";
     help_grammar_collection => "bind the report to a collection (required)", "lier le rapport à une collection (obligatoire)", "bind rapporten til en samling (påkrævet)";
+    help_grammar_name => "report name; {time} stamps written files (YYYY-MM-DD-HHMMSS)", "nom du rapport ; {time} horodate les fichiers écrits (AAAA-MM-JJ-HHMMSS)", "rapportnavn; {time} tidsstempler skrevne filer (ÅÅÅÅ-MM-DD-TTMMSS)";
     help_grammar_environment => "run against one loaded environment (optional; no comparison)", "exécuter avec un environnement chargé (optionnel ; sans comparaison)", "kør mod ét indlæst miljø (valgfrit; ingen sammenligning)";
     help_grammar_assign => "set a variable, used elsewhere as {{KEY}}", "définir une variable, utilisée ailleurs comme {{KEY}}", "sæt en variabel, brugt andre steder som {{KEY}}";
     help_grammar_request => "send a request by name (no output row)", "envoyer une requête par son nom (sans ligne de sortie)", "send en anmodning ved navn (ingen outputrække)";

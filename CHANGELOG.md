@@ -12,6 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Timestamp your report output with `{time}`.** Put `{time}` anywhere in a
+  report's `# name:` (e.g. `# name: staging_{time}`) and every file the run
+  writes — the CSV export, a saved `.baseline` — is stamped with the local time
+  it was produced (`staging_2026-07-26-204500.csv`, `YYYY-MM-DD-HHMMSS`), so
+  running the same report repeatedly leaves a trail of files instead of
+  overwriting one. The token expands only when a file is written (the source and
+  the tab name keep the literal `{time}`), and a name with a token drives the
+  export filename even for a saved report — landing next to it.
 - **Report dry-run preview marks soft-wrapped lines.** Long binding/error lines
   in the dry-run overlay (`d`) now show the same dim `↵` end-of-line marker the
   Request/Response panels use, so a wrapped sample reads unambiguously as one

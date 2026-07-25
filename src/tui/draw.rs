@@ -2514,6 +2514,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.help_reports_grammar_heading,
                     &[
                         ("# collection: PATH", s.help_grammar_collection),
+                        ("# name: TEXT / TEXT_{time}", s.help_grammar_name),
                         ("# environment: NAME", s.help_grammar_environment),
                         ("KEY = value", s.help_grammar_assign),
                         ("REQUEST NAME", s.help_grammar_request),

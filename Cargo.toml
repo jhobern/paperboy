@@ -25,3 +25,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 ratatui-explorer = "0.3.0"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+# Local-time formatting for the report name `{time}` token. `Local` reads the
+# system timezone via libc (robust in our multithreaded runner, unlike the
+# `time` crate's local-offset guard). Already in the tree via `hurl`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

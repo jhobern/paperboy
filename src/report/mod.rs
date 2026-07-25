@@ -37,7 +37,7 @@ pub use flow::{
 };
 pub use model::{OutputColumn, ReportResult, ReportRow, TARGET_COLUMN};
 pub use parser::{ParseError, parse_flow};
-pub use report::Report;
+pub use report::{Report, expand_output_tokens, name_has_output_token};
 pub use run::{DryRunner, EntryRunner, LiveRunner, RunContext, resolve_title, run_flow};
 pub use validate::{Diagnostic, Severity, validate};
 pub use writer::{CsvWriter, ReportWriter};
