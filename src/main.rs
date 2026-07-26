@@ -38,6 +38,7 @@ Runs in one of three modes:\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
 \x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
 \x20 paperboy -c collection.hurl -e environment.vars -r report.report   Run a report\n\
+\x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.report   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.report --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.report -o out.csv   Write the report to a file (- = stdout)\n\n\
 Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
@@ -54,9 +55,15 @@ struct Cli {
     #[arg(short = 'c', long, value_name = "FILE")]
     collection: Option<String>,
 
-    /// Optional environment (.vars) file supplying `{{ VAR }}` values.
+    /// Environment (.vars) file supplying `{{ VAR }}` values. Repeatable: pass
+    /// `-e` more than once to load several environments for a report (`-r`) —
+    /// each is named by its file stem and becomes selectable in an `ENVS` loop
+    /// (e.g. `-e prod.vars -e staging.vars` satisfies
+    /// `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`). The first `-e`
+    /// is the base variable layer. A plain collection run (`-c` only) uses just
+    /// the first.
     #[arg(short = 'e', long, value_name = "FILE")]
-    env: Option<String>,
+    env: Vec<String>,
 
     /// Run every request as a single batch instead of streaming each result
     /// as soon as it finishes. Slower to show any output, but preserves
@@ -68,7 +75,8 @@ struct Cli {
     batch: bool,
 
     /// Run a PaperTrail report (`.report`) against the collection given by
-    /// `-c` and exit. Requires `-c`; `-e` supplies the base variable layer.
+    /// `-c` and exit. Requires `-c`; `-e` supplies the base variable layer and
+    /// (when repeated) the environments an `ENVS` loop can name.
     #[arg(short = 'r', long, value_name = "FILE")]
     report: Option<String>,
 
@@ -108,7 +116,12 @@ fn main() {
 
     // Headless CLI mode (explicit "run and exit").
     if let Some(collection) = cli.collection {
-        std::process::exit(cli::run(collection, cli.env, cli.batch));
+        if cli.env.len() > 1 {
+            eprintln!(
+                "warning: multiple -e environments are only used by reports (-r); running the collection with the first one"
+            );
+        }
+        std::process::exit(cli::run(collection, cli.env.into_iter().next(), cli.batch));
     }
 
     // Terminal UI (the default).

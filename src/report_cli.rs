@@ -31,14 +31,15 @@ use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
 /// exits 0 — its errors are reported but every row was produced).
 ///
 /// `-c` names the collection to run against (re-pointable without editing the
-/// report), `-e` an optional environment used as the base variable layer,
+/// report), `-e` zero or more environments used as the base variable layer and
+/// (when repeated) the environments an `ENVS` loop can select by name,
 /// `--dry-run` expands the flow without sending any request, and `-o` chooses
 /// the output (`-` = stdout; a path whose extension selects the format; omitted
 /// = the `# output:` format written to a `# name:`-derived file next to the
 /// report, honouring the `{time}` token).
 pub fn run(
     collection_path: String,
-    env_path: Option<String>,
+    env_paths: Vec<String>,
     report_path: String,
     output: Option<String>,
     dry_run: bool,
@@ -77,15 +78,18 @@ pub fn run(
         return 1;
     }
 
-    // --- environment -----------------------------------------------------
-    // The single `-e` environment is the report's base variable layer, and is
-    // also the one environment selectable by name in an `ENVS` loop (multiple
-    // environments aren't supported in the CLI in v1 — an `ENVS` loop naming an
-    // unloaded environment fails validation).
+    // --- environment(s) --------------------------------------------------
+    // Zero or more `-e` environments. Each is loaded, named by its file stem,
+    // and made selectable by that name in an `ENVS` loop — so a
+    // `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")` comparison runs
+    // headlessly by passing `-e prod.vars -e staging.vars`. The first `-e`
+    // doubles as the base variable layer for requests outside any `ENVS` loop.
+    // Distinct stems are required so an `ENVS` clause names an environment
+    // unambiguously. Backward compatible with a single `-e`.
     let mut base_vars: HashMap<String, String> = HashMap::new();
     let mut named_envs: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut env_name: Option<String> = None;
-    if let Some(env_path) = &env_path {
+    let mut env_names_loaded: Vec<String> = Vec::new();
+    for env_path in &env_paths {
         let env_content = match fs::read_to_string(env_path) {
             Ok(c) => c,
             Err(e) => {
@@ -100,15 +104,24 @@ pub fn run(
             return 1;
         }
         let name = crate::shared_utils::stem(env_path, "env");
+        if named_envs.contains_key(&name) {
+            eprintln!(
+                "error: duplicate environment name '{name}' (from '{env_path}') — each -e file must have a distinct stem so an ENVS clause can name it unambiguously"
+            );
+            return 1;
+        }
         let env = parse_vars(name.clone(), &env_content);
         let flat: HashMap<String, String> = env
             .vars
             .iter()
             .map(|v| (v.key.clone(), v.value.clone()))
             .collect();
-        base_vars = flat.clone();
+        // The first environment is the base variable layer.
+        if env_names_loaded.is_empty() {
+            base_vars = flat.clone();
+        }
         named_envs.insert(name.clone(), flat);
-        env_name = Some(name);
+        env_names_loaded.push(name);
     }
 
     // --- validation ------------------------------------------------------
@@ -168,8 +181,14 @@ pub fn run(
     let mut decor = Decor::new(to_stdout);
     decor.line(&format!("PaperBoy — report \"{}\"", report.name));
     decor.line(&format!("  Collection : {collection_path}"));
-    if let Some(name) = &env_name {
-        decor.line(&format!("  Environment: {name}"));
+    if let [one] = env_names_loaded.as_slice() {
+        decor.line(&format!("  Environment: {one}"));
+    } else if !env_names_loaded.is_empty() {
+        decor.line(&format!(
+            "  Environments: {} (base: {})",
+            env_names_loaded.join(", "),
+            env_names_loaded[0]
+        ));
     }
     if dry_run {
         decor.line("  Mode       : DRY RUN (no requests sent)");
@@ -467,7 +486,7 @@ mod tests {
 
         let code = run(
             coll.to_string_lossy().into_owned(),
-            None,
+            Vec::new(),
             report.to_string_lossy().into_owned(),
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP
@@ -484,6 +503,80 @@ mod tests {
     }
 
     #[test]
+    fn multi_env_loads_every_env_and_runs_the_envs_loop() {
+        // Two `-e` files with distinct stems make a `FOR … IN ENVS` loop
+        // resolvable headlessly: both environments load, are selectable by
+        // stem, and the flow iterates once per environment.
+        let dir = temp_dir("multienv");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        fs::write(dir.join("prod.vars"), "HOST=prod.test\n").unwrap();
+        fs::write(dir.join("staging.vars"), "HOST=staging.test\n").unwrap();
+        let report = dir.join("r.report");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nFOR TARGET IN ENVS \"prod\", \"staging\"\n    REPORT TARGET\n    REPORT REQUEST Ping\nEND\n",
+        )
+        .unwrap();
+        let out = dir.join("out.csv");
+
+        let code = run(
+            coll.to_string_lossy().into_owned(),
+            vec![
+                dir.join("prod.vars").to_string_lossy().into_owned(),
+                dir.join("staging.vars").to_string_lossy().into_owned(),
+            ],
+            report.to_string_lossy().into_owned(),
+            Some(out.to_string_lossy().into_owned()),
+            true, // dry-run: no HTTP, but the ENVS loop still expands per env
+        );
+        assert_eq!(code, 0, "a multi-env dry run should succeed");
+
+        let csv = fs::read_to_string(&out).unwrap();
+        // The ENVS loop iterated once per loaded environment (no "not loaded"
+        // errors), so both env names appear in the reported TARGET column.
+        assert!(csv.contains("prod"), "prod env row missing:\n{csv}");
+        assert!(csv.contains("staging"), "staging env row missing:\n{csv}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_env_stem_is_rejected() {
+        // Two `-e` files that share a stem are ambiguous for an ENVS clause, so
+        // the second is a fatal setup error.
+        let dir = temp_dir("dupenv");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("prod.vars"), "HOST=a.test\n").unwrap();
+        fs::write(b.join("prod.vars"), "HOST=b.test\n").unwrap();
+        let report = dir.join("r.report");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let code = run(
+            coll.to_string_lossy().into_owned(),
+            vec![
+                a.join("prod.vars").to_string_lossy().into_owned(),
+                b.join("prod.vars").to_string_lossy().into_owned(),
+            ],
+            report.to_string_lossy().into_owned(),
+            Some("-".to_string()),
+            true,
+        );
+        assert_eq!(code, 1, "a duplicate env stem is a fatal setup error");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn missing_collection_is_a_setup_error() {
         let dir = temp_dir("nocoll");
         let report = dir.join("r.report");
@@ -495,7 +588,7 @@ mod tests {
 
         let code = run(
             dir.join("missing.hurl").to_string_lossy().into_owned(),
-            None,
+            Vec::new(),
             report.to_string_lossy().into_owned(),
             Some("-".to_string()),
             true,
@@ -519,7 +612,7 @@ mod tests {
 
         let code = run(
             coll.to_string_lossy().into_owned(),
-            None,
+            Vec::new(),
             report.to_string_lossy().into_owned(),
             Some(dir.join("out.pdf").to_string_lossy().into_owned()),
             true,
@@ -558,7 +651,7 @@ mod tests {
             let out = dir.join(format!("out.{ext}"));
             let code = run(
                 coll.to_string_lossy().into_owned(),
-                None,
+                Vec::new(),
                 report.to_string_lossy().into_owned(),
                 Some(out.to_string_lossy().into_owned()),
                 true, // dry-run: no HTTP

@@ -12,6 +12,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Multiple `-e/--env` environments on the CLI report runner.** `-e` is now
+  repeatable, so a headless report that compares environments —
+  `FOR TARGET IN ENVS BASELINE("prod"), COMPARISON("staging")` — can be run with
+  `paperboy -c coll.hurl -e prod.vars -e staging.vars -r report.report`. Each
+  file is loaded and made selectable by its file stem (the name an `ENVS` clause
+  references); the first `-e` also serves as the base variable layer for
+  requests outside any `ENVS` loop. Passing two files that share a stem is a
+  fatal error (an `ENVS` clause could not tell them apart). A single `-e` behaves
+  exactly as before; a plain collection run (`-c` without `-r`) still uses only
+  the first environment and warns if more are given.
+
 - **Live per-row status icons in the streaming results grid.** While a report
   runs, each row now shows a status marker in a leading column: `·` (dim) for a
   row still scheduled, `…` for a row whose requests are in flight, and `✓`
