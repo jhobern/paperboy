@@ -30,7 +30,7 @@ use crate::report::Report;
 use crate::report::flow::{FlowNode, Header, Producer, ReportFlow};
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
 use crate::report::run::{
-    DryRunner, EntryRunner, LiveRunner, RunContext, finalize, run_flow, run_flow_raw,
+    DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
 use crate::report::validate::{Context, Diagnostic, Severity, validate};
 use crate::report::writer::{CsvWriter, writer_for_extension};
@@ -59,6 +59,14 @@ pub(crate) enum ReportRunUpdate {
         report_id: u64,
         result: ReportResult,
     },
+    /// A leaf row has *started* running its requests (fired before any of them
+    /// complete). Routed to its skeleton slot by `path` and drawn with a
+    /// "running" marker so the grid shows which rows are in flight — several at
+    /// once under a `PARALLEL` loop. Followed later by a [`Row`](Self::Row).
+    RowStarted {
+        report_id: u64,
+        path: Vec<(usize, usize)>,
+    },
     /// One completed iteration's row, matched into the skeleton by
     /// [`ReportRow::path`] and un-greyed. May arrive out of order under a
     /// `PARALLEL` loop (the path still identifies the target slot).
@@ -76,6 +84,7 @@ impl ReportRunUpdate {
     fn report_id(&self) -> u64 {
         match self {
             ReportRunUpdate::Skeleton { report_id, .. }
+            | ReportRunUpdate::RowStarted { report_id, .. }
             | ReportRunUpdate::Row { report_id, .. }
             | ReportRunUpdate::Done { report_id, .. } => *report_id,
         }
@@ -261,20 +270,35 @@ impl ReportWorkspace {
     }
 }
 
+/// The live state of one streaming report row, drawn as a status icon beside
+/// the row and used to grey rows that haven't finished yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowState {
+    /// Placed in the skeleton but not started yet (its requests are queued).
+    Scheduled,
+    /// Its requests are in flight (a [`RowStarted`](ReportRunUpdate::RowStarted)
+    /// arrived). Under `PARALLEL` several rows can be running at once.
+    Running,
+    /// Its result has streamed in ([`Row`](ReportRunUpdate::Row)); cells filled.
+    Finished,
+}
+
 /// Per-tab live-streaming bookkeeping for an in-flight background report run.
 /// The skeleton rows are stored on [`ReportTab::result`] (so the grid renders
-/// them immediately, greyed); this tracks which have completed, how to route a
-/// streamed row to its slot, and what to restore on cancel.
+/// them immediately, greyed); this tracks each row's [`RowState`] (for the
+/// status icon + greying), how to route a streamed row to its slot, and what to
+/// restore on cancel.
 pub(crate) struct RunProgress {
-    /// One flag per skeleton row (index-aligned with `result.rows`): `true` once
-    /// that row's real result has streamed in. Pending (`false`) rows are drawn
-    /// greyed so the grid doubles as a progress indicator.
-    pub(crate) filled: Vec<bool>,
+    /// One [`RowState`] per skeleton row (index-aligned with `result.rows`):
+    /// `Scheduled` until it starts, `Running` while its requests are in flight,
+    /// `Finished` once its real result has streamed in. Non-`Finished` rows are
+    /// drawn greyed so the grid doubles as a live progress indicator.
+    pub(crate) states: Vec<RowState>,
     /// Maps a row's structural [`ReportRow::path`] to its index in `result.rows`,
     /// so an out-of-order streamed row (under `PARALLEL`) still lands in the
     /// right slot.
     pub(crate) index: HashMap<Vec<(usize, usize)>, usize>,
-    /// How many rows have been filled so far (for the progress status).
+    /// How many rows have finished so far (for the progress status).
     pub(crate) done: usize,
     /// The result shown before this run started, restored verbatim if the run is
     /// cancelled (so a cancel discards the partial run and leaves the prior grid,
@@ -897,22 +921,31 @@ impl TuiApp {
                 return; // Receiver gone (tab closed) — nothing more to do.
             }
 
-            // 2. Live run: stream each completed row through a `Sync` sink (the
+            // 2. Live run: stream each row's lifecycle through a `Sync` sink (the
             //    `PARALLEL` workers call it from several threads, and an
             //    `mpsc::Sender` is `Send` but not `Sync`, so it's wrapped in a
-            //    `Mutex`). Rows may arrive out of iteration order under
-            //    `PARALLEL`; their `path` still identifies the target slot.
+            //    `Mutex`). A row is announced `Started` (its slot goes "running")
+            //    before its requests fire, then `Completed` when it lands. Events
+            //    may arrive out of iteration order under `PARALLEL`; each row's
+            //    `path` still identifies the target slot.
             let runner = CancellableRunner {
                 inner: make_runner(file_root),
                 cancel: cancel_worker,
             };
             let row_tx = Mutex::new(tx.clone());
-            let sink = move |row: &ReportRow| {
+            let sink = move |ev: RowEvent| {
                 if let Ok(tx) = row_tx.lock() {
-                    let _ = tx.send(ReportRunUpdate::Row {
-                        report_id,
-                        row: Box::new(row.clone()),
-                    });
+                    let msg = match ev {
+                        RowEvent::Started(path) => ReportRunUpdate::RowStarted {
+                            report_id,
+                            path: path.to_vec(),
+                        },
+                        RowEvent::Completed(row) => ReportRunUpdate::Row {
+                            report_id,
+                            row: Box::new(row.clone()),
+                        },
+                    };
+                    let _ = tx.send(msg);
                 }
             };
             let ctx = RunContext {
@@ -1008,7 +1041,7 @@ impl TuiApp {
                 let prev_result = rt.result.take();
                 rt.result = Some(result);
                 rt.run_progress = Some(RunProgress {
-                    filled: vec![false; n],
+                    states: vec![RowState::Scheduled; n],
                     index,
                     done: 0,
                     prev_result,
@@ -1022,6 +1055,25 @@ impl TuiApp {
                     self.report_tabbar_focus = false;
                 }
                 self.status = Some(Status::ReportRunProgress { done: 0, total: n });
+            }
+            ReportRunUpdate::RowStarted { path, .. } => {
+                if self.report_run_cancelled(report_id) {
+                    return;
+                }
+                let Some(idx) = self.report_index_by_id(report_id) else {
+                    return;
+                };
+                let rt = &mut self.reports[idx];
+                let Some(prog) = rt.run_progress.as_mut() else {
+                    return;
+                };
+                // Mark this row's slot "running" (unless it already finished —
+                // a very fast row's Row can race ahead of its RowStarted).
+                if let Some(&ri) = prog.index.get(&path)
+                    && prog.states.get(ri) == Some(&RowState::Scheduled)
+                {
+                    prog.states[ri] = RowState::Running;
+                }
             }
             ReportRunUpdate::Row { row, .. } => {
                 if self.report_run_cancelled(report_id) {
@@ -1041,13 +1093,13 @@ impl TuiApp {
                     && ri < result.rows.len()
                 {
                     result.rows[ri] = *row;
-                    if !prog.filled[ri] {
-                        prog.filled[ri] = true;
+                    if prog.states[ri] != RowState::Finished {
+                        prog.states[ri] = RowState::Finished;
                         prog.done += 1;
                     }
                 }
                 let done = prog.done;
-                let total = prog.filled.len();
+                let total = prog.states.len();
                 self.status = Some(Status::ReportRunProgress { done, total });
             }
             ReportRunUpdate::Done { result, .. } => {
@@ -3062,10 +3114,11 @@ fn draw_report_results(
             ),
             Some(result) => {
                 let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
-                // While a run streams, grey the rows that haven't completed yet
-                // so the grid doubles as a live progress indicator.
-                let filled = rt.run_progress.as_ref().map(|p| p.filled.as_slice());
-                let lines = report_grid_lines(result, &header, filled, th);
+                // While a run streams, each row carries a live `RowState`: the
+                // grid greys unfinished rows and shows a status icon per row so
+                // it doubles as a live progress indicator.
+                let states = rt.run_progress.as_ref().map(|p| p.states.as_slice());
+                let lines = report_grid_lines(result, &header, states, th);
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
                 } else {
@@ -3102,13 +3155,15 @@ fn draw_report_results(
 /// headers followed by one line per row, each cell padded to its column's
 /// width (capped) so the columns line up under [`WrapMode::Clip`]. Newlines in
 /// a cell (e.g. a multi-line response body) are collapsed to a marker so a row
-/// stays on one grid line. When `filled` is `Some` (a run is streaming), rows
-/// whose flag is `false` are drawn dimmed — the still-pending, placeholder rows
-/// of the skeleton — so the grid doubles as a live progress indicator.
+/// stays on one grid line. When `states` is `Some` (a run is streaming), each
+/// row gets a leading status icon (scheduled/running/finished) and the
+/// still-pending rows are drawn dimmed — so the grid doubles as a live progress
+/// indicator. When `None` (a completed or static result) no icon column is
+/// drawn and every row uses the normal text colour.
 fn report_grid_lines(
     result: &ReportResult,
     header: &crate::report::flow::Header,
-    filled: Option<&[bool]>,
+    states: Option<&[RowState]>,
     th: &Theme,
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
@@ -3146,28 +3201,58 @@ fn report_grid_lines(
         .collect();
 
     let mut lines = Vec::with_capacity(body.len() + 1);
-    lines.push(grid_line(
-        &headers,
-        &widths,
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
+    // While a run streams, every line carries a leading status-icon cell
+    // (icon glyph + trailing space); the header's is blank so columns still
+    // line up. Off-stream results draw no icon column at all.
+    let show_icons = states.is_some();
+    let header_style = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let mut header_spans: Vec<Span<'static>> = Vec::new();
+    if show_icons {
+        header_spans.push(Span::styled("  ".to_string(), header_style));
+    }
+    header_spans.push(Span::styled(grid_row_text(&headers, &widths), header_style));
+    lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
-        // A row still awaiting its result (streaming) is dimmed; completed and
-        // static (non-streaming) rows use the normal text colour.
-        let pending = filled.map(|f| f.get(i) == Some(&false)).unwrap_or(false);
-        let style = if pending {
+        let state = states.and_then(|s| s.get(i)).copied();
+        // A row that hasn't finished (still scheduled or running) is dimmed;
+        // finished and static (non-streaming) rows use the normal text colour.
+        let pending = matches!(state, Some(RowState::Scheduled) | Some(RowState::Running));
+        let text_style = if pending {
             Style::default().fg(th.dim)
         } else {
             Style::default().fg(th.text)
         };
-        lines.push(grid_line(row, &widths, style));
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if show_icons {
+            // Mirror the collection view's Run-All markers (…/✓) for a
+            // consistent visual language; a dim dot marks a queued row.
+            let (glyph, color) = match state {
+                Some(RowState::Running) => (ROW_RUNNING_ICON, th.pending),
+                Some(RowState::Finished) => (ROW_FINISHED_ICON, th.ok),
+                _ => (ROW_SCHEDULED_ICON, th.dim),
+            };
+            spans.push(Span::styled(
+                format!("{glyph} "),
+                Style::default().fg(color),
+            ));
+        }
+        spans.push(Span::styled(grid_row_text(row, &widths), text_style));
+        lines.push(Line::from(spans));
     }
     lines
 }
 
-/// Assemble one grid line: each field padded/truncated to its column width and
-/// joined with a two-space gutter, styled uniformly.
-fn grid_line(fields: &[String], widths: &[usize], style: Style) -> Line<'static> {
+/// Status icons drawn beside each streaming report row. Scheduled reuses a dim
+/// dot; running/finished reuse the collection view's Run-All markers (`…`/`✓`)
+/// so the two progress indicators read the same way.
+const ROW_SCHEDULED_ICON: &str = "\u{00B7}"; // ·
+const ROW_RUNNING_ICON: &str = "\u{2026}"; // …
+const ROW_FINISHED_ICON: &str = "\u{2713}"; // ✓
+
+/// Assemble one grid row's text: each field padded/truncated to its column
+/// width and joined with a two-space gutter. The caller styles the returned
+/// string (and may prepend a status-icon span).
+fn grid_row_text(fields: &[String], widths: &[usize]) -> String {
     let mut out = String::new();
     for (i, field) in fields.iter().enumerate() {
         if i > 0 {
@@ -3186,7 +3271,7 @@ fn grid_line(fields: &[String], widths: &[usize], style: Style) -> Line<'static>
             out.extend(std::iter::repeat_n(' ', w - count));
         }
     }
-    Line::from(Span::styled(out, style))
+    out
 }
 
 /// Collapse a possibly multi-line cell value onto one line (newlines → `⏎`) so a

@@ -21,10 +21,10 @@ use crate::postman::parse_collection;
 use crate::report::flow::Header;
 use crate::report::producers::resolve_path;
 use crate::report::report::{expand_output_tokens, name_has_output_token};
-use crate::report::run::{DryRunner, LiveRunner, RunContext, finalize, run_flow_raw};
+use crate::report::run::{DryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow_raw};
 use crate::report::validate::{Context, Severity, validate};
 use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
-use crate::report::{CsvWriter, Report, ReportResult, ReportRow, ReportWriter};
+use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
 
 /// Run a report headlessly. Returns an OS exit code (0 = success, 1 = a fatal
 /// setup/validation error; a run that merely collected per-row errors still
@@ -206,7 +206,12 @@ pub fn run(
         };
         decor.line(&format!("  Rows       : {total}"));
         let done = std::sync::atomic::AtomicUsize::new(0);
-        let sink = |_row: &ReportRow| {
+        let sink = |ev: RowEvent| {
+            // Count only completed rows for the progress readout (a row is also
+            // announced when it starts, which we ignore here).
+            if !matches!(ev, RowEvent::Completed(_)) {
+                return;
+            }
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Progress is inherently ephemeral; keep it on stderr regardless of
             // where the CSV goes, redrawing one line in place.

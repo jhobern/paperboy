@@ -114,15 +114,32 @@ impl EntryRunner for DryRunner {
     }
 }
 
-/// A per-row streaming hook: called once for **each row as it is emitted**
-/// (innermost-loop completion), before any outer-scope broadcast cells or the
-/// final comparison/baseline collapse are applied. It lets a front-end fill a
-/// pre-built grid live as a long run progresses (matched by [`ReportRow::path`],
-/// which is stable and unique) instead of waiting for the whole run. Must be
-/// `Sync` — `PARALLEL` loop workers call it from several threads at once (so a
-/// `mpsc::Sender` sink needs a `Mutex`), and it may arrive out of iteration
-/// order under `PARALLEL` (the `path` still identifies the target row).
-pub type RowSink<'a> = dyn Fn(&ReportRow) + Sync + 'a;
+/// A row-lifecycle event delivered to a [`RowSink`] as a run progresses, so a
+/// front-end can reflect each row's state (scheduled → running → finished) in a
+/// pre-built grid. Both variants identify the target row by its structural
+/// [`ReportRow::path`], which is stable and unique even under out-of-order
+/// `PARALLEL` execution.
+pub enum RowEvent<'r> {
+    /// A leaf block (one with no nested loop, so it emits exactly one row) has
+    /// begun running its requests. Fired once, carrying the row's `path`,
+    /// *before* any of that row's requests are sent — the signal a front-end
+    /// uses to mark the slot "running" while its (possibly slow) requests are in
+    /// flight. Under `PARALLEL`, several rows can be running at once.
+    Started(&'r [(usize, usize)]),
+    /// A row has finished and is fully built (before any outer-scope broadcast
+    /// cells or the final comparison/baseline collapse are applied); carries the
+    /// row so the front-end can fill and un-grey its slot.
+    Completed(&'r ReportRow),
+}
+
+/// A per-row streaming hook: called with a [`RowEvent`] as each row starts and
+/// completes, so a front-end can fill a pre-built grid live as a long run
+/// progresses (matched by [`ReportRow::path`], which is stable and unique)
+/// instead of waiting for the whole run. Must be `Sync` — `PARALLEL` loop
+/// workers call it from several threads at once (so a `mpsc::Sender` sink needs
+/// a `Mutex`), and events may arrive out of iteration order under `PARALLEL`
+/// (the `path` still identifies the target row).
+pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 
 /// The immutable context a flow runs against: the bound collection's entries,
 /// the base variable layer (global + pinned env, resolved once), any named
@@ -437,6 +454,15 @@ impl<'a> Exec<'a> {
     /// are accumulated and either broadcast into the rows produced by nested
     /// loops or, when the block has no loop, emitted as a single row.
     fn exec_block(&mut self, nodes: &[FlowNode]) -> Vec<ReportRow> {
+        // A block with no nested loop emits exactly one row (a "leaf" block).
+        // Signal that row's slot as "running" up front — before any of its
+        // requests are sent — so a streaming front-end shows it in flight.
+        let is_leaf = !nodes
+            .iter()
+            .any(|n| matches!(n, FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. }));
+        if is_leaf && let Some(sink) = self.ctx.sink {
+            sink(RowEvent::Started(&self.path));
+        }
         let mut own: HashMap<String, String> = HashMap::new();
         let mut child_rows: Vec<ReportRow> = Vec::new();
         let mut has_loop = false;
@@ -527,7 +553,7 @@ impl<'a> Exec<'a> {
             target: self.target.clone(),
         };
         if let Some(sink) = self.ctx.sink {
-            sink(&row);
+            sink(RowEvent::Completed(&row));
         }
         row
     }
@@ -1581,7 +1607,11 @@ mod tests {
         )
         .unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
-        let sink = |row: &ReportRow| streamed.lock().unwrap().push(row.clone());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed(row) = ev {
+                streamed.lock().unwrap().push(row.clone());
+            }
+        };
         let ctx = RunContext {
             entries: &entries,
             base_vars: HashMap::new(),
@@ -1649,7 +1679,11 @@ mod tests {
         let flow =
             parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n").unwrap();
         let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
-        let sink = |row: &ReportRow| streamed.lock().unwrap().push(row.clone());
+        let sink = |ev: RowEvent| {
+            if let RowEvent::Completed(row) = ev {
+                streamed.lock().unwrap().push(row.clone());
+            }
+        };
         let ctx = RunContext {
             entries: &entries,
             base_vars: HashMap::new(),
@@ -1688,6 +1722,71 @@ mod tests {
             assert!(
                 index.contains_key(&row.path),
                 "every streamed row maps to a skeleton slot"
+            );
+        }
+    }
+
+    /// Every row is announced with a `Started` event carrying its structural
+    /// path *before* it is `Completed`, so a front-end can mark a slot "running"
+    /// while its requests are in flight, then "finished" when the row lands.
+    #[test]
+    fn streaming_sink_signals_started_before_completed_per_row() {
+        let fake = Fake::new(&[(
+            "send",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("send", &[])];
+        let flow =
+            parse_flow("FOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n").unwrap();
+        // Record the ordered (kind, path) event stream.
+        #[derive(PartialEq, Debug)]
+        enum Kind {
+            Started,
+            Completed,
+        }
+        let events: Mutex<Vec<(Kind, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
+        let sink = |ev: RowEvent| {
+            let mut log = events.lock().unwrap();
+            match ev {
+                RowEvent::Started(path) => log.push((Kind::Started, path.to_vec())),
+                RowEvent::Completed(row) => log.push((Kind::Completed, row.path.clone())),
+            }
+        };
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: Some(&sink),
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let events = events.into_inner().unwrap();
+
+        // One Started and one Completed per row.
+        assert_eq!(
+            events.iter().filter(|(k, _)| *k == Kind::Started).count(),
+            result.rows.len()
+        );
+        assert_eq!(
+            events.iter().filter(|(k, _)| *k == Kind::Completed).count(),
+            result.rows.len()
+        );
+        // For every row path, its Started appears before its Completed.
+        for row in &result.rows {
+            let started = events
+                .iter()
+                .position(|(k, p)| *k == Kind::Started && *p == row.path);
+            let completed = events
+                .iter()
+                .position(|(k, p)| *k == Kind::Completed && *p == row.path);
+            assert!(
+                matches!((started, completed), (Some(s), Some(c)) if s < c),
+                "row {:?} must be Started before Completed",
+                row.path
             );
         }
     }

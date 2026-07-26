@@ -12,6 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Live per-row status icons in the streaming results grid.** While a report
+  runs, each row now shows a status marker in a leading column: `·` (dim) for a
+  row still scheduled, `…` for a row whose requests are in flight, and `✓`
+  (green) once its result lands — reusing the same glyphs as the collection
+  view's Run-All markers. Under a `PARALLEL` loop several rows show `…` at once,
+  so the grid makes it obvious at a glance what has finished, what is running,
+  and what is still queued.
+
 - **Create a new report directly in a workspace.** In the workspace file
   picker, press **R** to name and create a brand-new `.report` inside the
   workspace (subfolders allowed; a missing extension defaults to `.report`).

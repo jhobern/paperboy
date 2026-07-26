@@ -15401,7 +15401,7 @@ fn cancelled_background_report_run_discards_its_result() {
 /// finalized result — clearing the per-row progress so the grid is fully lit.
 #[test]
 fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
-    use super::reports::{ReportRunUpdate, ReportView};
+    use super::reports::{ReportRunUpdate, ReportView, RowState};
     use crate::i18n::Status;
     let mut app = TuiApp::default();
     app.collections.push(Collection::new(
@@ -15443,7 +15443,14 @@ fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
     app.poll_report_run_updates();
     assert_eq!(app.reports[idx].view, ReportView::Results);
     let prog = app.reports[idx].run_progress.as_ref().expect("streaming");
-    assert_eq!(prog.filled, vec![false, false, false]);
+    assert_eq!(
+        prog.states,
+        vec![
+            RowState::Scheduled,
+            RowState::Scheduled,
+            RowState::Scheduled
+        ]
+    );
     assert_eq!(prog.done, 0);
     assert!(matches!(
         app.status,
@@ -15455,6 +15462,19 @@ fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     }
+
+    // 1b. A RowStarted marks that slot Running (its requests are in flight) but
+    //     doesn't advance the finished count — the icon flips scheduled→running.
+    tx.send(ReportRunUpdate::RowStarted {
+        report_id,
+        path: skeleton.rows[1].path.clone(),
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    let prog = app.reports[idx].run_progress.as_ref().unwrap();
+    assert_eq!(prog.states[1], RowState::Running, "row 1 is running");
+    assert_eq!(prog.states[0], RowState::Scheduled);
+    assert_eq!(prog.done, 0, "running does not count as finished");
 
     // 2. Rows stream in (deliberately out of order, as PARALLEL would): each
     //    lands in its own slot by path and advances the progress count.
@@ -15469,7 +15489,7 @@ fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
         .unwrap();
         app.poll_report_run_updates();
         let prog = app.reports[idx].run_progress.as_ref().unwrap();
-        assert!(prog.filled[src], "slot {src} filled");
+        assert_eq!(prog.states[src], RowState::Finished, "slot {src} finished");
         assert_eq!(prog.done, order + 1);
         assert!(matches!(
             app.status,
