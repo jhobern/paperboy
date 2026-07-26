@@ -2405,6 +2405,12 @@ impl TuiApp {
                 // file — see `open_new_workspace_collection_prompt`.
                 self.open_new_workspace_collection_prompt(picker.collection_idx);
             }
+            // Create a brand-new report in this workspace. Only in Browse mode
+            // (a report can't be a move/copy/add-request target), mirroring the
+            // `n` new-collection action — see `open_new_workspace_report_prompt`.
+            KeyCode::Char('R') if picker.mode == WsPickerMode::Browse => {
+                self.open_new_workspace_report_prompt(picker.collection_idx);
+            }
             KeyCode::Enter => match picker.entries.get(picker.selected) {
                 Some(entry) if !entry.is_dir => {
                     let path = entry.path.clone();

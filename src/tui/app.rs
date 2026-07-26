@@ -133,6 +133,12 @@ pub(crate) enum PromptKind {
     /// `.hurl` extension is defaulted. Reached via `n` in the workspace
     /// destination picker.
     NewWorkspaceCollection(usize),
+    /// Naming a brand-new `.report` file being created inside a Workspace tab
+    /// (the `usize` is the workspace collection index). Like
+    /// [`Self::NewWorkspaceCollection`] the typed text is a path relative to
+    /// the workspace root; subfolders are allowed and a `.report` extension is
+    /// defaulted. Reached via `R` in the workspace destination picker.
+    NewWorkspaceReport(usize),
     /// Editing one report-flow node "as a line" in the structured node editor:
     /// the prompt is seeded with the node's single-line source form and, on
     /// commit, that text is re-parsed and swapped back into the flow at `path`
@@ -153,6 +159,7 @@ impl PromptKind {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
             PromptKind::NewWorkspaceCollection(_) => ".hurl",
+            PromptKind::NewWorkspaceReport(_) => ".report",
             _ => "",
         }
     }
@@ -1527,6 +1534,7 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
+            PromptKind::NewWorkspaceReport(ci) => self.create_workspace_report(ci, text),
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
@@ -2267,6 +2275,31 @@ impl TuiApp {
             kind: PromptKind::NewWorkspaceCollection(ci),
             editor: Editor::blank(),
             title: s.workspace_new_collection_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Open the "name a new report" prompt for Workspace tab `ci` (see
+    /// [`PromptKind::NewWorkspaceReport`]). The typed text is a path relative
+    /// to the workspace root; `.report` is ghosted as the default extension.
+    /// Mirrors [`Self::open_new_workspace_collection_prompt`].
+    pub(crate) fn open_new_workspace_report_prompt(&mut self, ci: usize) {
+        if self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::NewWorkspaceReport(ci),
+            editor: Editor::blank(),
+            title: s.workspace_new_report_title.to_string(),
             mask: false,
             reset_to: None,
             secret_intact: false,

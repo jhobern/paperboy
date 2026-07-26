@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Create a new report directly in a workspace.** In the workspace file
+  picker, press **R** to name and create a brand-new `.report` inside the
+  workspace (subfolders allowed; a missing extension defaults to `.report`).
+  The file is written straight away, appears in the workspace tree next to its
+  collections, and opens as a workspace-pinned report ready to bind to a
+  collection and edit — mirroring the **n** new-collection action.
+
 - **Load and save `.report` files to a git remote.** Reports now use the same
   git flow as collections and environments: **File → Load → Report → Git** pulls
   a `.report` straight from a repo (no local clone — only that file is fetched),

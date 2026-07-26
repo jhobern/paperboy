@@ -503,7 +503,69 @@ impl TuiApp {
             Err(e) => self.status = Some(Status::Error(e)),
         }
     }
-    /// report's `# collection:` reference (relative to the report's own path
+
+    /// Create a brand-new scratch `.report` inside Workspace tab `ci`'s root at
+    /// the relative path `rel`, write it to disk immediately (so it becomes a
+    /// real member of the workspace tree), and open it as a workspace-aware
+    /// report pinned to that tree. Subfolders are allowed; a missing extension
+    /// defaults to `.report`. Absolute paths or ones escaping the root via `..`
+    /// are rejected. Mirrors [`Self::create_workspace_collection`], but a report
+    /// is a single self-contained file so it is saved right away rather than
+    /// staying in memory until Ctrl+S.
+    pub(crate) fn create_workspace_report(&mut self, ci: usize, rel: String) {
+        let Some(root) = self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.clone())
+        else {
+            return;
+        };
+        let browse = self
+            .collections
+            .get(ci)
+            .map(|c| c.workspace_browse.clone())
+            .unwrap_or_default();
+        let rel = rel.trim();
+        if rel.is_empty() {
+            return;
+        }
+        let mut rel_path = std::path::PathBuf::from(rel);
+        if rel_path.extension().is_none() {
+            rel_path.set_extension("report");
+        }
+        // Reject absolute paths or any `..`/root component that would let the
+        // new file escape the workspace root (same rule as new collections).
+        let safe = rel_path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if !safe {
+            self.status = Some(Status::Error(rel_path.display().to_string()));
+            return;
+        }
+        let full_path = root.join(&rel_path);
+        let s = Strings::for_language(&self.language);
+        let mut report = Report::scratch(s.report_default_name);
+        // Create any parent folders inside the workspace before writing.
+        if let Some(parent) = full_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.status = Some(Status::Error(format!("{}: {e}", parent.display())));
+            return;
+        }
+        if let Err(e) = report.save_local(&full_path) {
+            self.status = Some(Status::Error(e));
+            return;
+        }
+        // Open it pinned to the workspace tree it now belongs to.
+        self.open_workspace_report(full_path, root, browse);
+        self.status = Some(Status::WorkspaceReportCreated(
+            rel_path.display().to_string(),
+        ));
+    }
+
     /// when possible, else as an absolute path) against each open collection's
     /// path. Falls back to matching a collection by *name* so a report bound
     /// before the collection was ever saved to disk (common in tests / scratch

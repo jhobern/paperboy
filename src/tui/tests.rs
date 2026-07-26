@@ -12225,6 +12225,86 @@ fn create_workspace_collection_rejects_paths_escaping_the_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn create_workspace_report_writes_the_file_and_opens_a_workspace_report() {
+    let dir = workspace_temp_dir("ws_new_report");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    // A relative subfolder path with no extension → `.report` is defaulted and
+    // the parent folder is created on the spot (the report is written now, not
+    // deferred like a new collection).
+    app.create_workspace_report(ci, "reports/nightly".to_string());
+
+    let expected = dir.join("reports").join("nightly.report");
+    assert!(
+        expected.is_file(),
+        "the report is written to disk immediately"
+    );
+    assert_eq!(app.reports.len(), 1, "a report tab was opened");
+    let rt = &app.reports[0];
+    assert_eq!(rt.report.path.as_deref(), Some(expected.as_path()));
+    assert!(
+        rt.workspace.is_some(),
+        "opened pinned to the workspace tree, not as a plain report tab"
+    );
+    assert_eq!(
+        app.active_tab,
+        app.collections.len() + app.reports.len() - 1,
+        "the new report tab is the active tab"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceReportCreated(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_workspace_report_rejects_paths_escaping_the_root() {
+    let dir = workspace_temp_dir("ws_new_report_escape");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+
+    app.create_workspace_report(ci, "../evil".to_string());
+
+    assert!(
+        app.reports.is_empty(),
+        "a `..` path is rejected, no report is created"
+    );
+    assert!(!dir.join("..").join("evil.report").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capital_r_in_the_workspace_picker_opens_the_new_report_prompt() {
+    let dir = workspace_temp_dir("ws_picker_new_report");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // A Browse-mode picker (the `w` flow) → `R` opens the new-report prompt.
+    app.open_workspace_picker_for_active_tab();
+    press(&mut app, KeyCode::Char('R'));
+
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, .. }) => {
+            assert!(matches!(kind, PromptKind::NewWorkspaceReport(idx) if *idx == ci));
+        }
+        _ => panic!("expected the new-report name prompt"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Load `alpha.hurl` into a fresh Workspace tab so a request row is
 /// highlighted, ready for a move/copy. Returns the app and the tab index.
 fn workspace_tab_with_alpha_loaded(tag: &str) -> (TuiApp, usize, std::path::PathBuf) {

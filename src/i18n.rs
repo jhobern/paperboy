@@ -148,7 +148,7 @@ strings! {
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
     foot_workspace => "browse workspace", "parcourir workspace", "gennemse workspace";
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
-    workspace_picker_hint => "Enter open · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint => "Enter open · n new collection · R new report · Tab filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · R nouveau rapport · Tab filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · R ny rapport · Tab filter · ↑↓ flyt · Esc annuller";
     workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
     workspace_picker_hint_move => "Enter move request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée déplacer la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter flyt forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
     workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
@@ -159,7 +159,9 @@ strings! {
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
+    workspace_new_report_title => "New report (path relative to workspace)", "Nouveau rapport (chemin relatif au workspace)", "Ny rapport (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
+    workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
     workspace_filter_on => "Filter: .hurl/.json", "Filtre : .hurl/.json", "Filter: .hurl/.json";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
@@ -651,6 +653,7 @@ pub enum Status {
     /// a Workspace — names the relative file path so the user knows where the
     /// just-added request landed and that it still needs saving.
     WorkspaceCollectionCreated(String),
+    WorkspaceReportCreated(String),
     /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
     /// URL, which is the one field a request can't be saved without — the
     /// wizard is kept open (focused on the URL field) instead of silently
@@ -801,6 +804,9 @@ impl Status {
             Status::WorkspaceSaveFailed(e) => s.workspace_save_failed.replace("{e}", e),
             Status::WorkspaceCollectionCreated(name) => {
                 s.workspace_collection_created.replace("{name}", name)
+            }
+            Status::WorkspaceReportCreated(name) => {
+                s.workspace_report_created.replace("{name}", name)
             }
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
