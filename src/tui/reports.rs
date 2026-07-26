@@ -22,7 +22,9 @@ use tui_panel_select::{MultiSelectPanel, WrapMode};
 
 use super::app::{Overlay, Pane, TuiApp};
 use super::draw::panel;
-use super::editor::{Editor, apply_edit_key_full, render_editor_highlighted};
+use super::editor::{
+    Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
+};
 use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
@@ -2206,46 +2208,6 @@ enum NamePartial {
     Bare { text: String, start: usize },
     /// The text after an as-yet-unclosed opening quote (may contain spaces).
     Quoted(String),
-}
-
-/// Move the editor cursor left to the start of the previous word: skip any
-/// whitespace immediately to the left, then the run of non-whitespace. At
-/// column 0 this falls back to a plain left move (wrapping to the previous
-/// line), matching a normal cursor.
-fn word_left(ed: &mut Editor) {
-    if ed.col == 0 {
-        ed.left();
-        return;
-    }
-    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
-    let mut c = ed.col;
-    while c > 0 && chars[c - 1].is_whitespace() {
-        c -= 1;
-    }
-    while c > 0 && !chars[c - 1].is_whitespace() {
-        c -= 1;
-    }
-    ed.col = c;
-}
-
-/// Move the editor cursor right past the current/next word: skip any whitespace
-/// under the cursor, then the run of non-whitespace. At the line end this falls
-/// back to a plain right move (wrapping to the next line).
-fn word_right(ed: &mut Editor) {
-    let len = ed.line_len(ed.row);
-    if ed.col >= len {
-        ed.right();
-        return;
-    }
-    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
-    let mut c = ed.col;
-    while c < len && chars[c].is_whitespace() {
-        c += 1;
-    }
-    while c < len && !chars[c].is_whitespace() {
-        c += 1;
-    }
-    ed.col = c;
 }
 
 /// One level of source indentation (matches the flow serializer's four spaces).

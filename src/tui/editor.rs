@@ -13,6 +13,49 @@ use tui_line_editor::{EditorTheme, TruncationMarker};
 
 pub(crate) use tui_line_editor::{Editor, apply_edit_key, apply_edit_key_full};
 
+/// Move the editor cursor left to the start of the previous word: skip any
+/// whitespace immediately to the left, then the run of non-whitespace. At
+/// column 0 this falls back to a plain left move (wrapping to the previous
+/// line), matching a normal cursor. Shared by every editing surface so
+/// `Ctrl+Left` means the same thing in the report editor, Raw Mode, and the
+/// request wizard.
+pub(crate) fn word_left(ed: &mut Editor) {
+    if ed.col == 0 {
+        ed.left();
+        return;
+    }
+    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
+    let mut c = ed.col;
+    while c > 0 && chars[c - 1].is_whitespace() {
+        c -= 1;
+    }
+    while c > 0 && !chars[c - 1].is_whitespace() {
+        c -= 1;
+    }
+    ed.col = c;
+}
+
+/// Move the editor cursor right past the current/next word: skip any whitespace
+/// under the cursor, then the run of non-whitespace. At the line end this falls
+/// back to a plain right move (wrapping to the next line). The `Ctrl+Right`
+/// counterpart of [`word_left`].
+pub(crate) fn word_right(ed: &mut Editor) {
+    let len = ed.line_len(ed.row);
+    if ed.col >= len {
+        ed.right();
+        return;
+    }
+    let chars: Vec<char> = ed.lines[ed.row].chars().collect();
+    let mut c = ed.col;
+    while c < len && chars[c].is_whitespace() {
+        c += 1;
+    }
+    while c < len && !chars[c].is_whitespace() {
+        c += 1;
+    }
+    ed.col = c;
+}
+
 /// Map PaperBoy's [`Theme`] to the crate's [`EditorTheme`].
 fn editor_theme(th: &Theme) -> EditorTheme {
     EditorTheme {

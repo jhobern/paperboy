@@ -376,7 +376,16 @@ impl NodeKind {
             },
             NodeKind::ForEnvs => FlowNode::ForEnvs {
                 var: "TARGET".into(),
-                clause: EnvClause::Plain(Vec::new()),
+                // A placeholder BASELINE/COMPARISON pair — the comparison is the
+                // whole point of an `ENVS` loop, so the inserted template shows
+                // the shape to fill in. An empty clause would serialize to a
+                // bare `FOR TARGET IN ENVS ` which doesn't re-parse (it would
+                // kick the user out of the node editor). The names are just
+                // placeholders the user replaces with real loaded environments.
+                clause: EnvClause::Roles {
+                    baseline: vec!["baseline".into()],
+                    comparisons: vec!["candidate".into()],
+                },
                 body: Vec::new(),
                 parallel: None,
             },

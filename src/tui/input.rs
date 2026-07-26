@@ -3385,6 +3385,18 @@ impl TuiApp {
                 // Cursor movement is meaningless while the intact secret is shown.
                 // Shift+Arrow extends (or starts) a text selection instead of
                 // just moving the cursor; a plain arrow move clears it.
+                // Ctrl+Left/Right jump a whole word (matching the report editor)
+                // — placed before the plain-arrow arms so the modifier wins.
+                KeyCode::Left if ctrl && !secret_intact => {
+                    editor.set_selecting(shift);
+                    super::editor::word_left(&mut editor);
+                    Act::Edit
+                }
+                KeyCode::Right if ctrl && !secret_intact => {
+                    editor.set_selecting(shift);
+                    super::editor::word_right(&mut editor);
+                    Act::Edit
+                }
                 KeyCode::Left if !secret_intact => {
                     editor.set_selecting(shift);
                     editor.left();

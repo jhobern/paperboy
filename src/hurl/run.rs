@@ -242,7 +242,13 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
                 .iter()
                 .map(|h| (h.name.clone(), h.value.clone()))
                 .collect();
-            let raw = String::from_utf8_lossy(&r.body).to_string();
+            // Decompress by `Content-Encoding` first: when a request sends its
+            // own `Accept-Encoding` header, libcurl won't auto-decode, so
+            // `r.body` is still the compressed bytes. `uncompress_body` honours
+            // the header (and no-ops when absent); fall back to the raw bytes if
+            // the stream is malformed.
+            let bytes = r.uncompress_body().unwrap_or_else(|_| r.body.clone());
+            let raw = String::from_utf8_lossy(&bytes).to_string();
             let body = serde_json::from_str::<JsonValue>(&raw)
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone()))
                 .unwrap_or_else(|_| raw.clone());
@@ -433,6 +439,55 @@ mod tests {
             .find(|a| a.expr == "status == 200")
             .expect("a `status == 200` assert row");
         assert!(status_assert.passed);
+    }
+
+    /// Spawn a one-shot server that answers with a gzip-compressed body and a
+    /// `Content-Encoding: gzip` header (but no `Content-Length`, closing the
+    /// connection to signal end-of-body). Mirrors a server honouring a request's
+    /// own `Accept-Encoding` header — the case libcurl leaves un-decoded.
+    fn one_shot_gzip_server(gzip_body: &'static [u8]) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head);
+                let _ = sock.write_all(gzip_body);
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// Feature: a gzip response is decompressed for display. When a server
+    /// returns `Content-Encoding: gzip` (as it does for a request that sends its
+    /// own `Accept-Encoding`), libcurl doesn't auto-decode, so the mapping must
+    /// uncompress the body itself — otherwise the raw compressed bytes would be
+    /// shown (the garbled-output bug).
+    #[test]
+    fn gzip_response_body_is_decompressed() {
+        // gzip of `{"ok":true}` (mtime=0 for a stable literal).
+        static GZIP_OK: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let port = one_shot_gzip_server(GZIP_OK);
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(e.ok, "entry should pass, error: {:?}", e.error);
+        // raw_body is the exact decompressed bytes; body is its pretty JSON view.
+        assert_eq!(e.raw_body, "{\"ok\":true}");
+        assert!(
+            e.body.contains("\"ok\": true"),
+            "body should be decompressed pretty JSON, got: {:?}",
+            e.body
+        );
     }
 
     /// Feature: a failed status assertion is both surfaced as a failed
