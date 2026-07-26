@@ -578,8 +578,8 @@ pub(crate) enum FileKind {
     Environment,
     Workspace,
     /// A PaperTrail `.report` document (see [`crate::report::Report`]). Loaded
-    /// into / saved from a report tab, and — unlike the other kinds — has no
-    /// git destination yet (local only for now; git is a fast-follow).
+    /// into / saved from a report tab, locally or from a git remote (mirroring
+    /// the collection flow).
     Report,
 }
 
@@ -654,8 +654,8 @@ pub(crate) fn file_save_dest_items(kind: FileKind, s: &Strings) -> Vec<&'static 
         FileKind::Collection => vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git],
         FileKind::Environment => vec![s.file_dest_save, s.file_dest_save_as],
         FileKind::Workspace => vec![s.file_dest_save_as, s.file_dest_git],
-        // Reports save locally only for now (git is a fast-follow).
-        FileKind::Report => vec![s.file_dest_save, s.file_dest_save_as],
+        // Reports can be saved to their file, a new file, or a git remote.
+        FileKind::Report => vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git],
     }
 }
 
@@ -2794,6 +2794,25 @@ impl TuiApp {
         ))));
     }
 
+    /// Open the "Save Report to Git…" wizard for the active report tab, or show
+    /// [`Status::NoGitOrigin`] if it wasn't loaded from git (mirrors
+    /// [`Self::open_git_save_wizard`] — pushing to a brand-new remote is not
+    /// offered here, only repinning a report that already has a git origin).
+    pub(crate) fn open_git_save_report_wizard(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            self.status = Some(Status::NotReport);
+            return;
+        };
+        if self.reports[idx].report.git_origin.is_none() {
+            self.status = Some(Status::NoGitOrigin);
+            return;
+        }
+        self.overlay = Some(Overlay::GitSave(Box::new(GitSaveWizard::new_report(
+            idx,
+            &self.reports[idx].report,
+        ))));
+    }
+
     /// Open the "Save Workspace to Git…" wizard for the active tab, or show
     /// [`Status::NoGitOrigin`] if it isn't a git-loaded Workspace (this action
     /// is only ever offered for a tab that was downloaded from git and still
@@ -3141,6 +3160,16 @@ impl TuiApp {
                         self.load_environment_text(name, &text, None, origin);
                         false
                     }
+                    RemoteKind::Report => {
+                        // Build a report straight from the fetched text (keeping
+                        // its git provenance so a later "Save to Git" repins
+                        // in place), then open it as a new report tab.
+                        let fallback = file_stem(&path, "report");
+                        let mut report = crate::report::Report::from_text(fallback, text);
+                        report.git_origin = origin;
+                        self.open_loaded_report(report);
+                        false
+                    }
                     // A Workspace load never reaches `PickFile`/`Content` —
                     // it takes the `PickWorkspaceFilter` -> `GitMsg::Workspace`
                     // path instead (see above). Unreachable in practice.
@@ -3392,6 +3421,12 @@ impl TuiApp {
                                 }
                                 files
                             }
+                            GitSaveSource::Report { report_idx } => {
+                                // Push the report's source text as-is to the
+                                // chosen path (no accompanying env file).
+                                let text = self.reports[*report_idx].report.text.clone();
+                                vec![(w.collection_path.text(), text)]
+                            }
                         };
                         w.rx = Some(spawn_git_save_push(
                             w.url.text(),
@@ -3488,6 +3523,28 @@ impl TuiApp {
     /// branch origin untouched, per spec.
     fn finish_git_save(&mut self, w: &GitSaveWizard, new_sha: &str) {
         let ci = w.ci;
+        if let GitSaveSource::Report { report_idx } = &w.source {
+            // A report push has no per-request markers; just clear the dirty
+            // flag and, for a branch target, repin the report's git origin to
+            // the path/branch just pushed (a tag save leaves it untouched,
+            // mirroring the collection flow).
+            let idx = *report_idx;
+            if let Some(rt) = self.reports.get_mut(idx) {
+                rt.report.dirty = false;
+                if w.target_kind == GitSaveTarget::Branch {
+                    rt.report.git_origin = Some(GitOrigin {
+                        repo_url: w.url.text(),
+                        path: w.collection_path.text(),
+                        ref_kind: RefKind::Branch,
+                        ref_name: w.target_name.text(),
+                    });
+                }
+            }
+            self.remember_git_url(&w.url.text());
+            self.save_state();
+            self.status = Some(Status::GitSaved);
+            return;
+        }
         if let GitSaveSource::Workspace { filter, .. } = &w.source {
             // A Workspace push commits the on-disk tree, not the in-memory
             // collection, so there are no per-request "modified" markers to

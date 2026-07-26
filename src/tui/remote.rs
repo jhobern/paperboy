@@ -15,12 +15,14 @@ use super::draw::*;
 use super::editor::*;
 use super::theme::*;
 
-/// Whether the remote-git wizard is loading a collection, an environment, or
-/// a whole Workspace (many collection files at once, filtered by extension).
+/// Whether the remote-git wizard is loading a collection, an environment, a
+/// PaperTrail `.report`, or a whole Workspace (many collection files at once,
+/// filtered by extension).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RemoteKind {
     Collection,
     Environment,
+    Report,
     Workspace,
 }
 
@@ -250,6 +252,9 @@ pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> 
                 matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
                     || name.eq_ignore_ascii_case(".env")
                     || name.to_ascii_lowercase().starts_with(".env.")
+            }
+            RemoteKind::Report => {
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("report"))
             }
             // A Workspace load uses the file-type filter step, not this picker.
             RemoteKind::Workspace => true,
@@ -488,6 +493,7 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
     let title = match w.kind {
         RemoteKind::Collection => s.git_collection_menu,
         RemoteKind::Environment => s.git_env_menu,
+        RemoteKind::Report => s.git_report_menu,
         RemoteKind::Workspace => s.git_workspace_menu,
     };
     match &w.stage {
@@ -643,6 +649,7 @@ mod tests {
             "envs/dev.vars",
             ".env",
             ".env.dev-au",
+            "reports/nightly.report",
             "README.md",
             "src/main.rs",
         ]
@@ -661,6 +668,12 @@ mod tests {
     fn relevant_files_for_an_environment_keeps_vars_and_dotenv_style_files() {
         let out = relevant_files(RemoteKind::Environment, &files());
         assert_eq!(out, vec!["envs/dev.vars", ".env", ".env.dev-au"]);
+    }
+
+    #[test]
+    fn relevant_files_for_a_report_keeps_only_report_files() {
+        let out = relevant_files(RemoteKind::Report, &files());
+        assert_eq!(out, vec!["reports/nightly.report"]);
     }
 
     #[test]

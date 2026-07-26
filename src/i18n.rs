@@ -246,6 +246,7 @@ strings! {
     git_collection_menu => "Load Collection from Git…", "Charger une collection depuis Git…", "Indlæs samling fra Git…";
     git_env_menu => "Load Environment from Git…", "Charger un environnement depuis Git…", "Indlæs miljø fra Git…";
     git_workspace_menu => "Load Workspace from Git…", "Charger un Workspace depuis Git…", "Indlæs Workspace fra Git…";
+    git_report_menu => "Load Report from Git…", "Charger un rapport depuis Git…", "Indlæs rapport fra Git…";
     git_url_label => "Git URL", "URL Git", "Git-URL";
     git_token_label => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
     git_connect_hint => "Tab switch field · Enter connect · Esc cancel", "Tab changer de champ · Entrée connecter · Échap annuler", "Tab skift felt · Enter forbind · Esc annuller";
@@ -306,6 +307,7 @@ strings! {
     ws_switch_unsaved_cancel => "Cancel", "Annuler", "Annuller";
     git_save_include_env_label => "Also save the environment", "Enregistrer aussi l'environnement", "Gem også miljøet";
     git_save_collection_path_label => "Collection path in repo", "Chemin de la collection dans le dépôt", "Samlingens sti i repoet";
+    git_save_report_path_label => "Report path in repo", "Chemin du rapport dans le dépôt", "Rapportens sti i repoet";
     git_save_env_path_label => "Environment path in repo", "Chemin de l'environnement dans le dépôt", "Miljøets sti i repoet";
     git_save_step_hint => "Tab switch field · Enter continue · Esc cancel", "Tab changer de champ · Entrée continuer · Échap annuler", "Tab skift felt · Enter fortsæt · Esc annuller";
     git_save_branch_label => "Branch", "Branche", "Gren";

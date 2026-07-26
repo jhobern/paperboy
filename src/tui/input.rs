@@ -2503,9 +2503,9 @@ impl TuiApp {
             1 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Collection, 0)),
             2 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Environment, 0)),
             3 => self.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 0)),
-            // Reports are local-only for now (git is a fast-follow), so — like a
-            // Request — they skip the source step and open the file browser.
-            _ => self.open_browser(FileAction::OpenReport),
+            // Reports can be loaded locally or from git, so — like a collection
+            // — they go through the local/git source step.
+            _ => self.overlay = Some(Overlay::FileLoadSource(FileKind::Report, 0)),
         }
     }
 
@@ -2519,9 +2519,8 @@ impl TuiApp {
             (FileKind::Environment, false) => self.open_remote_wizard(RemoteKind::Environment),
             (FileKind::Workspace, true) => self.open_browser(FileAction::OpenWorkspace),
             (FileKind::Workspace, false) => self.open_remote_wizard(RemoteKind::Workspace),
-            // Reports are local-only for now (they normally skip this source
-            // step); open the local browser regardless of the source choice.
-            (FileKind::Report, _) => self.open_browser(FileAction::OpenReport),
+            (FileKind::Report, true) => self.open_browser(FileAction::OpenReport),
+            (FileKind::Report, false) => self.open_remote_wizard(RemoteKind::Report),
         }
     }
 
@@ -2563,7 +2562,8 @@ impl TuiApp {
             },
             FileKind::Report => match sel {
                 0 => self.begin_save(FileAction::SaveReport),
-                _ => self.begin_save_as(FileAction::SaveReport),
+                1 => self.begin_save_as(FileAction::SaveReport),
+                _ => self.open_git_save_report_wizard(),
             },
         }
     }

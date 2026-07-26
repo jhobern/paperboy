@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Load and save `.report` files to a git remote.** Reports now use the same
+  git flow as collections and environments: **File → Load → Report → Git** pulls
+  a `.report` straight from a repo (no local clone — only that file is fetched),
+  and **File → Save → Report → To Git…** pushes the report's source back,
+  repinning its origin so the next save appends to the same branch. This lets a
+  team keep a report versioned alongside the collection it drives.
+
 - **Reports warn up front when a `# baseline:` snapshot is missing.** If a
   report references a saved `.baseline` snapshot that isn't on disk, the report
   view (and the CLI) now flag it as a warning while you edit — instead of only

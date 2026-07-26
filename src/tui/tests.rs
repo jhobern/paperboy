@@ -16299,14 +16299,14 @@ fn p8_temp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn file_load_report_item_opens_the_local_browser() {
+fn file_load_report_item_opens_the_report_source_step() {
     let mut app = TuiApp::default();
-    // Row 4 of the Load kind list is the new "Report" item; it is local-only,
-    // so it skips the source step and opens the file browser directly.
+    // Row 4 of the Load kind list is the "Report" item; like a collection it
+    // can be loaded locally or from git, so it opens the local/git source step.
     app.activate_file_load_item(4);
     assert!(matches!(
         app.overlay,
-        Some(Overlay::Browser(FileAction::OpenReport, _))
+        Some(Overlay::FileLoadSource(FileKind::Report, 0))
     ));
 }
 
@@ -16321,12 +16321,64 @@ fn file_save_report_item_opens_the_report_destination_step() {
 }
 
 #[test]
-fn report_save_dest_items_are_local_only() {
+fn report_save_dest_items_include_git() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
     let items = file_save_dest_items(FileKind::Report, &s);
-    assert_eq!(items, vec![s.file_dest_save, s.file_dest_save_as]);
+    assert_eq!(
+        items,
+        vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git]
+    );
     assert_eq!(file_save_kind_index(FileKind::Report), 4);
+}
+
+#[test]
+fn report_load_from_git_opens_the_report_remote_wizard() {
+    let mut app = TuiApp::default();
+    // Choosing the "git" source for a Report opens the remote wizard scoped to
+    // reports (so its file picker only offers `.report` files).
+    app.activate_file_load_source(FileKind::Report, 1);
+    assert!(matches!(
+        &app.overlay,
+        Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Report
+    ));
+}
+
+#[test]
+fn report_git_save_needs_a_git_origin() {
+    use crate::i18n::Status;
+    let mut app = TuiApp::default();
+    app.new_report_tab(); // a scratch report has no git origin
+    app.open_git_save_report_wizard();
+    assert!(app.overlay.is_none(), "no wizard without a git origin");
+    assert!(matches!(app.status, Some(Status::NoGitOrigin)));
+}
+
+#[test]
+fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.git_origin = Some(crate::git_remote::GitOrigin {
+        repo_url: "https://example.test/repo.git".to_string(),
+        path: "reports/nightly.report".to_string(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".to_string(),
+    });
+    app.open_git_save_report_wizard();
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => {
+            assert!(matches!(
+                w.source,
+                crate::tui::git_save::GitSaveSource::Report { report_idx } if report_idx == idx
+            ));
+            assert_eq!(w.collection_path.text(), "reports/nightly.report");
+        }
+        other => panic!(
+            "expected the git-save wizard, got overlay present: {}",
+            other.is_some()
+        ),
+    }
 }
 
 #[test]
