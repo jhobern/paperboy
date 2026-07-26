@@ -14980,7 +14980,8 @@ fn report_editor_ctrl_h_deletes_a_word_like_ctrl_backspace() {
 }
 
 /// Tab in the report view rotates focus editor → tab list → editor when the
-/// report has no results grid yet (the results stop is skipped).
+/// A report with no results grid yet: Tab has only the editor to focus, so it
+/// stays put (the tab bar is no longer a focus stop).
 #[test]
 fn report_tab_cycles_focus_to_the_tab_list_and_back() {
     use super::reports::ReportView;
@@ -14989,15 +14990,13 @@ fn report_tab_cycles_focus_to_the_tab_list_and_back() {
     let idx = app.active_report_index().unwrap();
     assert!(!app.report_tabbar_focus);
     assert_eq!(app.reports[idx].view, ReportView::Source);
-    press(&mut app, KeyCode::Tab); // Editor -> Tab List (no grid to visit)
-    assert!(app.report_tabbar_focus, "Tab focuses the tab list");
-    press(&mut app, KeyCode::Tab); // Tab List -> Editor
-    assert!(!app.report_tabbar_focus);
+    press(&mut app, KeyCode::Tab); // no grid, no tree → nothing else to focus
+    assert!(!app.report_tabbar_focus, "Tab never focuses the tab list");
     assert_eq!(app.reports[idx].view, ReportView::Source);
 }
 
-/// With a results grid available, Tab visits it between the editor and the tab
-/// list: editor → results → tab list → editor.
+/// With a results grid available, Tab toggles between the editor and the grid —
+/// editor → results → editor — and never lands on the tab bar.
 #[test]
 fn report_tab_focus_cycle_visits_the_results_grid() {
     use super::reports::ReportView;
@@ -15024,9 +15023,7 @@ fn report_tab_focus_cycle_visits_the_results_grid() {
     assert_eq!(app.reports[idx].view, ReportView::Results);
     assert!(!app.report_tabbar_focus);
 
-    press(&mut app, KeyCode::Tab); // Results -> Tab List
-    assert!(app.report_tabbar_focus);
-    press(&mut app, KeyCode::Tab); // Tab List -> Editor (source)
+    press(&mut app, KeyCode::Tab); // Results -> Editor (source)
     assert!(!app.report_tabbar_focus);
     assert_eq!(app.reports[idx].view, ReportView::Source);
     press(&mut app, KeyCode::Tab); // Editor -> Results

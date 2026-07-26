@@ -303,6 +303,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Tab in the report view now cycles only the editor and results.** Pressing
+  **Tab** in a report rotates focus between the source/node editor and the
+  results grid (and, for a workspace report, the pinned tree) — it no longer
+  stops on the tab bar, which was a disorienting extra stop. Switch tabs the
+  same way as everywhere else: `[`/`]`, PageUp/PageDown, or Ctrl/plain arrows.
+
 - **Simpler, consistent keys in the report node editor.** `f` now always opens
   the **File** menu (as it does everywhere else) instead of doing double duty as
   a per-node "detail" key. Configuring a node — a request's options, a loop's

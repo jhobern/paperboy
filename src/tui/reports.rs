@@ -1159,20 +1159,21 @@ impl TuiApp {
 
     /// Rotate keyboard focus across the report view's areas: (for a
     /// workspace-aware report) the pinned Workspace tree, then the active editor
-    /// (source or nodes), the results grid, and the tab bar ("Tab List").
-    /// Forward order is Tree → Editor → Results → Tab List → Tree; `forward ==
-    /// false` reverses it. The Tree stop is present only for a workspace report;
-    /// the Results stop is skipped when the report hasn't produced a grid yet.
+    /// (source or nodes), then the results grid. Forward order is Tree → Editor
+    /// → Results → Tree; `forward == false` reverses it. The Tree stop is
+    /// present only for a workspace report; the Results stop is skipped when the
+    /// report hasn't produced a grid yet. The tab bar is deliberately *not* a
+    /// focus stop — cycling into it was disorienting, and the tab list is always
+    /// reachable with `[`/`]`, PageUp/PageDown and Ctrl/plain arrows instead.
     /// The body shown (`ReportView`) is kept in step with the focused body area
     /// so flipping to the grid and back is one continuous cycle; while the tree
-    /// or tab bar is focused the body keeps showing whatever it last did.
+    /// is focused the body keeps showing whatever it last did.
     pub(crate) fn cycle_report_focus(&mut self, forward: bool) {
         #[derive(PartialEq, Clone, Copy)]
         enum Focus {
             Tree,
             Editor,
             Results,
-            TabBar,
         }
         let Some(idx) = self.active_report_index() else {
             return;
@@ -1193,12 +1194,10 @@ impl TuiApp {
         if has_results {
             stops.push(Focus::Results);
         }
-        stops.push(Focus::TabBar);
-        // Where focus is now.
+        // Where focus is now. Leaving the tab bar out of the cycle means it is
+        // never a focus stop; any stale tab-bar focus is cleared below.
         let cur = if self.report_tree_focus && has_tree {
             Focus::Tree
-        } else if self.report_tabbar_focus {
-            Focus::TabBar
         } else if self.reports[idx].view == ReportView::Results {
             Focus::Results
         } else {
@@ -1213,12 +1212,12 @@ impl TuiApp {
         };
         let target = stops[next];
         self.report_tree_focus = target == Focus::Tree;
-        self.report_tabbar_focus = target == Focus::TabBar;
+        self.report_tabbar_focus = false;
         match target {
             Focus::Editor => self.reports[idx].view = self.reports[idx].editor_view,
             Focus::Results => self.reports[idx].view = ReportView::Results,
-            // Tree / TabBar leave the body showing whatever it last did.
-            _ => {}
+            // Tree leaves the body showing whatever it last did.
+            Focus::Tree => {}
         }
     }
 
@@ -1873,10 +1872,10 @@ impl TuiApp {
             KeyCode::Char('b') => self.open_report_bind(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
-            // Tab rotates focus across the report's areas — Editor (source) →
-            // Results grid → Tab List (the tab bar) → Editor — so the tab bar
-            // is reachable from the keyboard without leaving the report. Shift+
-            // Tab rotates the other way.
+            // Tab rotates focus across the report's areas — Editor (source or
+            // nodes) → Results grid → (for a workspace report) the pinned tree →
+            // Editor. The tab bar is not in this cycle (use `[`/`]` or the arrow
+            // keys to move across tabs). Shift+Tab rotates the other way.
             KeyCode::Tab => self.cycle_report_focus(true),
             KeyCode::BackTab => self.cycle_report_focus(false),
             // Export the last run to CSV next to the report.
