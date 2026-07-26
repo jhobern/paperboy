@@ -261,6 +261,14 @@ struct Exec<'a> {
     target: Option<String>,
     /// The current `ENVS` target's variables, layered above pinned/global.
     target_env: Option<HashMap<String, String>>,
+    /// Cells produced by REPORT statements in *enclosing* blocks (before this
+    /// loop) that broadcast into every row of this subtree. Threaded into each
+    /// [`emit_row`](Self::emit_row) with `or_insert` semantics (a row's own
+    /// inner cells win) so a streamed row already carries its outer-scope
+    /// columns — without this the top-level `REPORT REQUEST` columns stay blank
+    /// in the live grid until the run's final merge. Nearer scopes override
+    /// farther ones.
+    broadcast: HashMap<String, String>,
     /// Produced column keys in first-seen order (the default column order).
     column_order: Vec<String>,
     /// Non-fatal problems (unresolved request, transport failure, …). Every
@@ -282,6 +290,7 @@ struct ExecState {
     path: Vec<(usize, usize)>,
     target: Option<String>,
     target_env: Option<HashMap<String, String>>,
+    broadcast: HashMap<String, String>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -303,6 +312,7 @@ impl<'a> Exec<'a> {
             path: Vec::new(),
             target: None,
             target_env: None,
+            broadcast: HashMap::new(),
             column_order: Vec::new(),
             errors: Vec::new(),
         }
@@ -320,6 +330,7 @@ impl<'a> Exec<'a> {
             path: self.path.clone(),
             target: self.target.clone(),
             target_env: self.target_env.clone(),
+            broadcast: self.broadcast.clone(),
         }
     }
 
@@ -335,6 +346,7 @@ impl<'a> Exec<'a> {
             path: state.path,
             target: state.target,
             target_env: state.target_env,
+            broadcast: state.broadcast,
             column_order: Vec::new(),
             errors: Vec::new(),
         }
@@ -461,6 +473,7 @@ impl<'a> Exec<'a> {
                         producer,
                         body,
                         parallel.as_ref(),
+                        &own,
                     ));
                 }
                 FlowNode::ForEnvs {
@@ -476,6 +489,7 @@ impl<'a> Exec<'a> {
                         clause,
                         body,
                         parallel.as_ref(),
+                        &own,
                     ));
                 }
             }
@@ -495,10 +509,16 @@ impl<'a> Exec<'a> {
 
     /// Build the single row for a loop-free (innermost) block: this-block's
     /// cells plus a snapshot of the visible variables, the current row key, and
-    /// the current `ENVS` target. Fires the streaming [`RowSink`] (if any) with
-    /// the finished row before returning it, so a live front-end sees each row
-    /// as it completes.
-    fn emit_row(&self, cells: HashMap<String, String>) -> ReportRow {
+    /// the current `ENVS` target. Any enclosing-scope [`broadcast`](Self::broadcast)
+    /// cells are folded in (a row's own inner cells win) so a *streamed* row
+    /// already carries its outer-scope columns — the block's post-loop merge
+    /// keeps the returned rows correct even for reports that follow the loop.
+    /// Fires the streaming [`RowSink`] (if any) with the finished row before
+    /// returning it, so a live front-end sees each row as it completes.
+    fn emit_row(&self, mut cells: HashMap<String, String>) -> ReportRow {
+        for (k, v) in &self.broadcast {
+            cells.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         let row = ReportRow {
             cells,
             vars: self.visible_vars(),
@@ -689,6 +709,7 @@ impl<'a> Exec<'a> {
         producer: &Producer,
         body: &[FlowNode],
         parallel: Option<&ParallelSpec>,
+        inherited: &HashMap<String, String>,
     ) -> Vec<ReportRow> {
         let items = match self.expand_producer(producer) {
             Ok(t) => t,
@@ -698,7 +719,12 @@ impl<'a> Exec<'a> {
             }
         };
         // How one iteration seeds a fresh forked `Exec` and runs the body.
-        let seed = self.to_state();
+        let mut seed = self.to_state();
+        // Fold this block's pre-loop REPORT cells into the broadcast set so each
+        // streamed row carries them (nearer scope overrides farther).
+        for (k, v) in inherited {
+            seed.broadcast.insert(k.clone(), v.clone());
+        }
         let ctx = self.ctx;
         let run_one = |i: usize| -> IterOut {
             let item = &items[i];
@@ -731,6 +757,7 @@ impl<'a> Exec<'a> {
         clause: &EnvClause,
         body: &[FlowNode],
         parallel: Option<&ParallelSpec>,
+        inherited: &HashMap<String, String>,
     ) -> Vec<ReportRow> {
         let names: Vec<String> = match clause {
             EnvClause::Plain(names) => names.clone(),
@@ -739,7 +766,10 @@ impl<'a> Exec<'a> {
                 comparisons,
             } => baseline.iter().chain(comparisons).cloned().collect(),
         };
-        let seed = self.to_state();
+        let mut seed = self.to_state();
+        for (k, v) in inherited {
+            seed.broadcast.insert(k.clone(), v.clone());
+        }
         let ctx = self.ctx;
         let run_one = |i: usize| -> IterOut {
             let name = &names[i];
@@ -1520,6 +1550,59 @@ mod tests {
         );
         for row in &res.rows {
             assert!(row.cells.contains_key("oauth.HttpStatus"));
+        }
+    }
+
+    /// Regression: an outer-scope `REPORT REQUEST` (before a loop) must appear on
+    /// each row *as it streams*, not only in the run's final merged result — so a
+    /// live grid shows the broadcast columns during a long run instead of leaving
+    /// them blank until the very end.
+    #[test]
+    fn outer_report_columns_are_present_on_streamed_rows() {
+        let fake = Fake::new(&[
+            (
+                "oauth",
+                Canned {
+                    status: 201,
+                    ..Default::default()
+                },
+            ),
+            (
+                "up",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("oauth", &[]), entry("up", &[])];
+        let flow = parse_flow(
+            "REPORT REQUEST oauth\nFOR X IN [\"a\", \"b\"]\n    REPORT REQUEST up\nEND\n",
+        )
+        .unwrap();
+        let streamed: Mutex<Vec<ReportRow>> = Mutex::new(Vec::new());
+        let sink = |row: &ReportRow| streamed.lock().unwrap().push(row.clone());
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: Some(&sink),
+        };
+        let result = run_flow_raw(&flow, &ctx);
+        let streamed = streamed.into_inner().unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(streamed.len(), 2, "one streamed row per loop iteration");
+        // Every *streamed* row already carries the outer oauth column with its
+        // real value — the fix for the broadcast-during-streaming bug.
+        for row in &streamed {
+            assert_eq!(
+                row.cells.get("oauth.HttpStatus"),
+                Some(&"201".to_string()),
+                "streamed row is missing the broadcast outer-report column"
+            );
         }
     }
 

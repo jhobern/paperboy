@@ -314,6 +314,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Outer-scope report columns now fill in live, not only at the end.** A
+  `REPORT REQUEST` placed *outside* a loop (e.g. a top-level `REPORT REQUEST
+  "Get token"`) produces a column that applies to every row. Previously that
+  column stayed blank in the live results grid for the whole run and only
+  populated when the run finished — on a 500–1000 document run it looked like
+  the column never worked. Its value is now broadcast onto each row *as the row
+  streams in*, so the grid is correct throughout the run (the final export was
+  always correct).
+
 - **A file that disappears mid-run now names itself in the error.** When a
   request loads a local file during a report run (a Base64 file body, or a
   `[Form]`/`[Multipart]` file) and that file has been deleted since the run's
