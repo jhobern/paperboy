@@ -650,6 +650,206 @@ impl RequestForm {
     }
 }
 
+/// One row of the [`EnvsForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvsRow {
+    /// The loop variable name (a free identifier, editable inline).
+    Var,
+    /// The Iterate (`Plain`) vs Compare (`Roles`) mode toggle.
+    Mode,
+    /// One environment entry (index into [`EnvsForm::entries`]).
+    Env(usize),
+}
+
+/// One chosen environment in the [`EnvsForm`]. `baseline` is only meaningful in
+/// Compare mode (at most one entry is the baseline; the rest are comparisons).
+pub(crate) struct EnvEntry {
+    pub(crate) name: String,
+    pub(crate) baseline: bool,
+}
+
+/// The `FOR … IN ENVS` configure form ([`Overlay::ReportNodeEnvs`]), reached
+/// with Enter on an `ENVS` loop node. It picks the loop variable, the mode
+/// (Iterate = `ENVS "a", "b"` vs Compare = `ENVS BASELINE(…), COMPARISON(…)`)
+/// and — the point of #11 — the environment names from the *loaded*
+/// environments rather than typing them by hand.
+pub(crate) struct EnvsForm {
+    /// The report being edited (looked up by id, resilient to tab reorder).
+    pub(crate) report_id: u64,
+    /// Path of the node this edits.
+    pub(crate) path: Vec<usize>,
+    /// The loop variable name.
+    pub(crate) var: String,
+    /// `false` = Iterate (`Plain`), `true` = Compare (`Roles`).
+    pub(crate) compare: bool,
+    /// The chosen environments, in row order.
+    pub(crate) entries: Vec<EnvEntry>,
+    /// Loaded environment names the env rows cycle through (empty ⇒ no picker).
+    pub(crate) choices: Vec<String>,
+    /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
+    pub(crate) selected: usize,
+}
+
+impl EnvsForm {
+    /// Build the form from a node's current variable and [`EnvClause`].
+    fn build(
+        report_id: u64,
+        path: Vec<usize>,
+        var: String,
+        clause: &EnvClause,
+        choices: Vec<String>,
+    ) -> Self {
+        let (compare, mut entries) = match clause {
+            EnvClause::Plain(names) => (
+                false,
+                names
+                    .iter()
+                    .map(|n| EnvEntry {
+                        name: n.clone(),
+                        baseline: false,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            EnvClause::Roles {
+                baseline,
+                comparisons,
+            } => {
+                let mut es: Vec<EnvEntry> = baseline
+                    .iter()
+                    .map(|n| EnvEntry {
+                        name: n.clone(),
+                        baseline: true,
+                    })
+                    .collect();
+                es.extend(comparisons.iter().map(|n| EnvEntry {
+                    name: n.clone(),
+                    baseline: false,
+                }));
+                (true, es)
+            }
+        };
+        // The clause always keeps at least one entry so it can't serialize to an
+        // empty (unparseable) `FOR VAR IN ENVS `.
+        if entries.is_empty() {
+            entries.push(EnvEntry {
+                name: choices.first().cloned().unwrap_or_default(),
+                baseline: compare,
+            });
+        }
+        EnvsForm {
+            report_id,
+            path,
+            var,
+            compare,
+            entries,
+            choices,
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn visible_rows(&self) -> Vec<EnvsRow> {
+        let mut rows = vec![EnvsRow::Var, EnvsRow::Mode];
+        rows.extend((0..self.entries.len()).map(EnvsRow::Env));
+        rows
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// Cycle one entry's environment name through the loaded names (a no-op when
+    /// none are loaded, so a fresh template's placeholders survive).
+    fn cycle_entry(&mut self, i: usize, forward: bool) {
+        let n = self.choices.len();
+        if n == 0 {
+            return;
+        }
+        let cur = &self.entries[i].name;
+        let next = match self.choices.iter().position(|c| c == cur) {
+            Some(p) if forward => (p + 1) % n,
+            Some(p) => (p + n - 1) % n,
+            None => 0,
+        };
+        self.entries[i].name = self.choices[next].clone();
+    }
+
+    /// Toggle whether entry `i` is the baseline (Compare mode only). Enforces
+    /// the "at most one baseline" rule by clearing every other entry's flag.
+    fn toggle_baseline(&mut self, i: usize) {
+        if !self.compare {
+            return;
+        }
+        let becoming = !self.entries[i].baseline;
+        for (j, e) in self.entries.iter_mut().enumerate() {
+            e.baseline = becoming && j == i;
+        }
+    }
+
+    /// Flip Iterate ↔ Compare. Entering Compare with no baseline promotes the
+    /// first entry so a comparison run has a reference by default.
+    fn toggle_mode(&mut self) {
+        self.compare = !self.compare;
+        if self.compare && !self.entries.iter().any(|e| e.baseline) {
+            if let Some(first) = self.entries.first_mut() {
+                first.baseline = true;
+            }
+        }
+    }
+
+    fn add_entry(&mut self) {
+        self.entries.push(EnvEntry {
+            name: self.choices.first().cloned().unwrap_or_default(),
+            baseline: false,
+        });
+    }
+
+    fn remove_entry(&mut self, i: usize) {
+        if self.entries.len() > 1 && i < self.entries.len() {
+            self.entries.remove(i);
+        }
+    }
+
+    fn var_or_default(&self) -> String {
+        let v = self.var.trim();
+        if v.is_empty() {
+            "TARGET".to_string()
+        } else {
+            v.to_string()
+        }
+    }
+
+    /// The [`EnvClause`] the current rows describe, or `None` when it would be
+    /// empty (nothing named) — the caller then leaves the node unchanged rather
+    /// than writing an unparseable clause.
+    fn clause(&self) -> Option<EnvClause> {
+        let named = |want_baseline: Option<bool>| -> Vec<String> {
+            self.entries
+                .iter()
+                .filter(|e| want_baseline.is_none_or(|b| e.baseline == b))
+                .map(|e| e.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        };
+        if self.compare {
+            let baseline = named(Some(true));
+            let comparisons = named(Some(false));
+            if baseline.is_empty() && comparisons.is_empty() {
+                return None;
+            }
+            Some(EnvClause::Roles {
+                baseline,
+                comparisons,
+            })
+        } else {
+            let names = named(None);
+            if names.is_empty() {
+                return None;
+            }
+            Some(EnvClause::Plain(names))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TuiApp integration
 // ---------------------------------------------------------------------------
@@ -868,6 +1068,9 @@ impl TuiApp {
         if self.open_report_node_request(idx) {
             return;
         }
+        if self.open_report_node_envs(idx) {
+            return;
+        }
         if self.open_report_node_folder(idx) {
             return;
         }
@@ -973,8 +1176,133 @@ impl TuiApp {
         self.apply_node_replace(idx, &form.path, node);
     }
 
-    /// Key handling for the request configure form
-    /// ([`Overlay::ReportNodeRequest`]). ↑/↓ (or Tab) move between rows; the
+    /// Open the configure form for the selected `FOR … IN ENVS` node (#11) so
+    /// its baseline/comparison environments are picked from the loaded ones
+    /// instead of typed. Returns `true` when the selection is an ENVS loop,
+    /// `false` otherwise so the caller can try another form.
+    fn open_report_node_envs(&mut self, idx: usize) -> bool {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return false;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else {
+            return false;
+        };
+        let path = row.path.clone();
+        let report_id = self.reports[idx].report.id;
+        let (var, clause) = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return false;
+            };
+            match node_at(&flow, &path) {
+                Some(FlowNode::ForEnvs { var, clause, .. }) => (var.clone(), clause.clone()),
+                _ => return false, // not an ENVS loop
+            }
+        };
+        let choices: Vec<String> = self.global_envs.iter().map(|e| e.name.clone()).collect();
+        let form = EnvsForm::build(report_id, path, var, &clause, choices);
+        self.overlay = Some(Overlay::ReportNodeEnvs(Box::new(form)));
+        true
+    }
+
+    /// Finish an [`EnvsForm`]: rebuild the `FOR … IN ENVS` node from it (keeping
+    /// the node's body and `PARALLEL` marker untouched) and write it back. A
+    /// no-op when the form describes no environments (so the node is never
+    /// replaced by an unparseable empty clause).
+    pub(crate) fn apply_report_node_envs(&mut self, form: EnvsForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(clause) = form.clause() else {
+            return;
+        };
+        // Preserve the existing node's body + parallel; only var/clause change.
+        let (body, parallel) = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return;
+            };
+            match node_at(&flow, &form.path) {
+                Some(FlowNode::ForEnvs { body, parallel, .. }) => (body.clone(), *parallel),
+                _ => return,
+            }
+        };
+        let node = FlowNode::ForEnvs {
+            var: form.var_or_default(),
+            clause,
+            body,
+            parallel,
+        };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the ENVS configure form ([`Overlay::ReportNodeEnvs`]).
+    /// ↑/↓ (or Tab) move between rows; the Var row takes identifier characters;
+    /// the Mode row toggles Iterate/Compare with Space/←/→; env rows cycle the
+    /// environment with Space/←/→, set the baseline with `b`, add with `n` and
+    /// remove with `x`/Del; Enter applies, Esc cancels.
+    pub(crate) fn report_node_envs_key_handler(&mut self, key: KeyEvent, mut form: Box<EnvsForm>) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeEnvs(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => self.apply_report_node_envs(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    Some(EnvsRow::Var) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => form.var.push(c),
+                            KeyCode::Backspace => {
+                                form.var.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(EnvsRow::Mode) => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                        ) {
+                            form.toggle_mode();
+                        }
+                        keep(self, form);
+                    }
+                    Some(EnvsRow::Env(ei)) => {
+                        match key.code {
+                            KeyCode::Char(' ') | KeyCode::Right => form.cycle_entry(ei, true),
+                            KeyCode::Left => form.cycle_entry(ei, false),
+                            KeyCode::Char('b') => form.toggle_baseline(ei),
+                            KeyCode::Char('n') => {
+                                form.add_entry();
+                                form.selected = form.last_row();
+                            }
+                            KeyCode::Char('x') | KeyCode::Delete => {
+                                form.remove_entry(ei);
+                                form.selected = form.selected.min(form.last_row());
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
     /// name/response rows cycle with Space/←/→; the Report row toggles with
     /// Space; the alias row takes typed identifier characters and Backspace;
     /// field rows toggle with Space/`x`; Enter applies and closes; Esc cancels

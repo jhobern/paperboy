@@ -19,6 +19,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   from a busy directory isn't buried under unrelated files. Press `Tab` to toggle
   the filter off (show everything) and on again for an oddly-named file.
 
+- **Pick a `FOR … IN ENVS` loop's environments from the loaded ones.** In the
+  report node editor, pressing **Enter** on a `FOR … IN ENVS` node now opens a
+  small configure form instead of the raw line editor: choose the loop
+  variable, switch between **Iterate** (`ENVS "a", "b"`) and **Compare**
+  (`ENVS BASELINE(…), COMPARISON(…)`) mode, and pick each environment by cycling
+  through the environments you've actually loaded (`←/→`) rather than typing
+  their names. `b` marks the baseline, `n` adds an environment and `x` removes
+  one — mirroring how the request node already cycles request names.
+
 - **Revert a request or an environment to its last saved version.** Press
   **Ctrl+R** in the Requests list to discard a request's in-memory edits and
   reload it from the collection's file on disk, or **Ctrl+R** in the environment

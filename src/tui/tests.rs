@@ -18206,6 +18206,100 @@ fn report_node_request_form_name_row_cycles_titles() {
     );
 }
 
+/// Enter on a `FOR … IN ENVS` node opens the ENVS configure form, populated
+/// from the clause, and cycling a comparison entry picks from the *loaded*
+/// environments (#11) — no typing env names by hand.
+#[test]
+fn report_node_envs_form_cycles_loaded_environments() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "prod");
+    add_empty_global_env(&mut app, "staging");
+    add_empty_global_env(&mut app, "candidate");
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    press(&mut app, KeyCode::Down); // select the FOR … IN ENVS node
+    press(&mut app, KeyCode::Enter); // open the ENVS configure form
+
+    {
+        let Some(Overlay::ReportNodeEnvs(form)) = &app.overlay else {
+            panic!("Enter opens the ENVS configure form");
+        };
+        assert!(form.compare, "a BASELINE/COMPARISON clause is Compare mode");
+        assert_eq!(form.entries.len(), 2);
+        assert_eq!(form.entries[0].name, "prod");
+        assert!(form.entries[0].baseline, "the baseline entry is flagged");
+        assert_eq!(form.entries[1].name, "staging");
+        assert!(!form.entries[1].baseline);
+        assert_eq!(
+            form.choices,
+            vec![
+                "prod".to_string(),
+                "staging".to_string(),
+                "candidate".to_string()
+            ],
+            "the picker offers every loaded environment"
+        );
+    }
+
+    // Rows: 0 Var, 1 Mode, 2 Env(0) baseline, 3 Env(1) comparison.
+    press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Env(0)
+    press(&mut app, KeyCode::Down); // Env(1) — the comparison
+    press(&mut app, KeyCode::Right); // staging -> candidate
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("BASELINE(\"prod\")"),
+        "the baseline is kept: {text:?}"
+    );
+    assert!(
+        text.contains("COMPARISON(\"candidate\")"),
+        "the comparison cycled to a loaded environment: {text:?}"
+    );
+    assert!(app.overlay.is_none(), "the form closes on apply");
+}
+
+/// Toggling the ENVS form's Mode row rewrites a `BASELINE/COMPARISON` clause as
+/// a plain iterate list (and the loop body is preserved).
+#[test]
+fn report_node_envs_form_mode_toggle_rewrites_the_clause() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "prod");
+    add_empty_global_env(&mut app, "staging");
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    press(&mut app, KeyCode::Down); // select the FOR … IN ENVS node
+    press(&mut app, KeyCode::Enter); // open the form
+    press(&mut app, KeyCode::Down); // Mode row
+    press(&mut app, KeyCode::Char(' ')); // Compare -> Iterate
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("ENVS \"prod\", \"staging\""),
+        "the roles clause became a plain iterate list: {text:?}"
+    );
+    assert!(
+        !text.contains("BASELINE"),
+        "no BASELINE role remains: {text:?}"
+    );
+    assert!(
+        text.contains("REQUEST upload"),
+        "the body is kept: {text:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Workspace-aware reports: opening a `.trail` from a Workspace tree pins that
 // tree to the left of the full report view, so the user can navigate the

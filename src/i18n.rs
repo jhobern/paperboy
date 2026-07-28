@@ -586,6 +586,15 @@ strings! {
     report_node_response_default => "default", "défaut", "standard";
     report_node_alias_label => "Alias", "Alias", "Alias";
     report_node_alias_none => "(request name)", "(nom de la requête)", "(forespørgselsnavn)";
+    report_node_envs_title => "Configure ENVS loop", "Configurer la boucle ENVS", "Konfigurer ENVS-løkke";
+    report_node_envs_hint => "↑↓ move · ←/→ pick env · b baseline · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · n tilføj · x fjern · Enter anvend · Esc annuller";
+    report_node_envs_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
+    report_node_envs_mode_label => "Mode", "Mode", "Tilstand";
+    report_node_envs_mode_plain => "Iterate", "Itérer", "Iterér";
+    report_node_envs_mode_roles => "Compare", "Comparer", "Sammenlign";
+    report_node_envs_baseline => "Baseline", "Référence", "Basislinje";
+    report_node_envs_comparison => "Comparison", "Comparaison", "Sammenligning";
+    report_node_envs_none => "no environments loaded — load one to pick", "aucun environnement chargé — en charger un pour choisir", "ingen miljøer indlæst — indlæs et for at vælge";
 }
 
 /// A language-independent status / notification message. It stores *what*

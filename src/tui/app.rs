@@ -459,6 +459,13 @@ pub(crate) enum Overlay {
     /// `f` on a `REPORT REQUEST` node. See
     /// [`crate::tui::report_nodes::RequestForm`].
     ReportNodeRequest(Box<crate::tui::report_nodes::RequestForm>),
+    /// The structured node editor's `FOR … IN ENVS` configure form
+    /// ([`Overlay::ReportNodeEnvs`]): picks the loop variable, the Iterate/
+    /// Compare mode and the baseline/comparison environment names from the
+    /// loaded environments (rather than typing them by hand). Opened with
+    /// `Enter` on a `FOR … IN ENVS` node. See
+    /// [`crate::tui::report_nodes::EnvsForm`].
+    ReportNodeEnvs(Box<crate::tui::report_nodes::EnvsForm>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see

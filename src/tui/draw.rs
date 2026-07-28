@@ -356,6 +356,99 @@ fn draw_report_node_request_overlay(
     }
 }
 
+/// Draw the ENVS-loop configure overlay ([`Overlay::ReportNodeEnvs`]): the loop
+/// variable and Iterate/Compare mode on top, then one row per chosen
+/// environment. In Compare mode each env row shows its `[Baseline]` /
+/// `[Comparison]` role; env names are picked from the loaded environments.
+fn draw_report_node_envs_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::EnvsForm,
+    s: &Strings,
+    th: &Theme,
+) {
+    use super::report_nodes::EnvsRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mode_label = if form.compare {
+        s.report_node_envs_mode_roles
+    } else {
+        s.report_node_envs_mode_plain
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            EnvsRow::Var => {
+                let mut text = format!("{}: {}", s.report_node_envs_var_label, form.var);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            EnvsRow::Mode => Line::from(Span::styled(
+                format!("{}: ‹{}›", s.report_node_envs_mode_label, mode_label),
+                base,
+            )),
+            EnvsRow::Env(ei) => {
+                let entry = &form.entries[ei];
+                let shown = if entry.name.is_empty() {
+                    s.report_node_envs_none
+                } else {
+                    entry.name.as_str()
+                };
+                let text = if form.compare {
+                    let role = if entry.baseline {
+                        s.report_node_envs_baseline
+                    } else {
+                        s.report_node_envs_comparison
+                    };
+                    format!("  [{role}] ‹{shown}›")
+                } else {
+                    format!("  ‹{shown}›")
+                };
+                Line::from(Span::styled(text, base))
+            }
+        };
+        lines.push(line);
+    }
+    let block = panel(s.report_node_envs_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_envs_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 /// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
 /// simple selectable list of the open collections, each showing its display
 /// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
@@ -2767,6 +2860,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeRequest(form) => {
             draw_report_node_request_overlay(f, form, s, th);
+        }
+        Overlay::ReportNodeEnvs(form) => {
+            draw_report_node_envs_overlay(f, form, s, th);
         }
         Overlay::Prompt {
             kind,

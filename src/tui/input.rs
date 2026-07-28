@@ -688,6 +688,7 @@ impl TuiApp {
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
+            Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
         }
     }
 
