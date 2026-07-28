@@ -1569,4 +1569,18 @@ mod tests {
         assert!(parse_one_node("FOR", false).is_none());
         assert!(parse_one_node("   ", false).is_none());
     }
+
+    /// The node editor's raw line prompt routes through `parse_one_node`, so a
+    /// `REPORT VAR AS <pretty name>` line becomes a renamed-variable node.
+    #[test]
+    fn parse_one_node_accepts_report_var_as() {
+        use crate::report::flow::{FlowNode, ReportStmt};
+        match parse_one_node("REPORT FILE AS \"Pretty name\"", false) {
+            Some(FlowNode::Report(ReportStmt::VarAs { var, name })) => {
+                assert_eq!(var, "FILE");
+                assert_eq!(name, "Pretty name");
+            }
+            other => panic!("expected a VarAs node, got {other:?}"),
+        }
+    }
 }

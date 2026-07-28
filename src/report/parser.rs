@@ -50,9 +50,10 @@ list-decl    := 'LIST' IDENT '=' producer
 
 request      := 'REQUEST' name
 report       := 'REPORT' report-target
-report-target:= 'REQUEST' name [ 'AS' IDENT ] [ response-fmt ] [ show ] [ with-block ]
+report-target:= 'REQUEST' name [ 'AS' name ] [ response-fmt ] [ show ] [ with-block ]
+              | IDENT 'AS' name                          # renamed variable column
               | var-list
-              | string 'AS' name                       # computed column
+              | string 'AS' name                         # computed column
 var-list     := IDENT | '(' IDENT (',' IDENT)* ')'
 response-fmt := 'RESPONSE' ('RAW' | 'PRETTY')
 show         := 'SHOW' '(' IDENT (',' IDENT)* ')'
@@ -375,9 +376,19 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
     )(i)
 }
 
-/// `REPORT <var>`.
+/// `REPORT <var> [AS <name>]` — a single variable column, optionally renamed.
+/// A bareword source (vs. `report_computed`'s quoted string) is what marks this
+/// as a *variable* reference rather than a literal template.
 fn report_single(i: &str) -> IResult<&str, ReportStmt> {
-    map(ident, |v| ReportStmt::Vars(vec![v]))(i)
+    let (i, var) = ident(i)?;
+    let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
+    Ok((
+        i,
+        match alias {
+            Some(name) => ReportStmt::VarAs { var, name },
+            None => ReportStmt::Vars(vec![var]),
+        },
+    ))
 }
 
 fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
@@ -908,6 +919,36 @@ mod tests {
         } else {
             panic!("expected ForEach");
         }
+    }
+
+    #[test]
+    fn report_var_as_renames_a_variable_column() {
+        // A bareword source with `AS` is a renamed *variable* column, distinct
+        // from the quoted-template computed column. A spaced pretty name must
+        // be quoted, and the whole thing round-trips.
+        let flow = assert_round_trips("REPORT FILE AS \"Pretty name\"\n");
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::VarAs { var, name }) => {
+                assert_eq!(var, "FILE");
+                assert_eq!(name, "Pretty name");
+            }
+            other => panic!("expected VarAs, got {other:?}"),
+        }
+        // A single-word pretty name needs no quotes.
+        assert!(matches!(
+            &assert_round_trips("REPORT FILE AS Label\n").nodes[0],
+            FlowNode::Report(ReportStmt::VarAs { .. })
+        ));
+        // A *quoted* source is still a computed (literal) column, not a var.
+        assert!(matches!(
+            &parse_flow("REPORT \"FILE\" AS Label\n").unwrap().nodes[0],
+            FlowNode::Report(ReportStmt::Computed { .. })
+        ));
+        // A bare `REPORT VAR` (no AS) is unchanged.
+        assert!(matches!(
+            &parse_flow("REPORT FILE\n").unwrap().nodes[0],
+            FlowNode::Report(ReportStmt::Vars(_))
+        ));
     }
 
     #[test]

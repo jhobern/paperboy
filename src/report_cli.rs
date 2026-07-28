@@ -30,15 +30,18 @@ use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
 /// setup/validation error; a run that merely collected per-row errors still
 /// exits 0 — its errors are reported but every row was produced).
 ///
-/// `-c` names the collection to run against (re-pointable without editing the
-/// report), `-e` zero or more environments used as the base variable layer and
-/// (when repeated) the environments an `ENVS` loop can select by name,
-/// `--dry-run` expands the flow without sending any request, and `-o` chooses
-/// the output (`-` = stdout; a path whose extension selects the format; omitted
-/// = the `# output:` format written to a `# name:`-derived file next to the
-/// report, honouring the `{time}` token).
+/// `collection` names the collection to run against (re-pointable without
+/// editing the report); when `None`, the report's own `# collection:` header is
+/// used, resolved relative to the report's folder. `env_paths` are zero or more
+/// environments used as the base variable layer and (when repeated) the
+/// environments an `ENVS` loop can select by name; when empty, the report's
+/// `# environment:` header (if any) is used, likewise resolved relative to the
+/// report. `--dry-run` expands the flow without sending any request, and `-o`
+/// chooses the output (`-` = stdout; a path whose extension selects the format;
+/// omitted = the `# output:` format written to a `# name:`-derived file next to
+/// the report, honouring the `{time}` token).
 pub fn run(
-    collection_path: String,
+    collection_path: Option<String>,
     env_paths: Vec<String>,
     report_path: String,
     output: Option<String>,
@@ -63,8 +66,27 @@ pub fn run(
             return 1;
         }
     };
+    // The report's folder anchors every relative reference it makes: the
+    // `# collection:`/`# environment:` header fallbacks below, and (later) the
+    // `# root:` producer/baseline base directory.
+    let report_dir = report.path.as_deref().and_then(Path::parent);
 
     // --- collection ------------------------------------------------------
+    // `-c` re-points the report at any collection; when omitted, fall back to
+    // the report's own `# collection:` header (resolved relative to the report's
+    // folder) so a workspace report "just runs" without repeating the path.
+    let collection_path = match collection_path {
+        Some(c) => c,
+        None => match report.collection_ref() {
+            Some(c) => resolve_path(report_dir, &c).to_string_lossy().into_owned(),
+            None => {
+                eprintln!(
+                    "error: no collection to run against — pass -c/--collection, or add a '# collection:' header to '{report_path}'"
+                );
+                return 1;
+            }
+        },
+    };
     let col_content = match fs::read_to_string(&collection_path) {
         Ok(c) => c,
         Err(e) => {
@@ -86,6 +108,18 @@ pub fn run(
     // doubles as the base variable layer for requests outside any `ENVS` loop.
     // Distinct stems are required so an `ENVS` clause names an environment
     // unambiguously. Backward compatible with a single `-e`.
+    //
+    // When no `-e` is given, fall back to the report's `# environment:` header
+    // (resolved relative to the report's folder), mirroring the collection
+    // fallback above. Explicit `-e` flags always win.
+    let env_paths: Vec<String> = if env_paths.is_empty() {
+        match report.environment_ref() {
+            Some(e) => vec![resolve_path(report_dir, &e).to_string_lossy().into_owned()],
+            None => Vec::new(),
+        }
+    } else {
+        env_paths
+    };
     let mut base_vars: HashMap<String, String> = HashMap::new();
     let mut named_envs: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut env_names_loaded: Vec<String> = Vec::new();
@@ -140,9 +174,9 @@ pub fn run(
         .collect();
     let env_names: Vec<String> = named_envs.keys().cloned().collect();
     // Relative producer paths (and the `# baseline:` snapshot) resolve against
-    // `# root:` if set, else the report file's own directory. Computed here so
-    // validation's baseline-existence check and the run context agree.
-    let report_dir = report.path.as_deref().and_then(Path::parent);
+    // `# root:` if set, else the report file's own directory (`report_dir`,
+    // computed above). Computed here so validation's baseline-existence check
+    // and the run context agree.
     let root: Option<PathBuf> = match flow.header.root() {
         Some(r) if !r.trim().is_empty() => Some(resolve_path(report_dir, r)),
         _ => report_dir.map(Path::to_path_buf),
@@ -485,7 +519,7 @@ mod tests {
         let out = dir.join("out.csv");
 
         let code = run(
-            coll.to_string_lossy().into_owned(),
+            Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
             Some(out.to_string_lossy().into_owned()),
@@ -521,7 +555,7 @@ mod tests {
         let out = dir.join("out.csv");
 
         let code = run(
-            coll.to_string_lossy().into_owned(),
+            Some(coll.to_string_lossy().into_owned()),
             vec![
                 dir.join("prod.vars").to_string_lossy().into_owned(),
                 dir.join("staging.vars").to_string_lossy().into_owned(),
@@ -562,7 +596,7 @@ mod tests {
         .unwrap();
 
         let code = run(
-            coll.to_string_lossy().into_owned(),
+            Some(coll.to_string_lossy().into_owned()),
             vec![
                 a.join("prod.vars").to_string_lossy().into_owned(),
                 b.join("prod.vars").to_string_lossy().into_owned(),
@@ -587,7 +621,7 @@ mod tests {
         .unwrap();
 
         let code = run(
-            dir.join("missing.hurl").to_string_lossy().into_owned(),
+            Some(dir.join("missing.hurl").to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
             Some("-".to_string()),
@@ -611,7 +645,7 @@ mod tests {
         .unwrap();
 
         let code = run(
-            coll.to_string_lossy().into_owned(),
+            Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
             Some(dir.join("out.pdf").to_string_lossy().into_owned()),
@@ -650,7 +684,7 @@ mod tests {
         ] {
             let out = dir.join(format!("out.{ext}"));
             let code = run(
-                coll.to_string_lossy().into_owned(),
+                Some(coll.to_string_lossy().into_owned()),
                 Vec::new(),
                 report.to_string_lossy().into_owned(),
                 Some(out.to_string_lossy().into_owned()),
@@ -661,6 +695,69 @@ mod tests {
             assert!(!bytes.is_empty(), ".{ext} is non-empty");
             assert!(check(&bytes), ".{ext} has the expected magic/shape");
         }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With neither `-c` nor `-e`, the report's own `# collection:` and
+    /// `# environment:` headers are honoured, resolved relative to the report's
+    /// folder — so a workspace report "just runs" with `paperboy -r report`.
+    #[test]
+    fn headers_supply_collection_and_environment_when_flags_omitted() {
+        let dir = temp_dir("hdrres");
+        // Put the report in a sub-folder to prove the header paths resolve
+        // relative to the report, not the process CWD.
+        let sub = dir.join("reports");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            dir.join("api.hurl"),
+            "# Ping\nGET https://example.test/ping\nHTTP *\n",
+        )
+        .unwrap();
+        fs::write(dir.join("prod.vars"), "HOST=prod.test\n").unwrap();
+        let report = sub.join("r.report");
+        fs::write(
+            &report,
+            "# name: r\n# collection: ../api.hurl\n# environment: ../prod.vars\nREPORT HOST\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+        let out = dir.join("out.csv");
+
+        let code = run(
+            None,       // no -c → header's `# collection:` is used
+            Vec::new(), // no -e → header's `# environment:` is used
+            report.to_string_lossy().into_owned(),
+            Some(out.to_string_lossy().into_owned()),
+            true, // dry-run: no HTTP
+        );
+        assert_eq!(code, 0, "header-resolved run should succeed");
+
+        let csv = fs::read_to_string(&out).unwrap();
+        // The environment loaded (HOST from prod.vars is in the projection).
+        assert!(csv.contains("prod.test"), "env not applied:\n{csv}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no `-c` and no `# collection:` header there is nothing to run
+    /// against — a clear, fatal setup error.
+    #[test]
+    fn missing_collection_and_no_header_is_a_setup_error() {
+        let dir = temp_dir("nohdr");
+        let report = dir.join("r.report");
+        fs::write(&report, "# name: r\nREPORT REQUEST Ping\n").unwrap();
+
+        let code = run(
+            None,
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Some("-".to_string()),
+            true,
+        );
+        assert_eq!(
+            code, 1,
+            "no collection flag and no header is a fatal setup error"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

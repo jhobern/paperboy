@@ -12,6 +12,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`REPORT <var> AS <name>` renames a variable's column inline.** Alongside
+  `REPORT (VAR)` (which uses the variable's own name as the header) you can now
+  write `REPORT FILE AS "Pretty name"` to project a single variable under a
+  chosen column heading, without a separate `# columns:` directive. The pretty
+  name follows the usual quoting rules (quote it when it contains spaces or
+  punctuation); a bare word needs no quotes. Round-trips through the raw editor
+  and the structured node editor.
+
+- **`paperboy -r report` can resolve its collection and environment from the
+  report itself.** The headless report runner no longer requires `-c`: when it
+  is omitted, the report's own `# collection:` header is used, resolved relative
+  to the report's folder (so a workspace report "just runs"). Likewise, with no
+  `-e`, the report's `# environment:` header supplies the base variables.
+  Explicit `-c`/`-e` flags still override the headers; a report with neither a
+  flag nor a `# collection:` header fails with a clear error.
+
 - **Postman import now recovers `[Captures]` from test scripts.** A request's
   Postman `test` script often stores a value out of the response with
   `pm.environment.set("token", jsonData['token'])` (or `.collectionVariables`/

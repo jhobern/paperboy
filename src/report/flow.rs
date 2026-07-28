@@ -180,6 +180,10 @@ pub enum ReportStmt {
     },
     /// `REPORT <var>` / `REPORT (<v1>, <v2>, …)` — one column per variable.
     Vars(Vec<String>),
+    /// `REPORT <var> AS <name>` — a single variable's value under a renamed
+    /// column. The bareword source is what distinguishes this from the
+    /// quoted-template `Computed` form.
+    VarAs { var: String, name: String },
     /// `REPORT "<template>" AS <name>` — a computed column.
     Computed { template: String, name: String },
 }
@@ -425,6 +429,9 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             } else {
                 let _ = writeln!(out, "REPORT ({})", vars.join(", "));
             }
+        }
+        ReportStmt::VarAs { var, name } => {
+            let _ = writeln!(out, "REPORT {var} AS {}", name_text(name));
         }
         ReportStmt::Computed { template, name } => {
             let _ = writeln!(out, "REPORT {} AS {}", quote(template), name_text(name));
@@ -673,6 +680,9 @@ fn report_label(stmt: &ReportStmt) -> String {
             } else {
                 format!("REPORT ({})", vars.join(", "))
             }
+        }
+        ReportStmt::VarAs { var, name } => {
+            format!("REPORT {var} AS {name}")
         }
         ReportStmt::Computed { template, name } => {
             format!("REPORT {} AS {name}", quote(template))

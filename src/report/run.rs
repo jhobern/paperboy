@@ -595,6 +595,9 @@ impl<'a> Exec<'a> {
                 .iter()
                 .map(|v| (v.clone(), self.lookup(v).unwrap_or_default()))
                 .collect(),
+            ReportStmt::VarAs { var, name } => {
+                vec![(name.clone(), self.lookup(var).unwrap_or_default())]
+            }
             ReportStmt::Computed { template, name } => {
                 let value = substitute(template, &self.vars_for());
                 vec![(name.clone(), value)]
@@ -1477,13 +1480,19 @@ mod tests {
     fn report_vars_and_computed_columns() {
         let fake = Fake::new(&[]);
         let res = run(
-            "FILE=a.jpg\nREPORT (FILE)\nREPORT \"doc-{{FILE}}\" AS label\n",
+            "FILE=a.jpg\nREPORT (FILE)\nREPORT FILE AS \"Pretty name\"\nREPORT \"doc-{{FILE}}\" AS label\n",
             &[],
             &[],
             &[],
             &fake,
         );
         assert_eq!(res.rows[0].cells.get("FILE"), Some(&"a.jpg".to_string()));
+        // `REPORT FILE AS "Pretty name"` puts the variable's value under the
+        // renamed column.
+        assert_eq!(
+            res.rows[0].cells.get("Pretty name"),
+            Some(&"a.jpg".to_string())
+        );
         assert_eq!(
             res.rows[0].cells.get("label"),
             Some(&"doc-a.jpg".to_string())

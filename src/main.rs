@@ -38,6 +38,7 @@ Runs in one of three modes:\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
 \x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
 \x20 paperboy -c collection.hurl -e environment.vars -r report.report   Run a report\n\
+\x20 paperboy -r report.report   Run a report, taking its collection/environment from the report's own headers\n\
 \x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.report   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.report --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.report -o out.csv   Write the report to a file (- = stdout)\n\n\
@@ -74,9 +75,12 @@ struct Cli {
     #[arg(short = 'b', long)]
     batch: bool,
 
-    /// Run a PaperTrail report (`.report`) against the collection given by
-    /// `-c` and exit. Requires `-c`; `-e` supplies the base variable layer and
-    /// (when repeated) the environments an `ENVS` loop can name.
+    /// Run a PaperTrail report (`.report`) and exit. The collection to run
+    /// against comes from `-c`, or (when `-c` is omitted) the report's own
+    /// `# collection:` header resolved relative to the report's folder. `-e`
+    /// supplies the base variable layer and (when repeated) the environments an
+    /// `ENVS` loop can name; with no `-e`, the report's `# environment:` header
+    /// (if any) is used instead.
     #[arg(short = 'r', long, value_name = "FILE")]
     report: Option<String>,
 
@@ -97,16 +101,13 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    // Headless report mode (`-r`): run a PaperTrail report against `-c`.
+    // Headless report mode (`-r`): run a PaperTrail report. `-c` may be omitted
+    // — the report's `# collection:` header (resolved relative to the report's
+    // folder) is used instead; `report_cli::run` raises a clear error if neither
+    // is available.
     if let Some(report) = cli.report {
-        let Some(collection) = cli.collection else {
-            eprintln!(
-                "error: -r/--report requires -c/--collection (the collection to run against)"
-            );
-            std::process::exit(2);
-        };
         std::process::exit(report_cli::run(
-            collection,
+            cli.collection,
             cli.env,
             report,
             cli.output,
