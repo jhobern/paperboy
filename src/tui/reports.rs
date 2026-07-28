@@ -31,6 +31,7 @@ use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::flow::{FlowNode, Header, Producer, ReportFlow};
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
+use crate::report::parser::opens_block;
 use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
@@ -2219,18 +2220,11 @@ fn leading_ws(line: &str) -> String {
     line.chars().take_while(|c| c.is_whitespace()).collect()
 }
 
-/// Whether `line` opens a nested block — i.e. begins (after indentation) with
-/// the `FOR` keyword. A newline after such a line gets one extra indent level.
-fn opens_block(line: &str) -> bool {
-    let t = line.trim_start();
-    strip_keyword(t, "FOR").is_some()
-}
-
 /// If the editor's current line now reads exactly `END` (ignoring case and
-/// surrounding whitespace), snap its indentation to that of the `FOR` it
+/// surrounding whitespace), snap its indentation to that of the block opener it
 /// closes, so finishing a block dedents one level. Idempotent: an `END` already
-/// aligned to its `FOR` is left untouched. Does nothing when the `FOR`/`END`
-/// nesting is unbalanced above the cursor. The cursor stays at the line end.
+/// aligned to its opener is left untouched. Does nothing when the block nesting
+/// above the cursor is unbalanced. The cursor stays at the line end.
 fn reindent_end_line(ed: &mut Editor) {
     let row = ed.row;
     let Some(line) = ed.lines.get(row) else {
@@ -2239,14 +2233,13 @@ fn reindent_end_line(ed: &mut Editor) {
     if !line.trim().eq_ignore_ascii_case("END") {
         return;
     }
-    // Walk upward tracking FOR/END balance to find the matching FOR.
+    // Walk upward tracking opener/END balance to find the matching opener.
     let mut depth = 0i32;
     let mut target: Option<String> = None;
     for prev in ed.lines[..row].iter().rev() {
-        let t = prev.trim_start();
-        if t.trim().eq_ignore_ascii_case("END") {
+        if prev.trim().eq_ignore_ascii_case("END") {
             depth += 1;
-        } else if strip_keyword(t, "FOR").is_some() {
+        } else if opens_block(prev) {
             if depth == 0 {
                 target = Some(leading_ws(prev));
                 break;
@@ -2267,7 +2260,7 @@ fn reindent_end_line(ed: &mut Editor) {
 fn strip_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let head = s.get(..kw.len())?;
     if head.eq_ignore_ascii_case(kw) {
-        let rest = &s[kw.len()..];
+        let rest: &str = &s[kw.len()..];
         if rest.starts_with(char::is_whitespace) {
             return Some(rest.trim_start());
         }

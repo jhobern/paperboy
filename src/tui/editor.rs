@@ -1,5 +1,6 @@
-//! PaperBoy's line/multi-line editor is now the reusable [`tui_line_editor`]
-//! crate. This module re-exports the editor type and key handler, and keeps
+//! PaperBoy's line/multi-line editor lives in the in-tree [`super::line_editor`]
+//! module (formerly the `tui-line-editor` crate). This module re-exports the
+//! editor type and key handler, and keeps
 //! the two theming-aware render wrappers so call sites can keep passing a
 //! [`Theme`] instead of an [`EditorTheme`].
 
@@ -9,9 +10,9 @@ use ratatui::text::Span;
 
 use super::theme::*;
 use ratatui::style::{Color, Style};
-use tui_line_editor::{EditorTheme, TruncationMarker};
+use super::line_editor::{EditorTheme, TruncationMarker};
 
-pub(crate) use tui_line_editor::{Editor, apply_edit_key, apply_edit_key_full};
+pub(crate) use super::line_editor::{Editor, apply_edit_key, apply_edit_key_full};
 
 /// Move the editor cursor left to the start of the previous word: skip any
 /// whitespace immediately to the left, then the run of non-whitespace. At
@@ -68,7 +69,7 @@ fn editor_theme(th: &Theme) -> EditorTheme {
 }
 
 pub(crate) fn render_editor(f: &mut Frame, area: Rect, ed: &Editor, masked: bool, th: &Theme) {
-    tui_line_editor::render_editor(f, area, ed, &editor_theme(th), masked);
+    super::line_editor::render_editor(f, area, ed, &editor_theme(th), masked);
 }
 
 /// Like [`render_editor`], but each visible logical line is drawn from the
@@ -83,7 +84,7 @@ pub(crate) fn render_editor_highlighted(
     th: &Theme,
     highlight: impl Fn(usize, &str) -> Vec<Span<'static>>,
 ) {
-    tui_line_editor::render_editor_highlighted(f, area, ed, &editor_theme(th), highlight);
+    super::line_editor::render_editor_highlighted(f, area, ed, &editor_theme(th), highlight);
 }
 
 /// Render a single-line editor's text into `area`, masking every character with
@@ -97,7 +98,7 @@ pub(crate) fn render_line_field(
     mask: bool,
     th: &Theme,
 ) {
-    tui_line_editor::render_line_field(f, area, ed, &editor_theme(th), focused, mask);
+    super::line_editor::render_line_field(f, area, ed, &editor_theme(th), focused, mask);
 }
 
 /// Render a read-only single line of `text` into `area` in `color`, drawing a
@@ -111,5 +112,5 @@ pub(crate) fn render_clipped_line(f: &mut Frame, area: Rect, text: &str, color: 
         glyph: '\u{2026}',
         style: Style::default().fg(th.dim),
     };
-    tui_line_editor::render_clipped_line(f, area, text, color, Some(marker));
+    super::line_editor::render_clipped_line(f, area, text, color, Some(marker));
 }

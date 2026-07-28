@@ -9,6 +9,7 @@ mod draw;
 mod editor;
 mod git_save;
 mod input;
+mod line_editor;
 mod new_request;
 pub(crate) mod remote;
 mod report_highlight;

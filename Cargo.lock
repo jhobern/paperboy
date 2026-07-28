@@ -1496,18 +1496,19 @@ dependencies = [
 name = "paperboy"
 version = "0.1.6"
 dependencies = [
+ "anyhow",
  "base64",
  "chrono",
  "clap",
  "hurl",
  "hurl_core",
+ "nom",
  "ratatui",
  "ratatui-explorer",
  "regex",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
- "tui-line-editor",
  "tui-panel-select",
  "tui-rgb-picker",
  "uuid",
@@ -2355,15 +2356,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "tui-line-editor"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d70d86e5808238a9c6dcb5e344149f9fa489c6bbf942080775655d88ec96f1bf"
-dependencies = [
- "ratatui",
 ]
 
 [[package]]

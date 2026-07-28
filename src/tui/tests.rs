@@ -14898,6 +14898,67 @@ fn report_editor_newline_indents_in_a_for_block_and_end_dedents() {
     );
 }
 
+/// Item 4 (rep-editor-indent): a `PARALLEL FOR` header opens a block just like
+/// a plain `FOR` — the next line indents and its `END` dedents to match.
+#[test]
+fn report_editor_indents_a_parallel_for_block() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: c.hurl\nPARALLEL(3) FOR F IN FILES \"docs\"");
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Enter);
+    for c in "REQUEST Oauth".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    for c in "END".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let text = app.active_report().unwrap().report.text.clone();
+    assert!(
+        text.contains("\n    REQUEST Oauth"),
+        "a newline after PARALLEL FOR indents one level: {text:?}"
+    );
+    assert!(
+        text.contains("\nEND") && !text.contains("\n    END"),
+        "typing END dedents to the PARALLEL FOR's indent: {text:?}"
+    );
+}
+
+/// Item 4 (rep-editor-indent): a `REPORT REQUEST … WITH` header opens a block
+/// too — the next line indents and the closing `END` snaps back to the
+/// `REPORT`'s indent.
+#[test]
+fn report_editor_indents_a_report_with_block() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: c.hurl\nREPORT REQUEST process WITH");
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Enter);
+    for c in "id: jsonpath \"$.id\"".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    for c in "END".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let text = app.active_report().unwrap().report.text.clone();
+    assert!(
+        text.contains("\n    id: jsonpath"),
+        "a newline after REPORT … WITH indents one level: {text:?}"
+    );
+    assert!(
+        text.contains("\nEND") && !text.contains("\n    END"),
+        "typing END dedents to the REPORT's indent: {text:?}"
+    );
+}
+
 /// Item 9 (rep-cwd-indicator): the binding panel names the directory relative
 /// producer paths resolve against — the report's own folder once saved, else
 /// the process working directory (flagged as a fallback).
@@ -14921,7 +14982,7 @@ fn report_binding_panel_shows_the_base_directory() {
 }
 
 /// Ctrl+Backspace in the report editor deletes the previous word (via the
-/// shared `tui-line-editor`), and Ctrl+Z undoes the deletion.
+/// in-tree `line_editor` module), and Ctrl+Z undoes the deletion.
 #[test]
 fn report_editor_ctrl_backspace_deletes_a_word_and_ctrl_z_undoes() {
     let mut app = TuiApp::default();

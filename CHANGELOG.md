@@ -339,6 +339,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The report editor now auto-indents `PARALLEL` loops and `REPORT … WITH`
+  blocks.** Pressing Enter after a block-opening line indents the body one
+  level, and typing `END` snaps back to the opener's indent. Previously only a
+  plain `FOR` line was recognised, so `PARALLEL FOR` / `PARALLEL(n) FOR` loops
+  and `REPORT REQUEST … WITH … END` blocks were left un-indented and their
+  `END` never dedented. Block recognition now runs the PaperTrail grammar's own
+  parser, so it stays in step with the language.
+
 - **Outer-scope report columns now fill in live, not only at the end.** A
   `REPORT REQUEST` placed *outside* a loop (e.g. a top-level `REPORT REQUEST
   "Get token"`) produces a column that applies to every row. Previously that

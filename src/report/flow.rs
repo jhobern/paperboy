@@ -26,6 +26,18 @@ pub struct Header {
     pub lines: Vec<HeaderLine>,
 }
 
+pub enum HeaderDirective {
+    Collection(String),
+    Name(String),
+    Output(String),
+    Columns(String),
+    Root(String),
+    Environment(String),
+    Baseline(String),
+    // Any directive that doesn't match one of the declared types is stored as (key, value)
+    Unknown(String, String),
+}
+
 /// One line of the header: either a recognised `# key: value` directive or a
 /// free-form `#` comment (preserved as-is).
 #[derive(Debug, Clone, PartialEq, Eq)]
