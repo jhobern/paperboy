@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn derived_output_path_uses_report_path_for_plain_name() {
         let mut report = Report::from_text("nightly", "# name: nightly\n");
-        report.path = Some(PathBuf::from("/reports/nightly.report"));
+        report.path = Some(PathBuf::from("/reports/nightly.trail"));
         assert_eq!(
             derived_output_path(&report, "csv"),
             PathBuf::from("/reports/nightly.csv")
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn derived_output_path_expands_time_token_next_to_report() {
         let mut report = Report::from_text("run_{time}", "# name: run_{time}\n");
-        report.path = Some(PathBuf::from("/reports/nightly.report"));
+        report.path = Some(PathBuf::from("/reports/nightly.trail"));
         let out = derived_output_path(&report, "csv");
         let name = out.file_name().unwrap().to_string_lossy();
         // Token expanded (no literal "{time}") and placed in the report's dir.
@@ -510,7 +510,7 @@ mod tests {
         let dir = temp_dir("dry");
         let coll = dir.join("api.hurl");
         fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\nREPORT REQUEST Ping\n",
@@ -546,7 +546,7 @@ mod tests {
         fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
         fs::write(dir.join("prod.vars"), "HOST=prod.test\n").unwrap();
         fs::write(dir.join("staging.vars"), "HOST=staging.test\n").unwrap();
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: api.hurl\nFOR TARGET IN ENVS \"prod\", \"staging\"\n    REPORT TARGET\n    REPORT REQUEST Ping\nEND\n",
@@ -588,7 +588,7 @@ mod tests {
         fs::create_dir_all(&b).unwrap();
         fs::write(a.join("prod.vars"), "HOST=a.test\n").unwrap();
         fs::write(b.join("prod.vars"), "HOST=b.test\n").unwrap();
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn missing_collection_is_a_setup_error() {
         let dir = temp_dir("nocoll");
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: missing.hurl\nREPORT REQUEST Ping\n",
@@ -637,7 +637,7 @@ mod tests {
         let dir = temp_dir("badext");
         let coll = dir.join("api.hurl");
         fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: api.hurl\nREPORT REQUEST Ping\n",
@@ -661,7 +661,7 @@ mod tests {
         let dir = temp_dir("fmts");
         let coll = dir.join("api.hurl");
         fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\nREPORT REQUEST Ping\n",
@@ -715,7 +715,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("prod.vars"), "HOST=prod.test\n").unwrap();
-        let report = sub.join("r.report");
+        let report = sub.join("r.trail");
         fs::write(
             &report,
             "# name: r\n# collection: ../api.hurl\n# environment: ../prod.vars\nREPORT HOST\nREPORT REQUEST Ping\n",
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn missing_collection_and_no_header_is_a_setup_error() {
         let dir = temp_dir("nohdr");
-        let report = dir.join("r.report");
+        let report = dir.join("r.trail");
         fs::write(&report, "# name: r\nREPORT REQUEST Ping\n").unwrap();
 
         let code = run(

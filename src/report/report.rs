@@ -1,11 +1,11 @@
-//! The front-end-agnostic runtime [`Report`]: an in-memory `.report` document
+//! The front-end-agnostic runtime [`Report`]: an in-memory `.trail` document
 //! (a display name, its PaperTrail source text, and file provenance) plus
 //! local load/save. It deliberately mirrors [`crate::collection::Collection`]
 //! so the TUI (and a future GUI) can treat a report tab like a collection tab.
 //!
 //! The **source of truth is the raw text** (the raw-text editor edits it
 //! directly); the parsed [`ReportFlow`] is derived on demand via [`Report::flow`].
-//! This keeps editing cheap and matches how `.report` files round-trip through
+//! This keeps editing cheap and matches how `.trail` files round-trip through
 //! [`super::parser::parse_flow`] / [`ReportFlow::to_text`].
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub fn next_report_id() -> u64 {
     NEXT_REPORT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// An in-memory `.report` document.
+/// An in-memory `.trail` document.
 #[derive(Debug, Clone)]
 pub struct Report {
     /// Process-unique identity (mirrors `Collection::id`).
@@ -40,7 +40,7 @@ pub struct Report {
     /// Display name (tab title). Derived from the header `name:` directive or
     /// the file stem on load, but independent thereafter.
     pub name: String,
-    /// The `.report` source (comment header + flow body) — the editing source of
+    /// The `.trail` source (comment header + flow body) — the editing source of
     /// truth. Parsed on demand via [`Self::flow`].
     pub text: String,
     /// Local file path this report was last loaded from / saved to, if any.
@@ -111,7 +111,7 @@ impl Report {
         self.dirty = true;
     }
 
-    /// Load a `.report` from a local file. The display name comes from the header
+    /// Load a `.trail` from a local file. The display name comes from the header
     /// `name:` directive, else the file stem.
     pub fn load_local(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
@@ -247,7 +247,7 @@ mod tests {
     fn local_save_then_load_round_trips() {
         let dir = std::env::temp_dir().join(format!("pb-report-{}", next_report_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nightly.report");
+        let path = dir.join("nightly.trail");
 
         let mut r = Report::from_text("nightly", "# name: N\n# collection: c.hurl\nREQUEST x\n");
         r.dirty = true;
@@ -268,7 +268,7 @@ mod tests {
     fn load_local_derives_name_from_file_stem_without_name_directive() {
         let dir = std::env::temp_dir().join(format!("pb-report-{}", next_report_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("my-report.report");
+        let path = dir.join("my-report.trail");
         std::fs::write(&path, "# collection: c.hurl\nREQUEST x\n").unwrap();
 
         let loaded = Report::load_local(&path).unwrap();

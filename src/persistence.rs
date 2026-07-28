@@ -287,7 +287,7 @@ impl PersistedTab {
     }
 }
 
-/// One persisted report tab (see [`crate::report::Report`]). The `.report`
+/// One persisted report tab (see [`crate::report::Report`]). The `.trail`
 /// *source text* is snapshotted (like [`PersistedTab`] snapshots collection
 /// entries) so an unsaved scratch report survives a restart; `path`/`git_origin`
 /// keep "Save" targeting the right place after a restart.
@@ -503,7 +503,7 @@ mod tests {
             "nightly",
             "# name: Nightly\n# collection: c.hurl\nREQUEST Oauth\n",
         );
-        r.path = Some(PathBuf::from("/tmp/nightly.report"));
+        r.path = Some(PathBuf::from("/tmp/nightly.trail"));
 
         let persisted = PersistedReport::from_report(&r);
         let json = serde_json::to_string(&persisted).unwrap();

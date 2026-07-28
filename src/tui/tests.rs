@@ -12234,12 +12234,12 @@ fn create_workspace_report_writes_the_file_and_opens_a_workspace_report() {
     app.collections.push(col);
     let ci = app.collections.len() - 1;
 
-    // A relative subfolder path with no extension → `.report` is defaulted and
+    // A relative subfolder path with no extension → `.trail` is defaulted and
     // the parent folder is created on the spot (the report is written now, not
     // deferred like a new collection).
     app.create_workspace_report(ci, "reports/nightly".to_string());
 
-    let expected = dir.join("reports").join("nightly.report");
+    let expected = dir.join("reports").join("nightly.trail");
     assert!(
         expected.is_file(),
         "the report is written to disk immediately"
@@ -12278,7 +12278,7 @@ fn create_workspace_report_rejects_paths_escaping_the_root() {
         app.reports.is_empty(),
         "a `..` path is rejected, no report is created"
     );
-    assert!(!dir.join("..").join("evil.report").exists());
+    assert!(!dir.join("..").join("evil.trail").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -15193,7 +15193,7 @@ fn report_binding_panel_shows_the_base_directory() {
     let mut app = TuiApp::default();
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
-    app.reports[idx].report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+    app.reports[idx].report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
     let s = Strings::for_language(&Language::English);
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
@@ -15915,7 +15915,7 @@ fn report_export_writes_a_csv_next_to_the_report() {
         crate::report::report::next_report_id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let report_path = dir.join("smoke.report");
+    let report_path = dir.join("smoke.trail");
 
     let mut app = TuiApp::default();
     app.collections.push(Collection::new(
@@ -15978,7 +15978,7 @@ fn report_export_format_follows_the_typed_extension() {
         crate::report::report::next_report_id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let report_path = dir.join("smoke.report");
+    let report_path = dir.join("smoke.trail");
 
     let mut app = TuiApp::default();
     app.collections.push(Collection::new(
@@ -16072,7 +16072,7 @@ fn report_baseline_save_writes_a_snapshot_next_to_the_report() {
         crate::report::report::next_report_id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let report_path = dir.join("smoke.report");
+    let report_path = dir.join("smoke.trail");
 
     let mut app = TuiApp::default();
     app.collections.push(Collection::new(
@@ -16741,7 +16741,7 @@ fn without_environment_header_the_active_env_is_used() {
     );
 }
 
-// ---- P8: .report file load/save via the File menu + BIND ----
+// ---- P8: .trail file load/save via the File menu + BIND ----
 
 /// A helper temp dir unique to each P8 test.
 fn p8_temp_dir(tag: &str) -> std::path::PathBuf {
@@ -16791,7 +16791,7 @@ fn report_save_dest_items_include_git() {
 fn report_load_from_git_opens_the_report_remote_wizard() {
     let mut app = TuiApp::default();
     // Choosing the "git" source for a Report opens the remote wizard scoped to
-    // reports (so its file picker only offers `.report` files).
+    // reports (so its file picker only offers `.trail` files).
     app.activate_file_load_source(FileKind::Report, 1);
     assert!(matches!(
         &app.overlay,
@@ -16816,7 +16816,7 @@ fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
     let idx = app.active_report_index().unwrap();
     app.reports[idx].report.git_origin = Some(crate::git_remote::GitOrigin {
         repo_url: "https://example.test/repo.git".to_string(),
-        path: "reports/nightly.report".to_string(),
+        path: "reports/nightly.trail".to_string(),
         ref_kind: RefKind::Branch,
         ref_name: "main".to_string(),
     });
@@ -16827,7 +16827,7 @@ fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
                 w.source,
                 crate::tui::git_save::GitSaveSource::Report { report_idx } if report_idx == idx
             ));
-            assert_eq!(w.collection_path.text(), "reports/nightly.report");
+            assert_eq!(w.collection_path.text(), "reports/nightly.trail");
         }
         other => panic!(
             "expected the git-save wizard, got overlay present: {}",
@@ -16839,7 +16839,7 @@ fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
 #[test]
 fn report_load_opens_a_new_tab_from_a_report_file() {
     let dir = p8_temp_dir("load");
-    let path = dir.join("smoke.report");
+    let path = dir.join("smoke.trail");
     std::fs::write(
         &path,
         "# name: Nightly\n# collection: api.hurl\nREQUEST Oauth\n",
@@ -16884,13 +16884,13 @@ fn report_save_as_writes_a_report_file_via_the_folder_picker() {
     ));
     app.overlay = None;
 
-    // Committing the folder pick writes `<dir>/nightly.report` and records it.
+    // Committing the folder pick writes `<dir>/nightly.trail` and records it.
     app.browser_commit_save(
         FileAction::SaveReportChooseFolder,
         dir.clone(),
         "nightly".to_string(),
     );
-    let path = dir.join("nightly.report");
+    let path = dir.join("nightly.trail");
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(written.contains("REQUEST Oauth"));
 
@@ -16908,7 +16908,7 @@ fn report_save_as_writes_a_report_file_via_the_folder_picker() {
 #[test]
 fn report_save_writes_back_and_clears_dirty() {
     let dir = p8_temp_dir("save");
-    let path = dir.join("smoke.report");
+    let path = dir.join("smoke.trail");
     std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
 
     let mut app = TuiApp::default();
@@ -16930,7 +16930,7 @@ fn report_save_writes_back_and_clears_dirty() {
 #[test]
 fn report_save_on_a_dirty_report_confirms_overwrite() {
     let dir = p8_temp_dir("saveconfirm");
-    let path = dir.join("smoke.report");
+    let path = dir.join("smoke.trail");
     std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
 
     let mut app = TuiApp::default();
@@ -17018,7 +17018,7 @@ fn report_bind_prefers_a_relative_path() {
     let dir = p8_temp_dir("bindrel");
     let col_path = dir.join("api.hurl");
     std::fs::write(&col_path, "GET http://example/oauth\n").unwrap();
-    let report_path = dir.join("smoke.report");
+    let report_path = dir.join("smoke.trail");
     std::fs::write(&report_path, "# collection:\n").unwrap();
 
     let mut app = TuiApp::default();
@@ -17849,7 +17849,7 @@ fn report_node_request_form_name_row_cycles_titles() {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace-aware reports: opening a `.report` from a Workspace tree pins that
+// Workspace-aware reports: opening a `.trail` from a Workspace tree pins that
 // tree to the left of the full report view, so the user can navigate the
 // workspace's collections/reports without leaving the report.
 // ---------------------------------------------------------------------------
@@ -17870,19 +17870,19 @@ fn workspace_with_reports() -> (TuiApp, usize, std::path::PathBuf) {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("api.hurl"), "GET https://example.test\n").unwrap();
     std::fs::write(
-        root.join("alpha.report"),
+        root.join("alpha.trail"),
         "# name: Alpha\n# collection: api.hurl\nREQUEST Oauth\n",
     )
     .unwrap();
     std::fs::write(
-        root.join("beta.report"),
+        root.join("beta.trail"),
         "# name: Beta\n# collection: api.hurl\nREQUEST Oauth\n",
     )
     .unwrap();
     let sub = root.join("nested");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(
-        sub.join("gamma.report"),
+        sub.join("gamma.trail"),
         "# name: Gamma\n# collection: api.hurl\nREQUEST Oauth\n",
     )
     .unwrap();
@@ -17896,18 +17896,20 @@ fn workspace_with_reports() -> (TuiApp, usize, std::path::PathBuf) {
     (app, ci, root)
 }
 
-/// Pressing Enter on a `.report` row in a Workspace tab's tree opens a
+/// Pressing Enter on a `.trail` row in a Workspace tab's tree opens a
 /// workspace-aware report tab: it lands in `reports`, carries the workspace
 /// context, and its pinned tree takes focus.
 #[test]
 fn opening_a_report_from_the_workspace_tree_opens_a_workspace_aware_report_tab() {
     let (mut app, ci, root) = workspace_with_reports();
-    // Find the `alpha.report` row and highlight it.
+    // Find the `alpha.trail` row and highlight it.
     let rows = app.collections[ci].ws_rows();
     let cursor = rows
         .iter()
-        .position(|r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.report"))
-        .expect("alpha.report is listed in the workspace tree");
+        .position(
+            |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+        )
+        .expect("alpha.trail is listed in the workspace tree");
     app.collections[ci].list_cursor = cursor;
     app.focus = super::app::Pane::List;
 
@@ -17934,7 +17936,7 @@ fn a_workspace_report_tree_lists_folders_collections_and_reports() {
         browse: Vec::new(),
         cursor: 0,
     };
-    let open = root.join("alpha.report");
+    let open = root.join("alpha.trail");
     let rows = ws.rows(Some(open.as_path()));
     // Subfolder first (list_dir puts dirs before files), then the collection,
     // then the two reports.
@@ -17950,16 +17952,16 @@ fn a_workspace_report_tree_lists_folders_collections_and_reports() {
     );
     let alpha = rows
         .iter()
-        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "alpha.report"))
-        .expect("alpha.report is listed");
+        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "alpha.trail"))
+        .expect("alpha.trail is listed");
     assert!(
         matches!(alpha, ReportTreeRow::Report { open: true, .. }),
         "the currently-open report is marked open"
     );
     let beta = rows
         .iter()
-        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "beta.report"))
-        .expect("beta.report is listed");
+        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "beta.trail"))
+        .expect("beta.trail is listed");
     assert!(
         matches!(beta, ReportTreeRow::Report { open: false, .. }),
         "a different report is not marked open"
@@ -17971,19 +17973,19 @@ fn a_workspace_report_tree_lists_folders_collections_and_reports() {
 #[test]
 fn report_tree_navigation_opens_another_report() {
     let (mut app, ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
     assert!(app.report_tree_focus);
     assert_eq!(app.reports.len(), 1);
 
-    // Move the tree cursor onto `beta.report` and open it.
+    // Move the tree cursor onto `beta.trail` and open it.
     let idx = app.active_report_index().unwrap();
     let open = app.reports[idx].report.path.clone();
     let ws = app.reports[idx].workspace.as_ref().unwrap();
     let target = ws
         .rows(open.as_deref())
         .into_iter()
-        .position(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "beta.report"))
-        .expect("beta.report is in the tree");
+        .position(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "beta.trail"))
+        .expect("beta.trail is in the tree");
     app.reports[idx].workspace.as_mut().unwrap().cursor = target;
 
     press(&mut app, KeyCode::Enter);
@@ -18002,7 +18004,7 @@ fn report_tree_navigation_opens_another_report() {
 #[test]
 fn report_tree_descends_into_a_subfolder() {
     let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
     let idx = app.active_report_index().unwrap();
     let open = app.reports[idx].report.path.clone();
     let ws = app.reports[idx].workspace.as_ref().unwrap();
@@ -18024,7 +18026,7 @@ fn report_tree_descends_into_a_subfolder() {
     assert!(
         ws.rows(open.as_deref())
             .iter()
-            .any(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "gamma.report")),
+            .any(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "gamma.trail")),
         "the subfolder's report is now listed"
     );
     // Backspace goes back up.
@@ -18057,7 +18059,7 @@ fn focus_cycle_includes_the_tree_only_for_workspace_reports() {
 
     // Workspace report: the cycle reaches the tree exactly once per lap.
     let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
     // Start from a known non-tree focus.
     app.report_tree_focus = false;
     app.report_tabbar_focus = false;
@@ -18078,7 +18080,7 @@ fn focus_cycle_includes_the_tree_only_for_workspace_reports() {
 fn workspace_report_context_round_trips_through_persistence() {
     let (mut app, _ci, root) = workspace_with_reports();
     app.open_workspace_report(
-        root.join("alpha.report"),
+        root.join("alpha.trail"),
         root.clone(),
         vec!["nested".into()],
     );
@@ -18111,7 +18113,7 @@ fn workspace_report_context_round_trips_through_persistence() {
 #[test]
 fn a_vanished_workspace_root_degrades_to_a_plain_report_on_restore() {
     let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.report"), root.clone(), Vec::new());
+    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
     let snapshot = app.to_persisted();
     // The folder disappears between sessions.
     std::fs::remove_dir_all(&root).unwrap();

@@ -48,7 +48,7 @@ pub(crate) enum GitSaveSource {
         root: PathBuf,
         filter: WorkspaceGitFilter,
     },
-    /// A PaperTrail `.report` document. Pushes the report's source text to the
+    /// A PaperTrail `.trail` document. Pushes the report's source text to the
     /// chosen path; `report_idx` identifies which report tab to repin on
     /// success (its git origin is updated in place, like a collection's).
     Report { report_idx: usize },
@@ -271,7 +271,7 @@ impl GitSaveWizard {
     /// Build a wizard for saving PaperTrail report `report_idx` back to the git
     /// remote it came from, seeded from the report's remembered [`GitOrigin`].
     /// Like a collection, the report has a single per-file path to choose (its
-    /// `.report`) but — unlike a collection — never an accompanying `.vars`, so
+    /// `.trail`) but — unlike a collection — never an accompanying `.vars`, so
     /// the environment step is skipped. Panics if the report has no
     /// `git_origin` (callers gate "Save to Git" on that).
     pub(crate) fn new_report(report_idx: usize, report: &crate::report::Report) -> Self {

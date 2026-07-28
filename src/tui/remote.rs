@@ -16,7 +16,7 @@ use super::editor::*;
 use super::theme::*;
 
 /// Whether the remote-git wizard is loading a collection, an environment, a
-/// PaperTrail `.report`, or a whole Workspace (many collection files at once,
+/// PaperTrail `.trail`, or a whole Workspace (many collection files at once,
 /// filtered by extension).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RemoteKind {
@@ -254,7 +254,7 @@ pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> 
                     || name.to_ascii_lowercase().starts_with(".env.")
             }
             RemoteKind::Report => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("report"))
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("trail"))
             }
             // A Workspace load uses the file-type filter step, not this picker.
             RemoteKind::Workspace => true,
@@ -649,7 +649,7 @@ mod tests {
             "envs/dev.vars",
             ".env",
             ".env.dev-au",
-            "reports/nightly.report",
+            "reports/nightly.trail",
             "README.md",
             "src/main.rs",
         ]
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn relevant_files_for_a_report_keeps_only_report_files() {
         let out = relevant_files(RemoteKind::Report, &files());
-        assert_eq!(out, vec!["reports/nightly.report"]);
+        assert_eq!(out, vec!["reports/nightly.trail"]);
     }
 
     #[test]

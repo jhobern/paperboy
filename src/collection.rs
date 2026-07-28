@@ -30,7 +30,7 @@ pub enum WsRow {
         name: String,
         open: bool,
     },
-    /// A PaperTrail report file (`.report`) in the folder being browsed.
+    /// A PaperTrail report file (`.trail`) in the folder being browsed.
     /// Selecting it opens the workspace-aware report view (it isn't loaded into
     /// this collection tab). Reports can live in a workspace alongside the
     /// collections they drive.

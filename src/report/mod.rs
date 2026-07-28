@@ -1,6 +1,6 @@
 //! PaperTrail — the report-flow language and engine.
 //!
-//! A *report flow* (a `.report` file, in the **PaperTrail** DSL) is written once
+//! A *report flow* (a `.trail` file, in the **PaperTrail** DSL) is written once
 //! by a programmer and run repeatedly by a non-technical user: it drives a bound
 //! collection against ranges of files/environments and produces a tabular report
 //! (CSV first). The design docs live in `docs/reports/` — `02-grammar.md` is the

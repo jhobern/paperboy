@@ -40,7 +40,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 - **Multiple `-e/--env` environments on the CLI report runner.** `-e` is now
   repeatable, so a headless report that compares environments —
   `FOR TARGET IN ENVS BASELINE("prod"), COMPARISON("staging")` — can be run with
-  `paperboy -c coll.hurl -e prod.vars -e staging.vars -r report.report`. Each
+  `paperboy -c coll.hurl -e prod.vars -e staging.vars -r report.trail`. Each
   file is loaded and made selectable by its file stem (the name an `ENVS` clause
   references); the first `-e` also serves as the base variable layer for
   requests outside any `ENVS` loop. Passing two files that share a stem is a
@@ -57,15 +57,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and what is still queued.
 
 - **Create a new report directly in a workspace.** In the workspace file
-  picker, press **R** to name and create a brand-new `.report` inside the
-  workspace (subfolders allowed; a missing extension defaults to `.report`).
+  picker, press **R** to name and create a brand-new `.trail` inside the
+  workspace (subfolders allowed; a missing extension defaults to `.trail`).
   The file is written straight away, appears in the workspace tree next to its
   collections, and opens as a workspace-pinned report ready to bind to a
   collection and edit — mirroring the **n** new-collection action.
 
-- **Load and save `.report` files to a git remote.** Reports now use the same
+- **Load and save `.trail` files to a git remote.** Reports now use the same
   git flow as collections and environments: **File → Load → Report → Git** pulls
-  a `.report` straight from a repo (no local clone — only that file is fetched),
+  a `.trail` straight from a repo (no local clone — only that file is fetched),
   and **File → Save → Report → To Git…** pushes the report's source back,
   repinning its origin so the next save appends to the same branch. This lets a
   team keep a report versioned alongside the collection it drives.
@@ -98,7 +98,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the structured view.
 
 
-  `.report` files alongside the collections they drive: they show up in the
+  `.trail` files alongside the collections they drive: they show up in the
   Workspace tab's file tree (with a distinct 📊 icon) and opening one lands you
   in the full report view with that workspace's tree pinned down the left. From
   there you can move through the workspace's folders, jump to another report, or
@@ -113,7 +113,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 - **Run reports from the command line.** A report can now be run headlessly
   without opening the TUI: `paperboy -c collection.hurl -e env.vars -r
-  report.report` runs the flow and writes its table, then exits — ideal for
+  report.trail` runs the flow and writes its table, then exits — ideal for
   scripting, CI, or a scheduled nightly run. `--dry-run` expands the report and
   prints the projected table without sending a single request (handy before a
   big run), and `-o` chooses where the output goes: `-o -` streams clean CSV to
@@ -179,7 +179,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 - **PaperTrail reports — new Reports view (work in progress).** A report is a
   new kind of tab, opened with **Shift+R**, that lives alongside the collection
   tabs but takes the whole body (no list / environment / response panels, so it
-  fits small screens). Each report holds a PaperTrail flow (`.report` source)
+  fits small screens). Each report holds a PaperTrail flow (`.trail` source)
   that will drive a bound collection against ranges of files/environments to
   produce a tabular report. This first slice adds the tab itself: a view of the
   flow source with its live validation (bound-collection status, parse errors,
@@ -327,9 +327,9 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   dimmed). The plain **`v`** key still simply flips between the source and the
   results grid.
 - **Load and save reports through the File menu, and re-point them with `b`.**
-  A report is now a first-class file: **File ▸ Load ▸ Report** opens a `.report`
+  A report is now a first-class file: **File ▸ Load ▸ Report** opens a `.trail`
   flow into a new tab, and **File ▸ Save ▸ Report** writes the active report back
-  to its file (**Save As** opens a folder chooser seeded with `<name>.report`).
+  to its file (**Save As** opens a folder chooser seeded with `<name>.trail`).
   The Reports view also gains a **`b`** (bind) action that lists the open
   collections and re-points the report's `# collection:` header at the chosen
   one — preferring a path relative to the report file (so a report and its
@@ -364,6 +364,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   popup) — so unsaved changes are visible without opening the environment.
 
 ### Changed
+
+- **Report files now use the `.trail` extension (was `.report`).** A PaperTrail
+  file describes *how to build* a report, not the report output itself, so the
+  extension now matches the language (`.trail`) to make that distinction clear.
+  This is a **breaking change**: existing `.report` files are no longer
+  recognised anywhere (workspace trees, the git and local file pickers, the CLI
+  `-r` runner) and must be renamed to `.trail` by hand. New reports are created
+  and saved as `.trail`; the `# collection:`/`# environment:` headers inside a
+  report are unaffected.
 
 - **Enter opens the report node editor; `e` edits the raw source.** Pressing
   **Enter** in a report now opens the structured node editor — mirroring how

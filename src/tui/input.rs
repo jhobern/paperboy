@@ -2068,7 +2068,7 @@ impl TuiApp {
                 self.open_path_prompt(action, s.save_environment, &default);
             }
             // Reports pick a destination folder like collections, but write a
-            // `.report` file (the real write routes through `SaveReport`).
+            // `.trail` file (the real write routes through `SaveReport`).
             FileAction::SaveReport => self.open_browser(FileAction::SaveReportChooseFolder),
             // Collections (including the Scratch Space) pick a destination
             // folder in the file browser first — the filename is entered in a
@@ -2105,7 +2105,7 @@ impl TuiApp {
     /// filename editor.
     pub(crate) fn default_save_report_filename(&self) -> String {
         let Some(idx) = self.active_report_index() else {
-            return "report.report".to_string();
+            return "report.trail".to_string();
         };
         let report = &self.reports[idx].report;
         report
@@ -2116,7 +2116,7 @@ impl TuiApp {
             .unwrap_or_else(|| {
                 let name = report.name.trim();
                 let base = if name.is_empty() { "report" } else { name };
-                format!("{base}.report")
+                format!("{base}.trail")
             })
     }
 
@@ -2204,7 +2204,7 @@ impl TuiApp {
             FileAction::SaveReportChooseFolder => {
                 let mut file = std::path::PathBuf::from(&name);
                 if file.extension().is_none() {
-                    file.set_extension("report");
+                    file.set_extension("trail");
                 }
                 let path = dir.join(file).to_string_lossy().into_owned();
                 self.save_as_path(FileAction::SaveReport, &path);

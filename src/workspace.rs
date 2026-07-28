@@ -167,7 +167,7 @@ pub fn list_dir(dir: &Path, filter_hurl_json: bool) -> Vec<WsEntry> {
 }
 
 /// Whether `path`'s extension marks it as a file the Workspace tree shows: a
-/// collection (`.hurl`/`.json`) or a PaperTrail report (`.report`) — always
+/// collection (`.hurl`/`.json`) or a PaperTrail report (`.trail`) — always
 /// `true` when the filter is off. Reports are surfaced so a workspace can hold
 /// (and run) reports alongside the collections they drive; the tree classifies
 /// them by extension (see [`is_report_file`]).
@@ -179,20 +179,20 @@ fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
         Some(ext) => {
             ext.eq_ignore_ascii_case("hurl")
                 || ext.eq_ignore_ascii_case("json")
-                || ext.eq_ignore_ascii_case("report")
+                || ext.eq_ignore_ascii_case("trail")
         }
         None => false,
     }
 }
 
-/// Whether `path` is a PaperTrail report (`.report`, case-insensitive). The
+/// Whether `path` is a PaperTrail report (`.trail`, case-insensitive). The
 /// Workspace tree uses this to tell a report file apart from a collection file
 /// (both are surfaced by [`is_matching_file`]), so selecting one opens the
 /// report view rather than trying to parse it as a collection.
 pub fn is_report_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("report"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("trail"))
 }
 
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any

@@ -65,11 +65,11 @@ pub(crate) enum FileAction {
     /// saved file is referenced by a `# baseline:` header directive so later
     /// runs diff against it (PaperTrail "Source B" comparison).
     SaveReportBaselineChooseFolder,
-    /// Loading a PaperTrail `.report` document from a local file into a new
+    /// Loading a PaperTrail `.trail` document from a local file into a new
     /// report tab (see [`crate::report::Report`]). Local-only, so — like
     /// `LoadRequest` — it skips the local-vs-git source step.
     OpenReport,
-    /// Writing the active report tab's `.report` source back to its own file
+    /// Writing the active report tab's `.trail` source back to its own file
     /// (the "Save" destination); the target path is the report's remembered
     /// path (else a "Save As" folder pick precedes it).
     SaveReport,
@@ -133,10 +133,10 @@ pub(crate) enum PromptKind {
     /// `.hurl` extension is defaulted. Reached via `n` in the workspace
     /// destination picker.
     NewWorkspaceCollection(usize),
-    /// Naming a brand-new `.report` file being created inside a Workspace tab
+    /// Naming a brand-new `.trail` file being created inside a Workspace tab
     /// (the `usize` is the workspace collection index). Like
     /// [`Self::NewWorkspaceCollection`] the typed text is a path relative to
-    /// the workspace root; subfolders are allowed and a `.report` extension is
+    /// the workspace root; subfolders are allowed and a `.trail` extension is
     /// defaulted. Reached via `R` in the workspace destination picker.
     NewWorkspaceReport(usize),
     /// Editing one report-flow node "as a line" in the structured node editor:
@@ -159,7 +159,7 @@ impl PromptKind {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
             PromptKind::NewWorkspaceCollection(_) => ".hurl",
-            PromptKind::NewWorkspaceReport(_) => ".report",
+            PromptKind::NewWorkspaceReport(_) => ".trail",
             _ => "",
         }
     }
@@ -584,7 +584,7 @@ pub(crate) enum FileKind {
     Collection,
     Environment,
     Workspace,
-    /// A PaperTrail `.report` document (see [`crate::report::Report`]). Loaded
+    /// A PaperTrail `.trail` document (see [`crate::report::Report`]). Loaded
     /// into / saved from a report tab, locally or from a git remote (mirroring
     /// the collection flow).
     Report,
@@ -741,7 +741,7 @@ pub struct TuiApp {
     pub(crate) vars: AppVars,
     pub(crate) collections: Vec<Collection>,
     pub(crate) active_tab: usize,
-    /// Report tabs (PaperTrail `.report` documents), shown in the same tab bar
+    /// Report tabs (PaperTrail `.trail` documents), shown in the same tab bar
     /// *after* the collection tabs. The unified tab index (`active_tab`) counts
     /// collections first, then reports: index `>= collections.len()` selects
     /// `reports[active_tab - collections.len()]`. See [`Self::active_is_report`].
@@ -2284,7 +2284,7 @@ impl TuiApp {
 
     /// Open the "name a new report" prompt for Workspace tab `ci` (see
     /// [`PromptKind::NewWorkspaceReport`]). The typed text is a path relative
-    /// to the workspace root; `.report` is ghosted as the default extension.
+    /// to the workspace root; `.trail` is ghosted as the default extension.
     /// Mirrors [`Self::open_new_workspace_collection_prompt`].
     pub(crate) fn open_new_workspace_report_prompt(&mut self, ci: usize) {
         if self

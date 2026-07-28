@@ -237,7 +237,7 @@ pub(crate) enum ReportTreeRow {
         path: std::path::PathBuf,
         name: String,
     },
-    /// A report file (`.report`). `open` marks the report this view is showing.
+    /// A report file (`.trail`). `open` marks the report this view is showing.
     Report {
         path: std::path::PathBuf,
         name: String,
@@ -479,7 +479,7 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Push an already-loaded [`Report`] (from a `.report` file or, later, git)
+    /// Push an already-loaded [`Report`] (from a `.trail` file or, later, git)
     /// as a new report tab, make it active, validate it and persist. Mirrors
     /// [`Self::new_report_tab`] but keeps the loaded report's provenance (path /
     /// git origin) so a subsequent "Save" writes back in place.
@@ -494,7 +494,7 @@ impl TuiApp {
         self.status = Some(Status::Loaded);
     }
 
-    /// Open (or re-activate) a `.report` file selected from a Workspace tree.
+    /// Open (or re-activate) a `.trail` file selected from a Workspace tree.
     /// The report carries the workspace context so the report view pins that
     /// tree to its left. If a report tab for the same file is already open it is
     /// re-activated (with a refreshed workspace browse) instead of duplicated.
@@ -544,11 +544,11 @@ impl TuiApp {
         }
     }
 
-    /// Create a brand-new scratch `.report` inside Workspace tab `ci`'s root at
+    /// Create a brand-new scratch `.trail` inside Workspace tab `ci`'s root at
     /// the relative path `rel`, write it to disk immediately (so it becomes a
     /// real member of the workspace tree), and open it as a workspace-aware
     /// report pinned to that tree. Subfolders are allowed; a missing extension
-    /// defaults to `.report`. Absolute paths or ones escaping the root via `..`
+    /// defaults to `.trail`. Absolute paths or ones escaping the root via `..`
     /// are rejected. Mirrors [`Self::create_workspace_collection`], but a report
     /// is a single self-contained file so it is saved right away rather than
     /// staying in memory until Ctrl+S.
@@ -571,7 +571,7 @@ impl TuiApp {
         }
         let mut rel_path = std::path::PathBuf::from(rel);
         if rel_path.extension().is_none() {
-            rel_path.set_extension("report");
+            rel_path.set_extension("trail");
         }
         // Reject absolute paths or any `..`/root component that would let the
         // new file escape the workspace root (same rule as new collections).
@@ -3680,11 +3680,11 @@ mod export_path_tests {
 
     #[test]
     fn time_token_name_overrides_a_saved_report_filename_and_stays_in_its_folder() {
-        // A saved report whose file is `dfa.report` but whose name carries the
+        // A saved report whose file is `dfa.trail` but whose name carries the
         // `{time}` token: the export must use the expanded name (not `dfa`) and
         // land next to the report file.
         let mut report = Report::from_text("dfa", "# name: run_{time}\n# collection: c.hurl\n");
-        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
 
         let csv = csv_export_path(&report);
         assert_eq!(csv.parent(), Some(std::path::Path::new("/tmp/reports")));
@@ -3701,7 +3701,7 @@ mod export_path_tests {
     #[test]
     fn without_a_token_a_saved_report_keeps_its_own_stem() {
         let mut report = Report::from_text("dfa", "# name: My Report\n# collection: c.hurl\n");
-        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.report"));
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
         assert_eq!(
             csv_export_path(&report),
             std::path::PathBuf::from("/tmp/reports/dfa.csv"),

@@ -37,11 +37,11 @@ Runs in one of three modes:\n\
 \x20 paperboy -c collection.hurl         Run a collection headlessly\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
 \x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
-\x20 paperboy -c collection.hurl -e environment.vars -r report.report   Run a report\n\
-\x20 paperboy -r report.report   Run a report, taking its collection/environment from the report's own headers\n\
-\x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.report   Run a baseline/comparison report\n\
-\x20 paperboy -c collection.hurl -r report.report --dry-run   Preview a report without sending anything\n\
-\x20 paperboy -c collection.hurl -r report.report -o out.csv   Write the report to a file (- = stdout)\n\n\
+\x20 paperboy -c collection.hurl -e environment.vars -r report.trail   Run a report\n\
+\x20 paperboy -r report.trail   Run a report, taking its collection/environment from the report's own headers\n\
+\x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.trail   Run a baseline/comparison report\n\
+\x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
+\x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\n\
 Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 {{ ... }} provider reference resolved when the environment is loaded:\n\
 \x20 Literal value       USERNAME=demo\n\
@@ -75,7 +75,7 @@ struct Cli {
     #[arg(short = 'b', long)]
     batch: bool,
 
-    /// Run a PaperTrail report (`.report`) and exit. The collection to run
+    /// Run a PaperTrail report (`.trail`) and exit. The collection to run
     /// against comes from `-c`, or (when `-c` is omitted) the report's own
     /// `# collection:` header resolved relative to the report's folder. `-e`
     /// supplies the base variable layer and (when repeated) the environments an
