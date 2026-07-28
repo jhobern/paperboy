@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Postman import now recovers `[Captures]` from test scripts.** A request's
+  Postman `test` script often stores a value out of the response with
+  `pm.environment.set("token", jsonData['token'])` (or `.collectionVariables`/
+  `.globals`/`.variables`); the importer now scans those calls and emits the
+  equivalent `[Captures]` line (`token: jsonpath "$.token"`), so captured
+  variables survive the import instead of being dropped. Simple accessor chains
+  (`json['a']['b']`, `json.a.b`, array indices) are mapped; anything more exotic
+  is skipped rather than guessed.
+
 - **Multiple `-e/--env` environments on the CLI report runner.** `-e` is now
   repeatable, so a headless report that compares environments —
   `FOR TARGET IN ENVS BASELINE("prod"), COMPARISON("staging")` — can be run with
@@ -369,6 +378,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   self-explanatory.
 
 ### Fixed
+
+- **Imported Postman requests now carry an `HTTP *` response line.** A bare
+  imported request had no response section, so hand-adding a `[Captures]` or
+  `[Asserts]` section to it later failed to parse ("response section with no
+  HTTP line"). Every imported request now emits the wildcard `HTTP *` (matches
+  any status), so those sections can be added freely; the wildcard also
+  round-trips through a save/reload instead of being dropped.
 
 - **The report body border now dims when the workspace tree has focus.** In a
   workspace report the source/nodes/results panel's border stayed lit even when
