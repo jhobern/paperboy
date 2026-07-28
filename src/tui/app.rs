@@ -594,7 +594,7 @@ pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
 /// The kinds of thing the File menu can load or save. Chosen in the first
 /// step of Load/Save; the local-vs-git (or Save/Save As/Git) choice is a
 /// second step (see [`Overlay::FileLoadSource`] / [`Overlay::FileSaveDest`]).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum FileKind {
     Collection,
     Environment,
@@ -628,14 +628,30 @@ pub(crate) fn file_load_kind_index(kind: FileKind) -> usize {
     }
 }
 
-/// The row this kind occupies in the "Save" kind list (see
-/// [`file_save_items`]), used to re-highlight it when Esc steps back.
-pub(crate) fn file_save_kind_index(kind: FileKind) -> usize {
-    match kind {
-        FileKind::Collection => 1,
-        FileKind::Environment => 2,
-        FileKind::Workspace => 3,
-        FileKind::Report => 4,
+/// One selectable row in the File → Save submenu. Which rows appear depends
+/// on what's currently open/focused (see [`TuiApp::file_save_items`]) so the
+/// menu never offers a save that can't apply — e.g. "Save Request" while a
+/// report tab is active (there's no request to write), or "Save Report" while
+/// a collection tab is active.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum SaveItem {
+    Request,
+    /// Collection / Environment / Workspace / Report — these route through the
+    /// second-step destination menu ([`Overlay::FileSaveDest`]).
+    Kind(FileKind),
+    Response,
+}
+
+impl SaveItem {
+    pub(crate) fn label(self, s: &Strings) -> &'static str {
+        match self {
+            SaveItem::Request => s.file_save_item_request,
+            SaveItem::Kind(FileKind::Collection) => s.file_save_item_collection,
+            SaveItem::Kind(FileKind::Environment) => s.file_save_item_environment,
+            SaveItem::Kind(FileKind::Workspace) => s.file_save_item_workspace,
+            SaveItem::Kind(FileKind::Report) => s.file_save_item_report,
+            SaveItem::Response => s.file_save_item_response,
+        }
     }
 }
 
@@ -647,18 +663,6 @@ pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 5] {
         s.file_load_item_environment,
         s.file_load_item_workspace,
         s.file_load_item_report,
-    ]
-}
-
-/// The 6 kinds of the File menu's "Save" submenu.
-pub(crate) fn file_save_items(s: &Strings) -> [&'static str; 6] {
-    [
-        s.file_save_item_request,
-        s.file_save_item_collection,
-        s.file_save_item_environment,
-        s.file_save_item_workspace,
-        s.file_save_item_report,
-        s.file_save_item_response,
     ]
 }
 
@@ -2613,6 +2617,51 @@ impl TuiApp {
             return Some(p.env_id);
         }
         self.global_envs.get(self.global_env_idx).map(|e| e.id)
+    }
+
+    /// The rows to show in the File → Save submenu, filtered to what actually
+    /// applies to the current context so the menu never offers an inapplicable
+    /// (or unsafe) save. A collection tab offers Request + Collection (plus
+    /// Workspace when it's workspace-backed); a report tab offers Report only;
+    /// Environment and Response appear whenever there's an env or a response to
+    /// write. The order mirrors the original fixed list — rows that don't apply
+    /// are simply omitted. (A report tab can't correctly target a collection or
+    /// workspace today — those saves key off the active *collection* tab — so
+    /// they're hidden there rather than silently no-op.)
+    pub(crate) fn file_save_items(&self) -> Vec<SaveItem> {
+        let report_active = self.active_report_index().is_some();
+        let collection = (!report_active)
+            .then(|| self.collections.get(self.active_tab))
+            .flatten();
+        let mut items = Vec::new();
+        if collection.is_some() {
+            items.push(SaveItem::Request);
+            items.push(SaveItem::Kind(FileKind::Collection));
+        }
+        if self.current_env_id().is_some() {
+            items.push(SaveItem::Kind(FileKind::Environment));
+        }
+        if collection.is_some_and(|c| c.workspace_root.is_some()) {
+            items.push(SaveItem::Kind(FileKind::Workspace));
+        }
+        if report_active {
+            items.push(SaveItem::Kind(FileKind::Report));
+        }
+        if !self.response.lock().unwrap().body.is_empty() {
+            items.push(SaveItem::Response);
+        }
+        items
+    }
+
+    /// The row `SaveItem::Kind(kind)` occupies in the current (filtered) Save
+    /// list, used to re-highlight it when Esc steps back from the destination
+    /// menu. The kind is always present (you reached the destination step by
+    /// selecting it), so this resolves; it falls back to `0` defensively.
+    pub(crate) fn file_save_kind_index(&self, kind: FileKind) -> usize {
+        self.file_save_items()
+            .iter()
+            .position(|it| *it == SaveItem::Kind(kind))
+            .unwrap_or(0)
     }
 
     /// Re-attempt resolving the currently-selected variable (env var /

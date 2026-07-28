@@ -390,6 +390,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The File → Save submenu now only lists what you can actually save.** The
+  Save menu was a fixed list of all six kinds (Request, Collection, Environment,
+  Workspace, Report, Response) regardless of context; it now shows just the ones
+  that apply. A collection tab offers Request and Collection (plus Workspace when
+  it's workspace-backed); a report tab offers Report; Environment appears when an
+  environment is loaded, and Response when there's a response to write. This
+  removes the confusing (and previously no-op) cases such as "Save Request" or
+  "Save Collection" while a report tab is active.
+
 - **Report files now use the `.trail` extension (was `.report`).** A PaperTrail
   file describes *how to build* a report, not the report output itself, so the
   extension now matches the language (`.trail`) to make that distinction clear.

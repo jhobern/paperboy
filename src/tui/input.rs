@@ -2658,16 +2658,20 @@ impl TuiApp {
     }
 
     pub(crate) fn activate_file_save_item(&mut self, sel: usize) {
+        let Some(item) = self.file_save_items().get(sel).copied() else {
+            return;
+        };
         let s = Strings::for_language(&self.language);
-        match sel {
+        match item {
             // Request and Response are single-destination path prompts, so
             // they skip the destination step entirely.
-            0 => self.open_path_prompt(FileAction::SaveRequest, s.save_request, "request.json"),
-            1 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Collection, 0)),
-            2 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Environment, 0)),
-            3 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
-            4 => self.overlay = Some(Overlay::FileSaveDest(FileKind::Report, 0)),
-            _ => self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json"),
+            SaveItem::Request => {
+                self.open_path_prompt(FileAction::SaveRequest, s.save_request, "request.json")
+            }
+            SaveItem::Kind(kind) => self.overlay = Some(Overlay::FileSaveDest(kind, 0)),
+            SaveItem::Response => {
+                self.open_path_prompt(FileAction::SaveResponse, s.save_response, "response.json")
+            }
         }
     }
 
@@ -3178,7 +3182,11 @@ impl TuiApp {
 
     fn file_save_menu_key_handler(&mut self, key: KeyEvent, sel: usize) {
         let s = Strings::for_language(&self.language);
-        let items = file_save_items(&s);
+        let labels: Vec<&str> = self
+            .file_save_items()
+            .iter()
+            .map(|it| it.label(&s))
+            .collect();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
                 self.overlay = Some(Overlay::FileMenu(1))
@@ -3187,10 +3195,12 @@ impl TuiApp {
                 self.overlay = Some(Overlay::FileSaveMenu(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::FileSaveMenu((sel + 1).min(items.len() - 1)));
+                self.overlay = Some(Overlay::FileSaveMenu(
+                    (sel + 1).min(labels.len().saturating_sub(1)),
+                ));
             }
             KeyCode::Enter | KeyCode::Right => self.activate_file_save_item(sel),
-            KeyCode::Char(c) => match mnemonic_index(&items, c) {
+            KeyCode::Char(c) => match mnemonic_index(&labels, c) {
                 Some(i) => self.activate_file_save_item(i),
                 None => self.overlay = Some(Overlay::FileSaveMenu(sel)),
             },
@@ -3227,7 +3237,7 @@ impl TuiApp {
         let items = file_save_dest_items(kind, &s);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
-                self.overlay = Some(Overlay::FileSaveMenu(file_save_kind_index(kind)));
+                self.overlay = Some(Overlay::FileSaveMenu(self.file_save_kind_index(kind)));
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.overlay = Some(Overlay::FileSaveDest(kind, sel.saturating_sub(1)));

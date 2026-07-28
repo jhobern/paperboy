@@ -2271,7 +2271,19 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
         for items in [
             file_menu_items(&s).to_vec(),
             file_load_items(&s).to_vec(),
-            file_save_items(&s).to_vec(),
+            // The Save submenu is now context-filtered, but every possible row
+            // must still carry a unique mnemonic — check the full set.
+            [
+                SaveItem::Request,
+                SaveItem::Kind(FileKind::Collection),
+                SaveItem::Kind(FileKind::Environment),
+                SaveItem::Kind(FileKind::Workspace),
+                SaveItem::Kind(FileKind::Report),
+                SaveItem::Response,
+            ]
+            .iter()
+            .map(|it| it.label(&s))
+            .collect::<Vec<_>>(),
             file_load_source_items(&s).to_vec(),
             file_save_dest_items(FileKind::Collection, &s),
             file_save_dest_items(FileKind::Environment, &s),
@@ -2651,15 +2663,50 @@ fn the_save_destination_step_lists_the_right_choices_per_kind() {
     assert_eq!(file_save_dest_items(FileKind::Workspace, &s).len(), 2);
 
     let mut app = TuiApp {
-        overlay: Some(Overlay::FileSaveDest(FileKind::Workspace, 0)),
+        overlay: Some(Overlay::FileSaveDest(FileKind::Collection, 0)),
         ..Default::default()
     };
 
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::FileSaveMenu(3))),
-        "Esc steps back to the Save kind list with Workspace (row 3) highlighted"
+        matches!(app.overlay, Some(Overlay::FileSaveMenu(1))),
+        "Esc steps back to the Save kind list with Collection (row 1) highlighted"
     );
+}
+
+#[test]
+fn the_save_submenu_is_filtered_to_the_current_context() {
+    // A plain collection tab offers only its Request + Collection.
+    let mut app = TuiApp::default();
+    assert_eq!(
+        app.file_save_items(),
+        vec![SaveItem::Request, SaveItem::Kind(FileKind::Collection)],
+        "a collection tab offers Request + Collection only"
+    );
+
+    // Backing that tab with a workspace additionally offers Workspace.
+    app.collections[0].workspace_root = Some(std::path::PathBuf::from("/tmp/ws"));
+    assert!(
+        app.file_save_items()
+            .contains(&SaveItem::Kind(FileKind::Workspace)),
+        "a workspace-backed tab offers Workspace"
+    );
+
+    // A present response makes "Save Response" appear.
+    app.response.lock().unwrap().body = Arc::from("body");
+    assert!(
+        app.file_save_items().contains(&SaveItem::Response),
+        "a present response offers Save Response"
+    );
+
+    // A report tab offers Report and hides the collection-only saves.
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let items = app.file_save_items();
+    assert!(items.contains(&SaveItem::Kind(FileKind::Report)));
+    assert!(!items.contains(&SaveItem::Request));
+    assert!(!items.contains(&SaveItem::Kind(FileKind::Collection)));
+    assert!(!items.contains(&SaveItem::Kind(FileKind::Workspace)));
 }
 
 // ── Workspace redownload-on-missing (see `WorkspaceGitOrigin`) ─────────
@@ -17126,7 +17173,15 @@ fn file_load_report_item_opens_the_report_source_step() {
 #[test]
 fn file_save_report_item_opens_the_report_destination_step() {
     let mut app = TuiApp::default();
-    app.activate_file_save_item(4);
+    app.new_report_tab();
+    // With a report tab active the Save submenu offers "Report" (Request /
+    // Collection are hidden — there's no request/collection tab to write).
+    let sel = app
+        .file_save_items()
+        .iter()
+        .position(|it| *it == SaveItem::Kind(FileKind::Report))
+        .expect("a report tab offers the Report save item");
+    app.activate_file_save_item(sel);
     assert!(matches!(
         app.overlay,
         Some(Overlay::FileSaveDest(FileKind::Report, 0))
@@ -17142,7 +17197,11 @@ fn report_save_dest_items_include_git() {
         items,
         vec![s.file_dest_save, s.file_dest_save_as, s.file_dest_git]
     );
-    assert_eq!(file_save_kind_index(FileKind::Report), 4);
+    // In a bare report tab the Report row is the only Save item, so it sits at
+    // index 0 of the filtered list.
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    assert_eq!(app.file_save_kind_index(FileKind::Report), 0);
 }
 
 #[test]
