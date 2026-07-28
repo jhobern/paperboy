@@ -7668,7 +7668,114 @@ fn saving_an_environment_clears_new_and_modified_markers() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ── Save-prompt extension ghost autocomplete (feature 2) ──────────────
+// ── Batch 6: load-browser extension filter (#8) + env-save folder memory (#16) ──
+
+/// A load browser hides files that can't be the kind being opened (a
+/// collection load shows only `.hurl`/`.json`, plus directories to navigate),
+/// and `Tab` toggles the filter off/on so an oddly-named file is still pickable.
+#[test]
+fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
+    let dir = temp_dir("loadfilter");
+    for f in ["api.hurl", "data.json", "notes.txt", "run.trail"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => {
+                ex.files().iter().map(|f| f.name().to_string()).collect()
+            }
+            _ => panic!("browser not open"),
+        }
+    };
+
+    app.open_browser(FileAction::OpenCollection);
+    assert!(app.browser_filter_on, "the filter is on by default");
+    let shown = names(&app);
+    assert!(shown.iter().any(|n| n == "api.hurl"));
+    assert!(shown.iter().any(|n| n == "data.json"));
+    assert!(
+        shown.iter().any(|n| n == "sub/"),
+        "directories still show (listed with a trailing slash)"
+    );
+    assert!(!shown.iter().any(|n| n == "notes.txt"), "a .txt is hidden");
+    assert!(
+        !shown.iter().any(|n| n == "run.trail"),
+        "a .trail is hidden for a collection load"
+    );
+
+    // Tab reveals everything.
+    press(&mut app, KeyCode::Tab);
+    assert!(!app.browser_filter_on);
+    let all = names(&app);
+    assert!(
+        all.iter().any(|n| n == "notes.txt") && all.iter().any(|n| n == "run.trail"),
+        "Tab reveals the filtered-out files"
+    );
+
+    // Tab again re-applies the filter.
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_filter_on);
+    assert!(!names(&app).iter().any(|n| n == "notes.txt"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// "Save Environment As" for a never-saved environment seeds the path prompt
+/// with the last folder an environment was loaded/saved from, so the chooser
+/// remembers where environments live instead of dropping a bare filename in
+/// the process working directory.
+#[test]
+fn save_env_as_seeds_the_prompt_with_the_last_env_folder() {
+    let dir = temp_dir("saveenvfolder");
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "staging"); // never saved → path is None
+    app.global_env_idx = 0;
+    app.last_env_dir = Some(dir.clone());
+
+    app.begin_save_as(FileAction::SaveEnv);
+    match &app.overlay {
+        Some(Overlay::Prompt {
+            editor,
+            kind: PromptKind::FilePath(FileAction::SaveEnv),
+            ..
+        }) => assert_eq!(
+            editor.text(),
+            dir.join("staging.vars").to_string_lossy(),
+            "the prompt is seeded inside the remembered env folder"
+        ),
+        _ => panic!("SaveEnv path prompt not open"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Choosing "Save Request" while a report tab is active must not panic:
+/// `active_tab` points past the collections into the report range, so the
+/// guarded lookup makes it a no-op status instead of an out-of-bounds index.
+#[test]
+fn save_request_with_a_report_tab_active_is_a_noop_not_a_crash() {
+    let dir = temp_dir("savereqreport");
+    let target = dir.join("req.json");
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    assert!(
+        app.active_report_index().is_some(),
+        "a report tab is active"
+    );
+
+    app.do_file_action(FileAction::SaveRequest, target.to_str().unwrap());
+    assert!(
+        !target.exists(),
+        "nothing is written when no request is active"
+    );
+    assert!(matches!(app.status, Some(crate::i18n::Status::NoResponse)));
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 #[test]
 fn tab_completes_the_hurl_ghost_in_a_save_prompt() {

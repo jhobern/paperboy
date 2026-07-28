@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Load choosers hide files that can't be what you're opening.** The local
+  "Open Collection", "Load Environment" and "Open Report" browsers now show only
+  the matching file types (`.hurl`/`.json`, `.vars`/`.env*`, `.trail`) plus
+  folders to navigate — the same sets the git picker already uses — so loading
+  from a busy directory isn't buried under unrelated files. Press `Tab` to toggle
+  the filter off (show everything) and on again for an oddly-named file.
+
 - **`REPORT <var> AS <name>` renames a variable's column inline.** Alongside
   `REPORT (VAR)` (which uses the variable's own name as the header) you can now
   write `REPORT FILE AS "Pretty name"` to project a single variable under a
@@ -425,6 +432,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   self-explanatory.
 
 ### Fixed
+
+- **"Save Request" no longer crashes when a report tab is active.** The File ▸
+  Save ▸ Request action indexed the active tab straight into the collections
+  list, but a report tab's index points past it — so invoking it while a report
+  was focused panicked with an out-of-bounds error. It's now a guarded no-op
+  (a "no request" status) in that context. (A future change will hide the option
+  entirely when it doesn't apply.)
+
+- **"Save Environment As" remembers where environments live.** A never-saved
+  environment's "Save As" prompt used to offer only a bare `name.vars` filename,
+  dropping the file in the process working directory; it now seeds the prompt
+  inside the last folder an environment was loaded from or saved to. Saving an
+  environment also records its folder for next time.
 
 - **A cancelled report run can be restarted immediately.** Pressing `r` while a
   report was running cancelled it, but the run stayed marked "running" until the

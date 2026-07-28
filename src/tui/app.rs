@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -1016,6 +1016,11 @@ pub struct TuiApp {
     /// `browser_name` (reached with Tab) rather than the folder list. Enter on
     /// the focused filename saves into the current folder. Runtime-only.
     pub(crate) browser_name_focused: bool,
+    /// Whether the local load browser (Open Collection / Load Environment /
+    /// Open Report) is hiding files that don't match the action's extension set
+    /// (`.hurl`/`.json`, `.vars`/`.env*`, `.trail`). On by default; `Tab`
+    /// toggles it so an oddly-named file can still be picked. Runtime-only.
+    pub(crate) browser_filter_on: bool,
     /// Which pane focus returns to when the New/Edit Request wizard closes
     /// (whether saved or cancelled). Opening the wizard temporarily moves
     /// focus onto the Main panel so the request preview shows behind it, but
@@ -1117,6 +1122,7 @@ impl Default for TuiApp {
             pending_node_folder: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
+            browser_filter_on: true,
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
             pending_workspace_reloads: std::collections::VecDeque::new(),
@@ -1628,7 +1634,14 @@ impl TuiApp {
         }
         match action {
             FileAction::SaveRequest => {
-                let col = &self.collections[self.active_tab];
+                // `active_tab` counts collections then reports, so when a report
+                // tab is active it indexes past `collections` — guard with
+                // `.get()` (not `[]`) so "Save Request" with no active request
+                // is a no-op status, not an out-of-bounds panic.
+                let Some(col) = self.collections.get(self.active_tab) else {
+                    self.status = Some(Status::NoResponse);
+                    return;
+                };
                 let Some(entry) = col.entries.get(col.selected_entry) else {
                     self.status = Some(Status::NoResponse);
                     return;
@@ -1709,6 +1722,11 @@ impl TuiApp {
                     Ok(()) => {
                         if let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id) {
                             env.path = Some(PathBuf::from(path));
+                        }
+                        // Remember the folder so the next "Save Env As" (and the
+                        // env load picker) reopens here.
+                        if let Some(parent) = Path::new(path).parent() {
+                            self.last_env_dir = Some(parent.to_path_buf());
                         }
                         // Now part of the saved file — clear the "new"/"modified"
                         // markers and treat the current values as the loaded ones.

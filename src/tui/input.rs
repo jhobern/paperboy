@@ -7,7 +7,9 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
-use ratatui_explorer::{FileExplorer, FileExplorerBuilder, Theme as ExplorerTheme};
+use ratatui_explorer::{
+    File as ExplorerFile, FileExplorer, FileExplorerBuilder, Theme as ExplorerTheme,
+};
 
 use crate::collection::Collection;
 use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
@@ -2073,7 +2075,16 @@ impl TuiApp {
                         .and_then(|id| self.global_envs.iter().find(|e| e.id == id))
                         .map(|e| e.name.clone())
                         .unwrap_or_else(|| "environment".to_string());
-                    format!("{name}.vars")
+                    let filename = format!("{name}.vars");
+                    // A never-saved env has no path of its own, but the env
+                    // picker's last folder is a good guess — seed the prompt
+                    // there so "Save Env As" remembers where envs live.
+                    match self.last_env_dir.as_ref() {
+                        Some(dir) if dir.is_dir() => {
+                            dir.join(&filename).to_string_lossy().into_owned()
+                        }
+                        _ => filename,
+                    }
                 });
                 self.open_path_prompt(action, s.save_environment, &default);
             }
@@ -2666,6 +2677,8 @@ impl TuiApp {
             | FileAction::SaveReportCsvChooseFolder
             | FileAction::SaveReportBaselineChooseFolder
             | FileAction::SaveReportChooseFolder => s.browser_hint_collection_save,
+            // The load pickers get the `Tab all/matching` filter note.
+            _ if browser_filters_by_ext(action) => s.browser_hint_filter,
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
@@ -2745,6 +2758,15 @@ impl TuiApp {
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
+                }
+                // Load pickers hide files that can't be the thing being opened
+                // (a collection can't be a `.trail`, etc.); `Tab` toggles it via
+                // `browser_key_handler`. On by default each time the picker opens.
+                self.browser_filter_on = true;
+                if browser_filters_by_ext(action) {
+                    let _ = ex.set_filter_map(move |file| {
+                        browser_keep_file(action, &file).then_some(file)
+                    });
                 }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
@@ -3606,6 +3628,19 @@ impl TuiApp {
         let save_folder = action.is_save_to_folder();
         if save_folder && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.browser_name_focused = !self.browser_name_focused;
+            self.overlay = Some(Overlay::Browser(action, ex));
+            return;
+        }
+        // On a load picker, Tab toggles the extension filter (show all ↔ only
+        // matching files) so an oddly-named file can still be picked.
+        if browser_filters_by_ext(action) && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.browser_filter_on = !self.browser_filter_on;
+            if self.browser_filter_on {
+                let _ =
+                    ex.set_filter_map(move |file| browser_keep_file(action, &file).then_some(file));
+            } else {
+                let _ = ex.remove_filter_map();
+            }
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
         }
@@ -4521,6 +4556,46 @@ fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
     let rest = descendant.strip_prefix(ancestor).ok()?;
     let first = rest.components().next()?;
     Some(ancestor.join(first))
+}
+
+/// Whether the local load browser filters by extension for this action. The
+/// three "open an existing X" pickers hide files that can't be that X; the
+/// save-to-folder and folder-pick actions don't (they list everything). See
+/// [`browser_keep_file`].
+fn browser_filters_by_ext(action: FileAction) -> bool {
+    matches!(
+        action,
+        FileAction::OpenCollection | FileAction::LoadEnv | FileAction::OpenReport
+    )
+}
+
+/// Whether `file` should show in the load browser for `action` when the
+/// extension filter is on: directories always pass (so you can navigate into
+/// them), files must match the action's extension set. Mirrors the git
+/// picker's sets in [`crate::tui::remote::relevant_files`].
+fn browser_keep_file(action: FileAction, file: &ExplorerFile) -> bool {
+    if file.is_dir {
+        return true;
+    }
+    let path = &file.path;
+    let ext = path.extension().and_then(|e| e.to_str());
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    match action {
+        FileAction::OpenCollection => {
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
+        }
+        FileAction::LoadEnv => {
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
+                || name.eq_ignore_ascii_case(".env")
+                || name.to_ascii_lowercase().starts_with(".env.")
+        }
+        FileAction::OpenReport => matches!(ext, Some(e) if e.eq_ignore_ascii_case("trail")),
+        // Not a filtered action — everything shows.
+        _ => true,
+    }
 }
 
 /// Apply a horizontal-scroll `delta` to `current`, clamped to `[0, max]` where

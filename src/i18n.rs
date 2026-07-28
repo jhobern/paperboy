@@ -480,6 +480,7 @@ strings! {
     prompt_reset_hint => "^R reset", "^R réinitialiser", "^R nulstil";
     browser_select_file => "Select file", "Sélectionner un fichier", "Vælg fil";
     browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
+    browser_hint_filter => "Enter open · Tab all/matching · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · Tab tous/correspondants · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · Tab alle/matchende · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
