@@ -1837,6 +1837,16 @@ impl TuiApp {
             })
             .collect();
         self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
+        // A workspace collection resumes focused on its tree (`Pane::List`, the
+        // default), so a workspace report should too: resume on its pinned tree
+        // rather than the editor, for consistent reopen behaviour. A standalone
+        // report has no tree, so it stays on the editor.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].workspace.is_some()
+        {
+            self.report_tabbar_focus = false;
+            self.report_tree_focus = true;
+        }
         for i in 0..self.reports.len() {
             self.revalidate_report(i);
         }

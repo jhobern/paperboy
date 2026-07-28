@@ -18108,6 +18108,43 @@ fn workspace_report_context_round_trips_through_persistence() {
     );
 }
 
+/// On reopen, a workspace report resumes focused on its pinned tree (like a
+/// workspace collection resumes on `Pane::List`), not on the editor — so
+/// reopening is consistent regardless of which tab kind was active. A plain
+/// report has no tree and stays on the editor.
+#[test]
+fn a_workspace_report_reopens_focused_on_its_tree() {
+    let (mut app, _ci, root) = workspace_with_reports();
+    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
+    let snapshot = app.to_persisted();
+
+    let mut restored = TuiApp::default();
+    // A fresh app starts on the editor; restore must move focus to the tree.
+    assert!(!restored.report_tree_focus);
+    restored.apply_persisted(snapshot);
+    assert!(
+        restored.active_report_index().is_some(),
+        "the report is the active tab after restore"
+    );
+    assert!(
+        restored.report_tree_focus,
+        "a workspace report resumes focused on its pinned tree"
+    );
+    assert!(!restored.report_tabbar_focus);
+
+    // A standalone (non-workspace) report has no tree, so it stays on the editor.
+    let mut plain = TuiApp::default();
+    plain.new_report_tab();
+    let snapshot = plain.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert!(restored.active_report_index().is_some());
+    assert!(
+        !restored.report_tree_focus,
+        "a report with no pinned tree stays focused on the editor"
+    );
+}
+
 /// A workspace report whose root folder has vanished restores as an ordinary
 /// (non-workspace) report tab rather than pointing at a dead folder.
 #[test]

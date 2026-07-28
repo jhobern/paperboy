@@ -426,6 +426,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A workspace report now reopens focused on its pinned tree.** Reopening the
+  app restored a workspace *collection* with focus on its file tree but a
+  workspace *report* with focus on the editor — an inconsistency for the same
+  workspace. A workspace report now resumes on its pinned tree, matching a
+  collection (a standalone report, which has no tree, still resumes on the
+  editor).
+
 - **Blank lines in a report source no longer break selection and highlighting.**
   The read-only source view dropped blank separator lines from what it drew
   while still counting them in its selection/scroll geometry, so a mouse
