@@ -124,13 +124,11 @@ fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> H
     }
 
     let mut expected_status = None;
-    let mut any_status = false;
     let mut captures = Vec::new();
     let mut asserts = Vec::new();
     if let Some(resp) = &e.response {
-        match resp.status.value {
-            StatusValue::Specific(n) => expected_status = Some(n as u16),
-            StatusValue::Any => any_status = true,
+        if let StatusValue::Specific(n) = resp.status.value {
+            expected_status = Some(n as u16);
         }
         for section in &resp.sections {
             match &section.value {
@@ -167,7 +165,6 @@ fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> H
         cookies,
         body: req.body.as_ref().and_then(body_source),
         expected_status,
-        any_status,
         captures,
         asserts,
         reports: reports_from_span(lines, scan_start, scan_end),

@@ -160,14 +160,6 @@ pub struct HurlEntry {
     pub cookies: Vec<(String, String, bool)>,
     pub body: Option<String>,
     pub expected_status: Option<u16>,
-    /// `true` when the response section matched any status (`HTTP *`) rather
-    /// than a specific code. Kept so a wildcard response line round-trips — and
-    /// set on Postman import so every imported request carries `HTTP *`, letting
-    /// the user hand-add a `[Captures]`/`[Asserts]` section later without the
-    /// missing-response-line parse error. `#[serde(default)]` keeps older saved
-    /// states loadable.
-    #[serde(default)]
-    pub any_status: bool,
     /// (variable_name, query_expression) pairs, e.g. `("token", "jsonpath \"$.token\"")`.
     pub captures: Vec<(String, String)>,
     /// Raw `[Asserts]` expressions (e.g. `jsonpath "$.x" == "y"`), kept for
@@ -344,10 +336,7 @@ impl HurlEntry {
         // wildcard when reports are the only response-side metadata too.
         if let Some(status) = self.expected_status {
             out.push_str(&format!("HTTP {status}\n"));
-        } else if self.any_status
-            || !self.asserts.is_empty()
-            || !self.captures.is_empty()
-            || !self.reports.is_empty()
+        } else if !self.asserts.is_empty() || !self.captures.is_empty() || !self.reports.is_empty()
         {
             out.push_str("HTTP *\n");
         }

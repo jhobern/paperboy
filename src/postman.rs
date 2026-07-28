@@ -266,11 +266,11 @@ fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
     let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
+    // Captured variables from the request's `test` script (#24). A request that
+    // gets captures serializes with a `HTTP *` line automatically; one with none
+    // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
+    // parse error, so we don't emit an unsolicited wildcard line).
     entry.captures = captures_from_events(events);
-    // Every imported request carries `HTTP *` so the user can hand-add a
-    // `[Captures]`/`[Asserts]` section later without the "response section with
-    // no HTTP line" parse error (#18). Populated captures would emit it anyway.
-    entry.any_status = true;
     entry
 }
 
@@ -590,23 +590,25 @@ mod tests {
                 ("sid".to_string(), "jsonpath \"$.session.id\"".to_string()),
             ]
         );
-        // #18: captures (and any imported request) round-trip a `HTTP *` line so
-        // a hand-added section still parses.
+        // A request that gained captures serializes with a `HTTP *` line (so
+        // the [Captures] section parses); the capture rows follow it.
         let text = e[0].to_hurl();
         assert!(text.contains("HTTP *"), "wildcard status expected:\n{text}");
         assert!(text.contains("token: jsonpath \"$.token\""));
     }
 
     #[test]
-    fn imported_request_without_scripts_still_carries_wildcard_status() {
+    fn imported_request_without_captures_stays_bare() {
         let json =
             r#"{"info":{},"item":[{"name":"x","request":{"method":"GET","url":"{{u}}/a"}}]}"#;
         let e = import_postman(json);
         assert_eq!(e.len(), 1);
         assert!(e[0].captures.is_empty());
+        // No captures/asserts → no unsolicited `HTTP *`; hand-adding a section
+        // later surfaces a clear "add an HTTP line" parse error instead.
         assert!(
-            e[0].to_hurl().contains("HTTP *"),
-            "every imported request emits HTTP * so sections can be added later"
+            !e[0].to_hurl().contains("HTTP"),
+            "a capture-less import has no response line"
         );
     }
 }

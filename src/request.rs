@@ -573,7 +573,6 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
             .collect(),
         body: resolved.body,
         expected_status: base.expected_status,
-        any_status: base.any_status,
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),

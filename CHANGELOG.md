@@ -379,13 +379,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
-- **Imported Postman requests now carry an `HTTP *` response line.** A bare
-  imported request had no response section, so hand-adding a `[Captures]` or
-  `[Asserts]` section to it later failed to parse ("response section with no
-  HTTP line"). Every imported request now emits the wildcard `HTTP *` (matches
-  any status), so those sections can be added freely; the wildcard also
-  round-trips through a save/reload instead of being dropped.
-
 - **The report body border now dims when the workspace tree has focus.** In a
   workspace report the source/nodes/results panel's border stayed lit even when
   focus was on the pinned file tree, so it was ambiguous which pane was active.
