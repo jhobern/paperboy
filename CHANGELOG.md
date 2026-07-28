@@ -426,6 +426,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A cancelled report run can be restarted immediately.** Pressing `r` while a
+  report was running cancelled it, but the run stayed marked "running" until the
+  background worker finished winding down (which, mid-`PARALLEL` batch, could
+  take a while), so the next `r` was read as *another* cancel instead of a fresh
+  start. Cancelling now retires the run at once — the running marker clears, the
+  partial grid rolls back to whatever was showing before, and the very next `r`
+  starts a new run. The detached worker keeps winding down in the background;
+  its late results are ignored. (In-flight requests already dispatched still
+  finish — aborting a request mid-flight isn't possible — but no *new* requests
+  fire once cancelled.)
+
 - **A workspace report now reopens focused on its pinned tree.** Reopening the
   app restored a workspace *collection* with focus on its file tree but a
   workspace *report* with focus on the editor — an inconsistency for the same

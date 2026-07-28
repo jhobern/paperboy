@@ -861,11 +861,27 @@ impl TuiApp {
     fn prepare_report_run(&mut self) -> Option<(u64, ReportRunInputs)> {
         let idx = self.active_report_index()?;
         let report_id = self.reports[idx].report.id;
-        // A second `r` while running is a cancel: flip the flag the worker's
-        // runner checks between requests, so it winds down and its result is
-        // discarded on arrival.
-        if let Some(cancel) = self.running_reports.get(&report_id) {
+        // A second `r` while running is a cancel. Set the worker's flag (so it
+        // fires no more requests and winds down) and retire the run *now* —
+        // drop our receiver and clear the running marker — rather than waiting
+        // for the worker's `Done` to arrive. This lets the very next `r` start a
+        // fresh run instead of being read as another cancel (the old behaviour,
+        // which left the id in `running_reports` until the wind-down finished —
+        // slow when a `PARALLEL` batch is still in flight). The detached worker
+        // keeps draining in the background; its remaining messages land on the
+        // dropped receiver and are ignored. Roll the partial grid back to
+        // whatever was showing before the run (same result the deferred cancel
+        // gave, just immediate). Mirrors `close_active_report_tab`.
+        if let Some(cancel) = self.running_reports.remove(&report_id) {
             cancel.store(true, Ordering::Relaxed);
+            self.pending_report_runs.retain(|(id, _)| *id != report_id);
+            let rt = &mut self.reports[idx];
+            if let Some(prog) = rt.run_progress.take() {
+                rt.result = prog.prev_result;
+                if rt.result.is_none() && rt.view == ReportView::Results {
+                    rt.view = rt.editor_view;
+                }
+            }
             self.status = Some(Status::ReportRunCancelled);
             return None;
         }

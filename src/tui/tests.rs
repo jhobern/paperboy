@@ -15881,8 +15881,95 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
     assert_ne!(app.reports[ridx].view, ReportView::Source);
 }
 
-/// An unbound report can't run: `run_report_flow` returns a reason and
-/// `apply_report_run` keeps the source view with a blocked status.
+/// Cancelling a running report with a second `r` retires the run *immediately*
+/// (clears the running marker, drops the channel, rolls the grid back) rather
+/// than waiting for the worker's `Done`. This means the very next `r` starts a
+/// fresh run instead of being read as another cancel.
+#[test]
+fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
+    use super::reports::{ReportRunUpdate, ReportView};
+    use crate::i18n::Status;
+    use crate::report::model::ReportResult;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+
+    // Seed a prior grid, then start streaming so `run_progress` is live with
+    // that grid stashed as `prev_result` — the state a mid-run cancel must undo.
+    let mut prior = ReportResult::default();
+    prior.column_order = vec!["prior".into()];
+    app.reports[idx].result = Some(prior.clone());
+    let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.running_reports.insert(
+        report_id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.pending_report_runs.push((report_id, rx));
+    tx.send(ReportRunUpdate::Skeleton {
+        report_id,
+        result: skeleton,
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    assert!(app.reports[idx].run_progress.is_some(), "streaming started");
+
+    // A second `r` cancels — and retires the run synchronously.
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    assert!(
+        app.running_reports.is_empty(),
+        "cancel clears the running marker immediately"
+    );
+    assert!(
+        app.pending_report_runs.is_empty(),
+        "cancel drops the run's channel immediately"
+    );
+    assert!(
+        app.reports[idx].run_progress.is_none(),
+        "streaming progress is cleared"
+    );
+    assert_eq!(
+        app.reports[idx].result.as_ref().map(|r| &r.column_order),
+        Some(&prior.column_order),
+        "the pre-run grid is restored"
+    );
+    assert!(matches!(app.status, Some(Status::ReportRunCancelled)));
+
+    // The next `r` is *not* read as another cancel — it starts a fresh run.
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    assert!(
+        app.running_reports.contains_key(&report_id),
+        "a fresh run starts right after cancel"
+    );
+    assert_eq!(app.pending_report_runs.len(), 1, "the fresh run is polling");
+
+    // Drain the fresh run to completion so the worker thread winds down.
+    for _ in 0..200 {
+        app.poll_report_run_updates();
+        if app.pending_report_runs.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.running_reports.is_empty(), "the fresh run finished");
+}
+
 #[test]
 fn report_run_is_blocked_when_unbound() {
     use super::reports::ReportView;
