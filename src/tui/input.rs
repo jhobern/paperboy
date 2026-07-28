@@ -731,6 +731,9 @@ impl TuiApp {
             // Ctrl+W closes the active collection tab (an unambiguous alias for
             // `x`, usable regardless of which pane has focus).
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
+            // Ctrl+R (Requests list) reverts the selected request to its saved
+            // on-disk version, discarding its in-memory edits (#19).
+            KeyCode::Char('r') if ctrl && self.focus == Pane::List => self.begin_revert_request(),
             // Reopens the most recently closed tab. Deliberately a plain
             // unmodified key rather than a Ctrl+Shift combo: terminal emulators
             // commonly intercept Ctrl+Shift+T themselves (as "new tab") before
@@ -1986,7 +1989,54 @@ impl TuiApp {
                 }
             }
             ConfirmAction::DeleteEnv(idx) => self.delete_global_env(idx),
+            ConfirmAction::RevertRequest(ci, ei) => match self.revert_request_to_saved(ci, ei) {
+                Some(method) => self.status = Some(Status::RequestReverted(method)),
+                None => self.status = Some(Status::NothingToRevert),
+            },
+            ConfirmAction::RevertEnv(env_id) => match self.revert_env_to_saved(env_id) {
+                Some(name) => self.status = Some(Status::EnvReverted(name)),
+                None => self.status = Some(Status::NothingToRevert),
+            },
         }
+    }
+
+    /// `Ctrl+R` in the Requests list: revert the selected request to its saved
+    /// on-disk version, discarding its in-memory edits (#19). Asks to confirm
+    /// first (there's no undo); a no-op with a status when there's nothing to
+    /// revert (a scratch collection, or an unedited/never-saved request).
+    pub(crate) fn begin_revert_request(&mut self) {
+        let ci = self.active_tab;
+        let revertable = self.collections.get(ci).is_some_and(|c| {
+            c.path.is_some() && c.entries.get(c.selected_entry).is_some_and(|e| e.modified)
+        });
+        if !revertable {
+            self.status = Some(Status::NothingToRevert);
+            return;
+        }
+        let ei = self.collections[ci].selected_entry;
+        self.overlay = Some(Overlay::Confirm {
+            action: ConfirmAction::RevertRequest(ci, ei),
+            sel: 1,
+        });
+    }
+
+    /// `Ctrl+R` in the entries popup: revert the whole environment to its last
+    /// saved values (#19). Asks to confirm first; a no-op with a status when
+    /// there's nothing to revert (a never-saved env, or no unsaved changes).
+    pub(crate) fn begin_revert_env(&mut self, env_id: u64) {
+        let revertable = self
+            .global_envs
+            .iter()
+            .find(|e| e.id == env_id)
+            .is_some_and(|e| e.path.is_some() && e.vars.iter().any(|v| v.user_added || v.modified));
+        if !revertable {
+            self.status = Some(Status::NothingToRevert);
+            return;
+        }
+        self.overlay = Some(Overlay::Confirm {
+            action: ConfirmAction::RevertEnv(env_id),
+            sel: 1,
+        });
     }
 
     /// The original file a collection / environment was loaded from (or last
@@ -2333,6 +2383,17 @@ impl TuiApp {
                 self.overlay = Some(Overlay::EnvPopup(popup));
             }
             KeyCode::Char('n') => self.open_prompt_add_env(popup.env_id),
+            // Ctrl+R reverts the whole environment to its last saved values
+            // (#19). Matched before the plain `r` reload arm below, which would
+            // otherwise swallow the Ctrl variant.
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.begin_revert_env(popup.env_id);
+                // Keep the popup open when the revert was a no-op (no confirm
+                // overlay was raised).
+                if self.overlay.is_none() {
+                    self.overlay = Some(Overlay::EnvPopup(popup));
+                }
+            }
             KeyCode::Char('r') => {
                 self.overlay = Some(Overlay::EnvPopup(popup));
                 self.reload_selected_env_var();

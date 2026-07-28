@@ -2258,6 +2258,34 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::RevertRequest(ci, ei) => {
+                    let name = app
+                        .collections
+                        .get(*ci)
+                        .and_then(|c| c.entries.get(*ei))
+                        .map(|e| {
+                            let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                            if leaf.is_empty() { e.url.clone() } else { leaf }
+                        })
+                        .unwrap_or_default();
+                    s.confirm_revert_request_q.replace("{r}", &name)
+                }
+                ConfirmAction::RevertEnv(env_id) => {
+                    let (name, n) = app
+                        .global_envs
+                        .iter()
+                        .find(|e| e.id == *env_id)
+                        .map(|e| {
+                            (
+                                e.name.clone(),
+                                e.vars.iter().filter(|v| v.user_added || v.modified).count(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    s.confirm_revert_env_q
+                        .replace("{e}", &name)
+                        .replace("{n}", &n.to_string())
+                }
             };
             draw_confirm_popup(f, &question, &[s.confirm_yes, s.confirm_no], *sel, th);
         }
@@ -2364,6 +2392,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+J", s.help_raw_json),
                             ("b", s.help_base_url),
                             ("u (List pane)", s.help_restore_request),
+                            ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
                         ],
@@ -2382,6 +2411,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_environments,
                         &[
                             ("r (Env popup)", s.help_reload_var),
+                            ("^r (Env popup)", s.help_revert_env),
                             ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
                             ("x", s.help_env_delete),

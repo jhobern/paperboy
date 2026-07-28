@@ -102,6 +102,8 @@ strings! {
     confirm_save_env_q => "There are {e} new or modified environment entries. Saving will overwrite the original environment file. Proceed?", "Il y a {e} variable(s) d'environnement nouvelle(s) ou modifiée(s). L'enregistrement écrasera le fichier d'environnement d'origine. Continuer\u{a0}?", "Der er {e} nye eller ændrede miljøvariabler. Gemning vil overskrive den oprindelige miljøfil. Fortsæt?";
     confirm_save_report_q => "This report has unsaved edits. Saving will overwrite the original report file. Proceed?", "Ce rapport a des modifications non enregistrées. L'enregistrement écrasera le fichier de rapport d'origine. Continuer\u{a0}?", "Denne rapport har ugemte ændringer. Gemning vil overskrive den oprindelige rapportfil. Fortsæt?";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
+    confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
+    confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_yes => "Yes", "Oui", "Ja";
     confirm_no => "No", "Non", "Nej";
     file_menu => "File", "Fichier", "Fil";
@@ -404,6 +406,8 @@ strings! {
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
+    help_revert_request => "revert the selected request to its last saved version on disk", "rétablir la requête sélectionnée à sa dernière version enregistrée sur le disque", "gendan den valgte anmodning til dens sidst gemte version på disken";
+    help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
     help_resize_width => "grow / shrink left column", "agrandir / réduire la colonne de gauche", "forøg / formindsk venstre kolonne";
     help_tab_manage => "close / reopen collection or workspace tab", "fermer / rouvrir un onglet de collection ou d'espace de travail", "luk / genåbn samlings- eller workspace-fane";
@@ -546,6 +550,9 @@ strings! {
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
+    status_request_reverted => "request reverted to last saved", "requête rétablie à la dernière sauvegarde", "anmodning gendannet til sidst gemte";
+    status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
+    status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
     report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · Esc source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · Échap source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · Esc kilde";
@@ -732,6 +739,16 @@ pub enum Status {
     /// A running report was cancelled by the user before it finished; any
     /// partial result is discarded.
     ReportRunCancelled,
+    /// The selected request was reverted to its last-saved on-disk version,
+    /// discarding its in-memory edits. Holds the HTTP method for the message.
+    RequestReverted(String),
+    /// A Global Environment's unsaved edits were discarded, restoring the
+    /// last-saved values (added vars dropped, modified ones restored). Names it.
+    EnvReverted(String),
+    /// A revert (`Ctrl+R`) had nothing to do: the item has no on-disk version
+    /// to revert to (a scratch collection / never-saved env), or no unsaved
+    /// changes.
+    NothingToRevert,
 }
 
 impl Status {
@@ -761,6 +778,8 @@ impl Status {
                     | Status::ReportColumnsApplied
                     | Status::ReportBound(_)
                     | Status::ReportNodeUndone(_)
+                    | Status::RequestReverted(_)
+                    | Status::EnvReverted(_)
             ),
         }
     }
@@ -867,6 +886,9 @@ impl Status {
                 .replace("{done}", &done.to_string())
                 .replace("{total}", &total.to_string()),
             Status::ReportRunCancelled => s.report_run_cancelled.to_string(),
+            Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
+            Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
+            Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
         }
     }
 }

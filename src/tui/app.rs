@@ -553,6 +553,14 @@ pub(crate) enum ConfirmAction {
     /// the Global Environments panel) — any collections linked to it become
     /// unlinked.
     DeleteEnv(usize),
+    /// Discard a request's in-memory edits, reloading it from the collection's
+    /// on-disk file. Holds `(collection index, entry index)`. Raised by `Ctrl+R`
+    /// in the Requests list only when that entry has unsaved changes.
+    RevertRequest(usize, usize),
+    /// Discard a Global Environment's unsaved edits, restoring the last-saved
+    /// values. Holds the env id. Raised by `Ctrl+R` in the entries popup only
+    /// when the env has unsaved changes.
+    RevertEnv(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1626,6 +1634,51 @@ impl TuiApp {
                 v.original_value = v.value.clone();
             }
         }
+    }
+
+    /// Discard the selected request's in-memory edits by reloading the single
+    /// entry at the same position from the collection's on-disk file (#19).
+    /// Returns the reverted request's HTTP method on success, or `None` when
+    /// there's nothing to revert to — the collection has no file (scratch), the
+    /// file can't be read/parsed, or it holds no entry at that position (e.g. a
+    /// never-saved request). The other entries and their edits are untouched.
+    pub(crate) fn revert_request_to_saved(&mut self, ci: usize, ei: usize) -> Option<String> {
+        let path = self.collections.get(ci)?.path.clone()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut disk = crate::postman::parse_collection(&content);
+        if ei >= disk.len() {
+            return None;
+        }
+        let entry = disk.swap_remove(ei);
+        let method = entry.method.clone();
+        let col = self.collections.get_mut(ci)?;
+        col.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
+        col.invalidate_request_json();
+        col.sync_folder_to_selected();
+        Some(method)
+    }
+
+    /// Discard a Global Environment's unsaved edits, restoring the last-saved
+    /// disk values (#19): every modified var goes back to its `original_value`
+    /// and every user-added var (not in the file) is dropped. Returns the env's
+    /// name on success, or `None` when there's nothing to revert (unknown id,
+    /// no file, or no changes).
+    pub(crate) fn revert_env_to_saved(&mut self, env_id: u64) -> Option<String> {
+        let env = self.global_envs.iter_mut().find(|e| e.id == env_id)?;
+        if env.path.is_none() || !env.vars.iter().any(|v| v.user_added || v.modified) {
+            return None;
+        }
+        env.vars.retain(|v| !v.user_added);
+        for v in &mut env.vars {
+            v.value = v.original_value.clone();
+            v.modified = false;
+        }
+        let name = env.name.clone();
+        for col in &mut self.collections {
+            col.invalidate_request_json();
+        }
+        self.save_state();
+        Some(name)
     }
 
     pub(crate) fn do_file_action(&mut self, action: FileAction, path: &str) {

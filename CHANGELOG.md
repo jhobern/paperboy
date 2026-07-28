@@ -19,6 +19,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   from a busy directory isn't buried under unrelated files. Press `Tab` to toggle
   the filter off (show everything) and on again for an oddly-named file.
 
+- **Revert a request or an environment to its last saved version.** Press
+  **Ctrl+R** in the Requests list to discard a request's in-memory edits and
+  reload it from the collection's file on disk, or **Ctrl+R** in the environment
+  entries popup to drop every unsaved change to that environment (edited values
+  go back to their saved value; hand-added variables are removed). Both actions
+  ask for confirmation first (there is no undo) and are a no-op with an
+  explanatory status when there's nothing to revert — a scratch collection/env
+  with no file, an unedited request, or an environment with no unsaved changes.
+
 - **`REPORT <var> AS <name>` renames a variable's column inline.** Alongside
   `REPORT (VAR)` (which uses the variable's own name as the header) you can now
   write `REPORT FILE AS "Pretty name"` to project a single variable under a

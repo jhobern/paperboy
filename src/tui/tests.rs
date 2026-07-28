@@ -7777,6 +7777,170 @@ fn save_request_with_a_report_tab_active_is_a_noop_not_a_crash() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ── Batch 7: revert request / environment to last saved on disk (#19) ──
+
+/// Ctrl+R in the Requests list reloads the selected request from the
+/// collection's on-disk file (discarding in-memory edits), after confirmation,
+/// and leaves the other entries untouched.
+#[test]
+fn ctrl_r_reverts_the_selected_request_to_its_saved_version() {
+    let dir = temp_dir("revreq");
+    let path = dir.join("api.hurl");
+
+    let mut app = TuiApp::default();
+    let e0 = HurlEntry::from_fields("first", "GET", "http://h/orig", vec![], "");
+    let e1 = HurlEntry::from_fields("second", "POST", "http://h/two", vec![], "");
+    app.collections
+        .push(Collection::new("api".into(), vec![e0, e1]));
+    app.active_tab = 1;
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    // Edit the first request in memory.
+    {
+        let col = &mut app.collections[1];
+        col.selected_entry = 0;
+        col.entries[0].url = "http://h/EDITED".into();
+        col.entries[0].modified = true;
+    }
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::RevertRequest(1, 0),
+                ..
+            })
+        ),
+        "Ctrl+R opens the revert confirmation"
+    );
+    press(&mut app, KeyCode::Char('y'));
+
+    let col = &app.collections[1];
+    assert_eq!(
+        col.entries[0].url, "http://h/orig",
+        "the request is reloaded from disk"
+    );
+    assert!(!col.entries[0].modified, "the modified marker is cleared");
+    assert_eq!(
+        col.entries[1].url, "http://h/two",
+        "the other entry is untouched"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::RequestReverted(_))
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ctrl+R on a request with nothing to revert (a scratch collection with no
+/// file, or an unedited request) is a no-op that shows a status instead of
+/// opening a confirmation.
+#[test]
+fn ctrl_r_on_an_unmodified_or_scratch_request_is_a_noop() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".into(),
+        vec![HurlEntry::from_fields("x", "GET", "http://h/x", vec![], "")],
+    ));
+    app.active_tab = 1;
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation for a scratch/unedited request"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NothingToRevert)
+    ));
+}
+
+/// Ctrl+R in the entries popup reverts the whole environment to its last saved
+/// values (after confirmation): edited vars go back to the saved value and
+/// user-added vars are dropped.
+#[test]
+fn ctrl_r_reverts_the_whole_environment_to_its_saved_values() {
+    let dir = temp_dir("revenv");
+    let path = dir.join("staging.vars");
+
+    let mut app = TuiApp::default();
+    let env_id = add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+    app.add_env_var(env_id, "HOST".into(), "prod".into());
+    app.do_file_action(FileAction::SaveEnv, path.to_str().unwrap());
+
+    // Modify HOST and add a new var, both unsaved.
+    app.commit_prompt_with_secrecy(PromptKind::EnvValue(env_id, 0), "localhost".into(), false);
+    app.add_env_var(env_id, "EXTRA".into(), "temp".into());
+    {
+        let env = app.global_envs.iter().find(|e| e.id == env_id).unwrap();
+        assert!(env.vars.iter().any(|v| v.modified), "an edited var exists");
+        assert!(env.vars.iter().any(|v| v.user_added), "a new var exists");
+    }
+
+    open_only_env_popup(&mut app);
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::RevertEnv(id),
+                ..
+            }) if id == env_id
+        ),
+        "Ctrl+R opens the revert confirmation"
+    );
+    press(&mut app, KeyCode::Char('y'));
+
+    let env = app.global_envs.iter().find(|e| e.id == env_id).unwrap();
+    assert_eq!(env.vars.len(), 1, "the user-added var is dropped");
+    assert_eq!(env.vars[0].key, "HOST");
+    assert_eq!(
+        env.vars[0].value, "prod",
+        "the edited var is restored to its saved value"
+    );
+    assert!(
+        env.vars.iter().all(|v| !v.modified && !v.user_added),
+        "all markers are cleared"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::EnvReverted(ref n)) if n == "staging"
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Ctrl+R in the entries popup with no unsaved changes is a no-op that keeps
+/// the popup open (rather than the plain-`r` secret reload or a confirmation).
+#[test]
+fn ctrl_r_on_an_unchanged_environment_keeps_the_popup_open() {
+    let dir = temp_dir("revenvnoop");
+    let path = dir.join("staging.vars");
+
+    let mut app = TuiApp::default();
+    let env_id = add_empty_global_env(&mut app, "staging");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 0;
+    app.add_env_var(env_id, "HOST".into(), "prod".into());
+    app.do_file_action(FileAction::SaveEnv, path.to_str().unwrap());
+
+    open_only_env_popup(&mut app);
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvPopup(_))),
+        "the popup stays open when there is nothing to revert"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NothingToRevert)
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn tab_completes_the_hurl_ghost_in_a_save_prompt() {
     let mut app = TuiApp::default();
