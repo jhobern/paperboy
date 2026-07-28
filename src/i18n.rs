@@ -503,13 +503,14 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Tab source · x csv · B baseline", "Tab source · x csv · B référence", "Tab kilde · x csv · B basislinje";
+    report_hint_results => "Tab source · x export · B baseline", "Tab source · x export · B référence", "Tab kilde · x export · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
     report_run_has_errors => "Fix the validation errors before running.", "Corrigez les erreurs de validation avant l'exécution.", "Ret valideringsfejlene før kørsel.";
     report_export_no_result => "Run the report before exporting.", "Exécutez le rapport avant l'exportation.", "Kør rapporten før eksport.";
-    report_export_csv_folder => "Export Report CSV — Choose Destination Folder", "Exporter le CSV du rapport — Choisir le dossier de destination", "Eksportér rapport-CSV — Vælg destinationsmappe";
+    report_export_csv_folder => "Export Report — Choose Destination Folder", "Exporter le rapport — Choisir le dossier de destination", "Eksportér rapport — Vælg destinationsmappe";
+    report_export_format_hint => "Format (↑↓)", "Format (↑↓)", "Format (↑↓)";
     report_save_baseline_folder => "Save Report Baseline — Choose Destination Folder", "Enregistrer la référence du rapport — Choisir le dossier de destination", "Gem rapport-basislinje — Vælg destinationsmappe";
     report_run_complete => "Report run complete:", "Exécution du rapport terminée :", "Rapportkørsel fuldført:";
     report_status_rows => "rows", "lignes", "rækker";

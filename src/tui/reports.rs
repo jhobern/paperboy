@@ -1965,6 +1965,16 @@ impl TuiApp {
             KeyCode::Down => self.scroll_report(1),
             KeyCode::Home => self.scroll_report(i32::MIN),
             KeyCode::End => self.scroll_report(i32::MAX),
+            // `<`/`>` resize the pinned workspace tree column, mirroring the
+            // collection view's request-list resize (same 20..80 clamp).
+            KeyCode::Char('>') => {
+                self.list_width = (self.list_width + 2).min(80);
+                self.save_state();
+            }
+            KeyCode::Char('<') => {
+                self.list_width = self.list_width.saturating_sub(2).max(20);
+                self.save_state();
+            }
             _ => {}
         }
     }
@@ -2045,6 +2055,49 @@ impl TuiApp {
                     editor.checkpoint();
                     accept_request_completion(editor, completion.as_ref().unwrap());
                     Some(editor.text())
+                }
+                // Tab with no pending completion indents one level (4 spaces)
+                // rather than moving focus — the report body is code-like, so
+                // Tab is expected to indent while editing. Snap a bare `END`
+                // back afterwards so an over-indent can't leave it detached from
+                // its opener (matching the backspace/space behaviour below).
+                KeyCode::Tab if !ctrl && !shift => {
+                    editor.checkpoint();
+                    editor.insert_str(INDENT_UNIT);
+                    reindent_end_line(editor);
+                    Some(editor.text())
+                }
+                // Backspace over a run of spaces deletes back to the previous
+                // 4-space stop within that run (mirroring the Tab indent), so
+                // one press clears a whole level rather than a single space —
+                // whether the spaces lead the line or trail earlier content
+                // (e.g. the padding Tab leaves after an `END`). Anywhere else
+                // it's an ordinary character delete.
+                KeyCode::Backspace if !ctrl => {
+                    let chars: Vec<char> = editor.lines[editor.row].chars().collect();
+                    if editor.col > 0 && chars.get(editor.col - 1) == Some(&' ') {
+                        let mut run_start = editor.col;
+                        while run_start > 0 && chars[run_start - 1] == ' ' {
+                            run_start -= 1;
+                        }
+                        let within = editor.col - run_start;
+                        let remove = (within - 1) % 4 + 1;
+                        editor.checkpoint();
+                        for _ in 0..remove {
+                            editor.backspace();
+                        }
+                        reindent_end_line(editor);
+                        Some(editor.text())
+                    } else {
+                        let resp = apply_edit_key_full(editor, key);
+                        copy = resp.copy;
+                        if resp.changed {
+                            reindent_end_line(editor);
+                            Some(editor.text())
+                        } else {
+                            None
+                        }
+                    }
                 }
                 // Enter keeps the current line's indentation on the new line
                 // (and adds one level after a `FOR` that opens a block), so
@@ -3113,8 +3166,14 @@ fn draw_report_results(
             }
         }
     };
-    // Dim the grid's border while the tab bar holds focus (Tab-list stop).
-    let block = panel(title, !app.report_tabbar_focus, th);
+    // Dim the grid's border while the tab bar or the workspace tree holds focus
+    // (both are separate Tab stops), so the lit border always marks the pane
+    // that actually has focus.
+    let block = panel(
+        title,
+        !app.report_tabbar_focus && !app.report_tree_focus,
+        th,
+    );
     let (inner, bar) = draw_report_panel(
         f,
         area,
@@ -3480,9 +3539,14 @@ fn draw_report_source(
         )
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
-    // Dim the source panel's border when the tab bar has focus (Tab-list stop),
-    // so the focused area is unambiguous; editing always keeps it lit.
-    let block = panel(title, editing || !app.report_tabbar_focus, th);
+    // Dim the source panel's border when the tab bar or the workspace tree has
+    // focus (both are separate Tab stops), so the focused area is unambiguous;
+    // editing always keeps it lit.
+    let block = panel(
+        title,
+        editing || (!app.report_tabbar_focus && !app.report_tree_focus),
+        th,
+    );
     // Context so the highlighter can colour the `# collection:`/`# environment:`
     // references (and `ENVS` names) by whether they currently resolve. Built
     // before any `&mut app` borrow below.

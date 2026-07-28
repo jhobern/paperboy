@@ -27,8 +27,11 @@ use super::model::{ReportResult, ReportRow};
 pub const RESULT_COLUMN: &str = "Result";
 
 /// `Result` value when the candidate matches the baseline on every compared
-/// field.
-pub const MATCH: &str = "OK";
+/// field. A descriptive phrase (rather than a bare "OK") so a matching row is
+/// self-explanatory in an exported CSV/JSON. Kept a plain data constant like
+/// its `NO_BASELINE`/`NO_CANDIDATE` siblings — these are report *data* written
+/// to shared files, not UI chrome, so they are not translated per UI language.
+pub const MATCH: &str = "Comparison matched baseline";
 /// `Result` value for a candidate row whose row key has no baseline sibling.
 pub const NO_BASELINE: &str = "no baseline";
 /// `Result` value for a baseline row whose row key produced no candidate.

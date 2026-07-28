@@ -1060,8 +1060,9 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .global_env_idx
         .min(app.global_envs.len().saturating_sub(1));
     // Columns available for the name text (after the border, highlight
-    // symbol and the active-marker column); used to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2);
+    // symbol, the leftmost pencil column and the active-marker column); used
+    // to clamp scrolling.
+    let text_w = area.width.saturating_sub(2 + 2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
     let sel_len = app
         .global_envs
@@ -1086,12 +1087,25 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             let name_color = if is_active { th.ok } else { th.text };
             let selected = i == sel;
             let mark_fg = if selected { th.bg } else { marker_fg };
+            // A pencil in the leftmost column flags an environment with unsaved
+            // (added or modified) variables — placed left of the name so it
+            // matches the Requests list's modified/added marker convention
+            // (and stays put rather than trailing a scrolling name).
+            let (pencil, pencil_fg) = if app.changed_env_count(env.id) > 0 {
+                ("\u{270e} ", th.accent)
+            } else {
+                ("  ", th.dim)
+            };
+            let pencil_fg = if selected { th.bg } else { pencil_fg };
             let git_prefix = if env.git_origin.is_some() {
                 format!("{GIT_ICON} ")
             } else {
                 String::new()
             };
-            let mut spans = vec![Span::styled(marker, Style::default().fg(mark_fg))];
+            let mut spans = vec![
+                Span::styled(pencil, Style::default().fg(pencil_fg)),
+                Span::styled(marker, Style::default().fg(mark_fg)),
+            ];
             let full = format!("{git_prefix}{}", env.name);
             if selected {
                 // Same truncate-with-arrow-hints convention as the Requests
@@ -1910,17 +1924,20 @@ pub(crate) fn draw_response(
         return;
     }
     if !error.is_empty() {
-        app.resp_max_scroll = 0;
-        app.resp_text_area = Rect::default();
+        // Render the runner error *through* the selectable response panel (not
+        // a plain Paragraph) so it can be mouse-selected and `y`-copied like any
+        // response body — the red fg is applied as the paragraph's fallback
+        // style, and the panel still owns wrapping/scrolling for long errors.
+        let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+        app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
         app.resp_panel
-            .set_content(Arc::from(""), area.width.max(1) as usize);
-        app.resp_panel.clear();
-        app.resp_panel.set_scroll(0);
+            .set_content(content, inner.width.max(1) as usize);
+        app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
         app.resp_scrollbar_area = Rect::default();
+        let visible_wrapped = app.resp_panel.visible_rows(inner.height);
+        app.resp_text_area = inner;
         f.render_widget(
-            Paragraph::new(format!("{} {error}", s.req_error_prefix))
-                .style(Style::default().fg(th.err))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
             inner,
         );
         return;
@@ -2090,6 +2107,43 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, ca
         Paragraph::new(Line::styled(hint, Style::default().fg(th.dim)))
             .style(Style::default().bg(th.panel)),
         area,
+    );
+}
+
+/// Render the report-export format strip (`CSV JSON HTML XLSX`) into `row`,
+/// highlighting the format that matches `filename`'s extension (an unknown or
+/// absent extension highlights CSV, the writer's fallback). Cycled with ↑/↓
+/// while the filename field is focused — see `cycle_browser_export_format`.
+fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &Strings, th: &Theme) {
+    use crate::report::writer::OUTPUT_EXTENSIONS;
+    let cur = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let known = cur
+        .as_deref()
+        .map(|c| OUTPUT_EXTENSIONS.contains(&c))
+        .unwrap_or(false);
+    let mut spans = vec![Span::styled(
+        format!(" {}  ", s.report_export_format_hint),
+        Style::default().fg(th.dim),
+    )];
+    for ext in OUTPUT_EXTENSIONS {
+        let active = cur.as_deref() == Some(ext) || (!known && ext == "csv");
+        let style = if active {
+            Style::default()
+                .bg(th.accent)
+                .fg(th.bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        spans.push(Span::styled(format!(" {} ", ext.to_uppercase()), style));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+        row,
     );
 }
 
@@ -2804,9 +2858,25 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             if action.is_save_to_folder() {
                 // Reserve a bordered filename box at the bottom that the user
                 // can Tab to and press Enter to save into the current folder.
-                let rows =
-                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+                // The report-export picker also gets a one-line format strip
+                // above it (CSV/JSON/HTML/XLSX; the active one derived from the
+                // typed extension, cycled with ↑/↓ while the name is focused).
+                let show_formats = *action == FileAction::SaveReportCsvChooseFolder;
+                let rows = if show_formats {
+                    Layout::vertical([
+                        Constraint::Min(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                    ])
+                    .split(area)
+                } else {
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area)
+                };
                 ex.widget().render_ref(rows[0], f.buffer_mut());
+                let name_row = if show_formats { rows[2] } else { rows[1] };
+                if show_formats {
+                    draw_export_format_strip(f, rows[1], &app.browser_name.text(), s, th);
+                }
                 let focused = app.browser_name_focused;
                 let label = if *action == FileAction::SaveWorkspaceChooseFolder {
                     s.browser_foldername_label
@@ -2822,8 +2892,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // focused, dim otherwise, panel background) so the field looks
                 // like every other bordered box in the app.
                 let block = panel(title, focused, th);
-                let inner = block.inner(rows[1]);
-                f.render_widget(block, rows[1]);
+                let inner = block.inner(name_row);
+                f.render_widget(block, name_row);
                 if focused {
                     render_editor(f, inner, &app.browser_name, false, th);
                 } else {

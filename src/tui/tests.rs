@@ -14579,6 +14579,159 @@ fn report_inline_edit_esc_returns_to_shortcuts() {
     );
 }
 
+/// Tab in the report source editor (with no pending completion) indents one
+/// level — four spaces — rather than moving focus, since the body is code-like.
+#[test]
+fn report_editor_tab_indents_four_spaces() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // A non-REQUEST line so no name completion is pending (Tab would otherwise
+    // accept the ghost). Cursor lands at the end on entering edit focus.
+    app.reports[idx].report.set_text("# note");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e'));
+    app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "# note    ",
+        "Tab inserts four spaces at the cursor"
+    );
+}
+
+/// Tab inserted before an `END` snaps it to its opener's indent (matching the
+/// backspace/space behaviour) rather than blindly over-indenting it.
+#[test]
+fn report_editor_tab_before_end_snaps_to_opener_indent() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("FOR ENV IN ENVS\nEND");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e'));
+    // Cursor starts at the end of the END line; jump to its start, then Tab.
+    app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "FOR ENV IN ENVS\nEND",
+        "Tab before END snaps it back to the opener's indent"
+    );
+}
+
+/// Backspace inside a line's leading indentation deletes back to the previous
+/// 4-space stop (mirroring the Tab indent), not one space at a time.
+#[test]
+fn report_editor_backspace_unindents_in_fours() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text("        x");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e'));
+    // Move the cursor to the end of the 8-space indent (just before `x`).
+    app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "    x",
+        "backspace snaps from column 8 to 4"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "x",
+        "backspace snaps from column 4 to 0"
+    );
+}
+
+/// Backspace over the padding Tab leaves *after* an `END` (trailing, not
+/// leading, spaces) still deletes a whole four-space unit at a time.
+#[test]
+fn report_editor_backspace_removes_trailing_indent_after_end_in_fours() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Tab at the end of an `END` line leaves four trailing spaces.
+    app.reports[idx].report.set_text("FOR ENV IN ENVS\nEND    ");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('e'));
+    app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(
+        app.active_report().unwrap().report.text,
+        "FOR ENV IN ENVS\nEND",
+        "one backspace clears the whole four-space run after END"
+    );
+}
+
+/// `<` / `>` resize the workspace-tree column from the report view (parity with
+/// the collection view), clamped to 20..80.
+#[test]
+fn report_view_angle_brackets_resize_the_list_column() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    app.list_width = 40;
+    app.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+    assert_eq!(app.list_width, 42, "> widens the column by 2");
+    app.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+    app.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+    assert_eq!(app.list_width, 38, "< narrows the column by 2");
+}
+
+/// The report-export picker's ↑/↓ cycle the output format by rewriting the
+/// filename's extension (the format *is* the extension), wrapping around.
+#[test]
+fn export_format_cycles_through_output_formats() {
+    let mut app = TuiApp::default();
+    app.browser_name = super::editor::Editor::new("report.csv", false);
+    app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.json");
+    app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.html");
+    app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.xlsx");
+    app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.csv", "wraps back to csv");
+    app.cycle_browser_export_format(false);
+    assert_eq!(app.browser_name.text(), "report.xlsx", "↑ steps backwards");
+    // An unknown extension is treated as csv, so the next format is json.
+    app.browser_name = super::editor::Editor::new("data.txt", false);
+    app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "data.json");
+}
+
+/// Ctrl+Backspace in the raw-mode prompt (which legacy terminals deliver as
+/// Ctrl+H) deletes the previous word instead of typing a literal `h`.
+#[test]
+fn raw_prompt_ctrl_h_deletes_a_word_not_types_h() {
+    let mut entry = HurlEntry::from_fields("r", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    assert!(matches!(app.overlay, Some(Overlay::Prompt { .. })));
+    // Put the cursor at a known end-of-line and type a marker word.
+    app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    for c in "zzz".chars() {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let with_word = match &app.overlay {
+        Some(Overlay::Prompt { editor, .. }) => editor.text(),
+        _ => unreachable!(),
+    };
+    assert!(with_word.contains("zzz"), "the marker word was typed");
+    app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    let after = match &app.overlay {
+        Some(Overlay::Prompt { editor, .. }) => editor.text(),
+        _ => unreachable!(),
+    };
+    assert!(
+        !after.contains("zzz"),
+        "Ctrl+H word-deletes the marker, and never inserts a literal 'h' (got {after:?})"
+    );
+}
+
 /// Ctrl+Left / Ctrl+Right move the source editor cursor a word at a time
 /// (rather than jumping to the line ends).
 #[test]

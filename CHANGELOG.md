@@ -320,6 +320,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `# [Reports]` comment block), and a request with no report fields contributes
   its whole response to a report instead.
 
+- **Export format picker in the report export dialog.** Exporting a report's
+  last run (**x**) now shows a `CSV / JSON / HTML / XLSX` strip above the
+  filename, with the active format highlighted; **↑/↓** (while the filename
+  field is focused) cycles it, rewriting the filename's extension. The format
+  has always been chosen by that extension — so typing `.json` still works — but
+  the picker makes it discoverable, and the dialog is no longer mislabelled
+  "Export Report CSV" (its `x export` hint was likewise misleading).
+
+- **Resize the workspace tree from the report view.** `<` and `>` now widen and
+  narrow the pinned workspace column while viewing a report, the same as in the
+  collection view.
+
+- **Pencil marker on environments with unsaved edits.** The Global Environments
+  panel now shows a `✎` in a column to the *left* of any environment name that
+  has added or modified variables — matching the Requests list's modified/added
+  marker placement (and the same glyph already used per-variable in the entries
+  popup) — so unsaved changes are visible without opening the environment.
+
 ### Changed
 
 - **Tab in the report view now cycles only the editor and results.** Pressing
@@ -337,7 +355,40 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   moved off the title onto a footer, so a long request name no longer truncates
   it.
 
+- **Tab in the report source editor indents.** While editing a report's source,
+  **Tab** now inserts four spaces (one indent level) instead of doing nothing —
+  unless a request/environment name completion is pending, in which case it
+  still accepts the completion. **Backspace** in a line's leading whitespace
+  deletes back to the previous four-space stop (so one press clears a whole
+  indent level), and both Tab and Backspace snap a bare `END` back to its
+  opener's indent, matching the existing space-key behaviour.
+
+- **Clearer "matched baseline" comparison result.** A comparison row that agrees
+  with its baseline on every field now reads **Comparison matched baseline** in
+  the `Result` column instead of a terse `OK`, so an exported CSV/JSON is
+  self-explanatory.
+
 ### Fixed
+
+- **The report body border now dims when the workspace tree has focus.** In a
+  workspace report the source/nodes/results panel's border stayed lit even when
+  focus was on the pinned file tree, so it was ambiguous which pane was active.
+  The body border now lights only when it (or its editor) actually holds focus.
+
+- **Ctrl+Backspace no longer types a literal `h` in the raw-mode and value
+  prompts.** The raw request / raw-JSON editor and the environment-value / save
+  prompts have their own key handling that lacked a word-delete binding, so on
+  terminals without the keyboard-enhancement protocol — where Ctrl+Backspace
+  arrives as Ctrl+H — the keystroke fell through to plain typing and inserted an
+  `h`. These prompts now delete the previous word on Ctrl+Backspace (and its
+  Ctrl+H alias), matching every other editor in the app.
+
+- **The runner "Request Error" is now copyable and selectable.** The error shown
+  when a request fails to send (e.g. an unresolved `{{VAR}}`) lives in a
+  separate channel from the top status line, so **Ctrl+Y** did not grab it and
+  the Response panel drew it as non-selectable text. Ctrl+Y now also copies the
+  runner error, and the Response panel renders it through the selectable body
+  panel so it can be mouse-selected and `y`-copied like any response.
 
 - **A `columns:` directive or `#` comment containing accented/non-ASCII text no
   longer crashes.** Two report code paths sliced UTF-8 text at a fixed byte

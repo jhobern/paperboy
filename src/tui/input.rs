@@ -33,20 +33,30 @@ impl TuiApp {
             self.quit = true;
             return;
         }
-        // Ctrl+Y copies the current status/error line to the clipboard. Error
-        // text (e.g. a Hurl parse failure) lives in the top bar where it can't
-        // be mouse-selected, so this is the one-key way to grab it — handy for
-        // pasting into a bug report, or straight back into the editor. Only
-        // intercepted while a message is actually showing, so it never shadows
-        // an editor's own Ctrl+Y the rest of the time. The message is left on
-        // screen (not replaced with "Copied") so it stays readable/re-copyable.
-        if key.code == KeyCode::Char('y')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && let Some(st) = &self.status
-        {
-            let text = st.text(&Strings::for_language(&self.language));
-            copy_to_clipboard(&text);
-            return;
+        // Ctrl+Y copies the current status/error line(s) to the clipboard.
+        // Error text lives in the two status areas where it can't be
+        // mouse-selected, so this is the one-key way to grab it — handy for
+        // pasting into a bug report, or straight back into the editor. Two
+        // channels are copied: the top status line (`app.status`, grabbed from
+        // anywhere it shows) and — in the main view only — the runner error
+        // (`response.error`, shown in the topbar; the overlay case is left to an
+        // overlay's own Ctrl+Y so it isn't shadowed). Messages are left on
+        // screen (not replaced with "Copied") so they stay readable/re-copyable.
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(st) = &self.status {
+                parts.push(st.text(&Strings::for_language(&self.language)));
+            }
+            if self.overlay.is_none() {
+                let err = self.response.lock().unwrap().error.clone();
+                if !err.is_empty() {
+                    parts.push(err);
+                }
+            }
+            if !parts.is_empty() {
+                copy_to_clipboard(&parts.join("\n"));
+                return;
+            }
         }
         if self.overlay.is_some() {
             self.on_key_overlay(key);
@@ -2117,6 +2127,40 @@ impl TuiApp {
     /// in `dir`. Collections write `dir/<name>.hurl` (extension added when
     /// missing) through the usual overwrite-confirming path; workspaces copy
     /// their files into `dir/<name>`.
+    /// Cycle the report-export folder picker's filename through the supported
+    /// output formats ([`OUTPUT_EXTENSIONS`]) by rewriting its extension. The
+    /// format *is* the extension (the single source of truth), so this leaves
+    /// `write_active_report_csv` — which picks the writer from the extension —
+    /// unchanged; typing an extension by hand still works too. `forward` steps
+    /// to the next format, else the previous; both wrap around.
+    pub(crate) fn cycle_browser_export_format(&mut self, forward: bool) {
+        use crate::report::writer::OUTPUT_EXTENSIONS;
+        let name = self.browser_name.text();
+        let path = std::path::Path::new(&name);
+        let cur = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        // Unknown/absent extension is treated as CSV (the writer's fallback),
+        // so cycling starts from CSV.
+        let idx = cur
+            .as_deref()
+            .and_then(|e| OUTPUT_EXTENSIONS.iter().position(|&x| x == e))
+            .unwrap_or(0);
+        let n = OUTPUT_EXTENSIONS.len();
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "report".to_string());
+        self.browser_name = Editor::new(&format!("{stem}.{}", OUTPUT_EXTENSIONS[next]), false);
+    }
+
     pub(crate) fn browser_commit_save(
         &mut self,
         action: FileAction,
@@ -3361,6 +3405,23 @@ impl TuiApp {
                     }
                     Act::Edit
                 }
+                // Ctrl+Backspace deletes the previous word. On terminals without
+                // the keyboard-enhancement protocol it arrives as Ctrl+H
+                // (`Char('h')`+CONTROL) rather than Backspace+CONTROL, so handle
+                // both here — *before* the generic `Char(c)`/`Backspace` arms
+                // below, which would otherwise type a literal `h` (the reported
+                // bug) or delete only one character. An intact secret is wiped
+                // whole, never revealing its length.
+                KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Backspace if ctrl => {
+                    if secret_intact {
+                        editor = Editor::new("", editor.multiline);
+                        secret_intact = false;
+                    } else {
+                        editor.clear_selection();
+                        editor.delete_word_left();
+                    }
+                    Act::Edit
+                }
                 KeyCode::Char(c) => {
                     if secret_intact {
                         // Typing replaces the whole secret with fresh input.
@@ -3560,6 +3621,14 @@ impl TuiApp {
                         // re-show here.
                         self.browser_commit_save(action, dir, name);
                     }
+                }
+                // Up/Down cycle the export format (rewriting the filename's
+                // extension) for the report-export picker. The single-line
+                // filename editor ignores these keys, so they're free to drive
+                // the format strip here; Down steps to the next format.
+                KeyCode::Up | KeyCode::Down if action == FileAction::SaveReportCsvChooseFolder => {
+                    self.cycle_browser_export_format(key.code == KeyCode::Down);
+                    self.overlay = Some(Overlay::Browser(action, ex));
                 }
                 _ => {
                     apply_edit_key(&mut self.browser_name, key);
