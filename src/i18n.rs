@@ -426,14 +426,14 @@ strings! {
     help_group_panels => "Panels & General", "Panneaux et général", "Paneler og generelt";
     help_group_reports => "Reports", "Rapports", "Rapporter";
     help_report_new => "new report tab (from any view)", "nouvel onglet de rapport (depuis n'importe quelle vue)", "ny rapportfane (fra enhver visning)";
-    help_report_edit => "edit the report source (type directly in the panel)", "modifier la source du rapport (saisir directement dans le panneau)", "rediger rapportkilden (skriv direkte i panelet)";
+    help_report_edit => "edit the raw report source (type directly in the panel)", "modifier la source brute du rapport (saisir directement dans le panneau)", "rediger den rå rapportkilde (skriv direkte i panelet)";
     help_report_leave_edit => "leave edit focus (single letters are shortcuts again)", "quitter le mode édition (les lettres redeviennent des raccourcis)", "forlad redigering (enkelte bogstaver er genveje igen)";
     help_report_word_move => "move the cursor a word at a time (while editing)", "déplacer le curseur d'un mot à la fois (en édition)", "flyt markøren et ord ad gangen (under redigering)";
     help_report_complete => "fill in the suggested request name (while editing)", "compléter le nom de requête suggéré (en édition)", "udfyld det foreslåede anmodningsnavn (under redigering)";
     help_report_run => "run the report and show its results grid", "exécuter le rapport et afficher sa grille de résultats", "kør rapporten og vis resultatgitteret";
     help_report_dry_run => "preview the projected rows without sending any requests", "prévisualiser les lignes prévues sans envoyer de requêtes", "forhåndsvis de forventede rækker uden at sende anmodninger";
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
-    help_report_nodes => "toggle between the source text and the structured node editor", "basculer entre le texte source et l'éditeur de nœuds structuré", "skift mellem kildeteksten og den strukturerede node-editor";
+    help_report_nodes => "open the structured node editor (Esc returns to the source)", "ouvrir l'éditeur de nœuds structuré (Échap revient à la source)", "åbn den strukturerede node-editor (Esc vender tilbage til kilden)";
     help_report_nodes_edit => "in the node editor: a add · Enter configure · e edit line · f File menu · Del remove · Shift+↑/↓ move · Ctrl+Z undo", "dans l'éditeur de nœuds : a ajouter · Entrée configurer · e modifier la ligne · f menu Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler", "i node-editoren: a tilføj · Enter konfigurer · e rediger linje · f Fil-menu · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd";
     help_report_focus_cycle => "cycle focus: editor → results → editor (tree included for workspace reports)", "faire défiler le focus : éditeur → résultats → éditeur (arbre inclus pour les rapports d'espace de travail)", "skift fokus: editor → resultater → editor (træ inkluderet for workspace-rapporter)";
     help_report_workspace_tree => "in a workspace report: ↑↓ move the pinned tree · Enter open a report/collection · ←/→ up/into a folder", "dans un rapport d'espace de travail : ↑↓ déplacer l'arbre épinglé · Entrée ouvrir un rapport/une collection · ←/→ monter/entrer dans un dossier", "i en arbejdsområderapport: ↑↓ flyt det fastgjorte træ · Enter åbn en rapport/samling · ←/→ op/ind i en mappe";
@@ -498,7 +498,7 @@ strings! {
     report_collection_missing => "Bound collection is not loaded — open it as a tab so its requests can be validated.", "La collection liée n'est pas chargée — ouvrez-la dans un onglet pour valider ses requêtes.", "Den bundne samling er ikke indlæst — åbn den som en fane, så dens anmodninger kan valideres.";
     report_no_diagnostics => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
     report_empty_source => "Empty report — press e to edit its source.", "Rapport vide — appuyez sur e pour modifier sa source.", "Tom rapport — tryk e for at redigere kilden.";
-    report_hint_edit => "e edit", "e modifier", "e rediger";
+    report_hint_edit => "e source", "e source", "e kilde";
     report_hint_run => "r run", "r exécuter", "r kør";
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
@@ -520,7 +520,7 @@ strings! {
     report_baseline_no_result => "Run the report before saving a baseline.", "Exécutez le rapport avant d'enregistrer une référence.", "Kør rapporten før du gemmer en basislinje.";
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
-    report_hint_nodes => "n nodes", "n nœuds", "n noder";
+    report_hint_nodes => "Enter nodes", "Entrée nœuds", "Enter noder";
     report_hint_view => "v output", "v sortie", "v output";
     report_workspace_heading => "Workspace", "Espace de travail", "Arbejdsområde";
     report_hint_tree => "↑↓ move · Enter open", "↑↓ déplacer · Entrée ouvrir", "↑↓ flyt · Enter åbn";
@@ -547,7 +547,7 @@ strings! {
     report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
-    report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · n source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · n source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · n kilde";
+    report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · Esc source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · Échap source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · Esc kilde";
     report_nodes_parse_error => "Fix the source before editing as nodes", "Corrigez la source avant de modifier en nœuds", "Ret kilden før redigering som noder";
     report_node_begin => "Begin", "Début", "Start";
     node_menu_title => "Add Node", "Ajouter un nœud", "Tilføj node";

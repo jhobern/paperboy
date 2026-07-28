@@ -17265,23 +17265,52 @@ fn node_editor_app(requests: &[&str]) -> (TuiApp, usize) {
     let idx = app.active_report_index().unwrap();
     app.reports[idx].report.set_text("# collection: api\n");
     app.revalidate_report(idx);
-    press(&mut app, KeyCode::Char('n')); // Source -> Nodes
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
     (app, idx)
 }
 
-/// `n` flips the report between the source text editor and the structured node
-/// editor, and back.
+/// Enter opens the structured node editor (mirroring how Enter opens the
+/// request wizard) and Esc backs out to the source view. `n` no longer toggles
+/// — it is reserved for a future "new request" binding.
 #[test]
-fn report_n_key_toggles_the_node_view() {
+fn report_enter_opens_node_editor_and_esc_returns_to_source() {
     use super::reports::ReportView;
     let mut app = TuiApp::default();
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
     assert_eq!(app.reports[idx].view, ReportView::Source);
-    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Enter);
     assert_eq!(app.reports[idx].view, ReportView::Nodes);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    // `n` is unbound in the report body now — it must not toggle the node view.
     press(&mut app, KeyCode::Char('n'));
     assert_eq!(app.reports[idx].view, ReportView::Source);
+}
+
+/// A report whose source doesn't parse has no node outline, so Enter falls back
+/// to the raw text editor (the editor that can actually fix the source) rather
+/// than opening an empty node view.
+#[test]
+fn report_enter_falls_back_to_raw_editor_when_the_source_is_invalid() {
+    use super::reports::ReportView;
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nnonsense token\n");
+    app.revalidate_report(idx);
+    assert!(
+        app.reports[idx].report.flow().is_err(),
+        "precondition: the source must not parse"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.reports[idx].view, ReportView::Source);
+    assert!(
+        app.reports[idx].editor.is_some(),
+        "Enter opened the raw editor to fix the broken source"
+    );
 }
 
 /// A flow flattens to a Begin root plus one row per statement, with a loop
@@ -17592,7 +17621,7 @@ fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
         .report
         .set_text("# collection: api\nREPORT REQUEST upload\n");
     app.revalidate_report(idx);
-    press(&mut app, KeyCode::Char('n')); // Source -> Nodes
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
     (app, idx)
 }
 

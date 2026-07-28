@@ -349,14 +349,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Enter opens the report node editor; `e` edits the raw source.** Pressing
+  **Enter** in a report now opens the structured node editor — mirroring how
+  Enter opens the request wizard on a collection — while **`e`** is the
+  dedicated raw source-text editor. On a report whose source doesn't parse there
+  is no node outline to show, so Enter falls back to the raw editor (the one that
+  can fix the source). **Esc** backs out of the node view to the source view.
+  The `n` key, which used to toggle source/nodes, is now unbound — reserved for a
+  future "new request" binding.
+
 - **Tab in a report only swaps focus with the workspace tree now; `v` swaps
   source and output.** Pressing **Tab** in a workspace report toggles focus
   between the report body and the pinned file tree — it never jumps onto the
   results grid (an easy mis-hit) and never stops on the tab bar. In a standalone
   report (no tree) Tab is inert. To flip the body between the editor and the run
-  output, use **`v`** (advertised in the panel hint once a run exists); `n` still
-  switches the editor between source and nodes. Switch tabs with `[`/`]`,
-  PageUp/PageDown, or Ctrl/plain arrows.
+  output, use **`v`** (advertised in the panel hint once a run exists). Switch
+  tabs with `[`/`]`, PageUp/PageDown, or Ctrl/plain arrows.
 
 - **Report source autocomplete is now case-insensitive and fixes casing.**
   Typing a request or environment name fragment matches regardless of case

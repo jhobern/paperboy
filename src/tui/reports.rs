@@ -1205,24 +1205,22 @@ impl TuiApp {
         self.report_tabbar_focus = false;
     }
 
-    /// Toggle the active report between the source (text) editor and the
-    /// structured node editor — the `n` key. Both are "editor" views over the
-    /// same flow, so switching just re-renders the same AST a different way.
-    pub(crate) fn toggle_report_nodes_view(&mut self) {
-        if let Some(idx) = self.active_report_index() {
-            // Committing any in-progress text edit first, so the node view sees
-            // the latest source. Remember the caret so returning to the source
-            // editor later lands where the user left off.
-            if let Some(editor) = self.reports[idx].editor.take() {
-                self.reports[idx].edit_cursor = Some((editor.row, editor.col));
-            }
-            let rt = &mut self.reports[idx];
-            rt.view = match rt.view {
-                ReportView::Nodes => ReportView::Source,
-                _ => ReportView::Nodes,
-            };
-            rt.editor_view = rt.view;
+    /// Open the structured node editor for the active report — the Enter key,
+    /// mirroring how Enter opens the request wizard. A report that doesn't parse
+    /// has no node outline, so Enter drops into the raw text editor instead (the
+    /// one editor that can fix the source). Esc (see `on_key_report`) backs out
+    /// of the node view to the source view; there is no `n` toggle any more.
+    pub(crate) fn open_report_node_editor(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if self.reports[idx].report.flow().is_err() {
+            self.enter_report_edit();
+            return;
         }
+        let rt = &mut self.reports[idx];
+        rt.view = ReportView::Nodes;
+        rt.editor_view = ReportView::Nodes;
         self.report_tabbar_focus = false;
     }
 
@@ -1908,11 +1906,22 @@ impl TuiApp {
             }
             // Open another new report.
             KeyCode::Char('R') => self.new_report_tab(),
-            // Report-specific: give the source panel edit focus.
-            KeyCode::Char('e') | KeyCode::Enter => self.enter_report_edit(),
-            // Toggle between the text (source) editor and the structured node
-            // editor — two ways to edit the same flow.
-            KeyCode::Char('n') => self.toggle_report_nodes_view(),
+            // `e` gives the source panel raw-text edit focus. Enter opens the
+            // structured node editor instead — mirroring how Enter opens the
+            // request wizard — falling back to raw editing on a report that
+            // doesn't parse (so Enter always opens *an* editor). Esc backs out
+            // of the node editor again. `n` is deliberately left unbound here,
+            // reserved for a future "new request" binding.
+            KeyCode::Char('e') => self.enter_report_edit(),
+            KeyCode::Enter => self.open_report_node_editor(),
+            KeyCode::Esc => {
+                if let Some(idx) = self.active_report_index()
+                    && self.reports[idx].view == ReportView::Nodes
+                {
+                    self.reports[idx].view = ReportView::Source;
+                    self.reports[idx].editor_view = ReportView::Source;
+                }
+            }
             // Run the report against its bound collection and show the grid.
             KeyCode::Char('r') | KeyCode::F(5) => self.run_active_report(),
             // Dry-run: preview the projected rows/bindings without sending HTTP.
