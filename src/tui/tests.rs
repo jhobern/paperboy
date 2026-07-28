@@ -14837,7 +14837,11 @@ fn report_editor_ghost_is_scoped_to_request_lines() {
     assert!(app.report_completion(idx).is_none());
     press(&mut app, KeyCode::Esc);
 
-    // A REPORT REQUEST line does complete.
+    // A REPORT REQUEST line does complete. (These two scenarios stand in for two
+    // separate reports; a real second report tab starts with no remembered
+    // caret, so clear the one the first scenario's Esc left behind — otherwise
+    // it would be restored mid-line and suppress the end-of-line completion.)
+    app.reports[idx].edit_cursor = None;
     app.reports[idx]
         .report
         .set_text("# collection: api\nREPORT REQUEST Oa");
@@ -14934,6 +14938,72 @@ fn report_editor_ghost_closes_an_opened_quote() {
     assert_eq!(
         app.report_completion(idx).map(|c| c.ghost).as_deref(),
         Some("\"")
+    );
+}
+
+/// Item 4 (rep-ci-autocomplete): autocomplete matches case-insensitively, and
+/// accepting adopts the request name's canonical casing — typing a lowercase
+/// `r` completes to `Report value` (capital R), replacing what was typed rather
+/// than appending after it.
+#[test]
+fn report_editor_autocomplete_is_case_insensitive_and_recases() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Report value".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREQUEST r");
+    press(&mut app, KeyCode::Char('e')); // edit; cursor after the lowercase `r`
+    assert_eq!(
+        app.report_completion(idx).map(|c| c.ghost).as_deref(),
+        Some("eport value"),
+        "a lowercase fragment matches the capitalised request name"
+    );
+    press(&mut app, KeyCode::Right); // accept
+    assert!(
+        app.active_report()
+            .unwrap()
+            .report
+            .text
+            .ends_with("REQUEST \"Report value\""),
+        "the typed `r` is replaced with the canonical `R`, and the spaced name is quoted: {:?}",
+        app.active_report().unwrap().report.text
+    );
+}
+
+/// Item 23 (rep-cursor-memory): leaving and re-entering the source editor
+/// restores the caret where it last sat, rather than jumping to the buffer end.
+#[test]
+fn report_editor_remembers_the_last_cursor_position() {
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("REQUEST A\nREQUEST B\nREQUEST C");
+    press(&mut app, KeyCode::Char('e')); // enter edit; cursor at end (row 2)
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up); // move up to row 0
+    let (row, col) = {
+        let ed = app.reports[idx].editor.as_ref().unwrap();
+        (ed.row, ed.col)
+    };
+    assert_eq!(row, 0, "cursor moved to the first line");
+    press(&mut app, KeyCode::Esc); // leave edit — position is remembered
+
+    press(&mut app, KeyCode::Char('e')); // re-enter edit
+    let ed = app.reports[idx].editor.as_ref().unwrap();
+    assert_eq!(
+        (ed.row, ed.col),
+        (row, col),
+        "re-entering edit restores the remembered caret, not the buffer end"
     );
 }
 
@@ -15193,7 +15263,6 @@ fn report_editor_ctrl_h_deletes_a_word_like_ctrl_backspace() {
     );
 }
 
-/// Tab in the report view rotates focus editor → tab list → editor when the
 /// A report with no results grid yet: Tab has only the editor to focus, so it
 /// stays put (the tab bar is no longer a focus stop).
 #[test]
@@ -15209,10 +15278,11 @@ fn report_tab_cycles_focus_to_the_tab_list_and_back() {
     assert_eq!(app.reports[idx].view, ReportView::Source);
 }
 
-/// With a results grid available, Tab toggles between the editor and the grid —
-/// editor → results → editor — and never lands on the tab bar.
+/// A standalone report's source↔output swap is `v` (not `Tab`): `Tab` no longer
+/// jumps onto the results grid, so it can't be hit by accident, while `v`
+/// toggles the body between the editor and the grid.
 #[test]
-fn report_tab_focus_cycle_visits_the_results_grid() {
+fn report_v_swaps_between_editor_and_results_grid() {
     use super::reports::ReportView;
     let mut app = TuiApp::default();
     app.collections.push(Collection::new(
@@ -15235,13 +15305,15 @@ fn report_tab_focus_cycle_visits_the_results_grid() {
     };
     app.apply_report_run(idx, &runner); // lands on the results grid
     assert_eq!(app.reports[idx].view, ReportView::Results);
+
+    // Tab is inert for a standalone report — it never leaves the grid.
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.reports[idx].view, ReportView::Results);
     assert!(!app.report_tabbar_focus);
 
-    press(&mut app, KeyCode::Tab); // Results -> Editor (source)
-    assert!(!app.report_tabbar_focus);
+    press(&mut app, KeyCode::Char('v')); // Results -> Source (the editor)
     assert_eq!(app.reports[idx].view, ReportView::Source);
-    press(&mut app, KeyCode::Tab); // Editor -> Results
-    assert!(!app.report_tabbar_focus);
+    press(&mut app, KeyCode::Char('v')); // Source -> Results
     assert_eq!(app.reports[idx].view, ReportView::Results);
 }
 

@@ -160,6 +160,16 @@ impl Editor {
         }
     }
 
+    /// Move the cursor to `(row, col)`, clamped to the current text (`row` to
+    /// the last line, `col` to that line's character length), dropping any
+    /// selection. Used to restore a remembered caret when an editor is
+    /// re-opened over the same (or edited) text.
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.row = row.min(self.lines.len().saturating_sub(1));
+        self.col = col.min(self.lines[self.row].chars().count());
+        self.sel_anchor = None;
+    }
+
     /// An empty single-line editor — the common case for form cells.
     pub fn blank() -> Self {
         Self::new("", false)

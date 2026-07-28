@@ -503,7 +503,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Tab source · x export · B baseline", "Tab source · x export · B référence", "Tab kilde · x export · B basislinje";
+    report_hint_results => "v source · x export · B baseline", "v source · x export · B référence", "v kilde · x export · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -521,6 +521,7 @@ strings! {
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "n nodes", "n nœuds", "n noder";
+    report_hint_view => "v output", "v sortie", "v output";
     report_workspace_heading => "Workspace", "Espace de travail", "Arbejdsområde";
     report_hint_tree => "↑↓ move · Enter open", "↑↓ déplacer · Entrée ouvrir", "↑↓ flyt · Enter åbn";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";

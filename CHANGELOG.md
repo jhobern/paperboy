@@ -349,11 +349,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
-- **Tab in the report view now cycles only the editor and results.** Pressing
-  **Tab** in a report rotates focus between the source/node editor and the
-  results grid (and, for a workspace report, the pinned tree) — it no longer
-  stops on the tab bar, which was a disorienting extra stop. Switch tabs the
-  same way as everywhere else: `[`/`]`, PageUp/PageDown, or Ctrl/plain arrows.
+- **Tab in a report only swaps focus with the workspace tree now; `v` swaps
+  source and output.** Pressing **Tab** in a workspace report toggles focus
+  between the report body and the pinned file tree — it never jumps onto the
+  results grid (an easy mis-hit) and never stops on the tab bar. In a standalone
+  report (no tree) Tab is inert. To flip the body between the editor and the run
+  output, use **`v`** (advertised in the panel hint once a run exists); `n` still
+  switches the editor between source and nodes. Switch tabs with `[`/`]`,
+  PageUp/PageDown, or Ctrl/plain arrows.
+
+- **Report source autocomplete is now case-insensitive and fixes casing.**
+  Typing a request or environment name fragment matches regardless of case
+  (typing `r` offers `Report value`), and accepting the completion rewrites the
+  fragment with the name's canonical spelling — so a lowercased `r` becomes `R`
+  rather than leaving `report value`.
+
+- **The report source editor remembers your last cursor position.** Leaving edit
+  mode (Esc) and returning (`e`) — or flipping to the node view and back — now
+  restores the caret where it was instead of jumping to the end of the buffer
+  (clamped to the current text if the source changed meanwhile).
 
 - **Simpler, consistent keys in the report node editor.** `f` now always opens
   the **File** menu (as it does everywhere else) instead of doing double duty as
@@ -378,6 +392,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   self-explanatory.
 
 ### Fixed
+
+- **Blank lines in a report source no longer break selection and highlighting.**
+  The read-only source view dropped blank separator lines from what it drew
+  while still counting them in its selection/scroll geometry, so a mouse
+  selection or the highlighted parse-error line landed one row off for every
+  blank above it. The source panel now renders one row per line (blanks
+  included), keeping the view exactly aligned with selection and highlighting.
 
 - **The report body border now dims when the workspace tree has focus.** In a
   workspace report the source/nodes/results panel's border stayed lit even when

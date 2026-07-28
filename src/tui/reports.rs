@@ -154,6 +154,11 @@ pub(crate) struct ReportTab {
     /// validation panel and tab name stay current) instead of acting as view
     /// shortcuts. `None` = navigation mode.
     pub(crate) editor: Option<Editor>,
+    /// The `(row, col)` the source editor's cursor last sat at, remembered when
+    /// leaving edit mode so re-entering (`e`) restores the caret there instead
+    /// of jumping to the buffer end (clamped to the current text on restore).
+    /// `None` until the tab has been edited once.
+    pub(crate) edit_cursor: Option<(usize, usize)>,
     /// Selection/scroll panel backing the read-only source view (so it renders
     /// with the same wrapping, scrollbar and mouse-selection feel as the
     /// collection view's panels).
@@ -382,13 +387,21 @@ impl ReportTab {
         // A grid wants each row on exactly one line with columns aligned, so the
         // panel clips overflow rather than wrapping cells onto extra rows.
         results_panel.set_wrap_mode(WrapMode::Clip);
+        // The source view is code-like (short, structured lines), so it clips
+        // rather than wraps too — and, crucially, clip mode renders a blank
+        // source line as one empty row (the wrap path drops empty lines), so the
+        // read view's rows stay 1:1 with the buffer's and selection/highlight
+        // land on the right lines even when the flow has blank separators.
+        let mut source_panel = MultiSelectPanel::new();
+        source_panel.set_wrap_mode(WrapMode::Clip);
         Self {
             report,
             diagnostics: Vec::new(),
             parse_error: None,
             parse_error_line: None,
             editor: None,
-            source_panel: MultiSelectPanel::new(),
+            edit_cursor: None,
+            source_panel,
             validation_panel: MultiSelectPanel::new(),
             view: ReportView::Source,
             editor_view: ReportView::Source,
@@ -1198,9 +1211,10 @@ impl TuiApp {
     pub(crate) fn toggle_report_nodes_view(&mut self) {
         if let Some(idx) = self.active_report_index() {
             // Committing any in-progress text edit first, so the node view sees
-            // the latest source.
-            if self.reports[idx].editor.is_some() {
-                self.reports[idx].editor = None;
+            // the latest source. Remember the caret so returning to the source
+            // editor later lands where the user left off.
+            if let Some(editor) = self.reports[idx].editor.take() {
+                self.reports[idx].edit_cursor = Some((editor.row, editor.col));
             }
             let rt = &mut self.reports[idx];
             rt.view = match rt.view {
@@ -1212,68 +1226,27 @@ impl TuiApp {
         self.report_tabbar_focus = false;
     }
 
-    /// Rotate keyboard focus across the report view's areas: (for a
-    /// workspace-aware report) the pinned Workspace tree, then the active editor
-    /// (source or nodes), then the results grid. Forward order is Tree → Editor
-    /// → Results → Tree; `forward == false` reverses it. The Tree stop is
-    /// present only for a workspace report; the Results stop is skipped when the
-    /// report hasn't produced a grid yet. The tab bar is deliberately *not* a
-    /// focus stop — cycling into it was disorienting, and the tab list is always
-    /// reachable with `[`/`]`, PageUp/PageDown and Ctrl/plain arrows instead.
-    /// The body shown (`ReportView`) is kept in step with the focused body area
-    /// so flipping to the grid and back is one continuous cycle; while the tree
-    /// is focused the body keeps showing whatever it last did.
-    pub(crate) fn cycle_report_focus(&mut self, forward: bool) {
-        #[derive(PartialEq, Clone, Copy)]
-        enum Focus {
-            Tree,
-            Editor,
-            Results,
-        }
+    /// Toggle keyboard focus between the report body (the active editor or the
+    /// results grid) and — for a workspace-aware report — its pinned Workspace
+    /// tree. `Tab`/`BackTab` are a plain two-way toggle: they move focus but
+    /// never change *what* the body shows (source ↔ output is `v`; source ↔
+    /// nodes is `n`), so an accidental `Tab` can't jump you onto the results
+    /// grid. For a standalone report (no tree) there is nothing to toggle, so
+    /// `Tab` is inert. The tab bar is deliberately never a focus stop — the tab
+    /// list is reachable with `[`/`]`, PageUp/PageDown and Ctrl/plain arrows.
+    /// `forward` is unused (a two-way toggle has no direction) but kept so the
+    /// `Tab`/`BackTab` call sites stay symmetric.
+    pub(crate) fn cycle_report_focus(&mut self, _forward: bool) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        let has_tree = self.reports[idx].workspace.is_some();
-        let has_results = self.reports[idx].result.is_some();
-        // Remember which editor (Source/Nodes) is showing so returning to the
-        // body lands on the one the user last used.
-        if self.reports[idx].view.is_editor() {
-            self.reports[idx].editor_view = self.reports[idx].view;
-        }
-        // The ordered focus stops that exist for this report.
-        let mut stops: Vec<Focus> = Vec::new();
-        if has_tree {
-            stops.push(Focus::Tree);
-        }
-        stops.push(Focus::Editor);
-        if has_results {
-            stops.push(Focus::Results);
-        }
-        // Where focus is now. Leaving the tab bar out of the cycle means it is
-        // never a focus stop; any stale tab-bar focus is cleared below.
-        let cur = if self.report_tree_focus && has_tree {
-            Focus::Tree
-        } else if self.reports[idx].view == ReportView::Results {
-            Focus::Results
-        } else {
-            Focus::Editor
-        };
-        let n = stops.len();
-        let pos = stops.iter().position(|s| *s == cur).unwrap_or(0);
-        let next = if forward {
-            (pos + 1) % n
-        } else {
-            (pos + n - 1) % n
-        };
-        let target = stops[next];
-        self.report_tree_focus = target == Focus::Tree;
         self.report_tabbar_focus = false;
-        match target {
-            Focus::Editor => self.reports[idx].view = self.reports[idx].editor_view,
-            Focus::Results => self.reports[idx].view = ReportView::Results,
-            // Tree leaves the body showing whatever it last did.
-            Focus::Tree => {}
+        // Only a workspace report has a second focus stop (its pinned tree); a
+        // standalone report has just the body, so Tab has nothing to move to.
+        if self.reports[idx].workspace.is_none() {
+            return;
         }
+        self.report_tree_focus = !self.report_tree_focus;
     }
 
     /// Key handling while a workspace-aware report's pinned tree has focus.
@@ -1808,7 +1781,13 @@ impl TuiApp {
             // user was looking at the results grid.
             self.reports[idx].view = ReportView::Source;
             let text = self.reports[idx].report.text.clone();
-            self.reports[idx].editor = Some(Editor::new(&text, true));
+            let mut editor = Editor::new(&text, true);
+            // Restore the caret to where the user last left it (clamped to the
+            // possibly-edited text) rather than always jumping to the end.
+            if let Some((row, col)) = self.reports[idx].edit_cursor {
+                editor.set_cursor(row, col);
+            }
+            self.reports[idx].editor = Some(editor);
         }
         // Editing focuses the body, so drop any tab-bar / tree focus.
         self.report_tabbar_focus = false;
@@ -2019,6 +1998,7 @@ impl TuiApp {
         };
 
         let mut leave = false;
+        let mut leave_cursor: Option<(usize, usize)> = None;
         let mut copy: Option<String> = None;
         // Apply the keystroke to the editor, then read back the (possibly)
         // updated text; the borrow of `self.reports[idx].editor` ends with this
@@ -2032,9 +2012,11 @@ impl TuiApp {
                 return;
             };
             match key.code {
-                // Esc leaves edit focus (the live-applied text is kept).
+                // Esc leaves edit focus (the live-applied text is kept), first
+                // remembering the caret so re-entering edit mode restores it.
                 KeyCode::Esc => {
                     leave = true;
+                    leave_cursor = Some((editor.row, editor.col));
                     Some(editor.text())
                 }
                 // Ctrl+Left/Right move one word (not to the line ends), keeping
@@ -2151,6 +2133,7 @@ impl TuiApp {
             if let Some(rt) = self.reports.get_mut(idx) {
                 if leave {
                     rt.editor = None;
+                    rt.edit_cursor = leave_cursor;
                 }
                 rt.report.set_text(text);
             }
@@ -2201,12 +2184,13 @@ impl TuiApp {
     }
 }
 
-/// Build a [`RequestCompletion`] for `partial` against the first matching
-/// `candidate`. When `always_quote` is set (env names, which must be quoted) or
-/// the matched candidate contains whitespace, a bare fragment is auto-quoted:
-/// the opening quote is inserted at the fragment's start column on accept and a
-/// closing quote is appended. Inside an already-opened quote the closing quote
-/// alone is appended.
+/// Build a [`RequestCompletion`] for `partial` against the first candidate that
+/// extends it, matched **case-insensitively**. When `always_quote` is set (env
+/// names, which must be quoted) or the matched candidate contains whitespace,
+/// the completed name is wrapped in quotes. Because the match ignores case, the
+/// completion rewrites the whole typed fragment with the candidate's canonical
+/// spelling on accept (so typing `r` completes to `Report value`, not
+/// `report value`) — see [`accept_request_completion`].
 fn complete_name(
     partial: &NamePartial,
     mut candidates: impl Iterator<Item = String>,
@@ -2214,61 +2198,66 @@ fn complete_name(
 ) -> Option<RequestCompletion> {
     match partial {
         NamePartial::Bare { text: p, start } => {
-            let t = candidates.find(|t| t.len() > p.len() && t.starts_with(p.as_str()))?;
-            let suffix = t[p.len()..].to_string();
-            if always_quote || t.chars().any(char::is_whitespace) {
-                // Show the plain suffix (so the ghost stays visually balanced);
-                // on accept, wrap the whole name in quotes by inserting the
-                // opening quote at its start column.
-                Some(RequestCompletion {
-                    ghost: suffix.clone(),
-                    insert: format!("{suffix}\""),
-                    quote_at: Some(*start),
-                })
-            } else {
-                Some(RequestCompletion {
-                    ghost: suffix.clone(),
-                    insert: suffix,
-                    quote_at: None,
-                })
-            }
-        }
-        NamePartial::Quoted(p) => {
-            let t = candidates.find(|t| t.len() >= p.len() && t.starts_with(p.as_str()))?;
-            let ghost = format!("{}\"", &t[p.len()..]);
+            let pl = p.to_lowercase();
+            let pchars = p.chars().count();
+            let t = candidates.find(|t| t.chars().count() > pchars && ci_prefix(t, &pl))?;
+            let suffix: String = t.chars().skip(pchars).collect();
+            let quote = always_quote || t.chars().any(char::is_whitespace);
             Some(RequestCompletion {
-                insert: ghost.clone(),
-                ghost,
-                quote_at: None,
+                // The ghost shows the plain suffix only (the leading/closing
+                // quotes, when auto-quoting, are added on accept), so it stays
+                // visually balanced as the line's continuation.
+                ghost: suffix,
+                replacement: if quote { format!("\"{t}\"") } else { t },
+                start: *start,
+            })
+        }
+        NamePartial::Quoted { text: p, start } => {
+            let pl = p.to_lowercase();
+            let pchars = p.chars().count();
+            let t = candidates.find(|t| t.chars().count() >= pchars && ci_prefix(t, &pl))?;
+            let suffix: String = t.chars().skip(pchars).collect();
+            Some(RequestCompletion {
+                ghost: format!("{suffix}\""),
+                replacement: format!("\"{t}\""),
+                start: *start,
             })
         }
     }
 }
 
-/// A pending request-name completion in the source editor.
-pub(crate) struct RequestCompletion {
-    /// The dim text shown starting at the cursor.
-    pub(crate) ghost: String,
-    /// The text inserted at the cursor when the completion is accepted (may add
-    /// a closing quote the ghost doesn't show, for the auto-quote case).
-    pub(crate) insert: String,
-    /// When `Some(col)`, an opening quote is inserted at this character column
-    /// (the start of the bare name) on accept — auto-quoting a name that
-    /// contains spaces so the completed line stays grammar-valid.
-    pub(crate) quote_at: Option<usize>,
+/// Whether `candidate` starts with the already-lowercased prefix `lower`,
+/// ignoring case.
+fn ci_prefix(candidate: &str, lower: &str) -> bool {
+    candidate.to_lowercase().starts_with(lower)
 }
 
-/// Apply `comp` to `ed`: optionally wrap the current bare name token in an
-/// opening quote (at the recorded name-start column), then insert the
-/// completion text at the cursor.
+/// A pending request-name completion in the source editor.
+pub(crate) struct RequestCompletion {
+    /// The dim text shown starting at the cursor — the candidate's suffix past
+    /// what the author has already typed (plus a closing quote when quoting).
+    pub(crate) ghost: String,
+    /// The character column where the name token begins. On accept the typed
+    /// fragment from here to the cursor is replaced by `replacement`, so a
+    /// case-insensitive match adopts the candidate's canonical casing.
+    start: usize,
+    /// The full canonical name to write in place of the typed fragment, already
+    /// wrapped in quotes when the name needs quoting.
+    replacement: String,
+}
+
+/// Apply `comp` to `ed`: replace the typed fragment — from the recorded name
+/// start column to the cursor (which sits at the line end when a completion is
+/// offered) — with the canonical `replacement`. Replacing (rather than merely
+/// appending a suffix) lets a case-insensitive match correct the casing of what
+/// was already typed and, when quoting, wrap the whole name in one step.
 fn accept_request_completion(ed: &mut Editor, comp: &RequestCompletion) {
     ed.clear_selection();
-    if let Some(col) = comp.quote_at {
-        let byte = Editor::byte_idx(&ed.lines[ed.row], col);
-        ed.lines[ed.row].insert(byte, '"');
-        ed.col += 1;
-    }
-    ed.insert_str(&comp.insert);
+    let line = &ed.lines[ed.row];
+    let start = Editor::byte_idx(line, comp.start);
+    let end = Editor::byte_idx(line, ed.col);
+    ed.lines[ed.row].replace_range(start..end, &comp.replacement);
+    ed.col = comp.start + comp.replacement.chars().count();
 }
 
 /// The partially-typed request name on a `REQUEST`/`REPORT REQUEST` line, and
@@ -2277,8 +2266,10 @@ enum NamePartial {
     /// A bare (unquoted) token, along with the character column in the source
     /// line where the name begins (used to auto-quote a spaced completion).
     Bare { text: String, start: usize },
-    /// The text after an as-yet-unclosed opening quote (may contain spaces).
-    Quoted(String),
+    /// The text after an as-yet-unclosed opening quote (may contain spaces),
+    /// with the character column of that opening quote (so accepting can
+    /// rewrite the whole quoted name — e.g. to adopt the match's casing).
+    Quoted { text: String, start: usize },
 }
 
 /// One level of source indentation (matches the flow serializer's four spaces).
@@ -2351,7 +2342,14 @@ fn request_name_partial(line: &str) -> Option<NamePartial> {
         if inner.contains('"') {
             return None; // already closed — the name is finished
         }
-        Some(NamePartial::Quoted(inner.to_string()))
+        // The name (and its opening quote) begin where `name` starts; every
+        // byte before it (indentation + keywords) is ASCII, so its byte offset
+        // equals its character column.
+        let start = name.as_ptr() as usize - line.as_ptr() as usize;
+        Some(NamePartial::Quoted {
+            text: inner.to_string(),
+            start,
+        })
     } else if name.is_empty() {
         None
     } else {
@@ -2413,7 +2411,10 @@ fn env_name_partial(line: &str) -> Option<NamePartial> {
         if inner.contains('"') {
             return None; // this env name is already closed
         }
-        Some(NamePartial::Quoted(inner.to_string()))
+        Some(NamePartial::Quoted {
+            text: inner.to_string(),
+            start,
+        })
     } else if token.is_empty() {
         None
     } else {
@@ -3529,14 +3530,21 @@ fn draw_report_source(
     let hint = if editing {
         s.report_hint_leave.to_string()
     } else {
-        format!(
+        let mut hint = format!(
             "{} · {} · {} · {} · {}",
             s.report_hint_edit,
             s.report_hint_run,
             s.report_hint_dry,
             s.report_hint_bind,
             s.report_hint_nodes
-        )
+        );
+        // Once a run has produced a grid, advertise `v` as the source↔output
+        // swap (the discoverable replacement for the old Tab-into-results).
+        if app.reports[idx].result.is_some() {
+            hint.push_str(" · ");
+            hint.push_str(s.report_hint_view);
+        }
+        hint
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
     // Dim the source panel's border when the tab bar or the workspace tree has
@@ -3702,5 +3710,41 @@ mod export_path_tests {
         // Inserting a brand-new directive above a non-ASCII comment is also safe.
         let cols = set_flow_directive("# café ☕ notes\nREQUEST A\n", "columns", "FILE");
         assert!(cols.contains("# columns: FILE"));
+    }
+}
+
+#[cfg(test)]
+mod source_panel_tests {
+    use super::*;
+    use crate::i18n::Language;
+    use crate::tui::report_highlight::{HlCtx, highlight_source};
+    use crate::tui::theme::theme;
+
+    /// Item 10 (rep-blank-highlight): the read-only source panel must render one
+    /// row per source line — *including blank separators* — so its display stays
+    /// 1:1 with the buffer and mouse selection/highlight land on the right
+    /// lines. Clip mode gives an empty line one empty row; the wrap path drops
+    /// it, which is the bug this guards against.
+    #[test]
+    fn source_panel_keeps_blank_lines_as_rows() {
+        let th = theme(&Language::English);
+        let ctx = HlCtx::default();
+        let text = "REQUEST A\n\nREQUEST B\n\nREQUEST C";
+        let lines = highlight_source(text, &ctx, &th);
+        assert_eq!(lines.len(), 5, "five source lines, two of them blank");
+
+        // Build the panel exactly as `ReportTab::new` does for the source view.
+        let mut panel = ReportTab::new(Report::from_text("t", text)).source_panel;
+        panel.set_styled_content(&lines, 40);
+        assert_eq!(
+            panel.total_rows(),
+            5,
+            "the selection geometry counts every line, blanks included"
+        );
+        assert_eq!(
+            panel.visible_rows(10).len(),
+            5,
+            "the rendered rows match — blank lines are not dropped from the view"
+        );
     }
 }
