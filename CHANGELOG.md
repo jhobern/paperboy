@@ -339,6 +339,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A `columns:` directive or `#` comment containing accented/non-ASCII text no
+  longer crashes.** Two report code paths sliced UTF-8 text at a fixed byte
+  offset while scanning for the ` AS ` keyword (in a `# columns:` header) or a
+  directive key (when BIND or the column picker rewrites the header). A
+  multi-byte character (e.g. `naïve`, `café`, `año`) landing on that offset
+  panicked — crashing the whole TUI on BIND/column-apply, or the run on a
+  non-ASCII column header. Both now compare bytes on char boundaries.
+
+- **Report names, aliases and computed-column headers containing spaces or
+  punctuation now survive a save/reload.** The serializer only quoted names
+  that contained whitespace, and never quoted an `AS <alias>` / computed
+  `AS <header>` at all. A name with a space (`AS "Overall Result"`) or a
+  bareword terminator (`REQUEST "a,b"`, `"get(id)"`) was written unquoted and
+  then failed to re-parse, silently corrupting the report on the next load.
+  Such names are now re-quoted whenever they aren't a valid bare token.
+
 - **The report editor now auto-indents `PARALLEL` loops and `REPORT … WITH`
   blocks.** Pressing Enter after a block-opening line indents the body one
   level, and typing `END` snaps back to the opener's indent. Previously only a
@@ -376,6 +392,35 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the TUI response panel. The body is now decompressed by its `Content-Encoding`
   before it's shown (and pretty-printed if it's JSON); `[Captures]`/`[Asserts]`
   were unaffected as Hurl already decoded internally for those.
+
+- **A symlink loop under a `FILES … MATCH "**/…"` producer no longer crashes the
+  run.** The recursive file walk followed directory symlinks, so a link that
+  pointed back at an ancestor (a cycle) recursed forever and overflowed the
+  stack, aborting the process. The walk now recurses only into real
+  subdirectories and skips directory symlinks, so a cyclic tree terminates
+  cleanly while ordinary files (and file symlinks) are still listed.
+
+- **CSV report exports are hardened against spreadsheet formula injection.**
+  Report cells carry arbitrary HTTP response text, so a value beginning with a
+  spreadsheet formula trigger (`=`, `+`, `@`, tab or CR) could execute as a
+  formula when the exported `.csv` was opened in Excel or Google Sheets. Such a
+  field is now prefixed with an apostrophe (the "treat as text" marker) so it is
+  shown literally; a leading `-` is left alone so negative numbers and the
+  no-match marker keep their value. JSON/HTML/xlsx exports were never affected.
+
+- **Closing a report tab while its run is still streaming no longer leaves it
+  stuck.** A tab closed mid-run was stashed (for reopen with `u`) with its live
+  progress state intact, but the background poller can only reach *open* tabs —
+  so reopening it showed a permanently greyed, half-filled "running" grid that
+  never completed. Closing a running tab now cancels its worker, retires the
+  run, and restores the grid that was showing before the run started.
+
+- **A `# columns:` directive that names two columns the same is now rejected.**
+  Two columns resolving to the same header (e.g. `columns: FILE AS X, p.status
+  AS X`) collided in JSON output — where rows are keyed by header, so the second
+  column silently overwrote the first and a column vanished. Such a directive is
+  now flagged as an error while you edit (and blocks the run), so every export
+  format stays faithful; give each column a distinct `AS <name>`.
 
 
 ## [0.1.6] - 2026-07-18

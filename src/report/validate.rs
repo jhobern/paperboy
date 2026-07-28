@@ -92,6 +92,29 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
             )));
         }
     }
+    // Two resolved columns that share the same header collide when the report is
+    // written as JSON (row objects are keyed by header, so the later column
+    // silently overwrites the earlier one) — a data loss the other formats don't
+    // have. Reject a duplicate header up front so every format stays faithful;
+    // the fix is to give each column a distinct `AS <name>`.
+    if let Some(spec) = flow.header.columns() {
+        let cols = super::model::parse_columns(spec);
+        let mut seen: Vec<&str> = Vec::new();
+        let mut reported: Vec<&str> = Vec::new();
+        for header in cols.iter().map(|c| c.header.as_str()) {
+            if seen.contains(&header) {
+                if !reported.contains(&header) {
+                    diags.push(Diagnostic::error(format!(
+                        "duplicate column header '{header}' in '# columns:' — give each \
+                         column a distinct name with AS"
+                    )));
+                    reported.push(header);
+                }
+            } else {
+                seen.push(header);
+            }
+        }
+    }
     // An optional `# environment:` names a single already-loaded environment to
     // use as the report's base variable layer (the plain, no-comparison run).
     // Like an `ENVS` loop, the environment must be loaded — flag it when it
@@ -521,6 +544,32 @@ mod tests {
             .filter(|d| d.severity == Severity::Warning)
             .map(|d| d.message)
             .collect()
+    }
+
+    #[test]
+    fn duplicate_column_headers_are_rejected() {
+        let titles = titles();
+        // `FILE AS X` and `Oauth.status AS X` both resolve to header `X`, which
+        // would collide in JSON output — one error, reported once.
+        let errs = errors(
+            "# collection: c\n# columns: FILE AS X, Oauth.status AS X, Oauth AS X\nREPORT REQUEST Oauth\n",
+            Some(&titles),
+            None,
+        );
+        let dup: Vec<_> = errs
+            .iter()
+            .filter(|m| m.contains("duplicate column"))
+            .collect();
+        assert_eq!(dup.len(), 1, "one duplicate-header error: {errs:?}");
+        assert!(dup[0].contains('X'));
+
+        // Distinct headers are fine.
+        assert!(!has_err(
+            "# collection: c\n# columns: FILE AS Name, Oauth.status AS Status\nREPORT REQUEST Oauth\n",
+            Some(&titles),
+            None,
+            "duplicate column",
+        ));
     }
 
     #[test]

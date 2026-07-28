@@ -950,6 +950,20 @@ mod tests {
     }
 
     #[test]
+    fn names_aliases_and_computed_headers_with_punctuation_round_trip() {
+        // Names/aliases/headers that contain whitespace or a bareword
+        // terminator (`()[],="`) must be re-quoted by the serializer so the
+        // save -> to_text -> reload cycle stays stable rather than corrupting.
+        assert_round_trips("# collection: c.hurl\nREQUEST \"a,b\"\n");
+        assert_round_trips("# collection: c.hurl\nREQUEST \"get(id)\"\n");
+        assert_round_trips("# collection: c.hurl\nREPORT REQUEST \"x=y\"\n");
+        assert_round_trips(
+            "# collection: c.hurl\nREPORT REQUEST proc AS \"Overall Result\" SHOW(status)\n",
+        );
+        assert_round_trips("# collection: c.hurl\nREPORT \"{{v}}\" AS \"Overall Result\"\n");
+    }
+
+    #[test]
     fn unbalanced_for_is_an_error() {
         assert!(parse_flow("FOR X IN FILES \"d\"\n  REQUEST r\n").is_err());
     }

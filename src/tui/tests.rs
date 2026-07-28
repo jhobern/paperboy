@@ -15584,6 +15584,78 @@ fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
     ));
 }
 
+/// Closing a report tab whose run is still streaming detaches it cleanly:
+/// the worker is cancelled, its channel retired, and the pre-run grid restored
+/// so reopening (`u`) shows a normal grid instead of a permanently greyed,
+/// half-filled "running" one the background poller can no longer reach.
+#[test]
+fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
+    use super::reports::{ReportRunUpdate, ReportView};
+    use crate::report::model::ReportResult;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "send".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/send".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR X IN [\"a\", \"b\"]\n    REPORT REQUEST send\nEND\n");
+    app.revalidate_report(idx);
+
+    // Seed a prior grid, then start streaming so `run_progress` is live with
+    // that grid stashed as `prev_result`.
+    let mut prior = ReportResult::default();
+    prior.column_order = vec!["prior".into()];
+    app.reports[idx].result = Some(prior.clone());
+    let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.running_reports.insert(
+        report_id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.pending_report_runs.push((report_id, rx));
+    tx.send(ReportRunUpdate::Skeleton {
+        report_id,
+        result: skeleton,
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    assert!(app.reports[idx].run_progress.is_some(), "streaming started");
+
+    // Close the running tab.
+    app.close_active_report_tab();
+    assert!(
+        app.running_reports.is_empty(),
+        "the worker's cancel flag is set and the run retired"
+    );
+    assert!(
+        app.pending_report_runs.is_empty(),
+        "the run's channel is retired so a late Done can't clobber the grid"
+    );
+
+    // Reopen it: no lingering streaming state, and the pre-run grid is back.
+    app.reopen_closed_tab();
+    let ridx = app.active_report_index().unwrap();
+    assert!(
+        app.reports[ridx].run_progress.is_none(),
+        "reopened tab is not stuck in a greyed running state"
+    );
+    assert_eq!(
+        app.reports[ridx].result.as_ref().map(|r| &r.column_order),
+        Some(&prior.column_order),
+        "the pre-run grid is restored"
+    );
+    assert_ne!(app.reports[ridx].view, ReportView::Source);
+}
+
 /// An unbound report can't run: `run_report_flow` returns a reason and
 /// `apply_report_run` keeps the source view with a blocked status.
 #[test]

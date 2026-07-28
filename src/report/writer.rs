@@ -314,7 +314,22 @@ fn push_record<'a>(out: &mut String, fields: impl Iterator<Item = &'a str>) {
 /// interior quote) when it contains a comma, quote, CR or LF; otherwise emit it
 /// verbatim. Reports must never lose information, so multi-line response bodies
 /// are quoted and preserved rather than flattened.
+///
+/// Cells come from arbitrary HTTP responses, so a value beginning with a
+/// spreadsheet formula trigger (`=`, `+`, `@`, tab or CR) is prefixed with a `'`
+/// first — the standard mitigation against CSV/formula injection when the file
+/// is opened in Excel/Sheets. The apostrophe is Excel's "treat as text" marker.
+/// A leading `-` is deliberately *not* treated as a trigger: it almost always
+/// denotes a negative number or a placeholder (the no-match marker is `-`), so
+/// neutralising it would corrupt far more legitimate data than it protects.
 fn escape_field(field: &str) -> String {
+    let neutralised;
+    let field = if field.starts_with(['=', '+', '@', '\t', '\r']) {
+        neutralised = format!("'{field}");
+        neutralised.as_str()
+    } else {
+        field
+    };
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
@@ -375,6 +390,24 @@ mod tests {
         res.column_order = vec!["resp".into()];
         res.rows = vec![row(&[("resp", "a,\"b\"\nc")])];
         assert_eq!(csv(&res), "resp\r\n\"a,\"\"b\"\"\nc\"\r\n");
+    }
+
+    #[test]
+    fn formula_leading_fields_are_neutralised_against_injection() {
+        let mut res = ReportResult::default();
+        res.column_order = vec!["body".into()];
+        res.rows = vec![row(&[("body", "=1+SUM(A1)")])];
+        // The `=` trigger is prefixed with `'` so a spreadsheet treats it as
+        // text; the resulting field has no special chars so it stays unquoted.
+        assert_eq!(csv(&res), "body\r\n'=1+SUM(A1)\r\n");
+
+        // A trigger combined with a special char is still fully quoted.
+        res.rows = vec![row(&[("body", "@cmd,tail")])];
+        assert_eq!(csv(&res), "body\r\n\"'@cmd,tail\"\r\n");
+
+        // A leading `-` is left alone (negatives / the no-match marker `-`).
+        res.rows = vec![row(&[("body", "-42")])];
+        assert_eq!(csv(&res), "body\r\n-42\r\n");
     }
 
     #[test]

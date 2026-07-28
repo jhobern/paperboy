@@ -174,9 +174,9 @@ fn split_as(part: &str) -> (&str, Option<String>) {
         }
         if !in_quote
             && (c == 'A' || c == 'a')
-            && i + 3 <= bytes.len()
-            && part[i..].len() >= 3
-            && part[i..i + 2].eq_ignore_ascii_case("as")
+            && bytes
+                .get(i + 1)
+                .is_some_and(|b| b.eq_ignore_ascii_case(&b's'))
             && i > 0
             && bytes[i - 1].is_ascii_whitespace()
             && bytes.get(i + 2).is_some_and(|b| b.is_ascii_whitespace())
@@ -267,6 +267,18 @@ mod tests {
         let cols = parse_columns("proc.Response as \"Main Results\"");
         assert_eq!(cols[0].header, "Main Results");
         assert_eq!(cols[0].sources, vec!["proc.Response"]);
+    }
+
+    #[test]
+    fn columns_directive_with_non_ascii_does_not_panic() {
+        // `split_as` scans for a ` AS ` boundary byte-by-byte; a multi-byte
+        // char right after an `a`/`A` must not trip a non-char-boundary slice.
+        for spec in ["año", "naïve", "aé", "café as Name", "Naïve AS Rôle"] {
+            let _ = parse_columns(spec); // must not panic
+        }
+        let cols = parse_columns("café AS Rôle");
+        assert_eq!(cols[0].header, "Rôle");
+        assert_eq!(cols[0].sources, vec!["café"]);
     }
 
     #[test]

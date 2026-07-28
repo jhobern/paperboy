@@ -8,9 +8,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Span;
 
+use super::line_editor::{EditorTheme, TruncationMarker};
 use super::theme::*;
 use ratatui::style::{Color, Style};
-use super::line_editor::{EditorTheme, TruncationMarker};
 
 pub(crate) use super::line_editor::{Editor, apply_edit_key, apply_edit_key_full};
 

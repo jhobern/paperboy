@@ -1822,7 +1822,24 @@ impl TuiApp {
         let Some(ridx) = self.active_report_index() else {
             return;
         };
-        let rt = self.reports.remove(ridx);
+        let mut rt = self.reports.remove(ridx);
+        // If this tab was still streaming a run, detach it cleanly before
+        // stashing. The poller matches updates to *open* tabs by id and can't
+        // reach a closed/stashed tab, so a live `run_progress` would reopen as a
+        // permanently greyed grid and a late `Done` could clobber the restored
+        // one. Cancel the worker, retire its channel, and restore whatever grid
+        // was showing before the run started (the same result a `r`-cancel gives).
+        let report_id = rt.report.id;
+        if let Some(cancel) = self.running_reports.remove(&report_id) {
+            cancel.store(true, Ordering::Relaxed);
+            self.pending_report_runs.retain(|(id, _)| *id != report_id);
+            if let Some(prog) = rt.run_progress.take() {
+                rt.result = prog.prev_result;
+                if rt.result.is_none() && rt.view == ReportView::Results {
+                    rt.view = rt.editor_view;
+                }
+            }
+        }
         self.closed_tabs
             .push(super::app::ClosedTab::Report(ridx, Box::new(rt)));
         if self.closed_tabs.len() > 20 {
@@ -2883,7 +2900,11 @@ fn set_flow_directive(text: &str, key: &str, value: &str) -> String {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix('#') {
             let rest = rest.trim_start();
-            if rest.len() >= prefix.len() && rest[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            if rest
+                .as_bytes()
+                .get(..prefix.len())
+                .is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()))
+            {
                 *line = new_line.clone();
                 return rejoin(lines, trailing_nl);
             }
@@ -3605,5 +3626,17 @@ mod export_path_tests {
             std::path::PathBuf::from("/tmp/reports/dfa.csv"),
             "unchanged behaviour when the name has no token"
         );
+    }
+
+    #[test]
+    fn set_flow_directive_handles_non_ascii_comment_lines() {
+        // A `#` comment whose multi-byte char straddles the directive-key
+        // length must not trip a non-char-boundary slice (BIND / column-apply).
+        let text = "# aaaaaaaé note\n# collection: old.hurl\nREQUEST A\n";
+        let bound = set_flow_directive(text, "collection", "new.hurl");
+        assert!(bound.contains("# collection: new.hurl"));
+        // Inserting a brand-new directive above a non-ASCII comment is also safe.
+        let cols = set_flow_directive("# café ☕ notes\nREQUEST A\n", "columns", "FILE");
+        assert!(cols.contains("# columns: FILE"));
     }
 }

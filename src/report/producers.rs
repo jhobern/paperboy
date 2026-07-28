@@ -91,10 +91,20 @@ fn collect_files(
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path.is_dir() {
+        // `file_type()` describes the entry itself and never follows a symlink,
+        // so a real directory recurses while a directory *symlink* does not —
+        // that's what stops a self-referential link (`loop -> ..`) from
+        // recursing forever into a stack overflow.
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
             if recursive {
                 collect_files(&path, recursive, file_pat, out)?;
             }
+            continue;
+        }
+        if file_type.is_symlink() && path.is_dir() {
+            // A symlink pointing at a directory: skip it (don't descend, and
+            // don't mistake it for a file) so cycles can't blow the stack.
             continue;
         }
         let name = entry.file_name();
@@ -358,6 +368,22 @@ mod tests {
         fs::write(d.join("sub/deep.jpg"), "x").unwrap();
         let files = list_files(&d, Some("**/*.jpg")).unwrap();
         assert_eq!(files.len(), 2);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_files_does_not_follow_symlinked_directories_into_a_cycle() {
+        let d = tmpdir("cycle");
+        fs::write(d.join("top.jpg"), "x").unwrap();
+        // A directory symlink pointing back at its parent: following it while
+        // recursing would loop forever and overflow the stack.
+        std::os::unix::fs::symlink(&d, d.join("loop")).unwrap();
+        let files = list_files(&d, Some("**/*.jpg")).unwrap();
+        // Terminates, and the real file is still found (the symlink is skipped,
+        // not listed as a file).
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("top.jpg"));
         fs::remove_dir_all(&d).ok();
     }
 

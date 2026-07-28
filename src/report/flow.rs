@@ -392,7 +392,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
         } => {
             let _ = write!(out, "REPORT REQUEST {}", name_text(name));
             if let Some(a) = alias {
-                let _ = write!(out, " AS {a}");
+                let _ = write!(out, " AS {}", name_text(a));
             }
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
@@ -427,7 +427,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             }
         }
         ReportStmt::Computed { template, name } => {
-            let _ = writeln!(out, "REPORT {} AS {name}", quote(template));
+            let _ = writeln!(out, "REPORT {} AS {}", quote(template), name_text(name));
         }
     }
 }
@@ -526,10 +526,16 @@ fn env_clause_text(c: &EnvClause) -> String {
     }
 }
 
-/// Render a request/column name: bare when it's a simple token, quoted when it
-/// contains whitespace (so it re-parses as one name).
+/// Render a request/column name: bare when it is a valid bareword, quoted when
+/// it is empty or contains any character the parser's `word` production would
+/// stop at (whitespace or one of `()[],="`), so it always re-parses as one
+/// name.
 fn name_text(name: &str) -> String {
-    if name.chars().any(char::is_whitespace) || name.is_empty() {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || "()[],=\"".contains(c))
+    {
         quote(name)
     } else {
         name.to_string()
@@ -595,7 +601,7 @@ impl FlowNode {
             }) => {
                 let mut out = format!("REPORT REQUEST {}", name_text(name));
                 if let Some(a) = alias {
-                    let _ = write!(out, " AS {a}");
+                    let _ = write!(out, " AS {}", name_text(a));
                 }
                 if let Some(fmt) = response_fmt {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
