@@ -11,7 +11,10 @@ use hurl_core::ast::{
 use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
 
-use super::entry::{BASE64_FILE_CT_MARKER, FormField, FormFieldKind, HurlEntry, RunStatus};
+use super::entry::{
+    BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry,
+    RunStatus,
+};
 
 /// Parse a Hurl-format string into a list of [`HurlEntry`] values. Invalid input
 /// yields an empty list (the UI treats "no entries" as a failed load).
@@ -37,7 +40,7 @@ pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
         .enumerate()
         .map(|(i, e)| {
             let end = method_lines.get(i + 1).copied().unwrap_or(lines.len() + 1);
-            map_entry(e, &lines, method_lines[i], end)
+            map_entry(e, &lines, method_lines[i], end, i == 0)
         })
         .collect()
 }
@@ -96,29 +99,98 @@ pub fn parse_hurl_error(content: &str) -> Option<String> {
     Some(reason)
 }
 
-fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> HurlEntry {
+fn map_entry(
+    e: &Entry,
+    lines: &[&str],
+    scan_start: usize,
+    scan_end: usize,
+    is_first: bool,
+) -> HurlEntry {
     let req = &e.request;
+
+    // Structural anchors that terminate the inline header block and bound each
+    // request `[Section]`'s rows: the request body, any `[Section]` header, and
+    // the response's `HTTP` status line. Each is strictly inside this entry and
+    // *after* the headers, so a source scan bounded by the first anchor below a
+    // block can never spill into the body, a later section, the response, or —
+    // crucially — the following request. (We can't use `req.source_info.end`:
+    // `hurl_core` excludes trailing comment lines from it, which would drop a
+    // block's own trailing/all-disabled `# key: value` rows.)
+    let mut anchors: Vec<usize> = req
+        .sections
+        .iter()
+        .map(|s| s.source_info.start.line)
+        .collect();
+    if let Some(b) = &req.body {
+        anchors.push(body_start_line(b));
+    }
+    if let Some(resp) = &e.response {
+        anchors.push(resp.status.source_info.start.line);
+    }
+
+    // The same anchors, tagged with the block they open, drive prose-comment
+    // recovery: a comment is attributed to the first block that begins below it
+    // (see `scan_comments`).
+    let mut landmarks: Vec<(usize, CommentAnchor)> = Vec::new();
+    for section in &req.sections {
+        let anchor = match &section.value {
+            SectionValue::BasicAuth(_) => CommentAnchor::BasicAuth,
+            SectionValue::Cookies(_) => CommentAnchor::Cookies,
+            SectionValue::QueryParams(..) => CommentAnchor::Query,
+            SectionValue::FormParams(..) | SectionValue::MultipartFormData(..) => {
+                CommentAnchor::Form
+            }
+            _ => continue,
+        };
+        landmarks.push((section.source_info.start.line, anchor));
+    }
+    if let Some(b) = &req.body {
+        landmarks.push((body_start_line(b), CommentAnchor::Body));
+    }
+    if let Some(resp) = &e.response {
+        landmarks.push((resp.status.source_info.start.line, CommentAnchor::Response));
+        for section in &resp.sections {
+            let anchor = match &section.value {
+                SectionValue::Asserts(_) => CommentAnchor::Asserts,
+                SectionValue::Captures(_) => CommentAnchor::Captures,
+                _ => continue,
+            };
+            landmarks.push((section.source_info.start.line, anchor));
+        }
+    }
+    landmarks.sort_by_key(|(line, _)| *line);
+
+    // The body's source line span keeps a multiline body's `#` lines out of
+    // prose-comment recovery.
+    let body_range = req.body.as_ref().map(body_line_span);
 
     let mut basic_auth = None;
     let mut form_fields = Vec::new();
     let mut query_params = Vec::new();
     let mut cookies = Vec::new();
     for section in &req.sections {
-        // Rows start on the line after the `[Section]` header.
+        // Rows start on the line after the `[Section]` header and run up to the
+        // next structural anchor below it (the following section / body /
+        // response), or — for a trailing section with nothing after it — to the
+        // end of the contiguous rows (see `scan_kv_rows`).
         let rows_start = section.source_info.start.line + 1;
+        let rows_end = first_anchor_after(&anchors, section.source_info.start.line);
         match &section.value {
             SectionValue::BasicAuth(Some(kv)) => basic_auth = Some(kv_pair(kv)),
             SectionValue::FormParams(kvs, _) => {
-                form_fields = form_fields_from_section(kvs, None, lines, rows_start);
+                form_fields = form_fields_from_section(kvs, None, lines, rows_start, rows_end);
             }
             SectionValue::MultipartFormData(parts, _) => {
-                form_fields = form_fields_from_section(&[], Some(parts), lines, rows_start);
+                form_fields =
+                    form_fields_from_section(&[], Some(parts), lines, rows_start, rows_end);
             }
             // Headers live inline; Cookies/Query are `[Section]`s. All three are
             // scanned straight from source so a disabled row (kept as a
             // `# key: value` comment, invisible to `hurl_core`) round-trips.
-            SectionValue::QueryParams(..) => query_params = scan_kv_rows(lines, rows_start),
-            SectionValue::Cookies(_) => cookies = scan_kv_rows(lines, rows_start),
+            SectionValue::QueryParams(..) => {
+                query_params = scan_kv_rows(lines, rows_start, rows_end)
+            }
+            SectionValue::Cookies(_) => cookies = scan_kv_rows(lines, rows_start, rows_end),
             _ => {}
         }
     }
@@ -154,10 +226,15 @@ fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> H
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
         url: req.url.to_source().to_string(),
-        // Headers occupy the lines between the request line and the body /
-        // first section; scanning them (instead of reading the AST) recovers
-        // disabled rows kept as `# key: value` comments.
-        headers: scan_kv_rows(lines, req.url.source_info.start.line + 1),
+        // Headers occupy the lines between the request line and the first
+        // structural anchor (body / section / response). Scanning them (instead
+        // of reading the AST) recovers disabled rows kept as `# key: value`
+        // comments; the anchor bound keeps the scan inside this request.
+        headers: scan_kv_rows(
+            lines,
+            req.url.source_info.start.line + 1,
+            first_anchor_after(&anchors, req.url.source_info.start.line),
+        ),
         basic_auth,
         form_fields,
         is_multipart,
@@ -168,6 +245,9 @@ fn map_entry(e: &Entry, lines: &[&str], scan_start: usize, scan_end: usize) -> H
         captures,
         asserts,
         reports: reports_from_span(lines, scan_start, scan_end),
+        comments: scan_comments(
+            lines, &landmarks, body_range, scan_start, scan_end, is_first,
+        ),
         user_added: false,
         modified: false,
         last_run: RunStatus::default(),
@@ -182,21 +262,257 @@ fn kv_pair(kv: &KeyValue) -> (String, String) {
     )
 }
 
-/// Scan a contiguous block of `key: value` request-section rows starting at
-/// 1-based line `start`, returning each as a `(key, value, enabled)` triple.
-/// A row commented out with a leading `#` comes back as a disabled entry —
-/// this is how [`to_hurl`](super::entry::HurlEntry::to_hurl) round-trips
-/// disabled Header, Cookies and Query rows, which `hurl_core` drops as
-/// comments before they ever reach the AST. Scanning stops at the first line
-/// that isn't a request-style row (a blank line, a JSON/text body, a
-/// `[Section]` header, the `HTTP` response line, or a prose comment), which
-/// also bounds the inline header block against the body that follows it.
-fn scan_kv_rows(lines: &[&str], start: usize) -> Vec<(String, String, bool)> {
+/// The smallest structural anchor line strictly below `after` — i.e. the
+/// exclusive upper bound of the source block that begins just under `after`
+/// (the request line, for headers, or a `[Section]` header, for its rows).
+/// `None` means "no anchor below here": a request with no body, sections or
+/// response, or its final trailing section — in which case the block is scanned
+/// in the bounded-open mode described on [`scan_kv_rows`].
+fn first_anchor_after(anchors: &[usize], after: usize) -> Option<usize> {
+    anchors.iter().copied().filter(|&a| a > after).min()
+}
+
+/// The 1-based line a request body starts on (its value, past any leading blank
+/// lines) — the header block's lower boundary when a body is present.
+fn body_start_line(b: &Body) -> usize {
+    b.space0.source_info.start.line
+}
+
+/// The half-open 1-based line range `[start, end)` a request body occupies in
+/// source. Used to keep body content out of prose-comment recovery: a
+/// multiline-string body can contain lines that begin with `#`, which are body
+/// text — not comments — and must not be captured (or duplicated) as such.
+fn body_line_span(b: &Body) -> (usize, usize) {
+    let start = body_start_line(b);
+    // `line_terminator0` is the terminator right after the body value, so its
+    // newline sits on the body's last source line.
+    let end = b.line_terminator0.newline.source_info.start.line.max(start);
+    (start, end + 1)
+}
+
+/// Recover prose comments from an entry's raw source so they aren't silently
+/// dropped on load. `hurl_core` melts every comment into an opaque `Comment`
+/// node, so — as with disabled rows and the `# [Reports]` block — we scan the
+/// source lines ourselves. A comment line is captured unless it's already
+/// represented elsewhere: this entry's own title block, the next entry's title
+/// block, a disabled `# key: value` row inside a scanned rows region, the
+/// `# [Reports]` block, or body content. Each captured comment is anchored to
+/// the block it precedes (the first structural line below it — see
+/// [`CommentAnchor`]) so it re-emits near its original place even as
+/// surrounding lines change. `Lead` collects file-leading comments above the
+/// first entry; `Trailing` collects comments below the last block.
+fn scan_comments(
+    lines: &[&str],
+    landmarks: &[(usize, CommentAnchor)],
+    body_range: Option<(usize, usize)>,
+    method_line: usize,
+    scan_end: usize,
+    is_first: bool,
+) -> Vec<EntryComment> {
+    #[derive(Clone, Copy)]
+    enum RowKind {
+        Kv,
+        Form,
+    }
+    // Rows regions where a `# key: value` comment is a captured *disabled* row
+    // (recovered by `scan_kv_rows`/`scan_disabled_form_rows`), not prose. These
+    // mirror the row scans in `map_entry`: the inline header block, then each
+    // Cookies/Query/Form section's rows, each bounded by the next landmark.
+    let first_landmark = landmarks.first().map(|(l, _)| *l);
+    let mut regions: Vec<(usize, usize, RowKind)> = vec![(
+        method_line + 1,
+        first_landmark.unwrap_or(scan_end),
+        RowKind::Kv,
+    )];
+    for (k, (line, anchor)) in landmarks.iter().enumerate() {
+        let kind = match anchor {
+            CommentAnchor::Cookies | CommentAnchor::Query => RowKind::Kv,
+            CommentAnchor::Form => RowKind::Form,
+            _ => continue,
+        };
+        let end = landmarks.get(k + 1).map(|(l, _)| *l).unwrap_or(scan_end);
+        regions.push((line + 1, end, kind));
+    }
+
+    let in_body = |line_no: usize| body_range.is_some_and(|(s, e)| line_no >= s && line_no < e);
+
+    // A comment line that scan_kv_rows / scan_disabled_form_rows already recover
+    // as a disabled row (so it round-trips via `headers`/`queries`/etc., not as
+    // prose). Only meaningful for `#`-comment lines.
+    let is_disabled_row = |line_no: usize| {
+        let Some(&line) = lines.get(line_no.wrapping_sub(1)) else {
+            return false;
+        };
+        regions.iter().any(|&(s, e, kind)| {
+            line_no >= s
+                && line_no < e
+                && match kind {
+                    RowKind::Kv => parse_kv_row(line).is_some(),
+                    RowKind::Form => parse_form_field_line(uncomment(line).1, true).is_some(),
+                }
+        })
+    };
+
+    // A "structural" line marks a block position for anchoring: body content, an
+    // enabled row/section/response line, or a disabled row (which sits in its
+    // block's rows). Prose comments, the reports block and title comments are
+    // *not* structural — they float and take their anchor from the next
+    // structural line below them.
+    let is_structural = |line_no: usize| {
+        if in_body(line_no) {
+            return true;
+        }
+        let Some(&line) = lines.get(line_no.wrapping_sub(1)) else {
+            return false;
+        };
+        let t = line.trim();
+        if t.is_empty() {
+            return false;
+        }
+        if !t.starts_with('#') {
+            return true;
+        }
+        is_disabled_row(line_no)
+    };
+
+    // The anchor for a structural line at `l2`: the block it belongs to — the
+    // greatest landmark at/above it, or `Headers` when it's in the inline header
+    // block (above the first landmark).
+    let anchor_of_line = |l2: usize| match first_landmark {
+        Some(fl) if l2 >= fl => landmarks
+            .iter()
+            .rev()
+            .find(|(l, _)| *l <= l2)
+            .map_or(CommentAnchor::Headers, |(_, a)| *a),
+        _ => CommentAnchor::Headers,
+    };
+
+    // A prose comment is anchored to the first structural line below it (so it
+    // precedes that block), or `Trailing` when nothing structural follows.
+    let anchor_for_comment = |line_no: usize| {
+        (line_no + 1..scan_end)
+            .find(|&l2| is_structural(l2))
+            .map_or(CommentAnchor::Trailing, anchor_of_line)
+    };
+
+    // Lines already claimed elsewhere: the `# [Reports]` block …
+    let reports_block = {
+        let to = scan_end.min(lines.len() + 1);
+        let marker =
+            (method_line..to).find(|&i| lines.get(i - 1).is_some_and(|l| is_reports_marker(l)));
+        marker.map_or(0..0, |m| {
+            let mut j = m + 1;
+            while j < to && lines.get(j - 1).and_then(|l| parse_report_row(l)).is_some() {
+                j += 1;
+            }
+            m..j
+        })
+    };
+    // … and the next entry's title block (the contiguous comment lines directly
+    // above the next entry's method line, which `title_from_span` will claim as
+    // that entry's title). Only when there *is* a next entry in the window.
+    let next_title = if scan_end <= lines.len() {
+        let mut top = scan_end;
+        let mut idx = scan_end - 1;
+        while idx >= method_line
+            && lines
+                .get(idx - 1)
+                .is_some_and(|l| l.trim().starts_with('#'))
+        {
+            top = idx;
+            idx -= 1;
+        }
+        top..scan_end
+    } else {
+        0..0
+    };
+
+    let mut out = Vec::new();
+
+    // File-leading comments above the very first entry (everything above this
+    // entry's own title block), kept as `Lead`.
+    if is_first {
+        let mut title_top = method_line;
+        let mut idx = method_line.wrapping_sub(1);
+        while idx >= 1
+            && lines
+                .get(idx - 1)
+                .is_some_and(|l| l.trim().starts_with('#'))
+        {
+            title_top = idx;
+            idx -= 1;
+        }
+        for ln in 1..title_top {
+            if let Some(t) = lines
+                .get(ln - 1)
+                .map(|l| l.trim())
+                .filter(|t| t.starts_with('#'))
+            {
+                out.push(EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: t.to_string(),
+                });
+            }
+        }
+    }
+
+    for line_no in method_line..scan_end.min(lines.len() + 1) {
+        let Some(t) = lines.get(line_no - 1).map(|l| l.trim()) else {
+            break;
+        };
+        if !t.starts_with('#')
+            || in_body(line_no)
+            || is_disabled_row(line_no)
+            || reports_block.contains(&line_no)
+            || next_title.contains(&line_no)
+        {
+            continue;
+        }
+        out.push(EntryComment {
+            anchor: anchor_for_comment(line_no),
+            text: t.to_string(),
+        });
+    }
+    out
+}
+
+/// Scan a block of `key: value` request-section rows starting at 1-based line
+/// `start`, returning each as a `(key, value, enabled)` triple. A row commented
+/// out with a leading `#` comes back as a disabled entry — this is how
+/// [`to_hurl`](super::entry::HurlEntry::to_hurl) round-trips disabled Header,
+/// Cookies and Query rows, which `hurl_core` drops as comments before they ever
+/// reach the AST.
+///
+/// `end` is the block's exclusive upper bound — the next structural anchor
+/// below it (body / section / response), from [`first_anchor_after`]. It drives
+/// two scan modes that together match `hurl_core` without ever reading rows
+/// from the *next* request:
+///
+/// * **Bounded** (`Some(end)`): scan the half-open window `[start, end)`,
+///   collecting every `key: value` row and *skipping* blank lines and prose
+///   comments in between (including any leading ones, right after the request
+///   or section header). This mirrors `hurl_core`, which tolerates blank and
+///   comment lines interspersed among headers/section rows. Because `end` is an
+///   anchor strictly inside this entry, the window can't reach the next one.
+///
+/// * **Open** (`None`): a request with no body, section or response (or its
+///   last trailing section) has no anchor below it, so there's nothing bounding
+///   the window from the following entry. Here the scan stops at the *first*
+///   non-row line — including a leading blank line — so it halts at the blank
+///   that separates this entry from the next rather than skipping across it and
+///   absorbing that entry's leading comments/title as stray rows.
+fn scan_kv_rows(lines: &[&str], start: usize, end: Option<usize>) -> Vec<(String, String, bool)> {
     let mut rows = Vec::new();
     let mut i = start.saturating_sub(1);
-    while let Some(&line) = lines.get(i) {
+    let limit = end.map(|e| e.saturating_sub(1)).unwrap_or(lines.len());
+    while i < limit {
+        let Some(&line) = lines.get(i) else { break };
         match parse_kv_row(line) {
             Some(row) => rows.push(row),
+            // Bounded: skip a blank/prose line (leading or interior) and keep
+            // scanning — the anchor keeps us inside this entry. Open: stop, so
+            // we never cross into the next request's leading comments.
+            None if end.is_some() => {}
             None => break,
         }
         i += 1;
@@ -254,6 +570,7 @@ fn form_fields_from_section(
     parts: Option<&[MultipartParam]>,
     lines: &[&str],
     rows_start: usize,
+    rows_end: Option<usize>,
 ) -> Vec<FormField> {
     let mut rows: Vec<(usize, FormField)> = Vec::new();
     if let Some(parts) = parts {
@@ -275,7 +592,7 @@ fn form_fields_from_section(
             ));
         }
     }
-    rows.extend(scan_disabled_form_rows(lines, rows_start));
+    rows.extend(scan_disabled_form_rows(lines, rows_start, rows_end));
     rows.sort_by_key(|(line, _)| *line);
     rows.into_iter().map(|(_, f)| f).collect()
 }
@@ -290,18 +607,28 @@ fn multipart_param_line(p: &MultipartParam) -> usize {
 
 /// Walk a `[Form]`/`[Multipart]` section from `start`, collecting the
 /// `(line, field)` for each **disabled** (`# …`) row. Enabled rows are stepped
-/// over (they come from the AST); the walk stops at the section's end (a blank
-/// line, a following `[Section]`/`HTTP` line, or a prose comment).
+/// over (they come from the AST). `end` is the section's exclusive upper bound
+/// (the next structural anchor, from [`first_anchor_after`]) and drives the same
+/// two scan modes as [`scan_kv_rows`]: **bounded** (`Some`) skips interior
+/// blanks and prose within `[start, end)`; **open** (`None`, a trailing section
+/// with nothing below it) skips only leading blanks and then stops at the first
+/// non-row line, so the walk never runs into the following request.
 ///
 /// Disabled rows are parsed as file-capable regardless of the section type:
 /// a disabled `File`/`Base64File` field is always serialized with the
 /// `file,…` syntax (even inside an otherwise text-only `[Form]`, since the
 /// section type is chosen from the enabled fields alone), so parsing it back
 /// as a file is what restores its original kind.
-fn scan_disabled_form_rows(lines: &[&str], start: usize) -> Vec<(usize, FormField)> {
+fn scan_disabled_form_rows(
+    lines: &[&str],
+    start: usize,
+    end: Option<usize>,
+) -> Vec<(usize, FormField)> {
     let mut out = Vec::new();
     let mut i = start.saturating_sub(1);
-    while let Some(&line) = lines.get(i) {
+    let limit = end.map(|e| e.saturating_sub(1)).unwrap_or(lines.len());
+    while i < limit {
+        let Some(&line) = lines.get(i) else { break };
         let (enabled, rest) = uncomment(line);
         match parse_form_field_line(rest, true) {
             Some(mut field) if !enabled => {
@@ -310,7 +637,9 @@ fn scan_disabled_form_rows(lines: &[&str], start: usize) -> Vec<(usize, FormFiel
             }
             // An enabled row (already captured from the AST): step over it.
             Some(_) => {}
-            // Blank line, next section, or prose comment: end of the rows.
+            // Bounded: skip a blank/prose line (leading or interior) and keep
+            // scanning. Open: stop, so the walk can't reach the next request.
+            None if end.is_some() => {}
             None => break,
         }
         i += 1;
@@ -630,6 +959,196 @@ mod tests {
         assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
         assert_eq!(e[1].method, "GET");
         assert!(e[1].body.is_none());
+    }
+
+    #[test]
+    fn blank_line_before_headers_does_not_drop_them() {
+        // Hurl allows a blank line between the request line and the header
+        // block; hurl_core parses the headers, but PaperBoy's source-scan used
+        // to read that first blank line as "no headers". The scan must skip the
+        // leading blank line(s) and still recover every header.
+        let content = "# Get token\nPOST {{ URL }}/oauth2\n\nContent-Length: 0\nUser-Agent: crabman/0.1.0\nAccept: */*\nclient_id: {{ CLIENT_ID }}\n\nHTTP 200\n[Captures]\naccess_token: jsonpath \"$.token\"\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].headers,
+            vec![
+                ("Content-Length".into(), "0".into(), true),
+                ("User-Agent".into(), "crabman/0.1.0".into(), true),
+                ("Accept".into(), "*/*".into(), true),
+                ("client_id".into(), "{{ CLIENT_ID }}".into(), true),
+            ],
+            "a blank line after the request line must not drop the headers"
+        );
+    }
+
+    #[test]
+    fn blank_line_before_headers_without_body_leaves_headers_intact() {
+        // The no-body variant: skipping the leading blank must not run off into
+        // the response line and invent rows either.
+        let content = "GET http://h/x\n\nAccept: application/json\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].headers,
+            vec![("Accept".into(), "application/json".into(), true)]
+        );
+        assert!(e[0].body.is_none());
+    }
+
+    #[test]
+    fn blank_line_before_json_body_with_no_headers_stays_empty() {
+        // No headers, a blank line, then a JSON body: skipping the leading blank
+        // must not misread the body's first line as a header row.
+        let content = "POST http://h/x\n\n{\n  \"k\": \"v\"\n}\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].headers.is_empty(), "the JSON body is not a header");
+        assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
+    }
+
+    #[test]
+    fn blank_line_after_section_header_keeps_rows() {
+        // The same blank-line tolerance must apply to the `[Cookies]` and
+        // `[QueryStringParams]` sections, which share the source-scan helper.
+        let content = "GET http://h/x\n[QueryStringParams]\n\npage: 1\nsize: 20\n[Cookies]\n\ntheme: dark\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].queries,
+            vec![
+                ("page".into(), "1".into(), true),
+                ("size".into(), "20".into(), true),
+            ]
+        );
+        assert_eq!(e[0].cookies, vec![("theme".into(), "dark".into(), true)]);
+    }
+
+    #[test]
+    fn blank_and_comment_lines_between_headers_are_tolerated() {
+        // hurl_core keeps headers separated by interior blank lines and prose
+        // comments; the bounded scan (up to the HTTP line) must match it.
+        let content = "GET http://h/x\nAccept: 1\n\n# a prose note\nContent-Type: 2\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].headers,
+            vec![
+                ("Accept".into(), "1".into(), true),
+                ("Content-Type".into(), "2".into(), true),
+            ],
+            "an interior blank + prose comment must not truncate the header block"
+        );
+    }
+
+    #[test]
+    fn comment_before_first_header_is_skipped() {
+        let content = "GET http://h/x\n# leading note\nAccept: 1\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].headers, vec![("Accept".into(), "1".into(), true)]);
+    }
+
+    #[test]
+    fn trailing_and_all_disabled_headers_before_http_are_recovered() {
+        // Disabled rows kept as `# key: value` comments sit between the enabled
+        // headers and the HTTP line. hurl_core excludes them from the request's
+        // source span, so the scan must bound the block by the HTTP line, not by
+        // that span, or these rows would be silently dropped.
+        let trailing = "GET http://h/x\nAccept: 1\n# X-Debug: on\nHTTP 200\n";
+        let e = parse_hurl(trailing);
+        assert_eq!(
+            e[0].headers,
+            vec![
+                ("Accept".into(), "1".into(), true),
+                ("X-Debug".into(), "on".into(), false),
+            ]
+        );
+
+        let all_disabled = "GET http://h/x\n# A: 1\n# B: 2\nHTTP 200\n";
+        let e = parse_hurl(all_disabled);
+        assert_eq!(
+            e[0].headers,
+            vec![
+                ("A".into(), "1".into(), false),
+                ("B".into(), "2".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_header_scan_never_bleeds_into_the_next_request() {
+        // A request with no body/section/response has no structural anchor below
+        // its headers, so the scan runs in "open" mode: it must stop at the
+        // blank line separating it from the next entry and must NOT absorb that
+        // entry's banner as a disabled header of the first one.
+        let content = "GET http://h/a\nAccept: 1\n\n# X-Not-Mine: v\nGET http://h/b\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 2);
+        assert_eq!(
+            e[0].headers,
+            vec![("Accept".into(), "1".into(), true)],
+            "the second entry's banner must not leak into the first entry's headers"
+        );
+    }
+
+    #[test]
+    fn open_mode_zero_header_request_does_not_absorb_next_entrys_comment() {
+        // Regression: an entry with NO headers, body, section or response scans
+        // in open mode starting at the blank separator line. It must stop at
+        // that blank rather than skipping it and reading the following entry's
+        // leading `# key: value`-shaped comment as a disabled header of its own.
+        let content =
+            "GET http://api/health\n\n# TODO: fix auth below\nPOST http://api/login\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 2);
+        assert!(
+            e[0].headers.is_empty(),
+            "a zero-header request must not absorb the next entry's comment: {:?}",
+            e[0].headers
+        );
+    }
+
+    #[test]
+    fn all_disabled_and_trailing_section_rows_before_http_are_recovered() {
+        // The same anchor-bounded recovery must hold for `[QueryStringParams]`
+        // and `[Cookies]`: rows (including all-disabled ones) between the
+        // section header and the HTTP line survive.
+        let content = "GET http://h/x\n[QueryStringParams]\n# a: 1\n# b: 2\n[Cookies]\ntheme: dark\n# hidden: y\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].queries,
+            vec![
+                ("a".into(), "1".into(), false),
+                ("b".into(), "2".into(), false),
+            ]
+        );
+        assert_eq!(
+            e[0].cookies,
+            vec![
+                ("theme".into(), "dark".into(), true),
+                ("hidden".into(), "y".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_line_after_form_header_keeps_disabled_rows() {
+        // A `[Form]` with an enabled row (from the AST) and a disabled row
+        // recovered by scanning, separated from the header by a blank line.
+        let content = "POST http://h/x\n[Form]\n\nname: alice\n# nickname: al\nHTTP 200\n";
+        let e = parse_hurl(content);
+        assert_eq!(e.len(), 1);
+        let fields: Vec<(String, bool)> = e[0]
+            .form_fields
+            .iter()
+            .map(|f| (f.key.clone(), f.enabled))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("name".into(), true), ("nickname".into(), false)]
+        );
     }
 
     #[test]
@@ -1132,5 +1651,210 @@ mod tests {
         );
         let reparsed = parse_hurl(&text);
         assert_eq!(reparsed[0].form_fields, entry.form_fields);
+    }
+
+    // A parse → serialize → parse cycle that must reproduce the same comments.
+    fn assert_comments_round_trip(src: &str) -> Vec<HurlEntry> {
+        let first = parse_hurl(src);
+        let text = collection_to_hurl(&first);
+        let second = parse_hurl(&text);
+        let c1: Vec<_> = first.iter().map(|e| e.comments.clone()).collect();
+        let c2: Vec<_> = second.iter().map(|e| e.comments.clone()).collect();
+        assert_eq!(
+            c1, c2,
+            "comments must be stable across a round trip\n--- serialized ---\n{text}"
+        );
+        second
+    }
+
+    #[test]
+    fn a_comment_before_asserts_round_trips_before_asserts() {
+        let src = "GET http://h/a\nHTTP 200\n# validate the token\n[Asserts]\njsonpath \"$.token\" exists\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Asserts,
+                text: "# validate the token".into(),
+            }]
+        );
+        let text = e[0].to_hurl();
+        assert!(
+            text.contains("# validate the token\n[Asserts]"),
+            "the comment must stay directly before [Asserts]:\n{text}"
+        );
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_prose_comment_in_the_header_region_is_kept_and_anchored_to_headers() {
+        let src = "POST http://h/a\n# auth headers below\nAuthorization: Bearer x\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Headers,
+                text: "# auth headers below".into(),
+            }]
+        );
+        // The enabled header still loads (the comment isn't mistaken for one).
+        assert_eq!(
+            e[0].headers,
+            vec![("Authorization".into(), "Bearer x".into(), true)]
+        );
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_prose_comment_and_a_disabled_row_coexist_without_duplication() {
+        // `# X-Debug: 1` is a disabled header (kv-shaped); `# just a note` is
+        // prose. Neither should swallow or duplicate the other.
+        let src = "GET http://h/a\n# X-Debug: 1\n# just a note\nAccept: 1\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].headers,
+            vec![
+                ("X-Debug".into(), "1".into(), false),
+                ("Accept".into(), "1".into(), true),
+            ]
+        );
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Headers,
+                text: "# just a note".into(),
+            }]
+        );
+        let entries = assert_comments_round_trip(src);
+        // The disabled row survives exactly once (not also captured as prose).
+        let text = collection_to_hurl(&entries);
+        assert_eq!(text.matches("# X-Debug: 1").count(), 1, "{text}");
+        assert_eq!(text.matches("# just a note").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_reports_block_is_not_re_captured_as_prose() {
+        let src = "GET http://h/a\nHTTP 200\n# [Reports]\n# total: jsonpath \"$.total\"\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].reports,
+            vec![("total".into(), "jsonpath \"$.total\"".into())]
+        );
+        assert!(
+            e[0].comments.is_empty(),
+            "the reports block must not leak into prose comments: {:?}",
+            e[0].comments
+        );
+        // And it isn't duplicated on re-emit.
+        let text = e[0].to_hurl();
+        assert_eq!(text.matches("# [Reports]").count(), 1, "{text}");
+        assert_eq!(text.matches("# total:").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_banner_and_extra_leading_prose_round_trip() {
+        // The contiguous block above the method line is the title; a separate
+        // banner higher up (above the first entry) is kept as a Lead comment.
+        let src = "#####\n# File header\n#####\n\n# Get token\nGET http://h/a\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].title, "Get token");
+        assert_eq!(
+            e[0].comments,
+            vec![
+                EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: "#####".into()
+                },
+                EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: "# File header".into()
+                },
+                EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: "#####".into()
+                },
+            ]
+        );
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_trailing_comment_round_trips_at_the_end() {
+        let src = "GET http://h/a\nHTTP 200\n[Asserts]\njsonpath \"$.x\" == 1\n# checked above\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Trailing,
+                text: "# checked above".into(),
+            }]
+        );
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_comment_between_two_entries_is_kept_and_does_not_cross_over() {
+        let src = "GET http://h/a\nHTTP 200\n# note about the first request\n\n# Second\nPOST http://h/b\nHTTP 201\n";
+        let e = parse_hurl(src);
+        assert_eq!(e.len(), 2);
+        // The note stays with entry 0 (as a trailing comment); entry 1 keeps its
+        // title and gains no stray comments.
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Trailing,
+                text: "# note about the first request".into(),
+            }]
+        );
+        assert_eq!(e[1].title, "Second");
+        assert!(e[1].comments.is_empty(), "{:?}", e[1].comments);
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_hash_line_inside_a_multiline_body_is_not_captured_as_a_comment() {
+        let src = "POST http://h/a\n```\n# not a comment, this is body text\n```\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert!(
+            e[0].comments.is_empty(),
+            "multiline body content must not be captured as prose: {:?}",
+            e[0].comments
+        );
+        assert!(
+            e[0].body
+                .as_deref()
+                .unwrap_or_default()
+                .contains("# not a comment"),
+            "the body must still contain the # line: {:?}",
+            e[0].body
+        );
+    }
+
+    #[test]
+    fn a_comment_only_entry_keeps_its_comment_without_bleeding_into_the_next() {
+        // The reviewer's bleed case, now viewed through comment recovery: a
+        // comment glued directly above the next method line (blank above it) is
+        // that entry's *title* by PaperBoy's convention, so it stays with
+        // entry 1 and must never be absorbed into entry 0's headers or prose.
+        let src = "GET http://h/a\n\n# a floating note\nPOST http://h/b\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(e.len(), 2);
+        assert!(e[0].headers.is_empty());
+        assert!(e[0].comments.is_empty(), "{:?}", e[0].comments);
+        assert_eq!(e[1].title, "a floating note");
+        assert!(e[1].comments.is_empty(), "{:?}", e[1].comments);
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn comments_survive_a_full_document_round_trip_unchanged() {
+        // A dense mix: Lead banner, title, header-region prose, an inter-header
+        // disabled row, a section comment, a response comment and a trailing
+        // comment — all in one entry — must be byte-identical after two trips.
+        let src = "# top of file\n\n# Login\nPOST http://h/login\n# creds below\nContent-Type: json\n[Cookies]\n# the session cookie\nsid: abc\nHTTP 200\n# then assert\n[Asserts]\njsonpath \"$.ok\" == true\n# done\n";
+        let once = collection_to_hurl(&parse_hurl(src));
+        let twice = collection_to_hurl(&parse_hurl(&once));
+        assert_eq!(once, twice, "round trip must be idempotent:\n{once}");
+        assert_comments_round_trip(src);
     }
 }

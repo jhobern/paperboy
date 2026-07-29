@@ -566,6 +566,9 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),
+        // A transient copy that's only executed, never serialized — comments
+        // don't affect the run.
+        comments: Vec::new(),
         user_added: base.user_added,
         modified: base.modified,
         last_run: base.last_run,

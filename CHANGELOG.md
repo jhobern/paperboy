@@ -628,13 +628,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   its own, as before.
 
 - **Headers separated from the request line by a blank line are no longer
-  dropped on load.** Hurl permits a blank line between a request's method/URL
-  line and its header block (and, likewise, between a `[Section]` header and its
-  rows). PaperBoy's source-scan treated that first blank line as "no headers",
-  so a `.hurl` file whose request looked like `POST …` / blank line / headers
-  loaded with every header silently gone. The scan now skips leading blank lines
-  before the header block; the same fix hardens the `[QueryStringParams]`,
-  `[Cookies]`, `[Form]` and `[Multipart]` scans, which share the behaviour.
+  dropped on load.** Hurl permits blank lines — and prose comment lines —
+  between a request's method/URL line and its header block, and between header
+  rows (likewise for the `[QueryStringParams]`, `[Cookies]`, `[Form]` and
+  `[Multipart]` sections). PaperBoy's source-scan treated the first such line as
+  "end of block", so a `.hurl` file whose request looked like `POST …` / blank
+  line / headers loaded with every header silently gone. The scan now matches
+  `hurl_core`: it skips leading and interior blank/comment lines within a block,
+  bounding each block by the next structural anchor (the body, the following
+  section, or the response's `HTTP` line) so trailing and fully commented-out
+  (disabled) rows are still recovered. When a request has no such anchor below
+  its headers (no body, section or response), the scan stops at the blank line
+  separating it from the next request, so one entry can never absorb the
+  following entry's title/banner as a stray header.
+
+- **Prose comments in `.hurl` files are no longer silently discarded on load.**
+  Free-standing comment lines (banners, section notes, anything that isn't a
+  request title, a disabled `# key: value` row, or the `# [Reports]` block) used
+  to vanish the first time PaperBoy parsed a collection, so saving the file back
+  or opening it in the raw editor lost them. They now round-trip: each comment
+  is anchored to the nearest structural block (the header block, body,
+  `[Cookies]`/`[Query]`/`[Form]` section, the response, `[Asserts]`,
+  `[Captures]`, a file-leading banner, or the end of the entry) and re-emitted
+  in that position. This matters for the `[Reports]` feature, which works by
+  injecting comments into the `.hurl` file, and for the raw editor, which now
+  shows the comments it did before.
 
 - **Copying no longer makes the clipboard helper flicker in the app bar.** On
   Wayland/X11 the background `wl-copy`/`xclip` helper PaperBoy forks to own the
