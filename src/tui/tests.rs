@@ -13299,12 +13299,13 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
     let dir = workspace_temp_dir("ws_accordion");
     let (mut app, ci) = workspace_app(&dir);
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    let alpha = dir.join("alpha.hurl");
     app.focus = Pane::List;
 
     // The `alpha.hurl` collection row sits at index 1 (after `sub/`).
     app.collections[ci].list_cursor = 1;
     app.on_enter();
-    assert!(app.collections[ci].workspace_collapsed);
+    assert!(!app.collections[ci].workspace_expanded.contains(&alpha));
     let rows = app.collections[ci].ws_rows();
     assert!(
         !rows.iter().any(|r| matches!(r, WsRow::Request { .. })),
@@ -13315,7 +13316,7 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
     // Enter again on the same row re-expands it.
     app.collections[ci].list_cursor = 1;
     app.on_enter();
-    assert!(!app.collections[ci].workspace_collapsed);
+    assert!(app.collections[ci].workspace_expanded.contains(&alpha));
     assert!(
         app.collections[ci]
             .ws_rows()
@@ -13466,7 +13467,8 @@ fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
     app.focus = Pane::List;
 
     // Collapse the open `alpha.hurl` (row index 1), then Right re-expands it.
-    app.collections[ci].workspace_collapsed = true;
+    let alpha = dir.join("alpha.hurl");
+    app.collections[ci].workspace_expanded.remove(&alpha);
     let alpha_row = app.collections[ci]
         .ws_rows()
         .iter()
@@ -13475,7 +13477,7 @@ fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
     app.collections[ci].list_cursor = alpha_row;
     press(&mut app, KeyCode::Right);
     assert!(
-        !app.collections[ci].workspace_collapsed,
+        app.collections[ci].workspace_expanded.contains(&alpha),
         "Right on the collapsed loaded collection expands it"
     );
     assert!(
@@ -13735,6 +13737,379 @@ fn workspace_expanded_set_survives_persistence_round_trip() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = HashSet::<std::path::PathBuf>::new(); // suppress unused import hint
+}
+
+/// A workspace with two root-level collection files, each holding two titled
+/// requests — used to exercise inline listing of *several* collections' request
+/// names in the tree at once.
+fn workspace_temp_dir_two_collections(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("one.hurl"),
+        "# Login\nGET https://example.com/login\n\n# Logout\nGET https://example.com/logout\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("two.hurl"),
+        "# Search\nGET https://example.com/search\n\n# Detail\nGET https://example.com/detail\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Names of the `WsRow::Request` rows for a given collection path, tagged with
+/// whether the row is `loaded` (drawn from live entries) or listed from cache.
+fn ws_request_names(app: &TuiApp, ci: usize, collection: &std::path::Path) -> Vec<(String, bool)> {
+    use crate::collection::WsRow;
+    app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .filter_map(|r| match r {
+            WsRow::Request {
+                collection: c,
+                name,
+                loaded,
+                ..
+            } if c == collection => Some((name, loaded)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Loading a second collection while the first is left expanded lists BOTH
+/// collections' request names at once: the loaded one from its live entries,
+/// the other from the cached names snapshotted when it was switched away.
+#[test]
+fn two_expanded_collections_both_list_their_request_names() {
+    let dir = workspace_temp_dir_two_collections("ws_two_cols");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Load one.hurl (auto-expands + becomes loaded), then two.hurl. one.hurl
+    // stays in the expanded set, now listing from cache; two.hurl is loaded.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+
+    assert!(app.collections[ci].workspace_expanded.contains(&one));
+    assert!(app.collections[ci].workspace_expanded.contains(&two));
+
+    let one_rows = ws_request_names(&app, ci, &one);
+    assert_eq!(
+        one_rows,
+        vec![("Login".to_string(), false), ("Logout".to_string(), false),],
+        "the not-loaded collection lists its request names from cache"
+    );
+
+    let two_rows = ws_request_names(&app, ci, &two);
+    assert_eq!(
+        two_rows,
+        vec![("Search".to_string(), true), ("Detail".to_string(), true),],
+        "the loaded collection lists its requests from live entries"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A collection expanded but never loaded this session lists its request names
+/// straight from disk once `rebuild_expanded_titles` populates the cache — the
+/// path used by persistence restore.
+#[test]
+fn a_never_loaded_expanded_collection_lists_names_from_disk() {
+    let dir = workspace_temp_dir_two_collections("ws_from_disk");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+
+    // Mark one.hurl expanded WITHOUT loading it, then rebuild the cache from
+    // disk (exactly what persistence restore does).
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    let rows = ws_request_names(&app, ci, &one);
+    assert_eq!(
+        rows,
+        vec![("Login".to_string(), false), ("Logout".to_string(), false),],
+        "a never-loaded expanded collection lists names read from disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enter on a request of an expanded-but-not-loaded collection loads that
+/// collection and lands the selection on that very request.
+#[test]
+fn entering_a_not_loaded_collections_request_loads_it_and_selects_that_request() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_enter_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Both expanded; two.hurl is the loaded one, so one.hurl's requests are the
+    // not-loaded rows.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Land the cursor on one.hurl's SECOND request ("Logout", idx 1).
+    let target = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Request { collection, idx: 1, loaded: false, .. } if *collection == one))
+        .expect("Logout row of the not-loaded one.hurl");
+    app.collections[ci].list_cursor = target;
+    app.on_enter();
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(one.as_path()),
+        "Enter loaded the not-loaded collection"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "and landed on the request that was under the cursor"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Highlighting (not opening) a request of a not-loaded collection only
+/// previews its name — it must NOT switch the loaded collection or move the
+/// selection into it.
+#[test]
+fn highlighting_a_not_loaded_collections_request_does_not_load_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_preview_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Move the cursor onto the collection row, then Down onto its first
+    // request — the real key path runs the highlight/preview reconcile.
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Down);
+    assert!(
+        matches!(
+            app.collections[ci]
+                .ws_rows()
+                .into_iter()
+                .nth(app.collections[ci].list_cursor),
+            Some(WsRow::Request { loaded: false, .. })
+        ),
+        "cursor landed on a not-loaded request row"
+    );
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(two.as_path()),
+        "highlighting a not-loaded request leaves the loaded collection untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Left on an expanded, not-loaded collection collapses it (removes it from the
+/// expanded set and hides its request rows), mirroring folder collapse.
+#[test]
+fn left_collapses_an_expanded_not_loaded_collection() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_collapse_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Cursor on the one.hurl collection row (expanded, not loaded).
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Left);
+
+    assert!(
+        !app.collections[ci].workspace_expanded.contains(&one),
+        "Left collapsed the not-loaded collection"
+    );
+    assert!(
+        ws_request_names(&app, ci, &one).is_empty(),
+        "its request rows are hidden after collapse"
+    );
+    // The loaded collection is unaffected.
+    assert_eq!(app.collections[ci].path.as_deref(), Some(two.as_path()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An expanded collection restored from persisted state lists its request names
+/// after `rebuild_expanded_titles` — the tree survives a restart without the
+/// collection ever being reopened.
+#[test]
+fn expanded_collection_lists_names_after_persistence_restore() {
+    use crate::persistence::PersistedTab;
+
+    let dir = workspace_temp_dir_two_collections("ws_persist_names");
+    let one = dir.join("one.hurl");
+
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    col.workspace_expanded.insert(one.clone());
+
+    let tab = PersistedTab::from_collection(&col, None);
+    let json = serde_json::to_string(&tab).expect("serialise");
+    let tab2: PersistedTab = serde_json::from_str(&json).expect("deserialise");
+    let (restored, _pending) = tab2.into_collection(None);
+
+    assert!(restored.workspace_expanded.contains(&one));
+    let rows: Vec<String> = {
+        use crate::collection::WsRow;
+        restored
+            .ws_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                WsRow::Request {
+                    collection, name, ..
+                } if collection == one => Some(name),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows,
+        vec!["Login".to_string(), "Logout".to_string()],
+        "restore rebuilt the cached names so the expanded collection lists them"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right on a request of an expanded-but-not-loaded collection loads that
+/// collection and lands on that request, mirroring Enter.
+#[test]
+fn right_on_a_not_loaded_collections_request_loads_it_and_selects_that_request() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_right_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    let target = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Request { collection, idx: 1, loaded: false, .. } if *collection == one))
+        .expect("Logout row of the not-loaded one.hurl");
+    app.collections[ci].list_cursor = target;
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(app.collections[ci].path.as_deref(), Some(one.as_path()));
+    assert_eq!(app.collections[ci].selected_entry, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right on the title of a collection that was opened earlier but is no longer
+/// the loaded one (a different collection was opened since) refocuses it,
+/// making it the loaded collection again without collapsing it.
+#[test]
+fn right_on_an_open_but_not_loaded_collection_refocuses_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_refocus");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Open one.hurl, then two.hurl — two is now loaded, one stays expanded but
+    // is no longer the loaded collection.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+    assert_eq!(app.collections[ci].path.as_deref(), Some(two.as_path()));
+
+    // Cursor on one.hurl's (expanded, not-loaded) collection row.
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(one.as_path()),
+        "Right refocused the previously-opened collection"
+    );
+    // It stays expanded and its requests are now the loaded rows.
+    assert!(app.collections[ci].workspace_expanded.contains(&one));
+    assert!(
+        ws_request_names(&app, ci, &one)
+            .iter()
+            .all(|(_, loaded)| *loaded),
+        "its requests now render from live entries"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The loaded collection's name renders in the accent colour (so it's clear
+/// which collection the coloured requests belong to); other collections render
+/// dim, matching their dim request names.
+#[test]
+fn the_loaded_collection_name_is_accent_and_others_are_dim() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = workspace_temp_dir_two_collections("ws_focus_colour");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Both expanded; two.hurl is the loaded one.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.active_tab = ci;
+
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw::draw_collection_left(f, area, &app, ci, &s, &th);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+
+    assert_eq!(
+        fg_at_substr(buf, "two.hurl"),
+        Some(th.accent),
+        "the loaded collection's name is drawn in the accent colour"
+    );
+    assert_eq!(
+        fg_at_substr(buf, "one.hurl"),
+        Some(th.dim),
+        "a collection that isn't loaded is drawn dim"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

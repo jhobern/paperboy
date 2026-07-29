@@ -45,6 +45,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   set is saved in `state.json` under a new `workspace_expanded_paths` field;
   older state files without the field load cleanly with all folders collapsed.
 
+- **Workspace tree: expand a collection to list its requests inline.** Opening a
+  collection in the workspace tree now keeps its request names listed beneath it
+  until you collapse it, giving a clearer picture of the whole workspace.
+  Several collections can be expanded at once, and each collection's expanded
+  state persists across restarts alongside folders (same
+  `workspace_expanded_paths` set). **Right**/**Enter** on a collection loads and
+  expands it; **Left** or a second **Enter** collapses it. Requests of a
+  collection that isn't the loaded one are shown dim by name only; highlighting
+  one just previews its name, while **Enter**/**Right** loads that collection and
+  jumps straight to the highlighted request. The loaded collection's name is
+  drawn in the accent colour (and the others dim) so it's clear which collection
+  the coloured requests belong to.
+
 - **Dry-run preview now shows the real output grid.** Pressing `d` on a report
   opens the same column/row table the full run would produce — but with all
   HTTP-response fields blank because no request is sent. Loop bindings, variable
@@ -595,6 +608,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   self-explanatory.
 
 ### Fixed
+
+- **Headers separated from the request line by a blank line are no longer
+  dropped on load.** Hurl permits a blank line between a request's method/URL
+  line and its header block (and, likewise, between a `[Section]` header and its
+  rows). PaperBoy's source-scan treated that first blank line as "no headers",
+  so a `.hurl` file whose request looked like `POST …` / blank line / headers
+  loaded with every header silently gone. The scan now skips leading blank lines
+  before the header block; the same fix hardens the `[QueryStringParams]`,
+  `[Cookies]`, `[Form]` and `[Multipart]` scans, which share the behaviour.
 
 - **Copying no longer makes the clipboard helper flicker in the app bar.** On
   Wayland/X11 the background `wl-copy`/`xclip` helper PaperBoy forks to own the

@@ -143,6 +143,11 @@ enum LeftRow {
         name: String,
         depth: usize,
         open: bool,
+        /// True when this is the tab's currently-loaded collection — the one
+        /// whose requests render in full colour. Drawn in the accent colour so
+        /// it's visually obvious which collection the coloured requests belong
+        /// to; other collections (and their request names) render dim.
+        loaded: bool,
     },
     Report {
         name: String,
@@ -152,6 +157,13 @@ enum LeftRow {
         idx: usize,
         /// Indentation depth: 0 for non-workspace, collection-depth+1 for
         /// workspace requests.
+        depth: usize,
+    },
+    /// A request of an expanded but *not-loaded* workspace collection: only its
+    /// cached name is known (no entry to draw method/status from), so it renders
+    /// as a dim, name-only leaf. Opening it (Enter/Right) loads its collection.
+    WsRequestName {
+        name: String,
         depth: usize,
     },
 }
@@ -175,10 +187,32 @@ impl LeftRow {
                         expanded,
                     },
                     WsRow::Collection {
-                        name, depth, open, ..
-                    } => LeftRow::Collection { name, depth, open },
+                        path,
+                        name,
+                        depth,
+                        open,
+                    } => {
+                        let loaded = col.path.as_deref() == Some(path.as_path());
+                        LeftRow::Collection {
+                            name,
+                            depth,
+                            open,
+                            loaded,
+                        }
+                    }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
-                    WsRow::Request { idx, depth } => LeftRow::Entry { idx, depth },
+                    WsRow::Request {
+                        idx,
+                        depth,
+                        loaded: true,
+                        ..
+                    } => LeftRow::Entry { idx, depth },
+                    WsRow::Request {
+                        name,
+                        depth,
+                        loaded: false,
+                        ..
+                    } => LeftRow::WsRequestName { name, depth },
                 })
                 .collect()
         } else {
@@ -977,16 +1011,26 @@ pub(crate) fn draw_collection_left(
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 )))
             }
-            LeftRow::Collection { name, depth, open } => {
+            LeftRow::Collection {
+                name,
+                depth,
+                open,
+                loaded,
+            } => {
                 let indent = "  ".repeat(*depth);
                 let chevron = if *open {
                     COLLECTION_OPEN_ICON
                 } else {
                     COLLECTION_CLOSED_ICON
                 };
+                // The loaded collection (the one with coloured requests) is
+                // drawn in the accent colour so it clearly reads as the one in
+                // focus; every other collection recedes to dim, matching its
+                // dim request names.
+                let colour = if *loaded { th.accent } else { th.dim };
                 ListItem::new(Line::from(Span::styled(
                     format!("{indent}{chevron} {name}"),
-                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
                 )))
             }
             LeftRow::Report { name, depth } => {
@@ -994,6 +1038,16 @@ pub(crate) fn draw_collection_left(
                 ListItem::new(Line::from(Span::styled(
                     format!("{indent}{REPORT_ICON} {name}"),
                     Style::default().fg(th.accent),
+                )))
+            }
+            // A request of an expanded but not-loaded collection: dim, name only
+            // (its collection isn't loaded, so there's no method/status to show).
+            // The two-space pad lines the name up under the loaded rows' names.
+            LeftRow::WsRequestName { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}  {name}"),
+                    Style::default().fg(th.dim),
                 )))
             }
             LeftRow::Entry { idx, depth } => {

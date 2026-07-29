@@ -1076,15 +1076,39 @@ impl TuiApp {
                     }
                     // Already expanded: do nothing (use Left to collapse).
                     Some(crate::collection::WsRow::Folder { expanded: true, .. }) => {}
-                    Some(crate::collection::WsRow::Collection {
-                        path, open: false, ..
-                    }) => {
+                    // A collection row: (re)focus that collection. If it is
+                    // collapsed this also expands it; if it was opened earlier
+                    // but a *different* collection is now the loaded one, this
+                    // reloads and refocuses it; if it is already the loaded,
+                    // expanded collection this is a harmless no-op. Right never
+                    // collapses a collection (use Left or a second Enter).
+                    Some(crate::collection::WsRow::Collection { path, .. }) => {
                         if let Some(root) = self.collections[ci].workspace_root.clone() {
                             self.hide_embedded_report_for_root(&root);
                         }
                         self.activate_workspace_collection(ci, path);
                     }
-                    // The open collection or a request: scroll the URL.
+                    // A request of another (expanded but not loaded) collection:
+                    // Right loads that collection and lands on this request,
+                    // mirroring Enter. (Loading may be deferred by an
+                    // unsaved-edits prompt, in which case it lands on the first
+                    // request.)
+                    Some(crate::collection::WsRow::Request {
+                        collection,
+                        idx,
+                        loaded: false,
+                        ..
+                    }) => {
+                        self.open_workspace_collection(ci, collection.clone());
+                        if self.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                            let n = self.collections[ci].entries.len();
+                            self.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
+                            self.collections[ci].sync_folder_to_selected();
+                            self.collections[ci].sync_ws_cursor();
+                        }
+                    }
+                    // The expanded collection, or a request of the loaded
+                    // collection: scroll the URL.
                     _ => self.scroll_list_h(4),
                 }
             }
@@ -1345,8 +1369,9 @@ impl TuiApp {
         if !col.is_workspace() || col.workspace_root.is_none() {
             return;
         }
-        let Some(crate::collection::WsRow::Request { idx, .. }) =
-            col.ws_rows().into_iter().nth(col.list_cursor)
+        let Some(crate::collection::WsRow::Request {
+            idx, loaded: true, ..
+        }) = col.ws_rows().into_iter().nth(col.list_cursor)
         else {
             return;
         };
@@ -1466,8 +1491,16 @@ impl TuiApp {
                     self.hide_embedded_report_for_root(&root);
                 }
                 if open {
-                    // The open collection's own row collapses the accordion.
-                    self.collections[ci].workspace_collapsed = true;
+                    // Enter on an expanded collection collapses it (hides its
+                    // request names), mirroring folders; the file may still be
+                    // the loaded one — collapsing only hides the tree rows.
+                    self.collections[ci].workspace_expanded.remove(&path);
+                    let len = self.collections[ci].ws_rows().len();
+                    if self.collections[ci].list_cursor >= len {
+                        self.collections[ci].list_cursor = len.saturating_sub(1);
+                    }
+                    self.workspace_select_highlighted(ci);
+                    self.save_state();
                 } else {
                     self.activate_workspace_collection(ci, path);
                 }
@@ -1482,26 +1515,51 @@ impl TuiApp {
                     self.focus = Pane::Main;
                 }
             }
-            crate::collection::WsRow::Request { .. } => {
-                self.focus = Pane::Main;
-                self.open_edit_request_wizard(ci);
+            crate::collection::WsRow::Request {
+                collection,
+                idx,
+                loaded,
+                ..
+            } => {
+                if loaded {
+                    // A request of the loaded collection: edit it, as before.
+                    self.focus = Pane::Main;
+                    self.open_edit_request_wizard(ci);
+                } else {
+                    // A request of another (expanded but not loaded) collection:
+                    // load that collection and land on this request. A second
+                    // Enter then edits it. If loading is deferred by an
+                    // unsaved-edits prompt, we land on the first request instead.
+                    self.open_workspace_collection(ci, collection.clone());
+                    if self.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                        let n = self.collections[ci].entries.len();
+                        self.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
+                        self.collections[ci].sync_folder_to_selected();
+                        self.collections[ci].sync_ws_cursor();
+                    }
+                }
             }
         }
     }
 
     /// Reconcile a Workspace tab's right pane with whichever tree row is
     /// currently highlighted — highlighting *is* selecting, exactly as for
-    /// requests. A request row points `selected_entry` at it (the request shows
-    /// in the pane); a report row shows that report embedded in the pane (loaded
-    /// once, then retained); every other row (collection/folder) returns the
-    /// pane to the request/response view. Focus stays on the tree throughout.
-    /// Called on every cursor move within the tree and after expand/collapse.
+    /// requests. A request row of the *loaded* collection points `selected_entry`
+    /// at it (the request shows in the pane); a request of another expanded
+    /// collection is only previewed by name (loading is deferred to Enter/Right,
+    /// so the pane is left alone); a report row shows that report embedded in the
+    /// pane (loaded once, then retained); every other row (collection/folder)
+    /// returns the pane to the request/response view. Focus stays on the tree
+    /// throughout. Called on every cursor move within the tree and after
+    /// expand/collapse.
     fn workspace_select_highlighted(&mut self, ci: usize) {
         let cursor = self.collections[ci].list_cursor;
         let row = self.collections[ci].ws_rows().into_iter().nth(cursor);
         let root = self.collections[ci].workspace_root.clone();
         match row {
-            Some(crate::collection::WsRow::Request { idx, .. }) => {
+            Some(crate::collection::WsRow::Request {
+                idx, loaded: true, ..
+            }) => {
                 self.collections[ci].selected_entry = idx;
                 if let Some(root) = root {
                     self.hide_embedded_report_for_root(&root);
@@ -1522,8 +1580,9 @@ impl TuiApp {
 
     /// Handle Left on a Workspace tab's file-tree list row.
     ///
-    /// - Expanded folder → collapse it (cursor stays on the folder row).
-    /// - Collapsed folder, collection, report, or request → move the cursor to
+    /// - Expanded folder or expanded collection → collapse it (cursor stays on
+    ///   the row).
+    /// - Collapsed folder/collection, report, or request → move the cursor to
     ///   the nearest preceding row whose depth is one less than the current
     ///   row's depth (the "parent" in the tree hierarchy).  Root-level items
     ///   (depth 0) have no parent, so nothing happens.
@@ -1544,39 +1603,45 @@ impl TuiApp {
             }
         }
 
-        match row {
+        // An expanded folder or collection collapses in place; the path is the
+        // key removed from `workspace_expanded` in both cases.
+        let expanded_path = match row {
             crate::collection::WsRow::Folder {
                 path,
                 expanded: true,
                 ..
-            } => {
-                // Collapse the expanded folder; cursor stays on it.
-                let path = path.clone();
-                self.collections[ci].workspace_expanded.remove(&path);
-                // The fold may have consumed visible rows below: clamp cursor.
-                let len = self.collections[ci].ws_rows().len();
-                if self.collections[ci].list_cursor >= len {
-                    self.collections[ci].list_cursor = len.saturating_sub(1);
-                }
-                self.workspace_select_highlighted(ci);
-                self.save_state();
             }
-            row => {
-                // Navigate to the parent: the nearest preceding row whose
-                // depth is current_depth - 1.  Root-level items (depth 0)
-                // have no parent; do nothing in that case.
-                let depth = row_depth(row);
-                if depth == 0 {
-                    return;
-                }
-                let parent_depth = depth - 1;
-                if let Some(parent_idx) = rows[..cursor]
-                    .iter()
-                    .rposition(|r| row_depth(r) == parent_depth)
-                {
-                    self.collections[ci].list_cursor = parent_idx;
-                    self.workspace_select_highlighted(ci);
-                }
+            | crate::collection::WsRow::Collection {
+                path, open: true, ..
+            } => Some(path.clone()),
+            _ => None,
+        };
+
+        if let Some(path) = expanded_path {
+            // Collapse the expanded node; cursor stays on it.
+            self.collections[ci].workspace_expanded.remove(&path);
+            // The fold may have consumed visible rows below: clamp cursor.
+            let len = self.collections[ci].ws_rows().len();
+            if self.collections[ci].list_cursor >= len {
+                self.collections[ci].list_cursor = len.saturating_sub(1);
+            }
+            self.workspace_select_highlighted(ci);
+            self.save_state();
+        } else {
+            // Navigate to the parent: the nearest preceding row whose depth is
+            // current_depth - 1.  Root-level items (depth 0) have no parent; do
+            // nothing in that case.
+            let depth = row_depth(row);
+            if depth == 0 {
+                return;
+            }
+            let parent_depth = depth - 1;
+            if let Some(parent_idx) = rows[..cursor]
+                .iter()
+                .rposition(|r| row_depth(r) == parent_depth)
+            {
+                self.collections[ci].list_cursor = parent_idx;
+                self.workspace_select_highlighted(ci);
             }
         }
     }
@@ -1587,8 +1652,10 @@ impl TuiApp {
     /// loading replaces its entries wholesale).
     fn activate_workspace_collection(&mut self, ci: usize, path: PathBuf) {
         if self.collections[ci].path.as_deref() == Some(path.as_path()) {
-            self.collections[ci].workspace_collapsed = false;
+            // Already the loaded file: just re-expand it so its requests show.
+            self.collections[ci].workspace_expanded.insert(path);
             self.collections[ci].sync_ws_cursor();
+            self.save_state();
         } else {
             self.open_workspace_collection(ci, path);
         }

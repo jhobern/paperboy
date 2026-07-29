@@ -2110,6 +2110,10 @@ impl TuiApp {
             Ok(content) => {
                 let entries = crate::postman::parse_collection(&content);
                 if let Some(col) = self.collections.get_mut(collection_idx) {
+                    // Cache the outgoing file's request names first, so if it was
+                    // left expanded it keeps listing its requests from the cache
+                    // once it is no longer the loaded file.
+                    col.snapshot_loaded_titles();
                     col.entries = entries;
                     col.selected_entry = 0;
                     col.path = Some(path);

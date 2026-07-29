@@ -324,6 +324,10 @@ impl PersistedTab {
         // Ensure the loaded file's ancestor folders are expanded so it is
         // immediately visible, then position the cursor on it.
         c.expand_ancestors_for_path();
+        // Collections that were left expanded last session must list their
+        // requests without having been opened yet this session — read their
+        // names from disk into the cache.
+        c.rebuild_expanded_titles();
         c.sync_ws_cursor();
         (c, pending_reload)
     }
