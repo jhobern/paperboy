@@ -121,14 +121,39 @@ pub(crate) const REPORT_ICON: &str = "\u{1F4CA}"; // 📊
 
 /// A rendered row of the request list, unifying the ordinary title-folder
 /// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
-/// [`draw_collection_left`] can lay both out with one loop. `Entry.indent`
-/// nudges a Workspace request under its collection's file row.
+/// [`draw_collection_left`] can lay both out with one loop.
+///
+/// `WsFolder` is the workspace-specific folder variant (chevron + indented);
+/// `Folder` is the non-workspace virtual-folder variant (folder emoji, flat).
+/// `depth` on workspace rows drives `"  ".repeat(depth)` indentation in the
+/// rendered list.
 enum LeftRow {
     Up,
+    /// Non-workspace virtual folder (title-encoded); always flat, no expand
+    /// state, rendered with FOLDER_ICON.
     Folder(String),
-    Collection { name: String, open: bool },
-    Report { name: String },
-    Entry { idx: usize, indent: bool },
+    /// Workspace filesystem folder; indented by `depth * 2` spaces and
+    /// rendered with an expand/collapse chevron.
+    WsFolder {
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Collection {
+        name: String,
+        depth: usize,
+        open: bool,
+    },
+    Report {
+        name: String,
+        depth: usize,
+    },
+    Entry {
+        idx: usize,
+        /// Indentation depth: 0 for non-workspace, collection-depth+1 for
+        /// workspace requests.
+        depth: usize,
+    },
 }
 
 impl LeftRow {
@@ -139,11 +164,21 @@ impl LeftRow {
             col.ws_rows()
                 .into_iter()
                 .map(|r| match r {
-                    WsRow::Up => LeftRow::Up,
-                    WsRow::Folder(name) => LeftRow::Folder(name),
-                    WsRow::Collection { name, open, .. } => LeftRow::Collection { name, open },
-                    WsRow::Report { name, .. } => LeftRow::Report { name },
-                    WsRow::Request(idx) => LeftRow::Entry { idx, indent: true },
+                    WsRow::Folder {
+                        name,
+                        depth,
+                        expanded,
+                        ..
+                    } => LeftRow::WsFolder {
+                        name,
+                        depth,
+                        expanded,
+                    },
+                    WsRow::Collection {
+                        name, depth, open, ..
+                    } => LeftRow::Collection { name, depth, open },
+                    WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
+                    WsRow::Request { idx, depth } => LeftRow::Entry { idx, depth },
                 })
                 .collect()
         } else {
@@ -152,7 +187,7 @@ impl LeftRow {
                 .map(|r| match r {
                     tree::Row::Up => LeftRow::Up,
                     tree::Row::Folder(name) => LeftRow::Folder(name),
-                    tree::Row::Entry(idx) => LeftRow::Entry { idx, indent: false },
+                    tree::Row::Entry(idx) => LeftRow::Entry { idx, depth: 0 },
                 })
                 .collect()
         }
@@ -919,26 +954,49 @@ pub(crate) fn draw_collection_left(
                 s.list_up_row.to_string(),
                 Style::default().fg(th.dim),
             ))),
+            // Non-workspace virtual folder (title-encoded); no indentation.
             LeftRow::Folder(name) => ListItem::new(Line::from(Span::styled(
                 format!("{FOLDER_ICON} {name}/"),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ))),
-            LeftRow::Collection { name, open } => {
+            // Workspace filesystem folder with expand/collapse chevron and
+            // depth-based indentation.
+            LeftRow::WsFolder {
+                name,
+                depth,
+                expanded,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let chevron = if *expanded {
+                    COLLECTION_OPEN_ICON
+                } else {
+                    COLLECTION_CLOSED_ICON
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{chevron} {name}/"),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                )))
+            }
+            LeftRow::Collection { name, depth, open } => {
+                let indent = "  ".repeat(*depth);
                 let chevron = if *open {
                     COLLECTION_OPEN_ICON
                 } else {
                     COLLECTION_CLOSED_ICON
                 };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{chevron} {name}"),
+                    format!("{indent}{chevron} {name}"),
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 )))
             }
-            LeftRow::Report { name } => ListItem::new(Line::from(Span::styled(
-                format!("{REPORT_ICON} {name}"),
-                Style::default().fg(th.accent),
-            ))),
-            LeftRow::Entry { idx, indent } => {
+            LeftRow::Report { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{REPORT_ICON} {name}"),
+                    Style::default().fg(th.accent),
+                )))
+            }
+            LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];
                 // A plus marks a request the user added by hand (in a real
                 // collection); a pencil marks one edited away from its loaded
@@ -950,11 +1008,13 @@ pub(crate) fn draw_collection_left(
                 } else {
                     ("  ", th.text)
                 };
-                // Workspace request rows are indented one level so they read
-                // as children of their collection's file row.
+                // Workspace request rows carry a `depth` that reflects their
+                // position in the tree (collection depth + 1); non-workspace
+                // rows are always depth 0.  Two spaces per level matches the
+                // folder/collection indent above.
                 let mut spans = Vec::new();
-                if *indent {
-                    spans.push(Span::raw("  "));
+                if *depth > 0 {
+                    spans.push(Span::raw("  ".repeat(*depth)));
                 }
                 spans.push(Span::styled(marker, Style::default().fg(marker_fg)));
                 spans.push(Span::styled(
@@ -1044,11 +1104,11 @@ pub(crate) fn draw_collection_left(
         };
         format!("{}{}", tab_icons(col), display_name)
     };
-    if col.is_workspace() {
-        if !col.workspace_browse.is_empty() {
-            title = format!("{title} › {}", col.workspace_browse.join(" › "));
-        }
-    } else if !col.folder.is_empty() {
+    // Non-workspace tabs show the current in-collection folder path as a
+    // breadcrumb (the title-encoded virtual folder from `col.folder`).
+    // Workspace tabs use a real expand/collapse tree — there is no single
+    // "current folder" to display, so the breadcrumb is omitted there.
+    if !col.is_workspace() && !col.folder.is_empty() {
         title = format!("{title} › {}", col.folder.join(" › "));
     }
     // A collection linked to a Global Environment shows that environment's
@@ -2248,6 +2308,18 @@ fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &String
 }
 
 pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Theme) {
+    // `ReportCellPopup` needs a mutable borrow of its `MultiSelectPanel` to
+    // update scroll/content each frame, so it is handled before the immutable
+    // `as_ref()` match below.
+    if let Some(Overlay::ReportCellPopup {
+        title,
+        content,
+        panel,
+    }) = app.overlay.as_mut()
+    {
+        super::reports::draw_result_cell_popup_overlay(f, title, content, panel, s, th);
+        return;
+    }
     match app.overlay.as_ref().unwrap() {
         Overlay::FileMenu(sel) => {
             let items = file_menu_items(s);
@@ -3117,6 +3189,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             ];
             draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th);
         }
+        // Handled by the early-return above — unreachable in practice.
+        Overlay::ReportCellPopup { .. } => unreachable!("ReportCellPopup is drawn above"),
     }
 }
 
@@ -3241,6 +3315,11 @@ pub(crate) fn draw_workspace_picker(
                 ListItem::new(Line::styled(
                     format!("{indent}{FOLDER_ICON} {}/", e.display_name),
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ))
+            } else if crate::workspace::is_report_file(&e.path) {
+                ListItem::new(Line::styled(
+                    format!("{indent}{REPORT_ICON} {}", e.display_name),
+                    Style::default().fg(th.accent),
                 ))
             } else {
                 ListItem::new(Line::styled(

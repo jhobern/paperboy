@@ -165,7 +165,7 @@ strings! {
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
-    workspace_filter_on => "Filter: .hurl/.json", "Filtre : .hurl/.json", "Filter: .hurl/.json";
+    workspace_filter_on => "Filter: .hurl/.json/.trail", "Filtre : .hurl/.json/.trail", "Filter: .hurl/.json/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
     workspace_no_files => "No matching files in this folder.", "Aucun fichier correspondant dans ce dossier.", "Ingen matchende filer i denne mappe.";
     tab_request => "Scratch Space", "Brouillon", "Kladde";
@@ -508,7 +508,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "v source · x export · B baseline", "v source · x export · B référence", "v kilde · x export · B basislinje";
+    report_hint_results => "↑/↓/←/→ cursor · Enter drill-down · v source · x export · B baseline", "↑/↓/←/→ curseur · Entrée exploration · v source · x export · B référence", "↑/↓/←/→ markør · Enter udforsk · v kilde · x export · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -529,13 +529,13 @@ strings! {
     report_hint_view => "v output", "v sortie", "v output";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
-    report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";
     report_dry_run_no_rows => "No rows would be produced.", "Aucune ligne ne serait produite.", "Ingen rækker ville blive produceret.";
-    report_dry_run_no_bindings => "(single run, no loop variables)", "(exécution unique, sans variable de boucle)", "(enkelt kørsel, ingen løkkevariabler)";
-    report_dry_run_more => "more iterations", "itérations supplémentaires", "flere gentagelser";
     report_dry_run_problems_heading => "Problems", "Problèmes", "Problemer";
     report_dry_run_no_problems => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
     report_dry_run_hint => "↑/↓ scroll · Esc close", "↑/↓ défiler · Échap fermer", "↑/↓ rul · Esc luk";
+    report_dry_run_preview_notice => "Dry run — loop bindings resolved; HTTP response fields blank", "Simulation — liaisons de boucle résolues ; champs de réponse HTTP vides", "Prøvekørsel — løkkebindinger løst; HTTP-svarfelter tomme";
+    report_dry_run_warnings_heading => "Warnings", "Avertissements", "Advarsler";
+    report_cell_popup_hint => "↑/↓ scroll · y copy · Esc close", "↑/↓ défiler · y copier · Échap fermer", "↑/↓ rul · y kopier · Esc luk";
     report_columns_title => "Columns", "Colonnes", "Kolonner";
     report_columns_hint => "Space toggle · Shift+↑/↓ move · Enter apply · Esc cancel", "Espace bascule · Maj+↑/↓ déplacer · Entrée appliquer · Échap annuler", "Mellemrum skift · Skift+↑/↓ flyt · Enter anvend · Esc annuller";
     report_columns_need_run => "Run the report first so its columns are known", "Exécutez d'abord le rapport pour connaître ses colonnes", "Kør rapporten først, så dens kolonner kendes";
@@ -547,7 +547,7 @@ strings! {
     report_bind_no_collections => "Open a collection tab first, then bind the report to it", "Ouvrez d'abord un onglet de collection, puis liez-y le rapport", "Åbn først en samlingsfane, og bind derefter rapporten til den";
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
-    report_run_cancelled => "Report run cancelled", "Exécution du rapport annulée", "Rapportkørsel annulleret";
+    report_run_stopped => "Run stopped — partial results kept", "Exécution interrompue — résultats partiels conservés", "Kørsel stoppet — delvise resultater beholdt";
     status_request_reverted => "request reverted to last saved", "requête rétablie à la dernière sauvegarde", "anmodning gendannet til sidst gemte";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
     status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
@@ -743,9 +743,10 @@ pub enum Status {
         done: usize,
         total: usize,
     },
-    /// A running report was cancelled by the user before it finished; any
-    /// partial result is discarded.
-    ReportRunCancelled,
+    /// A running report was stopped by the user before it finished. Completed
+    /// rows are retained in the results grid; unstarted rows remain as skeleton
+    /// placeholders. The user can view, save, or export the partial output.
+    ReportRunStopped,
     /// The selected request was reverted to its last-saved on-disk version,
     /// discarding its in-memory edits. Holds the HTTP method for the message.
     RequestReverted(String),
@@ -892,7 +893,7 @@ impl Status {
                 .report_running_progress
                 .replace("{done}", &done.to_string())
                 .replace("{total}", &total.to_string()),
-            Status::ReportRunCancelled => s.report_run_cancelled.to_string(),
+            Status::ReportRunStopped => s.report_run_stopped.to_string(),
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),

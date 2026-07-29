@@ -617,19 +617,33 @@ impl<'a> Exec<'a> {
     /// its intrinsic columns (`HttpStatus`/`Time`/`Asserts`/`Error`/`Response`)
     /// plus one column per `[Reports]`/`WITH` field, all namespaced by `alias`
     /// (default: the request's leaf name). Columns are emitted in a fixed order
-    /// (intrinsics, then `[Reports]` fields, then `WITH` fields) so report output
-    /// is deterministic.
+    /// (intrinsics first, then `[Reports]` fields, then `WITH` fields) so report
+    /// output is deterministic.
     ///
-    /// Column selection (applied after the full `cells` list is built):
-    /// - A non-empty `show` keeps exactly those suffixes (in listed order) —
-    ///   SHOW takes full precedence, including over the WITH suppression below.
-    /// - Else if any `WITH` field declarations are present (`declared_only`),
-    ///   the 5 intrinsics are suppressed so the report focuses on declared
-    ///   fields. NOTE: a `[Reports]`-only request (no WITH fields) keeps its
-    ///   intrinsics unchanged.
-    /// - Otherwise all columns are kept (the unchanged default).
-    /// - HIDE is then applied in all branches: any field whose suffix is in
-    ///   `hide` is removed from the final output.
+    /// The emitted column set is the UNION of:
+    ///   (a) the request's `[Reports]` fields,
+    ///   (b) `WITH`-declared fields, and
+    ///   (c) any fields explicitly named in `SHOW(...)`.
+    ///
+    /// Intrinsic suppression rule: intrinsics are included **by default** only
+    /// for a "bare" request that has NO `[Reports]` fields AND NO `WITH` fields.
+    /// Once any declared field exists (`has_declared`), intrinsics are suppressed
+    /// unless the caller explicitly names one in `SHOW(...)`.  This removes the
+    /// previous asymmetry where a `[Reports]`-only request kept its intrinsics
+    /// while a `WITH`-only request suppressed them.
+    ///
+    /// `SHOW(...)` is **additive**, not a whitelist: it force-includes the named
+    /// fields on top of whatever would otherwise be emitted.  Its primary use
+    /// case is re-adding a specific intrinsic (e.g. `SHOW(HttpStatus)`) on a
+    /// request that has declared fields.  Naming a `[Reports]`/`WITH` field that
+    /// is already included is harmless; naming a non-existent field is silently
+    /// ignored.
+    ///
+    /// `[Reports]` and `WITH` fields are always emitted (they are the declared
+    /// output of this statement) unless removed by `HIDE`.
+    ///
+    /// `HIDE(...)` is applied **last** and removes any field — intrinsic,
+    /// `[Reports]`, or `WITH` — whose suffix matches a listed name.
     fn eval_report_request(
         &mut self,
         name: &str,
@@ -718,33 +732,30 @@ impl<'a> Exec<'a> {
 
         // Column selection is applied to the fully-built `cells` list.
         //
-        // `declared_only`: true when this statement has at least one WITH field
-        // declaration (not just a RESPONSE override). When true and SHOW is
-        // absent, the 5 intrinsics are suppressed so the report focuses on the
-        // explicitly declared fields. A `[Reports]`-only request (no WITH fields)
-        // is unaffected — it still emits intrinsics by default.
-        let declared_only = with.iter().any(|w| matches!(w, WithItem::Field { .. }));
+        // `has_declared`: true when this request has at least one declared field
+        // — either from its own `[Reports]` block or from a `WITH` field
+        // declaration (not just a RESPONSE format override).  When true,
+        // intrinsics are suppressed by default; SHOW can bring individual ones
+        // back.  A bare request (no declared fields of any kind) keeps all its
+        // intrinsics unchanged.
+        let has_declared =
+            !base.reports.is_empty() || with.iter().any(|w| matches!(w, WithItem::Field { .. }));
 
-        if !show.is_empty() {
-            // SHOW takes full precedence: keep exactly the listed suffixes (in
-            // listed order), including any intrinsics explicitly named.
-            let mut kept: Vec<(String, String)> = Vec::with_capacity(show.len());
-            for field in show {
-                let key = format!("{alias}.{field}");
-                if let Some((_, v)) = cells.iter().find(|(k, _)| *k == key) {
-                    kept.push((key, v.clone()));
-                }
-            }
-            cells = kept;
-        } else if declared_only {
-            // WITH fields were declared: suppress the 5 intrinsics so they don't
-            // drown out the declared field columns. Identified by matching the
-            // suffix after `alias.` against the known intrinsic names.
+        if has_declared {
+            // Suppress intrinsics that are not explicitly named in SHOW.  This
+            // `retain` preserves the original cell order (intrinsics first) for
+            // any that survive — deterministic even when SHOW mixes intrinsics
+            // and [Reports]/WITH fields.
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
-                !INTRINSIC_FIELDS.contains(&suffix)
+                // [Reports] and WITH fields are always kept; intrinsics survive
+                // only when SHOW explicitly lists them.
+                !INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
             });
         }
+        // Bare request: all cells (all 5 intrinsics) are kept.  SHOW on a bare
+        // request names fields that are already present, so it is a no-op for
+        // inclusion; only HIDE can narrow the output further.
 
         // Apply HIDE in all branches: remove any field whose suffix is in `hide`.
         if !hide.is_empty() {
@@ -1346,15 +1357,18 @@ mod tests {
         // The captured `token` from Oauth must be visible to the `me` request.
         assert_eq!(fake.call_vars("me").get("token"), Some(&"abc".to_string()));
         assert_eq!(res.rows[0].cells.get("me.name"), Some(&"jo".to_string()));
-        assert_eq!(
-            res.rows[0].cells.get("me.HttpStatus"),
-            Some(&"200".to_string())
-        );
+        // `me` has a [Reports] field (`name`), so has_declared=true and intrinsics
+        // are suppressed by default — HttpStatus is not in the output.
+        assert_eq!(res.rows[0].cells.get("me.HttpStatus"), None);
     }
 
     #[test]
     fn show_selector_prunes_columns_to_listed_fields() {
-        // A heavy Response should be droppable while keeping small fields.
+        // SHOW is additive: it force-includes named fields on top of what the
+        // union model already emits.  The request has a [Reports] field `name`
+        // (has_declared=true), so intrinsics are suppressed by default.
+        // SHOW(name, HttpStatus) re-adds HttpStatus; `name` is a [Reports] field
+        // so it is always emitted regardless.
         let fake = Fake::new(&[(
             "me",
             Canned {
@@ -1374,16 +1388,24 @@ mod tests {
         let cells = &res.rows[0].cells;
         assert_eq!(cells.get("me.name"), Some(&"jo".to_string()));
         assert_eq!(cells.get("me.HttpStatus"), Some(&"200".to_string()));
-        // The whole-body Response (and the other intrinsics) are pruned away.
+        // The other intrinsics are suppressed (not listed in SHOW and
+        // has_declared=true).
         assert_eq!(cells.get("me.Response"), None);
         assert_eq!(cells.get("me.Time"), None);
         assert_eq!(cells.get("me.Asserts"), None);
-        // Column order follows SHOW order, and only the two survive.
-        assert_eq!(res.column_order, vec!["me.name", "me.HttpStatus"]);
+        // Column order: intrinsics first, then [Reports] fields (cells order
+        // is preserved by retain; HttpStatus is an intrinsic so it precedes
+        // the [Reports] field `name` even though SHOW listed them the other
+        // way around).
+        assert_eq!(res.column_order, vec!["me.HttpStatus", "me.name"]);
     }
 
     #[test]
-    fn show_selector_skips_a_field_the_request_never_produces() {
+    fn show_on_bare_request_is_a_noop_for_inclusion() {
+        // A bare request (no [Reports], no WITH) keeps ALL intrinsics regardless
+        // of what SHOW names.  SHOW is additive, not a whitelist; on a bare
+        // request every intrinsic is already in the set, so SHOW(HttpStatus,
+        // bogus) adds nothing new (`bogus` doesn't exist → silently ignored).
         let fake = Fake::new(&[(
             "me",
             Canned {
@@ -1393,7 +1415,6 @@ mod tests {
             },
         )]);
         let entries = [entry("me", &[])];
-        // `bogus` isn't an intrinsic or a field → simply absent (no empty cell).
         let res = run(
             "REPORT REQUEST me SHOW(HttpStatus, bogus)\n",
             &entries,
@@ -1401,7 +1422,15 @@ mod tests {
             &[],
             &fake,
         );
-        assert_eq!(res.column_order, vec!["me.HttpStatus"]);
+        // All 5 intrinsics are present; `bogus` is silently absent.
+        assert_eq!(
+            res.rows[0].cells.get("me.HttpStatus"),
+            Some(&"200".to_string())
+        );
+        assert!(res.rows[0].cells.contains_key("me.Time"));
+        assert!(res.rows[0].cells.contains_key("me.Asserts"));
+        assert!(res.rows[0].cells.contains_key("me.Error"));
+        assert!(res.rows[0].cells.contains_key("me.Response"));
         assert_eq!(res.rows[0].cells.get("me.bogus"), None);
     }
 
@@ -1458,7 +1487,9 @@ mod tests {
     }
 
     #[test]
-    fn report_request_emits_intrinsics_and_fields() {
+    fn report_request_emits_fields_and_suppresses_intrinsics() {
+        // A request with [Reports] fields (has_declared=true) suppresses the
+        // 5 intrinsics by default.  Only the declared [Reports] field is emitted.
         let fake = Fake::new(&[(
             "process",
             Canned {
@@ -1473,15 +1504,13 @@ mod tests {
         let entries = [entry("process", &[("status", "jsonpath \"$.status\"")])];
         let res = run("REPORT REQUEST process\n", &entries, &[], &[], &fake);
         let cells = &res.rows[0].cells;
-        assert_eq!(cells.get("process.HttpStatus"), Some(&"201".to_string()));
-        assert_eq!(cells.get("process.Time"), Some(&"42".to_string()));
-        assert_eq!(cells.get("process.Asserts"), Some(&"2/3".to_string()));
+        // [Reports] field is present.
         assert_eq!(cells.get("process.status"), Some(&"ok".to_string()));
-        // Default response format is pretty.
-        assert_eq!(
-            cells.get("process.Response"),
-            Some(&"{\n  \"status\": \"ok\"\n}".to_string())
-        );
+        // Intrinsics are suppressed because has_declared=true.
+        assert_eq!(cells.get("process.HttpStatus"), None);
+        assert_eq!(cells.get("process.Time"), None);
+        assert_eq!(cells.get("process.Asserts"), None);
+        assert_eq!(cells.get("process.Response"), None);
     }
 
     #[test]
@@ -2491,8 +2520,8 @@ mod tests {
 
     #[test]
     fn with_fields_suppress_intrinsics_by_default() {
-        // When a WITH field is declared, intrinsics are suppressed unless SHOW
-        // explicitly names them. A [Reports] field is still emitted.
+        // has_declared=true (has both a [Reports] field and a WITH field), so
+        // intrinsics are suppressed.  Both declared fields are emitted.
         let fake = Fake::new(&[(
             "svc",
             Canned {
@@ -2510,10 +2539,10 @@ mod tests {
             &fake,
         );
         let cells = &res.rows[0].cells;
-        // The WITH field and the [Reports] field are present.
+        // The WITH field and the [Reports] field are both present.
         assert_eq!(cells.get("svc.extra"), Some(&"42".to_string()));
         assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
-        // Intrinsics are suppressed because WITH fields were declared.
+        // Intrinsics are suppressed because has_declared=true.
         assert_eq!(
             cells.get("svc.HttpStatus"),
             None,
@@ -2524,9 +2553,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_only_request_keeps_intrinsics() {
-        // INTENDED ASYMMETRY: a request with only [Reports] fields (no WITH) keeps
-        // intrinsics. WITH suppression only activates when WITH fields are present.
+    fn reports_only_request_suppresses_intrinsics() {
+        // Under the new union model, a request with [Reports] fields (but no
+        // WITH) is no longer asymmetric: has_declared=true because base.reports
+        // is non-empty, so intrinsics are suppressed just like a WITH request.
+        // Use SHOW(HttpStatus) to bring a specific intrinsic back.
         let fake = Fake::new(&[(
             "svc",
             Canned {
@@ -2538,18 +2569,53 @@ mod tests {
         let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
         let res = run("REPORT REQUEST svc\n", &entries, &[], &[], &fake);
         let cells = &res.rows[0].cells;
+        // Intrinsics are suppressed — no more asymmetry between [Reports]-only
+        // and WITH requests.
         assert_eq!(
             cells.get("svc.HttpStatus"),
-            Some(&"200".to_string()),
-            "intrinsics kept"
+            None,
+            "intrinsics suppressed by [Reports] fields"
         );
+        // The [Reports] field is still present.
         assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
     }
 
     #[test]
-    fn show_wins_over_with_suppression_and_can_readd_intrinsic() {
-        // When SHOW is present alongside WITH fields, SHOW takes full precedence
-        // and can explicitly re-add an intrinsic that WITH would otherwise suppress.
+    fn show_readds_intrinsic_on_reports_only_request() {
+        // SHOW is additive: naming an intrinsic on a [Reports]-only request
+        // (has_declared=true) force-includes it back.  Other intrinsics stay
+        // suppressed.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
+        let res = run(
+            "REPORT REQUEST svc SHOW(HttpStatus)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        // HttpStatus is in SHOW → kept; score is a [Reports] field → always kept.
+        assert_eq!(cells.get("svc.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
+        // Other intrinsics not in SHOW are absent.
+        assert_eq!(cells.get("svc.Time"), None);
+        assert_eq!(cells.get("svc.Response"), None);
+        // Intrinsics (in SHOW) precede [Reports] fields in the column order.
+        assert_eq!(res.column_order, vec!["svc.HttpStatus", "svc.score"]);
+    }
+
+    #[test]
+    fn show_readds_intrinsic_alongside_with_field() {
+        // SHOW is additive alongside WITH: naming an intrinsic re-adds it while
+        // the WITH field is always present.  Other intrinsics stay suppressed.
         let fake = Fake::new(&[(
             "svc",
             Canned {
@@ -2567,7 +2633,7 @@ mod tests {
             &fake,
         );
         let cells = &res.rows[0].cells;
-        // SHOW re-adds HttpStatus even though WITH would normally suppress it.
+        // HttpStatus is in SHOW → kept; extra is a WITH field → always kept.
         assert_eq!(
             cells.get("svc.HttpStatus"),
             Some(&"200".to_string()),
@@ -2576,11 +2642,16 @@ mod tests {
         assert_eq!(cells.get("svc.extra"), Some(&"42".to_string()));
         // Other intrinsics not in SHOW are absent.
         assert_eq!(cells.get("svc.Response"), None);
+        // Intrinsics (in SHOW) precede WITH fields in the column order.
         assert_eq!(res.column_order, vec!["svc.HttpStatus", "svc.extra"]);
     }
 
     #[test]
-    fn hide_removes_named_field() {
+    fn hide_removes_named_field_from_reports_only_request() {
+        // HIDE removes any field whose suffix matches, applied last.  For a
+        // [Reports]-only request (has_declared=true), intrinsics are already
+        // suppressed, so HIDE on an intrinsic is a no-op; HIDE on a [Reports]
+        // field does remove it.
         let fake = Fake::new(&[(
             "svc",
             Canned {
@@ -2591,6 +2662,33 @@ mod tests {
         )]);
         let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
         let res = run(
+            "REPORT REQUEST svc HIDE(score)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        // [Reports] field removed by HIDE.
+        assert_eq!(cells.get("svc.score"), None, "score hidden by HIDE");
+        // Intrinsics are already suppressed (has_declared=true).
+        assert_eq!(cells.get("svc.HttpStatus"), None);
+    }
+
+    #[test]
+    fn hide_removes_named_field_from_bare_request() {
+        // For a bare request (no [Reports], no WITH), all 5 intrinsics are
+        // emitted; HIDE removes the named ones.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[])];
+        let res = run(
             "REPORT REQUEST svc HIDE(Response, Error)\n",
             &entries,
             &[],
@@ -2600,14 +2698,17 @@ mod tests {
         let cells = &res.rows[0].cells;
         assert_eq!(cells.get("svc.Response"), None, "Response hidden");
         assert_eq!(cells.get("svc.Error"), None, "Error hidden");
-        // Other intrinsics and [Reports] fields still present.
+        // Remaining intrinsics are present.
         assert_eq!(cells.get("svc.HttpStatus"), Some(&"200".to_string()));
-        assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
+        assert!(cells.contains_key("svc.Time"));
+        assert!(cells.contains_key("svc.Asserts"));
     }
 
     #[test]
-    fn hide_applied_after_show() {
-        // HIDE acts after SHOW — even fields SHOW would keep can be removed by HIDE.
+    fn hide_applied_after_show_on_bare_request() {
+        // HIDE acts after everything else.  On a bare request (no declared
+        // fields), all intrinsics are kept; SHOW(HttpStatus, Time) is a no-op
+        // for inclusion; HIDE(Time) then removes Time.
         let fake = Fake::new(&[(
             "svc",
             Canned {
@@ -2626,7 +2727,200 @@ mod tests {
         );
         let cells = &res.rows[0].cells;
         assert_eq!(cells.get("svc.HttpStatus"), Some(&"200".to_string()));
-        assert_eq!(cells.get("svc.Time"), None, "HIDE removed Time after SHOW");
-        assert_eq!(res.column_order, vec!["svc.HttpStatus"]);
+        assert_eq!(cells.get("svc.Time"), None, "HIDE removed Time");
+        // Other intrinsics survive (bare request keeps all except those HIDEn).
+        assert!(cells.contains_key("svc.Asserts"));
+        assert!(cells.contains_key("svc.Error"));
+        assert!(cells.contains_key("svc.Response"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Worked examples from the union-model specification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worked_ex1_bare_request_emits_all_intrinsics() {
+        // Bare request, no clauses → all 5 intrinsics.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run("REPORT REQUEST r\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert!(cells.contains_key("r.HttpStatus"));
+        assert!(cells.contains_key("r.Time"));
+        assert!(cells.contains_key("r.Asserts"));
+        assert!(cells.contains_key("r.Error"));
+        assert!(cells.contains_key("r.Response"));
+        assert_eq!(
+            res.column_order,
+            vec![
+                "r.HttpStatus",
+                "r.Time",
+                "r.Asserts",
+                "r.Error",
+                "r.Response"
+            ]
+        );
+    }
+
+    #[test]
+    fn worked_ex2_reports_field_suppresses_intrinsics() {
+        // [Reports] has `Status`; no WITH; no SHOW → only r.Status.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"status\":\"ok\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("Status", "jsonpath \"$.status\"")])];
+        let res = run("REPORT REQUEST r\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.Status"), Some(&"ok".to_string()));
+        assert_eq!(cells.get("r.HttpStatus"), None, "intrinsics suppressed");
+        assert_eq!(cells.get("r.Time"), None);
+        assert_eq!(cells.get("r.Response"), None);
+        assert_eq!(res.column_order, vec!["r.Status"]);
+    }
+
+    #[test]
+    fn worked_ex3_reports_field_show_adds_intrinsic() {
+        // [Reports] has `Status`; SHOW(HttpStatus) → r.HttpStatus, r.Status.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"status\":\"ok\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("Status", "jsonpath \"$.status\"")])];
+        let res = run(
+            "REPORT REQUEST r SHOW(HttpStatus)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("r.Status"), Some(&"ok".to_string()));
+        // Intrinsic precedes [Reports] field.
+        assert_eq!(res.column_order, vec!["r.HttpStatus", "r.Status"]);
+    }
+
+    #[test]
+    fn worked_ex4a_with_only_emits_with_field() {
+        // WITH { Foo: ... } only → r.Foo (intrinsics suppressed).
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"x\":7}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r WITH\n    Foo: jsonpath \"$.x\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.Foo"), Some(&"7".to_string()));
+        assert_eq!(cells.get("r.HttpStatus"), None, "intrinsics suppressed");
+        assert_eq!(res.column_order, vec!["r.Foo"]);
+    }
+
+    #[test]
+    fn worked_ex4b_with_show_adds_intrinsic() {
+        // WITH { Foo } SHOW(Time) → r.Time, r.Foo.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"x\":7}".into(),
+                duration_ms: 55,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r SHOW(Time) WITH\n    Foo: jsonpath \"$.x\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.Time"), Some(&"55".to_string()));
+        assert_eq!(cells.get("r.Foo"), Some(&"7".to_string()));
+        // Intrinsic precedes WITH field in the column order.
+        assert_eq!(res.column_order, vec!["r.Time", "r.Foo"]);
+    }
+
+    #[test]
+    fn worked_ex5_reports_with_show_additive_union() {
+        // [Reports] has `A`; WITH { B: ... }; SHOW(Response) → r.Response, r.A, r.B.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1,\"b\":2}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("A", "jsonpath \"$.a\"")])];
+        let res = run(
+            "REPORT REQUEST r SHOW(Response) WITH\n    B: jsonpath \"$.b\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(
+            cells.get("r.Response"),
+            Some(&"{\"a\":1,\"b\":2}".to_string())
+        );
+        assert_eq!(cells.get("r.A"), Some(&"1".to_string()));
+        assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
+        // Intrinsic first, then [Reports], then WITH.
+        assert_eq!(res.column_order, vec!["r.Response", "r.A", "r.B"]);
+    }
+
+    #[test]
+    fn worked_ex6_hide_removes_any_field() {
+        // Based on worked_ex5 with HIDE(A) → A is removed regardless of source.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1,\"b\":2}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("A", "jsonpath \"$.a\"")])];
+        let res = run(
+            "REPORT REQUEST r SHOW(Response) HIDE(A) WITH\n    B: jsonpath \"$.b\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.A"), None, "A removed by HIDE");
+        // Response (SHOW-added intrinsic) and B (WITH) survive.
+        assert!(cells.contains_key("r.Response"));
+        assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
+        assert_eq!(res.column_order, vec!["r.Response", "r.B"]);
     }
 }

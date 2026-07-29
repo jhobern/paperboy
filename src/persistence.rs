@@ -137,6 +137,12 @@ pub struct PersistedTab {
     /// of just being reported as permanently missing.
     #[serde(default)]
     pub workspace_git_origin: Option<WorkspaceGitOrigin>,
+    /// Expanded folder paths in the workspace file tree, stored as
+    /// forward-slash-separated paths relative to `workspace_root`.  Absent in
+    /// older state files (field defaults to empty), which means all folders
+    /// start collapsed — a safe, backwards-compatible default.
+    #[serde(default)]
+    pub workspace_expanded_paths: Vec<String>,
 }
 
 /// Enough information to offer redownloading a Workspace whose entire
@@ -183,6 +189,29 @@ impl PersistedTab {
                 .then_some(c.workspace_filter_hurl_json),
             workspace_downloaded_from_git: c.workspace_downloaded_from_git,
             workspace_git_origin: c.workspace_git_origin.clone(),
+            // Serialise expanded paths relative to workspace_root using
+            // forward slashes so they survive cross-platform round-trips.
+            workspace_expanded_paths: c
+                .workspace_root
+                .as_ref()
+                .map(|root| {
+                    let mut paths: Vec<String> = c
+                        .workspace_expanded
+                        .iter()
+                        .filter_map(|abs| {
+                            abs.strip_prefix(root).ok().map(|rel| {
+                                rel.components()
+                                    .filter_map(|comp| comp.as_os_str().to_str())
+                                    .collect::<Vec<_>>()
+                                    .join("/")
+                            })
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    paths.sort(); // deterministic JSON
+                    paths
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -281,7 +310,20 @@ impl PersistedTab {
             self.workspace_git_origin
         };
         c.sync_folder_to_selected();
-        c.set_workspace_browse_from_path();
+        // Restore expanded folders: convert relative slash-paths back to
+        // absolute paths by prepending workspace_root.
+        c.workspace_expanded = if let Some(root) = &c.workspace_root {
+            self.workspace_expanded_paths
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|rel| root.join(rel))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        // Ensure the loaded file's ancestor folders are expanded so it is
+        // immediately visible, then position the cursor on it.
+        c.expand_ancestors_for_path();
         c.sync_ws_cursor();
         (c, pending_reload)
     }

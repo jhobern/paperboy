@@ -26,6 +26,7 @@ use super::editor::*;
 use super::new_request::*;
 use super::remote::*;
 use super::reports::ReportPane;
+use super::reports::{ReportView, grid_col_at_x, result_column_widths};
 use super::selection;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
@@ -264,6 +265,21 @@ impl TuiApp {
                     return;
                 }
                 let pane = self.report_pane_at(point);
+                // A plain click on the Results pane in Results-view mode drives
+                // the cell cursor (first click selects; click on the same cell
+                // opens the popup) rather than starting a text selection.
+                // Clicks on the header/border rows, out-of-bounds cells, or
+                // Alt+Clicks still fall through to the text-selection path.
+                if pane == Some(ReportPane::Results)
+                    && !ev.modifiers.contains(KeyModifiers::ALT)
+                    && self.active_report_index().is_some_and(|i| {
+                        self.reports[i].view == ReportView::Results
+                            && self.reports[i].result.is_some()
+                    })
+                    && self.on_mouse_results_cell_click(ev.column, ev.row)
+                {
+                    return;
+                }
                 if ev.modifiers.contains(KeyModifiers::ALT) {
                     // Alt+Click adds a region: finalize the live one first.
                     if let Some(active) = self.active_report_selection_pane()
@@ -297,6 +313,76 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    /// Map a click inside the Results pane to a cell `(data_row, col)` and
+    /// update the cell cursor. If the click lands on the already-selected cell,
+    /// open the drill-down popup (second-click activation). Returns `true` if
+    /// the click was consumed (landed on a valid data cell); `false` means the
+    /// click should fall through to the text-selection handler.
+    ///
+    /// Geometry: `report_pane_areas[Results]` is set to `inner` (the rect
+    /// returned by `block.inner(area)` in `draw_report_panel`), meaning the
+    /// border has already been stripped.  The whole `lines` vec — header at
+    /// index 0, data rows at 1..n — is rendered into `inner` scrolled by
+    /// `results_panel.scroll()`.  Therefore:
+    ///   y_off = row − area.y   (0 == header row when scroll == 0)
+    ///   grid_row = y_off + scroll   (no −1 for border)
+    ///   data_row = grid_row − 1    (only valid when grid_row >= 1)
+    fn on_mouse_results_cell_click(&mut self, col: u16, row: u16) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        let area = self.report_pane_areas[ReportPane::Results.idx()];
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+        // The pane_at check already confirmed the click is inside the inner
+        // rect, but guard defensively against underflow.
+        if row < area.y {
+            return false;
+        }
+        let y_off = (row - area.y) as usize;
+        if y_off >= area.height as usize {
+            return false;
+        }
+        let Some(result) = &self.reports[idx].result else {
+            return false;
+        };
+        let scroll = self.reports[idx].results_panel.scroll() as usize;
+        let grid_row = y_off + scroll;
+        if grid_row == 0 {
+            // Header row — fall through to text selection.
+            return false;
+        }
+        let data_row = grid_row - 1;
+        if data_row >= result.rows.len() {
+            return false;
+        }
+        let header = self.reports[idx]
+            .report
+            .flow()
+            .map(|f| f.header)
+            .unwrap_or_default();
+        // Reuse the same column-width computation as the renderer so the click
+        // lands on the right column.
+        let x_off = (col as usize).saturating_sub(area.x as usize);
+        let widths = result_column_widths(result, &header);
+        let n_cols = widths.len();
+        if n_cols == 0 {
+            return false;
+        }
+        let show_icons = self.reports[idx].run_progress.is_some();
+        let clicked_col = grid_col_at_x(&widths, x_off, show_icons).min(n_cols - 1);
+        let new_cell = (data_row, clicked_col);
+        let prev_cell = self.reports[idx].cell_cursor;
+        if prev_cell == Some(new_cell) {
+            // Second click on the same cell: open the drill-down popup.
+            self.open_result_cell_popup();
+        } else {
+            self.reports[idx].cell_cursor = Some(new_cell);
+        }
+        true
     }
 
     /// Which report panel (if any) has `point` inside its recorded text area.
@@ -684,6 +770,11 @@ impl TuiApp {
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
             Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
+            Overlay::ReportCellPopup {
+                title,
+                content,
+                panel,
+            } => self.result_cell_popup_key_handler(key, title, content, panel),
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
@@ -951,7 +1042,15 @@ impl TuiApp {
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::Tabs => self.cycle_tab(false),
             KeyCode::Right | KeyCode::Char('l') if self.focus == Pane::Tabs => self.cycle_tab(true),
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::List => {
-                self.scroll_list_h(-4)
+                // In a Workspace tab's file-tree, Left collapses an expanded
+                // folder or navigates to the parent of a file/collapsed-folder;
+                // for ordinary (non-workspace) tabs it scrolls the URL.
+                let ci = self.active_tab;
+                if self.collections[ci].is_workspace() {
+                    self.on_left_workspace_list(ci);
+                } else {
+                    self.scroll_list_h(-4);
+                }
             }
             KeyCode::Right | KeyCode::Char('l') if self.focus == Pane::List => {
                 // In a Workspace tab's file-tree, Right opens whatever is
@@ -965,10 +1064,18 @@ impl TuiApp {
                     .then(|| col.ws_rows().into_iter().nth(col.list_cursor))
                     .flatten();
                 match row {
-                    Some(crate::collection::WsRow::Folder(name)) => {
-                        self.workspace_folder_down(ci, name);
+                    // Expand a collapsed folder (Right = expand in tree nav).
+                    Some(crate::collection::WsRow::Folder {
+                        path,
+                        expanded: false,
+                        ..
+                    }) => {
+                        self.collections[ci].workspace_expanded.insert(path);
                         self.workspace_select_highlighted(ci);
+                        self.save_state();
                     }
+                    // Already expanded: do nothing (use Left to collapse).
+                    Some(crate::collection::WsRow::Folder { expanded: true, .. }) => {}
                     Some(crate::collection::WsRow::Collection {
                         path, open: false, ..
                     }) => {
@@ -977,6 +1084,7 @@ impl TuiApp {
                         }
                         self.activate_workspace_collection(ci, path);
                     }
+                    // The open collection or a request: scroll the URL.
                     _ => self.scroll_list_h(4),
                 }
             }
@@ -1237,7 +1345,7 @@ impl TuiApp {
         if !col.is_workspace() || col.workspace_root.is_none() {
             return;
         }
-        let Some(crate::collection::WsRow::Request(idx)) =
+        let Some(crate::collection::WsRow::Request { idx, .. }) =
             col.ws_rows().into_iter().nth(col.list_cursor)
         else {
             return;
@@ -1320,10 +1428,13 @@ impl TuiApp {
         col.list_cursor = 0;
     }
 
-    /// Handle Enter on a Workspace tab's file-tree list row. `../` and
-    /// subfolders navigate the filesystem breadcrumb; a collection file row
-    /// opens/collapses it (switching files warns first if the current one has
-    /// unsaved edits); a request row edits it.
+    /// Handle Enter on a Workspace tab's file-tree list row.
+    ///
+    /// - Folder: toggle expand/collapse.
+    /// - Collection file: collapse if already open; open otherwise (warns on
+    ///   unsaved edits, like the old breadcrumb model did).
+    /// - Report file: open node editor (focus moves into the report body).
+    /// - Request row: open the edit wizard.
     fn on_enter_workspace_list(&mut self, ci: usize) {
         let cursor = self.collections[ci].list_cursor;
         let Some(row) = self.collections[ci].ws_rows().into_iter().nth(cursor) else {
@@ -1332,29 +1443,30 @@ impl TuiApp {
         };
         // Selection already follows the highlight (see `workspace_select_highlighted`),
         // so the right pane matches the highlighted row before Enter is pressed.
-        // Enter is the explicit "open the editor for it" action, mirroring the
-        // request rule: a highlighted request already shows in the pane and Enter
-        // opens its wizard. For a report, Enter opens its node editor; for a
-        // collection/folder it navigates; the "up" row ascends.
         match row {
-            crate::collection::WsRow::Up => {
-                {
-                    let col = &mut self.collections[ci];
-                    col.workspace_browse.pop();
-                    col.list_cursor = 0;
+            crate::collection::WsRow::Folder { path, expanded, .. } => {
+                // Toggle: Enter on an expanded folder collapses it; on a
+                // collapsed folder expands it — consistent with typical file
+                // tree UX.
+                if expanded {
+                    self.collections[ci].workspace_expanded.remove(&path);
+                    // After collapsing the cursor may be past the new end.
+                    let len = self.collections[ci].ws_rows().len();
+                    if self.collections[ci].list_cursor >= len {
+                        self.collections[ci].list_cursor = len.saturating_sub(1);
+                    }
+                } else {
+                    self.collections[ci].workspace_expanded.insert(path);
                 }
                 self.workspace_select_highlighted(ci);
-            }
-            crate::collection::WsRow::Folder(name) => {
-                self.workspace_folder_down(ci, name);
-                self.workspace_select_highlighted(ci);
+                self.save_state();
             }
             crate::collection::WsRow::Collection { path, open, .. } => {
                 if let Some(root) = self.collections[ci].workspace_root.clone() {
                     self.hide_embedded_report_for_root(&root);
                 }
                 if open {
-                    // The open collection's own row collapses it.
+                    // The open collection's own row collapses the accordion.
                     self.collections[ci].workspace_collapsed = true;
                 } else {
                     self.activate_workspace_collection(ci, path);
@@ -1362,18 +1474,15 @@ impl TuiApp {
             }
             crate::collection::WsRow::Report { path, .. } => {
                 // The report is already shown (selected by the highlight); Enter
-                // opens its structured node editor — the report equivalent of a
-                // request's edit wizard — moving focus into the report body so
-                // the node keys act on it. `show_embedded_report` is idempotent
-                // and guards the (rare) case where Enter arrives without a prior
-                // highlight-driven selection (e.g. focus just entered the list).
+                // opens its structured node editor — moving focus into the report
+                // body so the node keys act on it.
                 if let Some(root) = self.collections[ci].workspace_root.clone() {
                     self.show_embedded_report(path, root);
                     self.open_report_node_editor();
                     self.focus = Pane::Main;
                 }
             }
-            crate::collection::WsRow::Request(_) => {
+            crate::collection::WsRow::Request { .. } => {
                 self.focus = Pane::Main;
                 self.open_edit_request_wizard(ci);
             }
@@ -1384,15 +1493,15 @@ impl TuiApp {
     /// currently highlighted — highlighting *is* selecting, exactly as for
     /// requests. A request row points `selected_entry` at it (the request shows
     /// in the pane); a report row shows that report embedded in the pane (loaded
-    /// once, then retained); every other row (collection/folder/up) returns the
+    /// once, then retained); every other row (collection/folder) returns the
     /// pane to the request/response view. Focus stays on the tree throughout.
-    /// Called on every cursor move within the tree and after folder navigation.
+    /// Called on every cursor move within the tree and after expand/collapse.
     fn workspace_select_highlighted(&mut self, ci: usize) {
         let cursor = self.collections[ci].list_cursor;
         let row = self.collections[ci].ws_rows().into_iter().nth(cursor);
         let root = self.collections[ci].workspace_root.clone();
         match row {
-            Some(crate::collection::WsRow::Request(idx)) => {
+            Some(crate::collection::WsRow::Request { idx, .. }) => {
                 self.collections[ci].selected_entry = idx;
                 if let Some(root) = root {
                     self.hide_embedded_report_for_root(&root);
@@ -1411,13 +1520,65 @@ impl TuiApp {
         }
     }
 
-    /// Descend into a subfolder in a Workspace tab's file-tree list (Enter or
-    /// Right on a folder row): push it onto the browse breadcrumb and reset
-    /// the highlight to the top of the new folder.
-    fn workspace_folder_down(&mut self, ci: usize, name: String) {
-        let col = &mut self.collections[ci];
-        col.workspace_browse.push(name);
-        col.list_cursor = 0;
+    /// Handle Left on a Workspace tab's file-tree list row.
+    ///
+    /// - Expanded folder → collapse it (cursor stays on the folder row).
+    /// - Collapsed folder, collection, report, or request → move the cursor to
+    ///   the nearest preceding row whose depth is one less than the current
+    ///   row's depth (the "parent" in the tree hierarchy).  Root-level items
+    ///   (depth 0) have no parent, so nothing happens.
+    fn on_left_workspace_list(&mut self, ci: usize) {
+        let cursor = self.collections[ci].list_cursor;
+        let rows = self.collections[ci].ws_rows();
+        let Some(row) = rows.get(cursor) else {
+            return;
+        };
+
+        // Helper to get the display-depth of any WsRow.
+        fn row_depth(r: &crate::collection::WsRow) -> usize {
+            match r {
+                crate::collection::WsRow::Folder { depth, .. } => *depth,
+                crate::collection::WsRow::Collection { depth, .. } => *depth,
+                crate::collection::WsRow::Report { depth, .. } => *depth,
+                crate::collection::WsRow::Request { depth, .. } => *depth,
+            }
+        }
+
+        match row {
+            crate::collection::WsRow::Folder {
+                path,
+                expanded: true,
+                ..
+            } => {
+                // Collapse the expanded folder; cursor stays on it.
+                let path = path.clone();
+                self.collections[ci].workspace_expanded.remove(&path);
+                // The fold may have consumed visible rows below: clamp cursor.
+                let len = self.collections[ci].ws_rows().len();
+                if self.collections[ci].list_cursor >= len {
+                    self.collections[ci].list_cursor = len.saturating_sub(1);
+                }
+                self.workspace_select_highlighted(ci);
+                self.save_state();
+            }
+            row => {
+                // Navigate to the parent: the nearest preceding row whose
+                // depth is current_depth - 1.  Root-level items (depth 0)
+                // have no parent; do nothing in that case.
+                let depth = row_depth(row);
+                if depth == 0 {
+                    return;
+                }
+                let parent_depth = depth - 1;
+                if let Some(parent_idx) = rows[..cursor]
+                    .iter()
+                    .rposition(|r| row_depth(r) == parent_depth)
+                {
+                    self.collections[ci].list_cursor = parent_idx;
+                    self.workspace_select_highlighted(ci);
+                }
+            }
+        }
     }
 
     /// "Open" a *collapsed* collection file row in a Workspace tab (Enter or

@@ -12226,6 +12226,7 @@ fn workspace_temp_dir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::write(dir.join("alpha.hurl"), "GET https://example.com/alpha\n").unwrap();
     std::fs::write(dir.join("notes.txt"), "not a collection").unwrap();
+    std::fs::write(dir.join("report.trail"), "").unwrap();
     std::fs::write(dir.join("sub").join("beta.json"), "[]").unwrap();
     dir
 }
@@ -12647,7 +12648,7 @@ fn workspace_tab_with_alpha_loaded(tag: &str) -> (TuiApp, usize, std::path::Path
     let cursor = app.collections[ci]
         .ws_rows()
         .into_iter()
-        .position(|r| matches!(r, crate::collection::WsRow::Request(_)))
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
         .expect("alpha.hurl's request row");
     app.collections[ci].list_cursor = cursor;
     (app, ci, dir)
@@ -13203,38 +13204,90 @@ fn workspace_rows_list_folders_and_collections_and_inline_the_open_collections_r
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
 
     let rows = app.collections[ci].ws_rows();
-    // Root: the `sub/` folder, then `alpha.hurl` (open, so its one request is
-    // inlined right beneath it). No `../` at the root.
-    assert!(matches!(&rows[0], WsRow::Folder(n) if n == "sub"));
-    assert!(matches!(&rows[1], WsRow::Collection { name, open: true, .. } if name == "alpha.hurl"));
-    assert!(matches!(rows[2], WsRow::Request(0)));
-    assert_eq!(rows.len(), 3);
+    // Root: the `sub/` folder (collapsed by default), then `alpha.hurl` (open,
+    // so its one request is inlined right beneath it), then `report.trail`.
+    // No `../` at the root.
+    assert!(
+        matches!(&rows[0], WsRow::Folder { name, expanded: false, .. } if name == "sub"),
+        "sub/ appears as a collapsed folder at the root"
+    );
+    assert!(
+        matches!(&rows[1], WsRow::Collection { name, open: true, .. } if name == "alpha.hurl"),
+        "alpha.hurl is open (just loaded)"
+    );
+    assert!(
+        matches!(rows[2], WsRow::Request { idx: 0, .. }),
+        "the request row is inlined under alpha.hurl"
+    );
+    assert!(
+        matches!(&rows[3], WsRow::Report { name, .. } if name == "report.trail"),
+        "report.trail appears at the root"
+    );
+    assert_eq!(
+        rows.len(),
+        4,
+        "four rows: sub/ (collapsed), alpha, request, report.trail"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn entering_a_workspace_subfolder_and_then_up_navigates_the_breadcrumb() {
+fn enter_on_a_workspace_folder_toggles_expand_collapse() {
     use crate::collection::WsRow;
-    let dir = workspace_temp_dir("ws_breadcrumb");
+    let dir = workspace_temp_dir("ws_folder_toggle");
     let (mut app, ci) = workspace_app(&dir);
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
     app.focus = Pane::List;
 
-    // Enter on the `sub/` folder row (index 0 at the root) descends into it.
+    // Initially sub/ is collapsed; beta.json should not be visible.
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        matches!(&rows[0], WsRow::Folder { name, expanded: false, .. } if name == "sub"),
+        "sub/ starts collapsed"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json")),
+        "beta.json is hidden while sub/ is collapsed"
+    );
+
+    // Enter on the sub/ folder row (index 0) expands it, making beta.json visible.
     app.collections[ci].list_cursor = 0;
     app.on_enter();
-    assert_eq!(
-        app.collections[ci].workspace_browse,
-        vec!["sub".to_string()]
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("sub")),
+        "sub/ was added to workspace_expanded after Enter"
     );
     let rows = app.collections[ci].ws_rows();
-    assert!(matches!(rows[0], WsRow::Up));
-    assert!(matches!(&rows[1], WsRow::Collection { name, open: false, .. } if name == "beta.json"));
+    assert!(
+        matches!(&rows[0], WsRow::Folder { name, expanded: true, .. } if name == "sub"),
+        "sub/ now shows as expanded"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json")),
+        "beta.json is visible under the expanded sub/"
+    );
 
-    // Enter on the `../` row (index 0) climbs back to the root.
+    // Enter again on sub/ collapses it again; beta.json disappears.
     app.collections[ci].list_cursor = 0;
     app.on_enter();
-    assert!(app.collections[ci].workspace_browse.is_empty());
+    assert!(
+        !app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("sub")),
+        "sub/ was removed from workspace_expanded after second Enter"
+    );
+    assert!(
+        !app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json")),
+        "beta.json is hidden again after collapsing sub/"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -13252,7 +13305,7 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
     assert!(app.collections[ci].workspace_collapsed);
     let rows = app.collections[ci].ws_rows();
     assert!(
-        !rows.iter().any(|r| matches!(r, WsRow::Request(_))),
+        !rows.iter().any(|r| matches!(r, WsRow::Request { .. })),
         "a collapsed collection hides its request rows"
     );
     assert!(matches!(&rows[1], WsRow::Collection { open: false, .. }));
@@ -13265,7 +13318,7 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
         app.collections[ci]
             .ws_rows()
             .iter()
-            .any(|r| matches!(r, WsRow::Request(0)))
+            .any(|r| matches!(r, WsRow::Request { idx: 0, .. }))
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -13279,11 +13332,12 @@ fn opening_a_different_collection_with_unsaved_edits_warns_before_switching() {
     app.collections[ci].entries[0].modified = true;
     app.focus = Pane::List;
 
-    // Browse into `sub/` and try to open `beta.json`.
-    app.collections[ci].list_cursor = 0; // sub/
-    app.on_enter();
-    app.collections[ci].list_cursor = 1; // beta.json
-    app.on_enter();
+    // Expand `sub/` (Enter on row 0), then try to open `beta.json` (Enter on row 1).
+    // After expansion, beta.json appears as row 1 (depth 1 inside sub/).
+    app.collections[ci].list_cursor = 0; // sub/ (collapsed)
+    app.on_enter(); // expands sub/
+    app.collections[ci].list_cursor = 1; // beta.json (now visible at depth 1)
+    app.on_enter(); // tries to open beta.json
 
     assert!(
         matches!(app.overlay, Some(Overlay::WorkspaceSwitchUnsaved { ci: c, .. }) if c == ci),
@@ -13302,9 +13356,9 @@ fn discarding_at_the_workspace_switch_warning_loads_the_new_collection() {
     app.collections[ci].entries[0].modified = true;
     app.focus = Pane::List;
     app.collections[ci].list_cursor = 0;
-    app.on_enter(); // into sub/
-    app.collections[ci].list_cursor = 1;
-    app.on_enter(); // warning
+    app.on_enter(); // expand sub/
+    app.collections[ci].list_cursor = 1; // beta.json now at row 1
+    app.on_enter(); // warning: unsaved edits
 
     // Move the selection to "Discard changes and switch" (sel 1) and confirm.
     press(&mut app, KeyCode::Down);
@@ -13327,9 +13381,9 @@ fn cancelling_the_workspace_switch_warning_keeps_the_current_collection_and_edit
     app.collections[ci].entries[0].modified = true;
     app.focus = Pane::List;
     app.collections[ci].list_cursor = 0;
-    app.on_enter();
-    app.collections[ci].list_cursor = 1;
-    app.on_enter(); // warning
+    app.on_enter(); // expand sub/
+    app.collections[ci].list_cursor = 1; // beta.json
+    app.on_enter(); // warning: unsaved edits
 
     press(&mut app, KeyCode::Esc);
 
@@ -13361,34 +13415,42 @@ fn enter_on_a_workspace_request_row_opens_the_edit_wizard() {
 }
 
 #[test]
-fn right_arrow_descends_into_a_highlighted_workspace_folder() {
+fn right_arrow_expands_a_highlighted_workspace_folder() {
     let dir = workspace_temp_dir("ws_right");
     let (mut app, ci) = workspace_app(&dir);
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
     app.focus = Pane::List;
 
-    // Highlight the `sub/` folder row (index 0) and press Right.
+    // Right on the `sub/` folder row (index 0) expands it.
     app.collections[ci].list_cursor = 0;
     press(&mut app, KeyCode::Right);
-    assert_eq!(
-        app.collections[ci].workspace_browse,
-        vec!["sub".to_string()],
-        "Right on a folder row descends into it, like Enter"
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("sub")),
+        "Right on a folder row expands it"
+    );
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        matches!(&rows[0], crate::collection::WsRow::Folder { name, expanded: true, .. } if name == "sub"),
+        "the folder row now shows as expanded"
     );
 
-    // Right on a request row must NOT navigate — it still scrolls the URL.
+    // Right on a request row must NOT expand a folder — it scrolls the URL.
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
     app.focus = Pane::List;
     let request_row = app.collections[ci]
         .ws_rows()
         .iter()
-        .position(|r| matches!(r, crate::collection::WsRow::Request(_)))
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
         .unwrap();
+    // Clear expanded state first so we can test the request-row case cleanly.
+    app.collections[ci].workspace_expanded.clear();
     app.collections[ci].list_cursor = request_row;
     press(&mut app, KeyCode::Right);
     assert!(
-        app.collections[ci].workspace_browse.is_empty(),
-        "Right on a request row does not navigate the tree"
+        app.collections[ci].workspace_expanded.is_empty(),
+        "Right on a request row does not expand any folder"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -13418,17 +13480,25 @@ fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
         app.collections[ci]
             .ws_rows()
             .iter()
-            .any(|r| matches!(r, WsRow::Request(0))),
+            .any(|r| matches!(r, WsRow::Request { idx: 0, .. })),
         "its requests are visible again"
     );
 
-    // Browse into `sub/` and open `beta.json` with Right (a different file).
-    app.collections[ci].list_cursor = 0; // sub/
-    press(&mut app, KeyCode::Right);
+    // Expand `sub/` with Right, then open `beta.json` inside it with Right.
+    app.collections[ci].list_cursor = 0; // sub/ (collapsed)
+    press(&mut app, KeyCode::Right); // expand sub/
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("sub")),
+        "sub/ is now expanded"
+    );
+    // beta.json is now at row 1 (depth 1, inside sub/).
+    // Find the first collection row that is *not* alpha.hurl.
     let beta_row = app.collections[ci]
         .ws_rows()
         .iter()
-        .position(|r| matches!(r, WsRow::Collection { .. }))
+        .position(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json"))
         .unwrap();
     app.collections[ci].list_cursor = beta_row;
     press(&mut app, KeyCode::Right);
@@ -13451,10 +13521,11 @@ fn always_save_preference_auto_saves_instead_of_prompting_on_a_workspace_switch(
     app.collections[ci].entries[0].modified = true;
     app.focus = Pane::List;
 
-    // Browse into `sub/` and open `beta.json` — no prompt should appear.
+    // Expand `sub/` (Enter on row 0), then open `beta.json` (Enter on row 1).
+    // With always-save on, the auto-save fires and no prompt appears.
     app.collections[ci].list_cursor = 0;
-    app.on_enter();
-    app.collections[ci].list_cursor = 1;
+    app.on_enter(); // expand sub/
+    app.collections[ci].list_cursor = 1; // beta.json at depth 1
     app.on_enter();
 
     assert!(
@@ -13472,6 +13543,196 @@ fn always_save_preference_auto_saves_instead_of_prompting_on_a_workspace_switch(
         "the edit was auto-saved to disk before switching"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── NEW: expand/collapse tree model tests ────────────────────────────────────
+
+/// Build a workspace root with TWO sibling subfolders (each holding one
+/// collection file), so we can test that expanding both leaves both open.
+fn workspace_temp_dir_two_siblings(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("folderA")).unwrap();
+    std::fs::create_dir_all(dir.join("folderB")).unwrap();
+    std::fs::write(
+        dir.join("folderA").join("a.hurl"),
+        "GET https://example.com/a
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("folderB").join("b.hurl"),
+        "GET https://example.com/b
+",
+    )
+    .unwrap();
+    dir
+}
+
+/// Expanding two sibling folders leaves BOTH expanded simultaneously — the
+/// new tree model does not collapse the first when the second is opened.
+#[test]
+fn expanding_two_sibling_folders_both_stay_open() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_siblings("ws_two_siblings");
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+
+    let rows = app.collections[ci].ws_rows();
+    // Both folders start collapsed; no collection files visible yet.
+    assert_eq!(
+        rows.len(),
+        2,
+        "only the two collapsed folder rows at the root"
+    );
+
+    // Find the row indices for the two folders.
+    let a_idx = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Folder { name, .. } if name == "folderA"))
+        .expect("folderA row");
+    let b_idx = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Folder { name, .. } if name == "folderB"))
+        .expect("folderB row");
+
+    // Expand folderA.
+    app.collections[ci].list_cursor = a_idx;
+    app.on_enter();
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("folderA")),
+        "folderA is expanded"
+    );
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "a.hurl")),
+        "a.hurl is visible after expanding folderA"
+    );
+
+    // Expand folderB — folderA must stay expanded.
+    // (Re-find b_idx in the now-longer row list.)
+    let b_idx_new = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Folder { name, .. } if name == "folderB"))
+        .expect("folderB row after folderA expanded");
+    app.collections[ci].list_cursor = b_idx_new;
+    app.on_enter();
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("folderA")),
+        "folderA is STILL expanded after folderB was expanded"
+    );
+    assert!(
+        app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("folderB")),
+        "folderB is also expanded"
+    );
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "a.hurl")),
+        "a.hurl still visible — folderA stayed open"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "b.hurl")),
+        "b.hurl now visible — folderB is open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // Suppress unused-variable warnings about the a/b_idx before expand.
+    let _ = (a_idx, b_idx);
+}
+
+/// Collapsing an expanded folder hides all of its children (files and further
+/// nested folders), even when they were themselves expanded.
+#[test]
+fn collapsing_a_folder_hides_its_children() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("ws_collapse_hides");
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+
+    // Expand `sub/` so beta.json is visible.
+    let sub_idx = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Folder { name, .. } if name == "sub"))
+        .expect("sub/ row");
+    app.collections[ci].list_cursor = sub_idx;
+    app.on_enter(); // expand
+    assert!(
+        app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json")),
+        "beta.json is visible after expanding sub/"
+    );
+
+    // Now collapse `sub/` via Left arrow.
+    app.collections[ci].list_cursor = sub_idx; // sub/ is still at the same index
+    press(&mut app, KeyCode::Left);
+    assert!(
+        !app.collections[ci]
+            .workspace_expanded
+            .contains(&dir.join("sub")),
+        "sub/ is no longer in workspace_expanded after Left"
+    );
+    assert!(
+        !app.collections[ci]
+            .ws_rows()
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "beta.json")),
+        "beta.json is hidden after collapsing sub/"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Expanded-folder state survives a `PersistedTab` round-trip (serialize →
+/// JSON → deserialize → restore), so the tree state is remembered across
+/// restarts.
+#[test]
+fn workspace_expanded_set_survives_persistence_round_trip() {
+    use crate::persistence::PersistedTab;
+    use std::collections::HashSet;
+
+    let dir = workspace_temp_dir("ws_persist_expand");
+
+    // Build a Collection with sub/ expanded.
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    col.workspace_expanded.insert(dir.join("sub"));
+
+    // Snapshot → JSON → restore.
+    let tab = PersistedTab::from_collection(&col, None);
+    let json = serde_json::to_string(&tab).expect("serialise");
+    let tab2: PersistedTab = serde_json::from_str(&json).expect("deserialise");
+    let (restored, _pending) = tab2.into_collection(None);
+
+    // The workspace_root must survive the round-trip.
+    assert_eq!(restored.workspace_root, Some(dir.clone()));
+    // sub/ must be expanded in the restored collection.
+    assert!(
+        restored.workspace_expanded.contains(&dir.join("sub")),
+        "sub/ is expanded in the restored collection"
+    );
+    // An old state JSON without the field must default to empty (no expanded folders).
+    let old_json = r#"{"name":"ws","workspace_root":"/some/path"}"#;
+    let old_tab: PersistedTab =
+        serde_json::from_str(old_json).expect("old state without workspace_expanded_paths");
+    assert!(
+        old_tab.workspace_expanded_paths.is_empty(),
+        "missing field defaults to empty — backward compatible with old state files"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = HashSet::<std::path::PathBuf>::new(); // suppress unused import hint
 }
 
 #[test]
@@ -13521,6 +13782,10 @@ fn the_workspace_picker_popup_renders_its_tree_filter_state_and_footer_hint() {
     );
     assert!(text.contains("alpha.hurl"));
     assert!(text.contains("sub"));
+    assert!(
+        text.contains(&format!("{}  report.trail", super::draw::REPORT_ICON)),
+        "report files are rendered with the REPORT_ICON"
+    );
     assert!(
         !text.contains("notes.txt"),
         "notes.txt is excluded by the .hurl/.json filter"
@@ -15519,7 +15784,7 @@ fn report_binding_panel_shows_the_base_directory() {
     let mut app = TuiApp::default();
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
-    app.reports[idx].report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
+    app.reports[idx].report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
     let s = Strings::for_language(&Language::English);
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
@@ -15959,8 +16224,10 @@ fn background_report_run_delivers_a_result_via_poll() {
     assert!(app.pending_report_runs.is_empty());
 }
 
-/// A cancelled background run's delivered result is discarded (not stored on the
-/// tab), and the running flag is cleared.
+/// A run stopped before any skeleton arrives has no partial result: the stop
+/// flag prevents the `Skeleton` update from being installed, so `result` stays
+/// `None`. The running flag is cleared and the tab is left in whatever state it
+/// was before the run started.
 #[test]
 fn cancelled_background_report_run_discards_its_result() {
     let mut app = TuiApp::default();
@@ -15983,7 +16250,8 @@ fn cancelled_background_report_run_discards_its_result() {
 
     let body = "{}".to_string();
     app.start_report_run_faked(move |_| FakeReportRunner { body });
-    // Cancel it before polling: the poller must discard the arriving result.
+    // Stop it before polling: the Skeleton update is discarded, so no partial
+    // result is ever installed — there is nothing to retain.
     app.running_reports
         .get(&report_id)
         .unwrap()
@@ -15996,10 +16264,10 @@ fn cancelled_background_report_run_discards_its_result() {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(app.running_reports.is_empty(), "cancel clears the run flag");
+    assert!(app.running_reports.is_empty(), "stop clears the run flag");
     assert!(
         app.reports[idx].result.is_none(),
-        "a cancelled run's result is discarded"
+        "no result: the skeleton was never installed before the run was stopped"
     );
 }
 
@@ -16132,10 +16400,120 @@ fn streaming_report_updates_fill_the_greyed_skeleton_row_by_row() {
     ));
 }
 
+/// Stopping a run mid-flight retains the partial grid: rows that completed
+/// keep their real responses, while rows that hadn't started yet remain as
+/// greyed skeleton placeholders. The view stays on Results, no row is left
+/// rendered as "running", and the status reflects the partial stop.
+#[test]
+fn stopping_a_run_retains_partial_results() {
+    use super::reports::{ReportRunUpdate, ReportView};
+    use crate::i18n::Status;
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "send".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/send".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let report_id = app.reports[idx].report.id;
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR X IN [\"a\", \"b\", \"c\"]\n    REPORT REQUEST send\nEND\n",
+    );
+    app.revalidate_report(idx);
+
+    let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    assert_eq!(skeleton.rows.len(), 3);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.running_reports.insert(
+        report_id,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    app.pending_report_runs.push((report_id, rx));
+
+    // 1. Skeleton → greyed grid shown on Results.
+    tx.send(ReportRunUpdate::Skeleton {
+        report_id,
+        result: skeleton.clone(),
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+    assert_eq!(app.reports[idx].view, ReportView::Results);
+
+    // 2. One row completes (row 0).
+    let mut completed = skeleton.rows[0].clone();
+    completed
+        .cells
+        .insert("send.Marker".to_string(), "done".to_string());
+    tx.send(ReportRunUpdate::Row {
+        report_id,
+        row: Box::new(completed),
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+
+    // 3. User stops the run: set the cancel flag and deliver Done, exercising
+    //    the `apply_report_run_update` cancelled branch. (In the real user path
+    //    `prepare_report_run` drops the channel immediately before Done arrives;
+    //    this drives the deferred Done path for extra coverage.)
+    app.running_reports
+        .get(&report_id)
+        .unwrap()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tx.send(ReportRunUpdate::Done {
+        report_id,
+        result: skeleton.clone(), // finalized result — must NOT replace the partial grid
+    })
+    .unwrap();
+    app.poll_report_run_updates();
+
+    // Run state is cleared.
+    assert!(app.running_reports.is_empty(), "run flag cleared on stop");
+    assert!(
+        app.reports[idx].run_progress.is_none(),
+        "run_progress cleared — no row renders as running"
+    );
+
+    // View stays on Results so the user can immediately inspect the partial output.
+    assert_eq!(
+        app.reports[idx].view,
+        ReportView::Results,
+        "view stays on Results after stop"
+    );
+
+    // The partial grid is retained: row 0 has its real response, rows 1–2 are skeleton.
+    let result = app.reports[idx]
+        .result
+        .as_ref()
+        .expect("partial result retained, not discarded");
+    assert_eq!(
+        result.rows[0].cells.get("send.Marker"),
+        Some(&"done".to_string()),
+        "completed row retains its response"
+    );
+    assert_eq!(
+        result.rows[1].cells.get("send.Marker"),
+        None,
+        "unstarted row stays as skeleton placeholder"
+    );
+
+    // Status signals a partial stop, not a full-run completion or full discard.
+    assert!(
+        matches!(app.status, Some(Status::ReportRunStopped)),
+        "status is ReportRunStopped"
+    );
+}
+
 /// Closing a report tab whose run is still streaming detaches it cleanly:
-/// the worker is cancelled, its channel retired, and the pre-run grid restored
-/// so reopening (`u`) shows a normal grid instead of a permanently greyed,
-/// half-filled "running" one the background poller can no longer reach.
+/// the worker is stopped, its channel retired, and the partial grid retained so
+/// reopening (`u`) shows the work done so far — completed rows with their real
+/// responses, unstarted rows as greyed skeleton placeholders — instead of a
+/// permanently greyed "running" grid the background poller can no longer reach.
 #[test]
 fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
     use super::reports::{ReportRunUpdate, ReportView};
@@ -16158,12 +16536,13 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
         .set_text("# collection: api\nFOR X IN [\"a\", \"b\"]\n    REPORT REQUEST send\nEND\n");
     app.revalidate_report(idx);
 
-    // Seed a prior grid, then start streaming so `run_progress` is live with
-    // that grid stashed as `prev_result`.
+    // Seed a prior grid, then start streaming so the skeleton is installed in
+    // `rt.result`. The partial grid (skeleton) is what must be retained on close.
     let mut prior = ReportResult::default();
     prior.column_order = vec!["prior".into()];
-    app.reports[idx].result = Some(prior.clone());
+    app.reports[idx].result = Some(prior);
     let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    let skeleton_columns = skeleton.column_order.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     app.running_reports.insert(
         report_id,
@@ -16182,14 +16561,14 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
     app.close_active_report_tab();
     assert!(
         app.running_reports.is_empty(),
-        "the worker's cancel flag is set and the run retired"
+        "the worker's stop flag is set and the run retired"
     );
     assert!(
         app.pending_report_runs.is_empty(),
         "the run's channel is retired so a late Done can't clobber the grid"
     );
 
-    // Reopen it: no lingering streaming state, and the pre-run grid is back.
+    // Reopen it: no lingering streaming state, and the partial (skeleton) grid is kept.
     app.reopen_closed_tab();
     let ridx = app.active_report_index().unwrap();
     assert!(
@@ -16198,16 +16577,16 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
     );
     assert_eq!(
         app.reports[ridx].result.as_ref().map(|r| &r.column_order),
-        Some(&prior.column_order),
-        "the pre-run grid is restored"
+        Some(&skeleton_columns),
+        "the partial (skeleton) grid is retained after close, not the pre-run grid"
     );
-    assert_ne!(app.reports[ridx].view, ReportView::Source);
+    assert_eq!(app.reports[ridx].view, ReportView::Results);
 }
 
-/// Cancelling a running report with a second `r` retires the run *immediately*
-/// (clears the running marker, drops the channel, rolls the grid back) rather
-/// than waiting for the worker's `Done`. This means the very next `r` starts a
-/// fresh run instead of being read as another cancel.
+/// Stopping a running report with a second `r` retires the run *immediately*
+/// (clears the running marker, drops the channel) rather than waiting for the
+/// worker's `Done`. This means the very next `r` starts a fresh run instead of
+/// being read as another stop.
 #[test]
 fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
     use super::reports::{ReportRunUpdate, ReportView};
@@ -16231,12 +16610,13 @@ fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
         .set_text("# collection: api\nREPORT REQUEST Oauth\n");
     app.revalidate_report(idx);
 
-    // Seed a prior grid, then start streaming so `run_progress` is live with
-    // that grid stashed as `prev_result` — the state a mid-run cancel must undo.
+    // Seed a prior grid, then start streaming so the skeleton is installed in
+    // `rt.result` — the partial result a mid-run stop must retain.
     let mut prior = ReportResult::default();
     prior.column_order = vec!["prior".into()];
-    app.reports[idx].result = Some(prior.clone());
+    app.reports[idx].result = Some(prior);
     let skeleton = app.dry_run_report_flow(idx).expect("expandable");
+    let skeleton_columns = skeleton.column_order.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     app.running_reports.insert(
         report_id,
@@ -16251,34 +16631,35 @@ fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
     app.poll_report_run_updates();
     assert!(app.reports[idx].run_progress.is_some(), "streaming started");
 
-    // A second `r` cancels — and retires the run synchronously.
+    // A second `r` stops the run — and retires it synchronously.
     let body = "{}".to_string();
     app.start_report_run_faked(move |_| FakeReportRunner { body });
     assert!(
         app.running_reports.is_empty(),
-        "cancel clears the running marker immediately"
+        "stop clears the running marker immediately"
     );
     assert!(
         app.pending_report_runs.is_empty(),
-        "cancel drops the run's channel immediately"
+        "stop drops the run's channel immediately"
     );
     assert!(
         app.reports[idx].run_progress.is_none(),
-        "streaming progress is cleared"
+        "streaming progress is cleared so no row shows as running"
     );
+    // The partial grid (skeleton, which replaced `prior`) is retained.
     assert_eq!(
         app.reports[idx].result.as_ref().map(|r| &r.column_order),
-        Some(&prior.column_order),
-        "the pre-run grid is restored"
+        Some(&skeleton_columns),
+        "the partial (skeleton) grid is retained, not the pre-run grid"
     );
-    assert!(matches!(app.status, Some(Status::ReportRunCancelled)));
+    assert!(matches!(app.status, Some(Status::ReportRunStopped)));
 
-    // The next `r` is *not* read as another cancel — it starts a fresh run.
+    // The next `r` is *not* read as another stop — it starts a fresh run.
     let body = "{}".to_string();
     app.start_report_run_faked(move |_| FakeReportRunner { body });
     assert!(
         app.running_reports.contains_key(&report_id),
-        "a fresh run starts right after cancel"
+        "a fresh run starts right after stop"
     );
     assert_eq!(app.pending_report_runs.len(), 1, "the fresh run is polling");
 
@@ -16766,12 +17147,16 @@ fn dry_run_previews_row_count_and_file_bindings() {
     press(&mut app, KeyCode::Char('d'));
     match app.overlay.as_ref() {
         Some(Overlay::ReportDryRun(p)) => {
-            assert_eq!(p.rows, 3);
-            assert_eq!(p.samples.len(), 3);
+            assert_eq!(p.rows, 3, "three files → three rows");
+            assert_eq!(
+                p.result.rows.len(),
+                3,
+                "result should carry three rows for the grid"
+            );
+            // Each row's variable snapshot holds the FILE loop binding.
             assert!(
-                p.samples.iter().all(|line| line.starts_with("FILE=")),
-                "each sample should show the FILE binding, got {:?}",
-                p.samples
+                p.result.rows.iter().all(|r| r.vars.contains_key("FILE")),
+                "each row should have the FILE loop binding in its vars snapshot"
             );
             assert!(p.errors.is_empty(), "a valid loop should have no problems");
         }
@@ -16870,6 +17255,152 @@ fn dry_run_overlay_scrolls_and_closes() {
     assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
     press(&mut app, KeyCode::Esc);
     assert!(app.overlay.is_none(), "Esc closes the dry-run overlay");
+}
+
+/// The dry-run preview overlay renders the same output grid as the Results
+/// view: a header row followed by one row per iteration, all in the same
+/// column format.  The grid should contain at least the column header line
+/// (row 0) and one data row for a flow that produces a row.
+#[test]
+fn dry_run_overlay_renders_grid_not_bindings_list() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ping".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ping".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Two-iteration loop so the grid has 1 header + 2 data rows.
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR X IN [\"a\", \"b\"]\n    REPORT REQUEST Ping\nEND\n");
+    app.revalidate_report(idx);
+
+    press(&mut app, KeyCode::Char('d'));
+    let p = match app.overlay.as_ref() {
+        Some(Overlay::ReportDryRun(p)) => p,
+        _ => panic!("expected ReportDryRun overlay"),
+    };
+
+    assert_eq!(p.rows, 2, "two iterations → two rows");
+    assert_eq!(p.result.rows.len(), 2, "result carries both rows");
+
+    // The rendered lines must include at least the grid header (with a column
+    // name like "Ping.HttpStatus") and two data rows.
+    let th = app.theme();
+    let s = crate::i18n::Strings::for_language(&Language::English);
+    let lines = p.lines(&s, &th);
+    // Each ratatui `Line` is built from spans — join them to get readable text.
+    let text_of = |l: &ratatui::text::Line| -> String {
+        l.spans.iter().map(|sp| sp.content.to_string()).collect()
+    };
+    let texts: Vec<String> = lines.iter().map(text_of).collect();
+
+    // There should be a line containing "Ping.HttpStatus" (the first intrinsic
+    // column emitted by REPORT REQUEST).
+    assert!(
+        texts.iter().any(|t| t.contains("Ping.HttpStatus")),
+        "grid should show column headers including Ping.HttpStatus: {texts:?}"
+    );
+    // There should be at least two data rows (one per iteration).
+    let data_rows = texts
+        .iter()
+        .filter(|t| !t.trim().is_empty() && !t.contains("Ping.HttpStatus"))
+        .count();
+    assert!(
+        data_rows >= 2,
+        "grid should have at least 2 data rows: {texts:?}"
+    );
+}
+
+/// When the static analysis detects a likely-undefined variable, the warning
+/// appears in the dry-run overlay's `var_warnings` list.
+#[test]
+fn dry_run_overlay_shows_var_availability_warnings() {
+    let mut app = TuiApp::default();
+    // Entry whose URL references {{API_KEY}}, which won't be in the env.
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Secure".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/{{API_KEY}}/data".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Secure\n");
+    // No environment loaded → base_var_names = Some([]) → API_KEY is missing.
+    app.revalidate_report(idx);
+
+    // The validation panel should already carry a Warning about API_KEY.
+    let has_diag_warning = app.reports[idx]
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Warning && d.message.contains("API_KEY"));
+    assert!(
+        has_diag_warning,
+        "validation diagnostics should warn about {{API_KEY}}: {:?}",
+        app.reports[idx].diagnostics
+    );
+
+    // The dry-run overlay should also surface the warning.
+    press(&mut app, KeyCode::Char('d'));
+    let p = match app.overlay.as_ref() {
+        Some(Overlay::ReportDryRun(p)) => p,
+        _ => panic!("expected ReportDryRun overlay"),
+    };
+    assert!(
+        p.var_warnings.iter().any(|w| w.contains("API_KEY")),
+        "dry-run overlay should list the API_KEY warning: {:?}",
+        p.var_warnings
+    );
+}
+
+/// When a variable IS supplied by the base environment, the dry-run overlay
+/// carries no var-availability warning for it.
+#[test]
+fn dry_run_no_warning_when_var_in_env() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ping".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/{{HOST}}/ping".to_string(),
+            ..Default::default()
+        }],
+    ));
+    // Create and activate an environment that provides HOST.
+    let (env, _) = crate::environment::parse_vars_pending("myenv".into(), "HOST=example.test");
+    let env_id = add_global_env(&mut app, env);
+    app.active_env_id = Some(env_id);
+
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Ping\n");
+    app.revalidate_report(idx);
+
+    let api_key_warns: Vec<_> = app.reports[idx]
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning && d.message.contains("HOST"))
+        .collect();
+    assert!(
+        api_key_warns.is_empty(),
+        "HOST is in the env — no warning expected: {:?}",
+        app.reports[idx].diagnostics
+    );
 }
 
 /// `wrap_lines_with_marker` breaks an over-long line into several, ending every
@@ -18622,7 +19153,7 @@ fn highlighting_a_request_row_shows_the_request_and_hides_the_report() {
 
     // Highlight the request row: the report hides and the request shows.
     let req_row = ws_row_pos(&app, ci, "the request", |r| {
-        matches!(r, crate::collection::WsRow::Request(_))
+        matches!(r, crate::collection::WsRow::Request { .. })
     });
     select_row(&mut app, ci, req_row);
     assert!(
@@ -18960,5 +19491,392 @@ fn a_vanished_workspace_root_degrades_to_a_plain_report_on_restore() {
     assert!(
         restored.reports[0].workspace_root.is_none(),
         "a missing workspace root degrades to a plain report tab"
+    );
+}
+
+// ─── Cell-cursor drill-down tests ──────────────────────────────────────────
+
+/// Build a two-row, three-column result for cell-cursor tests.
+fn report_with_multi_row_result() -> (TuiApp, usize) {
+    use crate::report::model::{ReportResult, ReportRow};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let cols = ["Col1", "Col2", "Col3"];
+    let mut rows = Vec::new();
+    for r in 0..3usize {
+        let mut row = ReportRow::default();
+        for (c, col) in cols.iter().enumerate() {
+            row.cells.insert(col.to_string(), format!("r{r}c{c}"));
+        }
+        rows.push(row);
+    }
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: cols.iter().map(|c| c.to_string()).collect(),
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    (app, idx)
+}
+
+#[test]
+fn result_cell_cursor_starts_none() {
+    let (app, idx) = report_with_multi_row_result();
+    assert!(
+        app.reports[idx].cell_cursor.is_none(),
+        "cursor should be None before any navigation"
+    );
+}
+
+#[test]
+fn result_cell_cursor_moves_down_with_arrow() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // First Down: initialises cursor at (0,0) then moves to (1,0).
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.reports[idx].cell_cursor, Some((1, 0)));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.reports[idx].cell_cursor, Some((2, 0)));
+}
+
+#[test]
+fn result_cell_cursor_moves_right_with_arrow() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // First Right: initialises cursor at (0,0) then moves to (0,1).
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.reports[idx].cell_cursor, Some((0, 1)));
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.reports[idx].cell_cursor, Some((0, 2)));
+}
+
+#[test]
+fn result_cell_cursor_clamps_at_bottom_edge() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // Grid has 3 rows (0..2). Ten Down presses should clamp to row 2.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Down);
+    }
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert_eq!(row, 2, "cursor must not exceed the last row");
+}
+
+#[test]
+fn result_cell_cursor_clamps_at_right_edge() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // Grid has 3 columns (0..2). Ten Right presses should clamp to col 2.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Right);
+    }
+    let (_, col) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert_eq!(col, 2, "cursor must not exceed the last column");
+}
+
+#[test]
+fn result_cell_cursor_clamps_at_top_edge() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // Move down first, then press Up many times.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Up);
+    }
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert_eq!(row, 0, "cursor must not go above row 0");
+}
+
+#[test]
+fn result_cell_cursor_home_jumps_to_first_row() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // Land at row 2, then Home.
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(app.reports[idx].cell_cursor, Some((2, 0)));
+    press(&mut app, KeyCode::Home);
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert_eq!(row, 0, "Home must jump to the first row");
+}
+
+#[test]
+fn result_cell_cursor_end_jumps_to_last_row() {
+    let (mut app, idx) = report_with_multi_row_result();
+    press(&mut app, KeyCode::Down); // initialise
+    press(&mut app, KeyCode::End);
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert_eq!(row, 2, "End must jump to the last row");
+}
+
+#[test]
+fn enter_on_cursor_opens_cell_popup() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // Navigate to row 0, col 1 (first Right initialises at (0,0) and moves
+    // to (0,1) in one step), then press Enter to open the popup.
+    press(&mut app, KeyCode::Right); // None → (0,1)
+    press(&mut app, KeyCode::Enter); // open popup
+    match &app.overlay {
+        Some(Overlay::ReportCellPopup { title, content, .. }) => {
+            assert_eq!(
+                title.as_str(),
+                "Col2",
+                "popup title should be column header"
+            );
+            assert!(
+                content.contains("r0c1"),
+                "popup content should contain the cell value; got: {content:?}"
+            );
+        }
+        _ => panic!("expected Overlay::ReportCellPopup, got a different overlay"),
+    }
+    let _ = idx;
+}
+
+#[test]
+fn enter_with_no_cursor_initialises_cursor_and_does_not_open_popup() {
+    let (mut app, idx) = report_with_multi_row_result();
+    // First Enter: no cursor → initialise cursor at (0,0), don't open popup.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.overlay.is_none(),
+        "first Enter should just select (0,0), not open the popup"
+    );
+    assert_eq!(
+        app.reports[idx].cell_cursor,
+        Some((0, 0)),
+        "cursor should be initialised to (0,0)"
+    );
+}
+
+#[test]
+fn esc_closes_cell_popup() {
+    let (mut app, _idx) = report_with_multi_row_result();
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter); // open popup
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportCellPopup { .. })),
+        "popup should be open"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "Esc must close the popup");
+}
+
+#[test]
+fn mouse_click_selects_cell_in_results_view() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_multi_row_result();
+    // Render once so `report_pane_areas` is populated.
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    // The Results pane area is the INNER rect (border already stripped by
+    // `block.inner()`).  So: area.y == header row (y_off 0),
+    // area.y+1 == first data row (y_off 1).
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 2 {
+        return; // pane not visible on this terminal size — skip
+    }
+    let click_row = area.y + 1; // first data row (inner rect: header=+0, data=+1)
+    let click_col = area.x + 1; // somewhere in the first column
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: click_col,
+        row: click_row,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    let (data_row, _col) = app.reports[idx]
+        .cell_cursor
+        .expect("click should set the cell cursor");
+    assert_eq!(data_row, 0, "click on first data row should select row 0");
+    let _ = term;
+}
+
+#[test]
+fn second_click_on_same_cell_opens_popup() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _idx) = report_with_multi_row_result();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    let click_col = area.x + 1;
+    let click_row = area.y + 1; // first data row (inner rect: header=+0, data=+1)
+    let ev = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: click_col,
+        row: click_row,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    };
+    // First click: select the cell.
+    app.on_mouse(ev);
+    assert!(app.overlay.is_none(), "first click must not open a popup");
+    // Second click on the same cell: open the popup.
+    app.on_mouse(ev);
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportCellPopup { .. })),
+        "second click on the same cell must open the drill-down popup"
+    );
+    let _ = term;
+}
+
+/// Rendering-anchored mouse test: renders to a TestBackend, finds the
+/// screen row where the known value "r1c0" (data row 1, column 0) is
+/// actually drawn, clicks on that row, and asserts `cell_cursor == Some((1, _))`.
+/// This pins the row-mapping to what's on screen rather than to assumed layout.
+#[test]
+fn mouse_click_row_maps_to_correct_data_row_by_rendered_position() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_multi_row_result();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 3 {
+        return; // not enough rows visible — skip
+    }
+
+    // Find which screen row shows "r1c0" (data row 1, col 0).
+    let buf = term.backend().buffer();
+    let target = "r1c0";
+    let found_row = (area.y..area.y + area.height).find(|&screen_row| {
+        let line: String = (area.x..area.x + area.width)
+            .map(|x| buf[(x, screen_row)].symbol().to_string())
+            .collect();
+        line.contains(target)
+    });
+    let screen_row = found_row.expect("r1c0 must be visible in the rendered buffer");
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: screen_row,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    let (data_row, _) = app.reports[idx]
+        .cell_cursor
+        .expect("click should set the cursor");
+    assert_eq!(
+        data_row, 1,
+        "clicking the rendered row for r1c0 must select data_row 1"
+    );
+}
+
+/// Clicking the header row (area.y in the inner rect) must NOT consume the
+/// click — `cell_cursor` stays None and text-selection still works.
+#[test]
+fn mouse_click_on_header_row_does_not_select_a_cell() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_multi_row_result();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // area.y is the header row in the inner rect.
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y, // header
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    assert!(
+        app.reports[idx].cell_cursor.is_none(),
+        "clicking the header row must not set cell_cursor"
+    );
+    // It also must not break text-selection: the results panel should have
+    // begun a selection (has an active region).
+    assert!(
+        app.has_any_selection(),
+        "clicking the header row must fall through to text-selection"
+    );
+    let _ = term;
+}
+
+/// With scroll > 0, the row mapping must account for the scroll offset so
+/// the click lands on the correct logical data row.
+#[test]
+fn mouse_click_with_scroll_maps_to_correct_data_row() {
+    use crate::report::model::{ReportResult, ReportRow};
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    // Build a result with 10 rows so we can scroll past the first few.
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let cols = ["A"];
+    let rows: Vec<ReportRow> = (0..10)
+        .map(|r| {
+            let mut row = ReportRow::default();
+            row.cells.insert("A".to_string(), format!("val{r}"));
+            row
+        })
+        .collect();
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: vec!["A".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+
+    // Render at a terminal large enough to see the pane.
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+
+    // Manually set scroll to 3 so the inner header (y_off 0) now shows grid
+    // line 3 (which is data row 2, since grid_row = y_off + scroll = 0 + 3;
+    // but grid_row 0 is header, 1 = data0, 2 = data1, 3 = data2).
+    // The first visible data row is at y_off 1: grid_row = 1 + 3 = 4 → data row 3.
+    app.reports[idx].results_panel.set_scroll(3);
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y + 1, // y_off = 1, grid_row = 1 + 3 = 4, data_row = 3
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    let (data_row, _) = app.reports[idx]
+        .cell_cursor
+        .expect("click should set the cursor");
+    assert_eq!(
+        data_row, 3,
+        "with scroll=3, clicking y_off=1 should select data_row 3"
     );
 }

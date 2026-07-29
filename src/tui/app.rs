@@ -435,6 +435,17 @@ pub(crate) enum Overlay {
     /// no-op runner (no HTTP). Opened with `d` in the Reports view; scrolls with
     /// Up/Down, closes with Esc/`q` (see [`crate::tui::reports::DryRunReport`]).
     ReportDryRun(Box<crate::tui::reports::DryRunReport>),
+    /// Drill-down popup for a results grid cell: shows the selected cell's full
+    /// (untruncated, unflattened) content in a scrollable, selectable panel.
+    /// Opened with Enter (or a second click on the same cell) in the Results
+    /// grid; closed with Esc. The `title` is the column header, `content` is the
+    /// raw cell value (may be multi-line), and `panel` tracks scroll + text
+    /// selection across frames.
+    ReportCellPopup {
+        title: String,
+        content: String,
+        panel: Box<tui_panel_select::MultiSelectPanel>,
+    },
     /// Column-picker overlay for a report tab: an interactive checklist of the
     /// columns the last run produced (plus the flow's raw loop/assign
     /// variables). Toggling/reordering writes back to the flow's `# columns:`
@@ -2106,7 +2117,9 @@ impl TuiApp {
                     col.workspace_filter_hurl_json = filter;
                     col.invalidate_request_json();
                     col.sync_folder_to_selected();
-                    col.set_workspace_browse_from_path();
+                    // Expand all ancestor folders of the newly-loaded file so
+                    // it is visible in the tree (and un-collapse its accordion).
+                    col.expand_ancestors_for_path();
                     col.sync_ws_cursor();
                 }
                 self.active_tab = collection_idx;

@@ -15,7 +15,7 @@
 //!
 //! Diagnostics never abort; the caller decides whether any `Error` blocks a run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt};
 
@@ -65,6 +65,21 @@ pub struct Context<'a> {
     /// exist on disk is flagged so the user finds out before running rather
     /// than after. `None` skips the filesystem check (e.g. an unsaved report).
     pub root: Option<&'a std::path::Path>,
+    /// Variable names that the report's effective base environment provides
+    /// (global + pinned, or the `# environment:` override). `None` means the
+    /// environment isn't known at validation time — the variable-availability
+    /// check is skipped entirely to avoid false positives.
+    pub base_var_names: Option<&'a [String]>,
+    /// Union of every variable name defined across ALL loaded environments —
+    /// used conservatively inside `FOR … IN ENVS` loop bodies, where any of
+    /// the named environments may be active so any of their variables is
+    /// potentially in scope. `None` skips the check inside ENVS bodies.
+    pub all_env_var_names: Option<&'a [String]>,
+    /// The bound collection's entries, used to scan each request's `{{VAR}}`
+    /// references and to know which names its `[Captures]` block defines after
+    /// it runs. `None` (unbound collection) skips the variable-availability
+    /// check entirely.
+    pub request_entries: Option<&'a [crate::hurl::HurlEntry]>,
 }
 
 /// Validate `flow` against `ctx`, returning all diagnostics (errors + warnings).
@@ -171,6 +186,17 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut scopes: Vec<HashMap<String, Producer>> = vec![HashMap::new()];
     walk(&flow.nodes, ctx, &mut scopes, &mut diags);
 
+    // Variable-availability analysis: walk the flow in execution order and
+    // warn when a request references a `{{VAR}}` that is provably not defined
+    // at that point. Only runs when both the base-env variable names AND the
+    // bound collection's entries are known; if either is absent we can't
+    // distinguish "definitely undefined" from "defined by an unknown source"
+    // and must stay silent to avoid false positives.
+    if ctx.request_entries.is_some() && ctx.base_var_names.is_some() {
+        let mut defined = initial_defined_vars(ctx);
+        check_var_availability(&flow.nodes, ctx, &mut defined, &mut diags);
+    }
+
     diags
 }
 
@@ -238,8 +264,11 @@ fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
 /// Warn when a `SHOW(...)` field can't be produced by the request: it is
 /// neither an intrinsic (`HttpStatus`/`Time`/`Asserts`/`Error`/`Response`), a
 /// `WITH` field on this statement, nor a `[Reports]` field of the resolved
-/// request. Skipped when the collection isn't bound (the field set is unknown),
-/// so it never false-warns on a real `[Reports]` field we can't see.
+/// request.  Under the additive model such a field is silently ignored at
+/// runtime (it will not appear in the output), so this is a warning rather than
+/// an error — consistent with how `check_hide_fields` handles unknown fields.
+/// Skipped when the collection isn't bound (the field set is unknown), so it
+/// never false-warns on a real `[Reports]` field we can't see.
 fn check_show_fields(
     name: &str,
     show: &[String],
@@ -282,7 +311,7 @@ fn check_show_fields(
             || report_fields.iter().any(|f| f == field);
         if !known {
             diags.push(Diagnostic::warning(format!(
-                "SHOW field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — that column will be empty"
+                "SHOW field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — it will be ignored"
             )));
         }
     }
@@ -545,6 +574,192 @@ fn check_producer(
                 "CONCAT inputs have inconsistent arity (every input must yield the \
                  same number of values per item)",
             ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Variable-availability analysis
+// ---------------------------------------------------------------------------
+
+/// Build the initial set of variable names available before the first
+/// statement executes: the base environment's keys plus the engine's
+/// built-in `PRELUDE_*` names (which always have defaults, so a request
+/// that references one is never provably undefined).
+fn initial_defined_vars(ctx: &Context) -> HashSet<String> {
+    let mut defined = HashSet::new();
+    if let Some(names) = ctx.base_var_names {
+        defined.extend(names.iter().cloned());
+    }
+    // Engine defaults — any flow can reference these without an explicit
+    // assignment and they will always resolve.
+    for name in [
+        "PRELUDE_NO_MATCH_MARKER",
+        "PRELUDE_RESPONSE_FORMAT",
+        "PRELUDE_MAX_PARALLEL",
+    ] {
+        defined.insert(name.to_string());
+    }
+    defined
+}
+
+/// Resolve a request name against the bound entries — same leaf/exact logic
+/// as [`check_request_name`] — returning the first matching entry, or `None`
+/// for an ambiguous/missing name (those cases are already reported by the
+/// structural walk; here we silently skip to avoid double-reporting).
+fn resolve_entry_by_name<'a>(
+    entries: &'a [crate::hurl::HurlEntry],
+    name: &str,
+) -> Option<&'a crate::hurl::HurlEntry> {
+    let exact: Vec<_> = entries.iter().filter(|e| e.title == name).collect();
+    if exact.len() == 1 {
+        return Some(exact[0]);
+    }
+    if exact.len() > 1 {
+        return None; // ambiguous
+    }
+    let leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.title.rsplit('/').next() == Some(name))
+        .collect();
+    if leaves.len() == 1 {
+        Some(leaves[0])
+    } else {
+        None
+    }
+}
+
+/// The named fields a producer binds by name (not position) — specifically
+/// the role names in a `FOLDERS … WITH role="glob", …` producer. These bind
+/// directly into the loop scope like `FOR (A, B) IN …` would bind `A` and `B`,
+/// so they must be treated as defined inside the loop body.
+fn producer_static_named_fields(producer: &Producer) -> Vec<String> {
+    match producer {
+        Producer::Folders { roles, .. } => roles.iter().map(|(r, _)| r.clone()).collect(),
+        // ZIP/CONCAT: union the named fields from all sub-producers.
+        Producer::Zip(ps) | Producer::Concat(ps) => {
+            ps.iter().flat_map(producer_static_named_fields).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Emit a warning for each `{{VAR}}` that `name`'s request references but
+/// that isn't in `defined` at the call site. Silently skips unresolvable
+/// request names (already reported by the structural walk).
+fn warn_if_vars_undefined(
+    name: &str,
+    ctx: &Context,
+    defined: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(entries) = ctx.request_entries else {
+        return;
+    };
+    let Some(entry) = resolve_entry_by_name(entries, name) else {
+        return; // unresolvable — structural check already warned
+    };
+    let refs = crate::request::entry_referenced_keys(entry);
+    for var in &refs {
+        if !defined.contains(var.as_str()) {
+            diags.push(Diagnostic::warning(format!(
+                "request '{name}' references {{{{{}}}}} which may not be defined at this point \
+                 in the flow — add it to the environment or assign it before this request",
+                var
+            )));
+        }
+    }
+}
+
+/// Thread the capture names of a successfully-resolved request into `defined`
+/// so that subsequent requests in the same block can use them.
+fn add_entry_captures(name: &str, ctx: &Context, defined: &mut HashSet<String>) {
+    let Some(entries) = ctx.request_entries else {
+        return;
+    };
+    let Some(entry) = resolve_entry_by_name(entries, name) else {
+        return;
+    };
+    for (cap_name, _) in &entry.captures {
+        defined.insert(cap_name.clone());
+    }
+}
+
+/// Walk `nodes` in execution order, maintaining `defined` (the set of
+/// variable names provably in scope), and emit a warning for every `{{VAR}}`
+/// in a request that isn't covered by any in-scope source.
+///
+/// Conservative design: when a scope source can't be statically enumerated
+/// (e.g. `TUPLES FROM` column names, or a `FOR … IN ENVS` body when the
+/// loaded env variable names aren't known), we skip that scope entirely and
+/// produce no warnings — under-warning is far better than a false positive.
+fn check_var_availability(
+    nodes: &[FlowNode],
+    ctx: &Context,
+    defined: &mut HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for node in nodes {
+        match node {
+            // An assignment defines the key for all subsequent nodes.
+            FlowNode::Assign { key, .. } => {
+                defined.insert(key.clone());
+            }
+            FlowNode::ListDecl { .. } => {}
+            // A bare REQUEST (no report output) — check its vars, then thread
+            // its captures forward.
+            FlowNode::Request { name } => {
+                warn_if_vars_undefined(name, ctx, defined, diags);
+                add_entry_captures(name, ctx, defined);
+            }
+            // A REPORT statement — only the REQUEST form sends HTTP.
+            FlowNode::Report(stmt) => {
+                if let ReportStmt::Request { name, .. } = stmt {
+                    warn_if_vars_undefined(name, ctx, defined, diags);
+                    add_entry_captures(name, ctx, defined);
+                }
+            }
+            // A FOR loop over a producer: pattern binders and any named fields
+            // (FOLDERS roles, TUPLES headers when statically unknown are left
+            // out — they're runtime-determined, so we err on the side of not
+            // warning). The loop body runs with a snapshot of `defined` plus
+            // those new names; changes inside the body don't leak outward.
+            FlowNode::ForEach {
+                pattern,
+                producer,
+                body,
+                ..
+            } => {
+                let mut inner = defined.clone();
+                for binder_name in pattern.named() {
+                    inner.insert(binder_name.to_string());
+                }
+                // FOLDERS roles are known statically and bind by name.
+                for fname in producer_static_named_fields(producer) {
+                    inner.insert(fname);
+                }
+                // TUPLES FROM / ZIP / CONCAT may also yield named fields at
+                // runtime (CSV headers, etc.) — we can't enumerate them here,
+                // so we don't add them. This means we may miss some true
+                // negatives inside TUPLES loops, but we'll never false-positive.
+                check_var_availability(body, ctx, &mut inner, diags);
+            }
+            // A FOR … IN ENVS loop: the loop variable is in scope, and each
+            // iteration's environment also makes its variables available.
+            // We add the union of ALL loaded env vars so we don't false-warn
+            // inside the body regardless of which env is active. If the loaded
+            // env variable names are unknown (`all_env_var_names` is None) we
+            // skip the body entirely to stay conservative.
+            FlowNode::ForEnvs { var, body, .. } => {
+                let mut inner = defined.clone();
+                inner.insert(var.clone());
+                if let Some(env_vars) = ctx.all_env_var_names {
+                    inner.extend(env_vars.iter().cloned());
+                    check_var_availability(body, ctx, &mut inner, diags);
+                }
+                // If all_env_var_names is None, skip the body — we can't know
+                // what the environment will provide, so no warnings here.
+            }
         }
     }
 }
@@ -1120,6 +1335,208 @@ mod tests {
         assert!(
             warns.is_empty(),
             "unbound flow shouldn't warn on HIDE: {warns:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Variable-availability analysis tests
+    // -----------------------------------------------------------------------
+
+    /// Make a minimal `HurlEntry` for testing: `title` as the name,
+    /// `{{VAR}}` references baked into the URL, and named captures.
+    fn test_entry(title: &str, url_vars: &[&str], captures: &[&str]) -> crate::hurl::HurlEntry {
+        use crate::hurl::HurlEntry;
+        let url: String = url_vars
+            .iter()
+            .map(|v| format!("{{{{{}}}}} ", v))
+            .collect::<String>();
+        HurlEntry {
+            title: title.to_string(),
+            method: "GET".to_string(),
+            url: format!("http://example/{}x", url),
+            captures: captures
+                .iter()
+                .map(|c| ((*c).to_string(), "jsonpath \"$.v\"".to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Validate `src` with a given context and return only the variable-
+    /// availability warning messages.
+    fn var_warns(
+        src: &str,
+        base_vars: &[&str],
+        all_env_vars: &[&str],
+        entries: &[crate::hurl::HurlEntry],
+    ) -> Vec<String> {
+        let flow = parse_flow(src).expect("test source should parse");
+        let base: Vec<String> = base_vars.iter().map(|s| s.to_string()).collect();
+        let all_env: Vec<String> = all_env_vars.iter().map(|s| s.to_string()).collect();
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            base_var_names: Some(&base),
+            all_env_var_names: Some(&all_env),
+            request_entries: Some(entries),
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be defined"))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn missing_var_in_request_url_produces_a_warning() {
+        // Oauth's URL references {{TOKEN}} which isn't in the env or in scope.
+        let entries = vec![test_entry("Oauth", &["TOKEN"], &[])];
+        let warns = var_warns(
+            "# collection: c\nREPORT REQUEST Oauth\n",
+            &[], // no env vars
+            &[],
+            &entries,
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("TOKEN")),
+            "{{TOKEN}} should warn as undefined: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn var_defined_by_base_env_does_not_warn() {
+        // When BASE_URL is in the base environment, no warning.
+        let entries = vec![test_entry("Oauth", &["BASE_URL"], &[])];
+        let warns = var_warns(
+            "# collection: c\nREPORT REQUEST Oauth\n",
+            &["BASE_URL"], // provided by env
+            &[],
+            &entries,
+        );
+        assert!(
+            warns.is_empty(),
+            "BASE_URL is in the base env — no warning expected: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn var_defined_by_explicit_assignment_does_not_warn() {
+        // An explicit `KEY=value` assignment before the request defines it.
+        let entries = vec![test_entry("Oauth", &["TOKEN"], &[])];
+        let warns = var_warns(
+            "# collection: c\nTOKEN=abc\nREPORT REQUEST Oauth\n",
+            &[], // not in env
+            &[],
+            &entries,
+        );
+        assert!(
+            warns.is_empty(),
+            "TOKEN is assigned before the request — no warning: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn var_defined_by_for_loop_binder_does_not_warn() {
+        // TOKEN is the loop binder inside a FOR loop.
+        let entries = vec![test_entry("Oauth", &["TOKEN"], &[])];
+        let warns = var_warns(
+            "# collection: c\nFOR TOKEN IN [\"x\", \"y\"]\n    REPORT REQUEST Oauth\nEND\n",
+            &[],
+            &[],
+            &entries,
+        );
+        assert!(
+            warns.is_empty(),
+            "TOKEN is a FOR loop binder — no warning: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn var_defined_by_prior_capture_does_not_warn() {
+        // Auth request captures TOKEN; then Api uses it.
+        let auth = test_entry("Auth", &[], &["TOKEN"]);
+        let api = test_entry("Api", &["TOKEN"], &[]);
+        let entries = vec![auth, api];
+        let warns = var_warns(
+            "# collection: c\nREQUEST Auth\nREPORT REQUEST Api\n",
+            &[],
+            &[],
+            &entries,
+        );
+        assert!(
+            warns.is_empty(),
+            "TOKEN is captured by Auth before Api runs — no warning: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn var_defined_by_envs_loop_does_not_warn() {
+        // Inside a FOR … IN ENVS loop, any env variable is potentially in scope.
+        let entries = vec![test_entry("Api", &["REGION"], &[])];
+        // REGION is in one of the loaded envs (all_env_vars).
+        let warns = var_warns(
+            "# collection: c\nFOR ENV IN ENVS \"prod\", \"staging\"\n    REPORT REQUEST Api\nEND\n",
+            &[],         // not in base env
+            &["REGION"], // but one of the envs provides it
+            &entries,
+        );
+        assert!(
+            warns.is_empty(),
+            "REGION comes from the ENVS loop env — no warning: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn no_warning_without_base_var_names_context() {
+        // When base_var_names is None the check is skipped entirely
+        // (conservative: we can't know what the env provides).
+        let entries = vec![test_entry("Oauth", &["MISSING"], &[])];
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let flow = parse_flow("# collection: c\nREPORT REQUEST Oauth\n").unwrap();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            base_var_names: None, // unknown
+            request_entries: Some(&entries),
+            ..Default::default()
+        };
+        let warns: Vec<_> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be defined"))
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "without base_var_names the check must be skipped: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn capture_is_only_available_after_the_capturing_request() {
+        // TOKEN is captured by Auth, but if a request runs before Auth and uses
+        // TOKEN, it should warn. After Auth the warning is gone.
+        let auth = test_entry("Auth", &[], &["TOKEN"]);
+        let before = test_entry("Before", &["TOKEN"], &[]);
+        let after = test_entry("After", &["TOKEN"], &[]);
+        let entries = vec![auth.clone(), before.clone(), after.clone()];
+        // Flow: Before (uses TOKEN — not yet captured), then Auth (captures TOKEN),
+        // then After (uses TOKEN — OK, captured by Auth).
+        let warns_before = var_warns(
+            "# collection: c\nREPORT REQUEST Before\nREQUEST Auth\nREPORT REQUEST After\n",
+            &[],
+            &[],
+            &entries,
+        );
+        assert!(
+            warns_before
+                .iter()
+                .any(|w| w.contains("TOKEN") && w.contains("Before")),
+            "TOKEN is not yet captured when Before runs: {warns_before:?}"
+        );
+        assert!(
+            !warns_before
+                .iter()
+                .any(|w| w.contains("TOKEN") && w.contains("After")),
+            "TOKEN IS captured by the time After runs: {warns_before:?}"
         );
     }
 }

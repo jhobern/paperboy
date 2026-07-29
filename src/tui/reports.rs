@@ -29,7 +29,7 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
-use crate::report::flow::{FlowNode, Header, Producer, ReportFlow};
+use crate::report::flow::{Header, ReportFlow};
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
 use crate::report::parser::opens_block;
 use crate::report::run::{
@@ -189,13 +189,21 @@ pub(crate) struct ReportTab {
     pub(crate) result: Option<ReportResult>,
     /// Live streaming state while a background run is in flight: which of the
     /// pre-built skeleton rows have been filled yet (so the grid greys the
-    /// pending ones), the path→row-index lookup that routes each streamed row to
-    /// its slot, and the prior result to restore if the run is cancelled.
-    /// `None` when no run is streaming (never run / finished / cancelled).
+    /// pending ones) and the path→row-index lookup that routes each streamed row
+    /// to its slot. `None` when no run is streaming (never run / finished /
+    /// stopped). Clearing this field is sufficient to stop highlighting rows as
+    /// "running"; the partial grid in `result` is retained automatically.
     pub(crate) run_progress: Option<RunProgress>,
     /// Selection/scroll panel backing the results grid (clip-wrapped so each
     /// row stays on one line and columns line up, like program output).
     pub(crate) results_panel: MultiSelectPanel,
+    /// Keyboard/mouse cell cursor in the results grid: `(row, col)` where both
+    /// are 0-indexed over the data rows and columns respectively — row 0 is the
+    /// first data row, not the header. `None` until the user first navigates or
+    /// clicks. Clamped on draw to the current grid bounds (which grow as rows
+    /// stream in). Reset to `None` each time a new run starts so the cursor
+    /// begins fresh on the new grid.
+    pub(crate) cell_cursor: Option<(usize, usize)>,
     /// When this report was opened from a Workspace tree, the workspace root it
     /// belongs to. This is a *link*, not UI state: the report is shown in the
     /// right pane of the Workspace collection tab rooted here, while that tab's
@@ -232,8 +240,9 @@ pub(crate) enum RowState {
 /// Per-tab live-streaming bookkeeping for an in-flight background report run.
 /// The skeleton rows are stored on [`ReportTab::result`] (so the grid renders
 /// them immediately, greyed); this tracks each row's [`RowState`] (for the
-/// status icon + greying), how to route a streamed row to its slot, and what to
-/// restore on cancel.
+/// status icon + greying) and how to route a streamed row to its slot. When the
+/// run is stopped, `run_progress` is simply cleared: completed rows already
+/// live in `result`, so the partial grid is retained automatically.
 pub(crate) struct RunProgress {
     /// One [`RowState`] per skeleton row (index-aligned with `result.rows`):
     /// `Scheduled` until it starts, `Running` while its requests are in flight,
@@ -246,10 +255,6 @@ pub(crate) struct RunProgress {
     pub(crate) index: HashMap<Vec<(usize, usize)>, usize>,
     /// How many rows have finished so far (for the progress status).
     pub(crate) done: usize,
-    /// The result shown before this run started, restored verbatim if the run is
-    /// cancelled (so a cancel discards the partial run and leaves the prior grid,
-    /// matching the pre-streaming cancel semantics).
-    pub(crate) prev_result: Option<ReportResult>,
 }
 
 /// One entry on a report's node-editor undo stack: a full snapshot of the
@@ -348,6 +353,7 @@ impl ReportTab {
             result: None,
             run_progress: None,
             results_panel,
+            cell_cursor: None,
             workspace_root: None,
             embedded_active: true,
         }
@@ -613,16 +619,17 @@ impl TuiApp {
         let Some(root) = col.workspace_root.clone() else {
             return;
         };
-        col.workspace_browse = path
-            .parent()
-            .and_then(|parent| parent.strip_prefix(&root).ok())
-            .map(|rel| {
-                rel.components()
-                    .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        col.workspace_collapsed = false;
+        // Expand all ancestor folders of this report so it is visible in the
+        // tree, then position the cursor on its row.
+        if let Some(parent) = path.parent()
+            && let Ok(rel) = parent.strip_prefix(&root)
+        {
+            let mut cur = root.clone();
+            for component in rel.components() {
+                cur.push(component);
+                col.workspace_expanded.insert(cur.clone());
+            }
+        }
         col.list_cursor = col
             .ws_rows()
             .iter()
@@ -796,11 +803,51 @@ impl TuiApp {
                     // directory, but only when it's anchored (saved / `# root:`)
                     // so a scratch report doesn't warn against the CWD.
                     let (base_dir, anchored) = report_base_dir(&rt.report);
+
+                    // Variable-availability analysis: compute the effective base
+                    // variable names. Mirrors `build_report_run_inputs` — a
+                    // `# environment:` directive names a single env; otherwise
+                    // fall back to the bound collection's active+pinned merge.
+                    // `None` when the collection is unbound (check skipped).
+                    let base_var_names: Option<Vec<String>> =
+                        match (bound, flow.header.environment()) {
+                            (_, Some(name)) => {
+                                let name = name.trim();
+                                self.global_envs
+                                    .iter()
+                                    .find(|e| e.name == name)
+                                    .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
+                            }
+                            (Some(ci), None) => Some(
+                                self.effective_env(ci)
+                                    .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
+                                    .unwrap_or_default(),
+                            ),
+                            (None, _) => None,
+                        };
+                    // Union of ALL loaded env variable names — used
+                    // conservatively inside `FOR … IN ENVS` bodies so we don't
+                    // false-warn when any of the named envs might supply a var.
+                    let mut all_env_var_names: Vec<String> = self
+                        .global_envs
+                        .iter()
+                        .flat_map(|e| e.vars.iter().map(|v| v.key.clone()))
+                        .collect();
+                    all_env_var_names.sort();
+                    all_env_var_names.dedup();
+                    // The bound collection's entries, for `{{VAR}}` scanning
+                    // and capture-name extraction.
+                    let request_entries_owned: Option<Vec<crate::hurl::HurlEntry>> =
+                        bound.map(|ci| self.collections[ci].entries.clone());
+
                     let ctx = Context {
                         request_titles: titles.as_deref(),
                         env_names: Some(&env_names),
                         request_fields: fields.as_deref(),
                         root: anchored.then_some(base_dir.as_path()),
+                        base_var_names: base_var_names.as_deref(),
+                        all_env_var_names: Some(&all_env_var_names),
+                        request_entries: request_entries_owned.as_deref(),
                     };
                     (None, None, validate(&flow, &ctx))
                 }
@@ -1002,20 +1049,18 @@ impl TuiApp {
         // which left the id in `running_reports` until the wind-down finished —
         // slow when a `PARALLEL` batch is still in flight). The detached worker
         // keeps draining in the background; its remaining messages land on the
-        // dropped receiver and are ignored. Roll the partial grid back to
-        // whatever was showing before the run (same result the deferred cancel
-        // gave, just immediate). Mirrors `close_active_report_tab`.
+        // dropped receiver and are ignored. Retain the partial grid: completed
+        // rows keep their real responses and unstarted rows remain as greyed
+        // skeleton placeholders — the user can view, save, or export the partial
+        // output. Mirrors `close_active_report_tab`.
         if let Some(cancel) = self.running_reports.remove(&report_id) {
             cancel.store(true, Ordering::Relaxed);
             self.pending_report_runs.retain(|(id, _)| *id != report_id);
             let rt = &mut self.reports[idx];
-            if let Some(prog) = rt.run_progress.take() {
-                rt.result = prog.prev_result;
-                if rt.result.is_none() && rt.view == ReportView::Results {
-                    rt.view = rt.editor_view;
-                }
-            }
-            self.status = Some(Status::ReportRunCancelled);
+            // Clear streaming progress so no row is left rendering as "running".
+            // The partial grid in `rt.result` is intentionally kept.
+            rt.run_progress = None;
+            self.status = Some(Status::ReportRunStopped);
             return None;
         }
         if let Some(reason) = self.report_run_blocker(idx) {
@@ -1182,8 +1227,10 @@ impl TuiApp {
     /// kind (see [`ReportRunUpdate`]): a **Skeleton** installs the greyed
     /// projected grid and switches to Results; a **Row** fills (and un-greys) its
     /// slot and advances the progress status; **Done** swaps in the finalized
-    /// result. A run cancelled by the user discards its streamed rows and
-    /// restores the prior grid (matching the pre-streaming cancel semantics).
+    /// result. When the user stops a run mid-flight, the partial grid is retained
+    /// (completed rows keep their real responses; unstarted rows stay as greyed
+    /// skeleton placeholders) so the user can view, save, or export the work done
+    /// so far.
     fn apply_report_run_update(&mut self, update: ReportRunUpdate) {
         let report_id = update.report_id();
         match update {
@@ -1203,14 +1250,15 @@ impl TuiApp {
                     .map(|(i, row)| (row.path.clone(), i))
                     .collect();
                 let rt = &mut self.reports[idx];
-                let prev_result = rt.result.take();
                 rt.result = Some(result);
                 rt.run_progress = Some(RunProgress {
                     states: vec![RowState::Scheduled; n],
                     index,
                     done: 0,
-                    prev_result,
                 });
+                // A new run invalidates the cell cursor (column layout may
+                // change) — reset it so the cursor starts fresh on the new grid.
+                rt.cell_cursor = None;
                 // Show the (greyed) grid straight away so the run's shape/size
                 // is visible before any request completes — unless the user is
                 // mid-edit, in which case just stage it (they can flip with Tab).
@@ -1277,19 +1325,25 @@ impl TuiApp {
                     return;
                 };
                 let rt = &mut self.reports[idx];
-                let progress = rt.run_progress.take();
+                // Take run_progress to clear the running-row highlight regardless of
+                // whether the run completed normally or was stopped.
+                let _progress = rt.run_progress.take();
                 if cancelled {
-                    // Discard the partial streamed run: restore whatever grid was
-                    // showing before it started (may be nothing).
-                    rt.result = progress.and_then(|p| p.prev_result);
-                    if rt.result.is_none() && rt.view == ReportView::Results {
-                        rt.view = rt.editor_view;
-                    }
+                    // Run was stopped: `progress` has already been taken, so no
+                    // row is left rendering as "running". Keep `rt.result` as the
+                    // partial grid — completed rows have their real responses and
+                    // unstarted rows remain as greyed skeleton placeholders. Stay
+                    // on Results so the user can immediately view, save, or export
+                    // the work done so far.
+                    self.status = Some(Status::ReportRunStopped);
                     return;
                 }
                 let rows = result.rows.len();
                 let errors = result.errors.len();
                 rt.result = Some(result);
+                // The finalized grid may have different columns/rows than the
+                // streamed skeleton — reset cursor so it starts fresh.
+                rt.cell_cursor = None;
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
@@ -1299,9 +1353,10 @@ impl TuiApp {
         }
     }
 
-    /// Whether the run for `report_id` has been cancelled by the user (its
-    /// cancel flag is set). A run with no live flag counts as cancelled/finished
-    /// so a stray late message is ignored.
+    /// Whether the run for `report_id` has been stopped by the user (its cancel
+    /// flag is set). A run with no live flag is treated as stopped/finished so
+    /// stray late messages (e.g. from a run whose channel was already dropped)
+    /// are silently ignored.
     fn report_run_cancelled(&self, report_id: u64) -> bool {
         self.running_reports
             .get(&report_id)
@@ -1323,6 +1378,7 @@ impl TuiApp {
                 let errors = result.errors.len();
                 let rt = &mut self.reports[idx];
                 rt.result = Some(result);
+                rt.cell_cursor = None;
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
                 self.status = Some(Status::ReportRunDone { rows, errors });
@@ -1498,28 +1554,39 @@ impl TuiApp {
     }
 
     /// Dry-run the active report: expand its flow with a no-op runner (no HTTP)
-    /// and open a preview overlay summarising the projected row count, a sample
-    /// of the first few iterations' resolved bindings, and any producer /
-    /// request-resolution problems — so misaligned `ZIP`s, empty globs and
-    /// Cartesian-product blow-ups are caught before firing real requests. A run
-    /// that can't even be expanded (parse error / unbound collection) reports
-    /// why in the status bar instead.
+    /// and open a preview overlay showing the projected output grid (identical
+    /// to what a real run would produce, but with all HTTP-response fields
+    /// blank), plus any variable-availability warnings from static analysis and
+    /// any producer / request-resolution problems — so misaligned `ZIP`s,
+    /// empty globs, Cartesian-product blow-ups and likely-undefined variables
+    /// are caught before firing real requests. A run that can't even be
+    /// expanded (parse error / unbound collection) reports why in the status
+    /// bar instead.
     pub(crate) fn open_report_dry_run(&mut self) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
         match self.dry_run_report_flow(idx) {
             Ok(result) => {
-                let names = self.reports[idx]
+                // The flow header is needed to resolve `# columns:` for the
+                // preview grid; fall back to an empty header if the flow is
+                // somehow unparseable (shouldn't happen since dry_run_report_flow
+                // already checked for parse errors).
+                let header = self.reports[idx]
                     .report
                     .flow()
-                    .map(|f| flow_local_names(&f.nodes))
+                    .map(|f| f.header)
                     .unwrap_or_default();
-                let preview = DryRunReport::from_result(
-                    &Strings::for_language(&self.language),
-                    &result,
-                    &names,
-                );
+                // Extract the variable-availability warnings that validate()
+                // computed at the last revalidation; these are Warning-severity
+                // diagnostics and are non-blocking by design.
+                let var_warnings: Vec<String> = self.reports[idx]
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == Severity::Warning)
+                    .map(|d| d.message.clone())
+                    .collect();
+                let preview = DryRunReport::from_result(result, header, var_warnings);
                 self.dry_run_scroll = 0;
                 self.overlay = Some(Overlay::ReportDryRun(Box::new(preview)));
             }
@@ -1527,7 +1594,174 @@ impl TuiApp {
         }
     }
 
-    /// Key handling for the report dry-run overlay ([`Overlay::ReportDryRun`]).
+    /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.
+    /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
+    /// the data-row/column count so it never points outside the grid.
+    fn result_cursor_move(&mut self, dr: i32, dc: i32) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let Some(result) = &self.reports[idx].result else {
+            return;
+        };
+        let header = self.reports[idx]
+            .report
+            .flow()
+            .map(|f| f.header)
+            .unwrap_or_default();
+        let ncols = result.resolved_columns(&header).len();
+        let nrows = result.rows.len();
+        if nrows == 0 || ncols == 0 {
+            return;
+        }
+        let (cur_row, cur_col) = self.reports[idx].cell_cursor.unwrap_or((0, 0));
+        let new_row = (cur_row as i32 + dr).clamp(0, nrows as i32 - 1) as usize;
+        let new_col = (cur_col as i32 + dc).clamp(0, ncols as i32 - 1) as usize;
+        self.reports[idx].cell_cursor = Some((new_row, new_col));
+    }
+
+    /// Jump the cell cursor to the first data row (row 0) while keeping the
+    /// current column. If there is no cursor yet, lands at `(0, 0)`.
+    fn result_cursor_jump_home(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if self.reports[idx]
+            .result
+            .as_ref()
+            .is_some_and(|r| !r.rows.is_empty())
+        {
+            let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
+            self.reports[idx].cell_cursor = Some((0, col));
+        }
+    }
+
+    /// Jump the cell cursor to the last data row while keeping the current
+    /// column. If there is no cursor yet, lands at the last row, column 0.
+    fn result_cursor_jump_end(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let nrows = self.reports[idx]
+            .result
+            .as_ref()
+            .map(|r| r.rows.len())
+            .unwrap_or(0);
+        if nrows > 0 {
+            let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
+            self.reports[idx].cell_cursor = Some((nrows - 1, col));
+        }
+    }
+
+    /// Open the cell drill-down popup ([`Overlay::ReportCellPopup`]) for the
+    /// currently-selected cell. If no cell is selected yet, selects `(0, 0)` and
+    /// waits for the user's next Enter press.
+    pub(crate) fn open_result_cell_popup(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        // Lazily initialise cursor on the first Enter press so the first Enter
+        // simply selects a cell rather than immediately opening the popup.
+        let Some((row, col)) = self.reports[idx].cell_cursor else {
+            self.result_cursor_move(0, 0); // lands at (0, 0)
+            return;
+        };
+        let Some(result) = &self.reports[idx].result else {
+            return;
+        };
+        let header = self.reports[idx]
+            .report
+            .flow()
+            .map(|f| f.header)
+            .unwrap_or_default();
+        let columns = result.resolved_columns(&header);
+        let Some(col_def) = columns.get(col) else {
+            return;
+        };
+        let Some(data_row) = result.rows.get(row) else {
+            return;
+        };
+        let title = col_def.header.clone();
+        // Full (unflattened) cell value — may be multi-line.
+        let content = col_def.value(data_row, &result.no_match_marker);
+        let mut panel = Box::new(MultiSelectPanel::new());
+        // Wrap mode so long values wrap to multiple lines inside the popup.
+        panel.set_wrap_mode(WrapMode::Wrap);
+        self.overlay = Some(Overlay::ReportCellPopup {
+            title,
+            content,
+            panel,
+        });
+    }
+
+    /// Key handling for the cell drill-down popup ([`Overlay::ReportCellPopup`]).
+    /// Up/Down/PageUp/PageDown/Home/End scroll the panel; `y` copies the
+    /// selection (or whole content) to the clipboard; Esc closes. All other keys
+    /// keep the popup open (so the user can interact with the panel). The overlay
+    /// was already `take`n by the dispatcher, so closing is just not restoring it.
+    pub(crate) fn result_cell_popup_key_handler(
+        &mut self,
+        key: KeyEvent,
+        title: String,
+        content: String,
+        mut panel: Box<MultiSelectPanel>,
+    ) {
+        let keep = |app: &mut TuiApp, title, content, panel| {
+            app.overlay = Some(Overlay::ReportCellPopup {
+                title,
+                content,
+                panel,
+            });
+        };
+        match key.code {
+            // Esc closes the popup.
+            KeyCode::Esc => {}
+            // Scroll the popup panel (the draw pass clamps overshoot via
+            // `clamp_scroll` so over-large offsets are safe here).
+            KeyCode::Up => {
+                panel.set_scroll(panel.scroll().saturating_sub(1));
+                keep(self, title, content, panel);
+            }
+            KeyCode::Down => {
+                panel.set_scroll(panel.scroll().saturating_add(1));
+                keep(self, title, content, panel);
+            }
+            KeyCode::PageUp => {
+                panel.set_scroll(panel.scroll().saturating_sub(10));
+                keep(self, title, content, panel);
+            }
+            KeyCode::PageDown => {
+                panel.set_scroll(panel.scroll().saturating_add(10));
+                keep(self, title, content, panel);
+            }
+            KeyCode::Home => {
+                panel.set_scroll(0);
+                keep(self, title, content, panel);
+            }
+            KeyCode::End => {
+                panel.set_scroll(u16::MAX);
+                keep(self, title, content, panel);
+            }
+            // `y` copies the panel selection to the clipboard, or — when
+            // nothing is selected — the entire cell content.
+            KeyCode::Char('y') => {
+                use super::clipboard::copy_to_clipboard;
+                let text = panel
+                    .selected_text(None)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| content.clone());
+                if !text.is_empty() {
+                    copy_to_clipboard(&text);
+                    self.status = Some(crate::i18n::Status::Copied);
+                }
+                keep(self, title, content, panel);
+            }
+            // Any other key keeps the popup open (supports Shift+Arrow
+            // text-selection extension, etc.).
+            _ => keep(self, title, content, panel),
+        }
+    }
+
     /// Mirrors the Help overlay: Up/Down/PageUp/PageDown/Home/End scroll the
     /// preview (the draw pass clamps overshoot against the real content height);
     /// Esc, `q` or Enter close it, and — as with Help — any other key dismisses
@@ -1798,19 +2032,17 @@ impl TuiApp {
         // If this tab was still streaming a run, detach it cleanly before
         // stashing. The poller matches updates to *open* tabs by id and can't
         // reach a closed/stashed tab, so a live `run_progress` would reopen as a
-        // permanently greyed grid and a late `Done` could clobber the restored
-        // one. Cancel the worker, retire its channel, and restore whatever grid
-        // was showing before the run started (the same result a `r`-cancel gives).
+        // permanently greyed grid. Cancel the worker, retire its channel, and
+        // retain the partial grid (completed rows keep their real responses,
+        // unstarted rows stay as greyed placeholders) so reopening the tab with
+        // `u` shows the work done so far.
         let report_id = rt.report.id;
         if let Some(cancel) = self.running_reports.remove(&report_id) {
             cancel.store(true, Ordering::Relaxed);
             self.pending_report_runs.retain(|(id, _)| *id != report_id);
-            if let Some(prog) = rt.run_progress.take() {
-                rt.result = prog.prev_result;
-                if rt.result.is_none() && rt.view == ReportView::Results {
-                    rt.view = rt.editor_view;
-                }
-            }
+            // Clear streaming progress so no row is left rendering as "running".
+            // The partial grid in `rt.result` is intentionally kept.
+            rt.run_progress = None;
         }
         self.closed_tabs
             .push(super::app::ClosedTab::Report(ridx, Box::new(rt)));
@@ -1880,6 +2112,49 @@ impl TuiApp {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // When the results grid is visible and has data, plain (unmodified)
+        // arrow keys drive the cell cursor rather than cycling tabs or
+        // scrolling the panel. Home/End also jump to the first/last data row.
+        // Shift+arrows still extend panel text selections (unchanged), and
+        // Ctrl+arrows still cycle tabs for a standalone report.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].view == ReportView::Results
+            && self.reports[idx].result.is_some()
+            && !ctrl
+            && !shift
+        {
+            match key.code {
+                KeyCode::Up => {
+                    self.result_cursor_move(-1, 0);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.result_cursor_move(1, 0);
+                    return;
+                }
+                KeyCode::Left => {
+                    self.result_cursor_move(0, -1);
+                    return;
+                }
+                KeyCode::Right => {
+                    self.result_cursor_move(0, 1);
+                    return;
+                }
+                KeyCode::Home => {
+                    self.result_cursor_jump_home();
+                    return;
+                }
+                KeyCode::End => {
+                    self.result_cursor_jump_end();
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.open_result_cell_popup();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
             // Tab navigation (mirrors the collection-view bindings). `[`/`]`
@@ -2629,66 +2904,37 @@ fn sanitize_file_stem(name: &str) -> String {
     }
 }
 
-/// How many sample iterations the dry-run preview lists before collapsing the
-/// rest into an "… +N more" line.
-const DRY_RUN_SAMPLE_CAP: usize = 12;
-
-/// Preview state for the report dry-run overlay ([`Overlay::ReportDryRun`]): the
-/// projected row count, a sample of the first few iterations' resolved
-/// bindings, and any producer / request-resolution problems the expansion hit —
-/// all computed by expanding the flow with a no-op runner (no HTTP). `scroll`
-/// is the overlay's own vertical offset, so a long preview scrolls rather than
-/// clipping silently.
+/// Preview state for the report dry-run overlay ([`Overlay::ReportDryRun`]):
+/// the full [`ReportResult`] produced by expanding the flow with a no-op
+/// runner (so all loop iterations, ZIP pairings and nested scopes are resolved
+/// but no HTTP is sent) plus any variable-availability warnings from static
+/// analysis. The result's column model is populated with everything knowable
+/// without HTTP; intrinsic response fields (`HttpStatus`, `Time`, etc.) are
+/// blank, matching a real grid cell that received no response.
 pub(crate) struct DryRunReport {
-    /// Total rows the flow would emit (`0` = nothing would run, e.g. an empty
-    /// glob at the outermost loop).
+    /// Total rows the flow would emit (`0` = empty glob, mismatched ZIP, …).
     pub(crate) rows: usize,
-    /// One line per sampled iteration (`FILE=a.jpg, PREFIX=…`), capped at
-    /// [`DRY_RUN_SAMPLE_CAP`].
-    pub(crate) samples: Vec<String>,
-    /// How many rows beyond the sampled ones exist (drives the "… +N more"
-    /// note); `0` when every row is shown.
-    pub(crate) more: usize,
+    /// The full dry-run result, used to render the same output grid the real
+    /// run would show (via [`report_grid_lines`]).
+    pub(crate) result: ReportResult,
+    /// The flow's header (needed to resolve the `# columns:` directive for
+    /// [`report_grid_lines`]).
+    header: Header,
     /// Deduplicated producer / resolution problems (empty glob, ZIP length
     /// mismatch, unresolved request name, unloaded environment, …).
     pub(crate) errors: Vec<String>,
+    /// Variable-availability warnings from static analysis (any `{{VAR}}`
+    /// that may not be defined when the request that references it runs).
+    pub(crate) var_warnings: Vec<String>,
 }
 
 impl DryRunReport {
-    /// Summarise an expanded [`ReportResult`] into the preview. `names` is the
-    /// set of flow-defined variable names ([`flow_local_names`]) so each sample
-    /// shows just the per-iteration bindings, hiding the inherited environment
-    /// variables that also live in a row's `vars` snapshot.
-    fn from_result(
-        s: &Strings,
-        result: &ReportResult,
-        names: &std::collections::HashSet<String>,
-    ) -> Self {
-        let samples: Vec<String> = result
-            .rows
-            .iter()
-            .take(DRY_RUN_SAMPLE_CAP)
-            .map(|row| {
-                let mut parts: Vec<(&String, &String)> = row
-                    .vars
-                    .iter()
-                    .filter(|(k, _)| names.contains(k.as_str()))
-                    .collect();
-                parts.sort_by(|a, b| a.0.cmp(b.0));
-                if parts.is_empty() {
-                    s.report_dry_run_no_bindings.to_string()
-                } else {
-                    parts
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            })
-            .collect();
-        let more = result.rows.len().saturating_sub(samples.len());
+    /// Build the preview from an expanded [`ReportResult`] (no HTTP), the
+    /// flow's [`Header`] (for column resolution), and the variable-availability
+    /// `var_warnings` already extracted from the report's diagnostics.
+    fn from_result(result: ReportResult, header: Header, var_warnings: Vec<String>) -> Self {
         // A Cartesian product can repeat the same producer error on every
-        // iteration, so collapse duplicates while keeping first-seen order.
+        // iteration — collapse duplicates while keeping first-seen order.
         let mut seen = std::collections::HashSet::new();
         let errors: Vec<String> = result
             .errors
@@ -2696,117 +2942,103 @@ impl DryRunReport {
             .filter(|e| seen.insert((*e).clone()))
             .cloned()
             .collect();
+        let rows = result.rows.len();
         Self {
-            rows: result.rows.len(),
-            samples,
-            more,
+            rows,
+            result,
+            header,
             errors,
+            var_warnings,
         }
     }
 
-    /// Render the preview body as themed lines (used by the overlay draw pass
-    /// and, via its length, for scroll clamping).
+    /// Render the preview body as themed lines for the overlay draw pass.
+    ///
+    /// Layout:
+    /// 1. Preview-notice label (marks this as a dry run, not a real result).
+    /// 2. Projected row count.
+    /// 3. The output grid (same format as the Results view) — loop-resolved
+    ///    variables and structure are visible; HTTP intrinsics are blank.
+    /// 4. Variable-availability warnings (if any) — yellow `!` prefix.
+    /// 5. Producer/expansion errors (if any) — red `•` prefix.
+    /// 6. "No problems found." when both 4 and 5 are empty.
     pub(crate) fn lines(&self, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Dry-run notice: distinguish the preview grid from a real-run result.
+        lines.push(Line::from(Span::styled(
+            s.report_dry_run_preview_notice.to_string(),
+            Style::default().fg(th.dim),
+        )));
+        lines.push(Line::from(""));
+
+        // Row count.
         lines.push(Line::from(Span::styled(
             format!("{} {}", s.report_dry_run_rows, self.rows),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            s.report_dry_run_samples_heading.to_string(),
-            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-        )));
-        if self.samples.is_empty() {
+
+        // Output grid — identical path to the Results view.
+        if self.rows == 0 {
             lines.push(Line::from(Span::styled(
                 s.report_dry_run_no_rows.to_string(),
                 Style::default().fg(th.dim),
             )));
         } else {
-            for (i, sample) in self.samples.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("#{}  ", i + 1), Style::default().fg(th.dim)),
-                    Span::styled(sample.clone(), Style::default().fg(th.text)),
-                ]));
-            }
-            if self.more > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!("… +{} {}", self.more, s.report_dry_run_more),
-                    Style::default().fg(th.dim),
-                )));
-            }
+            // Pass `None` for states (no streaming progress in a dry run) so
+            // the grid renders without status icons, exactly like a finished run.
+            lines.extend(report_grid_lines(
+                &self.result,
+                &self.header,
+                None,
+                th,
+                None,
+            ));
         }
+
         lines.push(Line::from(""));
-        if self.errors.is_empty() {
+
+        // Warnings and errors sections.
+        let has_warnings = !self.var_warnings.is_empty();
+        let has_errors = !self.errors.is_empty();
+
+        if !has_warnings && !has_errors {
             lines.push(Line::from(Span::styled(
                 s.report_dry_run_no_problems.to_string(),
                 Style::default().fg(th.accent),
             )));
         } else {
-            lines.push(Line::from(Span::styled(
-                s.report_dry_run_problems_heading.to_string(),
-                Style::default().fg(th.err).add_modifier(Modifier::BOLD),
-            )));
-            for err in &self.errors {
+            if has_warnings {
                 lines.push(Line::from(Span::styled(
-                    format!("• {err}"),
-                    Style::default().fg(th.err),
+                    s.report_dry_run_warnings_heading.to_string(),
+                    Style::default().fg(th.pending).add_modifier(Modifier::BOLD),
                 )));
-            }
-        }
-        lines
-    }
-}
-
-/// Collect the flow-defined variable names — loop binders, `KEY=` assignments
-/// (excluding the `PRELUDE_*` engine settings), `ENVS` vars and `FOLDERS … WITH`
-/// role names — so the dry-run preview shows just those per-iteration bindings,
-/// filtering out the inherited environment variables that also live in a row's
-/// variable snapshot.
-fn flow_local_names(nodes: &[FlowNode]) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    collect_flow_names(nodes, &mut out);
-    out
-}
-
-fn collect_flow_names(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
-    for node in nodes {
-        match node {
-            FlowNode::Assign { key, .. } if !key.starts_with("PRELUDE_") => {
-                out.insert(key.clone());
-            }
-            FlowNode::ForEach {
-                pattern,
-                producer,
-                body,
-                ..
-            } => {
-                for n in pattern.named() {
-                    out.insert(n.to_string());
+                for w in &self.var_warnings {
+                    lines.push(Line::from(vec![
+                        Span::styled("! ", Style::default().fg(th.pending)),
+                        Span::styled(w.clone(), Style::default().fg(th.text)),
+                    ]));
                 }
-                collect_producer_names(producer, out);
-                collect_flow_names(body, out);
+                if has_errors {
+                    lines.push(Line::from(""));
+                }
             }
-            FlowNode::ForEnvs { var, body, .. } => {
-                out.insert(var.clone());
-                collect_flow_names(body, out);
+            if has_errors {
+                lines.push(Line::from(Span::styled(
+                    s.report_dry_run_problems_heading.to_string(),
+                    Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+                )));
+                for err in &self.errors {
+                    lines.push(Line::from(Span::styled(
+                        format!("• {err}"),
+                        Style::default().fg(th.err),
+                    )));
+                }
             }
-            FlowNode::ListDecl { producer, .. } => collect_producer_names(producer, out),
-            _ => {}
         }
-    }
-}
 
-fn collect_producer_names(producer: &Producer, out: &mut std::collections::HashSet<String>) {
-    match producer {
-        Producer::Folders { roles, .. } => {
-            for (role, _) in roles {
-                out.insert(role.clone());
-            }
-        }
-        Producer::Zip(inner) => inner.iter().for_each(|p| collect_producer_names(p, out)),
-        Producer::Concat(inner) => inner.iter().for_each(|p| collect_producer_names(p, out)),
-        _ => {}
+        lines
     }
 }
 
@@ -3051,12 +3283,14 @@ pub(crate) fn draw_report_content(
     app.report_pane_areas = [Rect::default(); 3];
     app.report_pane_bars = [Rect::default(); 3];
 
-    // The results grid is shown full-height (below the binding row) when the
-    // user has flipped to it; otherwise the source + validation split.
+    // The results grid is shown full-height (no binding/validation at the top)
+    // when the user has flipped to it; otherwise the source + binding +
+    // validation stack (binding and validation moved to the bottom for stable
+    // layout when scrolling past different reports in a workspace).
     if app.reports[idx].view == ReportView::Results {
-        let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(area);
-        draw_report_binding(f, rows[0], app, idx, s, th);
-        draw_report_results(f, rows[1], app, idx, s, th);
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
+        draw_report_results(f, rows[0], app, idx, s, th);
+        draw_report_binding(f, rows[1], app, idx, s, th);
         return;
     }
 
@@ -3073,18 +3307,18 @@ pub(crate) fn draw_report_content(
     let diag_h = (diag_count as u16 + 2).min(10);
 
     let rows = Layout::vertical([
-        Constraint::Length(4),
         Constraint::Min(3),
+        Constraint::Length(4),
         Constraint::Length(diag_h),
     ])
     .split(area);
 
-    draw_report_binding(f, rows[0], app, idx, s, th);
     if app.reports[idx].view == ReportView::Nodes {
-        super::report_nodes::draw_report_nodes(f, rows[1], app, idx, s, th);
+        super::report_nodes::draw_report_nodes(f, rows[0], app, idx, s, th);
     } else {
-        draw_report_source(f, rows[1], app, idx, s, th);
+        draw_report_source(f, rows[0], app, idx, s, th);
     }
+    draw_report_binding(f, rows[1], app, idx, s, th);
     draw_report_validation(f, rows[2], app, idx, s, th);
 }
 
@@ -3098,6 +3332,24 @@ fn draw_report_results(
     s: &Strings,
     th: &Theme,
 ) {
+    // Auto-scroll the results panel to keep the cell cursor visible. The inner
+    // height is `area.height - 2` (one-pixel border top + bottom from `panel`).
+    let inner_h = area.height.saturating_sub(2) as usize;
+    if inner_h > 0 {
+        if let Some((cursor_row, _)) = app.reports[idx].cell_cursor {
+            // Grid line 0 is the header row; data row `cursor_row` maps to grid
+            // line `cursor_row + 1`.
+            let grid_line = cursor_row + 1;
+            let scroll = app.reports[idx].results_panel.scroll() as usize;
+            if grid_line < scroll {
+                app.reports[idx].results_panel.set_scroll(grid_line as u16);
+            } else if grid_line >= scroll + inner_h {
+                let new_scroll = (grid_line + 1).saturating_sub(inner_h) as u16;
+                app.reports[idx].results_panel.set_scroll(new_scroll);
+            }
+        }
+    }
+
     let (lines, title) = {
         let rt = &app.reports[idx];
         match &rt.result {
@@ -3114,7 +3366,7 @@ fn draw_report_results(
                 // grid greys unfinished rows and shows a status icon per row so
                 // it doubles as a live progress indicator.
                 let states = rt.run_progress.as_ref().map(|p| p.states.as_slice());
-                let lines = report_grid_lines(result, &header, states, th);
+                let lines = report_grid_lines(result, &header, states, th, rt.cell_cursor);
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
                 } else {
@@ -3150,19 +3402,22 @@ fn draw_report_results(
 }
 
 /// Build the grid's styled lines: a bold header row of the resolved column
-/// headers followed by one line per row, each cell padded to its column's
+/// headers followed by one line per data row, each cell padded to its column's
 /// width (capped) so the columns line up under [`WrapMode::Clip`]. Newlines in
 /// a cell (e.g. a multi-line response body) are collapsed to a marker so a row
 /// stays on one grid line. When `states` is `Some` (a run is streaming), each
 /// row gets a leading status icon (scheduled/running/finished) and the
 /// still-pending rows are drawn dimmed — so the grid doubles as a live progress
 /// indicator. When `None` (a completed or static result) no icon column is
-/// drawn and every row uses the normal text colour.
+/// drawn and every row uses the normal text colour. `cursor` highlights the
+/// selected cell using the theme's selection colours so the active cell reads
+/// as distinct from its row's text style.
 fn report_grid_lines(
     result: &ReportResult,
     header: &crate::report::flow::Header,
     states: Option<&[RowState]>,
     th: &Theme,
+    cursor: Option<(usize, usize)>, // (data_row, col) 0-indexed
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
     if columns.is_empty() {
@@ -3185,18 +3440,10 @@ fn report_grid_lines(
         })
         .collect();
 
-    // Per-column width = widest cell (header or body), capped so one wide cell
-    // (a response body) can't push everything else off-screen.
-    const MAX_COL: usize = 32;
-    let widths: Vec<usize> = (0..columns.len())
-        .map(|c| {
-            let mut w = headers[c].chars().count();
-            for row in &body {
-                w = w.max(row[c].chars().count());
-            }
-            w.clamp(1, MAX_COL)
-        })
-        .collect();
+    // Column widths are factored out so the mouse hit-test shares the same
+    // computation (see `result_column_widths` / `grid_col_at_x`).
+    let widths = grid_column_widths(&headers, &body);
+    let cursor_style = Style::default().bg(th.select_bg).fg(th.select_fg);
 
     let mut lines = Vec::with_capacity(body.len() + 1);
     // While a run streams, every line carries a leading status-icon cell
@@ -3208,7 +3455,14 @@ fn report_grid_lines(
     if show_icons {
         header_spans.push(Span::styled("  ".to_string(), header_style));
     }
-    header_spans.push(Span::styled(grid_row_text(&headers, &widths), header_style));
+    // Header row: no cursor highlighting (cursor is on data rows only).
+    header_spans.extend(grid_row_cell_spans(
+        &headers,
+        &widths,
+        header_style,
+        None,
+        cursor_style,
+    ));
     lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
         let state = states.and_then(|s| s.get(i)).copied();
@@ -3233,7 +3487,15 @@ fn report_grid_lines(
                 Style::default().fg(color),
             ));
         }
-        spans.push(Span::styled(grid_row_text(row, &widths), text_style));
+        // Highlight the cursor column for this row if the cursor is here.
+        let cursor_col = cursor.and_then(|(r, c)| if r == i { Some(c) } else { None });
+        spans.extend(grid_row_cell_spans(
+            row,
+            &widths,
+            text_style,
+            cursor_col,
+            cursor_style,
+        ));
         lines.push(Line::from(spans));
     }
     lines
@@ -3246,29 +3508,117 @@ const ROW_SCHEDULED_ICON: &str = "\u{00B7}"; // ·
 const ROW_RUNNING_ICON: &str = "\u{2026}"; // …
 const ROW_FINISHED_ICON: &str = "\u{2713}"; // ✓
 
-/// Assemble one grid row's text: each field padded/truncated to its column
-/// width and joined with a two-space gutter. The caller styles the returned
-/// string (and may prepend a status-icon span).
-fn grid_row_text(fields: &[String], widths: &[usize]) -> String {
-    let mut out = String::new();
+/// Per-column display width cap: a response body can easily be thousands of
+/// characters, so each column is capped so one wide cell can't push everything
+/// else off-screen. Shared by the renderer and the mouse hit-test.
+const MAX_COL_WIDTH: usize = 32;
+
+/// Compute per-column display widths from pre-materialised headers and body.
+/// Width = max(header length, max(cell length)) clamped to [`MAX_COL_WIDTH`].
+/// Private: callers outside this module use [`result_column_widths`].
+fn grid_column_widths(headers: &[String], body: &[Vec<String>]) -> Vec<usize> {
+    (0..headers.len())
+        .map(|c| {
+            let mut w = headers[c].chars().count();
+            for row in body {
+                w = w.max(row[c].chars().count());
+            }
+            w.clamp(1, MAX_COL_WIDTH)
+        })
+        .collect()
+}
+
+/// Return the display column widths for `result`'s resolved grid — the same
+/// widths [`report_grid_lines`] uses — so the mouse hit-test in
+/// [`crate::tui::input`] can map a click's x offset to a column index without
+/// duplicating the width computation.
+pub(crate) fn result_column_widths(
+    result: &ReportResult,
+    header: &crate::report::flow::Header,
+) -> Vec<usize> {
+    let columns = result.resolved_columns(header);
+    let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
+    let body: Vec<Vec<String>> = result
+        .rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|c| flatten_cell(&c.value(row, &result.no_match_marker)))
+                .collect()
+        })
+        .collect();
+    grid_column_widths(&headers, &body)
+}
+
+/// Map an x offset within a grid row to a column index. The grid layout has
+/// each column occupying `widths[i]` characters followed by a two-space gutter
+/// (before the next column); an optional 2-character status-icon prefix is
+/// present when `show_icons` is true. Clicks that fall in a gutter are
+/// assigned to the preceding column; clicks past the last column's end return
+/// the last column index.
+pub(crate) fn grid_col_at_x(widths: &[usize], x_off: usize, show_icons: bool) -> usize {
+    if widths.is_empty() {
+        return 0;
+    }
+    // Strip the icon prefix so `x` is relative to the first column's start.
+    let x = if show_icons {
+        x_off.saturating_sub(2)
+    } else {
+        x_off
+    };
+    let mut pos = 0usize;
+    for (ci, &w) in widths.iter().enumerate() {
+        // Column `ci` occupies [pos, pos+w-1]; the gutter is [pos+w, pos+w+1].
+        // Clicks within the column or the gutter after it map to column `ci`,
+        // except when we're on the last column (no gutter after it).
+        let next_col_start = pos + w + 2;
+        if ci + 1 == widths.len() || x < next_col_start {
+            return ci;
+        }
+        pos = next_col_start;
+    }
+    widths.len() - 1
+}
+
+/// Produce the per-cell spans for one grid row. Each cell is padded (or
+/// truncated with `…`) to its column width; columns are joined with a two-space
+/// gutter. The column at `cursor_col` (if any) uses `cursor_style` instead of
+/// `base_style` so the selected cell is visually highlighted. Used for both the
+/// header row (always `cursor_col = None`) and each data row.
+fn grid_row_cell_spans(
+    fields: &[String],
+    widths: &[usize],
+    base_style: Style,
+    cursor_col: Option<usize>,
+    cursor_style: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     for (i, field) in fields.iter().enumerate() {
         if i > 0 {
-            out.push_str("  ");
+            spans.push(Span::styled("  ".to_string(), base_style));
         }
         let w = widths[i];
         let count = field.chars().count();
-        if count > w {
+        let cell_text: String = if count > w {
             // Truncate with an ellipsis so a clipped value reads as clipped.
             let take = w.saturating_sub(1);
             let mut s: String = field.chars().take(take).collect();
             s.push('…');
-            out.push_str(&s);
+            s
         } else {
-            out.push_str(field);
-            out.extend(std::iter::repeat_n(' ', w - count));
-        }
+            let mut s = field.clone();
+            s.extend(std::iter::repeat_n(' ', w - count));
+            s
+        };
+        let style = if cursor_col == Some(i) {
+            cursor_style
+        } else {
+            base_style
+        };
+        spans.push(Span::styled(cell_text, style));
     }
-    out
+    spans
 }
 
 /// Collapse a possibly multi-line cell value onto one line (newlines → `⏎`) so a
@@ -3332,7 +3682,51 @@ fn draw_report_panel(
     (inner, bar_area)
 }
 
-/// Draw the ghost completion `ghost` as dim text starting at the editor's
+/// Draw the cell drill-down popup overlay ([`crate::tui::app::Overlay::ReportCellPopup`]):
+/// the selected cell's full (untruncated, unflattened) content in a scrollable,
+/// selectable panel. The popup title shows the column header name plus a hint.
+/// Scroll/selection state is held in `panel` across frames. Called from
+/// `draw.rs`'s `draw_overlay` handler.
+pub(crate) fn draw_result_cell_popup_overlay(
+    f: &mut Frame,
+    title: &str,
+    content: &str,
+    panel: &mut MultiSelectPanel,
+    s: &Strings,
+    th: &Theme,
+) {
+    use super::draw::centered_rect;
+    let box_w = f.area().width.saturating_sub(8).clamp(40, 90);
+    // Convert the raw content into styled lines (one per line in the value).
+    let content_lines: Vec<Line<'static>> = content
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(th.text))))
+        .collect();
+    // Guard against empty content (e.g. the no-match marker is empty string).
+    let content_lines = if content_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            String::new(),
+            Style::default().fg(th.dim),
+        ))]
+    } else {
+        content_lines
+    };
+    // Size the box to fit the content, capping at the terminal height.
+    let box_h = (content_lines.len() as u16 + 2)
+        .max(4)
+        .min(f.area().height.saturating_sub(4).max(4));
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(ratatui::widgets::Clear, area);
+    let popup_title = format!("{title}  ({})", s.report_cell_popup_hint);
+    draw_report_panel(
+        f,
+        area,
+        super::draw::panel(popup_title, true, th),
+        panel,
+        &content_lines,
+        th,
+    );
+}
 /// cursor, on top of the already-rendered editor. Mirrors the horizontal /
 /// vertical scroll maths [`render_editor_highlighted`] uses so it lands exactly
 /// at the cursor cell (the completion is only offered when the cursor is at the
@@ -3628,11 +4022,11 @@ mod export_path_tests {
 
     #[test]
     fn time_token_name_overrides_a_saved_report_filename_and_stays_in_its_folder() {
-        // A saved report whose file is `dfa.trail` but whose name carries the
-        // `{time}` token: the export must use the expanded name (not `dfa`) and
+        // A saved report whose file is `sample.trail` but whose name carries the
+        // `{time}` token: the export must use the expanded name (not `sample`) and
         // land next to the report file.
-        let mut report = Report::from_text("dfa", "# name: run_{time}\n# collection: c.hurl\n");
-        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
+        let mut report = Report::from_text("sample", "# name: run_{time}\n# collection: c.hurl\n");
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
 
         let csv = csv_export_path(&report);
         assert_eq!(csv.parent(), Some(std::path::Path::new("/tmp/reports")));
@@ -3641,18 +4035,18 @@ mod export_path_tests {
         assert!(file.ends_with(".csv"));
         assert!(!file.contains("{time}"), "token expanded: {file}");
         assert!(
-            !file.starts_with("dfa"),
+            !file.starts_with("sample"),
             "name wins over the file stem: {file}"
         );
     }
 
     #[test]
     fn without_a_token_a_saved_report_keeps_its_own_stem() {
-        let mut report = Report::from_text("dfa", "# name: My Report\n# collection: c.hurl\n");
-        report.path = Some(std::path::PathBuf::from("/tmp/reports/dfa.trail"));
+        let mut report = Report::from_text("sample", "# name: My Report\n# collection: c.hurl\n");
+        report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
         assert_eq!(
             csv_export_path(&report),
-            std::path::PathBuf::from("/tmp/reports/dfa.csv"),
+            std::path::PathBuf::from("/tmp/reports/sample.csv"),
             "unchanged behaviour when the name has no token"
         );
     }

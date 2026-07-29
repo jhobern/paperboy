@@ -10,7 +10,57 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Stopping a report run now keeps the partial results.** Previously, pressing
+  `r` to cancel a running report discarded all streamed rows and restored
+  whatever grid was showing before the run started. Now the partial grid is
+  retained: rows that finished keep their real responses, and rows that hadn't
+  started yet remain as greyed skeleton placeholders. The view stays on the
+  Results grid so the partial output can be inspected, saved, or exported
+  immediately. Closing a running report tab also retains the partial result in
+  the stashed tab (reopenable with `u`). A new status message "Run stopped —
+  partial results kept" reflects the change.
+
 ### Added
+
+- **Workspace file tree: real expand/collapse replaces the old breadcrumb.**
+  The workspace tab's file list is now a proper multi-folder tree: any number of
+  folders can be expanded at once, their open/closed state persists across
+  restarts, and you can see files from several parts of the tree simultaneously.
+  Navigation keys follow normal file-tree conventions — **Right** / **Enter**
+  expands a collapsed folder (Enter on an already-open folder collapses it);
+  **Left** collapses an expanded folder, or moves the cursor to the parent of a
+  collapsed folder / file; **Up**/**Down** move across visible rows as usual.
+  Opening a collection file or a report works exactly as before.  The old
+  breadcrumb ("enter one folder at a time" + `../` row) is gone; there is no
+  longer a "current folder" appended to the panel title.  The expanded-folder
+  set is saved in `state.json` under a new `workspace_expanded_paths` field;
+  older state files without the field load cleanly with all folders collapsed.
+
+- **Dry-run preview now shows the real output grid.** Pressing `d` on a report
+  opens the same column/row table the full run would produce — but with all
+  HTTP-response fields blank because no request is sent. Loop bindings, variable
+  assignments, `ZIP` pairings, producer structure and column headers are all
+  resolved and visible, so the shape and size of the run are immediately clear
+  before you commit to sending any traffic.
+
+- **Variable-availability static analysis.** The report validation panel (and
+  the dry-run overlay) now warns when a `{{VAR}}` referenced by a request may
+  not be defined by the time that request runs. The check walks the flow in
+  execution order, tracking variables from the environment, `FOR` loop binders,
+  explicit assignments, `FOLDERS … WITH` role names, and `[Captures]` blocks of
+  earlier requests. It is conservative — sources that can't be statically
+  resolved (provider references, `TUPLES FROM` column names, unknown env names)
+  are treated as "may define" so no false positives are emitted. Warnings are
+  non-blocking and never prevent a run.
+
+- **Drill down into any Results-grid cell with a popup.** In the Results view
+  of a report, arrow keys now move a highlighted cell cursor across the grid.
+  Pressing **Enter** (or clicking a cell a second time) opens a scrollable
+  popup showing the column name and the full cell value — useful for long
+  values that are truncated in the grid. The popup supports text selection and
+  copy (matching the existing request/response panels), and **Esc** closes it.
 
 - **`REPORT REQUEST … HIDE(a, b, …)` drops columns you don't want.** Mirroring
   `SHOW(…)`, a `HIDE(…)` clause removes the named field suffixes (intrinsics like
@@ -36,6 +86,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   folders to navigate — the same sets the git picker already uses — so loading
   from a busy directory isn't buried under unrelated files. Press `Tab` to toggle
   the filter off (show everything) and on again for an oddly-named file.
+
+- **Workspace picker shows report files with an icon and updated filter label.**
+  Report files (`.trail`) now display with a report icon (📊) in the workspace
+  quick-browse popup (opened with `w`), so they stand out from plain collection
+  files. The popup's filter label is also updated to show
+  "Filter: .hurl/.json/.trail" instead of just ".hurl/.json".
 
 - **Pick a `FOR … IN ENVS` loop's environments from the loaded ones.** In the
   report node editor, pressing **Enter** on a `FOR … IN ENVS` node now opens a
@@ -415,13 +471,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
-- **A `REPORT REQUEST … WITH` block now restricts the report to the fields you
-  declare.** When a request's `WITH … END` block declares at least one field, the
-  five intrinsic columns (`HttpStatus`, `Time`, `Asserts`, `Error`, `Response`)
-  are suppressed by default so the declared fields take centre stage — you no
-  longer have to `SHOW(…)` to trim them. `SHOW(…)` still wins when present and can
-  explicitly re-add an intrinsic, and a request that declares fields only through
-  its own `[Reports]` block (no `WITH`) keeps its intrinsics as before.
+- **Report binding and validation panels moved to the bottom.** In the report
+  editor view, the collection binding info and validation diagnostics now appear
+  at the bottom of the panel (below the source editor) instead of at the top.
+  This keeps the layout stable when scrolling past different reports in a
+  workspace — the sections that change height per report no longer cause jarring
+  layout shifts above them.
+
+- **`REPORT REQUEST` column selection now uses a union model.**  The emitted
+  columns are the union of (a) the request's `[Reports]` fields, (b) any `WITH`
+  fields, and (c) any fields explicitly named in `SHOW(…)`.  Intrinsics
+  (`HttpStatus`, `Time`, `Asserts`, `Error`, `Response`) are included by default
+  only for a *bare* request that has no `[Reports]` and no `WITH` fields; once
+  any declared field exists, intrinsics are suppressed unless `SHOW` names them.
+  `SHOW(…)` is now **additive** rather than a whitelist — it force-includes the
+  named fields (its practical purpose is bringing a specific intrinsic back on a
+  request that has declared fields); naming a field that is already in the set is
+  harmless, and naming a non-existent field is silently ignored.  `[Reports]`
+  and `WITH` fields are always emitted unless removed by `HIDE`.  This removes
+  the previous asymmetry where a `[Reports]`-only request kept its intrinsics
+  while a `WITH`-only request suppressed them — both now behave consistently.
 
 - **Environment-comparison `Result` cells are now readable, structured JSON.**
   The old run-on `field: a→b; …` summary is replaced by a compact single-line JSON

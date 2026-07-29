@@ -181,11 +181,32 @@ pub fn run(
         Some(r) if !r.trim().is_empty() => Some(resolve_path(report_dir, r)),
         _ => report_dir.map(Path::to_path_buf),
     };
+    // For the variable-availability check: the base env variables and the union
+    // of all loaded env variables.
+    let base_var_names_owned: Vec<String> = env_names_loaded
+        .first()
+        .and_then(|first_name| named_envs.get(first_name))
+        .map(|m| {
+            let mut keys: Vec<String> = m.keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+    let mut all_env_var_names_owned: Vec<String> = named_envs
+        .values()
+        .flat_map(|m| m.keys().cloned())
+        .collect();
+    all_env_var_names_owned.sort();
+    all_env_var_names_owned.dedup();
+
     let ctx = Context {
         request_titles: Some(&titles),
         env_names: Some(&env_names),
         request_fields: Some(&fields),
         root: root.as_deref(),
+        base_var_names: Some(&base_var_names_owned),
+        all_env_var_names: Some(&all_env_var_names_owned),
+        request_entries: Some(&entries),
     };
     let diags = validate(&flow, &ctx);
     let has_error = diags.iter().any(|d| d.severity == Severity::Error);
