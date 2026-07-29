@@ -1691,7 +1691,7 @@ pub(crate) fn draw_report_nodes(
     s: &Strings,
     th: &Theme,
 ) {
-    let focused = !app.report_tabbar_focus && !app.report_tree_focus;
+    let focused = app.report_body_focused();
     let title = format!("{} — {}", s.report_nodes_heading, s.report_nodes_hint);
     let block = panel(title, focused, th);
     let inner = block.inner(area);

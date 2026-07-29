@@ -17,7 +17,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
 use super::app::{Overlay, Pane, TuiApp};
@@ -196,86 +196,24 @@ pub(crate) struct ReportTab {
     /// Selection/scroll panel backing the results grid (clip-wrapped so each
     /// row stays on one line and columns line up, like program output).
     pub(crate) results_panel: MultiSelectPanel,
-    /// When this report was opened from a Workspace tree, the workspace context
-    /// pins that tree to the left of the report view (so the user can jump
-    /// between the workspace's collections and reports without leaving). `None`
-    /// for an ordinary (non-workspace) report tab.
-    pub(crate) workspace: Option<ReportWorkspace>,
-}
-
-/// The Workspace context carried by a report opened from a Workspace tree: the
-/// root folder, the browsed sub-path, and the tree cursor. Drives the pinned
-/// left-hand tree in the report view (see [`super::draw`]); its rows are the
-/// same filesystem file-tree the collection Workspace tab shows, so the user
-/// can navigate folders and open other collections/reports from within the
-/// report view.
-#[derive(Clone)]
-pub(crate) struct ReportWorkspace {
-    /// The workspace root folder the tree is rooted at.
-    pub(crate) root: std::path::PathBuf,
-    /// Breadcrumb of subfolder names below `root` currently being browsed.
-    pub(crate) browse: Vec<String>,
-    /// The highlighted row in the tree (index into [`Self::rows`]; clamped on
-    /// use).
-    pub(crate) cursor: usize,
-}
-
-/// One row of the report view's pinned Workspace tree — the filesystem
-/// file-tree of the browsed folder: `../` (unless at the root), subfolders,
-/// then the collection and report files. Mirrors [`crate::collection::WsRow`]
-/// but without inlined requests (the report view doesn't show a collection's
-/// requests) and with the currently-open report marked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReportTreeRow {
-    /// Go up to the parent folder (only when not at the workspace root).
-    Up,
-    /// Descend into an immediate subfolder.
-    Folder(String),
-    /// A collection file (`.hurl`/`.json`) — opens/activates a Workspace
-    /// collection tab for it.
-    Collection {
-        path: std::path::PathBuf,
-        name: String,
-    },
-    /// A report file (`.trail`). `open` marks the report this view is showing.
-    Report {
-        path: std::path::PathBuf,
-        name: String,
-        open: bool,
-    },
-}
-
-impl ReportWorkspace {
-    /// Build the tree rows for the currently-browsed folder. `open_path` is the
-    /// path of the report this view is showing (so its row is marked open).
-    pub(crate) fn rows(&self, open_path: Option<&std::path::Path>) -> Vec<ReportTreeRow> {
-        let mut dir = self.root.clone();
-        for seg in &self.browse {
-            dir.push(seg);
-        }
-        let mut rows = Vec::new();
-        if !self.browse.is_empty() {
-            rows.push(ReportTreeRow::Up);
-        }
-        for e in crate::workspace::list_dir(&dir, true) {
-            if e.is_dir {
-                rows.push(ReportTreeRow::Folder(e.display_name));
-            } else if crate::workspace::is_report_file(&e.path) {
-                let open = open_path == Some(e.path.as_path());
-                rows.push(ReportTreeRow::Report {
-                    path: e.path,
-                    name: e.display_name,
-                    open,
-                });
-            } else {
-                rows.push(ReportTreeRow::Collection {
-                    path: e.path,
-                    name: e.display_name,
-                });
-            }
-        }
-        rows
-    }
+    /// When this report was opened from a Workspace tree, the workspace root it
+    /// belongs to. This is a *link*, not UI state: the report is shown in the
+    /// right pane of the Workspace collection tab rooted here, while that tab's
+    /// own file-tree (drawn by `draw_collection_left`) stays on the left and
+    /// drives all navigation. `None` for a standalone (non-workspace) report
+    /// tab, which is a full-screen strip tab with no tree.
+    pub(crate) workspace_root: Option<std::path::PathBuf>,
+    /// For a Workspace-embedded report (`workspace_root.is_some()`): whether
+    /// this report is the one currently *displayed* in its Workspace collection
+    /// tab's right pane (`true`), or merely retained while that tab shows its
+    /// request/response view (`false`, set once the user opens a
+    /// collection/folder/request from the tab's tree). Keeping the hidden
+    /// `ReportTab` around preserves its edits/results/in-flight run, so
+    /// re-selecting the same `.trail` restores state instead of reloading from
+    /// disk. A Workspace tab embeds at most one report at a time (opening a
+    /// different one replaces it). Ignored for standalone report tabs, which
+    /// always occupy their own strip slot regardless of this flag.
+    pub(crate) embedded_active: bool,
 }
 
 /// The live state of one streaming report row, drawn as a status icon beside
@@ -410,16 +348,17 @@ impl ReportTab {
             result: None,
             run_progress: None,
             results_panel,
-            workspace: None,
+            workspace_root: None,
+            embedded_active: true,
         }
     }
 
-    /// A report tab opened from a Workspace tree: as [`Self::new`] but carrying
-    /// the [`ReportWorkspace`] context that pins the workspace file-tree to the
-    /// left of the report view.
-    pub(crate) fn new_in_workspace(report: Report, workspace: ReportWorkspace) -> Self {
+    /// A report opened from a Workspace tree: as [`Self::new`] but linked to the
+    /// Workspace `root` it belongs to, so it embeds in that Workspace collection
+    /// tab's right pane (the tab's own file-tree drives navigation).
+    pub(crate) fn new_in_workspace(report: Report, root: std::path::PathBuf) -> Self {
         let mut rt = Self::new(report);
-        rt.workspace = Some(workspace);
+        rt.workspace_root = Some(root);
         rt
     }
 
@@ -442,23 +381,72 @@ impl ReportTab {
 }
 
 impl TuiApp {
-    /// Total number of tabs across both kinds (collections first, then reports).
+    /// Indices into `self.reports` of the *standalone* report tabs — the ones
+    /// that occupy their own slot in the tab strip (collections first, then
+    /// these). Workspace-embedded reports (`workspace_root.is_some()`) are shown
+    /// inside their Workspace collection tab's right pane rather than as a
+    /// separate strip tab, so they're excluded here (and from
+    /// [`Self::tab_count`]). Order-preserving, so slot `k` past the collections
+    /// maps to `reports[standalone_report_indices()[k]]`.
+    pub(crate) fn standalone_report_indices(&self) -> Vec<usize> {
+        self.reports
+            .iter()
+            .enumerate()
+            .filter(|(_, rt)| rt.workspace_root.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The `self.reports` index of the report embedded in — and currently
+    /// *shown* by — Workspace collection tab `ci`, if any. `None` when `ci`
+    /// isn't a Workspace tab, has no embedded report, or is currently showing
+    /// its request/response view (the embedded report retained but hidden, i.e.
+    /// `embedded_active == false`).
+    pub(crate) fn embedded_report_index(&self, ci: usize) -> Option<usize> {
+        let root = self.collections.get(ci)?.workspace_root.as_deref()?;
+        self.reports
+            .iter()
+            .position(|rt| rt.embedded_active && rt.workspace_root.as_deref() == Some(root))
+    }
+
+    /// Total number of tabs in the strip (collection tabs plus *standalone*
+    /// report tabs). Workspace-embedded reports don't add a strip tab — they
+    /// ride inside their Workspace collection tab — so they aren't counted.
     pub(crate) fn tab_count(&self) -> usize {
-        self.collections.len() + self.reports.len()
+        self.collections.len() + self.standalone_report_indices().len()
     }
 
-    /// Whether the active tab is a report tab (its unified index falls past the
-    /// collection tabs).
+    /// Whether the active tab is currently showing a report — either a
+    /// standalone report strip tab, or a Workspace collection tab displaying an
+    /// embedded report in its right pane. Drives the report draw/key routing.
     pub(crate) fn active_is_report(&self) -> bool {
-        self.active_tab >= self.collections.len() && !self.reports.is_empty()
+        self.active_report_index().is_some()
     }
 
-    /// The `self.reports` index of the active tab, if it is a report tab.
+    /// Whether the active tab is a *standalone* report strip tab (its unified
+    /// index falls past the collection tabs), as opposed to a Workspace
+    /// collection tab showing an embedded report (whose `active_tab` is a
+    /// collection index). Used by tab-strip operations (move/close) that reason
+    /// about strip position rather than "am I looking at a report".
+    pub(crate) fn active_is_strip_report(&self) -> bool {
+        self.active_tab >= self.collections.len()
+    }
+
+    /// The `self.reports` index of the report the active tab is showing, if any
+    /// — resolving both a standalone report strip tab and a Workspace
+    /// collection tab with an embedded report on display.
     pub(crate) fn active_report_index(&self) -> Option<usize> {
-        if self.active_is_report() {
-            Some(self.active_tab - self.collections.len())
+        let c = self.collections.len();
+        if self.active_tab >= c {
+            // A standalone report strip tab: map its strip slot to the reports
+            // index, skipping embedded reports (which aren't in the strip).
+            self.standalone_report_indices()
+                .into_iter()
+                .nth(self.active_tab - c)
         } else {
-            None
+            // A collection tab: it shows an embedded report only if it's a
+            // Workspace tab currently displaying one.
+            self.embedded_report_index(self.active_tab)
         }
     }
 
@@ -466,14 +454,30 @@ impl TuiApp {
         self.active_report_index().and_then(|i| self.reports.get(i))
     }
 
+    /// Whether the report *body* (as opposed to the workspace tree, for an
+    /// embedded report) currently holds focus — drives whether the body panels'
+    /// borders are lit. A standalone report owns the whole view, so its body is
+    /// always focused; an embedded report's body is focused only while
+    /// `focus == Pane::Main` (the tree is `Pane::List`).
+    pub(crate) fn report_body_focused(&self) -> bool {
+        if self.active_is_strip_report() {
+            true
+        } else {
+            self.focus == Pane::Main
+        }
+    }
+
     /// Create a new scratch report tab, make it active, validate it and persist.
     pub(crate) fn new_report_tab(&mut self) {
         let s = Strings::for_language(&self.language);
         let report = Report::scratch(s.report_default_name);
         self.reports.push(ReportTab::new(report));
-        self.active_tab = self.collections.len() + self.reports.len() - 1;
+        // A scratch report is standalone (no workspace), so it occupies the last
+        // strip slot past the collection tabs. Count standalone reports rather
+        // than `reports.len()`, which also includes embedded workspace reports
+        // that don't appear in the strip.
+        self.active_tab = self.collections.len() + self.standalone_report_indices().len() - 1;
         self.focus = Pane::Tabs;
-        self.report_tabbar_focus = false;
         let idx = self.reports.len() - 1;
         self.revalidate_report(idx);
         self.save_state();
@@ -485,62 +489,191 @@ impl TuiApp {
     /// git origin) so a subsequent "Save" writes back in place.
     pub(crate) fn open_loaded_report(&mut self, report: Report) {
         self.reports.push(ReportTab::new(report));
-        self.active_tab = self.collections.len() + self.reports.len() - 1;
+        // Standalone report (see `new_report_tab`): its strip slot is the last
+        // among the standalone reports, not `reports.len()` (which counts the
+        // embedded workspace reports that aren't in the strip).
+        self.active_tab = self.collections.len() + self.standalone_report_indices().len() - 1;
         self.focus = Pane::Tabs;
-        self.report_tabbar_focus = false;
         let idx = self.reports.len() - 1;
         self.revalidate_report(idx);
         self.save_state();
         self.status = Some(Status::Loaded);
     }
 
-    /// Open (or re-activate) a `.trail` file selected from a Workspace tree.
-    /// The report carries the workspace context so the report view pins that
-    /// tree to its left. If a report tab for the same file is already open it is
-    /// re-activated (with a refreshed workspace browse) instead of duplicated.
-    /// `root`/`browse` come from the tab the report was opened from so the
-    /// pinned tree opens focused on the report's own folder.
-    pub(crate) fn open_workspace_report(
+    /// Show the `.trail` at `path` **in place**, embedded in the right pane of
+    /// its Workspace collection tab (rooted at `root`) — the pane that normally
+    /// holds the request editor + response is replaced by the report body while
+    /// the same file-tree stays on the left and keeps focus. This deliberately
+    /// does *not* spawn a separate report tab (mirroring how selecting a
+    /// collection/request from a Workspace tab doesn't spawn one); the
+    /// standalone report path is [`Self::open_loaded_report`] instead.
+    ///
+    /// Selection follows the tree highlight, exactly like requests: landing the
+    /// cursor on a report row *shows* it (no `Enter` needed). So this is called
+    /// as the highlight moves, and must be cheap and non-destructive — it never
+    /// discards a report or drops edits. Each visited report is loaded once and
+    /// then **retained** in `self.reports` (hidden when the highlight moves off
+    /// it, via [`Self::hide_embedded_report_for_root`]); moving back re-shows the
+    /// retained tab with its edits/results intact. A Workspace tab shows at most
+    /// one report at a time — the one flagged `embedded_active` — so showing a
+    /// different report just flips the active flag (the previous one stays
+    /// retained), and only a never-visited report triggers a disk load.
+    ///
+    /// The embedded `ReportTab` carries `workspace_root`, which excludes it from
+    /// the tab strip and links it to its Workspace tab, so it reuses every
+    /// report handler unchanged. Focus and the tree cursor are left untouched
+    /// (the user is already standing on the report's row), keeping all
+    /// navigation on the single collection-side tree.
+    pub(crate) fn show_embedded_report(
         &mut self,
         path: std::path::PathBuf,
         root: std::path::PathBuf,
-        browse: Vec<String>,
     ) {
-        let ws = ReportWorkspace {
-            root,
-            browse,
-            cursor: 0,
+        // The Workspace collection tab this report embeds into (create one if
+        // the workspace isn't open as a tab yet — e.g. restored/edge cases).
+        let ci = self.workspace_collection_tab(root.clone());
+
+        // Selecting a report hides (but retains) whichever report this tab was
+        // showing, so at most one is `embedded_active` per root. A no-op when
+        // the same report is already the shown one.
+        for rt in self
+            .reports
+            .iter_mut()
+            .filter(|rt| rt.workspace_root.as_deref() == Some(root.as_path()))
+        {
+            rt.embedded_active = false;
+        }
+
+        // Re-show a previously-visited report (edits/results intact) or load a
+        // never-seen one from disk, retaining it for future re-selection.
+        if let Some(i) = self.reports.iter().position(|rt| {
+            rt.workspace_root.as_deref() == Some(root.as_path())
+                && rt.report.path.as_deref() == Some(path.as_path())
+        }) {
+            self.reports[i].embedded_active = true;
+            self.revalidate_report(i);
+        } else {
+            match Report::load_local(&path) {
+                Ok(report) => {
+                    self.reports.push(ReportTab::new_in_workspace(report, root));
+                    let idx = self.reports.len() - 1;
+                    self.revalidate_report(idx);
+                }
+                Err(e) => {
+                    self.status = Some(Status::Error(e));
+                    return;
+                }
+            }
+        }
+        self.finish_show_embedded_report(ci);
+    }
+
+    /// Point the active tab at Workspace collection tab `ci` and keep focus on
+    /// its file-tree, after (re)attaching an embedded report to it. Focus stays
+    /// on the tree (`Pane::List`) so the single collection-side tree keeps
+    /// driving navigation; the tree cursor is deliberately left where the user
+    /// was. Selection follows the highlight, so this runs on every cursor step
+    /// onto a report row — it stays lightweight (no `save_state`/status spill;
+    /// the choice is persisted with the rest of the session on exit).
+    fn finish_show_embedded_report(&mut self, ci: usize) {
+        self.active_tab = ci;
+        self.focus = Pane::List;
+    }
+
+    /// Find the Workspace collection tab rooted at `root`, creating an empty one
+    /// if the workspace isn't open as a tab yet.
+    pub(crate) fn workspace_collection_tab(&mut self, root: std::path::PathBuf) -> usize {
+        if let Some(ci) = self
+            .collections
+            .iter()
+            .position(|c| c.workspace_root.as_deref() == Some(root.as_path()))
+        {
+            return ci;
+        }
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        let mut col = crate::collection::Collection::new(name, Vec::new());
+        col.workspace_root = Some(root);
+        self.collections.push(col);
+        self.collections.len() - 1
+    }
+
+    /// Point Workspace tab `ci`'s file-tree browse breadcrumb and cursor onto
+    /// the row for report `path` — its containing folder relative to the root,
+    /// then the report's own row. Used on restore so a reopened embedded report
+    /// resumes with the tree highlighting it (the tab's `list_cursor` isn't
+    /// persisted separately; it's normally derived from the loaded collection
+    /// file, which is `None` while a report is showing).
+    pub(crate) fn focus_workspace_tree_on_report(&mut self, ci: usize, path: &std::path::Path) {
+        let Some(col) = self.collections.get_mut(ci) else {
+            return;
         };
-        // Re-activate an already-open tab for this file rather than opening a
-        // second copy (matching how the collection tree re-opens a loaded file).
-        if let Some(i) = self
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        col.workspace_browse = path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&root).ok())
+            .map(|rel| {
+                rel.components()
+                    .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        col.workspace_collapsed = false;
+        col.list_cursor = col
+            .ws_rows()
+            .iter()
+            .position(
+                |r| matches!(r, crate::collection::WsRow::Report { path: p, .. } if p == path),
+            )
+            .unwrap_or(0);
+    }
+
+    /// Remove the embedded report at `self.reports[i]`, cleaning up a live run
+    /// first (the poller routes updates to open tabs by id, so a stray channel
+    /// for a removed tab must be retired). Used when a Workspace tab swaps one
+    /// embedded report for another, or is closed.
+    fn discard_embedded_report(&mut self, i: usize) {
+        let rt = self.reports.remove(i);
+        let report_id = rt.report.id;
+        if let Some(cancel) = self.running_reports.remove(&report_id) {
+            cancel.store(true, Ordering::Relaxed);
+            self.pending_report_runs.retain(|(id, _)| *id != report_id);
+        }
+    }
+
+    /// Drop every embedded report belonging to Workspace root `root`. With
+    /// selection following the tree highlight, a root can accumulate several
+    /// retained reports (one per report the user has visited), so this scans
+    /// until none remain rather than assuming a single one. Called when the
+    /// Workspace collection tab is closed so its retained reports don't outlive
+    /// the tab in `self.reports`.
+    pub(crate) fn discard_embedded_reports_for_root(&mut self, root: &std::path::Path) {
+        while let Some(i) = self
             .reports
             .iter()
-            .position(|rt| rt.report.path.as_deref() == Some(path.as_path()))
+            .position(|rt| rt.workspace_root.as_deref() == Some(root))
         {
-            self.reports[i].workspace = Some(ws);
-            self.active_tab = self.collections.len() + i;
-            self.focus = Pane::Tabs;
-            self.report_tabbar_focus = false;
-            self.report_tree_focus = true;
-            self.revalidate_report(i);
-            self.save_state();
-            self.status = Some(Status::Loaded);
-            return;
+            self.discard_embedded_report(i);
         }
-        match Report::load_local(&path) {
-            Ok(report) => {
-                self.reports.push(ReportTab::new_in_workspace(report, ws));
-                self.active_tab = self.collections.len() + self.reports.len() - 1;
-                self.focus = Pane::Tabs;
-                self.report_tabbar_focus = false;
-                self.report_tree_focus = true;
-                let idx = self.reports.len() - 1;
-                self.revalidate_report(idx);
-                self.save_state();
-                self.status = Some(Status::Loaded);
-            }
-            Err(e) => self.status = Some(Status::Error(e)),
+    }
+
+    /// Hide (but retain) whichever report Workspace root `root` is showing, so
+    /// its collection tab returns to the request/response view. Every retained
+    /// `ReportTab` for the root is flipped to `embedded_active = false` (there
+    /// may be several visited-and-retained ones — only one is ever active, but
+    /// clearing them all is the robust "show no report" operation), preserving
+    /// their state for when a `.trail` is re-selected from the tree.
+    pub(crate) fn hide_embedded_report_for_root(&mut self, root: &std::path::Path) {
+        for rt in self
+            .reports
+            .iter_mut()
+            .filter(|rt| rt.workspace_root.as_deref() == Some(root))
+        {
+            rt.embedded_active = false;
         }
     }
 
@@ -560,11 +693,6 @@ impl TuiApp {
         else {
             return;
         };
-        let browse = self
-            .collections
-            .get(ci)
-            .map(|c| c.workspace_browse.clone())
-            .unwrap_or_default();
         let rel = rel.trim();
         if rel.is_empty() {
             return;
@@ -599,8 +727,13 @@ impl TuiApp {
             self.status = Some(Status::Error(e));
             return;
         }
-        // Open it pinned to the workspace tree it now belongs to.
-        self.open_workspace_report(full_path, root, browse);
+        // Show it embedded in this workspace tab's right pane and highlight its
+        // new row in the tree (selection follows the highlight). Persist the new
+        // selection now — creation is a deliberate action, unlike plain cursor
+        // movement which relies on the session save at exit.
+        self.show_embedded_report(full_path.clone(), root);
+        self.focus_workspace_tree_on_report(ci, &full_path);
+        self.save_state();
         self.status = Some(Status::WorkspaceReportCreated(
             rel_path.display().to_string(),
         ));
@@ -1084,7 +1217,6 @@ impl TuiApp {
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
-                    self.report_tabbar_focus = false;
                 }
                 self.status = Some(Status::ReportRunProgress { done: 0, total: n });
             }
@@ -1161,7 +1293,6 @@ impl TuiApp {
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
-                    self.report_tabbar_focus = false;
                 }
                 self.status = Some(Status::ReportRunDone { rows, errors });
             }
@@ -1194,7 +1325,6 @@ impl TuiApp {
                 rt.result = Some(result);
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
-                self.report_tabbar_focus = false;
                 self.status = Some(Status::ReportRunDone { rows, errors });
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
@@ -1217,8 +1347,6 @@ impl TuiApp {
                 v => v,
             };
         }
-        // `v` always lands on the body (the tab bar is only reached via `Tab`).
-        self.report_tabbar_focus = false;
     }
 
     /// Open the structured node editor for the active report — the Enter key,
@@ -1237,166 +1365,6 @@ impl TuiApp {
         let rt = &mut self.reports[idx];
         rt.view = ReportView::Nodes;
         rt.editor_view = ReportView::Nodes;
-        self.report_tabbar_focus = false;
-    }
-
-    /// Toggle keyboard focus between the report body (the active editor or the
-    /// results grid) and — for a workspace-aware report — its pinned Workspace
-    /// tree. `Tab`/`BackTab` are a plain two-way toggle: they move focus but
-    /// never change *what* the body shows (source ↔ output is `v`; source ↔
-    /// nodes is `n`), so an accidental `Tab` can't jump you onto the results
-    /// grid. For a standalone report (no tree) there is nothing to toggle, so
-    /// `Tab` is inert. The tab bar is deliberately never a focus stop — the tab
-    /// list is reachable with `[`/`]`, PageUp/PageDown and Ctrl/plain arrows.
-    /// `forward` is unused (a two-way toggle has no direction) but kept so the
-    /// `Tab`/`BackTab` call sites stay symmetric.
-    pub(crate) fn cycle_report_focus(&mut self, _forward: bool) {
-        let Some(idx) = self.active_report_index() else {
-            return;
-        };
-        self.report_tabbar_focus = false;
-        // Only a workspace report has a second focus stop (its pinned tree); a
-        // standalone report has just the body, so Tab has nothing to move to.
-        if self.reports[idx].workspace.is_none() {
-            return;
-        }
-        self.report_tree_focus = !self.report_tree_focus;
-    }
-
-    /// Key handling while a workspace-aware report's pinned tree has focus.
-    /// Arrows/`jk` move the cursor, `Enter`/`Right`/`l` open the selected row
-    /// (descend a folder, open a collection tab, or load another report),
-    /// `Left`/`Backspace`/`h` go up a folder. Returns `true` when it consumed
-    /// the key; `false` lets it fall through to the shared report shortcuts
-    /// (Tab, run, menus, …) so those keep working while the tree is focused.
-    fn on_key_report_tree(&mut self, key: KeyEvent) -> bool {
-        let Some(idx) = self.active_report_index() else {
-            return false;
-        };
-        let open_path = self.reports[idx].report.path.clone();
-        let Some(ws) = self.reports[idx].workspace.as_ref() else {
-            return false;
-        };
-        let rows = ws.rows(open_path.as_deref());
-        let len = rows.len();
-        let cursor = ws.cursor.min(len.saturating_sub(1));
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.cursor = cursor.saturating_sub(1);
-                }
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.cursor = if len == 0 {
-                        0
-                    } else {
-                        (cursor + 1).min(len - 1)
-                    };
-                }
-                true
-            }
-            KeyCode::Home => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.cursor = 0;
-                }
-                true
-            }
-            KeyCode::End => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.cursor = len.saturating_sub(1);
-                }
-                true
-            }
-            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut()
-                    && !ws.browse.is_empty()
-                {
-                    ws.browse.pop();
-                    ws.cursor = 0;
-                }
-                true
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                self.activate_report_tree_row(idx, rows.into_iter().nth(cursor));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Act on the selected report-tree row: `../` and folders navigate the
-    /// breadcrumb, a collection opens/activates a Workspace collection tab, and
-    /// a report loads into (or re-activates) a report tab. A no-op if the row is
-    /// gone (empty folder) or is the report already showing.
-    fn activate_report_tree_row(&mut self, idx: usize, row: Option<ReportTreeRow>) {
-        let Some(row) = row else {
-            return;
-        };
-        match row {
-            ReportTreeRow::Up => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.browse.pop();
-                    ws.cursor = 0;
-                }
-            }
-            ReportTreeRow::Folder(name) => {
-                if let Some(ws) = self.reports[idx].workspace.as_mut() {
-                    ws.browse.push(name);
-                    ws.cursor = 0;
-                }
-            }
-            ReportTreeRow::Report { path, open, .. } => {
-                // Re-selecting the report already on screen does nothing.
-                if open {
-                    return;
-                }
-                let Some(ws) = self.reports[idx].workspace.as_ref() else {
-                    return;
-                };
-                let root = ws.root.clone();
-                let browse = ws.browse.clone();
-                self.open_workspace_report(path, root, browse);
-            }
-            ReportTreeRow::Collection { path, .. } => {
-                let Some(ws) = self.reports[idx].workspace.as_ref() else {
-                    return;
-                };
-                let root = ws.root.clone();
-                self.activate_report_tree_collection(root, path);
-            }
-        }
-    }
-
-    /// Open a collection selected from a report's Workspace tree: reuse an
-    /// already-open Workspace collection tab rooted at the same folder if there
-    /// is one, otherwise create one, then load the chosen file into it and
-    /// switch to it (so the user jumps from the report back to its collections).
-    fn activate_report_tree_collection(
-        &mut self,
-        root: std::path::PathBuf,
-        path: std::path::PathBuf,
-    ) {
-        let ci = self
-            .collections
-            .iter()
-            .position(|c| c.workspace_root.as_deref() == Some(root.as_path()));
-        let ci = match ci {
-            Some(ci) => ci,
-            None => {
-                let name = root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| root.to_string_lossy().into_owned());
-                let mut col = crate::collection::Collection::new(name, Vec::new());
-                col.workspace_root = Some(root);
-                self.collections.push(col);
-                self.collections.len() - 1
-            }
-        };
-        self.report_tree_focus = false;
-        self.load_workspace_file(ci, path);
     }
 
     /// Export the active report's last run to CSV. Opens the folder picker
@@ -1803,18 +1771,29 @@ impl TuiApp {
             }
             self.reports[idx].editor = Some(editor);
         }
-        // Editing focuses the body, so drop any tab-bar / tree focus.
-        self.report_tabbar_focus = false;
-        self.report_tree_focus = false;
+        // For an embedded report, editing means the body (not the tree) has
+        // focus.
+        if self.active_report_index().is_some() && !self.active_is_strip_report() {
+            self.focus = Pane::Main;
+        }
     }
 
     /// Close the active report tab, remembering it for reopen (`u`) and moving
     /// focus to the previous tab. Unlike collection tabs, a report tab at any
     /// position is closable (only the built-in Request collection tab is fixed).
+    /// Only reachable for a *standalone* report strip tab — an embedded report
+    /// is closed with its Workspace collection tab (see `finish_close_tab`).
     pub(crate) fn close_active_report_tab(&mut self) {
         let Some(ridx) = self.active_report_index() else {
             return;
         };
+        // The strip slot the closed report occupied (standalone reports only),
+        // so we can land on the neighbouring strip tab after removing it.
+        let slot = self
+            .standalone_report_indices()
+            .iter()
+            .position(|&i| i == ridx)
+            .unwrap_or(0);
         let mut rt = self.reports.remove(ridx);
         // If this tab was still streaming a run, detach it cleanly before
         // stashing. The poller matches updates to *open* tabs by id and can't
@@ -1838,37 +1817,49 @@ impl TuiApp {
         if self.closed_tabs.len() > 20 {
             self.closed_tabs.remove(0);
         }
-        // Prefer staying on the neighbouring report; otherwise fall back to the
-        // last collection tab. `active_tab` counts collections then reports.
+        // Prefer staying on the neighbouring standalone report; otherwise fall
+        // back to the last collection tab. Strip slots count collections, then
+        // the standalone reports (embedded reports aren't in the strip).
         let base = self.collections.len();
-        self.active_tab = if self.reports.is_empty() {
-            base - 1
+        let remaining = self.standalone_report_indices().len();
+        self.active_tab = if remaining == 0 {
+            base.saturating_sub(1)
         } else {
-            base + ridx.min(self.reports.len() - 1)
+            base + slot.min(remaining - 1)
         };
         self.focus = Pane::Tabs;
         self.status = Some(crate::i18n::Status::TabClosed);
         self.save_state();
     }
 
-    /// Key handling for the main view while a report tab is active. Kept
-    /// separate from `on_key_normal` (which is full of `collections[active_tab]`
-    /// accesses that would panic on a report's unified index) — the normal
-    /// handler dispatches here at its very top. Only tab-navigation, global
-    /// menu, and report-specific keys are honoured.
+    /// Key handling for a *standalone* report strip tab (its unified tab index
+    /// falls past the collection tabs). Kept separate from `on_key_normal`
+    /// (which is full of `collections[active_tab]` accesses that would panic on
+    /// a report's unified index) — the normal handler dispatches here at its
+    /// very top for a standalone report. Left/Right cycle tabs (the report is
+    /// full-screen, so the arrows are free to move across the strip); Tab is
+    /// inert (there is no second pane to move focus to).
     pub(crate) fn on_key_report(&mut self, key: KeyEvent) {
-        // A focused Workspace tree (workspace-aware report, not editing) drives
-        // navigation/selection with the arrows + Enter; anything it doesn't
-        // consume falls through to the shared shortcuts below (Tab, run, …) so
-        // those still work while the tree is focused.
-        if self.report_tree_focus
-            && self.active_report_index().is_some_and(|i| {
-                self.reports[i].workspace.is_some() && self.reports[i].editor.is_none()
-            })
-            && self.on_key_report_tree(key)
-        {
-            return;
-        }
+        self.handle_report_key(key, false);
+    }
+
+    /// Key handling for a workspace report embedded in the right pane of its
+    /// collection tab, while that report body holds focus (`Pane::Main`). The
+    /// same body keys as [`Self::on_key_report`] minus the tab-cycling arrows:
+    /// the single collection-side tree drives tab/pane navigation instead, so
+    /// Left/Right are inert here and Tab rotates focus back to the tree (via
+    /// `cycle_focus`). The tree-focused case never reaches this handler — it
+    /// falls through to the normal collection handler in `on_key_normal`.
+    pub(crate) fn on_key_report_body(&mut self, key: KeyEvent) {
+        self.handle_report_key(key, true);
+    }
+
+    /// Shared report key map for both the standalone strip tab (`embedded ==
+    /// false`) and the workspace-embedded right pane (`embedded == true`). The
+    /// only difference is the arrow/Tab handling (see the two public wrappers);
+    /// every body key — edit, node editor, run, dry-run, columns, bind, view
+    /// flip, export, baseline, copy, scroll, resize — is identical.
+    fn handle_report_key(&mut self, key: KeyEvent, embedded: bool) {
         // When the source panel has edit focus, keystrokes type into it rather
         // than acting as view shortcuts (Esc leaves edit focus).
         if let Some(idx) = self.active_report_index()
@@ -1883,7 +1874,6 @@ impl TuiApp {
         // menus, tab navigation, run, the `n` toggle, …).
         if let Some(idx) = self.active_report_index()
             && self.reports[idx].view == ReportView::Nodes
-            && !self.report_tabbar_focus
             && self.on_key_report_nodes(key, idx)
         {
             return;
@@ -1892,25 +1882,34 @@ impl TuiApp {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
-            // Tab navigation (mirrors the collection-view bindings).
+            // Tab navigation (mirrors the collection-view bindings). `[`/`]`
+            // and PageUp/Down work in both modes (an embedded report can still
+            // switch tabs with the brackets).
             KeyCode::Char('[') | KeyCode::PageUp => self.cycle_tab(false),
             KeyCode::Char(']') | KeyCode::PageDown => self.cycle_tab(true),
-            KeyCode::Left if ctrl && shift => self.move_active_tab(false),
-            KeyCode::Right if ctrl && shift => self.move_active_tab(true),
-            KeyCode::Left if ctrl => self.cycle_tab(false),
-            KeyCode::Right if ctrl => self.cycle_tab(true),
+            KeyCode::Left if ctrl && shift && !embedded => self.move_active_tab(false),
+            KeyCode::Right if ctrl && shift && !embedded => self.move_active_tab(true),
+            KeyCode::Left if ctrl && !embedded => self.cycle_tab(false),
+            KeyCode::Right if ctrl && !embedded => self.cycle_tab(true),
             // Shift+Arrow adjusts the end of a mouse-started panel selection
             // (same as the collection view's body panels).
             KeyCode::Left if shift => self.extend_report_selection(KeyCode::Left),
             KeyCode::Right if shift => self.extend_report_selection(KeyCode::Right),
             KeyCode::Up if shift => self.extend_report_selection(KeyCode::Up),
             KeyCode::Down if shift => self.extend_report_selection(KeyCode::Down),
-            // Plain Left/Right also move across tabs: the report view is
-            // full-screen (no left/right panes to traverse), so — unlike the
-            // collection view — arrows are free to drive tab navigation, and
-            // users expect them to move *past* a report tab in the bar.
-            KeyCode::Left => self.cycle_tab(false),
-            KeyCode::Right => self.cycle_tab(true),
+            // Plain Left/Right also move across tabs *for a standalone report*:
+            // it's full-screen (no left/right panes to traverse), so — unlike
+            // the collection view — arrows are free to drive tab navigation. An
+            // embedded report shares the collection tree's left pane, so its
+            // Left/Right must NOT cycle tabs (the tree owns them) — inert here.
+            KeyCode::Left | KeyCode::Right if !embedded => {
+                if key.code == KeyCode::Left {
+                    self.cycle_tab(false);
+                } else {
+                    self.cycle_tab(true);
+                }
+            }
+            KeyCode::Left | KeyCode::Right => {}
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // Global menus, unchanged from the collection view.
@@ -1948,12 +1947,13 @@ impl TuiApp {
             KeyCode::Char('b') => self.open_report_bind(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
-            // Tab rotates focus across the report's areas — Editor (source or
-            // nodes) → Results grid → (for a workspace report) the pinned tree →
-            // Editor. The tab bar is not in this cycle (use `[`/`]` or the arrow
-            // keys to move across tabs). Shift+Tab rotates the other way.
-            KeyCode::Tab => self.cycle_report_focus(true),
-            KeyCode::BackTab => self.cycle_report_focus(false),
+            // Tab moves focus. A standalone report has a single (full-screen)
+            // body, so Tab is inert. An embedded report shares its tab with the
+            // collection tree, so Tab rotates focus back to that tree (and on
+            // round to the body / env), via the shared `cycle_focus`.
+            KeyCode::Tab if embedded => self.cycle_focus(true),
+            KeyCode::BackTab if embedded => self.cycle_focus(false),
+            KeyCode::Tab | KeyCode::BackTab => {}
             // Export the last run to CSV next to the report.
             KeyCode::Char('x') => self.export_active_report_csv(),
             // Save the last run as a `.baseline` snapshot (Shift+B) — `b` is
@@ -1969,8 +1969,8 @@ impl TuiApp {
             KeyCode::Down => self.scroll_report(1),
             KeyCode::Home => self.scroll_report(i32::MIN),
             KeyCode::End => self.scroll_report(i32::MAX),
-            // `<`/`>` resize the pinned workspace tree column, mirroring the
-            // collection view's request-list resize (same 20..80 clamp).
+            // `<`/`>` resize the request-list / results column width, mirroring
+            // the collection view's request-list resize (same 20..80 clamp).
             KeyCode::Char('>') => {
                 self.list_width = (self.list_width + 2).min(80);
                 self.save_state();
@@ -3011,8 +3011,12 @@ fn rejoin(lines: Vec<String>, trailing_nl: bool) -> String {
     out
 }
 
-/// Draw a report tab's full-screen body: the binding status, the flow source
-/// (syntax-highlighted, editable in place), and the live validation panel.
+/// Draw a standalone report tab's full-screen body: the binding status, the
+/// flow source (syntax-highlighted, editable in place), and the live
+/// validation panel. A standalone report owns the whole area and always holds
+/// body focus. The embedded-in-a-workspace path calls [`draw_report_content`]
+/// directly for the right pane instead (the workspace file-tree stays on the
+/// left).
 pub(crate) fn draw_report_body(
     f: &mut Frame,
     area: Rect,
@@ -3023,19 +3027,24 @@ pub(crate) fn draw_report_body(
     let Some(idx) = app.active_report_index() else {
         return;
     };
+    draw_report_content(f, area, app, idx, s, th);
+}
 
-    // A workspace-aware report pins the workspace file-tree to the left; the
-    // report body (binding + source/nodes/results) fills the rest. Split it off
-    // first so the body layout below is unchanged, just narrower.
-    let area = if app.reports[idx].workspace.is_some() {
-        let cols = Layout::horizontal([Constraint::Length(app.list_width), Constraint::Min(20)])
-            .split(area);
-        draw_report_workspace_tree(f, cols[0], app, idx, s, th);
-        cols[1]
-    } else {
-        area
-    };
-
+/// Draw the report *content* — everything to the right of any workspace tree:
+/// the binding row plus either the results grid or the source/nodes editor with
+/// the validation panel below. Shared by the standalone full-screen report
+/// ([`draw_report_body`]) and the workspace-embedded right pane (see
+/// [`super::draw::draw_body`]). Whether the body border is lit follows
+/// [`TuiApp::report_body_focused`] (always true for a standalone report; for an
+/// embedded one, only while the report body — not the tree — holds focus).
+pub(crate) fn draw_report_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
     // Reset the mouse hit-test areas each frame; the specific panel draws below
     // record the ones actually shown (a panel not drawn this frame stays
     // `Rect::default()`, so it can never be hit).
@@ -3079,74 +3088,6 @@ pub(crate) fn draw_report_body(
     draw_report_validation(f, rows[2], app, idx, s, th);
 }
 
-/// Draw the pinned Workspace file-tree on the left of a workspace-aware report
-/// view. Same filesystem tree the collection Workspace tab shows (`../`,
-/// subfolders, collections, reports) but with the open report marked and no
-/// inlined requests. Highlights the cursor row; the border is lit only while
-/// the tree holds focus (`Tab` moves focus in/out). Selecting a row is handled
-/// in the key layer (see [`TuiApp::on_key_report_tree`]).
-fn draw_report_workspace_tree(
-    f: &mut Frame,
-    area: Rect,
-    app: &mut TuiApp,
-    idx: usize,
-    s: &Strings,
-    th: &Theme,
-) {
-    use super::draw::{COLLECTION_CLOSED_ICON, FOLDER_ICON, REPORT_ICON};
-    let open_path = app.reports[idx].report.path.clone();
-    let Some(ws) = &app.reports[idx].workspace else {
-        return;
-    };
-    let rows = ws.rows(open_path.as_deref());
-    let sel = ws.cursor.min(rows.len().saturating_sub(1));
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| match row {
-            ReportTreeRow::Up => ListItem::new(Line::from(Span::styled(
-                s.list_up_row.to_string(),
-                Style::default().fg(th.dim),
-            ))),
-            ReportTreeRow::Folder(name) => ListItem::new(Line::from(Span::styled(
-                format!("{FOLDER_ICON} {name}/"),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ))),
-            ReportTreeRow::Collection { name, .. } => ListItem::new(Line::from(Span::styled(
-                format!("{COLLECTION_CLOSED_ICON} {name}"),
-                Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-            ))),
-            ReportTreeRow::Report { name, open, .. } => {
-                let style = if *open {
-                    Style::default().fg(th.ok).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(th.accent)
-                };
-                ListItem::new(Line::from(Span::styled(
-                    format!("{REPORT_ICON} {name}"),
-                    style,
-                )))
-            }
-        })
-        .collect();
-    let focused = app.report_tree_focus;
-    let title = format!("{} — {}", s.report_workspace_heading, s.report_hint_tree);
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        state.select(Some(sel));
-    }
-    let list = List::new(items)
-        .block(panel(title, focused, th))
-        .highlight_style(
-            Style::default()
-                .bg(th.accent)
-                .fg(th.bg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-/// resolved column names, then one clipped, column-aligned line per produced
 /// row. Any run-level errors are surfaced in the panel title so a partly-failed
 /// run isn't silently presented as clean.
 fn draw_report_results(
@@ -3192,14 +3133,10 @@ fn draw_report_results(
             }
         }
     };
-    // Dim the grid's border while the tab bar or the workspace tree holds focus
-    // (both are separate Tab stops), so the lit border always marks the pane
-    // that actually has focus.
-    let block = panel(
-        title,
-        !app.report_tabbar_focus && !app.report_tree_focus,
-        th,
-    );
+    // Dim the grid's border unless the report body actually holds focus (for an
+    // embedded report the workspace tree can hold it instead), so the lit
+    // border always marks the pane that has focus.
+    let block = panel(title, app.report_body_focused(), th);
     let (inner, bar) = draw_report_panel(
         f,
         area,
@@ -3572,14 +3509,10 @@ fn draw_report_source(
         hint
     };
     let title = format!("{} — {}", s.report_source_heading, hint);
-    // Dim the source panel's border when the tab bar or the workspace tree has
-    // focus (both are separate Tab stops), so the focused area is unambiguous;
-    // editing always keeps it lit.
-    let block = panel(
-        title,
-        editing || (!app.report_tabbar_focus && !app.report_tree_focus),
-        th,
-    );
+    // Dim the source panel's border unless it holds focus (for an embedded
+    // report the workspace tree can hold it instead), so the focused area is
+    // unambiguous; editing always keeps it lit.
+    let block = panel(title, editing || app.report_body_focused(), th);
     // Context so the highlighter can colour the `# collection:`/`# environment:`
     // references (and `ENVS` names) by whether they currently resolve. Built
     // before any `&mut app` borrow below.

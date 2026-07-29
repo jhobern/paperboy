@@ -715,14 +715,10 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
 }
 
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    // In the report view `focus` is pinned to `Pane::Tabs`, so the tab-bar
-    // highlight follows the report's own focus flag instead: it's lit only when
-    // `Tab` has rotated focus onto the tab list.
-    let focused = if app.active_is_report() {
-        app.report_tabbar_focus
-    } else {
-        app.focus == Pane::Tabs
-    };
+    // A *standalone* report strip tab always keeps focus on its body (the tab
+    // bar is never a focus stop), so its tab-bar highlight is never lit. An
+    // embedded report rides a collection tab, whose Tabs focus works normally.
+    let focused = !app.active_is_strip_report() && app.focus == Pane::Tabs;
     let mk = |label: String, active: bool| -> Span {
         if active {
             Span::styled(
@@ -766,11 +762,14 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(mk(name, app.active_tab == i));
         pos += w;
     }
-    // Report tabs follow the collection tabs in the same strip (unified index:
-    // `collections.len() + report_index`). A leading icon distinguishes them,
+    // Standalone report tabs follow the collection tabs in the same strip
+    // (unified index: `collections.len() + strip_slot`). Workspace-embedded
+    // reports aren't in the strip (they ride inside their Workspace collection
+    // tab), so they're skipped here. A leading icon distinguishes report tabs,
     // and a dirty marker flags unsaved source edits.
     let report_base = app.collections.len();
-    for (r, rt) in app.reports.iter().enumerate() {
+    for (slot, ri) in app.standalone_report_indices().into_iter().enumerate() {
+        let rt = &app.reports[ri];
         spans.push(Span::raw("│"));
         pos += 1;
         // Unsaved edits get a trailing dot (with a leading space so it never
@@ -781,7 +780,7 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             String::new()
         };
         let name = format!("{}{}{}", s.report_tab_icon, rt.report.name, marker);
-        let idx = report_base + r;
+        let idx = report_base + slot;
         let w = name.chars().count() + 2;
         if app.active_tab == idx {
             active_start = pos;
@@ -832,18 +831,26 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
 }
 
 pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &mut TuiApp, s: &Strings, th: &Theme) {
-    // A report tab takes the whole body (no list/environment/response panels),
-    // per the design — so branch before the collection-tab layout below, which
-    // indexes `app.collections[app.active_tab]` and would panic on a report's
-    // unified tab index.
-    if app.active_is_report() {
+    // A *standalone* report strip tab takes the whole body (no
+    // list/environment/response panels) — branch before the collection-tab
+    // layout below, which indexes `app.collections[app.active_tab]` and would
+    // panic on a report's unified tab index.
+    if app.active_is_strip_report() {
         super::reports::draw_report_body(f, area, app, s, th);
         return;
     }
+    // Otherwise it's a collection tab: always draw its left column (the request
+    // list / Workspace file-tree). For a Workspace tab showing an *embedded*
+    // report, the right column is the report body; otherwise it's the usual
+    // request editor + response split.
     let cols =
         Layout::horizontal([Constraint::Length(app.list_width), Constraint::Min(10)]).split(area);
     let ci = app.active_tab;
     draw_collection_left(f, cols[0], app, ci, s, th);
+    if let Some(idx) = app.active_report_index() {
+        super::reports::draw_report_content(f, cols[1], app, idx, s, th);
+        return;
+    }
     let right = Layout::vertical([Constraint::Min(4), Constraint::Percentage(app.response_pct)])
         .split(cols[1]);
     draw_collection_main(f, right[0], app, ci, s, th);

@@ -12566,14 +12566,22 @@ fn create_workspace_report_writes_the_file_and_opens_a_workspace_report() {
     let rt = &app.reports[0];
     assert_eq!(rt.report.path.as_deref(), Some(expected.as_path()));
     assert!(
-        rt.workspace.is_some(),
-        "opened pinned to the workspace tree, not as a plain report tab"
+        rt.workspace_root.is_some(),
+        "opened embedded in the workspace tab, not as a plain report tab"
     );
+    // The report is embedded *in* the Workspace collection tab, not spawned as a
+    // separate strip tab: the active tab stays the collection tab and the strip
+    // count is unchanged (Request tab + the Workspace tab = 2).
     assert_eq!(
-        app.active_tab,
-        app.collections.len() + app.reports.len() - 1,
-        "the new report tab is the active tab"
+        app.active_tab, ci,
+        "the Workspace collection tab stays active"
     );
+    assert_eq!(app.tab_count(), 2, "no new strip tab is created");
+    assert!(
+        app.active_is_report(),
+        "the Workspace tab now shows the embedded report"
+    );
+    assert_eq!(app.active_report_index(), Some(0));
     assert!(matches!(
         app.status,
         Some(crate::i18n::Status::WorkspaceReportCreated(_))
@@ -15589,10 +15597,8 @@ fn report_tab_cycles_focus_to_the_tab_list_and_back() {
     let mut app = TuiApp::default();
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
-    assert!(!app.report_tabbar_focus);
     assert_eq!(app.reports[idx].view, ReportView::Source);
     press(&mut app, KeyCode::Tab); // no grid, no tree → nothing else to focus
-    assert!(!app.report_tabbar_focus, "Tab never focuses the tab list");
     assert_eq!(app.reports[idx].view, ReportView::Source);
 }
 
@@ -15627,7 +15633,6 @@ fn report_v_swaps_between_editor_and_results_grid() {
     // Tab is inert for a standalone report — it never leaves the grid.
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.reports[idx].view, ReportView::Results);
-    assert!(!app.report_tabbar_focus);
 
     press(&mut app, KeyCode::Char('v')); // Results -> Source (the editor)
     assert_eq!(app.reports[idx].view, ReportView::Source);
@@ -18360,9 +18365,10 @@ fn report_node_envs_form_mode_toggle_rewrites_the_clause() {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace-aware reports: opening a `.trail` from a Workspace tree pins that
-// tree to the left of the full report view, so the user can navigate the
-// workspace's collections/reports without leaving the report.
+// Workspace-aware reports: opening a `.trail` from a Workspace tab's tree
+// embeds it in that tab's *right pane* while the single collection-side tree
+// stays on the left driving navigation. No duplicate tree, no separate report
+// tab — the report just replaces the request/response view in place.
 // ---------------------------------------------------------------------------
 
 /// Build a temp workspace folder holding a collection and two report files
@@ -18407,261 +18413,542 @@ fn workspace_with_reports() -> (TuiApp, usize, std::path::PathBuf) {
     (app, ci, root)
 }
 
-/// Pressing Enter on a `.trail` row in a Workspace tab's tree opens a
-/// workspace-aware report tab: it lands in `reports`, carries the workspace
-/// context, and its pinned tree takes focus.
-#[test]
-fn opening_a_report_from_the_workspace_tree_opens_a_workspace_aware_report_tab() {
-    let (mut app, ci, root) = workspace_with_reports();
-    // Find the `alpha.trail` row and highlight it.
-    let rows = app.collections[ci].ws_rows();
-    let cursor = rows
+/// Helper: index of the first workspace tree row matching `pred`, panicking with
+/// `what` if absent. Keeps the press-driven tests below terse.
+fn ws_row_pos(
+    app: &TuiApp,
+    ci: usize,
+    what: &str,
+    pred: impl Fn(&crate::collection::WsRow) -> bool,
+) -> usize {
+    app.collections[ci]
+        .ws_rows()
         .iter()
-        .position(
-            |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
-        )
-        .expect("alpha.trail is listed in the workspace tree");
-    app.collections[ci].list_cursor = cursor;
+        .position(|r| pred(r))
+        .unwrap_or_else(|| panic!("{what} is listed in the workspace tree"))
+}
+
+/// Helper: highlight tree row `target` in Workspace tab `ci` by a **real arrow
+/// keypress** — position the cursor one row away and press Up/Down so it lands
+/// on `target`, driving the selection-follows-highlight path exactly as a user
+/// would. Requires the target not to be the only row.
+fn select_row(app: &mut TuiApp, ci: usize, target: usize) {
     app.focus = super::app::Pane::List;
+    let from = if target == 0 { target + 1 } else { target - 1 };
+    app.collections[ci].list_cursor = from;
+    let key = if from < target {
+        KeyCode::Down
+    } else {
+        KeyCode::Up
+    };
+    press(app, key);
+    assert_eq!(
+        app.collections[ci].list_cursor, target,
+        "the arrow keypress landed the cursor on the target row"
+    );
+}
 
-    press(&mut app, KeyCode::Enter);
+/// Landing the tree highlight on a `.trail` row *selects* it — the report shows
+/// embedded in that tab's right pane with no keypress beyond the cursor move
+/// (no `Enter`), no new strip tab, focus still on the tree, and the cursor left
+/// on the report's own row.
+#[test]
+fn highlighting_a_report_row_embeds_it_in_place() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let tabs_before = app.tab_count();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
 
-    assert_eq!(app.reports.len(), 1, "a report tab was opened");
-    assert!(app.active_is_report(), "the report tab is now active");
+    select_row(&mut app, ci, alpha);
+
+    assert_eq!(app.reports.len(), 1, "the report was loaded and embedded");
+    assert_eq!(
+        app.tab_count(),
+        tabs_before,
+        "the report embeds in the Workspace tab — no new strip tab"
+    );
+    assert!(
+        !app.active_is_strip_report(),
+        "the embedded report is not a strip tab"
+    );
+    assert_eq!(
+        app.active_tab, ci,
+        "the Workspace collection tab stays active"
+    );
+    assert!(
+        app.active_report_index().is_some(),
+        "the tab shows the embedded report in its right pane"
+    );
+    assert_eq!(
+        app.focus,
+        super::app::Pane::List,
+        "selection keeps focus on the tree, not the report body"
+    );
+    assert_eq!(
+        app.collections[ci].list_cursor, alpha,
+        "the tree cursor stays on the report row"
+    );
     let rt = app.active_report().expect("active report");
     assert_eq!(rt.report.name, "Alpha");
-    let ws = rt.workspace.as_ref().expect("workspace context is carried");
-    assert_eq!(ws.root, root, "the tree is rooted at the workspace root");
-    assert!(app.report_tree_focus, "the pinned tree takes focus on open");
-    let _ = ci;
+    assert_eq!(rt.workspace_root.as_deref(), Some(root.as_path()));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A workspace report's pinned tree lists the browsed folder's subfolders,
-/// collections, and report files, marking the open report.
+/// Moving the highlight *off* a report onto a collection row returns the right
+/// pane to the request/response view (the report is hidden but retained), still
+/// in the same tab with focus on the tree; moving back re-shows the retained
+/// report without adding a tab.
 #[test]
-fn a_workspace_report_tree_lists_folders_collections_and_reports() {
-    use super::reports::{ReportTreeRow, ReportWorkspace};
-    let (_app, _ci, root) = workspace_with_reports();
-    let ws = ReportWorkspace {
-        root: root.clone(),
-        browse: Vec::new(),
-        cursor: 0,
-    };
-    let open = root.join("alpha.trail");
-    let rows = ws.rows(Some(open.as_path()));
-    // Subfolder first (list_dir puts dirs before files), then the collection,
-    // then the two reports.
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r, ReportTreeRow::Folder(n) if n == "nested")),
-        "the subfolder is listed: {rows:?}"
-    );
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r, ReportTreeRow::Collection { name, .. } if name == "api.hurl")),
-        "the collection is listed"
-    );
-    let alpha = rows
-        .iter()
-        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "alpha.trail"))
-        .expect("alpha.trail is listed");
-    assert!(
-        matches!(alpha, ReportTreeRow::Report { open: true, .. }),
-        "the currently-open report is marked open"
-    );
-    let beta = rows
-        .iter()
-        .find(|r| matches!(r, ReportTreeRow::Report { name, .. } if name == "beta.trail"))
-        .expect("beta.trail is listed");
-    assert!(
-        matches!(beta, ReportTreeRow::Report { open: false, .. }),
-        "a different report is not marked open"
-    );
-}
-
-/// With the pinned tree focused, arrows move the cursor and Enter on another
-/// report opens (and activates) it as a second workspace-aware report tab.
-#[test]
-fn report_tree_navigation_opens_another_report() {
+fn moving_the_highlight_off_a_report_returns_to_the_request_view() {
     let (mut app, ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
-    assert!(app.report_tree_focus);
-    assert_eq!(app.reports.len(), 1);
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert!(app.active_report_index().is_some(), "report embedded");
+    let tabs_before = app.tab_count();
 
-    // Move the tree cursor onto `beta.trail` and open it.
+    // Highlight the collection row: the report hides, the pane returns to
+    // request/response.
+    let col_row = ws_row_pos(
+        &app,
+        ci,
+        "api.hurl",
+        |r| matches!(r, crate::collection::WsRow::Collection { name, .. } if name == "api.hurl"),
+    );
+    select_row(&mut app, ci, col_row);
+    assert!(
+        app.active_report_index().is_none(),
+        "the right pane is back to request/response"
+    );
+    assert_eq!(app.focus, super::app::Pane::List, "focus stays on the tree");
+    assert_eq!(app.reports.len(), 1, "the report is retained (hidden)");
+    assert!(
+        !app.reports[0].embedded_active,
+        "retained report marked hidden"
+    );
+    assert_eq!(app.tab_count(), tabs_before, "no tab added or removed");
+
+    // Highlight the report again: it re-shows without loading a second copy.
+    select_row(&mut app, ci, alpha);
+    assert!(
+        app.active_report_index().is_some(),
+        "the report is shown again"
+    );
+    assert_eq!(app.reports.len(), 1, "no duplicate report tab");
+    assert_eq!(app.active_report().unwrap().report.name, "Alpha");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A report's in-memory source edits survive moving the highlight away and back
+/// — the retained `ReportTab` isn't reloaded from disk, mirroring how a
+/// request's edits persist while you browse other rows.
+#[test]
+fn report_edits_survive_moving_the_highlight_away_and_back() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
     let idx = app.active_report_index().unwrap();
-    let open = app.reports[idx].report.path.clone();
-    let ws = app.reports[idx].workspace.as_ref().unwrap();
-    let target = ws
-        .rows(open.as_deref())
-        .into_iter()
-        .position(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "beta.trail"))
-        .expect("beta.trail is in the tree");
-    app.reports[idx].workspace.as_mut().unwrap().cursor = target;
+    // Dirty the embedded report's source in memory (not saved to disk).
+    app.reports[idx]
+        .report
+        .set_text("# name: Alpha edited\nREQUEST Oauth\n");
+    assert!(app.reports[idx].report.dirty);
+
+    // Browse away (collection row) then back to the report.
+    let col_row = ws_row_pos(
+        &app,
+        ci,
+        "api.hurl",
+        |r| matches!(r, crate::collection::WsRow::Collection { name, .. } if name == "api.hurl"),
+    );
+    select_row(&mut app, ci, col_row);
+    select_row(&mut app, ci, alpha);
+
+    let idx = app.active_report_index().unwrap();
+    assert!(
+        app.reports[idx].report.dirty,
+        "the retained report keeps its unsaved edits (not reloaded)"
+    );
+    assert!(
+        app.reports[idx].report.text.contains("Alpha edited"),
+        "the edited source is intact"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Highlighting a request row (with a report currently embedded) shows that
+/// request in the right pane and hides the report — the same
+/// selection-follows-highlight rule as collections.
+#[test]
+fn highlighting_a_request_row_shows_the_request_and_hides_the_report() {
+    let (mut app, ci, root) = workspace_with_reports();
+    app.focus = super::app::Pane::List;
+    // Expand the collection so its request rows appear in the tree.
+    let col_row = ws_row_pos(
+        &app,
+        ci,
+        "api.hurl",
+        |r| matches!(r, crate::collection::WsRow::Collection { name, .. } if name == "api.hurl"),
+    );
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.collections[ci].entries.is_empty(),
+        "the collection is loaded and expanded"
+    );
+
+    // Embed a report on top of the expanded-collection tree.
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert!(app.active_report_index().is_some(), "report embedded");
+
+    // Highlight the request row: the report hides and the request shows.
+    let req_row = ws_row_pos(&app, ci, "the request", |r| {
+        matches!(r, crate::collection::WsRow::Request(_))
+    });
+    select_row(&mut app, ci, req_row);
+    assert!(
+        app.active_report_index().is_none(),
+        "the report is hidden — the request shows in the pane"
+    );
+    assert_eq!(app.focus, super::app::Pane::List, "focus stays on the tree");
+    assert_eq!(
+        app.collections[ci].selected_entry, 0,
+        "the request is selected"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// With a report embedded and focus on the tree, the plain Left/Right arrows
+/// must NOT cycle tabs — the single tree owns the left pane; tab cycling is
+/// reserved for `[`/`]`.
+#[test]
+fn embedded_report_left_right_do_not_change_active_tab() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert!(app.active_report_index().is_some());
+    let active_before = app.active_tab;
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.active_tab, active_before, "Left does not cycle tabs");
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.active_tab, active_before, "Right does not cycle tabs");
+    assert_eq!(
+        app.focus,
+        super::app::Pane::List,
+        "focus is still on the tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Enter on a report row opens the report's node editor (the report equivalent
+/// of a request's edit wizard) and moves focus into the report body — the
+/// report is already shown by the highlight, so Enter is the "edit it" action.
+#[test]
+fn enter_on_a_report_row_opens_the_editor() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(
+        app.focus,
+        super::app::Pane::List,
+        "selection stays on the tree"
+    );
 
     press(&mut app, KeyCode::Enter);
-
-    assert_eq!(app.reports.len(), 2, "a second report tab opened");
-    assert_eq!(app.active_report().unwrap().report.name, "Beta");
-    assert!(
-        app.active_report().unwrap().workspace.is_some(),
-        "the newly-opened report also carries workspace context"
-    );
-    let _ = ci;
-}
-
-/// Descending into a subfolder from the pinned tree updates the breadcrumb and
-/// surfaces that folder's reports.
-#[test]
-fn report_tree_descends_into_a_subfolder() {
-    let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
-    let idx = app.active_report_index().unwrap();
-    let open = app.reports[idx].report.path.clone();
-    let ws = app.reports[idx].workspace.as_ref().unwrap();
-    let target = ws
-        .rows(open.as_deref())
-        .into_iter()
-        .position(|r| matches!(r, super::reports::ReportTreeRow::Folder(n) if n == "nested"))
-        .expect("the subfolder is in the tree");
-    app.reports[idx].workspace.as_mut().unwrap().cursor = target;
-
-    press(&mut app, KeyCode::Enter); // descend
-
-    let ws = app.reports[idx].workspace.as_ref().unwrap();
     assert_eq!(
-        ws.browse,
-        vec!["nested".to_string()],
-        "breadcrumb descended"
+        app.focus,
+        super::app::Pane::Main,
+        "Enter moves focus into the report body to edit it"
     );
+    let idx = app.active_report_index().expect("report still shown");
+    use super::reports::ReportView;
     assert!(
-        ws.rows(open.as_deref())
-            .iter()
-            .any(|r| matches!(r, super::reports::ReportTreeRow::Report { name, .. } if name == "gamma.trail")),
-        "the subfolder's report is now listed"
+        app.reports[idx].view == ReportView::Nodes || app.reports[idx].editor.is_some(),
+        "Enter opened an editor (node editor, or the source editor fallback)"
     );
-    // Backspace goes back up.
-    press(&mut app, KeyCode::Backspace);
-    assert!(
-        app.reports[idx]
-            .workspace
-            .as_ref()
-            .unwrap()
-            .browse
-            .is_empty(),
-        "Backspace ascends to the workspace root"
-    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `cycle_report_focus` visits the pinned tree only for a workspace report; a
-/// plain report tab never lands on a Tree focus.
+/// Tab from the tree moves focus into the report body; a following body key
+/// (`e`) then acts on the report (source edit) rather than switching tabs.
 #[test]
-fn focus_cycle_includes_the_tree_only_for_workspace_reports() {
-    // Plain report: Tab cycles editor/tabbar, never sets tree focus.
+fn tab_moves_focus_into_the_report_body() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(app.focus, super::app::Pane::List);
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        app.focus,
+        super::app::Pane::Main,
+        "Tab focuses the report body"
+    );
+    let active_before = app.active_tab;
+
+    press(&mut app, KeyCode::Char('e'));
+    assert_eq!(app.active_tab, active_before, "still the same tab");
+    let idx = app.active_report_index().unwrap();
+    assert!(
+        app.reports[idx].editor.is_some(),
+        "`e` entered source edit on the embedded report"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// While a report occupies the right pane, the File → Save submenu hides
+/// "Save Request" but still offers Report, Collection, and Workspace.
+#[test]
+fn file_save_items_hide_request_while_a_report_is_shown() {
+    use super::app::{FileKind, SaveItem};
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert!(app.active_report_index().is_some());
+
+    let items = app.file_save_items();
+    assert!(
+        !items.contains(&SaveItem::Request),
+        "Save Request is hidden while a report is shown: {items:?}"
+    );
+    assert!(
+        items.contains(&SaveItem::Kind(FileKind::Report)),
+        "Report is offered"
+    );
+    assert!(
+        items.contains(&SaveItem::Kind(FileKind::Collection)),
+        "Collection is offered"
+    );
+    assert!(
+        items.contains(&SaveItem::Kind(FileKind::Workspace)),
+        "Workspace is offered"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A standalone report (File → Load Report, no workspace) still opens as its own
+/// separate strip tab — the embedded-in-workspace path must not have changed it.
+#[test]
+fn a_standalone_report_still_opens_as_its_own_tab() {
     let mut app = TuiApp::default();
-    app.new_report_tab();
-    for _ in 0..6 {
-        app.cycle_report_focus(true);
-        assert!(
-            !app.report_tree_focus,
-            "a non-workspace report never focuses a tree"
-        );
-    }
+    let tabs_before = app.tab_count();
+    let report = crate::report::Report::scratch("Standalone");
+    app.open_loaded_report(report);
 
-    // Workspace report: the cycle reaches the tree exactly once per lap.
-    let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
-    // Start from a known non-tree focus.
-    app.report_tree_focus = false;
-    app.report_tabbar_focus = false;
-    let mut saw_tree = false;
-    for _ in 0..8 {
-        app.cycle_report_focus(true);
-        saw_tree |= app.report_tree_focus;
-    }
+    assert_eq!(
+        app.tab_count(),
+        tabs_before + 1,
+        "a standalone report adds a strip tab"
+    );
+    assert_eq!(app.reports.len(), 1);
     assert!(
-        saw_tree,
-        "the focus cycle reaches the pinned tree for a workspace report"
+        app.reports[0].workspace_root.is_none(),
+        "a standalone report carries no workspace link"
     );
+    assert!(app.active_is_report());
+    assert!(
+        app.active_is_strip_report(),
+        "its active_tab is a report strip slot, not a collection index"
+    );
+    assert_eq!(app.active_tab, app.collections.len());
 }
 
-/// The workspace context (root + browsed sub-path) round-trips through session
-/// persistence, so a workspace report reopens pinned where it was.
+/// The *shown* embedded report round-trips through session persistence back
+/// into its Workspace tab: after restore it's still embedded (resolved via the
+/// collection tab, not a strip tab), the strip count is unchanged, it resumes
+/// focused on its tree (`Pane::List`), and the tree cursor is restored onto the
+/// report's row.
 #[test]
-fn workspace_report_context_round_trips_through_persistence() {
-    let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(
-        root.join("alpha.trail"),
-        root.clone(),
-        vec!["nested".into()],
+fn an_embedded_workspace_report_round_trips_into_its_workspace_tab() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
     );
-    let idx = app.active_report_index().unwrap();
-    // Sanity: the browse breadcrumb we asked for is on the tab.
-    assert_eq!(
-        app.reports[idx].workspace.as_ref().unwrap().browse,
-        vec!["nested".to_string()]
-    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(app.active_tab, ci);
+    let tabs_before = app.tab_count();
 
     let snapshot = app.to_persisted();
     let mut restored = TuiApp::default();
     restored.apply_persisted(snapshot);
 
-    assert_eq!(restored.reports.len(), 1);
-    let ws = restored.reports[0]
-        .workspace
-        .as_ref()
-        .expect("workspace context restored");
-    assert_eq!(ws.root, root, "root restored");
-    assert_eq!(
-        ws.browse,
-        vec!["nested".to_string()],
-        "browsed sub-path restored"
+    assert_eq!(restored.reports.len(), 1, "the report is restored");
+    assert!(
+        restored.reports[0].workspace_root.is_some(),
+        "restored as a workspace-embedded report"
     );
-}
-
-/// On reopen, a workspace report resumes focused on its pinned tree (like a
-/// workspace collection resumes on `Pane::List`), not on the editor — so
-/// reopening is consistent regardless of which tab kind was active. A plain
-/// report has no tree and stays on the editor.
-#[test]
-fn a_workspace_report_reopens_focused_on_its_tree() {
-    let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
-    let snapshot = app.to_persisted();
-
-    let mut restored = TuiApp::default();
-    // A fresh app starts on the editor; restore must move focus to the tree.
-    assert!(!restored.report_tree_focus);
-    restored.apply_persisted(snapshot);
+    assert_eq!(
+        restored.tab_count(),
+        tabs_before,
+        "no extra strip tab after restore"
+    );
+    assert_eq!(restored.active_tab, ci, "the Workspace tab is active again");
     assert!(
         restored.active_report_index().is_some(),
-        "the report is the active tab after restore"
+        "the Workspace tab shows its embedded report again"
     );
-    assert!(
-        restored.report_tree_focus,
-        "a workspace report resumes focused on its pinned tree"
+    assert_eq!(restored.active_report().unwrap().report.name, "Alpha");
+    assert_eq!(
+        restored.focus,
+        super::app::Pane::List,
+        "the embedded report resumes focused on its tree, not the body"
     );
-    assert!(!restored.report_tabbar_focus);
-
-    // A standalone (non-workspace) report has no tree, so it stays on the editor.
-    let mut plain = TuiApp::default();
-    plain.new_report_tab();
-    let snapshot = plain.to_persisted();
-    let mut restored = TuiApp::default();
-    restored.apply_persisted(snapshot);
-    assert!(restored.active_report_index().is_some());
-    assert!(
-        !restored.report_tree_focus,
-        "a report with no pinned tree stays focused on the editor"
+    let want = ws_row_pos(
+        &restored,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
     );
+    assert_eq!(
+        restored.collections[ci].list_cursor, want,
+        "the tree resumes highlighting the embedded report"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A workspace report whose root folder has vanished restores as an ordinary
-/// (non-workspace) report tab rather than pointing at a dead folder.
+/// A merely-retained (hidden) report is a within-session cache, so it is *not*
+/// persisted: after a round-trip the Workspace tab shows its request/response
+/// view and no report lingers in `reports` (it reloads on demand when its row
+/// is highlighted again).
+#[test]
+fn a_hidden_embedded_report_is_dropped_from_persistence() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    // Move the highlight off the report so it's retained-but-hidden.
+    let col_row = ws_row_pos(
+        &app,
+        ci,
+        "api.hurl",
+        |r| matches!(r, crate::collection::WsRow::Collection { name, .. } if name == "api.hurl"),
+    );
+    select_row(&mut app, ci, col_row);
+    assert!(app.active_report_index().is_none(), "report hidden");
+    assert_eq!(app.reports.len(), 1, "still retained in-session");
+
+    let snapshot = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+
+    assert_eq!(
+        restored.reports.len(),
+        0,
+        "a hidden embedded report is not persisted"
+    );
+    assert!(
+        restored.active_report_index().is_none(),
+        "the Workspace tab shows its request/response view after restore"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A hidden embedded report that has **unsaved edits** must survive persistence
+/// (unlike a clean hidden one, which is a mere within-session cache). Edit the
+/// source, move the highlight off it (retained-but-hidden and dirty), then
+/// round-trip: the report is restored, stays hidden, and keeps its edited text.
+#[test]
+fn a_hidden_dirty_embedded_report_survives_persistence() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    let idx = app.active_report_index().unwrap();
+    // Dirty the embedded report's source without saving it to disk.
+    let edited = "# name: Alpha (edited)\n# collection: api.hurl\nREQUEST Oauth\n";
+    app.reports[idx].report.set_text(edited);
+    assert!(app.reports[idx].report.dirty, "the edit marked it dirty");
+
+    // Move the highlight off the report so it's retained-but-hidden *and* dirty.
+    let col_row = ws_row_pos(
+        &app,
+        ci,
+        "api.hurl",
+        |r| matches!(r, crate::collection::WsRow::Collection { name, .. } if name == "api.hurl"),
+    );
+    select_row(&mut app, ci, col_row);
+    assert!(app.active_report_index().is_none(), "report hidden");
+
+    let snapshot = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+
+    assert_eq!(
+        restored.reports.len(),
+        1,
+        "a hidden *dirty* embedded report is persisted so edits aren't lost"
+    );
+    assert!(
+        restored.active_report_index().is_none(),
+        "it restores hidden (its request/response view is shown)"
+    );
+    assert!(
+        restored.reports[0].report.text.contains("Alpha (edited)"),
+        "the unsaved edit survived the round-trip"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
 #[test]
 fn a_vanished_workspace_root_degrades_to_a_plain_report_on_restore() {
-    let (mut app, _ci, root) = workspace_with_reports();
-    app.open_workspace_report(root.join("alpha.trail"), root.clone(), Vec::new());
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
     let snapshot = app.to_persisted();
     // The folder disappears between sessions.
     std::fs::remove_dir_all(&root).unwrap();
@@ -18671,7 +18958,7 @@ fn a_vanished_workspace_root_degrades_to_a_plain_report_on_restore() {
 
     assert_eq!(restored.reports.len(), 1);
     assert!(
-        restored.reports[0].workspace.is_none(),
+        restored.reports[0].workspace_root.is_none(),
         "a missing workspace root degrades to a plain report tab"
     );
 }

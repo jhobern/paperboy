@@ -301,14 +301,21 @@ pub struct PersistedReport {
     #[serde(default)]
     pub git_origin: Option<GitOrigin>,
     /// When this report was opened from a Workspace tree, the workspace root
-    /// folder (absolute path) so it reopens pinned to that tree on restart.
-    /// `None` for an ordinary report tab.
+    /// folder (absolute path) so it re-embeds in that Workspace collection tab's
+    /// right pane on restart. `None` for an ordinary standalone report tab.
     #[serde(default)]
     pub workspace_root: Option<String>,
-    /// The browsed sub-path (folder names below `workspace_root`) the pinned
-    /// tree was showing, so it reopens where the user left it.
-    #[serde(default)]
-    pub workspace_browse: Vec<String>,
+    /// For a Workspace-embedded report, whether it was the one *shown* in its
+    /// Workspace tab's right pane (`true`) rather than merely retained while the
+    /// tab showed its request/response view (`false`). Ignored for standalone
+    /// reports. Older state files (no field) default to `true`, matching the
+    /// "opened ⇒ shown" behaviour.
+    #[serde(default = "default_true")]
+    pub embedded_active: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl PersistedReport {
@@ -323,7 +330,7 @@ impl PersistedReport {
             // `Report`; the tui layer fills these in when snapshotting (see
             // `TuiApp::to_persisted`).
             workspace_root: None,
-            workspace_browse: Vec::new(),
+            embedded_active: true,
         }
     }
 

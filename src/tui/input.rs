@@ -693,12 +693,21 @@ impl TuiApp {
     }
 
     pub(crate) fn on_key_normal(&mut self, key: KeyEvent) {
-        // A report tab has an entirely separate (much smaller) key map handled
-        // in `reports.rs`; intercept it here before any of the arms below, which
-        // freely index `self.collections[self.active_tab]` and would panic on a
-        // report's unified tab index.
-        if self.active_is_report() {
+        // A standalone report strip tab has an entirely separate (much smaller)
+        // key map handled in `reports.rs`; intercept it here before any of the
+        // arms below, which freely index `self.collections[self.active_tab]` and
+        // would panic on a report's unified tab index.
+        if self.active_is_strip_report() {
             self.on_key_report(key);
+            return;
+        }
+        // An embedded workspace report shows in the right pane while the
+        // collection tree stays on the left (a valid collection index, so the
+        // arms below are safe). When the report body holds focus, route body
+        // keys to the report handler; otherwise fall through so the single tree
+        // keeps driving tab/pane/tree navigation.
+        if self.focus == Pane::Main && self.active_report_index().is_some() {
+            self.on_key_report_body(key);
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -957,11 +966,17 @@ impl TuiApp {
                     .flatten();
                 match row {
                     Some(crate::collection::WsRow::Folder(name)) => {
-                        self.workspace_folder_down(ci, name)
+                        self.workspace_folder_down(ci, name);
+                        self.workspace_select_highlighted(ci);
                     }
                     Some(crate::collection::WsRow::Collection {
                         path, open: false, ..
-                    }) => self.activate_workspace_collection(ci, path),
+                    }) => {
+                        if let Some(root) = self.collections[ci].workspace_root.clone() {
+                            self.hide_embedded_report_for_root(&root);
+                        }
+                        self.activate_workspace_collection(ci, path);
+                    }
                     _ => self.scroll_list_h(4),
                 }
             }
@@ -1014,6 +1029,13 @@ impl TuiApp {
     }
 
     pub(crate) fn panes(&self) -> Vec<Pane> {
+        // An embedded workspace report replaces the tab's right pane (request +
+        // response) with a single report body (`Pane::Main`), so `Tab` rotates
+        // List ↔ report-body (↔ the Global Environments panel), skipping the
+        // Response pane, which doesn't exist for a report.
+        if self.active_report_index().is_some() {
+            return vec![Pane::Tabs, Pane::List, Pane::Main, Pane::GlobalEnv];
+        }
         // Reading order: top-left (List/Collections) → top-right (Main/Request
         // JSON) → bottom-left (Env/Environments) → bottom-right (Response),
         // with the Tabs bar first since it sits above everything else.
@@ -1070,10 +1092,11 @@ impl TuiApp {
     /// [`Overlay::CloseGitWorkspace`] and [`Self::finish_close_tab`].
     pub(crate) fn close_active_tab(&mut self) {
         let idx = self.active_tab;
-        // A report tab (unified index past the collections) is closed via its
-        // own path — it has no git-workspace folder to reason about and lives
-        // in a separate vector.
-        if self.active_is_report() {
+        // A standalone report strip tab (unified index past the collections) is
+        // closed via its own path — it has no git-workspace folder to reason
+        // about and lives in a separate vector. An *embedded* report shares its
+        // Workspace collection tab, so Ctrl+W there closes the whole tab below.
+        if self.active_is_strip_report() {
             self.close_active_report_tab();
             return;
         }
@@ -1098,6 +1121,12 @@ impl TuiApp {
     /// for `u`/Ctrl+Shift+T to reopen, so it must not be offered.
     pub(crate) fn finish_close_tab(&mut self, idx: usize, delete_folder: bool) {
         let removed = self.collections.remove(idx);
+        // A Workspace tab may have an embedded report living in `self.reports`
+        // (shown or hidden in its right pane); it belongs to this tab, so drop
+        // it too rather than leaving it orphaned in the reports vector.
+        if let Some(root) = removed.workspace_root.clone() {
+            self.discard_embedded_reports_for_root(&root);
+        }
         if delete_folder {
             if let Some(root) = &removed.workspace_root {
                 crate::git_remote::cleanup(root);
@@ -1138,7 +1167,15 @@ impl TuiApp {
             ClosedTab::Report(ridx, rt) => {
                 let ridx = ridx.min(self.reports.len());
                 self.reports.insert(ridx, *rt);
-                self.active_tab = self.collections.len() + ridx;
+                // A closed report is always standalone (embedded ones close with
+                // their Workspace tab), so map its reports-vec index back to a
+                // strip slot past the collections.
+                let slot = self
+                    .standalone_report_indices()
+                    .iter()
+                    .position(|&i| i == ridx)
+                    .unwrap_or(0);
+                self.active_tab = self.collections.len() + slot;
             }
         }
         self.focus = Pane::Tabs;
@@ -1148,25 +1185,29 @@ impl TuiApp {
     /// Move the active tab one position left/right among the reorderable tabs
     /// (index 0, the built-in Request tab, is fixed and never moved past).
     pub(crate) fn move_active_tab(&mut self, forward: bool) {
-        // Report tabs reorder only among themselves (they always follow the
-        // collection tabs in the unified strip), so a report never swaps across
-        // the collection/report boundary.
-        if self.active_is_report() {
+        // Report tabs reorder only among themselves (standalone reports always
+        // follow the collection tabs in the unified strip), so a report never
+        // swaps across the collection/report boundary. Embedded reports aren't
+        // in the strip, so this only fires for a standalone report strip tab.
+        if self.active_is_strip_report() {
             let base = self.collections.len();
-            let ridx = self.active_tab - base;
-            let target = if forward {
-                ridx + 1
+            let slot = self.active_tab - base;
+            let stand = self.standalone_report_indices();
+            let target_slot = if forward {
+                slot + 1
             } else {
-                ridx.wrapping_sub(1)
+                slot.wrapping_sub(1)
             };
-            if forward && target >= self.reports.len() {
+            if forward && target_slot >= stand.len() {
                 return;
             }
-            if !forward && ridx == 0 {
+            if !forward && slot == 0 {
                 return;
             }
-            self.reports.swap(ridx, target);
-            self.active_tab = base + target;
+            // Swap the two standalone reports at their reports-vec positions;
+            // the strip slots map through `standalone_report_indices`.
+            self.reports.swap(stand[slot], stand[target_slot]);
+            self.active_tab = base + target_slot;
             self.save_state();
             return;
         }
@@ -1289,16 +1330,29 @@ impl TuiApp {
             self.focus = Pane::Main;
             return;
         };
+        // Selection already follows the highlight (see `workspace_select_highlighted`),
+        // so the right pane matches the highlighted row before Enter is pressed.
+        // Enter is the explicit "open the editor for it" action, mirroring the
+        // request rule: a highlighted request already shows in the pane and Enter
+        // opens its wizard. For a report, Enter opens its node editor; for a
+        // collection/folder it navigates; the "up" row ascends.
         match row {
             crate::collection::WsRow::Up => {
-                let col = &mut self.collections[ci];
-                col.workspace_browse.pop();
-                col.list_cursor = 0;
+                {
+                    let col = &mut self.collections[ci];
+                    col.workspace_browse.pop();
+                    col.list_cursor = 0;
+                }
+                self.workspace_select_highlighted(ci);
             }
             crate::collection::WsRow::Folder(name) => {
                 self.workspace_folder_down(ci, name);
+                self.workspace_select_highlighted(ci);
             }
             crate::collection::WsRow::Collection { path, open, .. } => {
+                if let Some(root) = self.collections[ci].workspace_root.clone() {
+                    self.hide_embedded_report_for_root(&root);
+                }
                 if open {
                     // The open collection's own row collapses it.
                     self.collections[ci].workspace_collapsed = true;
@@ -1307,18 +1361,52 @@ impl TuiApp {
                 }
             }
             crate::collection::WsRow::Report { path, .. } => {
-                // A report file opens the workspace-aware report view, carrying
-                // this tab's workspace root + browsed folder so the report's
-                // pinned tree opens where the user was.
-                let root = self.collections[ci].workspace_root.clone();
-                let browse = self.collections[ci].workspace_browse.clone();
-                if let Some(root) = root {
-                    self.open_workspace_report(path, root, browse);
+                // The report is already shown (selected by the highlight); Enter
+                // opens its structured node editor — the report equivalent of a
+                // request's edit wizard — moving focus into the report body so
+                // the node keys act on it. `show_embedded_report` is idempotent
+                // and guards the (rare) case where Enter arrives without a prior
+                // highlight-driven selection (e.g. focus just entered the list).
+                if let Some(root) = self.collections[ci].workspace_root.clone() {
+                    self.show_embedded_report(path, root);
+                    self.open_report_node_editor();
+                    self.focus = Pane::Main;
                 }
             }
             crate::collection::WsRow::Request(_) => {
                 self.focus = Pane::Main;
                 self.open_edit_request_wizard(ci);
+            }
+        }
+    }
+
+    /// Reconcile a Workspace tab's right pane with whichever tree row is
+    /// currently highlighted — highlighting *is* selecting, exactly as for
+    /// requests. A request row points `selected_entry` at it (the request shows
+    /// in the pane); a report row shows that report embedded in the pane (loaded
+    /// once, then retained); every other row (collection/folder/up) returns the
+    /// pane to the request/response view. Focus stays on the tree throughout.
+    /// Called on every cursor move within the tree and after folder navigation.
+    fn workspace_select_highlighted(&mut self, ci: usize) {
+        let cursor = self.collections[ci].list_cursor;
+        let row = self.collections[ci].ws_rows().into_iter().nth(cursor);
+        let root = self.collections[ci].workspace_root.clone();
+        match row {
+            Some(crate::collection::WsRow::Request(idx)) => {
+                self.collections[ci].selected_entry = idx;
+                if let Some(root) = root {
+                    self.hide_embedded_report_for_root(&root);
+                }
+            }
+            Some(crate::collection::WsRow::Report { path, .. }) => {
+                if let Some(root) = root {
+                    self.show_embedded_report(path, root);
+                }
+            }
+            _ => {
+                if let Some(root) = root {
+                    self.hide_embedded_report_for_root(&root);
+                }
             }
         }
     }
@@ -1388,12 +1476,13 @@ impl TuiApp {
                 // (`ws_rows`), ordinary tabs the title-folder tree (`rows`).
                 let cur = self.collections[ci].list_cursor;
                 if self.collections[ci].is_workspace() {
-                    let rows = self.collections[ci].ws_rows();
-                    let next = step(cur, rows.len(), delta);
+                    let len = self.collections[ci].ws_rows().len();
+                    let next = step(cur, len, delta);
                     self.collections[ci].list_cursor = next;
-                    if let Some(crate::collection::WsRow::Request(idx)) = rows.get(next) {
-                        self.collections[ci].selected_entry = *idx;
-                    }
+                    // Highlighting is selecting: land on a request → it shows;
+                    // on a report → it embeds in the right pane; on anything
+                    // else → the pane returns to the request/response view.
+                    self.workspace_select_highlighted(ci);
                 } else {
                     let rows = self.collections[ci].rows();
                     let next = step(cur, rows.len(), delta);
@@ -1817,42 +1906,61 @@ impl TuiApp {
             self.open_next_pending_workspace_reload();
         }
         // Restore report tabs after the collections, then clamp the active tab
-        // against the *unified* tab count (collections + reports).
+        // against the *unified* tab count (collections + standalone reports).
         self.reports = state
             .reports
             .into_iter()
             .map(|pr| {
-                // Rebuild the pinned-tree workspace context if the report was a
-                // workspace report and its root still exists (a vanished folder
-                // silently degrades to an ordinary report tab).
-                let ws = pr
+                // Re-link a workspace report to its root if the folder still
+                // exists (a vanished folder silently degrades to a standalone
+                // report tab).
+                let root = pr
                     .workspace_root
                     .clone()
                     .map(PathBuf::from)
-                    .filter(|p| p.exists())
-                    .map(|root| crate::tui::reports::ReportWorkspace {
-                        root,
-                        browse: pr.workspace_browse.clone(),
-                        cursor: 0,
-                    });
+                    .filter(|p| p.exists());
+                let embedded_active = pr.embedded_active;
                 let report = pr.into_report();
-                match ws {
-                    Some(ws) => crate::tui::reports::ReportTab::new_in_workspace(report, ws),
+                match root {
+                    Some(root) => {
+                        let mut rt = crate::tui::reports::ReportTab::new_in_workspace(report, root);
+                        rt.embedded_active = embedded_active;
+                        rt
+                    }
                     None => crate::tui::reports::ReportTab::new(report),
                 }
             })
             .collect();
+        // A restored workspace report is embedded in — and (when shown) drawn
+        // by — the Workspace collection tab rooted at the same folder. Normally
+        // that tab was persisted alongside it, but an older/edge state file
+        // might carry the report without its collection tab; create an empty one
+        // so the embedded report stays reachable (rather than being an invisible
+        // reports-vec entry that's in neither the strip nor a tab). While here,
+        // point each shown report's Workspace tree at the report's own row so
+        // the tree resumes highlighting it (its `list_cursor` isn't persisted
+        // separately — it's derived from the loaded file, which is `None` here).
+        let embedded: Vec<(PathBuf, Option<PathBuf>, bool)> = self
+            .reports
+            .iter()
+            .filter_map(|rt| {
+                rt.workspace_root
+                    .clone()
+                    .map(|root| (root, rt.report.path.clone(), rt.embedded_active))
+            })
+            .collect();
+        for (root, path, active) in embedded {
+            let ci = self.workspace_collection_tab(root);
+            if active && let Some(path) = path {
+                self.focus_workspace_tree_on_report(ci, &path);
+            }
+        }
         self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
         // A workspace collection resumes focused on its tree (`Pane::List`, the
-        // default), so a workspace report should too: resume on its pinned tree
-        // rather than the editor, for consistent reopen behaviour. A standalone
-        // report has no tree, so it stays on the editor.
-        if let Some(idx) = self.active_report_index()
-            && self.reports[idx].workspace.is_some()
-        {
-            self.report_tabbar_focus = false;
-            self.report_tree_focus = true;
-        }
+        // default), and so does a workspace report shown in the right pane — the
+        // single tree keeps driving navigation. Nothing extra to set here (the
+        // default focus is already `Pane::List`); a standalone report routes via
+        // `active_is_strip_report` regardless of `focus`.
         for i in 0..self.reports.len() {
             self.revalidate_report(i);
         }
@@ -1895,16 +2003,26 @@ impl TuiApp {
                 .collect(),
             // Report tabs are persisted as source-text snapshots (see
             // `PersistedReport`) so an unsaved scratch report survives a restart.
+            // Standalone reports and the *shown* embedded report of each
+            // Workspace tab are persisted; a merely-retained (hidden) embedded
+            // report is dropped **only when clean** — it's a within-session cache
+            // that reloads from disk when its row is highlighted again, so
+            // persisting every clean report the user glanced at would only bloat
+            // the state file. A hidden *dirty* report is kept, however, so its
+            // unsaved edits survive the restart (it restores hidden/retained, its
+            // `embedded_active` state carried through as-is).
             reports: self
                 .reports
                 .iter()
+                .filter(|rt| rt.workspace_root.is_none() || rt.embedded_active || rt.report.dirty)
                 .map(|rt| {
                     let mut pr = PersistedReport::from_report(&rt.report);
-                    // Carry the pinned-tree workspace context (TUI-only state on
-                    // the `ReportTab`) so a workspace-aware report reopens pinned.
-                    if let Some(ws) = &rt.workspace {
-                        pr.workspace_root = Some(ws.root.to_string_lossy().into_owned());
-                        pr.workspace_browse = ws.browse.clone();
+                    // Carry the workspace link + shown state (TUI-only state on
+                    // the `ReportTab`) so a workspace report re-embeds in the
+                    // right pane of its Workspace tab on restart.
+                    if let Some(root) = &rt.workspace_root {
+                        pr.workspace_root = Some(root.to_string_lossy().into_owned());
+                        pr.embedded_active = rt.embedded_active;
                     }
                     pr
                 })
@@ -2553,13 +2671,17 @@ impl TuiApp {
                         WsPickerMode::AddRequest if is_report => {
                             self.overlay = Some(Overlay::WorkspacePicker(picker));
                         }
-                        // A report file opens the workspace-aware report view
-                        // rather than loading as a collection.
+                        // A report file opens embedded in this Workspace tab's
+                        // right pane rather than loading as a collection, with
+                        // the pinned tree highlighting it (selection follows the
+                        // highlight, so keep them in sync when opening via the
+                        // modal picker rather than the tree itself).
                         WsPickerMode::Browse if is_report => {
                             let root = self.collections[ci].workspace_root.clone();
-                            let browse = self.collections[ci].workspace_browse.clone();
                             if let Some(root) = root {
-                                self.open_workspace_report(path, root, browse);
+                                self.show_embedded_report(path.clone(), root);
+                                self.focus_workspace_tree_on_report(ci, &path);
+                                self.save_state();
                             }
                         }
                         WsPickerMode::MoveRequest | WsPickerMode::CopyRequest => {

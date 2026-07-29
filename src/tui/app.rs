@@ -760,10 +760,15 @@ pub struct TuiApp {
     pub(crate) vars: AppVars,
     pub(crate) collections: Vec<Collection>,
     pub(crate) active_tab: usize,
-    /// Report tabs (PaperTrail `.trail` documents), shown in the same tab bar
-    /// *after* the collection tabs. The unified tab index (`active_tab`) counts
-    /// collections first, then reports: index `>= collections.len()` selects
-    /// `reports[active_tab - collections.len()]`. See [`Self::active_is_report`].
+    /// Report tabs (PaperTrail `.trail` documents). *Standalone* reports show in
+    /// the same tab bar after the collection tabs — the unified tab index
+    /// (`active_tab`) counts collections first, then the standalone reports (see
+    /// [`Self::standalone_report_indices`]). A report opened from a Workspace
+    /// tree is instead *embedded* in its Workspace collection tab: it still lives
+    /// here (so it reuses every report handler) but carries `workspace`, which
+    /// keeps it out of the strip and links it to its collection tab by root — its
+    /// `active_tab` is that collection index. See [`Self::active_is_report`] and
+    /// [`Self::embedded_report_index`].
     pub(crate) reports: Vec<crate::tui::reports::ReportTab>,
     pub(crate) response: Arc<Mutex<ApiResponse>>,
 
@@ -856,19 +861,6 @@ pub struct TuiApp {
     /// The one-column scrollbar Rect for each report panel (same indexing as
     /// `report_pane_areas`), for scrollbar click-to-jump / drag-to-scroll.
     pub(crate) report_pane_bars: [Rect; 3],
-    /// In the full-screen report view (view mode, not editing), `true` when the
-    /// *tab bar* is the focused area rather than the report body. `Tab` rotates
-    /// focus Editor → Results → Tab List → Editor; this flag marks the "Tab
-    /// List" stop (so the tab bar is highlighted and the body panels dimmed).
-    /// It is otherwise ignored — the collection view uses `focus` instead.
-    pub(crate) report_tabbar_focus: bool,
-    /// In a *workspace-aware* report view (a report opened from a Workspace
-    /// tree), `true` when the pinned left-hand tree is the focused area rather
-    /// than the report body/tab bar. `Tab` rotates focus Tree → Editor →
-    /// Results → Tab List → Tree; this flag marks the "Tree" stop. Always
-    /// `false` for an ordinary report tab (no tree). Mutually exclusive with
-    /// `report_tabbar_focus`.
-    pub(crate) report_tree_focus: bool,
     /// Set while dragging a report panel's scrollbar thumb (which panel), so a
     /// `Drag` keeps adjusting its scroll even if the cursor leaves the
     /// one-column track. Cleared on `Up`.
@@ -1101,8 +1093,6 @@ impl Default for TuiApp {
             scrollbar_drag: None,
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
-            report_tabbar_focus: false,
-            report_tree_focus: false,
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
@@ -2622,20 +2612,31 @@ impl TuiApp {
     /// The rows to show in the File → Save submenu, filtered to what actually
     /// applies to the current context so the menu never offers an inapplicable
     /// (or unsafe) save. A collection tab offers Request + Collection (plus
-    /// Workspace when it's workspace-backed); a report tab offers Report only;
-    /// Environment and Response appear whenever there's an env or a response to
-    /// write. The order mirrors the original fixed list — rows that don't apply
-    /// are simply omitted. (A report tab can't correctly target a collection or
-    /// workspace today — those saves key off the active *collection* tab — so
-    /// they're hidden there rather than silently no-op.)
+    /// Workspace when it's workspace-backed); a standalone report tab offers
+    /// Report only; Environment and Response appear whenever there's an env or a
+    /// response to write. A report *embedded in a Workspace tab* is a special
+    /// case: its `active_tab` is the collection tab, so it offers Report
+    /// alongside the tab's own Collection/Workspace saves — but NOT "Save
+    /// Request" (the right pane is the report, not a request being edited). The
+    /// order mirrors the original fixed list — rows that don't apply are simply
+    /// omitted.
     pub(crate) fn file_save_items(&self) -> Vec<SaveItem> {
         let report_active = self.active_report_index().is_some();
-        let collection = (!report_active)
-            .then(|| self.collections.get(self.active_tab))
-            .flatten();
+        // The active collection tab underneath the current view, if any. For a
+        // standalone report tab `active_tab` is past the collections so this is
+        // `None`; for an embedded report it resolves to its Workspace tab, which
+        // *can* target a collection/workspace.
+        let collection = self.collections.get(self.active_tab);
         let mut items = Vec::new();
-        if collection.is_some() {
+        // "Save Request" only when a request is actually on screen — never while
+        // a report occupies the right pane (embedded), and never on a report
+        // strip tab (no collection).
+        if collection.is_some() && !report_active {
             items.push(SaveItem::Request);
+            items.push(SaveItem::Kind(FileKind::Collection));
+        } else if collection.is_some() {
+            // Embedded report: still offer Collection (the tab's own file), just
+            // not Request.
             items.push(SaveItem::Kind(FileKind::Collection));
         }
         if self.current_env_id().is_some() {

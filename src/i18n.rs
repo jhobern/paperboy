@@ -527,8 +527,6 @@ strings! {
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "Enter nodes", "Entrée nœuds", "Enter noder";
     report_hint_view => "v output", "v sortie", "v output";
-    report_workspace_heading => "Workspace", "Espace de travail", "Arbejdsområde";
-    report_hint_tree => "↑↓ move · Enter open", "↑↓ déplacer · Entrée ouvrir", "↑↓ flyt · Enter åbn";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
     report_dry_run_samples_heading => "Sample iterations", "Exemples d'itérations", "Eksempler på gentagelser";

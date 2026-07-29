@@ -122,19 +122,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   answers "how do I add REPORT to a line in the node editor?" without leaving
   the structured view.
 
-
-  `.trail` files alongside the collections they drive: they show up in the
-  Workspace tab's file tree (with a distinct 📊 icon) and opening one lands you
-  in the full report view with that workspace's tree pinned down the left. From
-  there you can move through the workspace's folders, jump to another report, or
-  open one of its collections without leaving — Tab cycles focus through the
-  pinned tree, the editor, the results grid and the tab list. The pinned tree is
-  keyboard-driven: ↑↓ (or j/k) move, Enter/→ open the highlighted row (descend a
-  folder, open a collection, or load another report), and ←/Backspace go back up
-  a folder. The workspace context (which folder you were browsing) is saved with
-  the session, so a workspace report reopens exactly where you left it; if the
-  workspace folder has since gone missing it degrades gracefully to an ordinary
-  report tab.
+- **Open a report in place inside its workspace tab.** A `.trail` in a Workspace
+  tab's file tree now shows *in that same tab's right pane* — the tree stays on
+  the left driving navigation, exactly as it does for collections and requests,
+  so a workspace no longer splits into a separate report tab. Selection follows
+  the tree highlight: moving the cursor onto a report row shows it embedded (no
+  `Enter` needed, just like landing on a request row shows that request), and
+  moving off it returns the pane to the request/response view — the report is
+  retained in the background with its edits intact, so highlighting it again
+  re-shows it instantly. `Enter` on a report row opens its node editor (the
+  report equivalent of a request's edit wizard) and moves focus into the body;
+  `Tab` moves focus between the tree and the report body. The tree keeps focus
+  and its highlighted row throughout, so selecting a report no longer jerks the
+  cursor back to the top, and every report action (edit, node editor, run,
+  results grid, dry-run, bind, columns, export, undo, save/revert) works
+  unchanged on the embedded report. The report a workspace tab is showing is
+  saved with the session and restored in place on the tree — as is a
+  highlighted-away report that still has unsaved edits, so moving off a dirty
+  report and quitting no longer loses those edits. Standalone reports
+  (File → Load Report, with no workspace) are unchanged — they still open as
+  their own full-screen tab.
 
 - **Run reports from the command line.** A report can now be run headlessly
   without opening the TUI: `paperboy -c collection.hurl -e env.vars -r
@@ -389,6 +396,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   popup) — so unsaved changes are visible without opening the environment.
 
 ### Changed
+
+- **A report opened from a workspace now opens in place, inside that workspace
+  tab.** Selecting a `.trail` from a workspace tab's tree used to spawn a
+  *separate* report tab (so one workspace could sit in the strip twice). It now
+  replaces that same tab's right pane — the request editor + response give way
+  to the report body while the pinned workspace tree stays on the left — exactly
+  as opening a collection/request from a workspace never spawns a new tab.
+  Opening a collection/request from within the embedded report returns the right
+  pane to the request/response view (the report is kept, so re-selecting it
+  restores its edits/results); the tree keeps its highlight on the report you
+  opened instead of jumping back to the top; and the workspace tab's Save menu
+  now offers Report alongside Request/Collection/Workspace. Which report is
+  embedded is remembered across a restart, reopening pinned to its tree.
+  Standalone reports (File → Load Report with no workspace) still open as their
+  own tab, unchanged.
 
 - **The File → Save submenu now only lists what you can actually save.** The
   Save menu was a fixed list of all six kinds (Request, Collection, Environment,
