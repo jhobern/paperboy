@@ -2137,26 +2137,34 @@ pub(crate) fn draw_response(
         );
         return;
     }
-    if !error.is_empty() {
-        // Render the runner error *through* the selectable response panel (not
-        // a plain Paragraph) so it can be mouse-selected and `y`-copied like any
-        // response body — the red fg is applied as the paragraph's fallback
-        // style, and the panel still owns wrapping/scrolling for long errors.
-        let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
-        app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
-        app.resp_panel
-            .set_content(content, inner.width.max(1) as usize);
-        app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
-        app.resp_scrollbar_area = Rect::default();
-        let visible_wrapped = app.resp_panel.visible_rows(inner.height);
-        app.resp_text_area = inner;
-        f.render_widget(
-            Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
-            inner,
-        );
-        return;
-    }
     if status == 0 {
+        // No response was received. A transport/parse failure (or a build error
+        // like the Body/Form conflict) leaves an error string but no response,
+        // so surface it here; otherwise show the neutral placeholder. A failed
+        // assert or status mismatch, by contrast, still produces a real
+        // response (status != 0) and is rendered in full below — with the
+        // failing checks marked — rather than replacing the response with the
+        // error text.
+        if !error.is_empty() {
+            // Render the runner error *through* the selectable response panel
+            // (not a plain Paragraph) so it can be mouse-selected and `y`-copied
+            // like any response body — the red fg is applied as the paragraph's
+            // fallback style, and the panel still owns wrapping/scrolling for
+            // long errors.
+            let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+            app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
+            app.resp_panel
+                .set_content(content, inner.width.max(1) as usize);
+            app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
+            app.resp_scrollbar_area = Rect::default();
+            let visible_wrapped = app.resp_panel.visible_rows(inner.height);
+            app.resp_text_area = inner;
+            f.render_widget(
+                Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
+                inner,
+            );
+            return;
+        }
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
         app.resp_panel
@@ -2224,18 +2232,37 @@ pub(crate) fn draw_response(
         })
         .collect();
 
-    // Layout: status (1) · asserts (capped, keeping ≥1 body row) · body (rest).
-    let assert_h = (assert_lines.len() as u16).min(inner.height.saturating_sub(2));
+    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 body row)
+    // · body (rest). A runner error that *isn't* already spelled out by a
+    // failed assert row — a failed `[Captures]`, a transport oddity that still
+    // returned a response — gets one error-coloured line so it isn't lost now
+    // that a non-empty error no longer replaces the whole response. When an
+    // assert failed (passed < total) that ✗ row already carries the reason, so
+    // the extra line would just be noise and is skipped.
+    let show_err_line = !error.is_empty() && passed == total;
+    let err_h: u16 = u16::from(show_err_line);
+    let assert_h =
+        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h));
     let rows = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(err_h),
         Constraint::Length(assert_h),
         Constraint::Min(1),
     ])
     .split(inner);
 
     f.render_widget(Paragraph::new(Line::from(status_spans)), rows[0]);
+    if show_err_line {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{} {error}", s.req_error_prefix),
+                Style::default().fg(th.err),
+            )),
+            rows[1],
+        );
+    }
     if assert_h > 0 {
-        f.render_widget(Paragraph::new(assert_lines), rows[1]);
+        f.render_widget(Paragraph::new(assert_lines), rows[2]);
     }
 
     // Wrap long lines to the body width and clamp scrolling so the user can't
@@ -2246,7 +2273,7 @@ pub(crate) fn draw_response(
     // this is what keeps dragging a selection or scrolling responsive
     // regardless of how large an "obscenely large" response body is. The
     // end-of-row wrap marker makes a soft wrap read as one logical line.
-    let body_area = rows[2];
+    let body_area = rows[3];
     let width = body_area.width as usize;
     app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
     app.resp_panel.set_content(body.clone(), width);

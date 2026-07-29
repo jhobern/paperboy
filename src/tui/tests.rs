@@ -5633,6 +5633,201 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     );
 }
 
+/// A failed status assertion (e.g. `HTTP 200` but the server returned 500)
+/// still shows the full response — status line, the failing assert marked ✗,
+/// and the response body — instead of replacing everything with the error text.
+#[test]
+fn response_panel_shows_full_response_when_the_status_assert_fails() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 500,
+            status_text: "Internal Server Error".into(),
+            body: "{\"reason\":\"boom\"}".into(),
+            // A real failed assert sets `error` too — this is exactly what used
+            // to hide the whole response behind the error text.
+            error: "Expected status 200 but got 500".into(),
+            assert_results: vec![AssertOutcome {
+                expr: "status == 200".into(),
+                passed: false,
+                detail: "got 500".into(),
+            }],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("500"), "the actual status is shown:\n{out}");
+    assert!(
+        out.contains('\u{2717}'),
+        "the failing status assert shows a cross:\n{out}"
+    );
+    assert!(
+        out.contains("status == 200"),
+        "the failing assert expression is shown:\n{out}"
+    );
+    assert!(
+        out.contains("boom"),
+        "the response body is still visible on failure:\n{out}"
+    );
+}
+
+/// A failed explicit `[Asserts]` check against a 200 response keeps the whole
+/// response visible (body included), with the failing assert marked ✗ — the
+/// error text no longer takes over the panel.
+#[test]
+fn response_panel_shows_full_response_when_an_explicit_assert_fails() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{\"via\":\"bearer\"}".into(),
+            error: "assert failed".into(),
+            assert_results: vec![
+                AssertOutcome {
+                    expr: "status == 200".into(),
+                    passed: true,
+                    detail: String::new(),
+                },
+                AssertOutcome {
+                    expr: "jsonpath \"$.via\" == \"oauth2\"".into(),
+                    passed: false,
+                    detail: "got \"bearer\"".into(),
+                },
+            ],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("200 OK"), "status still shown:\n{out}");
+    assert!(
+        out.contains("1/2"),
+        "the assert badge counts the failure:\n{out}"
+    );
+    assert!(
+        out.contains('\u{2713}') && out.contains('\u{2717}'),
+        "the passing assert keeps its check and the failing one a cross:\n{out}"
+    );
+    assert!(
+        out.contains("bearer"),
+        "the response body is still visible on assert failure:\n{out}"
+    );
+}
+
+/// A runner error not represented by a failed assert (e.g. a failed
+/// `[Captures]` on an otherwise-passing 200 response) is surfaced as a single
+/// error-coloured line above the body, while the response itself stays visible.
+#[test]
+fn response_panel_shows_a_non_assert_error_line_but_keeps_the_body() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{\"ok\":true}".into(),
+            error: "capture token failed".into(),
+            assert_results: vec![AssertOutcome {
+                expr: "status == 200".into(),
+                passed: true,
+                detail: String::new(),
+            }],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("200 OK"), "status shown:\n{out}");
+    assert!(
+        out.contains("capture token failed"),
+        "the non-assert error is surfaced as its own line:\n{out}"
+    );
+    assert!(
+        out.contains("\"ok\""),
+        "the response body is still visible:\n{out}"
+    );
+}
+
+/// A transport failure that returned no response (status 0) still shows the
+/// error text — that behaviour is unchanged.
+#[test]
+fn response_panel_shows_the_error_when_there_is_no_response() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 0,
+            error: "Could not resolve host: example.invalid".into(),
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(
+        out.contains("Could not resolve host"),
+        "a transport failure with no response still shows the error:\n{out}"
+    );
+}
+
 #[test]
 fn response_panel_shows_the_selected_entrys_own_response_not_the_last_entry_run() {
     // Regression test: after a "Run All" batch, the Response pane must

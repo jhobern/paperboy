@@ -609,6 +609,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A failed assertion no longer hides the response.** When a request's
+  `HTTP <status>` expectation or an `[Asserts]` check failed, the Response panel
+  replaced the whole response with the error text. It now keeps showing the full
+  response — status line, assertions, and body — with the failing check(s)
+  marked with a cross in the error colour and the `[Asserts]` badge counting the
+  failures, so the response you were inspecting stays visible. A runner error
+  that isn't already spelled out by a failing assertion (for example a failed
+  `[Captures]`) is surfaced as one error-coloured line above the body. A
+  transport failure that returned no response at all still shows the error on
+  its own, as before.
+
 - **Headers separated from the request line by a blank line are no longer
   dropped on load.** Hurl permits a blank line between a request's method/URL
   line and its header block (and, likewise, between a `[Section]` header and its
