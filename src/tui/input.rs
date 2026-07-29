@@ -1888,7 +1888,9 @@ impl TuiApp {
     /// Append the request built in the New Request form to the active tab, or
     /// (when `form.editing` is set) apply the edits back onto the existing
     /// entry in place — preserving fields the wizard doesn't expose
-    /// (`query_params`/`form_params`/`basic_auth`/`expected_status`).
+    /// (`query_params`/`form_params`/`basic_auth`). The response's `HTTP
+    /// <code>` status expectation *is* exposed, as a `status == <code>` assert
+    /// row that folds back into `expected_status` here.
     pub(crate) fn submit_new_request(&mut self, form: NewReq) {
         fn header_rows_to_triples(rows: &[HeaderRow]) -> Vec<(String, String, bool)> {
             rows.iter()
@@ -1948,12 +1950,24 @@ impl TuiApp {
                 }
             })
             .collect();
-        let asserts: Vec<String> = form
+        // Collect the assert rows, folding the first `status == <code>` row
+        // back into the response's `HTTP <code>` status expectation
+        // (`expected_status`). The wizard surfaces that expectation as an
+        // editable assert row (see the `NewReq` builder), so on save it must
+        // be pulled back out; the remaining rows are ordinary `[Asserts]`.
+        let mut expected_status: Option<u16> = None;
+        let mut asserts: Vec<String> = Vec::new();
+        for expr in form
             .asserts
             .iter()
             .map(|r| r.expr.text().trim().to_string())
             .filter(|e| !e.is_empty())
-            .collect();
+        {
+            match crate::hurl::status_eq_code(&expr) {
+                Some(code) if expected_status.is_none() => expected_status = Some(code),
+                _ => asserts.push(expr),
+            }
+        }
         let captures: Vec<(String, String)> = form
             .captures
             .iter()
@@ -1995,6 +2009,7 @@ impl TuiApp {
                 || entry.queries != queries
                 || entry.form_fields != form_fields
                 || entry.body != body
+                || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
                 || entry.reports != reports;
@@ -2007,6 +2022,7 @@ impl TuiApp {
                 entry.queries = queries;
                 entry.form_fields = form_fields;
                 entry.body = body;
+                entry.expected_status = expected_status;
                 entry.asserts = asserts;
                 entry.captures = captures;
                 entry.reports = reports;
@@ -2026,6 +2042,7 @@ impl TuiApp {
         entry.cookies = cookies;
         entry.queries = queries;
         entry.form_fields = form_fields;
+        entry.expected_status = expected_status;
         entry.asserts = asserts;
         entry.captures = captures;
         entry.reports = reports;

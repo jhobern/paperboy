@@ -29,6 +29,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the stashed tab (reopenable with `u`). A new status message "Run stopped —
   partial results kept" reflects the change.
 
+- **The response's expected status is now editable in the request wizard.** A
+  request's `HTTP <code>` status expectation is surfaced in the `[Asserts]`
+  table as a `status == <code>` row, so it can be changed or removed like any
+  other assert (previously it was only reachable through raw Hurl/JSON editing).
+  Editing the row updates the expectation and typing a new `status == <code>`
+  assert sets it; both round-trip back to the canonical `HTTP <code>` line.
+
 ### Added
 
 - **Workspace file tree: real expand/collapse replaces the old breadcrumb.**

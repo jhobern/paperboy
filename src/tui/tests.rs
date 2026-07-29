@@ -9251,8 +9251,9 @@ fn creating_a_request_returns_focus_to_the_requests_list() {
 }
 
 /// Editing an existing request through the wizard must not disturb fields
-/// the wizard doesn't expose (query params, basic auth, expected status)
-/// — only the fields shown in the form change.
+/// the wizard doesn't expose (query params, basic auth) — only the fields
+/// shown in the form change. The status expectation *is* now shown, as a
+/// `status == <code>` assert row, but survives untouched round-trips.
 #[test]
 fn editing_a_request_preserves_fields_the_wizard_does_not_expose() {
     let mut app = TuiApp::default();
@@ -9305,14 +9306,120 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "status == 200".chars() {
+    for ch in "jsonpath \"$.ok\" == \"yes\"".chars() {
         press(&mut app, KeyCode::Char(ch));
     }
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
     assert_eq!(e.len(), 1);
-    assert_eq!(e[0].asserts, vec!["status == 200".to_string()]);
+    assert_eq!(
+        e[0].asserts,
+        vec!["jsonpath \"$.ok\" == \"yes\"".to_string()]
+    );
+}
+
+/// `status_eq_code` recognises only a plain `status == <n>` equality (the
+/// canonical form of the Hurl `HTTP <n>` line); every other assert — other
+/// operators, a `jsonpath` on `status`, or a look-alike query name — stays an
+/// ordinary assert.
+#[test]
+fn status_eq_code_only_matches_a_plain_status_equality() {
+    use crate::hurl::status_eq_code;
+    assert_eq!(status_eq_code("status == 200"), Some(200));
+    assert_eq!(status_eq_code("  status==404 "), Some(404));
+    assert_eq!(status_eq_code("status >= 200"), None);
+    assert_eq!(status_eq_code("status != 500"), None);
+    assert_eq!(status_eq_code("jsonpath \"$.status\" == 200"), None);
+    assert_eq!(status_eq_code("statusCode == 200"), None);
+    assert_eq!(status_eq_code("status == 200 and more"), None);
+}
+
+/// The `HTTP <code>` response expectation (stored as `expected_status`) is
+/// surfaced in the wizard as an editable `status == <code>` assert row, ahead
+/// of any real asserts, so it reads and edits like the other checks.
+#[test]
+fn the_expected_status_appears_as_an_editable_assert_row() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    entry.asserts = vec!["jsonpath \"$.ok\" == \"yes\"".to_string()];
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    let form = form_ref(&app);
+    assert_eq!(form.asserts.len(), 2);
+    assert_eq!(form.asserts[0].expr.text(), "status == 200");
+    assert_eq!(form.asserts[1].expr.text(), "jsonpath \"$.ok\" == \"yes\"");
+}
+
+/// Editing the surfaced `status == <code>` row folds back into
+/// `expected_status` on save (it round-trips to the `HTTP <code>` line), and
+/// never leaks into the ordinary `[Asserts]` list.
+#[test]
+fn editing_the_status_assert_row_updates_the_expected_status() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.asserts[0].expr = super::editor::Editor::new("status == 404", false);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.expected_status, Some(404));
+    assert!(
+        e.asserts.is_empty(),
+        "the status row must not become an assert"
+    );
+}
+
+/// Removing the `status == <code>` row clears the status expectation entirely.
+#[test]
+fn deleting_the_status_assert_row_clears_the_expected_status() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.asserts.clear();
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert_eq!(app.collections[0].entries[0].expected_status, None);
+}
+
+/// A `status == <code>` typed into the asserts table becomes the request's
+/// `expected_status` rather than a literal assert, unifying the two ways of
+/// expressing a status check.
+#[test]
+fn a_typed_status_assert_becomes_the_expected_status() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    for ch in "http://h/x".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
+    press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
+    press(&mut app, KeyCode::Tab); // -> Body
+    press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
+    press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
+    for ch in "status == 201".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let e = &app.collections[0].entries;
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].expected_status, Some(201));
+    assert!(e[0].asserts.is_empty());
 }
 
 #[test]

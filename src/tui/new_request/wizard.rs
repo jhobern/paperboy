@@ -621,15 +621,22 @@ impl NewReq {
                 })
                 .collect()
         };
-        let asserts = entry
-            .asserts
-            .iter()
-            .map(|a| {
-                let mut row = AssertRow::new();
-                row.expr = Editor::new(a, false);
-                row
-            })
-            .collect();
+        // Surface the response's `HTTP <code>` status expectation (stored as
+        // `expected_status`) as an editable `status == <code>` assert row at
+        // the top of the section, so it can be changed or removed like any
+        // other assert. `submit_new_request` folds it back into
+        // `expected_status` on save.
+        let mut asserts: Vec<AssertRow> = Vec::new();
+        if let Some(code) = entry.expected_status {
+            let mut row = AssertRow::new();
+            row.expr = Editor::new(&format!("status == {code}"), false);
+            asserts.push(row);
+        }
+        asserts.extend(entry.asserts.iter().map(|a| {
+            let mut row = AssertRow::new();
+            row.expr = Editor::new(a, false);
+            row
+        }));
         let captures = entry
             .captures
             .iter()

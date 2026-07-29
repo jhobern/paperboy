@@ -377,6 +377,28 @@ pub fn collection_to_hurl(entries: &[HurlEntry]) -> String {
         .join("\n")
 }
 
+/// Recognise a `status == <code>` assert expression and return the numeric
+/// status code it checks.
+///
+/// The Hurl `HTTP <code>` response line and a `status == <code>` assert are
+/// equivalent — both fail the entry unless the response status matches — and
+/// PaperBoy stores that check once, as [`HurlEntry::expected_status`]
+/// (serialized back out as the `HTTP <code>` line). This lets the request
+/// wizard surface the status expectation as an editable assert row and fold it
+/// back into `expected_status` on save.
+///
+/// Returns `None` for anything that isn't a plain equality on `status`
+/// (e.g. `status >= 200`, `status != 404`, or a `jsonpath` assert), which stay
+/// as ordinary `[Asserts]` rows. Whitespace around `status` and `==` is
+/// tolerated so the row survives light hand-editing.
+pub fn status_eq_code(expr: &str) -> Option<u16> {
+    let rest = expr.trim().strip_prefix("status")?;
+    // Require a boundary after `status` so `status_line`/`statusCode` don't
+    // match; the next thing must be the `==` operator (after any whitespace).
+    let rest = rest.trim_start().strip_prefix("==")?;
+    rest.trim().parse::<u16>().ok()
+}
+
 /// HTTP methods offered when creating a request.
 pub const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 

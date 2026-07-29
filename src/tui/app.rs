@@ -1450,8 +1450,7 @@ impl TuiApp {
             PromptKind::Raw(ci) => {
                 // Reparse the edited Hurl text back into the entry; on success
                 // this can change any field (Raw Mode exposes everything,
-                // including query_params/form_fields/cookies/basic_auth/
-                // expected_status, which the Edit Request wizard hides). On
+                // including query_params/form_fields/cookies/basic_auth). On
                 // failure, reopen the overlay with the user's text intact so
                 // they can fix it.
                 let entries = crate::hurl::parse_hurl(&text);
