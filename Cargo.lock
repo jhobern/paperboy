@@ -2360,11 +2360,12 @@ dependencies = [
 
 [[package]]
 name = "tui-panel-select"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c22f6c4fdd28f5e8da0a234c1239642b67dafa6c6d8edf0be80ac86d3e23804"
+checksum = "20891d513ada49151e4c432b0320eb66d280e51eb93159b6612f61bdcf9aa1b3"
 dependencies = [
  "base64",
+ "libc",
  "ratatui",
 ]
 

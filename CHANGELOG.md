@@ -589,6 +589,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Copying no longer makes the clipboard helper flicker in the app bar.** On
+  Wayland/X11 the background `wl-copy`/`xclip` helper PaperBoy forks to own the
+  selection is now placed in its own session (via `setsid()` in the child before
+  `exec`), so the desktop environment no longer briefly lists it as a running
+  application — the Ubuntu app bar no longer expands and contracts on every copy.
+  (Requires `tui-panel-select` 0.1.5.)
+
 - **"Save Request" no longer crashes when a report tab is active.** The File ▸
   Save ▸ Request action indexed the active tab straight into the collections
   list, but a report tab's index points past it — so invoking it while a report

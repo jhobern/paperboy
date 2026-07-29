@@ -9,7 +9,7 @@ license = "MIT"
 
 
 [dependencies]
-tui-panel-select = "0.1.4"
+tui-panel-select = "0.1.5"
 tui-rgb-picker = "0.1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps JSON object key order when we pretty-print a response
