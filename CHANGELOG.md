@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The build no longer needs a system libcurl.** libcurl and OpenSSL are now
+  compiled and statically linked from source (via the `curl` crate's
+  `static-curl`/`static-ssl` features), so the resulting binary is
+  self-contained with no runtime libcurl dependency. Building now requires a C
+  compiler, `perl` and `make`; the previous hand-written pkg-config shim
+  (`.cargo/config.toml` + `.curl/`) has been removed.
+
 - **Stopping a report run now keeps the partial results.** Previously, pressing
   `r` to cancel a running report discarded all streamed rows and restored
   whatever grid was showing before the run started. Now the partial grid is

@@ -18,6 +18,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 hurl = "~8.0"
 hurl_core = "~8.0"
+# libcurl reaches the tree transitively via `hurl` -> `curl` -> `curl-sys`. We
+# depend on `curl` directly only to enable `static-curl`/`static-ssl`, which make
+# curl-sys compile and statically link vendored libcurl + OpenSSL from source
+# (via `cc`/`perl`). That removes any need for a system libcurl `-dev` package or
+# pkg-config `.pc` (this environment ships neither), so the build is
+# self-contained and reproducible rather than relying on a hand-written pkg-config
+# shim. Cargo feature-unifies onto the same `curl` crate `hurl` already uses.
+curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
 base64 = "0.22"
 ratatui = "0.30.2"
 clap = { version = "4.6.1", features = ["derive"] }

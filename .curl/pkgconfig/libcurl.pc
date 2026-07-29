@@ -1,8 +1,0 @@
-prefix=/usr
-libdir=../.curl/lib
-includedir=/usr/include
-Name: libcurl
-Description: Library to transfer files with URLs
-Version: 8.5.0
-Libs: -L${libdir} -lcurl
-Cflags: -I${includedir}
