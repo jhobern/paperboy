@@ -342,7 +342,8 @@ fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
             }
             push_key(&mut path, &rest[..end]);
             s = &rest[end..];
-        } else if let Some(rest) = s.strip_prefix('[') {
+        } else {
+            let rest = s.strip_prefix('[')?;
             let close = rest.find(']')?;
             let key = rest[..close].trim();
             if let Some(k) = unquote(key) {
@@ -353,8 +354,6 @@ fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
                 return None;
             }
             s = &rest[close + 1..];
-        } else {
-            return None;
         }
     }
     Some(path)

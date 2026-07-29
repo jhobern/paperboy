@@ -26,18 +26,6 @@ pub struct Header {
     pub lines: Vec<HeaderLine>,
 }
 
-pub enum HeaderDirective {
-    Collection(String),
-    Name(String),
-    Output(String),
-    Columns(String),
-    Root(String),
-    Environment(String),
-    Baseline(String),
-    // Any directive that doesn't match one of the declared types is stored as (key, value)
-    Unknown(String, String),
-}
-
 /// One line of the header: either a recognised `# key: value` directive or a
 /// free-form `#` comment (preserved as-is).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +49,6 @@ impl Header {
     /// runnable flow.
     pub fn collection(&self) -> Option<&str> {
         self.get("collection")
-    }
-    pub fn name(&self) -> Option<&str> {
-        self.get("name")
     }
     pub fn output(&self) -> Option<&str> {
         self.get("output")
@@ -93,27 +78,6 @@ impl Header {
     /// a `FOR … IN ENVS` loop, not this directive.
     pub fn environment(&self) -> Option<&str> {
         self.get("environment")
-    }
-
-    /// Set (or insert) the directive named `key` to `value`, preserving the
-    /// position of an existing directive and appending a new one otherwise.
-    /// Used when the user re-points a report (e.g. BIND changes `collection:`).
-    /// Matching is case-insensitive; the stored key is left as-was on update and
-    /// written lowercase for a fresh directive (matching the serializer style).
-    pub fn set(&mut self, key: &str, value: impl Into<String>) {
-        let value = value.into();
-        for line in &mut self.lines {
-            if let HeaderLine::Directive { key: k, value: v } = line
-                && k.eq_ignore_ascii_case(key)
-            {
-                *v = value;
-                return;
-            }
-        }
-        self.lines.push(HeaderLine::Directive {
-            key: key.to_ascii_lowercase(),
-            value,
-        });
     }
 }
 

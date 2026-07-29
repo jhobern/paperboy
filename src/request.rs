@@ -375,7 +375,7 @@ fn map_to_triples(map: BTreeMap<String, KvValue>) -> Vec<(String, String, bool)>
 /// Pretty-printed JSON of the request in its RAW, editable form: `{{ VAR }}`
 /// placeholders are kept intact and basic auth is shown as a readable
 /// `basic_auth` object (not an encoded header). The wire request is re-derived
-/// (substituted + encoded) from the entry by [`resolve_request`].
+/// (substituted + encoded) from the entry by [`resolve_entry`].
 pub fn build_request_json(entry: &HurlEntry) -> String {
     let dto = RequestJson {
         basic_auth: entry.basic_auth.as_ref().map(|(user, pass)| BasicAuthJson {
@@ -443,21 +443,11 @@ pub struct ResolvedRequest {
     pub body: Option<String>,
 }
 
-/// Resolve the wire request to send for the selected entry: always rebuilt from
-/// the entry (the source of truth) with `{{ VAR }}` placeholders substituted and
-/// basic auth encoded into an `Authorization` header. Editor changes are applied
-/// to the entry when committed, so this always reflects the current request.
-pub fn resolve_request(col: &Collection, env: Option<&Environment>) -> Option<ResolvedRequest> {
-    let entry = col.entries.get(col.selected_entry)?;
-    let vars = collection_vars(env, &col.captures);
-    Some(resolve_entry(entry, &vars))
-}
-
 /// Resolve one arbitrary `HurlEntry`'s `{{ VAR }}` placeholders against `vars`,
-/// folding any `basic_auth` into an `Authorization` header. This is the
-/// entry-level core of [`resolve_request`] (which applies it to the collection's
-/// *selected* entry with the collection's own vars); the report interpreter
-/// reuses it to resolve a request chosen by name with its own scoped vars.
+/// folding any `basic_auth` into an `Authorization` header. Callers pass the
+/// entry they want (e.g. a collection's *selected* entry with the collection's
+/// own vars); the report interpreter reuses it to resolve a request chosen by
+/// name with its own scoped vars.
 pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> ResolvedRequest {
     let method = entry.method.clone();
     let url = substitute(&entry.url, vars);
@@ -1173,7 +1163,8 @@ mod tests {
     }
 
     fn auth_header(col: &Collection, env: Option<&Environment>) -> String {
-        let headers = resolve_request(col, env).unwrap().headers;
+        let vars = collection_vars(env, &col.captures);
+        let headers = resolve_entry(&col.entries[col.selected_entry], &vars).headers;
         headers
             .into_iter()
             .find(|(k, _)| k == "Authorization")

@@ -16,8 +16,6 @@ use super::model::ReportResult;
 /// format like `.xlsx` fits the same interface). Fallible because a binary
 /// serializer (xlsx) can fail (e.g. exceeding the format's row limit).
 pub trait ReportWriter {
-    /// The file extension for this format (no dot), e.g. `"csv"`.
-    fn extension(&self) -> &'static str;
     /// Render `result` to bytes, using `header` for the `columns:` directive.
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String>;
 }
@@ -45,10 +43,6 @@ pub const OUTPUT_EXTENSIONS: [&str; 4] = ["csv", "json", "html", "xlsx"];
 pub struct CsvWriter;
 
 impl ReportWriter for CsvWriter {
-    fn extension(&self) -> &'static str {
-        "csv"
-    }
-
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         let columns = result.resolved_columns(header);
         let mut out = String::new();
@@ -77,10 +71,6 @@ impl ReportWriter for CsvWriter {
 pub struct JsonWriter;
 
 impl ReportWriter for JsonWriter {
-    fn extension(&self) -> &'static str {
-        "json"
-    }
-
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         let columns = result.resolved_columns(header);
         let headers: Vec<&str> = columns.iter().map(|c| c.header.as_str()).collect();
@@ -113,10 +103,6 @@ impl ReportWriter for JsonWriter {
 pub struct HtmlWriter;
 
 impl ReportWriter for HtmlWriter {
-    fn extension(&self) -> &'static str {
-        "html"
-    }
-
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         let columns = result.resolved_columns(header);
         let mut out = String::new();
@@ -186,10 +172,6 @@ fn push_escaped(out: &mut String, text: &str) {
 pub struct XlsxWriter;
 
 impl ReportWriter for XlsxWriter {
-    fn extension(&self) -> &'static str {
-        "xlsx"
-    }
-
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
 
@@ -362,18 +344,22 @@ mod tests {
 
     #[test]
     fn default_columns_follow_first_seen_order() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["p.HttpStatus".into(), "p.status".into()];
-        res.rows = vec![row(&[("p.HttpStatus", "200"), ("p.status", "ok")])];
+        let res = ReportResult {
+            column_order: vec!["p.HttpStatus".into(), "p.status".into()],
+            rows: vec![row(&[("p.HttpStatus", "200"), ("p.status", "ok")])],
+            ..Default::default()
+        };
         assert_eq!(csv(&res), "p.HttpStatus,p.status\r\n200,ok\r\n");
     }
 
     #[test]
     fn columns_directive_renames_reorders_and_marks_missing() {
-        let mut res = ReportResult::default();
-        res.no_match_marker = "-".into();
-        res.column_order = vec!["FILE".into(), "p.status".into()];
-        res.rows = vec![row(&[("FILE", "a.jpg")])]; // p.status missing -> marker
+        let res = ReportResult {
+            no_match_marker: "-".into(),
+            column_order: vec!["FILE".into(), "p.status".into()],
+            rows: vec![row(&[("FILE", "a.jpg")])], // p.status missing -> marker
+            ..Default::default()
+        };
         let header = Header {
             lines: vec![super::super::flow::HeaderLine::Directive {
                 key: "columns".into(),
@@ -386,17 +372,21 @@ mod tests {
 
     #[test]
     fn fields_with_commas_quotes_and_newlines_are_escaped() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["resp".into()];
-        res.rows = vec![row(&[("resp", "a,\"b\"\nc")])];
+        let res = ReportResult {
+            column_order: vec!["resp".into()],
+            rows: vec![row(&[("resp", "a,\"b\"\nc")])],
+            ..Default::default()
+        };
         assert_eq!(csv(&res), "resp\r\n\"a,\"\"b\"\"\nc\"\r\n");
     }
 
     #[test]
     fn formula_leading_fields_are_neutralised_against_injection() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["body".into()];
-        res.rows = vec![row(&[("body", "=1+SUM(A1)")])];
+        let mut res = ReportResult {
+            column_order: vec!["body".into()],
+            rows: vec![row(&[("body", "=1+SUM(A1)")])],
+            ..Default::default()
+        };
         // The `=` trigger is prefixed with `'` so a spreadsheet treats it as
         // text; the resulting field has no special chars so it stays unquoted.
         assert_eq!(csv(&res), "body\r\n'=1+SUM(A1)\r\n");
@@ -412,12 +402,14 @@ mod tests {
 
     #[test]
     fn json_output_is_columns_plus_row_objects_in_order() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["FILE".into(), "status".into()];
-        res.rows = vec![
-            row(&[("FILE", "a.jpg"), ("status", "ok")]),
-            row(&[("FILE", "b.jpg"), ("status", "error")]),
-        ];
+        let res = ReportResult {
+            column_order: vec!["FILE".into(), "status".into()],
+            rows: vec![
+                row(&[("FILE", "a.jpg"), ("status", "ok")]),
+                row(&[("FILE", "b.jpg"), ("status", "error")]),
+            ],
+            ..Default::default()
+        };
         let bytes = JsonWriter.write(&res, &Header::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["columns"], serde_json::json!(["FILE", "status"]));
@@ -435,10 +427,12 @@ mod tests {
 
     #[test]
     fn json_missing_source_uses_the_no_match_marker() {
-        let mut res = ReportResult::default();
-        res.no_match_marker = "∅".into();
-        res.column_order = vec!["FILE".into(), "missing".into()];
-        res.rows = vec![row(&[("FILE", "a.jpg")])];
+        let res = ReportResult {
+            no_match_marker: "∅".into(),
+            column_order: vec!["FILE".into(), "missing".into()],
+            rows: vec![row(&[("FILE", "a.jpg")])],
+            ..Default::default()
+        };
         let bytes = JsonWriter.write(&res, &Header::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["rows"][0]["missing"], "∅");
@@ -446,12 +440,14 @@ mod tests {
 
     #[test]
     fn html_output_is_a_self_contained_table_with_escaping_and_tints() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["FILE".into(), "Status".into()];
-        res.rows = vec![
-            row(&[("FILE", "a & <b>.jpg"), ("Status", "success")]),
-            row(&[("FILE", "c.jpg"), ("Status", "error")]),
-        ];
+        let res = ReportResult {
+            column_order: vec!["FILE".into(), "Status".into()],
+            rows: vec![
+                row(&[("FILE", "a & <b>.jpg"), ("Status", "success")]),
+                row(&[("FILE", "c.jpg"), ("Status", "error")]),
+            ],
+            ..Default::default()
+        };
         let bytes = HtmlWriter.write(&res, &Header::default()).unwrap();
         let html = String::from_utf8(bytes).unwrap();
         assert!(html.starts_with("<!DOCTYPE html>"), "is an HTML document");
@@ -477,9 +473,11 @@ mod tests {
 
     #[test]
     fn xlsx_output_is_a_valid_nonempty_zip() {
-        let mut res = ReportResult::default();
-        res.column_order = vec!["FILE".into(), "status".into()];
-        res.rows = vec![row(&[("FILE", "a.jpg"), ("status", "success")])];
+        let res = ReportResult {
+            column_order: vec!["FILE".into(), "status".into()],
+            rows: vec![row(&[("FILE", "a.jpg"), ("status", "success")])],
+            ..Default::default()
+        };
         let bytes = XlsxWriter.write(&res, &Header::default()).unwrap();
         assert!(!bytes.is_empty(), "xlsx produced bytes");
         // Every .xlsx is a ZIP container, so it starts with the ZIP magic `PK`.

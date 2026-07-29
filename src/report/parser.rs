@@ -769,7 +769,7 @@ mod tests {
             "# name: Smoke\n# collection: ./c.hurl\n\nURL=some.url:8080/api\nREQUEST Oauth\nREPORT REQUEST process_file\n",
         );
         assert_eq!(flow.header.collection(), Some("./c.hurl"));
-        assert_eq!(flow.header.name(), Some("Smoke"));
+        assert_eq!(flow.header.get("name"), Some("Smoke"));
         assert!(matches!(flow.nodes[0], FlowNode::Assign { .. }));
         assert!(matches!(flow.nodes[1], FlowNode::Request { .. }));
         assert!(matches!(flow.nodes[2], FlowNode::Report(_)));

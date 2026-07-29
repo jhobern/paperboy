@@ -54,7 +54,6 @@ use super::producers::{self, ProducerItem};
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
 /// `PRELUDE_*=…` assignment).
 const DEFAULT_NO_MATCH: &str = "";
-const DEFAULT_RESPONSE_FORMAT: &str = "pretty";
 /// Default `PARALLEL` worker cap when a bare `PARALLEL` loop doesn't set one and
 /// `PRELUDE_MAX_PARALLEL` is unset.
 const DEFAULT_MAX_PARALLEL: usize = 8;
@@ -1533,7 +1532,7 @@ mod tests {
         );
         // The raw cell is empty; the marker is applied once, at render time.
         assert_eq!(res.no_match_marker, "\u{2205}");
-        let col = crate::report::OutputColumn {
+        let col = crate::report::model::OutputColumn {
             header: "m".into(),
             sources: vec!["process.missing".into()],
         };
@@ -1820,7 +1819,8 @@ mod tests {
             Started,
             Completed,
         }
-        let events: Mutex<Vec<(Kind, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
+        type EventLog = Vec<(Kind, Vec<(usize, usize)>)>;
+        let events: Mutex<EventLog> = Mutex::new(Vec::new());
         let sink = |ev: RowEvent| {
             let mut log = events.lock().unwrap();
             match ev {

@@ -1229,7 +1229,9 @@ fn disabled_header_is_not_sent() {
         "a disabled header is kept in the model, not discarded"
     );
     // …but it is excluded from the actual wire request that gets sent.
-    let sent = crate::request::resolve_request(&app.collections[0], None).unwrap();
+    let col = &app.collections[0];
+    let vars = crate::request::collection_vars(None, &col.captures);
+    let sent = crate::request::resolve_entry(&col.entries[col.selected_entry], &vars);
     assert!(
         !sent.headers.iter().any(|(k, _)| k == "X-Test"),
         "a disabled header must not be sent"
@@ -7734,9 +7736,7 @@ fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
     };
     let names = |app: &TuiApp| -> Vec<String> {
         match &app.overlay {
-            Some(Overlay::Browser(_, ex)) => {
-                ex.files().iter().map(|f| f.name().to_string()).collect()
-            }
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
             _ => panic!("browser not open"),
         }
     };
@@ -9032,8 +9032,10 @@ fn closing_the_edit_wizard_returns_focus_to_the_requests_list() {
 
 #[test]
 fn creating_a_request_returns_focus_to_the_requests_list() {
-    let mut app = TuiApp::default();
-    app.focus = Pane::List;
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
 
     press(&mut app, KeyCode::Char('n'));
     assert!(matches!(app.overlay, Some(Overlay::NewRequest(_))));
@@ -15273,8 +15275,10 @@ fn report_view_angle_brackets_resize_the_list_column() {
 /// filename's extension (the format *is* the extension), wrapping around.
 #[test]
 fn export_format_cycles_through_output_formats() {
-    let mut app = TuiApp::default();
-    app.browser_name = super::editor::Editor::new("report.csv", false);
+    let mut app = TuiApp {
+        browser_name: super::editor::Editor::new("report.csv", false),
+        ..Default::default()
+    };
     app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.json");
     app.cycle_browser_export_format(true);
@@ -16538,8 +16542,10 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
 
     // Seed a prior grid, then start streaming so the skeleton is installed in
     // `rt.result`. The partial grid (skeleton) is what must be retained on close.
-    let mut prior = ReportResult::default();
-    prior.column_order = vec!["prior".into()];
+    let prior = ReportResult {
+        column_order: vec!["prior".into()],
+        ..Default::default()
+    };
     app.reports[idx].result = Some(prior);
     let skeleton = app.dry_run_report_flow(idx).expect("expandable");
     let skeleton_columns = skeleton.column_order.clone();
@@ -16589,7 +16595,7 @@ fn closing_a_running_report_tab_detaches_the_run_and_restores_the_grid() {
 /// being read as another stop.
 #[test]
 fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
-    use super::reports::{ReportRunUpdate, ReportView};
+    use super::reports::ReportRunUpdate;
     use crate::i18n::Status;
     use crate::report::model::ReportResult;
     let mut app = TuiApp::default();
@@ -16612,8 +16618,10 @@ fn re_running_a_report_right_after_cancel_starts_a_fresh_run() {
 
     // Seed a prior grid, then start streaming so the skeleton is installed in
     // `rt.result` — the partial result a mid-run stop must retain.
-    let mut prior = ReportResult::default();
-    prior.column_order = vec!["prior".into()];
+    let prior = ReportResult {
+        column_order: vec!["prior".into()],
+        ..Default::default()
+    };
     app.reports[idx].result = Some(prior);
     let skeleton = app.dry_run_report_flow(idx).expect("expandable");
     let skeleton_columns = skeleton.column_order.clone();
@@ -17133,7 +17141,7 @@ fn dry_run_previews_row_count_and_file_bindings() {
     ));
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
-    app.reports[idx].report.set_text(&format!(
+    app.reports[idx].report.set_text(format!(
         "# collection: api\nFOR FILE IN FILES {:?}\n    REPORT REQUEST Upload\nEND\n",
         dir.display().to_string()
     ));
@@ -18955,7 +18963,7 @@ fn ws_row_pos(
     app.collections[ci]
         .ws_rows()
         .iter()
-        .position(|r| pred(r))
+        .position(pred)
         .unwrap_or_else(|| panic!("{what} is listed in the workspace tree"))
 }
 
@@ -19835,7 +19843,6 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
     ));
     app.new_report_tab();
     let idx = app.active_report_index().unwrap();
-    let cols = ["A"];
     let rows: Vec<ReportRow> = (0..10)
         .map(|r| {
             let mut row = ReportRow::default();

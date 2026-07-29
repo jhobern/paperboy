@@ -186,15 +186,15 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
                 if let Some(base) = baseline {
                     for field in &roles.baseline_show {
                         for cand_key in cand.cells.keys().cloned().collect::<Vec<_>>() {
-                            if let Some((alias, f)) = cand_key.split_once('.') {
-                                if f == field {
-                                    let base_col = format!("baseline.{alias}.{field}");
-                                    if let Some(val) = base.cells.get(&cand_key) {
-                                        cand.cells
-                                            .entry(base_col.clone())
-                                            .or_insert_with(|| val.clone());
-                                        result.note_column(&base_col);
-                                    }
+                            if let Some((alias, f)) = cand_key.split_once('.')
+                                && f == field
+                            {
+                                let base_col = format!("baseline.{alias}.{field}");
+                                if let Some(val) = base.cells.get(&cand_key) {
+                                    cand.cells
+                                        .entry(base_col.clone())
+                                        .or_insert_with(|| val.clone());
+                                    result.note_column(&base_col);
                                 }
                             }
                         }

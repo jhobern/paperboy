@@ -3335,18 +3335,18 @@ fn draw_report_results(
     // Auto-scroll the results panel to keep the cell cursor visible. The inner
     // height is `area.height - 2` (one-pixel border top + bottom from `panel`).
     let inner_h = area.height.saturating_sub(2) as usize;
-    if inner_h > 0 {
-        if let Some((cursor_row, _)) = app.reports[idx].cell_cursor {
-            // Grid line 0 is the header row; data row `cursor_row` maps to grid
-            // line `cursor_row + 1`.
-            let grid_line = cursor_row + 1;
-            let scroll = app.reports[idx].results_panel.scroll() as usize;
-            if grid_line < scroll {
-                app.reports[idx].results_panel.set_scroll(grid_line as u16);
-            } else if grid_line >= scroll + inner_h {
-                let new_scroll = (grid_line + 1).saturating_sub(inner_h) as u16;
-                app.reports[idx].results_panel.set_scroll(new_scroll);
-            }
+    if inner_h > 0
+        && let Some((cursor_row, _)) = app.reports[idx].cell_cursor
+    {
+        // Grid line 0 is the header row; data row `cursor_row` maps to grid
+        // line `cursor_row + 1`.
+        let grid_line = cursor_row + 1;
+        let scroll = app.reports[idx].results_panel.scroll() as usize;
+        if grid_line < scroll {
+            app.reports[idx].results_panel.set_scroll(grid_line as u16);
+        } else if grid_line >= scroll + inner_h {
+            let new_scroll = (grid_line + 1).saturating_sub(inner_h) as u16;
+            app.reports[idx].results_panel.set_scroll(new_scroll);
         }
     }
 

@@ -804,10 +804,11 @@ impl EnvsForm {
     /// first entry so a comparison run has a reference by default.
     fn toggle_mode(&mut self) {
         self.compare = !self.compare;
-        if self.compare && !self.entries.iter().any(|e| e.baseline) {
-            if let Some(first) = self.entries.first_mut() {
-                first.baseline = true;
-            }
+        if self.compare
+            && !self.entries.iter().any(|e| e.baseline)
+            && let Some(first) = self.entries.first_mut()
+        {
+            first.baseline = true;
         }
     }
 
