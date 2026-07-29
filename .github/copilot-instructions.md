@@ -20,10 +20,14 @@ terminal UI (default) and a headless CLI runner.
 
 ### libcurl / build environment
 
-`.cargo/config.toml` sets `PKG_CONFIG_PATH=".curl/pkgconfig"`, pointing at a
-project-local `libcurl.pc` that wraps the system `libcurl.so.4` (this
-environment has no libcurl `-dev` package / `.pc` file). Don't remove or
-"clean up" this config — the build won't link without it.
+libcurl reaches the tree via `hurl` → `curl` → `curl-sys`. The direct `curl`
+dependency in `Cargo.toml` enables `static-curl`/`static-ssl`, so curl-sys
+**compiles and statically links vendored libcurl + OpenSSL from source** — no
+system libcurl `-dev` package or pkg-config `.pc` is needed (this environment
+ships neither). The build is therefore self-contained; it needs a C compiler,
+`perl` and `make` at build time (all present). Don't remove the `static-*`
+features expecting to fall back to a system libcurl — this environment can't
+link one.
 
 Rust edition is **2024**.
 

@@ -3,7 +3,7 @@
 //! request model, parser, serializer and `[Captures]`/`[Asserts]` evaluation
 //! live in the [`crate::hurl`] module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,23 +16,39 @@ use crate::tree::{self, Row};
 /// folders encoded in request titles inside one file, this navigates the real
 /// filesystem under the workspace root and inlines the currently-open
 /// collection's requests directly beneath its file row (an accordion).
+///
+/// The tree is a real expand/collapse tree: `workspace_expanded` (on
+/// [`Collection`]) holds the set of open folders; visibility is derived
+/// depth-first from that set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsRow {
-    /// Go up to the parent folder (only present when not at the workspace root).
-    Up,
-    /// Descend into an immediate subfolder of the folder being browsed.
-    Folder(String),
-    /// A collection file in the folder being browsed. `open` is true for the
-    /// currently-loaded, not-collapsed file — its requests follow as
-    /// [`WsRow::Request`] rows.
+    /// A folder in the workspace tree.  `expanded` is true when the folder is
+    /// in the tab's `workspace_expanded` set (its children are visible).
+    Folder {
+        path: PathBuf,
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    /// A collection file in the workspace tree.  `open` is true when this is
+    /// the currently-loaded file AND its inline requests are not collapsed.
     Collection {
         path: PathBuf,
         name: String,
+        depth: usize,
         open: bool,
+    },
+    /// A PaperTrail report file (`.trail`).  Selecting it opens the
+    /// workspace-aware report view embedded in the right pane.
+    Report {
+        path: PathBuf,
+        name: String,
+        depth: usize,
     },
     /// A request of the currently-open collection (index into `entries`),
     /// shown indented under its [`WsRow::Collection`] row.
-    Request(usize),
+    /// `depth` is the collection's depth + 1.
+    Request { idx: usize, depth: usize },
 }
 
 /// A loaded Hurl collection (one .hurl file).
@@ -111,18 +127,16 @@ pub struct Collection {
     /// commit rather than losing track of the workspace entirely — see
     /// `PersistedTab::into_collection`'s `PendingWorkspaceReload`.
     pub workspace_git_origin: Option<crate::tui::remote::WorkspaceGitOrigin>,
-    /// For a Workspace tab, the folder currently being browsed in the
-    /// file-tree request list, as a breadcrumb path relative to
-    /// `workspace_root` (root = empty). Reused from `folder`'s role for
-    /// ordinary tabs but keyed to the *real* filesystem rather than
-    /// title-encoded virtual folders (which are flattened in the Workspace
-    /// view). View state only, never persisted; re-derived from `path` on
-    /// load/restore.
-    pub workspace_browse: Vec<String>,
+    /// For a Workspace tab, the set of folder paths (absolute) that are
+    /// currently expanded in the file-tree.  A folder is visible when all its
+    /// ancestor folders are also in this set.  Persisted so the tree state
+    /// survives restarts.  Absolute paths in memory; serialised relative to
+    /// `workspace_root` in [`crate::persistence`].
+    pub workspace_expanded: HashSet<PathBuf>,
     /// For a Workspace tab, whether the currently-loaded collection is
-    /// collapsed (its requests hidden) in the file-tree list. Toggled by
-    /// pressing Enter on its file row; reset to expanded whenever a file is
-    /// loaded. View state only, never persisted.
+    /// collapsed (its inline requests hidden) in the file-tree list. Toggled
+    /// by pressing Enter on its file row; reset to expanded whenever a new
+    /// file is loaded.  Not persisted.
     pub workspace_collapsed: bool,
 }
 
@@ -154,7 +168,7 @@ impl Collection {
             workspace_auto_prompt_dismissed: false,
             workspace_downloaded_from_git: false,
             workspace_git_origin: None,
-            workspace_browse: Vec::new(),
+            workspace_expanded: HashSet::new(),
             workspace_collapsed: false,
         };
         c.sync_folder_to_selected();
@@ -186,57 +200,107 @@ impl Collection {
         self.workspace_root.is_some()
     }
 
-    /// The rows to show in a Workspace tab's file-tree request list: `../`
-    /// (unless at the root), then the browsed folder's subfolders and
-    /// collection files, with the currently-open collection's requests inlined
-    /// beneath its file row. Empty for a non-Workspace tab. Requests are shown
-    /// flat (their title-encoded virtual folders are ignored here).
+    /// The rows to show in a Workspace tab's expand/collapse file tree.
+    ///
+    /// Uses [`crate::workspace::scan_workspace`] for the full depth-first tree,
+    /// then applies the `workspace_expanded` visibility filter: an entry is
+    /// shown only when every ancestor folder in the DFS path is in that set.
+    /// Folders render with a chevron (expanded ▾ / collapsed ▸); selecting a
+    /// collection file opens it (with inline requests beneath); selecting a
+    /// report embeds it in the right pane.  Empty for a non-Workspace tab.
     pub fn ws_rows(&self) -> Vec<WsRow> {
         let Some(root) = &self.workspace_root else {
             return Vec::new();
         };
-        let mut dir = root.clone();
-        for seg in &self.workspace_browse {
-            dir.push(seg);
-        }
-        let mut rows = Vec::new();
-        if !self.workspace_browse.is_empty() {
-            rows.push(WsRow::Up);
-        }
-        for e in crate::workspace::list_dir(&dir, true) {
-            if e.is_dir {
-                rows.push(WsRow::Folder(e.display_name));
-            } else {
-                let open =
-                    self.path.as_deref() == Some(e.path.as_path()) && !self.workspace_collapsed;
-                rows.push(WsRow::Collection {
-                    path: e.path,
-                    name: e.display_name,
-                    open,
-                });
-                if open {
-                    rows.extend((0..self.entries.len()).map(WsRow::Request));
+
+        let full_tree = crate::workspace::scan_workspace(root, self.workspace_filter_hurl_json);
+        let mut out = Vec::new();
+
+        // `ancestor_at[d]` holds the absolute path of the most-recently-visited
+        // directory at depth d.  A row at depth D is visible iff every slot
+        // ancestor_at[0..D] points to a path in `workspace_expanded`.
+        let mut ancestor_at: Vec<Option<PathBuf>> = Vec::new();
+
+        for entry in full_tree {
+            let d = entry.depth;
+
+            // Moving to a shallower depth: slots d.. are no longer our ancestors.
+            if ancestor_at.len() > d {
+                ancestor_at.truncate(d);
+            }
+
+            // Visible iff every containing ancestor folder is expanded.
+            let visible = ancestor_at.iter().all(|opt| {
+                opt.as_ref()
+                    .is_some_and(|p| self.workspace_expanded.contains(p))
+            });
+
+            if entry.is_dir {
+                // Record this directory as the current ancestor at depth d,
+                // so its descendants can check its expansion state.
+                if ancestor_at.len() == d {
+                    ancestor_at.push(Some(entry.path.clone()));
+                } else {
+                    ancestor_at[d] = Some(entry.path.clone());
+                }
+
+                if visible {
+                    let expanded = self.workspace_expanded.contains(&entry.path);
+                    out.push(WsRow::Folder {
+                        path: entry.path,
+                        name: entry.display_name,
+                        depth: d,
+                        expanded,
+                    });
+                }
+            } else if visible {
+                if crate::workspace::is_report_file(&entry.path) {
+                    out.push(WsRow::Report {
+                        path: entry.path,
+                        name: entry.display_name,
+                        depth: d,
+                    });
+                } else {
+                    let open = self.path.as_deref() == Some(entry.path.as_path())
+                        && !self.workspace_collapsed;
+                    out.push(WsRow::Collection {
+                        path: entry.path,
+                        name: entry.display_name,
+                        depth: d,
+                        open,
+                    });
+                    if open {
+                        out.extend(
+                            (0..self.entries.len()).map(|idx| WsRow::Request { idx, depth: d + 1 }),
+                        );
+                    }
                 }
             }
         }
-        rows
+        out
     }
 
-    /// Point the Workspace browse breadcrumb at the folder containing the
-    /// currently-loaded file (`path`), relative to `workspace_root`, and
-    /// expand it. Root (empty) if there's no file or it sits at the root.
-    /// A no-op for a non-Workspace tab.
-    pub fn set_workspace_browse_from_path(&mut self) {
-        self.workspace_browse = Vec::new();
+    /// Expand all ancestor folders of the currently-loaded file so it is
+    /// visible in the workspace tree, and un-collapse the accordion so its
+    /// inline requests are shown.  A no-op for a non-Workspace tab or when no
+    /// file is loaded.  Called by [`crate::tui::app`] after loading a file and
+    /// by [`crate::persistence`] when restoring state.
+    pub fn expand_ancestors_for_path(&mut self) {
         self.workspace_collapsed = false;
-        if let (Some(root), Some(path)) = (&self.workspace_root, &self.path)
-            && let Some(parent) = path.parent()
-            && let Ok(rel) = parent.strip_prefix(root)
+        let (Some(root), Some(path)) = (&self.workspace_root, &self.path) else {
+            return;
+        };
+        // Clone to avoid the simultaneous &self borrow.
+        let root = root.clone();
+        let path = path.clone();
+        if let Some(parent) = path.parent()
+            && let Ok(rel) = parent.strip_prefix(&root)
         {
-            self.workspace_browse = rel
-                .components()
-                .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
-                .collect();
+            let mut cur = root;
+            for component in rel.components() {
+                cur.push(component);
+                self.workspace_expanded.insert(cur.clone());
+            }
         }
     }
 
@@ -252,7 +316,7 @@ impl Collection {
         let sel = self.selected_entry;
         let target = rows
             .iter()
-            .position(|r| matches!(r, WsRow::Request(i) if *i == sel))
+            .position(|r| matches!(r, WsRow::Request { idx, .. } if *idx == sel))
             .or_else(|| {
                 rows.iter()
                     .position(|r| matches!(r, WsRow::Collection { open: true, .. }))

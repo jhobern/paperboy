@@ -110,72 +110,33 @@ fn scan_dir(dir: &Path, depth: usize, filter_hurl_json: bool, out: &mut Vec<WsEn
     }
 }
 
-/// Non-recursive scan of a single directory's immediate children: its
-/// subfolders (alphabetical) followed by its `.hurl`/`.json` collection files
-/// (alphabetical), used by the Workspace tab's file-tree request list to
-/// browse one folder at a time. Unlike [`scan_workspace`] this does not
-/// recurse into the returned subfolders (their `depth` is always 0), but when
-/// `filter_hurl_json` is true a subfolder is still only listed if its subtree
-/// contains at least one collection file — so empty or unrelated folders
-/// don't clutter the browse view. Hidden dot-prefixed entries are always
-/// skipped; an unreadable directory yields an empty list.
-pub fn list_dir(dir: &Path, filter_hurl_json: bool) -> Vec<WsEntry> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<PathBuf> = Vec::new();
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            if filter_hurl_json {
-                let mut sub = Vec::new();
-                scan_dir(&path, 1, true, &mut sub);
-                if sub.is_empty() {
-                    continue;
-                }
-            }
-            dirs.push(path);
-        } else if is_matching_file(&path, filter_hurl_json) {
-            files.push(path);
-        }
-    }
-    dirs.sort();
-    files.sort();
-    let to_entry = |path: PathBuf, is_dir: bool| WsEntry {
-        display_name: path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string(),
-        path,
-        depth: 0,
-        is_dir,
-    };
-    let mut out = Vec::with_capacity(dirs.len() + files.len());
-    out.extend(dirs.into_iter().map(|d| to_entry(d, true)));
-    out.extend(files.into_iter().map(|f| to_entry(f, false)));
-    out
-}
-
-/// Whether `path`'s extension matches the collection-file filter (case
-/// insensitive `.hurl`/`.json`) — always `true` when the filter is off.
+/// Whether `path`'s extension marks it as a file the Workspace tree shows: a
+/// collection (`.hurl`/`.json`) or a PaperTrail report (`.trail`) — always
+/// `true` when the filter is off. Reports are surfaced so a workspace can hold
+/// (and run) reports alongside the collections they drive; the tree classifies
+/// them by extension (see [`is_report_file`]).
 fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
     if !filter_hurl_json {
         return true;
     }
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => ext.eq_ignore_ascii_case("hurl") || ext.eq_ignore_ascii_case("json"),
+        Some(ext) => {
+            ext.eq_ignore_ascii_case("hurl")
+                || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("trail")
+        }
         None => false,
     }
+}
+
+/// Whether `path` is a PaperTrail report (`.trail`, case-insensitive). The
+/// Workspace tree uses this to tell a report file apart from a collection file
+/// (both are surfaced by [`is_matching_file`]), so selecting one opens the
+/// report view rather than trying to parse it as a collection.
+pub fn is_report_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("trail"))
 }
 
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any

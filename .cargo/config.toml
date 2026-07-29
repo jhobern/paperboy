@@ -1,5 +1,0 @@
-# Point pkg-config at the project-local libcurl.pc that wraps the system
-# libcurl.so.4 (no -dev package / .pc is installed in this environment).
-# Default system pkg-config dirs are still searched, so openssl etc. resolve.
-[env]
-PKG_CONFIG_PATH = ".curl/pkgconfig"

@@ -6,6 +6,9 @@
 //! into the typed structs below, every field optional/defaulted so partial
 //! exports still import and anything unmodelled is ignored.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
@@ -24,6 +27,23 @@ struct Item {
     name: String,
     item: Option<Vec<Item>>,
     request: Option<Request>,
+    /// Pre-request / test scripts. Only `test` scripts are mined for
+    /// `pm.<store>.set(...)` capture calls (see [`captures_from_events`]).
+    event: Vec<Event>,
+}
+
+/// A Postman `event` — a `prerequest` or `test` script attached to an item.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Event {
+    listen: String,
+    script: Script,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Script {
+    exec: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -117,9 +137,9 @@ fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 }
 
 impl Param {
-    /// A `{key, value}` pair, unless the entry is disabled or keyless.
-    fn enabled_kv(&self) -> Option<(String, String)> {
-        (!self.disabled && !self.key.is_empty()).then(|| (self.key.clone(), self.value.clone()))
+    /// A `{key, value}` pair, unless the entry is  keyless.
+    fn enabled_kve(&self) -> Option<(String, String, bool)> {
+        (!self.key.is_empty()).then(|| (self.key.clone(), self.value.clone(), !self.disabled))
     }
 
     /// A form field — text, or a `File` using `src` as its path — unless the
@@ -135,6 +155,7 @@ impl Param {
                 kind: FormFieldKind::File,
                 content_type: self.content_type.clone(),
                 base64_prefix: None,
+                enabled: true,
             }
         } else {
             FormField {
@@ -143,6 +164,7 @@ impl Param {
                 kind: FormFieldKind::Text,
                 content_type: None,
                 base64_prefix: None,
+                enabled: true,
             }
         })
     }
@@ -196,14 +218,14 @@ fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) 
             } else {
                 format!("{}/{}", path.join("/"), it.name)
             };
-            out.push(map_request(&title, req));
+            out.push(map_request(&title, req, &it.event));
         }
     }
 }
 
-fn map_request(name: &str, req: &Request) -> HurlEntry {
-    let mut headers: Vec<(String, String)> =
-        req.header.iter().filter_map(Param::enabled_kv).collect();
+fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
+    let mut headers: Vec<(String, String, bool)> =
+        req.header.iter().filter_map(Param::enabled_kve).collect();
 
     // Auth → basic_auth, or a `Bearer` Authorization header for bearer tokens.
     let mut basic_auth = None;
@@ -219,7 +241,7 @@ fn map_request(name: &str, req: &Request) -> HurlEntry {
             "bearer" => {
                 let t = Auth::field(&auth.bearer, "token");
                 if !t.is_empty() {
-                    headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+                    headers.push(("Authorization".to_string(), format!("Bearer {t}"), true));
                 }
             }
             _ => {}
@@ -244,7 +266,121 @@ fn map_request(name: &str, req: &Request) -> HurlEntry {
     let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
+    // Captured variables from the request's `test` script (#24). A request that
+    // gets captures serializes with a `HTTP *` line automatically; one with none
+    // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
+    // parse error, so we don't emit an unsolicited wildcard line).
+    entry.captures = captures_from_events(events);
     entry
+}
+
+// `var/let/const X = pm.response.json()` — `X` is the parsed-body variable
+// whose accessor chains map to jsonpaths.
+static JSON_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:var|let|const)\s+(\w+)\s*=\s*pm\.response\.json\s*\(\s*\)").unwrap()
+});
+
+// `pm.<store>.set("NAME", <value>)` for the variable stores Postman exposes.
+static SET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"pm\.(?:environment|collectionVariables|globals|variables)\.set\(\s*['"]([^'"]+)['"]\s*,\s*([^)]+)\)"#,
+    )
+    .unwrap()
+});
+
+/// Best-effort scrape of a request's `test` scripts into `[Captures]`: each
+/// `pm.<store>.set("NAME", body['a']['b'])` (or `body.a.b`) call where `body`
+/// is the `pm.response.json()` variable becomes `NAME = jsonpath "$.a.b"`.
+/// Calls that don't reduce to a plain accessor chain are skipped rather than
+/// failing the import.
+fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
+    let script = events
+        .iter()
+        .filter(|e| e.listen == "test")
+        .flat_map(|e| e.script.exec.iter())
+        .map(|l| l.trim_end_matches('\r'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if script.is_empty() {
+        return Vec::new();
+    }
+    // Response-body variable name(s); default to the near-universal `jsonData`
+    // when the script assigns the body to nothing we recognise.
+    let mut roots: Vec<String> = JSON_VAR_RE
+        .captures_iter(&script)
+        .map(|c| c[1].to_string())
+        .collect();
+    if roots.is_empty() {
+        roots.push("jsonData".to_string());
+    }
+    SET_RE
+        .captures_iter(&script)
+        .filter_map(|c| {
+            let path = accessor_to_jsonpath(c[2].trim(), &roots)?;
+            Some((c[1].to_string(), format!("jsonpath \"{path}\"")))
+        })
+        .collect()
+}
+
+/// Convert a JS accessor chain rooted at one of `roots`
+/// (`body['a'].b["c"][0]`) into a jsonpath (`$.a.b.c[0]`). Returns `None` for
+/// anything past a simple `.ident` / `['key']` / `[n]` chain (a method call,
+/// arithmetic, …), so an unparseable capture is dropped instead of guessed.
+fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
+    let mut s = roots.iter().find_map(|r| {
+        expr.strip_prefix(r.as_str())
+            .filter(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+    })?;
+    let mut path = String::from("$");
+    while !s.is_empty() {
+        if let Some(rest) = s.strip_prefix('.') {
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            push_key(&mut path, &rest[..end]);
+            s = &rest[end..];
+        } else {
+            let rest = s.strip_prefix('[')?;
+            let close = rest.find(']')?;
+            let key = rest[..close].trim();
+            if let Some(k) = unquote(key) {
+                push_key(&mut path, k);
+            } else if !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit()) {
+                path.push_str(&format!("[{key}]"));
+            } else {
+                return None;
+            }
+            s = &rest[close + 1..];
+        }
+    }
+    Some(path)
+}
+
+/// Append a jsonpath key: a plain identifier as `.name`, anything else bracket-
+/// quoted (`['a-b']`) so the path stays valid.
+fn push_key(path: &mut String, key: &str) {
+    let simple = !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if simple {
+        path.push('.');
+        path.push_str(key);
+    } else {
+        path.push_str(&format!("['{key}']"));
+    }
+}
+
+/// Strip matching single or double quotes, returning the inner text.
+fn unquote(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -293,7 +429,14 @@ mod tests {
         assert_eq!(e[0].url, "{{url}}/login?next=1");
         assert_eq!(
             e[0].headers,
-            vec![("Content-Type".to_string(), "application/json".to_string())]
+            vec![
+                (
+                    "Content-Type".to_string(),
+                    "application/json".to_string(),
+                    true
+                ),
+                ("X-Off".to_string(), "no".to_string(), false),
+            ]
         );
         assert_eq!(e[0].body.as_deref(), Some("{\"u\":\"a\"}"));
 
@@ -307,6 +450,7 @@ mod tests {
                     kind: FormFieldKind::Text,
                     content_type: None,
                     base64_prefix: None,
+                    enabled: true
                 },
                 FormField {
                     key: "f".into(),
@@ -314,6 +458,7 @@ mod tests {
                     kind: FormFieldKind::File,
                     content_type: None,
                     base64_prefix: None,
+                    enabled: true
                 },
             ],
             "text and file form-data fields are both imported"
@@ -328,10 +473,11 @@ mod tests {
         }}]}"#;
         let e = import_postman(json);
         assert_eq!(e.len(), 1);
-        assert!(
-            e[0].headers
-                .contains(&("Authorization".to_string(), "Bearer {{tok}}".to_string()))
-        );
+        assert!(e[0].headers.contains(&(
+            "Authorization".to_string(),
+            "Bearer {{tok}}".to_string(),
+            true
+        )));
     }
 
     #[test]
@@ -399,5 +545,69 @@ mod tests {
             .collect();
         assert_eq!(keys, ["doc", "file", "back"]);
         assert_eq!(entries[0].form_fields[2].value, "/tmp/a.png");
+    }
+
+    #[test]
+    fn accessor_chains_become_jsonpaths() {
+        let roots = vec!["jsonData".to_string()];
+        let p = |e: &str| accessor_to_jsonpath(e, &roots);
+        assert_eq!(p("jsonData['token']").as_deref(), Some("$.token"));
+        assert_eq!(p("jsonData[\"token\"]").as_deref(), Some("$.token"));
+        assert_eq!(p("jsonData.a.b").as_deref(), Some("$.a.b"));
+        assert_eq!(p("jsonData['a']['b']").as_deref(), Some("$.a.b"));
+        assert_eq!(p("jsonData.items[0].id").as_deref(), Some("$.items[0].id"));
+        assert_eq!(p("jsonData['a-b']").as_deref(), Some("$['a-b']"));
+        // A bare root (unlikely) and anything past a plain accessor chain
+        // (method call, arithmetic) is dropped rather than mis-parsed.
+        assert_eq!(p("jsonData").as_deref(), Some("$"));
+        assert_eq!(p("jsonData.foo()"), None);
+        assert_eq!(p("other['x']"), None);
+    }
+
+    #[test]
+    fn test_script_set_calls_become_captures_with_wildcard_status() {
+        let json = r#"{
+          "info": {},
+          "item": [
+            { "name": "login", "request": { "method": "POST", "url": "{{url}}/login" },
+              "event": [
+                { "listen": "test", "script": { "exec": [
+                    "var jsonData = pm.response.json();\r",
+                    "pm.environment.set(\"token\", jsonData['token']);",
+                    "pm.collectionVariables.set(\"sid\", jsonData.session.id);"
+                ]}}
+              ]
+            }
+          ]
+        }"#;
+        let e = import_postman(json);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].captures,
+            vec![
+                ("token".to_string(), "jsonpath \"$.token\"".to_string()),
+                ("sid".to_string(), "jsonpath \"$.session.id\"".to_string()),
+            ]
+        );
+        // A request that gained captures serializes with a `HTTP *` line (so
+        // the [Captures] section parses); the capture rows follow it.
+        let text = e[0].to_hurl();
+        assert!(text.contains("HTTP *"), "wildcard status expected:\n{text}");
+        assert!(text.contains("token: jsonpath \"$.token\""));
+    }
+
+    #[test]
+    fn imported_request_without_captures_stays_bare() {
+        let json =
+            r#"{"info":{},"item":[{"name":"x","request":{"method":"GET","url":"{{u}}/a"}}]}"#;
+        let e = import_postman(json);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].captures.is_empty());
+        // No captures/asserts → no unsolicited `HTTP *`; hand-adding a section
+        // later surfaces a clear "add an HTTP line" parse error instead.
+        assert!(
+            !e[0].to_hurl().contains("HTTP"),
+            "a capture-less import has no response line"
+        );
     }
 }

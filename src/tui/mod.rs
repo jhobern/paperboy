@@ -9,8 +9,12 @@ mod draw;
 mod editor;
 mod git_save;
 mod input;
+mod line_editor;
 mod new_request;
 pub(crate) mod remote;
+mod report_highlight;
+mod report_nodes;
+mod reports;
 mod selection;
 #[cfg(test)]
 mod tests;
@@ -62,6 +66,9 @@ pub fn run() -> io::Result<()> {
         app.poll_git_save_updates();
         // Apply completed "Run All" (Alt+F5) results (captures + pass/fail markers).
         app.poll_batch_run_updates();
+        // Apply a finished background report run (non-blocking; the app stayed
+        // responsive while it ran).
+        app.poll_report_run_updates();
         match event::poll(Duration::from_millis(120)) {
             Ok(true) => {
                 // Terminal (column, row) bounds to clamp every incoming
@@ -154,7 +161,7 @@ pub fn run() -> io::Result<()> {
         // even when the mouse itself isn't moving (no new Drag event to
         // drive it) — ticked once per idle loop iteration, roughly every
         // 120ms while nothing else arrives.
-        if app.pending_autoscroll.is_some() {
+        if app.has_pending_autoscroll() {
             app.autoscroll_tick();
         }
         if app.quit {

@@ -44,8 +44,17 @@ pub struct EntryOutcome {
     pub headers: Vec<(String, String)>,
     /// Response body, pretty-printed when it parses as JSON.
     pub body: String,
+    /// The response body exactly as received (never reformatted), so a report
+    /// can render `RESPONSE RAW` without losing the server's original bytes
+    /// (whitespace, key order, non-JSON payloads). `body` is the pretty view of
+    /// this same content.
+    pub raw_body: String,
     pub asserts: Vec<AssertOutcome>,
     pub captures: Vec<(String, String)>,
+    /// Effective duration of the HTTP transfer(s) for this entry, in
+    /// milliseconds (excludes assert/capture processing). Reports surface this
+    /// as the per-request "Time" column.
+    pub duration_ms: u64,
     /// `true` when the runner reported no errors for this entry (status
     /// expectation, asserts and transport all satisfied).
     pub ok: bool,
@@ -225,7 +234,7 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         .last()
         .map(|c| (c.request.method.clone(), c.request.url.to_string()))
         .unwrap_or_default();
-    let (status, headers, body) = match e.calls.last() {
+    let (status, headers, body, raw_body) = match e.calls.last() {
         Some(call) => {
             let r = &call.response;
             let hdrs = r
@@ -233,18 +242,46 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
                 .iter()
                 .map(|h| (h.name.clone(), h.value.clone()))
                 .collect();
-            let raw = String::from_utf8_lossy(&r.body).to_string();
+            // Decompress by `Content-Encoding` first: when a request sends its
+            // own `Accept-Encoding` header, libcurl won't auto-decode, so
+            // `r.body` is still the compressed bytes. `uncompress_body` honours
+            // the header (and no-ops when absent); fall back to the raw bytes if
+            // the stream is malformed.
+            let bytes = r.uncompress_body().unwrap_or_else(|_| r.body.clone());
+            let raw = String::from_utf8_lossy(&bytes).to_string();
             let body = serde_json::from_str::<JsonValue>(&raw)
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.clone()))
-                .unwrap_or(raw);
-            (r.status as u16, hdrs, body)
+                .unwrap_or_else(|_| raw.clone());
+            (r.status as u16, hdrs, body, raw)
         }
-        None => (0, Vec::new(), String::new()),
+        None => (0, Vec::new(), String::new(), String::new()),
     };
 
-    // Only surface EXPLICIT [Asserts]; the implicit version/status asserts
-    // come from the `HTTP <status>` line and are reflected in the status.
+    // Only surface EXPLICIT [Asserts] plus the implicit status assertion; the
+    // implicit HTTP-version assert stays folded into the status/version line.
     let mut asserts = Vec::new();
+    // Surface the implicit HTTP status assertion (the `HTTP <code>` response
+    // line) as a leading `status == <code>` row, so the response's [Asserts]
+    // view shows the status check alongside the explicit asserts — Hurl treats
+    // the status line as an assertion too. `HTTP *` / no status line produces
+    // no `ImplicitStatus`, so nothing is shown in that case.
+    for a in &e.asserts {
+        if let AssertResult::ImplicitStatus {
+            actual, expected, ..
+        } = a
+        {
+            let failed = a.to_runner_error().is_some();
+            asserts.push(AssertOutcome {
+                expr: format!("status == {expected}"),
+                passed: !failed,
+                detail: if failed {
+                    format!("got {actual}")
+                } else {
+                    String::new()
+                },
+            });
+        }
+    }
     for a in &e.asserts {
         if !matches!(a, AssertResult::Explicit { .. }) {
             continue;
@@ -268,9 +305,32 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         .map(|c| (c.name.clone(), c.value.to_string()))
         .collect();
 
-    // The first error (transport failure, status mismatch or failed assert)
-    // is surfaced per-entry and, for the whole run, on the status bar.
-    let entry_error = e.errors.first().map(|er| render_error(er, lines));
+    // A failed status assertion gets a clear "expected X but got Y" message
+    // (with the request that produced it) rather than the runner's terse
+    // "Assert status code: HTTP 200", which hides both the expected and the
+    // actual status. Other errors (transport, failed explicit asserts) keep
+    // their concise per-line rendering.
+    let status_mismatch = e.asserts.iter().find_map(|a| match a {
+        AssertResult::ImplicitStatus {
+            actual, expected, ..
+        } if a.to_runner_error().is_some() => Some((*actual, *expected)),
+        _ => None,
+    });
+    let entry_error = if let Some((actual, expected)) = status_mismatch {
+        let reason = reason(actual as u16);
+        let actual_txt = if reason.is_empty() {
+            format!("{actual}")
+        } else {
+            format!("{actual} {reason}")
+        };
+        Some(format!(
+            "Expected status {expected} but got {actual_txt} ({method} {url})"
+        ))
+    } else {
+        // The first error (transport failure or failed assert) is surfaced
+        // per-entry and, for the whole run, on the status bar.
+        e.errors.first().map(|er| render_error(er, lines))
+    };
 
     (
         EntryOutcome {
@@ -280,8 +340,10 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
             status_text: reason(status).to_string(),
             headers,
             body,
+            raw_body,
             asserts,
             captures,
+            duration_ms: e.transfer_duration.as_millis() as u64,
             ok: e.errors.is_empty(),
             error: entry_error.clone(),
         },
@@ -334,6 +396,146 @@ fn reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn a one-shot HTTP/1.1 server on an ephemeral port that answers the
+    /// first connection with `status`/`reason` and a tiny JSON body, then
+    /// closes. Returns the bound port. Used to exercise the status-assertion
+    /// mapping against a real (local) response without any network access.
+    fn one_shot_server(status: u16, reason: &str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reason = reason.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// Feature: the implicit `HTTP <code>` status line surfaces in the mapped
+    /// asserts as a `status == <code>` row (so the response's [Asserts] view
+    /// shows the status check), and passes when the status matches.
+    #[test]
+    fn status_line_appears_as_a_passing_assert() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(e.ok, "entry should pass, error: {:?}", e.error);
+        let status_assert = e
+            .asserts
+            .iter()
+            .find(|a| a.expr == "status == 200")
+            .expect("a `status == 200` assert row");
+        assert!(status_assert.passed);
+    }
+
+    /// Spawn a one-shot server that answers with a gzip-compressed body and a
+    /// `Content-Encoding: gzip` header (but no `Content-Length`, closing the
+    /// connection to signal end-of-body). Mirrors a server honouring a request's
+    /// own `Accept-Encoding` header — the case libcurl leaves un-decoded.
+    fn one_shot_gzip_server(gzip_body: &'static [u8]) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head);
+                let _ = sock.write_all(gzip_body);
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// Feature: a gzip response is decompressed for display. When a server
+    /// returns `Content-Encoding: gzip` (as it does for a request that sends its
+    /// own `Accept-Encoding`), libcurl doesn't auto-decode, so the mapping must
+    /// uncompress the body itself — otherwise the raw compressed bytes would be
+    /// shown (the garbled-output bug).
+    #[test]
+    fn gzip_response_body_is_decompressed() {
+        // gzip of `{"ok":true}` (mtime=0 for a stable literal).
+        static GZIP_OK: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let port = one_shot_gzip_server(GZIP_OK);
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(e.ok, "entry should pass, error: {:?}", e.error);
+        // raw_body is the exact decompressed bytes; body is its pretty JSON view.
+        assert_eq!(e.raw_body, "{\"ok\":true}");
+        assert!(
+            e.body.contains("\"ok\": true"),
+            "body should be decompressed pretty JSON, got: {:?}",
+            e.body
+        );
+    }
+
+    /// Feature: a failed status assertion is both surfaced as a failed
+    /// `status == <expected>` assert row (with the actual status in its
+    /// detail) and rendered as a clear "expected X but got Y" error message
+    /// naming the request — not the runner's terse "Assert status code".
+    #[test]
+    fn failed_status_assertion_has_a_clear_message() {
+        let port = one_shot_server(404, "Not Found");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(!e.ok);
+        let status_assert = e
+            .asserts
+            .iter()
+            .find(|a| a.expr == "status == 200")
+            .expect("a `status == 200` assert row");
+        assert!(!status_assert.passed);
+        assert!(
+            status_assert.detail.contains("404"),
+            "detail should show the actual status, got: {}",
+            status_assert.detail
+        );
+        let msg = e.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("Expected status 200") && msg.contains("got 404"),
+            "message should state expected vs actual, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Assert status code"),
+            "message should not be the terse runner default, got: {msg}"
+        );
+    }
+
+    /// A `HTTP *` wildcard status line asserts nothing about the status, so no
+    /// synthetic `status == …` row is produced.
+    #[test]
+    fn wildcard_status_line_produces_no_status_assert() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP *\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        assert!(
+            !e.asserts.iter().any(|a| a.expr.starts_with("status ==")),
+            "HTTP * should not synthesize a status assert"
+        );
+    }
 
     /// A `[Multipart]` file field referenced by a path relative to the
     /// collection's own directory must be authorized when `file_root` is

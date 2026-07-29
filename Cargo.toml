@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -9,16 +9,40 @@ license = "MIT"
 
 
 [dependencies]
-tui-panel-select = "0.1"
+tui-panel-select = "0.1.5"
 tui-rgb-picker = "0.1"
-tui-line-editor = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps JSON object key order when we pretty-print a response
+# body (serde_json otherwise sorts keys). Reports must never silently reorder /
+# lose information about a response, so pretty output stays faithful to the wire.
+serde_json = { version = "1", features = ["preserve_order"] }
 hurl = "~8.0"
 hurl_core = "~8.0"
+# libcurl reaches the tree transitively via `hurl` -> `curl` -> `curl-sys`. We
+# depend on `curl` directly only to enable `static-curl`/`static-ssl`, which make
+# curl-sys compile and statically link vendored libcurl + OpenSSL from source
+# (via `cc`/`perl`). That removes any need for a system libcurl `-dev` package or
+# pkg-config `.pc` (this environment ships neither), so the build is
+# self-contained and reproducible rather than relying on a hand-written pkg-config
+# shim. Cargo feature-unifies onto the same `curl` crate `hurl` already uses.
+curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
 base64 = "0.22"
 ratatui = "0.30.2"
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui-explorer = "0.3.0"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+# Local-time formatting for the report name `{time}` token. `Local` reads the
+# system timezone via libc (robust in our multithreaded runner, unlike the
+# `time` crate's local-offset guard). Already in the tree via `hurl`.
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+] }
+# Pure-Rust `.xlsx` writer for report output (no C toolchain needed — its zlib
+# is the Rust `zlib-rs`), so it builds cleanly in this libcurl-`-dev`-less
+# environment. `default-features = false` drops the optional chrono/serde/polars
+# integrations we don't use, keeping the dependency tree small.
+anyhow = "1"
+rust_xlsxwriter = { version = "0.96.0", default-features = false }
+nom = "7.0"

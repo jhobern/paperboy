@@ -48,6 +48,10 @@ pub(crate) enum GitSaveSource {
         root: PathBuf,
         filter: WorkspaceGitFilter,
     },
+    /// A PaperTrail `.trail` document. Pushes the report's source text to the
+    /// chosen path; `report_idx` identifies which report tab to repin on
+    /// success (its git origin is updated in place, like a collection's).
+    Report { report_idx: usize },
 }
 
 /// Whether the user is targeting a branch or a tag.
@@ -263,6 +267,47 @@ impl GitSaveWizard {
     }
 }
 
+impl GitSaveWizard {
+    /// Build a wizard for saving PaperTrail report `report_idx` back to the git
+    /// remote it came from, seeded from the report's remembered [`GitOrigin`].
+    /// Like a collection, the report has a single per-file path to choose (its
+    /// `.trail`) but — unlike a collection — never an accompanying `.vars`, so
+    /// the environment step is skipped. Panics if the report has no
+    /// `git_origin` (callers gate "Save to Git" on that).
+    pub(crate) fn new_report(report_idx: usize, report: &crate::report::Report) -> Self {
+        let origin = report
+            .git_origin
+            .clone()
+            .expect("git-save requires a report git_origin");
+        let target_name = match origin.ref_kind {
+            RefKind::Branch => origin.ref_name.clone(),
+            RefKind::Tag => String::new(),
+        };
+        let target_intent = match origin.ref_kind {
+            RefKind::Branch => TargetIntent::ExistingBranch,
+            RefKind::Tag => TargetIntent::NewRef,
+        };
+        Self {
+            ci: 0,
+            url: Editor::new(&origin.repo_url, false),
+            token: Editor::blank(),
+            has_env: false,
+            env: None,
+            include_env: false,
+            collection_path: Editor::new(&origin.path, false),
+            env_path: Editor::blank(),
+            target_kind: GitSaveTarget::Branch,
+            target_name: Editor::new(&target_name, false),
+            target_intent,
+            commit_msg: Editor::new(&format!("Update {} via PaperBoy", report.name), false),
+            origin_gitref: origin.gitref(),
+            source: GitSaveSource::Report { report_idx },
+            stage: GitSaveStage::Connect { field: 0 },
+            rx: None,
+        }
+    }
+}
+
 pub(crate) fn spawn_git_save_refs(url: String, token: Option<String>) -> Receiver<GitSaveMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -400,7 +445,11 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
             let rows = Layout::vertical(constraints).split(inner);
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    s.git_save_collection_path_label,
+                    if matches!(w.source, GitSaveSource::Report { .. }) {
+                        s.git_save_report_path_label
+                    } else {
+                        s.git_save_collection_path_label
+                    },
                     Style::default().fg(th.accent),
                 )),
                 rows[0],

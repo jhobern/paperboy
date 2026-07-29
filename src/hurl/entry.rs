@@ -45,6 +45,7 @@ pub struct FormField {
     pub content_type: Option<String>,
     #[serde(default)]
     pub base64_prefix: Option<String>,
+    pub enabled: bool,
 }
 
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
@@ -66,6 +67,56 @@ fn escape_form_file_path(path: &str) -> String {
         }
     }
     out
+}
+
+/// Append `line` to `out` as its own line, commenting it out with a leading
+/// `# ` when the row is disabled. Disabled request rows are round-tripped as
+/// comments (Hurl ignores them at run time) so the enabled flag survives a
+/// save/reload; [`parse_hurl`](super::parse_hurl) restores a commented row
+/// that still looks like a real request line as a disabled entry.
+fn push_line(out: &mut String, line: &str, enabled: bool) {
+    if !enabled {
+        out.push_str("# ");
+    }
+    out.push_str(line);
+    out.push('\n');
+}
+
+/// Append one `key: value` request-section row to `out` (see [`push_line`] for
+/// the disabled-row handling). Shared by the Header, Cookies and Query
+/// sections, which are otherwise identical.
+fn push_kv_line(out: &mut String, k: &str, v: &str, enabled: bool) {
+    push_line(out, &format!("{k}: {v}"), enabled);
+}
+
+/// The Hurl source for one `[Form]`/`[Multipart]` field line (without the
+/// trailing newline or any disabled-row `# ` prefix). Split out so an enabled
+/// row and the commented form of a disabled row share one code path.
+fn form_field_line(f: &FormField) -> String {
+    match f.kind {
+        FormFieldKind::Text => format!("{}: {}", f.key, f.value),
+        FormFieldKind::File => {
+            let path = escape_form_file_path(&f.value);
+            match f.content_type.as_deref().map(str::trim) {
+                Some(ct) if !ct.is_empty() => format!("{}: file,{}; {}", f.key, path, ct),
+                _ => format!("{}: file,{};", f.key, path),
+            }
+        }
+        // A Base64File is transformed into a plain Text field before an actual
+        // request runs (see `expand_base64_form_fields`); this branch only runs
+        // when serializing for *saving* to disk. Encode it as a file line whose
+        // content-type carries a PaperBoy marker plus the URL-safe-base64
+        // encoded prefix, so parsing restores the Base64File kind and its prefix.
+        FormFieldKind::Base64File => {
+            let path = escape_form_file_path(&f.value);
+            let encoded_prefix =
+                URL_SAFE_NO_PAD.encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
+            format!(
+                "{}: file,{}; {}{}",
+                f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
+            )
+        }
+    }
 }
 
 /// Outcome of the most recent "Run All" (Alt+F5) pass over this entry's
@@ -92,7 +143,7 @@ pub struct HurlEntry {
     pub title: String,
     pub method: String,
     pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, String, bool)>,
     pub basic_auth: Option<(String, String)>,
     /// `[Form]` (all `Text`) or `[Multipart]` (any `File`) fields, chosen
     /// automatically by [`to_hurl`](HurlEntry::to_hurl). `#[serde(default)]`
@@ -102,11 +153,11 @@ pub struct HurlEntry {
     pub form_fields: Vec<FormField>,
     #[serde(default)]
     pub is_multipart: bool,
-    pub query_params: Vec<(String, String)>,
+    pub queries: Vec<(String, String, bool)>,
     /// `[Cookies]` `(name, value)` pairs — syntactic sugar over a `Cookie:`
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
-    pub cookies: Vec<(String, String)>,
+    pub cookies: Vec<(String, String, bool)>,
     pub body: Option<String>,
     pub expected_status: Option<u16>,
     /// (variable_name, query_expression) pairs, e.g. `("token", "jsonpath \"$.token\"")`.
@@ -116,6 +167,15 @@ pub struct HurlEntry {
     /// requests (which had no asserts field) loadable.
     #[serde(default)]
     pub asserts: Vec<String>,
+    /// PaperBoy-specific per-request report-field definitions: `(name, query)`
+    /// pairs, each a Hurl query (same grammar as `[Captures]`) evaluated against
+    /// the response to populate a report column. Stored inside valid Hurl as a
+    /// `# [Reports]` comment block (a literal `[Reports]` response section is a
+    /// non-recoverable `hurl_core` parse error), recovered by the line-scanning
+    /// parser — the same comment-encoding used for titles and disabled rows.
+    /// `#[serde(default)]` keeps older saved requests loadable.
+    #[serde(default)]
+    pub reports: Vec<(String, String)>,
     /// `true` when the user created this request by hand in a collection other
     /// than the Scratch Space. UI-only and never written to `.hurl` files (which
     /// use the manual [`to_hurl`](HurlEntry::to_hurl) serializer); persisted in
@@ -144,19 +204,19 @@ pub struct HurlEntry {
 
 impl HurlEntry {
     /// Build an entry from user-entered form fields. `headers` is a list of
-    /// `(key, value)` pairs; pairs with an empty key are skipped. An empty
+    /// `(key, value, enabled)` triples; triples with an false enabled are skipped. An empty
     /// `body` becomes `None`.
     pub fn from_fields(
         name: &str,
         method: &str,
         url: &str,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, String, bool)>,
         body: &str,
     ) -> Self {
         let headers = headers
             .into_iter()
-            .filter(|(k, _)| !k.trim().is_empty())
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, _, _)| !k.trim().is_empty())
+            .map(|(k, v, e)| (k.trim().to_string(), v.trim().to_string(), e))
             .collect();
         let body = if body.trim().is_empty() {
             None
@@ -197,10 +257,10 @@ impl HurlEntry {
         let has_content_length = self
             .headers
             .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+            .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"));
         if carries_body && !has_body && !has_content_length && !has_forms {
             self.headers
-                .push(("Content-Length".to_string(), "0".to_string()));
+                .push(("Content-Length".to_string(), "0".to_string(), true));
         }
     }
 
@@ -222,8 +282,8 @@ impl HurlEntry {
             self.method.as_str()
         };
         out.push_str(&format!("{method} {}\n", self.url));
-        for (k, v) in &self.headers {
-            out.push_str(&format!("{k}: {v}\n"));
+        for (k, v, enabled) in &self.headers {
+            push_kv_line(&mut out, k, v, *enabled);
         }
         if let Some(body) = &self.body {
             out.push_str(body);
@@ -236,66 +296,48 @@ impl HurlEntry {
         }
         if !self.cookies.is_empty() {
             out.push_str("[Cookies]\n");
-            for (k, v) in &self.cookies {
-                out.push_str(&format!("{k}: {v}\n"));
+            for (k, v, enabled) in &self.cookies {
+                push_kv_line(&mut out, k, v, *enabled);
             }
         }
-        if !self.query_params.is_empty() {
+        if !self.queries.is_empty() {
             out.push_str("[Query]\n");
-            for (k, v) in &self.query_params {
-                out.push_str(&format!("{k}: {v}\n"));
+            for (k, v, enabled) in &self.queries {
+                push_kv_line(&mut out, k, v, *enabled);
             }
         }
         if !self.form_fields.is_empty() {
-            // Any File field switches the whole section to `[Multipart]`
+            // Any enabled File field switches the whole section to `[Multipart]`
             // (Hurl's `[Form]` section is text-only); a Base64File also
             // serializes as a `file,...` line (carrying its marker), so it
             // forces `[Multipart]` too. Plain Text-only fields stay `[Form]`.
-            let multipart =
-                self.form_fields.iter().any(|f| f.kind.is_multipart()) || self.is_multipart;
+            // Only *enabled* fields drive this choice: a disabled row is a
+            // comment and never reaches the wire, so it must not flip an
+            // otherwise-`[Form]` request onto the multipart code path.
+            let multipart = self
+                .form_fields
+                .iter()
+                .any(|f| f.enabled && f.kind.is_multipart())
+                || self.is_multipart;
             out.push_str(if multipart {
                 "[Multipart]\n"
             } else {
                 "[Form]\n"
             });
             for f in &self.form_fields {
-                match f.kind {
-                    FormFieldKind::Text => out.push_str(&format!("{}: {}\n", f.key, f.value)),
-                    FormFieldKind::File => {
-                        let path = escape_form_file_path(&f.value);
-                        match f.content_type.as_deref().map(str::trim) {
-                            Some(ct) if !ct.is_empty() => {
-                                out.push_str(&format!("{}: file,{}; {}\n", f.key, path, ct));
-                            }
-                            _ => out.push_str(&format!("{}: file,{};\n", f.key, path)),
-                        }
-                    }
-                    // A Base64File is transformed into a plain Text field
-                    // before an actual request runs (see
-                    // `expand_base64_form_fields`); this branch only runs when
-                    // serializing for *saving* to disk. Encode it as a file
-                    // line whose content-type carries a PaperBoy marker plus
-                    // the URL-safe-base64 encoded prefix, so parsing restores
-                    // the Base64File kind and its prefix.
-                    FormFieldKind::Base64File => {
-                        let path = escape_form_file_path(&f.value);
-                        let encoded_prefix = URL_SAFE_NO_PAD
-                            .encode(f.base64_prefix.as_deref().unwrap_or("").as_bytes());
-                        out.push_str(&format!(
-                            "{}: file,{}; {}{}\n",
-                            f.key, path, BASE64_FILE_CT_MARKER, encoded_prefix
-                        ));
-                    }
-                }
+                push_line(&mut out, &form_field_line(f), f.enabled);
             }
         }
         // The response section (delimited by the `HTTP <status>` line) is only
         // needed to carry asserts/captures; use the wildcard `HTTP *` (any
         // status, per the Hurl spec) when no explicit status was set so those
         // sections still round-trip through parsing instead of being dropped.
+        // A `# [Reports]` block also lives in the response area, so emit the
+        // wildcard when reports are the only response-side metadata too.
         if let Some(status) = self.expected_status {
             out.push_str(&format!("HTTP {status}\n"));
-        } else if !self.asserts.is_empty() || !self.captures.is_empty() {
+        } else if !self.asserts.is_empty() || !self.captures.is_empty() || !self.reports.is_empty()
+        {
             out.push_str("HTTP *\n");
         }
         if !self.asserts.is_empty() {
@@ -309,6 +351,16 @@ impl HurlEntry {
             out.push_str("[Captures]\n");
             for (name, expr) in &self.captures {
                 out.push_str(&format!("{name}: {expr}\n"));
+            }
+        }
+        // Report fields: a comment-encoded pseudo-section. `hurl_core` treats
+        // every line here as a comment and ignores it; the PaperBoy parser
+        // recognises the `# [Reports]` marker and scans the `# name: query`
+        // rows back into `reports`. Reads like a real `[Reports]` section.
+        if !self.reports.is_empty() {
+            out.push_str("# [Reports]\n");
+            for (name, query) in &self.reports {
+                out.push_str(&format!("# {name}: {query}\n"));
             }
         }
         out
@@ -362,7 +414,7 @@ mod tests {
         assert!(
             e.headers
                 .iter()
-                .any(|(k, v)| k == "Content-Length" && v == "0")
+                .any(|(k, v, _)| k == "Content-Length" && v == "0")
         );
     }
 
@@ -372,7 +424,7 @@ mod tests {
             let mut e = entry(m);
             e.ensure_run_content_length();
             assert!(
-                e.headers.iter().any(|(k, _)| k == "Content-Length"),
+                e.headers.iter().any(|(k, _, _)| k == "Content-Length"),
                 "expected Content-Length for {m}"
             );
         }
@@ -386,7 +438,7 @@ mod tests {
             assert!(
                 !e.headers
                     .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
+                    .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length")),
                 "did not expect Content-Length for {m}"
             );
         }
@@ -400,7 +452,7 @@ mod tests {
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
         );
     }
 
@@ -413,12 +465,13 @@ mod tests {
             kind: FormFieldKind::Text,
             content_type: None,
             base64_prefix: None,
+            enabled: true,
         }];
         e.ensure_run_content_length();
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
         );
     }
 
@@ -426,12 +479,12 @@ mod tests {
     fn a_user_set_content_length_is_not_duplicated() {
         let mut e = entry("POST");
         e.headers
-            .push(("content-length".to_string(), "5".to_string()));
+            .push(("content-length".to_string(), "5".to_string(), true));
         e.ensure_run_content_length();
         let count = e
             .headers
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .filter(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
             .count();
         assert_eq!(count, 1);
     }

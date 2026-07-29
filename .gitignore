@@ -2,3 +2,5 @@
 **/.env*
 **/target/
 .vscode
+# Local-only PaperTrail/report design notes (kept on disk, not tracked upstream)
+docs/reports/

@@ -1,7 +1,9 @@
-//! Re-export of the panel line/wrap cache from the `tui-panel-select` crate.
+//! Re-export of the panel line/wrap cache types from the `tui-panel-select`
+//! crate.
 //!
-//! The implementation lives in that crate so it can be reused across TUI
-//! apps; PaperBoy consumes it here under the original module path so the
-//! rest of the code (and its tests) need no import changes.
+//! The wrap/selection implementation lives in that crate so it can be reused
+//! across TUI apps; PaperBoy now drives it through `MultiSelectPanel`, but
+//! still consumes the `TextPos` coordinate type here under the original
+//! module path so callers need no import changes.
 
-pub(crate) use tui_panel_select::wrapcache::{PanelWrap, TextPos};
+pub(crate) use tui_panel_select::wrapcache::TextPos;

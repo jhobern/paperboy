@@ -18,11 +18,10 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use super::selection;
 use super::theme::*;
-use super::wrapcache::{PanelWrap, TextPos};
+use super::wrapcache::TextPos;
 use std::sync::Arc;
-use tui_panel_select::wrap::wrap_line;
+use tui_panel_select::WrapMarker;
 
 /// Marks a collection/environment title as loaded from git — shown before the
 /// name whenever `Collection::git_origin` / `env_git_origin` is set.
@@ -37,6 +36,78 @@ pub(crate) const LINK_ICON: &str = "\u{1F517}";
 /// that one with emoji-style double-cell width even without a variation
 /// selector, which visually overlaps the very next character.
 pub(crate) const SHADOW_ICON: &str = "!";
+/// The end-of-row marker painted in a reserved rightmost column whenever a
+/// logical line is soft-wrapped by a body panel (Request/Response), so a
+/// wrapped line reads unambiguously as one line rather than several separate
+/// ones. Drawn dim so it never competes with the content. Built per-frame
+/// from the active theme (see `MultiSelectPanel::set_wrap_marker`).
+pub(crate) fn wrap_marker(th: &Theme) -> WrapMarker {
+    WrapMarker {
+        glyph: '↵',
+        style: Style::default().fg(th.dim),
+    }
+}
+
+/// The display width of a single `char`, measured the same way `ratatui`
+/// measures spans (so wide glyphs count as 2). Cheap enough for the capped,
+/// modal previews that call [`wrap_lines_with_marker`].
+fn char_display_width(ch: char) -> usize {
+    Span::raw(ch.to_string()).width().max(1)
+}
+
+/// Soft-wrap already-themed `lines` to `width` columns, appending the dim
+/// [`wrap_marker`] glyph at every break so a wrapped logical line still reads
+/// as one line. This is the manual counterpart of a body panel's wrap marker,
+/// for the plain-`Paragraph` overlays (the report dry-run preview) that render
+/// outside a `MultiSelectPanel` and so don't get the marker for free. Styles
+/// are preserved across breaks; the rightmost column is reserved for the marker
+/// (matching the panels), so content wraps at `width - 1`.
+pub(crate) fn wrap_lines_with_marker(
+    lines: Vec<Line<'static>>,
+    width: u16,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    if width < 2 {
+        return lines;
+    }
+    let limit = width - 1; // reserve the last column for the marker
+    let marker = wrap_marker(th);
+    let marker_glyph = marker.glyph.to_string();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        // Lines that already fit pass straight through unchanged.
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
+        for span in line.spans {
+            let style = span.style;
+            let mut buf = String::new();
+            for ch in span.content.chars() {
+                let cw = char_display_width(ch);
+                if col + cw > limit {
+                    if !buf.is_empty() {
+                        row.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    row.push(Span::styled(marker_glyph.clone(), marker.style));
+                    out.push(Line::from(std::mem::take(&mut row)));
+                    col = 0;
+                }
+                buf.push(ch);
+                col += cw;
+            }
+            if !buf.is_empty() {
+                row.push(Span::styled(buf, style));
+            }
+        }
+        // The final segment is the logical line's true end — no marker.
+        out.push(Line::from(row));
+    }
+    out
+}
 /// Marks a subfolder row in the request list tree, and (in the request
 /// editor's form) hints that a File-kind field's Value opens a file picker
 /// on Enter.
@@ -44,17 +115,45 @@ pub(crate) const FOLDER_ICON: &str = "\u{1F4C1}";
 /// Chevrons on a Workspace collection file row: expanded (requests inlined)
 /// vs collapsed.
 const COLLECTION_OPEN_ICON: &str = "\u{25BE}"; // ▾
-const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
+pub(crate) const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
+/// Marks a PaperTrail report file in the Workspace tree (a document/chart glyph).
+pub(crate) const REPORT_ICON: &str = "\u{1F4CA}"; // 📊
 
 /// A rendered row of the request list, unifying the ordinary title-folder
 /// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
-/// [`draw_collection_left`] can lay both out with one loop. `Entry.indent`
-/// nudges a Workspace request under its collection's file row.
+/// [`draw_collection_left`] can lay both out with one loop.
+///
+/// `WsFolder` is the workspace-specific folder variant (chevron + indented);
+/// `Folder` is the non-workspace virtual-folder variant (folder emoji, flat).
+/// `depth` on workspace rows drives `"  ".repeat(depth)` indentation in the
+/// rendered list.
 enum LeftRow {
     Up,
+    /// Non-workspace virtual folder (title-encoded); always flat, no expand
+    /// state, rendered with FOLDER_ICON.
     Folder(String),
-    Collection { name: String, open: bool },
-    Entry { idx: usize, indent: bool },
+    /// Workspace filesystem folder; indented by `depth * 2` spaces and
+    /// rendered with an expand/collapse chevron.
+    WsFolder {
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Collection {
+        name: String,
+        depth: usize,
+        open: bool,
+    },
+    Report {
+        name: String,
+        depth: usize,
+    },
+    Entry {
+        idx: usize,
+        /// Indentation depth: 0 for non-workspace, collection-depth+1 for
+        /// workspace requests.
+        depth: usize,
+    },
 }
 
 impl LeftRow {
@@ -65,10 +164,21 @@ impl LeftRow {
             col.ws_rows()
                 .into_iter()
                 .map(|r| match r {
-                    WsRow::Up => LeftRow::Up,
-                    WsRow::Folder(name) => LeftRow::Folder(name),
-                    WsRow::Collection { name, open, .. } => LeftRow::Collection { name, open },
-                    WsRow::Request(idx) => LeftRow::Entry { idx, indent: true },
+                    WsRow::Folder {
+                        name,
+                        depth,
+                        expanded,
+                        ..
+                    } => LeftRow::WsFolder {
+                        name,
+                        depth,
+                        expanded,
+                    },
+                    WsRow::Collection {
+                        name, depth, open, ..
+                    } => LeftRow::Collection { name, depth, open },
+                    WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
+                    WsRow::Request { idx, depth } => LeftRow::Entry { idx, depth },
                 })
                 .collect()
         } else {
@@ -77,7 +187,7 @@ impl LeftRow {
                 .map(|r| match r {
                     tree::Row::Up => LeftRow::Up,
                     tree::Row::Folder(name) => LeftRow::Folder(name),
-                    tree::Row::Entry(idx) => LeftRow::Entry { idx, indent: false },
+                    tree::Row::Entry(idx) => LeftRow::Entry { idx, depth: 0 },
                 })
                 .collect()
         }
@@ -110,6 +220,379 @@ pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// Draw the report column-picker overlay: a scrollable checklist of candidate
+/// output columns. The selected row is highlighted; a renamed column shows its
+/// underlying source(s) dimmed after a `←`.
+fn draw_report_columns_overlay(
+    f: &mut Frame,
+    picker: &super::reports::ColumnPicker,
+    s: &Strings,
+    th: &Theme,
+) {
+    let title = format!("{}  ({})", s.report_columns_title, s.report_columns_hint);
+    let n = picker.rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    // Scroll just enough to keep the selected row inside the visible window.
+    let scroll = if picker.selected >= inner_h {
+        picker.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in picker.rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let mark = if row.included { "[x]" } else { "[ ]" };
+        let base = if i == picker.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if row.included {
+            Style::default().fg(th.text)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        let mut spans = vec![Span::styled(format!("{mark} {}", row.header), base)];
+        let src = row.sources.join("|");
+        if src != row.header {
+            spans.push(Span::styled(
+                format!("  ← {src}"),
+                Style::default().fg(th.dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// Draw the reported-request detail form overlay
+/// ([`Overlay::ReportNodeRequest`]): a scrollable form for a `REPORT REQUEST`
+/// node — the response-format toggle and alias field on top, then a checklist
+/// of the fields the request can emit. The selected row is highlighted; ticked
+/// fields are kept, unticked ones are dropped from the node's `SHOW(…)`.
+fn draw_report_node_request_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::RequestForm,
+    s: &Strings,
+    th: &Theme,
+) {
+    use super::report_nodes::FormRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let response_label = match form.response {
+        None => s.report_node_response_default,
+        Some(crate::report::flow::ResponseFmt::Raw) => "RAW",
+        Some(crate::report::flow::ResponseFmt::Pretty) => "PRETTY",
+    };
+    let alias_shown = if form.alias.is_empty() {
+        s.report_node_alias_none
+    } else {
+        form.alias.as_str()
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            FormRow::Name => {
+                let shown = if form.request.is_empty() {
+                    s.report_node_name_none
+                } else {
+                    form.request.as_str()
+                };
+                Line::from(Span::styled(
+                    format!("{}: ‹{}›", s.report_node_name_label, shown),
+                    base,
+                ))
+            }
+            FormRow::Report => {
+                let mark = if form.report { "[x]" } else { "[ ]" };
+                Line::from(Span::styled(
+                    format!("{mark} {}", s.report_node_report_label),
+                    base,
+                ))
+            }
+            FormRow::Response => Line::from(Span::styled(
+                format!("{}: ‹{}›", s.report_node_response_label, response_label),
+                base,
+            )),
+            FormRow::Alias => {
+                let mut text = format!("{}: {}", s.report_node_alias_label, alias_shown);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            FormRow::Field(fi) => {
+                let fr = &form.fields[fi];
+                let mark = if fr.included { "[x]" } else { "[ ]" };
+                let style = if is_sel {
+                    base
+                } else if fr.included {
+                    Style::default().fg(th.text)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                Line::from(Span::styled(format!("{mark} {}", fr.name), style))
+            }
+        };
+        lines.push(line);
+    }
+    // The shortcut hint lives on the bottom border (a dim footer) rather than
+    // crammed into the title, so a long request name no longer truncates it.
+    let block = panel(s.report_node_config_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_request_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// Draw the ENVS-loop configure overlay ([`Overlay::ReportNodeEnvs`]): the loop
+/// variable and Iterate/Compare mode on top, then one row per chosen
+/// environment. In Compare mode each env row shows its `[Baseline]` /
+/// `[Comparison]` role; env names are picked from the loaded environments.
+fn draw_report_node_envs_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::EnvsForm,
+    s: &Strings,
+    th: &Theme,
+) {
+    use super::report_nodes::EnvsRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mode_label = if form.compare {
+        s.report_node_envs_mode_roles
+    } else {
+        s.report_node_envs_mode_plain
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            EnvsRow::Var => {
+                let mut text = format!("{}: {}", s.report_node_envs_var_label, form.var);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            EnvsRow::Mode => Line::from(Span::styled(
+                format!("{}: ‹{}›", s.report_node_envs_mode_label, mode_label),
+                base,
+            )),
+            EnvsRow::Env(ei) => {
+                let entry = &form.entries[ei];
+                let shown = if entry.name.is_empty() {
+                    s.report_node_envs_none
+                } else {
+                    entry.name.as_str()
+                };
+                let text = if form.compare {
+                    let role = if entry.baseline {
+                        s.report_node_envs_baseline
+                    } else {
+                        s.report_node_envs_comparison
+                    };
+                    format!("  [{role}] ‹{shown}›")
+                } else {
+                    format!("  ‹{shown}›")
+                };
+                Line::from(Span::styled(text, base))
+            }
+        };
+        lines.push(line);
+    }
+    let block = panel(s.report_node_envs_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_envs_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
+/// simple selectable list of the open collections, each showing its display
+/// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
+/// re-points the active report's `# collection:` header at it.
+fn draw_report_bind_overlay(
+    f: &mut Frame,
+    picker: &super::reports::ReportBindPicker,
+    s: &Strings,
+    th: &Theme,
+) {
+    let title = format!("{}  ({})", s.report_bind_title, s.report_bind_hint);
+    let n = picker.options.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = if picker.selected >= inner_h {
+        picker.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, opt) in picker.options.iter().enumerate().skip(scroll).take(inner_h) {
+        let base = if i == picker.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let mut spans = vec![Span::styled(opt.name.clone(), base)];
+        let detail = opt
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.report_bind_unsaved.to_string());
+        spans.push(Span::styled(
+            format!("  {detail}"),
+            Style::default().fg(th.dim),
+        ));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// Draw the node editor's insert / request-pick palette
+/// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
+/// adding, request titles when choosing a request name.
+fn draw_report_node_menu_overlay(
+    f: &mut Frame,
+    menu: &super::report_nodes::NodeMenu,
+    s: &Strings,
+    th: &Theme,
+) {
+    let hint = match menu.step {
+        super::report_nodes::NodeMenuStep::PickKind => s.node_menu_hint,
+        super::report_nodes::NodeMenuStep::PickRequest => s.node_pick_request_hint,
+    };
+    let title = format!("{}  ({})", menu.title(s), hint);
+    let n = menu.options.len().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = if menu.selected >= inner_h {
+        menu.selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if menu.options.is_empty() {
+        lines.push(Line::from(Span::styled(
+            s.node_pick_request_none.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    for (i, opt) in menu.options.iter().enumerate().skip(scroll).take(inner_h) {
+        let style = if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        lines.push(Line::from(Span::styled(opt.clone(), style)));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
@@ -158,29 +641,39 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 /// highlight can never bleed into a neighbouring panel or the rest of the
 /// terminal row.
 fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
-    if app.text_selection.is_none() && app.extra_selections.is_empty() {
+    if !app.has_any_selection() {
         return;
     }
-    let buf = f.buffer_mut();
     let style = Style::default().bg(th.select_bg).fg(th.select_fg);
-    for sel in app
-        .extra_selections
-        .iter()
-        .copied()
-        .chain(app.text_selection)
-    {
-        let (area, scroll, wrap) = match sel.pane {
-            Pane::Main => (app.main_text_area, app.main_scroll, app.main_wrap.as_ref()),
-            Pane::Response => (app.resp_text_area, app.resp_scroll, app.resp_wrap.as_ref()),
-            _ => continue,
-        };
-        let Some(wrap) = wrap else { continue };
-        let cells = selection::highlight_cells(sel.anchor, sel.cursor, wrap, area, scroll);
-        for (row, from, to) in cells {
-            for col in from..to {
-                if let Some(cell) = buf.cell_mut((col, row)) {
-                    cell.set_style(style);
-                }
+    // Each panel projects its own logical regions onto the current frame's
+    // screen cells (bounded to its own text area), so a highlight can never
+    // bleed into a neighbouring panel or the rest of the terminal row.
+    let mut cells = app.main_panel.highlight_regions(app.main_text_area);
+    cells.extend(app.resp_panel.highlight_regions(app.resp_text_area));
+    // The full-screen report view has its own three panels (source /
+    // validation / results); paint their selections the same way. Only the
+    // active report tab's panels can be showing, and only the panes drawn this
+    // frame have a non-default area, so this is safe for every tab kind.
+    if let Some(rt) = app.active_report() {
+        use crate::tui::reports::ReportPane;
+        cells.extend(
+            rt.source_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Source.idx()]),
+        );
+        cells.extend(
+            rt.validation_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Validation.idx()]),
+        );
+        cells.extend(
+            rt.results_panel
+                .highlight_regions(app.report_pane_areas[ReportPane::Results.idx()]),
+        );
+    }
+    let buf = f.buffer_mut();
+    for (row, from, to) in cells {
+        for col in from..to {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_style(style);
             }
         }
     }
@@ -196,6 +689,12 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(Span::raw("     "));
         let c = if st.is_ok() { th.ok } else { th.err };
         spans.push(Span::styled(st.text(s), Style::default().fg(c)));
+        // Advertise the copy shortcut so the (mouse-unselectable) status text
+        // can be grabbed — especially useful for long parse-error messages.
+        spans.push(Span::styled(
+            format!("  ({} {})", s.status_copy_key, s.status_copy_hint),
+            Style::default().fg(th.dim),
+        ));
     }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
@@ -216,17 +715,6 @@ pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
         ),
         Span::raw("  "),
         Span::styled(format!("[{lang}]"), Style::default().fg(th.dim)),
-        Span::raw("   "),
-        Span::styled(s.base_url, Style::default().fg(th.text)),
-        Span::raw(" "),
-        Span::styled(
-            app.vars.base_url.clone(),
-            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  (b {})", s.hint_edit_base_url),
-            Style::default().fg(th.dim),
-        ),
     ];
     // Surface the last runner error (transport failure / failed assert / parse
     // error) here on the status bar so it is never silently swallowed.
@@ -262,8 +750,10 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
 }
 
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    let focused = app.focus == Pane::Tabs;
-    let mut spans: Vec<Span> = Vec::new();
+    // A *standalone* report strip tab always keeps focus on its body (the tab
+    // bar is never a focus stop), so its tab-bar highlight is never lit. An
+    // embedded report rides a collection tab, whose Tabs focus works normally.
+    let focused = !app.active_is_strip_report() && app.focus == Pane::Tabs;
     let mk = |label: String, active: bool| -> Span {
         if active {
             Span::styled(
@@ -277,9 +767,18 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             Span::styled(format!(" {label} "), Style::default().fg(th.dim))
         }
     };
+    // Build every tab span up front, tracking the running character offset so
+    // the active tab's position within the full strip is known — that lets the
+    // bar scroll horizontally to keep the active tab visible when the tabs
+    // overflow the available width (otherwise later tabs are unreachable).
+    let mut spans: Vec<Span> = Vec::new();
+    let mut pos = 0usize;
+    let mut active_start = 0usize;
+    let mut active_w = 0usize;
     for (i, col) in app.collections.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("│"));
+            pos += 1;
         }
         // The tab's own name is persistent (renameable with F2) and never
         // changes when the user picks a different collection within a
@@ -290,19 +789,103 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         } else {
             format!("{}{}", tab_icons(col), col.name)
         };
+        let w = name.chars().count() + 2; // " {name} "
+        if app.active_tab == i {
+            active_start = pos;
+            active_w = w;
+        }
         spans.push(mk(name, app.active_tab == i));
+        pos += w;
     }
+    // Standalone report tabs follow the collection tabs in the same strip
+    // (unified index: `collections.len() + strip_slot`). Workspace-embedded
+    // reports aren't in the strip (they ride inside their Workspace collection
+    // tab), so they're skipped here. A leading icon distinguishes report tabs,
+    // and a dirty marker flags unsaved source edits.
+    let report_base = app.collections.len();
+    for (slot, ri) in app.standalone_report_indices().into_iter().enumerate() {
+        let rt = &app.reports[ri];
+        spans.push(Span::raw("│"));
+        pos += 1;
+        // Unsaved edits get a trailing dot (with a leading space so it never
+        // crowds the name); the report icon leads.
+        let marker = if rt.report.dirty {
+            format!(" {}", s.report_dirty_marker)
+        } else {
+            String::new()
+        };
+        let name = format!("{}{}{}", s.report_tab_icon, rt.report.name, marker);
+        let idx = report_base + slot;
+        let w = name.chars().count() + 2;
+        if app.active_tab == idx {
+            active_start = pos;
+            active_w = w;
+        }
+        spans.push(mk(name, app.active_tab == idx));
+        pos += w;
+    }
+    let total_w = pos;
+    // Content width available inside the panel borders.
+    let avail = area.width.saturating_sub(2) as usize;
+
+    let line = if total_w <= avail || avail == 0 {
+        Line::from(spans)
+    } else {
+        // Scroll so the active tab is fully visible. Reserve up to two columns
+        // for the ‹ / › overflow markers when deciding the target window, so
+        // the active tab never hides behind a marker.
+        let target_w = avail.saturating_sub(2).max(1);
+        let mut scroll = 0usize;
+        if active_start + active_w > scroll + target_w {
+            scroll = (active_start + active_w).saturating_sub(target_w);
+        }
+        if active_start < scroll {
+            scroll = active_start;
+        }
+        // Mirror the collection-list URL scroll: a ‹ marks hidden tabs to the
+        // left, a › hidden tabs to the right, each costing one column.
+        let show_left = scroll > 0;
+        let content_w_before_right = avail.saturating_sub(show_left as usize);
+        let remaining = total_w.saturating_sub(scroll);
+        let show_right = remaining > content_w_before_right;
+        let content_w = content_w_before_right.saturating_sub(show_right as usize);
+        let mut out: Vec<Span> = Vec::new();
+        if show_left {
+            out.push(Span::styled("\u{2039}", Style::default().fg(th.accent)));
+        }
+        out.extend(take_display(skip_display(spans, scroll), content_w));
+        if show_right {
+            out.push(Span::styled("\u{203a}", Style::default().fg(th.accent)));
+        }
+        Line::from(out)
+    };
     f.render_widget(
-        Paragraph::new(Line::from(spans)).block(panel(s.tabs_heading.to_string(), focused, th)),
+        Paragraph::new(line).block(panel(s.tabs_heading.to_string(), focused, th)),
         area,
     );
 }
 
 pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &mut TuiApp, s: &Strings, th: &Theme) {
+    // A *standalone* report strip tab takes the whole body (no
+    // list/environment/response panels) — branch before the collection-tab
+    // layout below, which indexes `app.collections[app.active_tab]` and would
+    // panic on a report's unified tab index.
+    if app.active_is_strip_report() {
+        super::reports::draw_report_body(f, area, app, s, th);
+        return;
+    }
+    // Otherwise it's a collection tab: always draw its left column (the request
+    // list / Workspace file-tree). For a Workspace tab showing an *embedded*
+    // report, the right column is the report body; otherwise it's the usual
+    // request editor + response split.
     let cols =
         Layout::horizontal([Constraint::Length(app.list_width), Constraint::Min(10)]).split(area);
     let ci = app.active_tab;
     draw_collection_left(f, cols[0], app, ci, s, th);
+    if let Some(idx) = app.active_report_index() {
+        super::reports::draw_report_content(f, cols[1], app, idx, s, th);
+        return;
+    }
     let right = Layout::vertical([Constraint::Min(4), Constraint::Percentage(app.response_pct)])
         .split(cols[1]);
     draw_collection_main(f, right[0], app, ci, s, th);
@@ -342,12 +925,24 @@ pub(crate) fn draw_collection_left(
     let url_w = panes[0].width.saturating_sub(2 + 2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
-    // Folder/Up/collection rows have no scrollable URL text.
+    // Folder/Up/collection rows have no scrollable URL text. A row that shows a
+    // request's name (title) instead of its URL isn't horizontally scrolled
+    // (names are short display labels), so its scroll length is zero.
     let sel_len = view_rows
         .get(sel)
         .and_then(LeftRow::entry_idx)
         .and_then(|idx| col.entries.get(idx))
-        .map(|e| crate::request::subst_display(&e.url, &smap).chars().count())
+        .map(|e| {
+            if crate::tree::entry_path(&e.title)
+                .pop()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                crate::request::subst_display(&e.url, &smap).chars().count()
+            } else {
+                0
+            }
+        })
         .unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((url_w as usize).saturating_sub(1));
     let hscroll = (app.list_hscroll as usize).min(max_scroll);
@@ -359,22 +954,49 @@ pub(crate) fn draw_collection_left(
                 s.list_up_row.to_string(),
                 Style::default().fg(th.dim),
             ))),
+            // Non-workspace virtual folder (title-encoded); no indentation.
             LeftRow::Folder(name) => ListItem::new(Line::from(Span::styled(
                 format!("{FOLDER_ICON} {name}/"),
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ))),
-            LeftRow::Collection { name, open } => {
+            // Workspace filesystem folder with expand/collapse chevron and
+            // depth-based indentation.
+            LeftRow::WsFolder {
+                name,
+                depth,
+                expanded,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let chevron = if *expanded {
+                    COLLECTION_OPEN_ICON
+                } else {
+                    COLLECTION_CLOSED_ICON
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{chevron} {name}/"),
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                )))
+            }
+            LeftRow::Collection { name, depth, open } => {
+                let indent = "  ".repeat(*depth);
                 let chevron = if *open {
                     COLLECTION_OPEN_ICON
                 } else {
                     COLLECTION_CLOSED_ICON
                 };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{chevron} {name}"),
+                    format!("{indent}{chevron} {name}"),
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 )))
             }
-            LeftRow::Entry { idx, indent } => {
+            LeftRow::Report { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{REPORT_ICON} {name}"),
+                    Style::default().fg(th.accent),
+                )))
+            }
+            LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];
                 // A plus marks a request the user added by hand (in a real
                 // collection); a pencil marks one edited away from its loaded
@@ -386,11 +1008,13 @@ pub(crate) fn draw_collection_left(
                 } else {
                     ("  ", th.text)
                 };
-                // Workspace request rows are indented one level so they read
-                // as children of their collection's file row.
+                // Workspace request rows carry a `depth` that reflects their
+                // position in the tree (collection depth + 1); non-workspace
+                // rows are always depth 0.  Two spaces per level matches the
+                // folder/collection indent above.
                 let mut spans = Vec::new();
-                if *indent {
-                    spans.push(Span::raw("  "));
+                if *depth > 0 {
+                    spans.push(Span::raw("  ".repeat(*depth)));
                 }
                 spans.push(Span::styled(marker, Style::default().fg(marker_fg)));
                 spans.push(Span::styled(
@@ -410,31 +1034,43 @@ pub(crate) fn draw_collection_left(
                     }
                     RunStatus::NotRun => Span::raw("  "),
                 });
-                // The URL, with `{{ VAR }}` substituted + colour-coded by status.
-                let mut seen = SubstSeen::default();
-                let url_spans = highlight_spans(&e.url, &smap, th, &mut seen, None, None);
-                // Horizontally scroll only the selected row so its full (possibly
-                // long) URL can be read with ← / →; other rows show from the start.
-                // Arrow hints appear on whichever side still has hidden text so
-                // it's clear more can be scrolled into view in that direction.
-                if i == sel {
-                    let avail = url_w as usize;
-                    let show_left = hscroll > 0;
-                    let content_w_before_right = avail.saturating_sub(show_left as usize);
-                    let remaining = sel_len.saturating_sub(hscroll);
-                    let show_right = remaining > content_w_before_right;
-                    let content_w = content_w_before_right.saturating_sub(show_right as usize);
-                    if show_left {
-                        spans.push(Span::styled("\u{2039}", Style::default().fg(th.dim))); // ‹ = scrolled
-                    }
-                    spans.extend(take_display(skip_display(url_spans, hscroll), content_w));
-                    if show_right {
-                        spans.push(Span::styled("\u{203a}", Style::default().fg(th.dim))); // › = more to the right
-                    }
+                // Show the request's name when it has one; otherwise fall back
+                // to the URL. A title encodes a folder path (`Auth/Login`), and
+                // those folders are already rows in the tree, so only the leaf
+                // segment (the request's own name within its folder) is shown
+                // here — never the redundant folder prefix.
+                let name = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                if !name.is_empty() {
+                    spans.push(Span::styled(name, Style::default().fg(th.text)));
+                    ListItem::new(Line::from(spans))
                 } else {
-                    spans.extend(url_spans);
+                    // The URL, with `{{ VAR }}` substituted + colour-coded by status.
+                    let mut seen = SubstSeen::default();
+                    let url_spans = highlight_spans(&e.url, &smap, th, &mut seen, None, None);
+                    // Horizontally scroll only the selected row so its full (possibly
+                    // long) URL can be read with ← / →; other rows show from the start.
+                    // Arrow hints appear on whichever side still has hidden text so
+                    // it's clear more can be scrolled into view in that direction.
+                    if i == sel {
+                        let avail = url_w as usize;
+                        let show_left = hscroll > 0;
+                        let content_w_before_right = avail.saturating_sub(show_left as usize);
+                        let remaining = sel_len.saturating_sub(hscroll);
+                        let show_right = remaining > content_w_before_right;
+                        let content_w = content_w_before_right.saturating_sub(show_right as usize);
+                        if show_left {
+                            spans.push(Span::styled("\u{2039}", Style::default().fg(th.dim))); // ‹ = scrolled
+                        }
+                        spans.extend(take_display(skip_display(url_spans, hscroll), content_w));
+                        if show_right {
+                            spans.push(Span::styled("\u{203a}", Style::default().fg(th.dim)));
+                            // › = more to the right
+                        }
+                    } else {
+                        spans.extend(url_spans);
+                    }
+                    ListItem::new(Line::from(spans))
                 }
-                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -468,11 +1104,11 @@ pub(crate) fn draw_collection_left(
         };
         format!("{}{}", tab_icons(col), display_name)
     };
-    if col.is_workspace() {
-        if !col.workspace_browse.is_empty() {
-            title = format!("{title} › {}", col.workspace_browse.join(" › "));
-        }
-    } else if !col.folder.is_empty() {
+    // Non-workspace tabs show the current in-collection folder path as a
+    // breadcrumb (the title-encoded virtual folder from `col.folder`).
+    // Workspace tabs use a real expand/collapse tree — there is no single
+    // "current folder" to display, so the breadcrumb is omitted there.
+    if !col.is_workspace() && !col.folder.is_empty() {
         title = format!("{title} › {}", col.folder.join(" › "));
     }
     // A collection linked to a Global Environment shows that environment's
@@ -584,8 +1220,9 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .global_env_idx
         .min(app.global_envs.len().saturating_sub(1));
     // Columns available for the name text (after the border, highlight
-    // symbol and the active-marker column); used to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2);
+    // symbol, the leftmost pencil column and the active-marker column); used
+    // to clamp scrolling.
+    let text_w = area.width.saturating_sub(2 + 2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
     let sel_len = app
         .global_envs
@@ -610,12 +1247,25 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             let name_color = if is_active { th.ok } else { th.text };
             let selected = i == sel;
             let mark_fg = if selected { th.bg } else { marker_fg };
+            // A pencil in the leftmost column flags an environment with unsaved
+            // (added or modified) variables — placed left of the name so it
+            // matches the Requests list's modified/added marker convention
+            // (and stays put rather than trailing a scrolling name).
+            let (pencil, pencil_fg) = if app.changed_env_count(env.id) > 0 {
+                ("\u{270e} ", th.accent)
+            } else {
+                ("  ", th.dim)
+            };
+            let pencil_fg = if selected { th.bg } else { pencil_fg };
             let git_prefix = if env.git_origin.is_some() {
                 format!("{GIT_ICON} ")
             } else {
                 String::new()
             };
-            let mut spans = vec![Span::styled(marker, Style::default().fg(mark_fg))];
+            let mut spans = vec![
+                Span::styled(pencil, Style::default().fg(pencil_fg)),
+                Span::styled(marker, Style::default().fg(mark_fg)),
+            ];
             let full = format!("{git_prefix}{}", env.name);
             if selected {
                 // Same truncate-with-arrow-hints convention as the Requests
@@ -1029,14 +1679,28 @@ pub(crate) fn help_section_divider(title: &str, width: usize, th: &Theme) -> Lin
 /// continuation line is indented so it lines up under the description
 /// column instead of wrapping back to column 0.
 pub(crate) fn help_entry_lines(shortcut: &str, desc: &str, width: usize) -> Vec<Line<'static>> {
-    const KEY_COL: usize = 17;
-    let indent = shortcut.chars().count().max(KEY_COL) + 1;
+    help_entry_lines_col(shortcut, desc, 17, width)
+}
+
+/// Like [`help_entry_lines`] but with a caller-supplied key-column width. A
+/// group of entries whose left-hand sides are longer than the default 17-column
+/// shortcut layout (e.g. the report grammar, `REPORT REQUEST NAME [AS COL]`)
+/// can pass its *own* widest key so every description in that group still lines
+/// up in one column instead of each row's description starting wherever its key
+/// happens to end.
+pub(crate) fn help_entry_lines_col(
+    key: &str,
+    desc: &str,
+    key_col: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = key.chars().count().max(key_col) + 1;
     let desc_width = width.saturating_sub(indent).max(1);
     let wrapped = word_wrap(desc, desc_width);
     let mut out = Vec::with_capacity(wrapped.len().max(1));
     for (i, chunk) in wrapped.iter().enumerate() {
         if i == 0 {
-            out.push(Line::raw(format!("{shortcut:<KEY_COL$} {chunk}")));
+            out.push(Line::raw(format!("{key:<key_col$} {chunk}")));
         } else {
             out.push(Line::raw(format!("{:indent$}{chunk}", "")));
         }
@@ -1114,9 +1778,11 @@ pub(crate) fn draw_collection_main(
 
     if app.collections[ci].entries.is_empty() {
         app.main_max_scroll = 0;
-        app.main_scroll = 0;
+        app.main_panel
+            .set_content(Arc::from(""), inner.width.max(1) as usize);
+        app.main_panel.clear();
+        app.main_panel.set_scroll(0);
         app.main_text_area = Rect::default();
-        app.main_wrap = None;
         app.main_shadow_icon_positions.clear();
         app.main_scrollbar_area = Rect::default();
         f.render_widget(
@@ -1136,6 +1802,7 @@ pub(crate) fn draw_collection_main(
     let url = entry.url.clone();
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
+    let expected_status = entry.expected_status;
     // The Hurl view always renders (it's actual Hurl syntax, not JSON, so the
     // "invalid JSON" check below is meaningless for it and skipped entirely).
     let (buf, valid) = if hurl_view {
@@ -1191,7 +1858,7 @@ pub(crate) fn draw_collection_main(
     // `TuiApp::main_shadow_icon_positions`) rather than corrupting a pasted
     // request with a stray "!".
     let mut shadow_positions: std::collections::HashSet<TextPos> = std::collections::HashSet::new();
-    let body_lines: Vec<Line> = buf
+    let mut body_lines: Vec<Line> = buf
         .lines()
         .enumerate()
         .map(|(li, l)| {
@@ -1203,29 +1870,21 @@ pub(crate) fn draw_collection_main(
             Line::from(spans)
         })
         .collect();
-    // The plain text `body_lines` actually renders — i.e. `buf` with every
-    // resolved `{{ VAR }}` already substituted in, exactly like the user
-    // sees on screen — rather than `buf` itself, which still has the raw
-    // `{{ VAR }}` moustache syntax. This (not `buf`) is what backs the
-    // panel's scroll geometry, mouse-selection extraction, and the
-    // whole-panel copy fallback, so a copied/selected value always matches
-    // what's visually shown instead of the underlying template.
-    let mut display_text: String = body_lines
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|sp| sp.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // `buf.lines()` (used to build `body_lines` above) drops a trailing
-    // newline just like `str::lines()` always does, so restore it here —
-    // otherwise a whole-panel copy of Hurl text would silently lose the
-    // trailing newline the raw buffer actually had.
+    // `body_lines` is what the panel actually renders — i.e. `buf` with every
+    // resolved `{{ VAR }}` already substituted in, exactly like the user sees
+    // on screen — rather than `buf` itself, which still has the raw
+    // `{{ VAR }}` moustache syntax. The panel derives its plain text from
+    // these lines (joined by `\n`), which is what backs its scroll geometry,
+    // mouse-selection extraction, and the whole-panel copy fallback, so a
+    // copied/selected value always matches what's visually shown instead of
+    // the underlying template.
+    //
+    // `buf.lines()` drops a trailing newline just like `str::lines()` always
+    // does, so re-add it as an empty trailing line — otherwise a whole-panel
+    // copy of Hurl text would silently lose the trailing newline the raw
+    // buffer actually had (and its geometry would be one row short).
     if buf.ends_with('\n') {
-        display_text.push('\n');
+        body_lines.push(Line::from(""));
     }
     top_lines.push(if valid {
         Line::styled(
@@ -1283,11 +1942,21 @@ pub(crate) fn draw_collection_main(
             ]));
         }
     }
-    if !asserts.is_empty() {
+    if !asserts.is_empty() || expected_status.is_some() {
         top_lines.push(Line::styled(
             "[Asserts]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
+        // Surface the `HTTP <code>` response line (stored separately as
+        // `expected_status`) as a synthesized `status == <code>` assert row so
+        // the status check reads as one of the asserts, matching how Hurl
+        // evaluates it.
+        if let Some(code) = expected_status {
+            top_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("status == {code}"), Style::default().fg(th.dim)),
+            ]));
+        }
         for a in &asserts {
             top_lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -1312,37 +1981,19 @@ pub(crate) fn draw_collection_main(
     // Clamp scrolling so the user can't scroll past the last line into blank space.
     let text_area = split[1];
     let width = text_area.width as usize;
-    // Request bodies (JSON or Hurl text) are realistically small, so
-    // rebuilding this cache fresh every frame (rather than reusing it across
-    // frames the way the Response panel does) is cheap and sidesteps having
-    // to separately invalidate it when `dvars`/highlighting-relevant state
-    // changes instead of just the buffer text itself.
-    let wrap = PanelWrap::build(Arc::from(display_text.as_str()), width);
-    let total_lines = wrap.total_rows().min(u16::MAX as u32) as u16;
-    let max_scroll = total_lines.saturating_sub(text_area.height);
+    // Push the styled body into the panel (rebuilt fresh every frame — the
+    // content is always small). The end-of-row wrap marker makes a soft wrap
+    // read unambiguously as one logical line rather than several. The panel
+    // wraps only the visible window internally, so scrolling/dragging stays
+    // responsive even for a large body.
+    app.main_panel.set_wrap_marker(Some(wrap_marker(th)));
+    app.main_panel.set_styled_content(&body_lines, width);
+    let total_lines = app.main_panel.total_rows().min(u16::MAX as u32) as u16;
+    let max_scroll = app.main_panel.clamp_scroll(text_area.height);
     app.main_max_scroll = max_scroll;
-    app.main_scroll = app.main_scroll.min(max_scroll);
-    let scroll = app.main_scroll;
-
-    // Only the visible window's raw lines are re-highlighted/wrapped — this
-    // keeps dragging a selection or scrolling responsive even for a large body.
-    let start = wrap.row_col_to_textpos(scroll as u32, 0);
-    let row_in_start_line = start.col.checked_div(width).unwrap_or(0);
+    let scroll = app.main_panel.scroll();
     let height = text_area.height as usize;
-    let mut visible_wrapped: Vec<Line<'static>> = Vec::with_capacity(height);
-    'outer: for (idx, line) in body_lines.iter().enumerate().skip(start.line) {
-        let skip = if idx == start.line {
-            row_in_start_line
-        } else {
-            0
-        };
-        for row in wrap_line(line.clone(), width).into_iter().skip(skip) {
-            visible_wrapped.push(row);
-            if visible_wrapped.len() >= height {
-                break 'outer;
-            }
-        }
-    }
+    let visible_wrapped = app.main_panel.visible_rows(text_area.height);
 
     // Overlay a scrollbar on the panel's right border (not stealing an inner
     // text column) whenever the body has more wrapped rows than fit, so it's
@@ -1368,10 +2019,9 @@ pub(crate) fn draw_collection_main(
         app.main_scrollbar_area = Rect::default();
     }
 
-    // Cache the wrap/geometry so mouse selection can map coordinates back to
-    // real, copyable text — scoped to this panel's own Rect only.
+    // Record the panel's Rect and shadow-icon positions so mouse selection can
+    // map coordinates back to real, copyable text — scoped to this panel only.
     app.main_text_area = text_area;
-    app.main_wrap = Some(wrap);
     app.main_shadow_icon_positions = shadow_positions;
 
     f.render_widget(
@@ -1419,7 +2069,10 @@ pub(crate) fn draw_response(
     if loading {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        app.resp_panel
+            .set_content(Arc::from(""), area.width.max(1) as usize);
+        app.resp_panel.clear();
+        app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -1431,14 +2084,20 @@ pub(crate) fn draw_response(
         return;
     }
     if !error.is_empty() {
-        app.resp_max_scroll = 0;
-        app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        // Render the runner error *through* the selectable response panel (not
+        // a plain Paragraph) so it can be mouse-selected and `y`-copied like any
+        // response body — the red fg is applied as the paragraph's fallback
+        // style, and the panel still owns wrapping/scrolling for long errors.
+        let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+        app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
+        app.resp_panel
+            .set_content(content, inner.width.max(1) as usize);
+        app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
         app.resp_scrollbar_area = Rect::default();
+        let visible_wrapped = app.resp_panel.visible_rows(inner.height);
+        app.resp_text_area = inner;
         f.render_widget(
-            Paragraph::new(format!("{} {error}", s.req_error_prefix))
-                .style(Style::default().fg(th.err))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
             inner,
         );
         return;
@@ -1446,7 +2105,10 @@ pub(crate) fn draw_response(
     if status == 0 {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
-        app.resp_wrap = None;
+        app.resp_panel
+            .set_content(Arc::from(""), area.width.max(1) as usize);
+        app.resp_panel.clear();
+        app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -1523,22 +2185,23 @@ pub(crate) fn draw_response(
     }
 
     // Wrap long lines to the body width and clamp scrolling so the user can't
-    // scroll past the last line into blank space. The wrap/line structure is
-    // cached (`PanelWrap::rebuild_if_needed`) and reused across frames as
-    // long as `body`'s identity and the panel width haven't changed, and even
-    // a rebuild only wraps the rows actually on screen — this is what keeps
-    // dragging a selection or scrolling responsive regardless of how large
-    // an "obscenely large" response body is.
+    // scroll past the last line into blank space. The panel caches the
+    // wrap/line structure (`set_content` → `rebuild_if_needed`) and reuses it
+    // across frames as long as `body`'s identity and the panel width haven't
+    // changed, and even a rebuild only wraps the rows actually on screen —
+    // this is what keeps dragging a selection or scrolling responsive
+    // regardless of how large an "obscenely large" response body is. The
+    // end-of-row wrap marker makes a soft wrap read as one logical line.
     let body_area = rows[2];
     let width = body_area.width as usize;
-    PanelWrap::rebuild_if_needed(&mut app.resp_wrap, &body, width);
-    let wrap = app.resp_wrap.as_ref().expect("just rebuilt above");
-    let total_lines = wrap.total_rows().min(u16::MAX as u32) as u16;
-    let max_scroll = total_lines.saturating_sub(body_area.height);
+    app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
+    app.resp_panel.set_content(body.clone(), width);
+    let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
+    let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
-    app.resp_scroll = app.resp_scroll.min(max_scroll);
+    let scroll = app.resp_panel.scroll();
 
-    let visible_wrapped = wrap.visible_window(app.resp_scroll, body_area.height);
+    let visible_wrapped = app.resp_panel.visible_rows(body_area.height);
 
     // Overlay a scrollbar on the panel's right border (not stealing an inner
     // text column, and safely outside `resp_text_area` so it can never be
@@ -1556,7 +2219,7 @@ pub(crate) fn draw_response(
             bar_area,
             total_lines as usize,
             body_area.height as usize,
-            app.resp_scroll as usize,
+            scroll as usize,
             th,
         );
         app.resp_scrollbar_area = bar_area;
@@ -1607,7 +2270,56 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, ca
     );
 }
 
+/// Render the report-export format strip (`CSV JSON HTML XLSX`) into `row`,
+/// highlighting the format that matches `filename`'s extension (an unknown or
+/// absent extension highlights CSV, the writer's fallback). Cycled with ↑/↓
+/// while the filename field is focused — see `cycle_browser_export_format`.
+fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &Strings, th: &Theme) {
+    use crate::report::writer::OUTPUT_EXTENSIONS;
+    let cur = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let known = cur
+        .as_deref()
+        .map(|c| OUTPUT_EXTENSIONS.contains(&c))
+        .unwrap_or(false);
+    let mut spans = vec![Span::styled(
+        format!(" {}  ", s.report_export_format_hint),
+        Style::default().fg(th.dim),
+    )];
+    for ext in OUTPUT_EXTENSIONS {
+        let active = cur.as_deref() == Some(ext) || (!known && ext == "csv");
+        let style = if active {
+            Style::default()
+                .bg(th.accent)
+                .fg(th.bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        spans.push(Span::styled(format!(" {} ", ext.to_uppercase()), style));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+        row,
+    );
+}
+
 pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Theme) {
+    // `ReportCellPopup` needs a mutable borrow of its `MultiSelectPanel` to
+    // update scroll/content each frame, so it is handled before the immutable
+    // `as_ref()` match below.
+    if let Some(Overlay::ReportCellPopup {
+        title,
+        content,
+        panel,
+    }) = app.overlay.as_mut()
+    {
+        super::reports::draw_result_cell_popup_overlay(f, title, content, panel, s, th);
+        return;
+    }
     match app.overlay.as_ref().unwrap() {
         Overlay::FileMenu(sel) => {
             let items = file_menu_items(s);
@@ -1618,8 +2330,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             draw_menu_popup(f, s.file_load_menu, &items, *sel, th);
         }
         Overlay::FileSaveMenu(sel) => {
-            let items = file_save_items(s);
-            draw_menu_popup(f, s.file_save_menu, &items, *sel, th);
+            let items = app.file_save_items();
+            let labels: Vec<&str> = items.iter().map(|it| it.label(s)).collect();
+            draw_menu_popup(f, s.file_save_menu, &labels, *sel, th);
         }
         Overlay::FileLoadSource(kind, sel) => {
             let items = file_load_source_items(s);
@@ -1633,37 +2346,47 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::Options(sel) => {
             let items = [
-                s.language_label,
-                s.theme_menu,
-                s.preferences_menu,
-                s.clear_all,
+                s.settings_item_language,
+                s.settings_item_theme,
+                s.settings_item_preferences,
+                s.settings_item_clear,
             ];
             draw_menu_popup(f, s.options_menu, &items, *sel, th);
         }
         Overlay::Preferences(sel) => {
             let mark = |b: bool| if b { "[x]" } else { "[ ]" };
-            let exit_item = format!("{} {}", mark(app.confirm_on_exit), s.confirm_on_exit);
-            let clear_item = format!("{} {}", mark(app.confirm_on_clear), s.confirm_on_clear);
+            let exit_item = format!("{} {}", mark(app.confirm_on_exit), s.pref_item_confirm_exit);
+            let clear_item = format!(
+                "{} {}",
+                mark(app.confirm_on_clear),
+                s.pref_item_confirm_clear
+            );
             let delete_env_item = format!(
                 "{} {}",
                 mark(app.confirm_on_delete_env),
-                s.confirm_on_delete_env
+                s.pref_item_confirm_delete_env
             );
             let view_label = match app.default_request_view {
                 request::RequestView::Json => "JSON",
                 request::RequestView::Hurl => "Hurl",
             };
-            let view_item = format!("{}: {view_label}", s.default_request_view_label);
+            let view_item = format!("{}: {view_label}", s.pref_item_default_view);
             let always_save_item = format!(
                 "{} {}",
                 mark(app.always_save_when_prompted),
-                s.always_save_when_prompted
+                s.pref_item_always_save
+            );
+            let run_all_batch_item = format!(
+                "{} {}",
+                mark(app.run_all_batch_mode),
+                s.pref_item_run_all_batch
             );
             let items = [
                 exit_item.as_str(),
                 clear_item.as_str(),
                 delete_env_item.as_str(),
                 always_save_item.as_str(),
+                run_all_batch_item.as_str(),
                 view_item.as_str(),
             ];
             draw_menu_popup(f, s.preferences_menu, &items, *sel, th);
@@ -1690,6 +2413,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .unwrap_or(0)
                         .to_string(),
                 ),
+                ConfirmAction::Save(FileAction::SaveReport) => s.confirm_save_report_q.to_string(),
                 ConfirmAction::Save(_) => s.confirm_save_collection_q.replace(
                     "{r}",
                     &app.changed_request_count(app.active_tab).to_string(),
@@ -1707,6 +2431,34 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::RevertRequest(ci, ei) => {
+                    let name = app
+                        .collections
+                        .get(*ci)
+                        .and_then(|c| c.entries.get(*ei))
+                        .map(|e| {
+                            let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                            if leaf.is_empty() { e.url.clone() } else { leaf }
+                        })
+                        .unwrap_or_default();
+                    s.confirm_revert_request_q.replace("{r}", &name)
+                }
+                ConfirmAction::RevertEnv(env_id) => {
+                    let (name, n) = app
+                        .global_envs
+                        .iter()
+                        .find(|e| e.id == *env_id)
+                        .map(|e| {
+                            (
+                                e.name.clone(),
+                                e.vars.iter().filter(|v| v.user_added || v.modified).count(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    s.confirm_revert_env_q
+                        .replace("{e}", &name)
+                        .replace("{n}", &n.to_string())
+                }
             };
             draw_confirm_popup(f, &question, &[s.confirm_yes, s.confirm_no], *sel, th);
         }
@@ -1754,6 +2506,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             Style::default().fg(th.dim)
                         },
                     ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!(" {} ", s.help_tab_reports),
+                        if active == 2 {
+                            Style::default()
+                                .bg(th.accent)
+                                .fg(th.bg)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th.dim)
+                        },
+                    ),
                     Span::raw("   "),
                     Span::styled(s.help_tab_switch_hint, Style::default().fg(th.dim)),
                 ])
@@ -1764,7 +2528,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // Glossary tab's two-heading layout) instead of one long
                 // flat list — new users found the un-grouped list hard to
                 // scan for the shortcut they needed.
-                let groups: [(&str, &[(&str, &str)]); 7] = [
+                let groups: [(&str, &[(&str, &str)]); 8] = [
                     (
                         s.help_group_navigation,
                         &[
@@ -1801,6 +2565,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+J", s.help_raw_json),
                             ("b", s.help_base_url),
                             ("u (List pane)", s.help_restore_request),
+                            ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
                         ],
@@ -1819,6 +2584,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_environments,
                         &[
                             ("r (Env popup)", s.help_reload_var),
+                            ("^r (Env popup)", s.help_revert_env),
                             ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
                             ("x", s.help_env_delete),
@@ -1834,6 +2600,27 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("y", s.help_copy_selection),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
+                        ],
+                    ),
+                    (
+                        s.help_group_reports,
+                        &[
+                            ("Shift+R", s.help_report_new),
+                            ("e (report)", s.help_report_edit),
+                            ("Enter (report)", s.help_report_nodes),
+                            ("r / F5 (report)", s.help_report_run),
+                            ("d (report)", s.help_report_dry_run),
+                            ("v (report)", s.help_report_view),
+                            ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
+                            ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
+                            ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
+                            ("x (report)", s.help_report_export),
+                            ("B (report)", s.help_report_baseline),
+                            ("c (report)", s.help_report_columns),
+                            ("b (report)", s.help_report_bind),
+                            ("Esc (report)", s.help_report_leave_edit),
+                            ("Ctrl+←/→ (report)", s.help_report_word_move),
+                            ("→ (report)", s.help_report_complete),
                         ],
                     ),
                     (
@@ -1958,6 +2745,93 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 body
             };
 
+            let reports_body = || {
+                // Render one titled group whose descriptions all align to that
+                // group's own widest key (so long grammar left-hand sides don't
+                // shove their descriptions out of line with the short ones).
+                let group = |body: &mut Vec<Line<'static>>,
+                             heading: &'static str,
+                             entries: &[(&'static str, &'static str)]| {
+                    body.push(help_section_divider(heading, inner_w, th));
+                    let key_col = entries
+                        .iter()
+                        .map(|(k, _)| k.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .clamp(6, 34);
+                    for &(code, desc) in entries {
+                        body.extend(help_entry_lines_col(code, desc, key_col, inner_w));
+                    }
+                };
+
+                let mut body = vec![help_section_divider(
+                    s.help_reports_about_heading,
+                    inner_w,
+                    th,
+                )];
+                for para in [s.help_reports_about_1, s.help_reports_about_2] {
+                    body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
+                    body.push(Line::raw(""));
+                }
+
+                group(
+                    &mut body,
+                    s.help_reports_shortcuts_heading,
+                    &[
+                        ("Shift+R", s.help_report_new),
+                        ("e", s.help_report_edit),
+                        ("Enter", s.help_report_nodes),
+                        ("r / F5", s.help_report_run),
+                        ("d", s.help_report_dry_run),
+                        ("v", s.help_report_view),
+                        ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
+                        ("Tab / Shift+Tab", s.help_report_focus_cycle),
+                        ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
+                        ("x", s.help_report_export),
+                        ("B", s.help_report_baseline),
+                        ("c", s.help_report_columns),
+                        ("Esc", s.help_report_leave_edit),
+                        ("Ctrl+←/→", s.help_report_word_move),
+                        ("→", s.help_report_complete),
+                    ],
+                );
+                body.push(Line::raw(""));
+                group(
+                    &mut body,
+                    s.help_reports_grammar_heading,
+                    &[
+                        ("# collection: PATH", s.help_grammar_collection),
+                        ("# name: TEXT / TEXT_{time}", s.help_grammar_name),
+                        ("# environment: NAME", s.help_grammar_environment),
+                        ("KEY = value", s.help_grammar_assign),
+                        ("REQUEST NAME", s.help_grammar_request),
+                        ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
+                        ("REPORT REQUEST NAME SHOW(a, b)", s.help_grammar_show),
+                        ("Result", s.help_grammar_result),
+                        ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
+                    ],
+                );
+                body.push(Line::raw(""));
+                group(
+                    &mut body,
+                    s.help_reports_loops_heading,
+                    &[
+                        ("FOR VAR IN SRC … END", s.help_grammar_for),
+                        ("FOR (A, B) IN SRC", s.help_grammar_for_tuple),
+                        ("FOR (A, _, ...) IN SRC", s.help_grammar_pattern),
+                        ("LIST NAME = SRC", s.help_grammar_list),
+                        ("[ \"a\", (\"x\",\"y\") ]", s.help_grammar_list_literal),
+                        ("FILES \"dir\" [MATCH \"g\"]", s.help_grammar_files),
+                        ("FOLDERS \"dir\" [WITH r=\"g\"]", s.help_grammar_folders),
+                        ("TUPLES FROM \"data.csv\"", s.help_grammar_tuples),
+                        ("ZIP(a, b, …)", s.help_grammar_zip),
+                        ("CONCAT(a, b, …)", s.help_grammar_concat),
+                        ("ENVS \"au\", \"eu\"", s.help_grammar_envs),
+                    ],
+                );
+                body
+            };
+
             let mut lines = vec![
                 Line::styled(
                     s.help_heading,
@@ -1965,36 +2839,35 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 ),
                 tab_bar(*tab),
             ];
-            lines.extend(if *tab == 0 {
-                shortcuts_body()
-            } else {
-                glossary_body()
+            lines.extend(match *tab {
+                0 => shortcuts_body(),
+                1 => glossary_body(),
+                _ => reports_body(),
             });
 
-            // Both tabs share one fixed height (the taller of the two,
-            // measured with the *other* tab's body too) so switching tabs
-            // doesn't resize the popup out from under the user — a stable
-            // box makes the tab strip read as one steady window rather than
-            // a jarring resize on every switch. `centered_rect` further caps
-            // this to the terminal's own height on small terminals, in which
-            // case the body is scrolled (Up/Down) with a scrollbar on the
-            // right border rather than clipping off the bottom silently.
-            let other_len = 2 + if *tab == 0 {
-                glossary_body().len()
-            } else {
-                shortcuts_body().len()
-            };
-            let content_len = lines.len().max(other_len);
+            // All three tabs share one fixed height (the tallest body) so
+            // switching tabs doesn't resize the popup out from under the user
+            // — a stable box makes the tab strip read as one steady window
+            // rather than a jarring resize on every switch. `centered_rect`
+            // further caps this to the terminal's own height on small
+            // terminals, in which case the body is scrolled (Up/Down) with a
+            // scrollbar on the right border rather than clipping off the
+            // bottom silently.
+            let content_len = lines
+                .len()
+                .max(2 + shortcuts_body().len())
+                .max(2 + glossary_body().len())
+                .max(2 + reports_body().len());
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
             let title = format!(
                 "{} — {}",
                 s.help_title,
-                if *tab == 0 {
-                    s.help_tab_shortcuts
-                } else {
-                    s.help_tab_glossary
+                match *tab {
+                    0 => s.help_tab_shortcuts,
+                    1 => s.help_tab_glossary,
+                    _ => s.help_tab_reports,
                 }
             );
             let visible_rows = area.height.saturating_sub(2) as usize;
@@ -2019,6 +2892,57 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 };
                 draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
             }
+        }
+        Overlay::ReportDryRun(preview) => {
+            let box_w = f.area().width.saturating_sub(6).clamp(48, 96);
+            // Pre-wrap to the inner width with an explicit end-of-line marker
+            // (rather than ratatui's markerless `Wrap`) so long binding/error
+            // lines read unambiguously as single logical lines.
+            let inner_w = box_w.saturating_sub(2);
+            let lines = wrap_lines_with_marker(preview.lines(s, th), inner_w, th);
+            let content_len = lines.len();
+            // Leave room for the border (2) and cap the height to the terminal;
+            // long previews scroll rather than overflowing.
+            let box_h = (content_len as u16 + 2).min(f.area().height.saturating_sub(2));
+            let area = centered_rect(box_w, box_h, f.area());
+            f.render_widget(Clear, area);
+            let title = format!("{}  ({})", s.report_dry_run_title, s.report_dry_run_hint);
+            let visible_rows = area.height.saturating_sub(2) as usize;
+            let max_scroll = content_len.saturating_sub(visible_rows) as u16;
+            if app.dry_run_scroll > max_scroll {
+                app.dry_run_scroll = max_scroll;
+            }
+            let scroll = app.dry_run_scroll;
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(panel(title, true, th))
+                    .scroll((scroll, 0)),
+                area,
+            );
+            if max_scroll > 0 {
+                let bar_area = Rect {
+                    x: area.x + area.width - 1,
+                    y: area.y + 1,
+                    width: 1,
+                    height: visible_rows as u16,
+                };
+                draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
+            }
+        }
+        Overlay::ReportColumns(picker) => {
+            draw_report_columns_overlay(f, picker, s, th);
+        }
+        Overlay::ReportBind(picker) => {
+            draw_report_bind_overlay(f, picker, s, th);
+        }
+        Overlay::ReportNodeMenu(menu) => {
+            draw_report_node_menu_overlay(f, menu, s, th);
+        }
+        Overlay::ReportNodeRequest(form) => {
+            draw_report_node_request_overlay(f, form, s, th);
+        }
+        Overlay::ReportNodeEnvs(form) => {
+            draw_report_node_envs_overlay(f, form, s, th);
         }
         Overlay::Prompt {
             kind,
@@ -2132,12 +3056,64 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 );
             }
         }
-        Overlay::Browser(_action, ex) => {
+        Overlay::Browser(action, ex) => {
             let w = (f.area().width * 7 / 10).max(50);
             let h = (f.area().height * 7 / 10).max(10);
             let area = centered_rect(w, h, f.area());
             f.render_widget(Clear, area);
-            ex.widget().render_ref(area, f.buffer_mut());
+            if action.is_save_to_folder() {
+                // Reserve a bordered filename box at the bottom that the user
+                // can Tab to and press Enter to save into the current folder.
+                // The report-export picker also gets a one-line format strip
+                // above it (CSV/JSON/HTML/XLSX; the active one derived from the
+                // typed extension, cycled with ↑/↓ while the name is focused).
+                let show_formats = *action == FileAction::SaveReportCsvChooseFolder;
+                let rows = if show_formats {
+                    Layout::vertical([
+                        Constraint::Min(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                    ])
+                    .split(area)
+                } else {
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area)
+                };
+                ex.widget().render_ref(rows[0], f.buffer_mut());
+                let name_row = if show_formats { rows[2] } else { rows[1] };
+                if show_formats {
+                    draw_export_format_strip(f, rows[1], &app.browser_name.text(), s, th);
+                }
+                let focused = app.browser_name_focused;
+                let label = if *action == FileAction::SaveWorkspaceChooseFolder {
+                    s.browser_foldername_label
+                } else {
+                    s.browser_filename_label
+                };
+                let title = if focused {
+                    format!("{label}  ({})", s.browser_name_hint)
+                } else {
+                    label.to_string()
+                };
+                // Use the shared themed panel (accent border + bold title when
+                // focused, dim otherwise, panel background) so the field looks
+                // like every other bordered box in the app.
+                let block = panel(title, focused, th);
+                let inner = block.inner(name_row);
+                f.render_widget(block, name_row);
+                if focused {
+                    render_editor(f, inner, &app.browser_name, false, th);
+                } else {
+                    // The folder list owns the cursor while unfocused; render
+                    // the pending name statically (no caret) so it's clear the
+                    // field isn't the active pane.
+                    f.render_widget(
+                        Paragraph::new(app.browser_name.text()).style(Style::default().fg(th.dim)),
+                        inner,
+                    );
+                }
+            } else {
+                ex.widget().render_ref(area, f.buffer_mut());
+            }
         }
         Overlay::NewRequest(form) => draw_new_request(f, form, s, th, app.enhanced_keys),
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th),
@@ -2213,6 +3189,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             ];
             draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th);
         }
+        // Handled by the early-return above — unreachable in practice.
+        Overlay::ReportCellPopup { .. } => unreachable!("ReportCellPopup is drawn above"),
     }
 }
 
@@ -2337,6 +3315,11 @@ pub(crate) fn draw_workspace_picker(
                 ListItem::new(Line::styled(
                     format!("{indent}{FOLDER_ICON} {}/", e.display_name),
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                ))
+            } else if crate::workspace::is_report_file(&e.path) {
+                ListItem::new(Line::styled(
+                    format!("{indent}{REPORT_ICON} {}", e.display_name),
+                    Style::default().fg(th.accent),
                 ))
             } else {
                 ListItem::new(Line::styled(
