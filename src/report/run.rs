@@ -607,8 +607,9 @@ impl<'a> Exec<'a> {
                 alias,
                 response_fmt,
                 show,
+                hide,
                 with,
-            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, show, with),
+            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, show, hide, with),
         }
     }
 
@@ -617,15 +618,25 @@ impl<'a> Exec<'a> {
     /// plus one column per `[Reports]`/`WITH` field, all namespaced by `alias`
     /// (default: the request's leaf name). Columns are emitted in a fixed order
     /// (intrinsics, then `[Reports]` fields, then `WITH` fields) so report output
-    /// is deterministic. A non-empty `show` prunes the emitted columns to just
-    /// the listed field suffixes (in listed order) — the lever for dropping a
-    /// heavy `Response` from the report.
+    /// is deterministic.
+    ///
+    /// Column selection (applied after the full `cells` list is built):
+    /// - A non-empty `show` keeps exactly those suffixes (in listed order) —
+    ///   SHOW takes full precedence, including over the WITH suppression below.
+    /// - Else if any `WITH` field declarations are present (`declared_only`),
+    ///   the 5 intrinsics are suppressed so the report focuses on declared
+    ///   fields. NOTE: a `[Reports]`-only request (no WITH fields) keeps its
+    ///   intrinsics unchanged.
+    /// - Otherwise all columns are kept (the unchanged default).
+    /// - HIDE is then applied in all branches: any field whose suffix is in
+    ///   `hide` is removed from the final output.
     fn eval_report_request(
         &mut self,
         name: &str,
         alias: Option<&str>,
         response_fmt: Option<ResponseFmt>,
         show: &[String],
+        hide: &[String],
         with: &[WithItem],
     ) -> Vec<(String, String)> {
         let alias = alias
@@ -705,11 +716,18 @@ impl<'a> Exec<'a> {
             cells.push((format!("{alias}.{fname}"), value));
         }
 
-        // A `SHOW(...)` selector prunes and reorders the emitted columns to just
-        // the listed field suffixes (matched against the `alias.` namespace).
-        // A listed field that the request never produced is silently skipped
-        // (validation warns about it); this is what drops a heavy `Response`.
+        // Column selection is applied to the fully-built `cells` list.
+        //
+        // `declared_only`: true when this statement has at least one WITH field
+        // declaration (not just a RESPONSE override). When true and SHOW is
+        // absent, the 5 intrinsics are suppressed so the report focuses on the
+        // explicitly declared fields. A `[Reports]`-only request (no WITH fields)
+        // is unaffected — it still emits intrinsics by default.
+        let declared_only = with.iter().any(|w| matches!(w, WithItem::Field { .. }));
+
         if !show.is_empty() {
+            // SHOW takes full precedence: keep exactly the listed suffixes (in
+            // listed order), including any intrinsics explicitly named.
             let mut kept: Vec<(String, String)> = Vec::with_capacity(show.len());
             for field in show {
                 let key = format!("{alias}.{field}");
@@ -718,6 +736,22 @@ impl<'a> Exec<'a> {
                 }
             }
             cells = kept;
+        } else if declared_only {
+            // WITH fields were declared: suppress the 5 intrinsics so they don't
+            // drown out the declared field columns. Identified by matching the
+            // suffix after `alias.` against the known intrinsic names.
+            cells.retain(|(k, _)| {
+                let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
+                !INTRINSIC_FIELDS.contains(&suffix)
+            });
+        }
+
+        // Apply HIDE in all branches: remove any field whose suffix is in `hide`.
+        if !hide.is_empty() {
+            cells.retain(|(k, _)| {
+                let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
+                !hide.iter().any(|h| h == suffix)
+            });
         }
 
         cells
@@ -793,6 +827,7 @@ impl<'a> Exec<'a> {
             EnvClause::Roles {
                 baseline,
                 comparisons,
+                ..
             } => baseline.iter().chain(comparisons).cloned().collect(),
         };
         let mut seed = self.to_state();
@@ -2116,10 +2151,17 @@ mod tests {
         for r in &res.rows {
             assert_eq!(r.target.as_deref(), Some("staging"));
             assert_eq!(r.cells.get("proc.overall"), Some(&"REVIEW".to_string()));
-            assert_eq!(
-                r.cells.get(crate::report::compare::RESULT_COLUMN),
-                Some(&"overall: CLEAR→REVIEW".to_string())
-            );
+            let result_cell = r
+                .cells
+                .get(crate::report::compare::RESULT_COLUMN)
+                .expect("Result column");
+            // Parse the JSON to verify structure.
+            let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+            let obj = parsed.as_object().expect("object");
+            assert!(obj.contains_key("prod (baseline)"));
+            assert!(obj.contains_key("staging"));
+            assert_eq!(obj["prod (baseline)"]["overall"], "CLEAR");
+            assert_eq!(obj["staging"]["overall"], "REVIEW");
         }
         assert_eq!(
             res.column_order.first(),
@@ -2202,9 +2244,18 @@ mod tests {
         );
         assert_eq!(second.rows.len(), 2);
         for r in &second.rows {
+            let result_cell = r.cells.get(RESULT_COLUMN).expect("Result column");
+            // Parse the JSON to verify structure.
+            let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+            let obj = parsed.as_object().expect("object");
+            assert!(obj.contains_key("baseline (baseline)"));
+            assert!(obj.contains_key("comparison"));
             assert_eq!(
-                r.cells.get(RESULT_COLUMN),
-                Some(&"overall: CLEAR→REVIEW".to_string()),
+                obj["baseline (baseline)"]["overall"], "CLEAR",
+                "every row differs from its snapshot sibling"
+            );
+            assert_eq!(
+                obj["comparison"]["overall"], "REVIEW",
                 "every row differs from its snapshot sibling"
             );
         }
@@ -2436,5 +2487,146 @@ mod tests {
             fake.peak_concurrency() >= 2,
             "ENVS loop runs envs concurrently"
         );
+    }
+
+    #[test]
+    fn with_fields_suppress_intrinsics_by_default() {
+        // When a WITH field is declared, intrinsics are suppressed unless SHOW
+        // explicitly names them. A [Reports] field is still emitted.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
+        let res = run(
+            "REPORT REQUEST svc WITH\n    extra: jsonpath \"$.score\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        // The WITH field and the [Reports] field are present.
+        assert_eq!(cells.get("svc.extra"), Some(&"42".to_string()));
+        assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
+        // Intrinsics are suppressed because WITH fields were declared.
+        assert_eq!(
+            cells.get("svc.HttpStatus"),
+            None,
+            "intrinsics suppressed by WITH"
+        );
+        assert_eq!(cells.get("svc.Time"), None);
+        assert_eq!(cells.get("svc.Response"), None);
+    }
+
+    #[test]
+    fn reports_only_request_keeps_intrinsics() {
+        // INTENDED ASYMMETRY: a request with only [Reports] fields (no WITH) keeps
+        // intrinsics. WITH suppression only activates when WITH fields are present.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
+        let res = run("REPORT REQUEST svc\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert_eq!(
+            cells.get("svc.HttpStatus"),
+            Some(&"200".to_string()),
+            "intrinsics kept"
+        );
+        assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn show_wins_over_with_suppression_and_can_readd_intrinsic() {
+        // When SHOW is present alongside WITH fields, SHOW takes full precedence
+        // and can explicitly re-add an intrinsic that WITH would otherwise suppress.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[])];
+        let res = run(
+            "REPORT REQUEST svc SHOW(HttpStatus, extra) WITH\n    extra: jsonpath \"$.score\"\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        // SHOW re-adds HttpStatus even though WITH would normally suppress it.
+        assert_eq!(
+            cells.get("svc.HttpStatus"),
+            Some(&"200".to_string()),
+            "SHOW re-added intrinsic"
+        );
+        assert_eq!(cells.get("svc.extra"), Some(&"42".to_string()));
+        // Other intrinsics not in SHOW are absent.
+        assert_eq!(cells.get("svc.Response"), None);
+        assert_eq!(res.column_order, vec!["svc.HttpStatus", "svc.extra"]);
+    }
+
+    #[test]
+    fn hide_removes_named_field() {
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{\"score\":42}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[("score", "jsonpath \"$.score\"")])];
+        let res = run(
+            "REPORT REQUEST svc HIDE(Response, Error)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("svc.Response"), None, "Response hidden");
+        assert_eq!(cells.get("svc.Error"), None, "Error hidden");
+        // Other intrinsics and [Reports] fields still present.
+        assert_eq!(cells.get("svc.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("svc.score"), Some(&"42".to_string()));
+    }
+
+    #[test]
+    fn hide_applied_after_show() {
+        // HIDE acts after SHOW — even fields SHOW would keep can be removed by HIDE.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                raw_body: "{}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[])];
+        let res = run(
+            "REPORT REQUEST svc SHOW(HttpStatus, Time) HIDE(Time)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("svc.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("svc.Time"), None, "HIDE removed Time after SHOW");
+        assert_eq!(res.column_order, vec!["svc.HttpStatus"]);
     }
 }

@@ -3212,13 +3212,12 @@ fn report_grid_lines(
     lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
         let state = states.and_then(|s| s.get(i)).copied();
-        // A row that hasn't finished (still scheduled or running) is dimmed;
-        // finished and static (non-streaming) rows use the normal text colour.
-        let pending = matches!(state, Some(RowState::Scheduled) | Some(RowState::Running));
-        let text_style = if pending {
-            Style::default().fg(th.dim)
-        } else {
-            Style::default().fg(th.text)
+        // A running row is highlighted in pending colour and bold so it stands out
+        // from queued/finished rows; scheduled rows stay dim, finished stay normal.
+        let text_style = match state {
+            Some(RowState::Running) => Style::default().fg(th.pending).add_modifier(Modifier::BOLD),
+            Some(RowState::Scheduled) => Style::default().fg(th.dim),
+            _ => Style::default().fg(th.text),
         };
         let mut spans: Vec<Span<'static>> = Vec::new();
         if show_icons {

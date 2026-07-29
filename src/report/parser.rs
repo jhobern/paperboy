@@ -6,7 +6,7 @@ use nom::{
     branch::alt,
     bytes::complete::{take_while, take_while1},
     character::complete::{char, multispace0, multispace1, not_line_ending, satisfy},
-    combinator::{eof, map, opt, recognize, value, verify},
+    combinator::{eof, map, opt, peek, recognize, value, verify},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair},
 };
@@ -50,13 +50,14 @@ list-decl    := 'LIST' IDENT '=' producer
 
 request      := 'REQUEST' name
 report       := 'REPORT' report-target
-report-target:= 'REQUEST' name [ 'AS' name ] [ response-fmt ] [ show ] [ with-block ]
+report-target:= 'REQUEST' name [ 'AS' name ] [ response-fmt ] [ show ] [ hide ] [ with-block ]
               | IDENT 'AS' name                          # renamed variable column
               | var-list
               | string 'AS' name                         # computed column
 var-list     := IDENT | '(' IDENT (',' IDENT)* ')'
 response-fmt := 'RESPONSE' ('RAW' | 'PRETTY')
 show         := 'SHOW' '(' IDENT (',' IDENT)* ')'
+hide         := 'HIDE' '(' IDENT (',' IDENT)* ')'
 with-block   := 'WITH' with-item* 'END'
 with-item    := response-fmt | field-def
 field-def    := IDENT ':' hurl-query                   # full Hurl query + filters
@@ -350,6 +351,7 @@ fn report_request(i: &str) -> IResult<&str, ReportStmt> {
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
     let (i, response_fmt) = opt(preceded(kw("RESPONSE"), resp_fmt))(i)?;
     let (i, show) = map(opt(show_clause), Option::unwrap_or_default)(i)?;
+    let (i, hide) = map(opt(hide_clause), Option::unwrap_or_default)(i)?;
     let (i, with) = map(opt(with_block), Option::unwrap_or_default)(i)?;
     Ok((
         i,
@@ -358,6 +360,7 @@ fn report_request(i: &str) -> IResult<&str, ReportStmt> {
             alias,
             response_fmt,
             show,
+            hide,
             with,
         },
     ))
@@ -401,6 +404,11 @@ fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
 /// `SHOW(a, b, …)` — at least one field (empty is a parse error).
 fn show_clause(i: &str) -> IResult<&str, Vec<String>> {
     preceded(kw("SHOW"), paren_list1(ident))(i)
+}
+
+/// `HIDE(a, b, …)` — at least one field (empty is a parse error).
+fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
+    preceded(kw("HIDE"), paren_list1(ident))(i)
 }
 
 /// `WITH <item>* END`.
@@ -601,9 +609,11 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
     let (i, roles) = separated_list1(sym(','), role)(i)?;
     let mut baseline = Vec::new();
     let mut comparisons = Vec::new();
-    for (is_baseline, mut names) in roles {
+    let mut baseline_show = Vec::new();
+    for (is_baseline, mut names, mut show) in roles {
         if is_baseline {
             baseline.append(&mut names);
+            baseline_show.append(&mut show);
         } else {
             comparisons.append(&mut names);
         }
@@ -613,16 +623,35 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
         EnvClause::Roles {
             baseline,
             comparisons,
+            baseline_show,
         },
     ))
 }
 
-/// One `BASELINE(...)` / `COMPARISON(...)` role; `true` for BASELINE.
-fn role(i: &str) -> IResult<&str, (bool, Vec<String>)> {
-    pair(
-        alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON")))),
-        paren_list1(string_lit),
-    )(i)
+/// One `BASELINE(...) [SHOW(...)]` / `COMPARISON(...)` role.
+///
+/// Returns `(is_baseline, names, show_fields)`.  `SHOW` after `COMPARISON` is a
+/// hard parse error (returned as `nom::Err::Failure`) so it can't be silently
+/// swallowed by the surrounding `alt`.
+fn role(i: &str) -> IResult<&str, (bool, Vec<String>, Vec<String>)> {
+    let (i, is_baseline) = alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON"))))(i)?;
+    let (i, names) = paren_list1(string_lit)(i)?;
+    // SHOW(…) is only legal on a BASELINE role.  If we see SHOW after a
+    // COMPARISON, surface it as a Failure (not a soft Error) so the user gets a
+    // clear rejection rather than a silent parse-stop.
+    let (i, show) = if is_baseline {
+        let (i, maybe) = opt(show_clause)(i)?;
+        (i, maybe.unwrap_or_default())
+    } else {
+        if peek(show_clause)(i).is_ok() {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        (i, Vec::new())
+    };
+    Ok((i, (is_baseline, names, show)))
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +738,7 @@ fn with_block_head(i: &str) -> IResult<&str, ()> {
     let (i, _) = opt(preceded(kw("AS"), str_or_word))(i)?;
     let (i, _) = opt(preceded(kw("RESPONSE"), resp_fmt))(i)?;
     let (i, _) = opt(show_clause)(i)?;
+    let (i, _) = opt(hide_clause)(i)?;
     let (i, _) = kw("WITH")(i)?;
     let (i, _) = multispace0(i)?;
     let (i, _) = eof(i)?;
@@ -882,6 +912,7 @@ mod tests {
                 &EnvClause::Roles {
                     baseline: vec!["prod-au".into()],
                     comparisons: vec!["staging-au".into(), "staging-eu".into()],
+                    baseline_show: vec![],
                 }
             );
         } else {
@@ -1127,6 +1158,11 @@ mod tests {
             "REPORT REQUEST r AS a RESPONSE RAW SHOW(x, y) WITH"
         ));
         assert!(opens_block("    REPORT REQUEST r WITH   "));
+        // HIDE clause between SHOW and WITH must not confuse the opener detector.
+        assert!(opens_block(
+            "REPORT REQUEST r AS a RESPONSE RAW SHOW(x) HIDE(b) WITH"
+        ));
+        assert!(opens_block("REPORT REQUEST r HIDE(Response) WITH"));
     }
 
     #[test]
@@ -1134,9 +1170,85 @@ mod tests {
         assert!(!opens_block("REQUEST oauth"));
         assert!(!opens_block("REPORT REQUEST process_file")); // no WITH → single line
         assert!(!opens_block("REPORT REQUEST r SHOW(a)")); // WITH not trailing
+        assert!(!opens_block("REPORT REQUEST r HIDE(a)")); // no WITH → single line
         assert!(!opens_block("END"));
         assert!(!opens_block("FORMAT = json")); // FOR must be a whole keyword
         assert!(!opens_block("PARALLEL")); // needs a FOR to open a block
         assert!(!opens_block("field: jsonpath \"$.id\" WITH")); // WITH mid-query, not a REPORT
+    }
+
+    #[test]
+    fn hide_clause_round_trips_and_parses_fields() {
+        let flow = assert_round_trips(
+            "REPORT REQUEST process AS proc RESPONSE RAW SHOW(status) HIDE(Response, Time)\n",
+        );
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { show, hide, .. }) => {
+                assert_eq!(show, &vec!["status".to_string()]);
+                assert_eq!(hide, &vec!["Response".to_string(), "Time".to_string()]);
+            }
+            other => panic!("expected report request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hide_clause_without_show_round_trips() {
+        let flow = assert_round_trips("REPORT REQUEST process HIDE(Error)\n");
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { show, hide, .. }) => {
+                assert!(show.is_empty());
+                assert_eq!(hide, &vec!["Error".to_string()]);
+            }
+            other => panic!("expected report request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_hide_selector_is_a_parse_error() {
+        assert!(parse_flow("REPORT REQUEST process HIDE()\n").is_err());
+    }
+
+    #[test]
+    fn hide_with_block_round_trips() {
+        // HIDE + WITH block: the WITH block opener must still be recognised.
+        assert_round_trips(
+            "REPORT REQUEST process HIDE(Response) WITH\n    result: jsonpath \"$.r\"\nEND\n",
+        );
+    }
+
+    #[test]
+    fn baseline_show_round_trips() {
+        // SHOW(…) on BASELINE is parsed, preserved in the AST, and emitted back.
+        let flow = assert_round_trips(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        );
+        if let FlowNode::ForEnvs { clause, .. } = &flow.nodes[0] {
+            assert_eq!(
+                clause,
+                &EnvClause::Roles {
+                    baseline: vec!["p".into()],
+                    comparisons: vec!["s".into()],
+                    baseline_show: vec!["Time".into()],
+                }
+            );
+        } else {
+            panic!("expected ForEnvs roles with SHOW");
+        }
+        // Multiple SHOW fields also round-trip.
+        assert_round_trips(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time, HttpStatus), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        );
+    }
+
+    #[test]
+    fn show_on_comparison_is_a_parse_error() {
+        // SHOW after COMPARISON must be rejected.
+        assert!(
+            parse_flow(
+                "FOR T IN ENVS BASELINE(\"p\"), COMPARISON(\"s\") SHOW(Time)\n    REQUEST r\nEND\n"
+            )
+            .is_err(),
+            "SHOW after COMPARISON should not parse"
+        );
     }
 }

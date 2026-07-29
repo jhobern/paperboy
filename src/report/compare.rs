@@ -15,6 +15,12 @@
 //! declares (`alias.<field>`). A request with no such fields falls back to its
 //! whole `Response`; the noisy intrinsics (`Time`, `HttpStatus`, `Asserts`,
 //! `Error`) are surfaced as their own columns and left out of the diff.
+//!
+//! The `Result` cell for differing rows is a compact single-line JSON object
+//! keyed by environment name, showing only fields that differ: the baseline
+//! entry has `(baseline)` suffix, the candidate entry carries just its environment
+//! name. Field values that parse as JSON are embedded structurally; other values
+//! are embedded as JSON strings.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -50,6 +56,11 @@ pub struct Roles {
     /// Candidate environment names, in clause order (each compared to the
     /// baseline; duplicates removed).
     comparisons: Vec<String>,
+    /// Field suffixes from the `BASELINE(…) SHOW(…)` clause.  For each such
+    /// field, matching baseline cells (`<alias>.<field>`) are copied into the
+    /// candidate row as `baseline.<alias>.<field>` — but only for aliases where
+    /// the candidate itself emits that field.
+    baseline_show: Vec<String>,
 }
 
 /// Extract the comparison roles a flow configures, or `None` when it has no
@@ -58,13 +69,20 @@ pub struct Roles {
 pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
-    collect_roles(&flow.nodes, &mut baseline, &mut comparisons);
+    let mut baseline_show = Vec::new();
+    collect_roles(
+        &flow.nodes,
+        &mut baseline,
+        &mut comparisons,
+        &mut baseline_show,
+    );
     if baseline.is_empty() {
         return None;
     }
     Some(Roles {
         baseline,
         comparisons,
+        baseline_show,
     })
 }
 
@@ -73,6 +91,7 @@ fn collect_roles(
     nodes: &[FlowNode],
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
+    baseline_show: &mut Vec<String>,
 ) {
     for node in nodes {
         match node {
@@ -80,6 +99,7 @@ fn collect_roles(
                 if let EnvClause::Roles {
                     baseline: b,
                     comparisons: c,
+                    baseline_show: s,
                 } = clause
                 {
                     for name in b {
@@ -90,10 +110,17 @@ fn collect_roles(
                             comparisons.push(name.clone());
                         }
                     }
+                    for field in s {
+                        if !baseline_show.contains(field) {
+                            baseline_show.push(field.clone());
+                        }
+                    }
                 }
-                collect_roles(body, baseline, comparisons);
+                collect_roles(body, baseline, comparisons, baseline_show);
             }
-            FlowNode::ForEach { body, .. } => collect_roles(body, baseline, comparisons),
+            FlowNode::ForEach { body, .. } => {
+                collect_roles(body, baseline, comparisons, baseline_show)
+            }
             _ => {}
         }
     }
@@ -153,6 +180,26 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
                 let verdict = compute_result(baseline, &cand);
                 cand.cells.insert(RESULT_COLUMN.to_string(), verdict);
+                // Copy baseline cells for each SHOW field, but only for aliases
+                // where the candidate row already emits that field.  This avoids
+                // inventing columns for requests that don't report the field at all.
+                if let Some(base) = baseline {
+                    for field in &roles.baseline_show {
+                        for cand_key in cand.cells.keys().cloned().collect::<Vec<_>>() {
+                            if let Some((alias, f)) = cand_key.split_once('.') {
+                                if f == field {
+                                    let base_col = format!("baseline.{alias}.{field}");
+                                    if let Some(val) = base.cells.get(&cand_key) {
+                                        cand.cells
+                                            .entry(base_col.clone())
+                                            .or_insert_with(|| val.clone());
+                                        result.note_column(&base_col);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 out.push(cand);
                 emitted = true;
             }
@@ -170,25 +217,48 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
 }
 
 /// Compare `cand` against its `baseline`, returning the `Result` cell: a
-/// `field: base→cand` summary of every differing compared field (joined by
-/// `; `), [`MATCH`] when all agree, or [`NO_BASELINE`] when there is no baseline.
+/// compact single-line JSON object keyed by environment name (baseline with
+/// `(baseline)` suffix, candidate as-is) showing only differing fields. Field
+/// values that parse as JSON are embedded structurally; others as JSON strings.
+/// Returns [`MATCH`] when all agree, or [`NO_BASELINE`] when there is no baseline.
 pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
     let Some(base) = baseline else {
         return NO_BASELINE.to_string();
     };
-    let mut diffs = Vec::new();
+
+    let mut base_diffs = serde_json::Map::new();
+    let mut cand_diffs = serde_json::Map::new();
+
     for key in comparable_keys(cand, base) {
         let b = base.cells.get(&key).map(String::as_str).unwrap_or("");
         let c = cand.cells.get(&key).map(String::as_str).unwrap_or("");
         if b != c {
             let label = key.rsplit('.').next().unwrap_or(&key);
-            diffs.push(format!("{label}: {b}→{c}"));
+            // Try to parse as JSON; if successful, embed structurally, else as string.
+            let b_value = serde_json::from_str::<serde_json::Value>(b)
+                .unwrap_or_else(|_| serde_json::Value::String(b.to_string()));
+            let c_value = serde_json::from_str::<serde_json::Value>(c)
+                .unwrap_or_else(|_| serde_json::Value::String(c.to_string()));
+            base_diffs.insert(label.to_string(), b_value);
+            cand_diffs.insert(label.to_string(), c_value);
         }
     }
-    if diffs.is_empty() {
+
+    if base_diffs.is_empty() {
         MATCH.to_string()
     } else {
-        diffs.join("; ")
+        // Build the outer object with baseline and candidate entries.
+        let base_env = base.target.as_deref().unwrap_or("baseline");
+        let cand_env = cand.target.as_deref().unwrap_or("comparison");
+        let mut result = serde_json::Map::new();
+        result.insert(
+            format!("{} (baseline)", base_env),
+            serde_json::Value::Object(base_diffs),
+        );
+        result.insert(cand_env.to_string(), serde_json::Value::Object(cand_diffs));
+        // Render as compact single-line JSON.
+        serde_json::to_string(&serde_json::Value::Object(result))
+            .unwrap_or_else(|_| MATCH.to_string())
     }
 }
 
@@ -248,6 +318,15 @@ mod tests {
         Roles {
             baseline: baseline.iter().map(|s| s.to_string()).collect(),
             comparisons: comparisons.iter().map(|s| s.to_string()).collect(),
+            baseline_show: Vec::new(),
+        }
+    }
+
+    fn roles_show(baseline: &[&str], comparisons: &[&str], show: &[&str]) -> Roles {
+        Roles {
+            baseline: baseline.iter().map(|s| s.to_string()).collect(),
+            comparisons: comparisons.iter().map(|s| s.to_string()).collect(),
+            baseline_show: show.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -300,9 +379,19 @@ mod tests {
         assert_eq!(r.target.as_deref(), Some("staging"));
         assert_eq!(r.cells.get("proc.overall"), Some(&"REVIEW".to_string()));
         // HttpStatus is an intrinsic — not part of the diff, and it matched anyway.
+        let result_cell = r.cells.get(RESULT_COLUMN).expect("Result column");
+        // Parse the JSON to verify structure.
+        let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+        let obj = parsed.as_object().expect("object");
+        assert!(obj.contains_key("prod (baseline)"), "has baseline key");
+        assert!(obj.contains_key("staging"), "has candidate key");
         assert_eq!(
-            r.cells.get(RESULT_COLUMN),
-            Some(&"overall: CLEAR→REVIEW".to_string())
+            obj["prod (baseline)"]["overall"],
+            serde_json::Value::String("CLEAR".to_string())
+        );
+        assert_eq!(
+            obj["staging"]["overall"],
+            serde_json::Value::String("REVIEW".to_string())
         );
         assert_eq!(
             result.column_order.first(),
@@ -372,10 +461,13 @@ mod tests {
             ..Default::default()
         };
         apply(&mut result, &roles(&["prod"], &["staging"]));
-        assert_eq!(
-            result.rows[0].cells.get(RESULT_COLUMN),
-            Some(&"Response: {\"x\":1}→{\"x\":2}".to_string())
-        );
+        let result_cell = result.rows[0].cells.get(RESULT_COLUMN).expect("Result");
+        // Parse the JSON to verify structure: Response values should be embedded as
+        // parsed objects (not escaped strings).
+        let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+        let obj = parsed.as_object().expect("object");
+        assert_eq!(obj["prod (baseline)"]["Response"]["x"], 1);
+        assert_eq!(obj["staging"]["Response"]["x"], 2);
     }
 
     #[test]
@@ -393,19 +485,159 @@ mod tests {
         };
         apply(&mut result, &roles(&["prod"], &["au", "eu"]));
         // Grouped by key (a then b), comparisons in clause order (au then eu).
-        let got: Vec<(&str, Option<&String>)> = result
-            .rows
-            .iter()
-            .map(|r| (r.target.as_deref().unwrap(), r.cells.get(RESULT_COLUMN)))
-            .collect();
+        assert_eq!(result.rows.len(), 4);
+
+        // Row 0: key "a", target "au" - should match (both "1").
+        assert_eq!(result.rows[0].target.as_deref(), Some("au"));
         assert_eq!(
-            got,
-            vec![
-                ("au", Some(&MATCH.to_string())),
-                ("eu", Some(&"v: 1→2".to_string())),
-                ("au", Some(&"v: 1→9".to_string())),
-                ("eu", Some(&MATCH.to_string())),
-            ]
+            result.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string())
         );
+
+        // Row 1: key "a", target "eu" - should differ ("1" → "2").
+        assert_eq!(result.rows[1].target.as_deref(), Some("eu"));
+        let r1_cell = result.rows[1].cells.get(RESULT_COLUMN).expect("Result");
+        let parsed: serde_json::Value = serde_json::from_str(r1_cell).expect("valid JSON");
+        assert_eq!(parsed["prod (baseline)"]["v"], serde_json::json!(1));
+        assert_eq!(parsed["eu"]["v"], serde_json::json!(2));
+
+        // Row 2: key "b", target "au" - should differ ("1" → "9").
+        assert_eq!(result.rows[2].target.as_deref(), Some("au"));
+        let r2_cell = result.rows[2].cells.get(RESULT_COLUMN).expect("Result");
+        let parsed: serde_json::Value = serde_json::from_str(r2_cell).expect("valid JSON");
+        assert_eq!(parsed["prod (baseline)"]["v"], serde_json::json!(1));
+        assert_eq!(parsed["au"]["v"], serde_json::json!(9));
+
+        // Row 3: key "b", target "eu" - should match (both "1").
+        assert_eq!(result.rows[3].target.as_deref(), Some("eu"));
+        assert_eq!(
+            result.rows[3].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string())
+        );
+    }
+
+    #[test]
+    fn result_embeds_json_values_structurally_and_is_single_line() {
+        // Baseline and candidate have JSON array values that differ; the Result
+        // should embed them as arrays (not escaped strings), and the whole result
+        // must be a single line (no newlines).
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["a"],
+                    "staging",
+                    &[(
+                        "proc.Breakdown",
+                        "[{\"key\":\"detail_check\",\"value\":\"Pass\"},{\"key\":\"photo_check\",\"value\":\"Fail\"}]",
+                    )],
+                ),
+                row(
+                    &["a"],
+                    "dev",
+                    &[(
+                        "proc.Breakdown",
+                        "[{\"key\":\"detail_check\",\"value\":\"Pass\"},{\"key\":\"photo_check\",\"value\":\"Pass\"}]",
+                    )],
+                ),
+            ],
+            ..Default::default()
+        };
+        apply(&mut result, &roles(&["staging"], &["dev"]));
+
+        let result_cell = result.rows[0].cells.get(RESULT_COLUMN).expect("Result");
+
+        // 1. Must be a single line (no newlines).
+        assert!(!result_cell.contains('\n'), "Result must be single line");
+
+        // 2. Must round-trip via serde_json.
+        let parsed: serde_json::Value =
+            serde_json::from_str(result_cell).expect("Result must be valid JSON");
+
+        // 3. Values must be embedded structurally (arrays, not escaped strings).
+        let obj = parsed.as_object().expect("Result is an object");
+        let baseline_obj = obj["staging (baseline)"]
+            .as_object()
+            .expect("baseline is object");
+        let dev_obj = obj["dev"].as_object().expect("dev is object");
+
+        let baseline_breakdown = baseline_obj["Breakdown"]
+            .as_array()
+            .expect("baseline Breakdown is array");
+        let dev_breakdown = dev_obj["Breakdown"]
+            .as_array()
+            .expect("dev Breakdown is array");
+
+        assert_eq!(baseline_breakdown.len(), 2);
+        assert_eq!(dev_breakdown.len(), 2);
+
+        // Verify the nested structure of the arrays.
+        assert_eq!(baseline_breakdown[0]["key"], "detail_check");
+        assert_eq!(baseline_breakdown[0]["value"], "Pass");
+        assert_eq!(baseline_breakdown[1]["key"], "photo_check");
+        assert_eq!(baseline_breakdown[1]["value"], "Fail");
+
+        assert_eq!(dev_breakdown[0]["key"], "detail_check");
+        assert_eq!(dev_breakdown[0]["value"], "Pass");
+        assert_eq!(dev_breakdown[1]["key"], "photo_check");
+        assert_eq!(dev_breakdown[1]["value"], "Pass");
+
+        // 4. Exact single-line string for this small case (verifies ordering).
+        let expected = "{\"staging (baseline)\":{\"Breakdown\":[{\"key\":\"detail_check\",\"value\":\"Pass\"},{\"key\":\"photo_check\",\"value\":\"Fail\"}]},\"dev\":{\"Breakdown\":[{\"key\":\"detail_check\",\"value\":\"Pass\"},{\"key\":\"photo_check\",\"value\":\"Pass\"}]}}";
+        assert_eq!(result_cell, expected);
+    }
+
+    #[test]
+    fn baseline_show_copies_matching_alias_cells() {
+        // proc.Time exists on both baseline and candidate → baseline.proc.Time added.
+        // aux has no Time on the candidate → no baseline.aux.Time added.
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["a"],
+                    "prod",
+                    &[
+                        ("proc.Time", "100ms"),
+                        ("aux.Time", "50ms"),
+                        ("proc.overall", "CLEAR"),
+                    ],
+                ),
+                row(
+                    &["a"],
+                    "staging",
+                    // candidate has proc.Time but no aux.Time
+                    &[("proc.Time", "120ms"), ("proc.overall", "CLEAR")],
+                ),
+            ],
+            ..Default::default()
+        };
+        apply(&mut result, &roles_show(&["prod"], &["staging"], &["Time"]));
+
+        assert_eq!(result.rows.len(), 1);
+        let r = &result.rows[0];
+        // baseline.proc.Time copied because candidate emits proc.Time
+        assert_eq!(
+            r.cells.get("baseline.proc.Time"),
+            Some(&"100ms".to_string())
+        );
+        // baseline.aux.Time NOT added because candidate has no aux.Time
+        assert!(!r.cells.contains_key("baseline.aux.Time"));
+        // The new column is registered in column_order
+        assert!(
+            result
+                .column_order
+                .contains(&"baseline.proc.Time".to_string())
+        );
+    }
+
+    #[test]
+    fn baseline_show_extracted_from_flow() {
+        let flow = parse_flow(
+            "FOR T IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"staging\")\n  REQUEST r\nEND\n",
+        )
+        .unwrap();
+        let r = comparison_roles(&flow).expect("roles");
+        assert!(r.baseline.contains("prod"));
+        assert_eq!(r.comparisons, vec!["staging"]);
+        assert_eq!(r.baseline_show, vec!["Time"]);
     }
 }

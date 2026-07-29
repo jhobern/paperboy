@@ -12,6 +12,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`REPORT REQUEST … HIDE(a, b, …)` drops columns you don't want.** Mirroring
+  `SHOW(…)`, a `HIDE(…)` clause removes the named field suffixes (intrinsics like
+  `Response`/`Time`, `[Reports]` fields or `WITH` fields) from a request's report
+  output. It is applied last, so it works in every case — the default column set,
+  a `SHOW(…)` selection, or a `WITH`-restricted one. Naming the same field in both
+  `SHOW` and `HIDE` is now a validation error, and both keywords are highlighted
+  in the report source editor.
+
+- **Keep baseline fields when comparing environments.** In a
+  `FOR … IN ENVS BASELINE(…), COMPARISON(…)` comparison, a `SHOW(field, …)` clause
+  after `BASELINE(…)` copies the chosen baseline fields into each candidate row as
+  `baseline.<request>.<field>` — but only for requests that actually report that
+  field. This lets a report show, say, both environments' `Time` side by side so
+  you can spot a performance regression, not just the comparison env's timing.
+  `SHOW` is only valid on `BASELINE` (it's a parse error on `COMPARISON`), and the
+  new columns are selectable/renamable through the `columns:` directive like any
+  other.
+
 - **Load choosers hide files that can't be what you're opening.** The local
   "Open Collection", "Load Environment" and "Open Report" browsers now show only
   the matching file types (`.hurl`/`.json`, `.vars`/`.env*`, `.trail`) plus
@@ -397,7 +415,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
-- **A report opened from a workspace now opens in place, inside that workspace
+- **A `REPORT REQUEST … WITH` block now restricts the report to the fields you
+  declare.** When a request's `WITH … END` block declares at least one field, the
+  five intrinsic columns (`HttpStatus`, `Time`, `Asserts`, `Error`, `Response`)
+  are suppressed by default so the declared fields take centre stage — you no
+  longer have to `SHOW(…)` to trim them. `SHOW(…)` still wins when present and can
+  explicitly re-add an intrinsic, and a request that declares fields only through
+  its own `[Reports]` block (no `WITH`) keeps its intrinsics as before.
+
+- **Environment-comparison `Result` cells are now readable, structured JSON.**
+  The old run-on `field: a→b; …` summary is replaced by a compact single-line JSON
+  object keyed by environment name — the baseline carries a `(baseline)` suffix —
+  listing only the fields that differ. Values that are themselves JSON are embedded
+  structurally rather than escaped, so a differing breakdown reads as nested JSON
+  instead of a wall of backslashes, and the cell can be parsed by JSON-aware tools.
+
+- **The report grid highlights the request that's currently running.** While a
+  report streams, the running row is drawn in the theme's `pending` colour and
+  bold so it stands out at a glance; queued rows stay dimmed and finished rows
+  return to normal. (Change the `pending` colour in your theme if you'd rather it
+  read differently.)
+
   tab.** Selecting a `.trail` from a workspace tab's tree used to spawn a
   *separate* report tab (so one workspace could sit in the strip twice). It now
   replaces that same tab's right pane — the request editor + response give way

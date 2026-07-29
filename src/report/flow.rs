@@ -165,7 +165,7 @@ pub struct ParallelSpec {
 /// The column-emitting `REPORT` statement in its three forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportStmt {
-    /// `REPORT REQUEST <name> [AS <alias>] [RESPONSE …] [SHOW(…)] [WITH … END]`.
+    /// `REPORT REQUEST <name> [AS <alias>] [RESPONSE …] [SHOW(…)] [HIDE(…)] [WITH … END]`.
     Request {
         name: String,
         alias: Option<String>,
@@ -176,6 +176,11 @@ pub enum ReportStmt {
         /// noisy `Response` (e.g. a base64 blob) can be dropped. Empty = no
         /// `SHOW` clause, i.e. emit every field (the default).
         show: Vec<String>,
+        /// `HIDE(a, b, …)`: remove these field suffixes from the final output
+        /// after all other selection rules have been applied. Takes effect in
+        /// every branch (SHOW, WITH-restricted, and default). Cannot overlap
+        /// with `SHOW` (validation rejects the conflict).
+        hide: Vec<String>,
         with: Vec<WithItem>,
     },
     /// `REPORT <var>` / `REPORT (<v1>, <v2>, …)` — one column per variable.
@@ -279,10 +284,15 @@ impl Pattern {
 pub enum EnvClause {
     /// `"a", "b"` — iterate the named environments, no comparison.
     Plain(Vec<String>),
-    /// `BASELINE("prod"), COMPARISON("staging", …)`.
+    /// `BASELINE("prod") SHOW(Time), COMPARISON("staging", …)`.
+    ///
+    /// `baseline_show` names the baseline fields to copy into each candidate row
+    /// under `baseline.<alias>.<field>` (only for aliases the candidate already
+    /// emits that field).  Empty when no `SHOW(…)` clause is present.
     Roles {
         baseline: Vec<String>,
         comparisons: Vec<String>,
+        baseline_show: Vec<String>,
     },
 }
 
@@ -392,6 +402,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             alias,
             response_fmt,
             show,
+            hide,
             with,
         } => {
             let _ = write!(out, "REPORT REQUEST {}", name_text(name));
@@ -403,6 +414,9 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             }
             if !show.is_empty() {
                 let _ = write!(out, " SHOW({})", show.join(", "));
+            }
+            if !hide.is_empty() {
+                let _ = write!(out, " HIDE({})", hide.join(", "));
             }
             if with.is_empty() {
                 out.push('\n');
@@ -518,11 +532,16 @@ fn env_clause_text(c: &EnvClause) -> String {
         EnvClause::Roles {
             baseline,
             comparisons,
+            baseline_show,
         } => {
             let mut parts = Vec::new();
             if !baseline.is_empty() {
                 let names: Vec<String> = baseline.iter().map(|s| quote(s)).collect();
-                parts.push(format!("BASELINE({})", names.join(", ")));
+                let mut token = format!("BASELINE({})", names.join(", "));
+                if !baseline_show.is_empty() {
+                    token.push_str(&format!(" SHOW({})", baseline_show.join(", ")));
+                }
+                parts.push(token);
             }
             if !comparisons.is_empty() {
                 let names: Vec<String> = comparisons.iter().map(|s| quote(s)).collect();
@@ -604,6 +623,7 @@ impl FlowNode {
                 alias,
                 response_fmt,
                 show,
+                hide,
                 ..
             }) => {
                 let mut out = format!("REPORT REQUEST {}", name_text(name));
@@ -615,6 +635,9 @@ impl FlowNode {
                 }
                 if !show.is_empty() {
                     let _ = write!(out, " SHOW({})", show.join(", "));
+                }
+                if !hide.is_empty() {
+                    let _ = write!(out, " HIDE({})", hide.join(", "));
                 }
                 out
             }
@@ -657,6 +680,7 @@ fn report_label(stmt: &ReportStmt) -> String {
             alias,
             response_fmt,
             show,
+            hide,
             with,
         } => {
             let mut out = format!("REPORT REQUEST {name}");
@@ -668,6 +692,9 @@ fn report_label(stmt: &ReportStmt) -> String {
             }
             if !show.is_empty() {
                 let _ = write!(out, " SHOW({})", show.join(", "));
+            }
+            if !hide.is_empty() {
+                let _ = write!(out, " HIDE({})", hide.join(", "));
             }
             if !with.is_empty() {
                 out.push_str(" WITH …");

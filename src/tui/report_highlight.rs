@@ -70,6 +70,8 @@ const KEYWORDS: &[&str] = &[
     "RESPONSE",
     "RAW",
     "PRETTY",
+    "SHOW",
+    "HIDE",
     "JOIN",
     "ON",
 ];

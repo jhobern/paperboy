@@ -221,11 +221,17 @@ fn walk(
 
 fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     if let ReportStmt::Request {
-        name, show, with, ..
+        name,
+        show,
+        hide,
+        with,
+        ..
     } = stmt
     {
         check_request_name(name, ctx, diags);
+        check_show_hide_overlap(show, hide, diags);
         check_show_fields(name, show, with, ctx, diags);
+        check_hide_fields(name, hide, with, ctx, diags);
     }
 }
 
@@ -282,6 +288,68 @@ fn check_show_fields(
     }
 }
 
+/// Error when the same field suffix appears in both SHOW and HIDE — the two
+/// clauses are contradictory (SHOW keeps, HIDE removes) and no ordering of
+/// evaluation resolves the conflict sensibly.
+fn check_show_hide_overlap(show: &[String], hide: &[String], diags: &mut Vec<Diagnostic>) {
+    for field in show {
+        if hide.iter().any(|h| h == field) {
+            diags.push(Diagnostic::error(format!(
+                "field '{field}' appears in both SHOW and HIDE — these clauses conflict"
+            )));
+        }
+    }
+}
+
+/// Warn when a `HIDE(...)` field can't be produced by the request (mirrors
+/// `check_show_fields`): it is neither an intrinsic, a WITH field, nor a
+/// `[Reports]` field of the resolved request. Skipped when the collection isn't
+/// bound (the field set is unknown).
+fn check_hide_fields(
+    name: &str,
+    hide: &[String],
+    with: &[super::flow::WithItem],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if hide.is_empty() {
+        return;
+    }
+    let Some(entries) = ctx.request_fields else {
+        return;
+    };
+    let by_exact = entries.iter().find(|(t, _)| t == name);
+    let resolved = by_exact.or_else(|| {
+        let mut leaves = entries
+            .iter()
+            .filter(|(t, _)| t.rsplit('/').next() == Some(name));
+        match (leaves.next(), leaves.next()) {
+            (Some(hit), None) => Some(hit),
+            _ => None,
+        }
+    });
+    let Some((_, report_fields)) = resolved else {
+        return;
+    };
+    let with_fields: Vec<&str> = with
+        .iter()
+        .filter_map(|w| match w {
+            super::flow::WithItem::Field { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for field in hide {
+        let known = super::run::INTRINSIC_FIELDS.contains(&field.as_str())
+            || with_fields.contains(&field.as_str())
+            || report_fields.iter().any(|f| f == field);
+        if !known {
+            diags.push(Diagnostic::warning(format!(
+                "HIDE field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — that field isn't produced by this request"
+            )));
+        }
+    }
+}
+
 /// Resolve a request name against the bound collection's titles: exact
 /// full-title → unique leaf name → error. Skipped when no collection is bound.
 fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
@@ -325,6 +393,7 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
         EnvClause::Roles {
             baseline,
             comparisons,
+            ..
         } => {
             if baseline.len() > 1 {
                 diags.push(Diagnostic::error(
@@ -1008,5 +1077,49 @@ mod tests {
             None,
             "unknown list"
         ));
+    }
+
+    #[test]
+    fn show_and_hide_overlap_is_an_error() {
+        // A field in both SHOW and HIDE is contradictory → validation error.
+        let t = titles();
+        let errs = errors(
+            "# collection: c\nREPORT REQUEST Oauth SHOW(HttpStatus, Time) HIDE(Time)\n",
+            Some(&t),
+            None,
+        );
+        let overlap: Vec<_> = errs.iter().filter(|m| m.contains("Time")).collect();
+        assert_eq!(overlap.len(), 1, "one overlap error for Time: {errs:?}");
+        assert!(
+            overlap[0].contains("conflict")
+                || overlap[0].contains("SHOW")
+                || overlap[0].contains("HIDE")
+        );
+    }
+
+    #[test]
+    fn hide_unknown_field_warns_but_known_fields_do_not() {
+        // Same semantics as the SHOW unknown-field warning, but for HIDE.
+        let warns = warnings_with_fields(
+            "REPORT REQUEST process HIDE(Response, Time, status, ghost)\n",
+            &[("process", &["status", "overall"])],
+        );
+        assert_eq!(warns.len(), 1, "only 'ghost' should warn: {warns:?}");
+        assert!(warns[0].contains("ghost"));
+    }
+
+    #[test]
+    fn hide_is_not_validated_without_a_bound_collection() {
+        let flow = parse_flow("REPORT REQUEST process HIDE(bogus)\n").unwrap();
+        let ctx = Context::default();
+        let warns: Vec<_> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .filter(|d| d.message.contains("HIDE"))
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "unbound flow shouldn't warn on HIDE: {warns:?}"
+        );
     }
 }

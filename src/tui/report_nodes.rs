@@ -385,6 +385,7 @@ impl NodeKind {
                 clause: EnvClause::Roles {
                     baseline: vec!["baseline".into()],
                     comparisons: vec!["candidate".into()],
+                    baseline_show: Vec::new(),
                 },
                 body: Vec::new(),
                 parallel: None,
@@ -405,6 +406,7 @@ fn request_node(name: &str, report: bool) -> FlowNode {
             alias: None,
             response_fmt: None,
             show: Vec::new(),
+            hide: Vec::new(),
             with: Vec::new(),
         })
     } else {
@@ -502,6 +504,10 @@ pub(crate) struct RequestForm {
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
+    /// The node's `HIDE(…)` clause, preserved verbatim across an edit (the
+    /// form doesn't expose a HIDE editor, but must not drop the clause when
+    /// re-serializing).
+    pub(crate) hide: Vec<String>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -525,6 +531,7 @@ impl RequestForm {
         current_show: &[String],
         report_fields: &[String],
         with: Vec<WithItem>,
+        hide: Vec<String>,
     ) -> Self {
         let with_fields: Vec<String> = with
             .iter()
@@ -570,6 +577,7 @@ impl RequestForm {
             alias: alias.unwrap_or_default(),
             fields,
             with,
+            hide,
             selected: 0,
         }
     }
@@ -688,6 +696,10 @@ pub(crate) struct EnvsForm {
     pub(crate) choices: Vec<String>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
+    /// Field suffixes from `BASELINE(…) SHOW(…)`.  The form has no editing UI
+    /// for this — it is preserved verbatim so a round-trip doesn't silently drop
+    /// a `SHOW(…)` clause the user wrote in source.
+    pub(crate) baseline_show: Vec<String>,
 }
 
 impl EnvsForm {
@@ -699,7 +711,7 @@ impl EnvsForm {
         clause: &EnvClause,
         choices: Vec<String>,
     ) -> Self {
-        let (compare, mut entries) = match clause {
+        let (compare, mut entries, baseline_show) = match clause {
             EnvClause::Plain(names) => (
                 false,
                 names
@@ -709,10 +721,12 @@ impl EnvsForm {
                         baseline: false,
                     })
                     .collect::<Vec<_>>(),
+                Vec::new(),
             ),
             EnvClause::Roles {
                 baseline,
                 comparisons,
+                baseline_show,
             } => {
                 let mut es: Vec<EnvEntry> = baseline
                     .iter()
@@ -725,7 +739,7 @@ impl EnvsForm {
                     name: n.clone(),
                     baseline: false,
                 }));
-                (true, es)
+                (true, es, baseline_show.clone())
             }
         };
         // The clause always keeps at least one entry so it can't serialize to an
@@ -744,6 +758,7 @@ impl EnvsForm {
             entries,
             choices,
             selected: 0,
+            baseline_show,
         }
     }
 
@@ -839,6 +854,7 @@ impl EnvsForm {
             Some(EnvClause::Roles {
                 baseline,
                 comparisons,
+                baseline_show: self.baseline_show.clone(),
             })
         } else {
             let names = named(None);
@@ -1093,19 +1109,26 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (name, report, alias, response, current_show, with) = {
+        let (name, report, alias, response, current_show, current_hide, with) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
             match node_at(&flow, &path) {
-                Some(FlowNode::Request { name }) => {
-                    (name.clone(), false, None, None, Vec::new(), Vec::new())
-                }
+                Some(FlowNode::Request { name }) => (
+                    name.clone(),
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
                 Some(FlowNode::Report(ReportStmt::Request {
                     name,
                     alias,
                     response_fmt,
                     show,
+                    hide,
                     with,
                 })) => (
                     name.clone(),
@@ -1113,6 +1136,7 @@ impl TuiApp {
                     alias.clone(),
                     *response_fmt,
                     show.clone(),
+                    hide.clone(),
                     with.clone(),
                 ),
                 _ => return false, // not a request node
@@ -1131,6 +1155,7 @@ impl TuiApp {
             &current_show,
             &report_fields,
             with,
+            current_hide,
         );
         self.overlay = Some(Overlay::ReportNodeRequest(Box::new(form)));
         true
@@ -1154,8 +1179,9 @@ impl TuiApp {
     /// Finish a [`RequestForm`]: rebuild the node from the form and write it
     /// back. The `REPORT` toggle chooses the node kind — a plain `REQUEST`
     /// (dropping any reporting options) or a `REPORT REQUEST` carrying the
-    /// name, response, alias (blank ⇒ none), `SHOW(…)` (all-ticked ⇒ none) and
-    /// the preserved `WITH … END` items. Re-serializes, revalidates, persists.
+    /// name, response, alias (blank ⇒ none), `SHOW(…)` (all-ticked ⇒ none), the
+    /// preserved `HIDE(…)` clause, and the preserved `WITH … END` items.
+    /// Re-serializes, revalidates, persists.
     pub(crate) fn apply_report_node_request(&mut self, form: RequestForm) {
         let Some(idx) = self.report_index_by_id(form.report_id) else {
             return;
@@ -1166,6 +1192,7 @@ impl TuiApp {
                 alias: form.alias_opt(),
                 response_fmt: form.response,
                 show: form.show(),
+                hide: form.hide.clone(),
                 with: form.with.clone(),
             })
         } else {
@@ -1910,5 +1937,28 @@ mod tests {
             }
             other => panic!("expected a VarAs node, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn envs_form_round_trip_preserves_baseline_show() {
+        // Build an EnvsForm from a Roles clause that carries SHOW(Time).
+        let clause = EnvClause::Roles {
+            baseline: vec!["prod".into()],
+            comparisons: vec!["staging".into()],
+            baseline_show: vec!["Time".into()],
+        };
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![]);
+        assert_eq!(form.baseline_show, vec!["Time".to_string()]);
+
+        // clause() must hand it back intact — no silent drop.
+        let rebuilt = form.clause().expect("clause must be Some");
+        assert_eq!(
+            rebuilt,
+            EnvClause::Roles {
+                baseline: vec!["prod".into()],
+                comparisons: vec!["staging".into()],
+                baseline_show: vec!["Time".into()],
+            }
+        );
     }
 }

@@ -227,10 +227,14 @@ mod tests {
         let snap = Baseline::from_result(&result(vec![row(&["a"], &[("proc.overall", "CLEAR")])]));
         let mut res = result(vec![row(&["a"], &[("proc.overall", "REVIEW")])]);
         apply(&mut res, &snap);
-        assert_eq!(
-            res.rows[0].cells.get(RESULT_COLUMN),
-            Some(&"overall: CLEAR→REVIEW".to_string())
-        );
+        let result_cell = res.rows[0].cells.get(RESULT_COLUMN).expect("Result column");
+        // Parse the JSON to verify structure.
+        let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+        let obj = parsed.as_object().expect("object");
+        assert!(obj.contains_key("baseline (baseline)"));
+        assert!(obj.contains_key("comparison"));
+        assert_eq!(obj["baseline (baseline)"]["overall"], "CLEAR");
+        assert_eq!(obj["comparison"]["overall"], "REVIEW");
     }
 
     #[test]
@@ -281,9 +285,12 @@ mod tests {
             &[("proc.HttpStatus", "200"), ("proc.Response", "{\"x\":2}")],
         )]);
         apply(&mut res, &snap);
-        assert_eq!(
-            res.rows[0].cells.get(RESULT_COLUMN),
-            Some(&"Response: {\"x\":1}→{\"x\":2}".to_string())
-        );
+        let result_cell = res.rows[0].cells.get(RESULT_COLUMN).expect("Result");
+        // Parse the JSON to verify structure: Response values should be embedded as
+        // parsed objects (not escaped strings).
+        let parsed: serde_json::Value = serde_json::from_str(result_cell).expect("valid JSON");
+        let obj = parsed.as_object().expect("object");
+        assert_eq!(obj["baseline (baseline)"]["Response"]["x"], 1);
+        assert_eq!(obj["comparison"]["Response"]["x"], 2);
     }
 }
