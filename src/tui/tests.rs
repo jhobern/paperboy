@@ -20898,4 +20898,36 @@ mod all_view_layout {
             "an unfocused section title should be an inset background band"
         );
     }
+
+    /// The compact empty-section lines pad their labels to a common width so the
+    /// "(＋ Add …)" actions all line up in one column, even though the section
+    /// labels differ in length (e.g. "Form" vs "Captures").
+    #[test]
+    fn all_view_aligns_empty_section_add_actions() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        // An all-empty request renders every section as a compact line.
+        let entry = HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "");
+        let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        let mut term = Terminal::new(TestBackend::new(90, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let out = buffer_text(term.backend().buffer());
+
+        // Column of the "(" in each compact line (measured from the line start).
+        let add_col = |label: &str| -> Option<usize> {
+            out.lines()
+                .find(|l| l.contains(label) && l.contains("Add "))
+                .and_then(|l| l.find('('))
+        };
+        let cols: Vec<usize> = ["Form", "Headers", "Captures", "Reports"]
+            .iter()
+            .filter_map(|l| add_col(l))
+            .collect();
+        assert_eq!(cols.len(), 4, "expected four compact section lines:\n{out}");
+        assert!(
+            cols.iter().all(|c| *c == cols[0]),
+            "the '(＋ Add …)' actions should all start at the same column, got {cols:?}:\n{out}"
+        );
+    }
 }

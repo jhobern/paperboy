@@ -1640,13 +1640,44 @@ fn all_section_empty_meta(
     }
 }
 
+/// The column at which the compact empty-section lines' `(＋ Add …)` actions
+/// start: the widest section label plus a small gap. Padding every label to
+/// this width lines the actions up in a single column in the stacked "All"
+/// view, regardless of the (varying, per-language) label lengths. Body is
+/// excluded — it never renders as a compact "＋ Add …" line.
+fn empty_section_add_col(s: &Strings) -> usize {
+    [
+        s.field_headers,
+        s.field_cookies,
+        s.field_queries,
+        s.field_options,
+        s.field_form,
+        s.field_asserts,
+        s.field_captures,
+        s.field_reports,
+    ]
+    .iter()
+    .map(|l| Span::raw(*l).width())
+    .max()
+    .unwrap_or(0)
+        + 3
+}
+
 /// Draw section `i` of the stacked "All" view into `area`. Empty sections
 /// render as one compact "Label   + Add …" line; populated ones split `area`
 /// into a label row and a table body and defer to the section's own drawer.
 fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
     if all_section_is_empty(form, i) {
         let (label, add_label, add_field) = all_section_empty_meta(form, i, s);
-        draw_empty_section_line(f, area, label, add_label, form.focus == add_field, th);
+        draw_empty_section_line(
+            f,
+            area,
+            label,
+            add_label,
+            empty_section_add_col(s),
+            form.focus == add_field,
+            th,
+        );
         return;
     }
     let label = Rect { height: 1, ..area };
@@ -1701,21 +1732,25 @@ fn draw_section_label(f: &mut Frame, area: Rect, text: &str, focused: bool, th: 
 /// Render an empty "All"-view section as a single line: its label followed by
 /// the "+ Add …" action in parentheses, with the column-title row omitted
 /// (there are no rows to label). Parenthesising the action keeps it reading as
-/// a button rather than a run-on continuation of the label. The whole line is
-/// the section's coloured title band (accent when focused), matching the filled
-/// title bands of the populated sections.
+/// a button rather than a run-on continuation of the label; padding the label
+/// to `add_col` display columns lines the actions up across sections despite
+/// their differing label widths. The whole line is the section's coloured title
+/// band (accent when focused), matching the filled title bands of the populated
+/// sections.
 fn draw_empty_section_line(
     f: &mut Frame,
     area: Rect,
     label: &str,
     add_label: &str,
+    add_col: usize,
     focused: bool,
     th: &Theme,
 ) {
     let (fg, bg) = section_label_colors(focused, th);
     let text_style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let pad = add_col.saturating_sub(Span::raw(label).width());
     let line = Line::from(vec![
-        Span::styled(format!("{label}   "), text_style),
+        Span::styled(format!("{label}{}", " ".repeat(pad)), text_style),
         Span::styled(format!("({add_label})"), text_style),
     ]);
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);

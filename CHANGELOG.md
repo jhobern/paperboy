@@ -18,7 +18,9 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the stacked "All" view it's obvious where one section ends and the next
   begins. The section the cursor is in gets a solid accent bar (matching the
   active section-tab styling); the others get a subtle inset band, and empty
-  sections' compact `Label   (＋ Add …)` lines share the same banding.
+  sections' compact `Label   (＋ Add …)` lines share the same banding, with
+  their labels padded to a common width so the `(＋ Add …)` actions all line up
+  in one column despite the differing label lengths.
 
 - **The build no longer needs a system libcurl.** libcurl and OpenSSL are now
   compiled and statically linked from source (via the `curl` crate's
