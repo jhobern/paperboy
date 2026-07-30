@@ -76,6 +76,14 @@ pub enum WsRow {
         name: String,
         depth: usize,
     },
+    /// An environment file (`.vars`).  Selecting it loads the file as a global
+    /// environment (the same path as File → Load → Environment) rather than
+    /// trying to parse it as a collection.
+    Environment {
+        path: PathBuf,
+        name: String,
+        depth: usize,
+    },
     /// A request shown indented under its [`WsRow::Collection`] row; `depth` is
     /// the collection's depth + 1. `collection` is the owning file's path and
     /// `idx` the request's position within it. When `loaded` is true the file
@@ -306,6 +314,12 @@ impl Collection {
                         name: entry.display_name,
                         depth: d,
                     });
+                } else if crate::workspace::is_env_file(&entry.path) {
+                    out.push(WsRow::Environment {
+                        path: entry.path,
+                        name: entry.display_name,
+                        depth: d,
+                    });
                 } else {
                     let expanded = self.workspace_expanded.contains(&entry.path);
                     let path = entry.path.clone();
@@ -383,7 +397,11 @@ impl Collection {
         let loaded = self.path.clone();
         let paths: Vec<PathBuf> = self.workspace_expanded.iter().cloned().collect();
         for p in paths {
-            if Some(&p) == loaded.as_ref() || !p.is_file() || crate::workspace::is_report_file(&p) {
+            if Some(&p) == loaded.as_ref()
+                || !p.is_file()
+                || crate::workspace::is_report_file(&p)
+                || crate::workspace::is_env_file(&p)
+            {
                 continue;
             }
             let names = read_collection_labels(&p);

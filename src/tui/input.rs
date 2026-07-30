@@ -835,6 +835,17 @@ impl TuiApp {
             // Ctrl+R (Requests list) reverts the selected request to its saved
             // on-disk version, discarding its in-memory edits (#19).
             KeyCode::Char('r') if ctrl && self.focus == Pane::List => self.begin_revert_request(),
+            // Ctrl+F (Workspace file-tree) toggles the extension filter that
+            // hides non-workspace files (images, build output, …) so the tree
+            // shows only `.hurl/.json/.vars/.trail`. Mirrors the picker's Tab
+            // toggle, but the tree can't reuse Tab (there it cycles focus).
+            KeyCode::Char('f')
+                if ctrl
+                    && self.focus == Pane::List
+                    && self.collections[self.active_tab].is_workspace() =>
+            {
+                self.toggle_workspace_tree_filter(self.active_tab);
+            }
             // Reopens the most recently closed tab. Deliberately a plain
             // unmodified key rather than a Ctrl+Shift combo: terminal emulators
             // commonly intercept Ctrl+Shift+T themselves (as "new tab") before
@@ -1106,6 +1117,11 @@ impl TuiApp {
                             self.collections[ci].sync_folder_to_selected();
                             self.collections[ci].sync_ws_cursor();
                         }
+                    }
+                    // An environment file: Right opens it as a global
+                    // environment (mirrors Enter), same as File → Load → Env.
+                    Some(crate::collection::WsRow::Environment { path, .. }) => {
+                        self.open_workspace_environment(&path);
                     }
                     // The expanded collection, or a request of the loaded
                     // collection: scroll the URL.
@@ -1515,6 +1531,12 @@ impl TuiApp {
                     self.focus = Pane::Main;
                 }
             }
+            crate::collection::WsRow::Environment { path, .. } => {
+                // Load the `.vars` file as a global environment — the same path
+                // as File → Load → Environment. Focus stays on the tree; the new
+                // environment appears in the Global Environments panel.
+                self.open_workspace_environment(&path);
+            }
             crate::collection::WsRow::Request {
                 collection,
                 idx,
@@ -1540,6 +1562,36 @@ impl TuiApp {
                 }
             }
         }
+    }
+
+    /// Load a workspace `.vars` file as a global environment (reusing the
+    /// File → Load → Environment code path). Reports a read error via the status
+    /// line if the file can't be read.
+    fn open_workspace_environment(&mut self, path: &std::path::Path) {
+        if let Some(p) = path.to_str() {
+            self.do_file_action(FileAction::LoadEnv, p);
+        }
+    }
+
+    /// Toggle the Workspace tree's extension filter (`Ctrl+F`): on shows only
+    /// the workspace's own file types (`.hurl/.json/.vars/.trail`); off shows
+    /// every file. Persisted via `workspace_filter_hurl_json` (shared with the
+    /// picker), so it survives across sessions and both surfaces agree.
+    fn toggle_workspace_tree_filter(&mut self, ci: usize) {
+        let on = {
+            let col = &mut self.collections[ci];
+            col.workspace_filter_hurl_json = !col.workspace_filter_hurl_json;
+            col.workspace_filter_hurl_json
+        };
+        // The visible row set changes with the filter; clamp the cursor to the
+        // new length and reconcile the right pane with the newly-highlighted row.
+        let len = self.collections[ci].ws_rows().len();
+        if self.collections[ci].list_cursor >= len {
+            self.collections[ci].list_cursor = len.saturating_sub(1);
+        }
+        self.workspace_select_highlighted(ci);
+        self.save_state();
+        self.status = Some(Status::WorkspaceTreeFilter(on));
     }
 
     /// Reconcile a Workspace tab's right pane with whichever tree row is
@@ -1599,6 +1651,7 @@ impl TuiApp {
                 crate::collection::WsRow::Folder { depth, .. } => *depth,
                 crate::collection::WsRow::Collection { depth, .. } => *depth,
                 crate::collection::WsRow::Report { depth, .. } => *depth,
+                crate::collection::WsRow::Environment { depth, .. } => *depth,
                 crate::collection::WsRow::Request { depth, .. } => *depth,
             }
         }

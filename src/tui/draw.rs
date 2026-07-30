@@ -118,6 +118,8 @@ const COLLECTION_OPEN_ICON: &str = "\u{25BE}"; // ▾
 pub(crate) const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
 /// Marks a PaperTrail report file in the Workspace tree (a document/chart glyph).
 pub(crate) const REPORT_ICON: &str = "\u{1F4CA}"; // 📊
+/// Marks an environment file (`.vars`) in the Workspace tree.
+pub(crate) const ENV_ICON: &str = "\u{1F310}"; // 🌐
 
 /// A rendered row of the request list, unifying the ordinary title-folder
 /// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
@@ -150,6 +152,12 @@ enum LeftRow {
         loaded: bool,
     },
     Report {
+        name: String,
+        depth: usize,
+    },
+    /// An environment file (`.vars`) in a Workspace tree; opening it loads the
+    /// file as a global environment.
+    Environment {
         name: String,
         depth: usize,
     },
@@ -201,6 +209,7 @@ impl LeftRow {
                         }
                     }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
+                    WsRow::Environment { name, depth, .. } => LeftRow::Environment { name, depth },
                     WsRow::Request {
                         idx,
                         depth,
@@ -1037,6 +1046,13 @@ pub(crate) fn draw_collection_left(
                 let indent = "  ".repeat(*depth);
                 ListItem::new(Line::from(Span::styled(
                     format!("{indent}{REPORT_ICON} {name}"),
+                    Style::default().fg(th.accent),
+                )))
+            }
+            LeftRow::Environment { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{ENV_ICON} {name}"),
                     Style::default().fg(th.accent),
                 )))
             }

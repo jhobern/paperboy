@@ -165,8 +165,10 @@ strings! {
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
-    workspace_filter_on => "Filter: .hurl/.json/.trail", "Filtre : .hurl/.json/.trail", "Filter: .hurl/.json/.trail";
+    workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
+    workspace_tree_filter_on => "Tree filter on: .hurl/.json/.vars/.trail only", "Filtre de l'arbre activé : .hurl/.json/.vars/.trail uniquement", "Træfilter til: kun .hurl/.json/.vars/.trail";
+    workspace_tree_filter_off => "Tree filter off: showing all files", "Filtre de l'arbre désactivé : tous les fichiers affichés", "Træfilter fra: viser alle filer";
     workspace_no_files => "No matching files in this folder.", "Aucun fichier correspondant dans ce dossier.", "Ingen matchende filer i denne mappe.";
     tab_request => "Scratch Space", "Brouillon", "Kladde";
     run_entry => "▶ Run", "▶ Exécuter", "▶ Kør";
@@ -759,6 +761,10 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// The Workspace tree's extension filter was toggled (`Ctrl+F`). `true`
+    /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
+    /// `false` shows every file.
+    WorkspaceTreeFilter(bool),
 }
 
 impl Status {
@@ -790,6 +796,7 @@ impl Status {
                     | Status::ReportNodeUndone(_)
                     | Status::RequestReverted(_)
                     | Status::EnvReverted(_)
+                    | Status::WorkspaceTreeFilter(_)
             ),
         }
     }
@@ -899,6 +906,13 @@ impl Status {
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::WorkspaceTreeFilter(on) => {
+                if *on {
+                    s.workspace_tree_filter_on.to_string()
+                } else {
+                    s.workspace_tree_filter_off.to_string()
+                }
+            }
         }
     }
 }

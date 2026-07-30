@@ -30,11 +30,13 @@ pub struct WsEntry {
 /// entries (each directory immediately followed by its children) — folders
 /// sorted before files at each level, then alphabetically within each group.
 ///
-/// When `filter_hurl_json` is `true`, only `.hurl`/`.json` files are
+/// When `filter_hurl_json` is `true`, only the workspace's own file types
+/// (`.hurl`/`.json` collections, `.vars` environments, `.trail` reports) are
 /// included, and any directory whose subtree contains none of those files is
-/// omitted entirely (so an unrelated folder full of other file types doesn't
-/// clutter the tree). When `false`, every non-hidden file is shown and no
-/// directory is hidden for being "empty" of matches.
+/// omitted entirely (so an unrelated folder full of other file types — images,
+/// build artifacts, … — doesn't clutter the tree). When `false`, every
+/// non-hidden file is shown and no directory is hidden for being "empty" of
+/// matches.
 ///
 /// Hidden entries (dot-prefixed names, e.g. `.git`) are always excluded.
 /// Unreadable directories are silently skipped rather than failing the
@@ -111,10 +113,11 @@ fn scan_dir(dir: &Path, depth: usize, filter_hurl_json: bool, out: &mut Vec<WsEn
 }
 
 /// Whether `path`'s extension marks it as a file the Workspace tree shows: a
-/// collection (`.hurl`/`.json`) or a PaperTrail report (`.trail`) — always
-/// `true` when the filter is off. Reports are surfaced so a workspace can hold
-/// (and run) reports alongside the collections they drive; the tree classifies
-/// them by extension (see [`is_report_file`]).
+/// collection (`.hurl`/`.json`), an environment (`.vars`) or a PaperTrail report
+/// (`.trail`) — always `true` when the filter is off. Environments and reports
+/// are surfaced so a workspace can hold (and open/run) them alongside the
+/// collections they drive; the tree classifies each by extension (see
+/// [`is_report_file`] and [`is_env_file`]).
 fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
     if !filter_hurl_json {
         return true;
@@ -123,6 +126,7 @@ fn is_matching_file(path: &Path, filter_hurl_json: bool) -> bool {
         Some(ext) => {
             ext.eq_ignore_ascii_case("hurl")
                 || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("vars")
                 || ext.eq_ignore_ascii_case("trail")
         }
         None => false,
@@ -137,6 +141,16 @@ pub fn is_report_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("trail"))
+}
+
+/// Whether `path` is an environment file (`.vars`, case-insensitive). The
+/// Workspace tree uses this to tell an environment apart from a collection file
+/// (both are surfaced by [`is_matching_file`]), so selecting one opens it as a
+/// global environment rather than trying to parse it as a collection.
+pub fn is_env_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("vars"))
 }
 
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any
@@ -303,13 +317,19 @@ mod tests {
         let root = tmp_dir("filter_on");
         fs::write(root.join("keep.hurl"), "").unwrap();
         fs::write(root.join("KEEP.JSON"), "").unwrap();
+        fs::write(root.join("env.vars"), "").unwrap();
+        fs::write(root.join("run.trail"), "").unwrap();
         fs::write(root.join("skip.txt"), "").unwrap();
+        fs::write(root.join("skip.png"), "").unwrap();
 
         let entries = scan_workspace(&root, true);
         let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"keep.hurl"));
         assert!(names.contains(&"KEEP.JSON"));
+        assert!(names.contains(&"env.vars"));
+        assert!(names.contains(&"run.trail"));
         assert!(!names.contains(&"skip.txt"));
+        assert!(!names.contains(&"skip.png"));
 
         let _ = fs::remove_dir_all(&root);
     }

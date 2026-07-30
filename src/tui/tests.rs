@@ -13732,6 +13732,122 @@ fn workspace_rows_list_folders_and_collections_and_inline_the_open_collections_r
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `.vars` environment file in the workspace is surfaced as its own
+/// `WsRow::Environment` row (not mis-classified as a collection), so selecting
+/// it can load it as an environment rather than trying to parse it as requests.
+#[test]
+fn a_vars_file_in_the_workspace_tree_is_an_environment_row_not_a_collection() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_env_row_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.hurl"), "GET https://example.com/a\n").unwrap();
+    std::fs::write(dir.join("staging.vars"), "BASE=https://staging\n").unwrap();
+
+    let (app, ci) = workspace_app(&dir);
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Environment { name, .. } if name == "staging.vars")),
+        "staging.vars appears as an Environment row"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "staging.vars")),
+        "staging.vars is not mis-classified as a Collection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pressing Enter (or Right) on a `.vars` row loads it as a global environment,
+/// exactly like File → Load → Environment.
+#[test]
+fn opening_a_vars_row_loads_it_as_a_global_environment() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_env_open_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("staging.vars"),
+        "BASE=https://staging\nTOKEN=abc\n",
+    )
+    .unwrap();
+
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let rows = app.collections[ci].ws_rows();
+    let env_idx = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Environment { .. }))
+        .expect("an environment row exists");
+    app.collections[ci].list_cursor = env_idx;
+
+    assert!(app.global_envs.is_empty(), "no environments loaded yet");
+    app.on_enter();
+    assert_eq!(
+        app.global_envs.len(),
+        1,
+        "the .vars file was loaded as a global environment"
+    );
+    assert_eq!(app.global_envs[0].name, "staging");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Ctrl+F` on the workspace tree toggles the extension filter: off shows every
+/// file (e.g. a stray image / notes file), on hides everything but the
+/// workspace's own file types. The choice is persisted on the collection.
+#[test]
+fn ctrl_f_toggles_the_workspace_tree_extension_filter() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_treefilter_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.hurl"), "GET https://example.com/a\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "just notes").unwrap();
+    std::fs::write(dir.join("logo.png"), "not an image really").unwrap();
+
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    assert!(
+        app.collections[ci].workspace_filter_hurl_json,
+        "the filter defaults on"
+    );
+    let has_noise = |app: &TuiApp| {
+        app.collections[ci].ws_rows().iter().any(|r| {
+            matches!(r, WsRow::Collection { name, .. } if name == "notes.txt" || name == "logo.png")
+        })
+    };
+    assert!(
+        !has_noise(&app),
+        "non-workspace files hidden while filter on"
+    );
+
+    // Ctrl+F turns the filter off — the stray files now show.
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(!app.collections[ci].workspace_filter_hurl_json);
+    assert!(
+        has_noise(&app),
+        "stray files visible once the filter is off"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceTreeFilter(false))
+    ));
+
+    // Ctrl+F again turns it back on.
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(app.collections[ci].workspace_filter_hurl_json);
+    assert!(!has_noise(&app), "stray files hidden again");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceTreeFilter(true))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn enter_on_a_workspace_folder_toggles_expand_collapse() {
     use crate::collection::WsRow;
@@ -14646,7 +14762,7 @@ fn the_workspace_picker_popup_renders_its_tree_filter_state_and_footer_hint() {
         ))),
         ..Default::default()
     };
-    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());

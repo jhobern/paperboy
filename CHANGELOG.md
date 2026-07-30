@@ -48,6 +48,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Workspace tree: environments show as their own rows, `.vars` is filtered
+  in, and `Ctrl+F` toggles the filter.** Environment files (`.vars`) in a
+  workspace now appear in the tree with a distinct icon and open (Enter / Right)
+  as a global environment — the same as File → Load → Environment — instead of
+  being mis-parsed as a collection. The tree's file-type filter now includes
+  `.vars` alongside `.hurl`, `.json` and `.trail`, and **Ctrl+F** toggles that
+  filter directly from the tree (previously only reachable from the `w`
+  picker's Tab), so folders cluttered with images or other files can be shown or
+  hidden without leaving the tree. The choice is persisted per workspace.
+
 - **The request `[Options]` section is now editable in the wizard.** A new
   **Options** section tab (between Queries and Form) lets you add, edit, disable
   and delete Hurl request options (`retry`, `insecure`, `variable: host=…`, and
