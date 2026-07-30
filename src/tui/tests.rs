@@ -3430,6 +3430,41 @@ fn intact_secret_renders_fixed_eight_dots_regardless_of_length() {
 }
 
 #[test]
+fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    // The workspace "New report" prompt has a long title; on the fixed-width
+    // single-line box it used to be clipped by the panel border, hiding the
+    // trailing "Esc cancel" (and the box's own right edge).
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::Prompt {
+        kind: PromptKind::NewWorkspaceReport(0),
+        editor: super::editor::Editor::blank(),
+        title: s.workspace_new_report_title.to_string(),
+        mask: false,
+        reset_to: None,
+        secret_intact: false,
+        secret_checkbox: None,
+    });
+    let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    let full = format!(
+        "{}  ({})",
+        s.workspace_new_report_title, s.prompt_save_hint_sl
+    );
+    assert!(
+        out.contains(&full),
+        "the full prompt title should be visible (box widened to fit it):\n{out}"
+    );
+}
+
+#[test]
 fn git_icon_shown_on_tab_and_requests_list_title_only_for_git_origin_collections() {
     use crate::git_remote::{GitOrigin, RefKind};
     use crate::i18n::{Language, Strings};

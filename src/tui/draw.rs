@@ -3043,13 +3043,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             } else {
                 3
             };
-            let w = if ml {
-                (f.area().width * 8 / 10).max(30)
-            } else {
-                64
-            };
-            let area = centered_rect(w, h, f.area());
-            f.render_widget(Clear, area);
+            // Build the title/hint first so the box can be widened to fit it:
+            // long titles (e.g. the workspace "New report (path relative to
+            // workspace)" prompt — longer still in other languages) were being
+            // clipped by the panel border on the fixed-width single-line box.
             let mut hint = if matches!(kind, PromptKind::Raw(_)) {
                 format!("{title}  ({})", s.raw_mode_hint)
             } else if matches!(kind, PromptKind::RawJson(_)) {
@@ -3070,6 +3067,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             if secret_checkbox.is_some() {
                 hint.push_str(&format!("  ·  {}", s.env_still_secret_hint));
             }
+            let base_w = if ml {
+                (f.area().width * 8 / 10).max(30)
+            } else {
+                64
+            };
+            // Widen to fit the title on the top border — 2 columns for the
+            // corners plus a little breathing room — but never past the
+            // terminal width (centered_rect clamps too).
+            let title_w = Line::from(hint.as_str()).width() as u16;
+            let w = base_w.max(title_w.saturating_add(4)).min(f.area().width);
+            let area = centered_rect(w, h, f.area());
+            f.render_widget(Clear, area);
             let block = panel(hint, true, th);
             let inner = block.inner(area);
             f.render_widget(block, area);

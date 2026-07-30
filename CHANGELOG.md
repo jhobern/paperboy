@@ -633,6 +633,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Prompt dialogs no longer clip their title.** A single-line prompt used a
+  fixed-width box, so a long title — most visibly the workspace **New report
+  (path relative to workspace)** prompt, and longer still in French/Danish —
+  ran past the panel border and lost its trailing `Esc cancel` (and the box's
+  own right edge). The box now widens to fit its title (clamped to the terminal
+  width).
+
 - **The request wizard's combined "All" view no longer hides populated
   sections when several are stacked.** With nine sections (Headers, Cookies,
   Queries, Options, Form, Body, Asserts, Captures, Reports) the fixed layout
