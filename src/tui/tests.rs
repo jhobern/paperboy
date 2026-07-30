@@ -871,6 +871,46 @@ fn arrow_up_stops_at_every_section_it_passes_through_just_like_arrow_down_does()
 }
 
 #[test]
+fn arrow_up_from_the_first_cookie_stops_at_the_populated_headers_add_row() {
+    // Regression: with headers present, Up out of the first Cookie row used to
+    // jump straight onto the last header row, skipping the Headers section's
+    // pinned "+ Add header" line entirely. It must stop there first — mirroring
+    // Down (last header -> "+ Add header" -> first cookie) — and only step onto
+    // the last header row on the following Up.
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.headers = vec![
+        ("H0".to_string(), "v0".to_string(), true),
+        ("H1".to_string(), "v1".to_string(), true),
+    ];
+    entry.cookies = vec![("C0".to_string(), "cv0".to_string(), true)];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // open the Edit Request wizard
+
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.focus = NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key);
+    } else {
+        panic!("expected the Edit Request wizard to open");
+    }
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Header),
+        "Up from the first Cookie row must stop on the Headers '+ Add header' row"
+    );
+
+    press(&mut app, KeyCode::Up);
+    assert!(
+        matches!(new_focus(&app), NewField::Kvd(KvdKind::Header, 1, _)),
+        "the next Up steps onto the last (populated) header row, got {:?}",
+        new_focus(&app)
+    );
+}
+
+#[test]
 fn arrow_up_from_the_first_form_field_stops_at_cookies_then_headers_one_section_at_a_time() {
     // Same bug, but two empty sections in a row above the current one
     // (Cookies then Headers) — Up must stop at each in turn, never
@@ -20687,4 +20727,119 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         data_row, 3,
         "with scroll=3, clicking y_off=1 should select data_row 3"
     );
+}
+
+#[cfg(test)]
+mod all_view_layout {
+    use super::*;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// A request whose headers sit under a blank line (the repro) parses into
+    /// seven headers; the combined "All" view must actually render them (the
+    /// regression showed the Headers table squeezed to zero data rows because
+    /// the nine stacked sections' chrome overflowed the dialog body).
+    #[test]
+    fn all_view_renders_header_rows_and_compacts_empty_sections() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry::from_fields("Get token", "POST", "{{ URL }}/oauth2", vec![], "");
+        entry.headers = vec![
+            ("Content-Length".into(), "0".into(), true),
+            ("User-Agent".into(), "crabman/0.1.0".into(), true),
+            ("Accept".into(), "*/*".into(), true),
+            ("Accept-Encoding".into(), "gzip, deflate, br".into(), true),
+            ("client_id".into(), "{{ CLIENT_ID }}".into(), true),
+            ("client_secret".into(), "{{ CLIENT_SECRET }}".into(), true),
+            ("grant_type".into(), "client_credentials".into(), true),
+        ];
+        // The default the wizard opens in (view_tab = All).
+        let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let out = buffer_text(term.backend().buffer());
+
+        // At least five of the seven header keys must be visible (the section's
+        // own scrollbar caps it at five data rows, but zero is the bug).
+        let visible = [
+            "Content-Length",
+            "User-Agent",
+            "Accept",
+            "Accept-Encoding",
+            "client_id",
+        ]
+        .iter()
+        .filter(|k| out.contains(**k))
+        .count();
+        assert!(
+            visible >= 5,
+            "expected the Headers table to show its rows, saw {visible}:\n{out}"
+        );
+
+        // Empty sections collapse to a single "Label   + Add …" line: the Add
+        // action shares the Cookies label row rather than sitting under its own
+        // "Value"/"Description" column-title row (which is omitted when empty).
+        assert!(
+            out.lines()
+                .any(|l| l.contains(s.field_cookies) && l.contains("Add cookie")),
+            "empty Cookies section should render as one compact 'label + Add' line:\n{out}"
+        );
+    }
+
+    /// When the stacked sections are collectively taller than the dialog body,
+    /// the whole "All" view scrolls (whole sections at a time) to keep the
+    /// focused section on screen, and a scrollbar appears.
+    #[test]
+    fn all_view_scrolls_to_keep_the_focused_section_visible() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+
+        let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+        entry.headers = (0..6)
+            .map(|i| (format!("SecretHeader{i}"), format!("v{i}"), true))
+            .collect();
+        entry.captures = (0..3)
+            .map(|i| (format!("cap{i}"), format!("jsonpath \"$.c{i}\"")))
+            .collect();
+        entry.reports = vec![
+            ("myreport".into(), "jsonpath \"$.overall\"".into()),
+            ("second".into(), "jsonpath \"$.second\"".into()),
+        ];
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+
+        // A short terminal forces the stack to overflow the dialog body.
+        let render = |form: &NewReq| {
+            let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            term.draw(|f| super::super::new_request::draw_new_request(f, form, &s, &th, true))
+                .unwrap();
+            buffer_text(term.backend().buffer())
+        };
+
+        // Focused on a Reports cell: Reports scrolls into view (and the top
+        // Headers section scrolls off), with a scrollbar thumb visible.
+        form.focus = NewField::Report(0, CapCol::Name);
+        let out = render(&form);
+        assert!(
+            out.contains("myreport"),
+            "the focused Reports section should be scrolled into view:\n{out}"
+        );
+        assert!(
+            !out.contains("SecretHeader0"),
+            "the far-away Headers section should have scrolled off:\n{out}"
+        );
+        assert!(
+            out.contains('\u{2588}'),
+            "a scrollbar thumb should appear when the stack overflows:\n{out}"
+        );
+
+        // Focusing a Header cell scrolls the top section back into view.
+        form.focus = NewField::Kvd(KvdKind::Header, 0, HdrCol::Key);
+        let out = render(&form);
+        assert!(
+            out.contains("SecretHeader0"),
+            "focusing a Header cell should scroll Headers back into view:\n{out}"
+        );
+    }
 }

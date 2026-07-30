@@ -276,17 +276,15 @@ impl NewReq {
         }
     }
 
-    /// Where Up-arrow lands when leaving the first row of the *next* section
-    /// upward into `kind`'s section: its last row if any exist, otherwise its
-    /// "+ Add …" row — arrow-key row navigation stops at every section exactly
-    /// like Down does, so an empty section is never skipped over.
+    /// Where Up-arrow lands when arrowing up out of the section below into
+    /// `kind`'s section: its "+ Add …" row. The Add row is pinned at the bottom
+    /// of every section — below the last data row and above the next section —
+    /// so it is the first stop when entering the section from below, whether or
+    /// not the section has any data rows. (Down mirrors this: the last data row
+    /// steps onto the Add row before leaving the section.) From the Add row a
+    /// further Up walks back up through the data rows, so no row is skipped.
     pub(crate) fn up_into_kvd(&self, kind: KvdKind) -> NewField {
-        let sec = self.kvd(kind);
-        if sec.is_empty() {
-            kind.add_field()
-        } else {
-            kind.field(sec.len() - 1, HdrCol::Key)
-        }
+        kind.add_field()
     }
 
     /// Where Up-arrow lands when leaving the first row of `kind`'s section

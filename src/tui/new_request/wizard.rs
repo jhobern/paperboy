@@ -509,6 +509,11 @@ pub(crate) struct NewReq {
     pub(crate) assert_scroll: std::cell::Cell<usize>,
     pub(crate) capture_scroll: std::cell::Cell<usize>,
     pub(crate) report_scroll: std::cell::Cell<usize>,
+    /// Index of the first visible section in the combined "All" view when the
+    /// nine stacked sections are collectively taller than the dialog body.
+    /// Persisted between renders so the scroll position stays put, moving only
+    /// as far as needed to keep the focused section on screen.
+    pub(crate) all_scroll: std::cell::Cell<usize>,
     /// Directory Form file paths are resolved against for the existence check
     /// (the saved collection's own directory, per Hurl's "relative to the
     /// input Hurl file" rule); `None` (Scratch Space, unsaved) resolves
@@ -570,6 +575,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: None,
             view_tab: WizardTab::All,
@@ -698,6 +704,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: Some((ci, ei)),
             view_tab: WizardTab::All,
@@ -1528,6 +1535,167 @@ pub(crate) fn section_height(header_h: u16, row_count: usize) -> u16 {
     header_h + (row_count.min(5) as u16) + 1
 }
 
+/// Number of stacked sections in the combined "All" view (Headers, Cookies,
+/// Queries, Options, Form, Body, Asserts, Captures, Reports — in that order).
+pub(crate) const SECTION_COUNT: usize = 9;
+
+/// Map a [`WizardTab`] to its index in the stacked "All" view (the order the
+/// sections are drawn). `All` has no position of its own.
+pub(crate) fn wizard_tab_section_index(tab: WizardTab) -> Option<usize> {
+    Some(match tab {
+        WizardTab::All => return None,
+        WizardTab::Headers => 0,
+        WizardTab::Cookies => 1,
+        WizardTab::Queries => 2,
+        WizardTab::Options => 3,
+        WizardTab::Form => 4,
+        WizardTab::Body => 5,
+        WizardTab::Asserts => 6,
+        WizardTab::Captures => 7,
+        WizardTab::Reports => 8,
+    })
+}
+
+/// Whether section `i` (see [`wizard_tab_section_index`]) has no rows. The Body
+/// (index 5) is never "empty" for layout purposes — it always shows its editor.
+fn all_section_is_empty(form: &NewReq, i: usize) -> bool {
+    match i {
+        0 => form.headers.is_empty(),
+        1 => form.cookies.is_empty(),
+        2 => form.queries.is_empty(),
+        3 => form.options.is_empty(),
+        4 => form.form_fields.is_empty(),
+        5 => false,
+        6 => form.asserts.is_empty(),
+        7 => form.captures.is_empty(),
+        8 => form.reports.is_empty(),
+        _ => true,
+    }
+}
+
+/// Natural height section `i` wants in the stacked "All" view. An empty section
+/// collapses to a single combined "Label   + Add …" line; a populated one is a
+/// label line plus its [`section_height`] table. Body is always its label plus
+/// a fixed four-row editor.
+fn all_section_block_h(form: &NewReq, i: usize) -> u16 {
+    if i == 5 {
+        return 1 + 4; // Body: label + editor
+    }
+    let (count, header_h) = match i {
+        0 => (form.headers.len(), 1),
+        1 => (form.cookies.len(), 1),
+        2 => (form.queries.len(), 1),
+        3 => (form.options.len(), 1),
+        4 => (form.form_fields.len(), 1),
+        6 => (form.asserts.len(), 0),
+        7 => (form.captures.len(), 1),
+        8 => (form.reports.len(), 1),
+        _ => (0, 1),
+    };
+    if count == 0 {
+        1
+    } else {
+        1 + section_height(header_h, count)
+    }
+}
+
+/// Label, "+ Add …" text and Add-row focus target for section `i`'s compact
+/// (empty) rendering.
+fn all_section_empty_meta(
+    form: &NewReq,
+    i: usize,
+    s: &Strings,
+) -> (&'static str, &'static str, NewField) {
+    let _ = form;
+    match i {
+        0 => (
+            KvdKind::Header.title(s),
+            KvdKind::Header.add_label(s),
+            KvdKind::Header.add_field(),
+        ),
+        1 => (
+            KvdKind::Cookie.title(s),
+            KvdKind::Cookie.add_label(s),
+            KvdKind::Cookie.add_field(),
+        ),
+        2 => (
+            KvdKind::Query.title(s),
+            KvdKind::Query.add_label(s),
+            KvdKind::Query.add_field(),
+        ),
+        3 => (
+            KvdKind::Options.title(s),
+            KvdKind::Options.add_label(s),
+            KvdKind::Options.add_field(),
+        ),
+        4 => (s.field_form, s.add_form_field, NewField::AddFormField),
+        6 => (s.field_asserts, s.add_assert, NewField::AddAssert),
+        7 => (s.field_captures, s.add_capture, NewField::AddCapture),
+        8 => (s.field_reports, s.add_report, NewField::AddReport),
+        _ => (
+            s.field_headers,
+            s.add_header,
+            NewField::AddKvd(KvdKind::Header),
+        ),
+    }
+}
+
+/// Draw section `i` of the stacked "All" view into `area`. Empty sections
+/// render as one compact "Label   + Add …" line; populated ones split `area`
+/// into a label row and a table body and defer to the section's own drawer.
+fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+    if all_section_is_empty(form, i) {
+        let (label, add_label, add_field) = all_section_empty_meta(form, i, s);
+        draw_empty_section_line(f, area, label, add_label, form.focus == add_field, th);
+        return;
+    }
+    let label = Rect { height: 1, ..area };
+    let table = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    match i {
+        0 => draw_kvd_section(f, label, table, form, KvdKind::Header, s, th),
+        1 => draw_kvd_section(f, label, table, form, KvdKind::Cookie, s, th),
+        2 => draw_kvd_section(f, label, table, form, KvdKind::Query, s, th),
+        3 => draw_kvd_section(f, label, table, form, KvdKind::Options, s, th),
+        4 => draw_form_section(f, label, table, form, s, th),
+        5 => draw_body_section(f, label, table, form, s, th),
+        6 => draw_asserts_section(f, label, table, form, s, th),
+        7 => draw_captures_section(f, label, table, form, s, th),
+        8 => draw_reports_section(f, label, table, form, s, th),
+        _ => {}
+    }
+}
+
+/// Render an empty "All"-view section as a single line: its label followed by
+/// the "+ Add …" action in parentheses, with the column-title row omitted
+/// (there are no rows to label). Parenthesising the action keeps it reading as
+/// a button rather than a run-on continuation of the label. Both go accent when
+/// the Add row is focused.
+fn draw_empty_section_line(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    add_label: &str,
+    focused: bool,
+    th: &Theme,
+) {
+    let color = if focused { th.accent } else { th.dim };
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{label}   "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({add_label})"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
 pub(crate) fn draw_new_request(
     f: &mut Frame,
     form: &NewReq,
@@ -1676,37 +1844,101 @@ pub(crate) fn draw_new_request(
     draw_wizard_tab_bar(f, rows[4], form.view_tab, &form.tab_order, s, th);
 
     if form.view_tab == WizardTab::All {
-        let sub = Layout::vertical([
-            Constraint::Length(1),                                         // headers label
-            Constraint::Length(section_height(1, form.headers.len())),     // headers table
-            Constraint::Length(1),                                         // cookies label
-            Constraint::Length(section_height(1, form.cookies.len())),     // cookies table
-            Constraint::Length(1),                                         // queries label
-            Constraint::Length(section_height(1, form.queries.len())),     // queries table
-            Constraint::Length(1),                                         // options label
-            Constraint::Length(section_height(1, form.options.len())),     // options table
-            Constraint::Length(1),                                         // form label
-            Constraint::Length(section_height(1, form.form_fields.len())), // form table
-            Constraint::Length(1),                                         // body label
-            Constraint::Length(4),                                         // body editor
-            Constraint::Length(1),                                         // asserts label
-            Constraint::Length(section_height(0, form.asserts.len())),     // asserts table
-            Constraint::Length(1),                                         // captures label
-            Constraint::Length(section_height(1, form.captures.len())),    // captures table
-            Constraint::Length(1),                                         // reports label
-            Constraint::Length(section_height(1, form.reports.len())),     // reports table
-        ])
-        .split(rows[5]);
+        // Natural height each section wants in the stacked "All" layout. Empty
+        // sections collapse to a single "Label   + Add …" line (no column-title
+        // row) — with nine sections stacked, the wasted chrome of an empty
+        // section's header/column-titles/Add rows would otherwise crowd out the
+        // populated ones. When the naturally-sized stack is still taller than
+        // the dialog body, the whole stack scrolls (whole sections at a time,
+        // keeping the focused one on screen) with a scrollbar in the reclaimed
+        // rightmost column.
+        let block_h: [u16; SECTION_COUNT] = std::array::from_fn(|i| all_section_block_h(form, i));
+        let total: u16 = block_h.iter().sum();
+        let vh = rows[5].height;
+        let overflow = total > vh;
 
-        draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th);
-        draw_kvd_section(f, sub[2], sub[3], form, KvdKind::Cookie, s, th);
-        draw_kvd_section(f, sub[4], sub[5], form, KvdKind::Query, s, th);
-        draw_kvd_section(f, sub[6], sub[7], form, KvdKind::Options, s, th);
-        draw_form_section(f, sub[8], sub[9], form, s, th);
-        draw_body_section(f, sub[10], sub[11], form, s, th);
-        draw_asserts_section(f, sub[12], sub[13], form, s, th);
-        draw_captures_section(f, sub[14], sub[15], form, s, th);
-        draw_reports_section(f, sub[16], sub[17], form, s, th);
+        // Reserve the rightmost column for the form-level scrollbar while
+        // scrolling; sections then render one column narrower.
+        let body_area = if overflow {
+            Rect {
+                width: rows[5].width.saturating_sub(1),
+                ..rows[5]
+            }
+        } else {
+            rows[5]
+        };
+
+        // First visible section, moved only as far as needed to keep the
+        // focused section fully on screen.
+        let mut first = if overflow {
+            form.all_scroll.get().min(SECTION_COUNT - 1)
+        } else {
+            0
+        };
+        if overflow {
+            if let Some(fs) = form
+                .focus
+                .wizard_section()
+                .and_then(wizard_tab_section_index)
+            {
+                if fs < first {
+                    first = fs;
+                }
+                while first < fs && block_h[first..=fs].iter().sum::<u16>() > vh {
+                    first += 1;
+                }
+            }
+            // Avoid leaving dead space below the last section: pull the window
+            // back up while the entire remaining tail still fits.
+            while first > 0 && block_h[first - 1..].iter().sum::<u16>() <= vh {
+                first -= 1;
+            }
+        }
+        form.all_scroll.set(first);
+
+        // Stack sections downward from `first`, each at its natural height,
+        // while they fully fit in the body.
+        let mut used = 0u16;
+        let mut rendered = 0usize;
+        for i in first..SECTION_COUNT {
+            if used + block_h[i] > body_area.height {
+                break;
+            }
+            let sect = Rect {
+                x: body_area.x,
+                y: body_area.y + used,
+                width: body_area.width,
+                height: block_h[i],
+            };
+            draw_all_section(f, i, sect, form, s, th);
+            used += block_h[i];
+            rendered += 1;
+        }
+        // Viewport smaller than even one section: still show the top (focused)
+        // section, clamped to the available height.
+        if rendered == 0 && first < SECTION_COUNT {
+            draw_all_section(
+                f,
+                first,
+                Rect {
+                    height: body_area.height,
+                    ..body_area
+                },
+                form,
+                s,
+                th,
+            );
+        }
+
+        if overflow {
+            let bar = Rect {
+                x: rows[5].x + rows[5].width.saturating_sub(1),
+                y: rows[5].y,
+                width: 1,
+                height: vh,
+            };
+            draw_scrollbar(f, bar, SECTION_COUNT, rendered.max(1), first, th);
+        }
     } else {
         // A single section tab is active: give it essentially the whole
         // remaining dialog body instead of a fixed sliver, so long lists are
@@ -2461,7 +2693,9 @@ fn draw_headerlike_table(
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Span only the scrollable data rows, not the pinned "+ Add …" line
+            // below them (which stays put and isn't part of the scroll region).
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(f, bar_area, rows.len(), data_rects.len().max(1), start, th);
     }
@@ -2815,7 +3049,8 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -2874,7 +3109,8 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             x: area.x,
             y: table_area.y,
             width: 1,
-            height: table_area.height,
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -2968,7 +3204,8 @@ pub(crate) fn draw_capture_table(
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -3057,7 +3294,8 @@ pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             x: area.x,
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,

@@ -623,6 +623,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The request wizard's combined "All" view no longer hides populated
+  sections when several are stacked.** With nine sections (Headers, Cookies,
+  Queries, Options, Form, Body, Asserts, Captures, Reports) the fixed layout
+  could overflow the dialog and let the ratatui solver compress the tallest
+  table — most visibly the Headers table, which on smaller terminals collapsed
+  to *zero* visible rows (so a request loaded from a `.hurl` file appeared to
+  have no headers even though they were parsed correctly). The All view now
+  (1) collapses each **empty** section to a single compact `Label   (＋ Add …)`
+  line — dropping its unused `Key / Value / Description` column-title row so the
+  populated sections get the space — and (2) **scrolls the whole stack** (whole
+  sections at a time, keeping the focused section on screen, with a scrollbar in
+  the reclaimed rightmost column) whenever the naturally-sized sections are
+  still collectively taller than the dialog body. The stale hint text that read
+  "Alt+1-6 jump" is corrected to "Alt+1-9" to match the nine section jumps.
+  Two follow-up glitches in that view are also fixed: the per-section scrollbar
+  no longer extends past the last data row into the pinned "＋ Add …" line (it
+  now covers only the scrollable data region), and pressing **Up** to leave a
+  section now stops on the "＋ Add …" line of the populated section above it
+  (instead of jumping straight into that section's last data row).
+
 - **A failed assertion no longer hides the response.** When a request's
   `HTTP <status>` expectation or an `[Asserts]` check failed, the Response panel
   replaced the whole response with the error text. It now keeps showing the full
