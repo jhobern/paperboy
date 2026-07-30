@@ -368,6 +368,7 @@ pub(crate) enum WizardTab {
     Cookies,
     Queries,
     Form,
+    Options,
     Body,
     Asserts,
     Captures,
@@ -377,11 +378,12 @@ pub(crate) enum WizardTab {
 impl WizardTab {
     /// All tabs, in their default display order — used to initialize a
     /// fresh `NewReq::tab_order` (which the user may subsequently reorder).
-    pub(crate) const ALL: [WizardTab; 9] = [
+    pub(crate) const ALL: [WizardTab; 10] = [
         WizardTab::All,
         WizardTab::Headers,
         WizardTab::Cookies,
         WizardTab::Queries,
+        WizardTab::Options,
         WizardTab::Form,
         WizardTab::Body,
         WizardTab::Asserts,
@@ -396,6 +398,7 @@ impl WizardTab {
             WizardTab::Cookies => s.field_cookies,
             WizardTab::Queries => s.field_queries,
             WizardTab::Form => s.field_form,
+            WizardTab::Options => s.field_options,
             WizardTab::Body => s.field_body,
             WizardTab::Asserts => s.field_asserts,
             WizardTab::Captures => s.field_captures,
@@ -415,6 +418,7 @@ impl WizardTab {
             WizardTab::Headers => NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
             WizardTab::Cookies => NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key),
             WizardTab::Queries => NewField::Kvd(KvdKind::Query, 0, HdrCol::Key),
+            WizardTab::Options => NewField::Kvd(KvdKind::Options, 0, HdrCol::Key),
             WizardTab::Form => NewField::FormField(0, FormCol::Key),
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::Assert(0),
@@ -431,6 +435,7 @@ impl WizardTab {
             WizardTab::Headers => NewField::AddKvd(KvdKind::Header),
             WizardTab::Cookies => NewField::AddKvd(KvdKind::Cookie),
             WizardTab::Queries => NewField::AddKvd(KvdKind::Query),
+            WizardTab::Options => NewField::AddKvd(KvdKind::Options),
             WizardTab::Form => NewField::AddFormField,
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::AddAssert,
@@ -447,6 +452,7 @@ pub(crate) struct NewReq {
     pub(crate) headers: KvdSection,
     pub(crate) cookies: KvdSection,
     pub(crate) queries: KvdSection,
+    pub(crate) options: KvdSection,
     pub(crate) form_fields: Vec<FormRow>,
     pub(crate) body: Editor,
     pub(crate) asserts: Vec<AssertRow>,
@@ -538,6 +544,7 @@ impl NewReq {
             headers: KvdSection::new(),
             cookies: KvdSection::new(),
             queries: KvdSection::new(),
+            options: KvdSection::new(),
             form_fields: Vec::new(),
             body: Editor::new("", true),
             asserts: Vec::new(),
@@ -602,6 +609,8 @@ impl NewReq {
 
         let queries = header_rows_from_triples(&entry.queries);
 
+        let options = header_rows_from_triples(&entry.options);
+
         let form_fields = if entry.form_fields.is_empty() {
             Vec::new()
         } else {
@@ -663,6 +672,7 @@ impl NewReq {
             headers,
             cookies,
             queries,
+            options,
             form_fields,
             body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
             asserts,
@@ -911,6 +921,9 @@ impl NewReq {
             NewField::Kvd(KvdKind::Query, i, col) => {
                 self.queries.get_mut(i).and_then(|r| r.cell_mut(col))
             }
+            NewField::Kvd(KvdKind::Options, i, col) => {
+                self.options.get_mut(i).and_then(|r| r.cell_mut(col))
+            }
             NewField::FormField(i, col) => {
                 self.form_fields.get_mut(i).and_then(|r| r.cell_mut(col))
             }
@@ -922,6 +935,7 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
+            | NewField::AddKvd(KvdKind::Options)
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
@@ -1231,15 +1245,17 @@ impl NewReq {
             NewField::AddKvd(KvdKind::Cookie) => (5, usize::MAX, 0),
             NewField::Kvd(KvdKind::Query, i, c) => (6, i, hdr(c)),
             NewField::AddKvd(KvdKind::Query) => (6, usize::MAX, 0),
-            NewField::FormField(i, c) => (7, i, form(c)),
-            NewField::AddFormField => (7, usize::MAX, 0),
-            NewField::Body => (8, 0, 0),
-            NewField::Assert(i) => (9, i, 0),
-            NewField::AddAssert => (9, usize::MAX, 0),
-            NewField::Capture(i, c) => (10, i, if c == CapCol::Name { 0 } else { 1 }),
-            NewField::AddCapture => (10, usize::MAX, 0),
-            NewField::Report(i, c) => (11, i, if c == CapCol::Name { 0 } else { 1 }),
-            NewField::AddReport => (11, usize::MAX, 0),
+            NewField::Kvd(KvdKind::Options, i, c) => (7, i, hdr(c)),
+            NewField::AddKvd(KvdKind::Options) => (7, usize::MAX, 0),
+            NewField::FormField(i, c) => (8, i, form(c)),
+            NewField::AddFormField => (8, usize::MAX, 0),
+            NewField::Body => (9, 0, 0),
+            NewField::Assert(i) => (10, i, 0),
+            NewField::AddAssert => (10, usize::MAX, 0),
+            NewField::Capture(i, c) => (11, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddCapture => (11, usize::MAX, 0),
+            NewField::Report(i, c) => (12, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddReport => (12, usize::MAX, 0),
         }
     }
 
@@ -1361,6 +1377,9 @@ impl NewReq {
                 self.kvd_entry(KvdKind::Query)
             }
             NewField::Kvd(KvdKind::Query, ..) | NewField::AddKvd(KvdKind::Query) => {
+                self.kvd_entry(KvdKind::Options)
+            }
+            NewField::Kvd(KvdKind::Options, ..) | NewField::AddKvd(KvdKind::Options) => {
                 self.form_entry()
             }
             NewField::FormField(..) | NewField::AddFormField => NewField::Body,
@@ -1387,7 +1406,10 @@ impl NewReq {
             NewField::Kvd(KvdKind::Query, ..) | NewField::AddKvd(KvdKind::Query) => {
                 self.kvd_entry(KvdKind::Cookie)
             }
-            NewField::FormField(..) | NewField::AddFormField => self.kvd_entry(KvdKind::Query),
+            NewField::Kvd(KvdKind::Options, ..) | NewField::AddKvd(KvdKind::Options) => {
+                self.kvd_entry(KvdKind::Query)
+            }
+            NewField::FormField(..) | NewField::AddFormField => self.kvd_entry(KvdKind::Options),
             NewField::Body => self.form_entry(),
             NewField::Assert(..) | NewField::AddAssert => NewField::Body,
             NewField::Capture(..) | NewField::AddCapture => self.assert_entry(),
@@ -1404,6 +1426,7 @@ impl NewReq {
             WizardTab::Headers => self.kvd_entry(KvdKind::Header),
             WizardTab::Cookies => self.kvd_entry(KvdKind::Cookie),
             WizardTab::Queries => self.kvd_entry(KvdKind::Query),
+            WizardTab::Options => self.kvd_entry(KvdKind::Options),
             WizardTab::Form => self.form_entry(),
             WizardTab::Asserts => self.assert_entry(),
             WizardTab::Captures => self.capture_entry(),
@@ -1422,7 +1445,8 @@ impl NewReq {
             NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
             | NewField::Kvd(KvdKind::Cookie, _, col)
-            | NewField::Kvd(KvdKind::Query, _, col) => {
+            | NewField::Kvd(KvdKind::Query, _, col)
+            | NewField::Kvd(KvdKind::Options, _, col) => {
                 matches!(col, HdrCol::Key | HdrCol::Value | HdrCol::Desc)
             }
             NewField::FormField(_, col) => matches!(
@@ -1434,6 +1458,7 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
+            | NewField::AddKvd(KvdKind::Options)
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
@@ -1656,8 +1681,10 @@ pub(crate) fn draw_new_request(
             Constraint::Length(section_height(1, form.headers.len())),     // headers table
             Constraint::Length(1),                                         // cookies label
             Constraint::Length(section_height(1, form.cookies.len())),     // cookies table
-            Constraint::Length(1),                                         // form label
+            Constraint::Length(1),                                         // queries label
             Constraint::Length(section_height(1, form.queries.len())),     // queries table
+            Constraint::Length(1),                                         // options label
+            Constraint::Length(section_height(1, form.options.len())),     // options table
             Constraint::Length(1),                                         // form label
             Constraint::Length(section_height(1, form.form_fields.len())), // form table
             Constraint::Length(1),                                         // body label
@@ -1674,11 +1701,12 @@ pub(crate) fn draw_new_request(
         draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th);
         draw_kvd_section(f, sub[2], sub[3], form, KvdKind::Cookie, s, th);
         draw_kvd_section(f, sub[4], sub[5], form, KvdKind::Query, s, th);
-        draw_form_section(f, sub[6], sub[7], form, s, th);
-        draw_body_section(f, sub[8], sub[9], form, s, th);
-        draw_asserts_section(f, sub[10], sub[11], form, s, th);
-        draw_captures_section(f, sub[12], sub[13], form, s, th);
-        draw_reports_section(f, sub[14], sub[15], form, s, th);
+        draw_kvd_section(f, sub[6], sub[7], form, KvdKind::Options, s, th);
+        draw_form_section(f, sub[8], sub[9], form, s, th);
+        draw_body_section(f, sub[10], sub[11], form, s, th);
+        draw_asserts_section(f, sub[12], sub[13], form, s, th);
+        draw_captures_section(f, sub[14], sub[15], form, s, th);
+        draw_reports_section(f, sub[16], sub[17], form, s, th);
     } else {
         // A single section tab is active: give it essentially the whole
         // remaining dialog body instead of a fixed sliver, so long lists are
@@ -1694,6 +1722,9 @@ pub(crate) fn draw_new_request(
             WizardTab::Headers => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th),
             WizardTab::Cookies => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Cookie, s, th),
             WizardTab::Queries => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Query, s, th),
+            WizardTab::Options => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Options, s, th)
+            }
             WizardTab::Form => draw_form_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th),

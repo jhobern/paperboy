@@ -6,7 +6,7 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hurl_core::ast::{
-    Body, Bytes, Capture, Entry, KeyValue, MultipartParam, SectionValue, StatusValue,
+    Body, Bytes, Capture, Entry, KeyValue, MultipartParam, SectionValue, StatusValue, VersionValue,
 };
 use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
@@ -140,6 +140,7 @@ fn map_entry(
             SectionValue::FormParams(..) | SectionValue::MultipartFormData(..) => {
                 CommentAnchor::Form
             }
+            SectionValue::Options(_) => CommentAnchor::Options,
             _ => continue,
         };
         landmarks.push((section.source_info.start.line, anchor));
@@ -148,7 +149,18 @@ fn map_entry(
         landmarks.push((body_start_line(b), CommentAnchor::Body));
     }
     if let Some(resp) = &e.response {
-        landmarks.push((resp.status.source_info.start.line, CommentAnchor::Response));
+        let status_line = resp.status.source_info.start.line;
+        landmarks.push((status_line, CommentAnchor::Response));
+        // Response headers sit between the `HTTP <status>` line and the first
+        // response block; anchor comments among them to `ResponseHeaders` when
+        // there are any (enabled rows, or disabled ones recovered from source).
+        if !resp.headers.is_empty()
+            || scan_kv_rows(lines, status_line + 1, first_response_anchor(resp))
+                .iter()
+                .any(|(_, _, enabled)| !enabled)
+        {
+            landmarks.push((status_line + 1, CommentAnchor::ResponseHeaders));
+        }
         for section in &resp.sections {
             let anchor = match &section.value {
                 SectionValue::Asserts(_) => CommentAnchor::Asserts,
@@ -157,17 +169,28 @@ fn map_entry(
             };
             landmarks.push((section.source_info.start.line, anchor));
         }
+        if let Some(b) = &resp.body {
+            landmarks.push((body_start_line(b), CommentAnchor::ResponseBody));
+        }
     }
     landmarks.sort_by_key(|(line, _)| *line);
 
-    // The body's source line span keeps a multiline body's `#` lines out of
-    // prose-comment recovery.
-    let body_range = req.body.as_ref().map(body_line_span);
+    // Each body's source line span keeps its multiline `#` lines out of
+    // prose-comment recovery (both the request body and the expected response
+    // body).
+    let mut body_ranges: Vec<(usize, usize)> = Vec::new();
+    if let Some(b) = &req.body {
+        body_ranges.push(body_line_span(b));
+    }
+    if let Some(b) = e.response.as_ref().and_then(|r| r.body.as_ref()) {
+        body_ranges.push(body_line_span(b));
+    }
 
     let mut basic_auth = None;
     let mut form_fields = Vec::new();
     let mut query_params = Vec::new();
     let mut cookies = Vec::new();
+    let mut options = Vec::new();
     for section in &req.sections {
         // Rows start on the line after the `[Section]` header and run up to the
         // next structural anchor below it (the following section / body /
@@ -191,6 +214,9 @@ fn map_entry(
                 query_params = scan_kv_rows(lines, rows_start, rows_end)
             }
             SectionValue::Cookies(_) => cookies = scan_kv_rows(lines, rows_start, rows_end),
+            // `[Options]` rows are `name: value` too (retry, insecure, …), so
+            // the same scan recovers them — including disabled ones — verbatim.
+            SectionValue::Options(_) => options = scan_kv_rows(lines, rows_start, rows_end),
             _ => {}
         }
     }
@@ -198,10 +224,28 @@ fn map_entry(
     let mut expected_status = None;
     let mut captures = Vec::new();
     let mut asserts = Vec::new();
+    let mut response_version = None;
+    let mut response_headers = Vec::new();
+    let mut response_body = None;
     if let Some(resp) = &e.response {
         if let StatusValue::Specific(n) = resp.status.value {
             expected_status = Some(n as u16);
         }
+        // The version-agnostic `HTTP` keyword (`VersionAny`) carries no explicit
+        // version; anything else (`HTTP/1.1`, `HTTP/2`, …) is preserved verbatim.
+        response_version = match resp.version.value {
+            VersionValue::VersionAny => None,
+            v => Some(v.to_string()),
+        };
+        // Response headers occupy the lines between the `HTTP <status>` line and
+        // the first response block; scanning them (like request headers)
+        // recovers disabled `# key: value` rows the AST drops as comments.
+        response_headers = scan_kv_rows(
+            lines,
+            resp.status.source_info.start.line + 1,
+            first_response_anchor(resp),
+        );
+        response_body = resp.body.as_ref().and_then(body_source);
         for section in &resp.sections {
             match &section.value {
                 SectionValue::Captures(caps) => {
@@ -240,19 +284,41 @@ fn map_entry(
         is_multipart,
         queries: query_params,
         cookies,
+        options,
         body: req.body.as_ref().and_then(body_source),
         expected_status,
+        response_version,
+        response_headers,
+        response_body,
         captures,
         asserts,
         reports: reports_from_span(lines, scan_start, scan_end),
         comments: scan_comments(
-            lines, &landmarks, body_range, scan_start, scan_end, is_first,
+            lines,
+            &landmarks,
+            &body_ranges,
+            scan_start,
+            scan_end,
+            is_first,
         ),
         user_added: false,
         modified: false,
         last_run: RunStatus::default(),
         last_response: None,
     }
+}
+
+/// The first structural anchor inside a response strictly below its `HTTP`
+/// status line — the earliest response `[Section]` header or the response
+/// body's start — bounding the response-header scan. `None` (open mode) when a
+/// response has no sections or body, so the header scan stops at the blank line
+/// separating this entry from the next (see [`scan_kv_rows`]).
+fn first_response_anchor(resp: &hurl_core::ast::Response) -> Option<usize> {
+    resp.sections
+        .iter()
+        .map(|s| s.source_info.start.line)
+        .chain(resp.body.as_ref().map(body_start_line))
+        .min()
 }
 
 fn kv_pair(kv: &KeyValue) -> (String, String) {
@@ -304,7 +370,7 @@ fn body_line_span(b: &Body) -> (usize, usize) {
 fn scan_comments(
     lines: &[&str],
     landmarks: &[(usize, CommentAnchor)],
-    body_range: Option<(usize, usize)>,
+    body_ranges: &[(usize, usize)],
     method_line: usize,
     scan_end: usize,
     is_first: bool,
@@ -317,7 +383,8 @@ fn scan_comments(
     // Rows regions where a `# key: value` comment is a captured *disabled* row
     // (recovered by `scan_kv_rows`/`scan_disabled_form_rows`), not prose. These
     // mirror the row scans in `map_entry`: the inline header block, then each
-    // Cookies/Query/Form section's rows, each bounded by the next landmark.
+    // Cookies/Query/Form/Options section's rows and the response-header block,
+    // each bounded by the next landmark.
     let first_landmark = landmarks.first().map(|(l, _)| *l);
     let mut regions: Vec<(usize, usize, RowKind)> = vec![(
         method_line + 1,
@@ -325,16 +392,26 @@ fn scan_comments(
         RowKind::Kv,
     )];
     for (k, (line, anchor)) in landmarks.iter().enumerate() {
-        let kind = match anchor {
-            CommentAnchor::Cookies | CommentAnchor::Query => RowKind::Kv,
-            CommentAnchor::Form => RowKind::Form,
+        // Section landmarks point at the `[Section]` header line, so their rows
+        // start one line below; the response-header landmark already points at
+        // the first header row (there's no `[Header]` line above it).
+        let (kind, rows_start) = match anchor {
+            CommentAnchor::Cookies | CommentAnchor::Query | CommentAnchor::Options => {
+                (RowKind::Kv, line + 1)
+            }
+            CommentAnchor::Form => (RowKind::Form, line + 1),
+            CommentAnchor::ResponseHeaders => (RowKind::Kv, *line),
             _ => continue,
         };
         let end = landmarks.get(k + 1).map(|(l, _)| *l).unwrap_or(scan_end);
-        regions.push((line + 1, end, kind));
+        regions.push((rows_start, end, kind));
     }
 
-    let in_body = |line_no: usize| body_range.is_some_and(|(s, e)| line_no >= s && line_no < e);
+    let in_body = |line_no: usize| {
+        body_ranges
+            .iter()
+            .any(|&(s, e)| line_no >= s && line_no < e)
+    };
 
     // A comment line that scan_kv_rows / scan_disabled_form_rows already recover
     // as a disabled row (so it round-trips via `headers`/`queries`/etc., not as
@@ -1856,5 +1933,270 @@ mod tests {
         let twice = collection_to_hurl(&parse_hurl(&once));
         assert_eq!(once, twice, "round trip must be idempotent:\n{once}");
         assert_comments_round_trip(src);
+    }
+
+    // ---- Request [Options] + response headers/body/version round-trip ----
+
+    /// Parse `src`, serialize, reparse and assert the whole model is stable
+    /// across the round trip for the Part 5 fields (plus that the serialized
+    /// text still parses cleanly through `hurl_core`).
+    fn assert_sections_round_trip(src: &str) -> Vec<HurlEntry> {
+        let first = parse_hurl(src);
+        let text = collection_to_hurl(&first);
+        assert!(
+            parse_hurl_error(&text).is_none(),
+            "serialized text must parse via hurl_core:\n{text}\nerror: {:?}",
+            parse_hurl_error(&text)
+        );
+        let second = parse_hurl(&text);
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.options, b.options, "options drift:\n{text}");
+            assert_eq!(
+                a.response_version, b.response_version,
+                "version drift:\n{text}"
+            );
+            assert_eq!(
+                a.response_headers, b.response_headers,
+                "resp headers drift:\n{text}"
+            );
+            assert_eq!(a.response_body, b.response_body, "resp body drift:\n{text}");
+        }
+        second
+    }
+
+    #[test]
+    fn request_options_section_round_trips() {
+        let src = "POST http://h/a\n[Options]\nretry: 3\ninsecure: true\nvariable: host=example.net\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].options,
+            vec![
+                ("retry".into(), "3".into(), true),
+                ("insecure".into(), "true".into(), true),
+                ("variable".into(), "host=example.net".into(), true),
+            ]
+        );
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn a_disabled_option_row_round_trips_as_a_comment() {
+        let src = "GET http://h/a\n[Options]\nretry: 3\n# insecure: true\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].options,
+            vec![
+                ("retry".into(), "3".into(), true),
+                ("insecure".into(), "true".into(), false),
+            ]
+        );
+        // The disabled row is an option, not captured a second time as prose.
+        assert!(e[0].comments.is_empty(), "{:?}", e[0].comments);
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn options_and_a_body_coexist_and_round_trip() {
+        // The critical ordering case: `hurl_core` parses a request as
+        // headers -> sections -> body and rejects a section after the body, so
+        // `to_hurl` must emit `[Options]` before the body. If it didn't, the
+        // serialized text wouldn't even parse.
+        let src = "POST http://h/a\n[Options]\nretry: 2\n```\n{\"x\":1}\n```\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].options, vec![("retry".into(), "2".into(), true)]);
+        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        let text = e[0].to_hurl();
+        assert!(
+            text.find("[Options]").unwrap() < text.find("```").unwrap(),
+            "[Options] must be emitted before the body:\n{text}"
+        );
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn response_headers_round_trip() {
+        let src = "GET http://h/a\nHTTP 200\nContent-Type: application/json\nX-Trace: abc\n[Asserts]\njsonpath \"$.ok\" == true\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].response_headers,
+            vec![
+                ("Content-Type".into(), "application/json".into(), true),
+                ("X-Trace".into(), "abc".into(), true),
+            ]
+        );
+        assert_eq!(e[0].asserts, vec!["jsonpath \"$.ok\" == true".to_string()]);
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn a_disabled_response_header_round_trips_as_a_comment() {
+        let src = "GET http://h/a\nHTTP 200\nContent-Type: application/json\n# X-Trace: abc\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].response_headers,
+            vec![
+                ("Content-Type".into(), "application/json".into(), true),
+                ("X-Trace".into(), "abc".into(), false),
+            ]
+        );
+        assert!(e[0].comments.is_empty(), "{:?}", e[0].comments);
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn response_body_round_trips_after_sections() {
+        let src =
+            "GET http://h/a\nHTTP 200\n[Asserts]\njsonpath \"$.a\" == 1\n```\n{\"a\":1}\n```\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_body.as_deref(), Some("```\n{\"a\":1}\n```"));
+        assert_eq!(e[0].asserts, vec!["jsonpath \"$.a\" == 1".to_string()]);
+        let text = e[0].to_hurl();
+        assert!(
+            text.find("[Asserts]").unwrap() < text.rfind("```").unwrap(),
+            "the response body must follow the response sections:\n{text}"
+        );
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn a_hash_line_inside_a_response_body_is_not_captured_as_a_comment() {
+        let src = "GET http://h/a\nHTTP 200\n```\n# not a comment\n```\n";
+        let e = parse_hurl(src);
+        assert!(e[0].comments.is_empty(), "{:?}", e[0].comments);
+        assert!(
+            e[0].response_body
+                .as_deref()
+                .unwrap_or_default()
+                .contains("# not a comment")
+        );
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn response_http_version_round_trips() {
+        let src = "GET http://h/a\nHTTP/1.1 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_version.as_deref(), Some("HTTP/1.1"));
+        assert_eq!(e[0].expected_status, Some(200));
+        let text = e[0].to_hurl();
+        assert!(
+            text.contains("HTTP/1.1 200"),
+            "version must round-trip:\n{text}"
+        );
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn version_agnostic_http_keyword_stays_versionless() {
+        let src = "GET http://h/a\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_version, None);
+        assert!(e[0].to_hurl().contains("HTTP 200"));
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn a_version_with_no_explicit_status_uses_the_wildcard() {
+        let src = "GET http://h/a\nHTTP/2 *\n[Asserts]\njsonpath \"$.x\" == 1\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_version.as_deref(), Some("HTTP/2"));
+        assert_eq!(e[0].expected_status, None);
+        assert!(e[0].to_hurl().contains("HTTP/2 *"));
+        assert_sections_round_trip(src);
+    }
+
+    #[test]
+    fn a_comment_before_options_anchors_to_options() {
+        let src = "GET http://h/a\n# tuning\n[Options]\nretry: 3\nHTTP 200\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::Options,
+                text: "# tuning".into(),
+            }]
+        );
+        assert!(e[0].to_hurl().contains("# tuning\n[Options]"));
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn a_comment_among_response_headers_stays_in_the_response_area() {
+        let src = "GET http://h/a\nHTTP 200\n# trace headers\nX-Trace: abc\n[Asserts]\njsonpath \"$.ok\" == true\n";
+        let e = parse_hurl(src);
+        assert_eq!(
+            e[0].comments,
+            vec![EntryComment {
+                anchor: CommentAnchor::ResponseHeaders,
+                text: "# trace headers".into(),
+            }]
+        );
+        let text = e[0].to_hurl();
+        assert!(
+            text.find("HTTP 200").unwrap() < text.find("# trace headers").unwrap()
+                && text.find("# trace headers").unwrap() < text.find("[Asserts]").unwrap(),
+            "the comment must stay between the HTTP line and [Asserts]:\n{text}"
+        );
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn options_response_headers_body_and_comments_all_survive_one_document() {
+        let src = "# Big one\nPOST http://h/a\nContent-Type: json\n[Options]\nretry: 2\n```\n{\"x\":1}\n```\nHTTP/1.1 201\nX-Trace: t\n[Asserts]\njsonpath \"$.id\" exists\n```\n{\"id\":9}\n```\n# all checked\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].options, vec![("retry".into(), "2".into(), true)]);
+        assert_eq!(e[0].response_version.as_deref(), Some("HTTP/1.1"));
+        assert_eq!(
+            e[0].response_headers,
+            vec![("X-Trace".into(), "t".into(), true)]
+        );
+        assert_eq!(e[0].response_body.as_deref(), Some("```\n{\"id\":9}\n```"));
+        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        assert_sections_round_trip(src);
+        assert_comments_round_trip(src);
+    }
+
+    #[test]
+    fn options_and_response_fields_do_not_bleed_into_the_next_request() {
+        // Two full entries, each with a request `[Options]` section, a response
+        // version, response headers and a response body. The scans for each of
+        // these must be bounded to their own entry — the second request's
+        // fields must not be absorbed into the first (and vice versa).
+        let src = concat!(
+            "GET http://h/a\n",
+            "[Options]\nretry: 1\n",
+            "HTTP/1.1 200\n",
+            "X-A: a\n",
+            "[Asserts]\njsonpath \"$.a\" == 1\n",
+            "```\n{\"a\":1}\n```\n",
+            "\n",
+            "GET http://h/b\n",
+            "[Options]\nretry: 2\n",
+            "HTTP/2 201\n",
+            "X-B: b\n",
+            "[Asserts]\njsonpath \"$.b\" == 2\n",
+            "```\n{\"b\":2}\n```\n",
+        );
+        let e = parse_hurl(src);
+        assert_eq!(e.len(), 2, "two distinct entries");
+
+        assert_eq!(e[0].options, vec![("retry".into(), "1".into(), true)]);
+        assert_eq!(e[0].response_version.as_deref(), Some("HTTP/1.1"));
+        assert_eq!(
+            e[0].response_headers,
+            vec![("X-A".into(), "a".into(), true)]
+        );
+        assert_eq!(e[0].response_body.as_deref(), Some("```\n{\"a\":1}\n```"));
+
+        assert_eq!(e[1].options, vec![("retry".into(), "2".into(), true)]);
+        assert_eq!(e[1].response_version.as_deref(), Some("HTTP/2"));
+        assert_eq!(
+            e[1].response_headers,
+            vec![("X-B".into(), "b".into(), true)]
+        );
+        assert_eq!(e[1].response_body.as_deref(), Some("```\n{\"b\":2}\n```"));
+
+        assert_sections_round_trip(src);
     }
 }

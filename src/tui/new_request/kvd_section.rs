@@ -34,12 +34,18 @@ pub(crate) enum KvdKind {
     Header,
     Cookie,
     Query,
+    Options,
 }
 
 impl KvdKind {
-    /// The three kinds in their fixed display order (Headers, then Cookies,
-    /// then Queries) — used to drive shared iteration.
-    pub(crate) const ALL: [KvdKind; 3] = [KvdKind::Header, KvdKind::Cookie, KvdKind::Query];
+    /// The kinds in their fixed display order (Headers, Cookies, Queries, then
+    /// the request `[Options]`) — used to drive shared iteration.
+    pub(crate) const ALL: [KvdKind; 4] = [
+        KvdKind::Header,
+        KvdKind::Cookie,
+        KvdKind::Query,
+        KvdKind::Options,
+    ];
 
     /// The `NewField` for a given row/column of this section.
     pub(crate) fn field(self, i: usize, col: HdrCol) -> NewField {
@@ -57,15 +63,17 @@ impl KvdKind {
             KvdKind::Header => WizardTab::Headers,
             KvdKind::Cookie => WizardTab::Cookies,
             KvdKind::Query => WizardTab::Queries,
+            KvdKind::Options => WizardTab::Options,
         }
     }
 
-    /// This section's title (`Headers` / `Cookies` / `Queries`).
+    /// This section's title (`Headers` / `Cookies` / `Queries` / `Options`).
     pub(crate) fn title(self, s: &Strings) -> &'static str {
         match self {
             KvdKind::Header => s.field_headers,
             KvdKind::Cookie => s.field_cookies,
             KvdKind::Query => s.field_queries,
+            KvdKind::Options => s.field_options,
         }
     }
 
@@ -75,6 +83,7 @@ impl KvdKind {
             KvdKind::Header => s.add_header,
             KvdKind::Cookie => s.add_cookie,
             KvdKind::Query => s.add_query,
+            KvdKind::Options => s.add_option,
         }
     }
 }
@@ -236,6 +245,7 @@ impl NewReq {
             KvdKind::Header => &self.headers,
             KvdKind::Cookie => &self.cookies,
             KvdKind::Query => &self.queries,
+            KvdKind::Options => &self.options,
         }
     }
 
@@ -245,6 +255,7 @@ impl NewReq {
             KvdKind::Header => &mut self.headers,
             KvdKind::Cookie => &mut self.cookies,
             KvdKind::Query => &mut self.queries,
+            KvdKind::Options => &mut self.options,
         }
     }
 
@@ -280,12 +291,14 @@ impl NewReq {
 
     /// Where Up-arrow lands when leaving the first row of `kind`'s section
     /// upward: the section immediately above it (URL above Headers, the last
-    /// Header row above Cookies, the last Cookie row above Queries).
+    /// Header row above Cookies, the last Cookie row above Queries, the last
+    /// Query row above Options).
     fn kvd_up_destination(&self, kind: KvdKind) -> NewField {
         match kind {
             KvdKind::Header => NewField::Url,
             KvdKind::Cookie => self.up_into_kvd(KvdKind::Header),
             KvdKind::Query => self.up_into_kvd(KvdKind::Cookie),
+            KvdKind::Options => self.up_into_kvd(KvdKind::Query),
         }
     }
 

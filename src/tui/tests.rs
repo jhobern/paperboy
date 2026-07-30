@@ -553,7 +553,10 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     press(&mut app, KeyCode::Tab); // empty cookie section -> AddQuery
     assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
 
-    press(&mut app, KeyCode::Tab); // empty query section -> AddFormField
+    press(&mut app, KeyCode::Tab); // empty query section -> AddOptions
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Options));
+
+    press(&mut app, KeyCode::Tab); // empty options section -> AddFormField
     assert_eq!(new_focus(&app), NewField::AddFormField);
 
     press(&mut app, KeyCode::Tab); // empty form section -> jump to Body
@@ -562,6 +565,8 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     // Shift+Tab from Body walks back through the same chain to URL.
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::AddFormField);
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Options));
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
     press(&mut app, KeyCode::BackTab);
@@ -599,6 +604,7 @@ fn open_form_on_form_field_kind(app: &mut TuiApp) {
     press(app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(app, KeyCode::Enter); // creates FormField(0, Key)
     press(app, KeyCode::Char('k')); // non-blank, or Tab skips the empty section
@@ -877,14 +883,21 @@ fn arrow_up_from_the_first_form_field_stops_at_cookies_then_headers_one_section_
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Enter); // creates FormField(0, Key); headers/cookies still empty
 
     press(&mut app, KeyCode::Up);
     assert_eq!(
         new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "Up from the first Form row must stop at the empty Options section first"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
-        "Up from the first Form row must stop at the empty Queries section first"
+        "the next Up stops at the empty Queries section"
     );
     press(&mut app, KeyCode::Up);
     assert_eq!(
@@ -915,7 +928,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
     press(&mut app, KeyCode::Char('n'));
     // Walk straight to Body, then on to the (empty) Asserts and Captures
     // "Add" rows.
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -941,7 +954,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
 fn up_down_in_the_body_move_the_cursor_then_leave_at_the_edges() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body (skips the blank sections)
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -1162,6 +1175,7 @@ fn arrows_can_reach_the_enabled_checkbox_in_a_form_row() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery, blank
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key), blank
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -9302,6 +9316,7 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
@@ -9408,6 +9423,7 @@ fn a_typed_status_assert_becomes_the_expected_status() {
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
@@ -9435,6 +9451,7 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
@@ -9483,6 +9500,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
     press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -9545,6 +9563,85 @@ fn creating_a_request_with_a_cookie_via_the_table() {
 }
 
 #[test]
+fn creating_a_request_with_an_option_via_the_table() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    for ch in "http://h/x".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> AddHeader, empty
+    press(&mut app, KeyCode::Tab); // -> AddCookie, empty
+    press(&mut app, KeyCode::Tab); // -> AddQuery, empty
+    press(&mut app, KeyCode::Tab); // -> AddOptions
+    press(&mut app, KeyCode::Enter); // -> Options(0, Key)
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Options, 0, HdrCol::Key)
+    );
+    for ch in "retry".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> Options(0, Value)
+    for ch in "3".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let e = &app.collections[0].entries;
+    assert_eq!(e.len(), 1);
+    assert_eq!(
+        e[0].options,
+        vec![("retry".to_string(), "3".to_string(), true)]
+    );
+    // And the serialized request carries the `[Options]` section.
+    assert!(
+        e[0].to_hurl().contains("[Options]"),
+        "the option should serialize into an [Options] section:\n{}",
+        e[0].to_hurl()
+    );
+}
+
+#[test]
+fn editing_a_request_populates_and_preserves_the_options_section() {
+    // `[Options]` rows now round-trip through the wizard: they populate the
+    // editable table on open and survive a commit that changes nothing else.
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.options = vec![
+        ("retry".to_string(), "3".to_string(), true),
+        ("insecure".to_string(), "true".to_string(), true),
+    ];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+
+    // The data is populated from entry.options.
+    {
+        let form = form_ref(&app);
+        assert_eq!(form.options.len(), 2);
+        assert_eq!(form.options[0].key.text(), "retry");
+        assert_eq!(form.options[0].value.text(), "3");
+        assert_eq!(form.options[1].key.text(), "insecure");
+        assert_eq!(form.options[1].value.text(), "true");
+    }
+
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)); // commit unchanged
+
+    let e = &app.collections[0].entries;
+    assert_eq!(
+        e[0].options,
+        vec![
+            ("retry".to_string(), "3".to_string(), true),
+            ("insecure".to_string(), "true".to_string(), true),
+        ]
+    );
+}
+
+#[test]
 fn creating_a_request_with_a_text_form_field_via_the_table() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
@@ -9557,6 +9654,7 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -9592,6 +9690,7 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -9797,6 +9896,7 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -10456,6 +10556,7 @@ fn section_tab_confines_enter_navigation_to_that_section() {
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
     press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -10558,6 +10659,13 @@ fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
         new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
         "queries start empty, so the entry point is the Add row"
+    );
+
+    press(&mut app, KeyCode::PageDown); // -> Options
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
 
     press(&mut app, KeyCode::PageDown); // -> Form
@@ -10708,7 +10816,7 @@ fn ctrl_left_right_are_a_third_alias_for_prev_next_tab_from_any_pane() {
 }
 
 #[test]
-fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
+fn alt_1_through_9_jump_directly_to_a_wizard_section_by_number() {
     // Alt, not Ctrl: Ctrl+<digit> has no standard control-code encoding,
     // so most terminals only report it with a modifier when the Kitty
     // keyboard protocol is active. Alt is sent as a plain ESC-prefix
@@ -10721,10 +10829,12 @@ fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
         ('1', NewField::AddKvd(KvdKind::Header)),
         ('2', NewField::AddKvd(KvdKind::Cookie)),
         ('3', NewField::AddKvd(KvdKind::Query)),
-        ('4', NewField::AddFormField),
-        ('5', NewField::Body),
-        ('6', NewField::AddAssert),
-        ('7', NewField::AddCapture),
+        ('4', NewField::AddKvd(KvdKind::Options)),
+        ('5', NewField::AddFormField),
+        ('6', NewField::Body),
+        ('7', NewField::AddAssert),
+        ('8', NewField::AddCapture),
+        ('9', NewField::AddReport),
     ];
     for (digit, expected) in cases {
         app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT));
@@ -10738,18 +10848,18 @@ fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
     // Works regardless of which section-view tab is currently active,
     // not just from `All`.
     press(&mut app, KeyCode::PageDown); // -> Headers view tab
-    app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
     assert_eq!(
         new_focus(&app),
         NewField::Body,
-        "Alt+5 still jumps to Body from a different section tab"
+        "Alt+6 still jumps to Body from a different section tab"
     );
 
     // Plain (unmodified) digits must still type into a text field
     // instead of being swallowed as a jump shortcut — this is exactly
     // the bug being guarded against (Ctrl+<digit> falling back to a
     // bare digit on terminals without keyboard-enhancement support).
-    // Focus is on Body (from the Alt+4 jump above); a bare '1' must be
+    // Focus is on Body (from the Alt+6 jump above); a bare '1' must be
     // typed into it, not reinterpreted as "jump to Headers".
     press(&mut app, KeyCode::Char('1'));
     assert!(
@@ -10781,6 +10891,12 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
         "queries start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(
@@ -10837,6 +10953,12 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         new_focus(&app),
         NewField::AddFormField,
         "form fields start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
@@ -18731,6 +18853,7 @@ fn tab_reaches_the_reports_section_after_captures() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert
@@ -18744,10 +18867,10 @@ fn tab_reaches_the_reports_section_after_captures() {
 }
 
 #[test]
-fn alt_8_jumps_to_the_reports_section() {
+fn alt_9_jumps_to_the_reports_section() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    app.on_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::ALT));
+    app.on_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT));
     assert_eq!(new_focus(&app), NewField::AddReport);
 }
 
@@ -18755,7 +18878,7 @@ fn alt_8_jumps_to_the_reports_section() {
 fn pagedown_cycles_to_the_reports_tab() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
@@ -18775,6 +18898,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert
@@ -18802,7 +18926,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
 fn deleting_the_last_report_row_leaves_the_section_empty() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown); // -> Reports
     }
     assert_eq!(new_focus(&app), NewField::AddReport);
@@ -18844,7 +18968,7 @@ fn editing_a_request_populates_and_renders_the_reports_section() {
     }
 
     // Switch to the Reports section tab (full-body) and confirm it renders.
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);

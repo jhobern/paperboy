@@ -38,6 +38,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The request `[Options]` section is now editable in the wizard.** A new
+  **Options** section tab (between Queries and Form) lets you add, edit, disable
+  and delete Hurl request options (`retry`, `insecure`, `variable: host=…`, and
+  so on) as a key/value table, just like Headers or Queries. It cycles with the
+  other tabs (`[`/`]`, PageUp/PageDown) and has a direct **Alt+4** jump; the
+  remaining section jumps shift up by one (Form is now Alt+5 … Reports Alt+9).
+
 - **Workspace file tree: real expand/collapse replaces the old breadcrumb.**
   The workspace tab's file list is now a proper multi-folder tree: any number of
   folders can be expanded at once, their open/closed state persists across
@@ -653,6 +660,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   in that position. This matters for the `[Reports]` feature, which works by
   injecting comments into the `.hurl` file, and for the raw editor, which now
   shows the comments it did before.
+
+- **Request `[Options]`, expected response headers/body, and the response HTTP
+  version are no longer silently dropped on load.** `hurl_core` parses all four,
+  but PaperBoy's request model discarded them, so saving a collection back (or
+  opening a request in the raw editor) erased any `[Options]` section, expected
+  response header rows, expected response body, and a specific `HTTP/x.y`
+  version (it was normalised away to a bare `HTTP`). They now round-trip through
+  the model and serializer unchanged — including disabled (`#`-prefixed)
+  `[Options]` rows — and the execution-affecting `[Options]` and the real
+  response header/body assertions are carried into the run instead of being lost.
 
 - **Copying no longer makes the clipboard helper flicker in the app bar.** On
   Wayland/X11 the background `wl-copy`/`xclip` helper PaperBoy forks to own the

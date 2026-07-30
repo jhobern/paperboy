@@ -1920,6 +1920,7 @@ impl TuiApp {
         let headers: Vec<(String, String, bool)> = header_rows_to_triples(&form.headers);
         let cookies: Vec<(String, String, bool)> = header_rows_to_triples(&form.cookies);
         let queries: Vec<(String, String, bool)> = header_rows_to_triples(&form.queries);
+        let options: Vec<(String, String, bool)> = header_rows_to_triples(&form.options);
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
@@ -2007,6 +2008,7 @@ impl TuiApp {
                 || entry.headers != headers
                 || entry.cookies != cookies
                 || entry.queries != queries
+                || entry.options != options
                 || entry.form_fields != form_fields
                 || entry.body != body
                 || entry.expected_status != expected_status
@@ -2020,6 +2022,7 @@ impl TuiApp {
                 entry.headers = headers;
                 entry.cookies = cookies;
                 entry.queries = queries;
+                entry.options = options;
                 entry.form_fields = form_fields;
                 entry.body = body;
                 entry.expected_status = expected_status;
@@ -2041,6 +2044,7 @@ impl TuiApp {
             HurlEntry::from_fields(&name, form.method(), &url, headers, &form.body.text());
         entry.cookies = cookies;
         entry.queries = queries;
+        entry.options = options;
         entry.form_fields = form_fields;
         entry.expected_status = expected_status;
         entry.asserts = asserts;
@@ -4468,12 +4472,12 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='8') = key.code {
-            // Alt+1..8 jumps directly to a section by number
-            // (Headers/Cookies/Queries/Form/Body/Asserts/Captures/Reports),
-            // regardless of the current section-view tab — a direct-jump
-            // complement to Ctrl+Up/Down's sequential one. Alt (not
-            // Ctrl) because Ctrl+<digit> has no standard control-code
+        } else if alt && let KeyCode::Char(c @ '1'..='9') = key.code {
+            // Alt+1..9 jumps directly to a section by number
+            // (Headers/Cookies/Queries/Options/Form/Body/Asserts/Captures/
+            // Reports), regardless of the current section-view tab — a
+            // direct-jump complement to Ctrl+Up/Down's sequential one. Alt
+            // (not Ctrl) because Ctrl+<digit> has no standard control-code
             // encoding and most terminals only report it with a
             // modifier when the Kitty keyboard protocol is active;
             // Alt is sent as a plain ESC-prefix almost everywhere, so
@@ -4482,11 +4486,12 @@ impl TuiApp {
                 '1' => WizardTab::Headers,
                 '2' => WizardTab::Cookies,
                 '3' => WizardTab::Queries,
-                '4' => WizardTab::Form,
-                '5' => WizardTab::Body,
-                '6' => WizardTab::Asserts,
-                '7' => WizardTab::Captures,
-                _ => WizardTab::Reports, // '8'
+                '4' => WizardTab::Options,
+                '5' => WizardTab::Form,
+                '6' => WizardTab::Body,
+                '7' => WizardTab::Asserts,
+                '8' => WizardTab::Captures,
+                _ => WizardTab::Reports, // '9'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -4557,7 +4562,7 @@ impl TuiApp {
 
                             NewField::FormField(i - 1, target_col)
                         } else {
-                            form.up_into_kvd(KvdKind::Query)
+                            form.up_into_kvd(KvdKind::Options)
                         };
                     }
                     KeyCode::Down => {

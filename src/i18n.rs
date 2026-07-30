@@ -191,6 +191,7 @@ strings! {
     field_cookies => "Cookies", "Cookies", "Cookies";
     field_queries => "Queries", "Requêtes", "Forespørgsler";
     field_form => "Form", "Formulaire", "Formular";
+    field_options => "Options", "Options", "Indstillinger";
     field_body => "Body", "Corps", "Brødtekst";
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
@@ -213,6 +214,7 @@ strings! {
     add_header => "\u{FF0B} Add header", "\u{FF0B} Ajouter un en-tête", "\u{FF0B} Tilføj header";
     add_cookie => "\u{FF0B} Add cookie", "\u{FF0B} Ajouter un cookie", "\u{FF0B} Tilføj cookie";
     add_query => "\u{FF0B} Add query", "\u{FF0B} Ajouter une requête", "\u{FF0B} Tilføj forespørgsel";
+    add_option => "\u{FF0B} Add option", "\u{FF0B} Ajouter une option", "\u{FF0B} Tilføj indstilling";
     add_form_field => "\u{FF0B} Add field", "\u{FF0B} Ajouter un champ", "\u{FF0B} Tilføj felt";
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
