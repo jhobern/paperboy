@@ -165,8 +165,10 @@ strings! {
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
-    workspace_filter_on => "Filter: .hurl/.json/.trail", "Filtre : .hurl/.json/.trail", "Filter: .hurl/.json/.trail";
+    workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
+    workspace_tree_filter_on => "Tree filter on: .hurl/.json/.vars/.trail only", "Filtre de l'arbre activé : .hurl/.json/.vars/.trail uniquement", "Træfilter til: kun .hurl/.json/.vars/.trail";
+    workspace_tree_filter_off => "Tree filter off: showing all files", "Filtre de l'arbre désactivé : tous les fichiers affichés", "Træfilter fra: viser alle filer";
     workspace_no_files => "No matching files in this folder.", "Aucun fichier correspondant dans ce dossier.", "Ingen matchende filer i denne mappe.";
     tab_request => "Scratch Space", "Brouillon", "Kladde";
     run_entry => "▶ Run", "▶ Exécuter", "▶ Kør";
@@ -191,6 +193,7 @@ strings! {
     field_cookies => "Cookies", "Cookies", "Cookies";
     field_queries => "Queries", "Requêtes", "Forespørgsler";
     field_form => "Form", "Formulaire", "Formular";
+    field_options => "Options", "Options", "Indstillinger";
     field_body => "Body", "Corps", "Brødtekst";
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
@@ -213,6 +216,7 @@ strings! {
     add_header => "\u{FF0B} Add header", "\u{FF0B} Ajouter un en-tête", "\u{FF0B} Tilføj header";
     add_cookie => "\u{FF0B} Add cookie", "\u{FF0B} Ajouter un cookie", "\u{FF0B} Tilføj cookie";
     add_query => "\u{FF0B} Add query", "\u{FF0B} Ajouter une requête", "\u{FF0B} Tilføj forespørgsel";
+    add_option => "\u{FF0B} Add option", "\u{FF0B} Ajouter une option", "\u{FF0B} Tilføj indstilling";
     add_form_field => "\u{FF0B} Add field", "\u{FF0B} Ajouter un champ", "\u{FF0B} Tilføj felt";
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
@@ -472,8 +476,8 @@ strings! {
     help_grammar_concat => "append sources end-to-end (same arity)", "concaténer les sources bout à bout (même arité)", "sammenkæd kilder efter hinanden (samme aritet)";
     help_grammar_envs => "loop over environments (BASELINE/COMPARISON to diff)", "boucler sur des environnements (BASELINE/COMPARISON pour comparer)", "gennemløb miljøer (BASELINE/COMPARISON for at sammenligne)";
     help_grammar_result => "diff column: candidate vs baseline env, per reported field", "colonne de différence : candidat vs référence, par champ rapporté", "forskelskolonne: kandidat vs. reference, pr. rapporteret felt";
-    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-6 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-6 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-6 hop til · ^Enter/F2 opret · Esc annuller";
-    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-6 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-6 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-6 hop til · ^Enter/F2 gem · Esc annuller";
+    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 opret · Esc annuller";
+    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 gem · Esc annuller";
     raw_mode_hint => "Edit the raw Hurl text · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le texte Hurl brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå Hurl-tekst · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     raw_json_hint => "Edit the raw JSON · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le JSON brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå JSON · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     ctrl_enter_key => "^Enter", "^Entrée", "^Enter";
@@ -757,6 +761,10 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// The Workspace tree's extension filter was toggled (`Ctrl+F`). `true`
+    /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
+    /// `false` shows every file.
+    WorkspaceTreeFilter(bool),
 }
 
 impl Status {
@@ -788,6 +796,7 @@ impl Status {
                     | Status::ReportNodeUndone(_)
                     | Status::RequestReverted(_)
                     | Status::EnvReverted(_)
+                    | Status::WorkspaceTreeFilter(_)
             ),
         }
     }
@@ -897,6 +906,13 @@ impl Status {
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::WorkspaceTreeFilter(on) => {
+                if *on {
+                    s.workspace_tree_filter_on.to_string()
+                } else {
+                    s.workspace_tree_filter_off.to_string()
+                }
+            }
         }
     }
 }

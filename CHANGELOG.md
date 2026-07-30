@@ -8,9 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [Unreleased]
+
+## [0.1.7] - 2026-07-30
 
 ### Changed
+
+- **The request wizard's section titles are now coloured bands.** Each section
+  header (Headers, Cookies, Queries, Options, Form, Body, Asserts, Captures,
+  Reports) is drawn as a full-width filled strip rather than plain text, so in
+  the stacked "All" view it's obvious where one section ends and the next
+  begins. The section the cursor is in gets a solid accent bar (matching the
+  active section-tab styling); the others get a subtle inset band, and empty
+  sections' compact `Label   (＋ Add …)` lines share the same banding, with
+  their labels padded to a common width so the `(＋ Add …)` actions all line up
+  in one column despite the differing label lengths.
 
 - **The build no longer needs a system libcurl.** libcurl and OpenSSL are now
   compiled and statically linked from source (via the `curl` crate's
@@ -29,7 +40,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the stashed tab (reopenable with `u`). A new status message "Run stopped —
   partial results kept" reflects the change.
 
+- **The response's expected status is now editable in the request wizard.** A
+  request's `HTTP <code>` status expectation is surfaced in the `[Asserts]`
+  table as a `status == <code>` row, so it can be changed or removed like any
+  other assert (previously it was only reachable through raw Hurl/JSON editing).
+  Editing the row updates the expectation and typing a new `status == <code>`
+  assert sets it; both round-trip back to the canonical `HTTP <code>` line.
+
 ### Added
+
+- **Workspace tree: environments show as their own rows, `.vars` is filtered
+  in, and `Ctrl+F` toggles the filter.** Environment files (`.vars`) in a
+  workspace now appear in the tree with a distinct icon and open (Enter / Right)
+  as a global environment — the same as File → Load → Environment — instead of
+  being mis-parsed as a collection. The tree's file-type filter now includes
+  `.vars` alongside `.hurl`, `.json` and `.trail`, and **Ctrl+F** toggles that
+  filter directly from the tree (previously only reachable from the `w`
+  picker's Tab), so folders cluttered with images or other files can be shown or
+  hidden without leaving the tree. The choice is persisted per workspace.
+
+- **The request `[Options]` section is now editable in the wizard.** A new
+  **Options** section tab (between Queries and Form) lets you add, edit, disable
+  and delete Hurl request options (`retry`, `insecure`, `variable: host=…`, and
+  so on) as a key/value table, just like Headers or Queries. It cycles with the
+  other tabs (`[`/`]`, PageUp/PageDown) and has a direct **Alt+4** jump; the
+  remaining section jumps shift up by one (Form is now Alt+5 … Reports Alt+9).
 
 - **Workspace file tree: real expand/collapse replaces the old breadcrumb.**
   The workspace tab's file list is now a proper multi-folder tree: any number of
@@ -44,6 +79,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   longer a "current folder" appended to the panel title.  The expanded-folder
   set is saved in `state.json` under a new `workspace_expanded_paths` field;
   older state files without the field load cleanly with all folders collapsed.
+
+- **Workspace tree: expand a collection to list its requests inline.** Opening a
+  collection in the workspace tree now keeps its request names listed beneath it
+  until you collapse it, giving a clearer picture of the whole workspace.
+  Several collections can be expanded at once, and each collection's expanded
+  state persists across restarts alongside folders (same
+  `workspace_expanded_paths` set). **Right**/**Enter** on a collection loads and
+  expands it; **Left** or a second **Enter** collapses it. Requests of a
+  collection that isn't the loaded one are shown dim by name only; highlighting
+  one just previews its name, while **Enter**/**Right** loads that collection and
+  jumps straight to the highlighted request. The loaded collection's name is
+  drawn in the accent colour (and the others dim) so it's clear which collection
+  the coloured requests belong to.
 
 - **Dry-run preview now shows the real output grid.** Pressing `d` on a report
   opens the same column/row table the full run would produce — but with all
@@ -595,6 +643,81 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   self-explanatory.
 
 ### Fixed
+
+- **Prompt dialogs no longer clip their title.** A single-line prompt used a
+  fixed-width box, so a long title — most visibly the workspace **New report
+  (path relative to workspace)** prompt, and longer still in French/Danish —
+  ran past the panel border and lost its trailing `Esc cancel` (and the box's
+  own right edge). The box now widens to fit its title (clamped to the terminal
+  width).
+
+- **The request wizard's combined "All" view no longer hides populated
+  sections when several are stacked.** With nine sections (Headers, Cookies,
+  Queries, Options, Form, Body, Asserts, Captures, Reports) the fixed layout
+  could overflow the dialog and let the ratatui solver compress the tallest
+  table — most visibly the Headers table, which on smaller terminals collapsed
+  to *zero* visible rows (so a request loaded from a `.hurl` file appeared to
+  have no headers even though they were parsed correctly). The All view now
+  (1) collapses each **empty** section to a single compact `Label   (＋ Add …)`
+  line — dropping its unused `Key / Value / Description` column-title row so the
+  populated sections get the space — and (2) **scrolls the whole stack** (whole
+  sections at a time, keeping the focused section on screen, with a scrollbar in
+  the reclaimed rightmost column) whenever the naturally-sized sections are
+  still collectively taller than the dialog body. The stale hint text that read
+  "Alt+1-6 jump" is corrected to "Alt+1-9" to match the nine section jumps.
+  Two follow-up glitches in that view are also fixed: the per-section scrollbar
+  no longer extends past the last data row into the pinned "＋ Add …" line (it
+  now covers only the scrollable data region), and pressing **Up** to leave a
+  section now stops on the "＋ Add …" line of the populated section above it
+  (instead of jumping straight into that section's last data row).
+
+- **A failed assertion no longer hides the response.** When a request's
+  `HTTP <status>` expectation or an `[Asserts]` check failed, the Response panel
+  replaced the whole response with the error text. It now keeps showing the full
+  response — status line, assertions, and body — with the failing check(s)
+  marked with a cross in the error colour and the `[Asserts]` badge counting the
+  failures, so the response you were inspecting stays visible. A runner error
+  that isn't already spelled out by a failing assertion (for example a failed
+  `[Captures]`) is surfaced as one error-coloured line above the body. A
+  transport failure that returned no response at all still shows the error on
+  its own, as before.
+
+- **Headers separated from the request line by a blank line are no longer
+  dropped on load.** Hurl permits blank lines — and prose comment lines —
+  between a request's method/URL line and its header block, and between header
+  rows (likewise for the `[QueryStringParams]`, `[Cookies]`, `[Form]` and
+  `[Multipart]` sections). PaperBoy's source-scan treated the first such line as
+  "end of block", so a `.hurl` file whose request looked like `POST …` / blank
+  line / headers loaded with every header silently gone. The scan now matches
+  `hurl_core`: it skips leading and interior blank/comment lines within a block,
+  bounding each block by the next structural anchor (the body, the following
+  section, or the response's `HTTP` line) so trailing and fully commented-out
+  (disabled) rows are still recovered. When a request has no such anchor below
+  its headers (no body, section or response), the scan stops at the blank line
+  separating it from the next request, so one entry can never absorb the
+  following entry's title/banner as a stray header.
+
+- **Prose comments in `.hurl` files are no longer silently discarded on load.**
+  Free-standing comment lines (banners, section notes, anything that isn't a
+  request title, a disabled `# key: value` row, or the `# [Reports]` block) used
+  to vanish the first time PaperBoy parsed a collection, so saving the file back
+  or opening it in the raw editor lost them. They now round-trip: each comment
+  is anchored to the nearest structural block (the header block, body,
+  `[Cookies]`/`[Query]`/`[Form]` section, the response, `[Asserts]`,
+  `[Captures]`, a file-leading banner, or the end of the entry) and re-emitted
+  in that position. This matters for the `[Reports]` feature, which works by
+  injecting comments into the `.hurl` file, and for the raw editor, which now
+  shows the comments it did before.
+
+- **Request `[Options]`, expected response headers/body, and the response HTTP
+  version are no longer silently dropped on load.** `hurl_core` parses all four,
+  but PaperBoy's request model discarded them, so saving a collection back (or
+  opening a request in the raw editor) erased any `[Options]` section, expected
+  response header rows, expected response body, and a specific `HTTP/x.y`
+  version (it was normalised away to a bare `HTTP`). They now round-trip through
+  the model and serializer unchanged — including disabled (`#`-prefixed)
+  `[Options]` rows — and the execution-affecting `[Options]` and the real
+  response header/body assertions are carried into the run instead of being lost.
 
 - **Copying no longer makes the clipboard helper flicker in the app bar.** On
   Wayland/X11 the background `wl-copy`/`xclip` helper PaperBoy forks to own the

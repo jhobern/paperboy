@@ -118,6 +118,8 @@ const COLLECTION_OPEN_ICON: &str = "\u{25BE}"; // ▾
 pub(crate) const COLLECTION_CLOSED_ICON: &str = "\u{25B8}"; // ▸
 /// Marks a PaperTrail report file in the Workspace tree (a document/chart glyph).
 pub(crate) const REPORT_ICON: &str = "\u{1F4CA}"; // 📊
+/// Marks an environment file (`.vars`) in the Workspace tree.
+pub(crate) const ENV_ICON: &str = "\u{1F310}"; // 🌐
 
 /// A rendered row of the request list, unifying the ordinary title-folder
 /// tree ([`tree::Row`]) and the Workspace file-tree ([`WsRow`]) so
@@ -143,8 +145,19 @@ enum LeftRow {
         name: String,
         depth: usize,
         open: bool,
+        /// True when this is the tab's currently-loaded collection — the one
+        /// whose requests render in full colour. Drawn in the accent colour so
+        /// it's visually obvious which collection the coloured requests belong
+        /// to; other collections (and their request names) render dim.
+        loaded: bool,
     },
     Report {
+        name: String,
+        depth: usize,
+    },
+    /// An environment file (`.vars`) in a Workspace tree; opening it loads the
+    /// file as a global environment.
+    Environment {
         name: String,
         depth: usize,
     },
@@ -152,6 +165,13 @@ enum LeftRow {
         idx: usize,
         /// Indentation depth: 0 for non-workspace, collection-depth+1 for
         /// workspace requests.
+        depth: usize,
+    },
+    /// A request of an expanded but *not-loaded* workspace collection: only its
+    /// cached name is known (no entry to draw method/status from), so it renders
+    /// as a dim, name-only leaf. Opening it (Enter/Right) loads its collection.
+    WsRequestName {
+        name: String,
         depth: usize,
     },
 }
@@ -175,10 +195,33 @@ impl LeftRow {
                         expanded,
                     },
                     WsRow::Collection {
-                        name, depth, open, ..
-                    } => LeftRow::Collection { name, depth, open },
+                        path,
+                        name,
+                        depth,
+                        open,
+                    } => {
+                        let loaded = col.path.as_deref() == Some(path.as_path());
+                        LeftRow::Collection {
+                            name,
+                            depth,
+                            open,
+                            loaded,
+                        }
+                    }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
-                    WsRow::Request { idx, depth } => LeftRow::Entry { idx, depth },
+                    WsRow::Environment { name, depth, .. } => LeftRow::Environment { name, depth },
+                    WsRow::Request {
+                        idx,
+                        depth,
+                        loaded: true,
+                        ..
+                    } => LeftRow::Entry { idx, depth },
+                    WsRow::Request {
+                        name,
+                        depth,
+                        loaded: false,
+                        ..
+                    } => LeftRow::WsRequestName { name, depth },
                 })
                 .collect()
         } else {
@@ -977,16 +1020,26 @@ pub(crate) fn draw_collection_left(
                     Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
                 )))
             }
-            LeftRow::Collection { name, depth, open } => {
+            LeftRow::Collection {
+                name,
+                depth,
+                open,
+                loaded,
+            } => {
                 let indent = "  ".repeat(*depth);
                 let chevron = if *open {
                     COLLECTION_OPEN_ICON
                 } else {
                     COLLECTION_CLOSED_ICON
                 };
+                // The loaded collection (the one with coloured requests) is
+                // drawn in the accent colour so it clearly reads as the one in
+                // focus; every other collection recedes to dim, matching its
+                // dim request names.
+                let colour = if *loaded { th.accent } else { th.dim };
                 ListItem::new(Line::from(Span::styled(
                     format!("{indent}{chevron} {name}"),
-                    Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
                 )))
             }
             LeftRow::Report { name, depth } => {
@@ -994,6 +1047,23 @@ pub(crate) fn draw_collection_left(
                 ListItem::new(Line::from(Span::styled(
                     format!("{indent}{REPORT_ICON} {name}"),
                     Style::default().fg(th.accent),
+                )))
+            }
+            LeftRow::Environment { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{ENV_ICON} {name}"),
+                    Style::default().fg(th.accent),
+                )))
+            }
+            // A request of an expanded but not-loaded collection: dim, name only
+            // (its collection isn't loaded, so there's no method/status to show).
+            // The two-space pad lines the name up under the loaded rows' names.
+            LeftRow::WsRequestName { name, depth } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}  {name}"),
+                    Style::default().fg(th.dim),
                 )))
             }
             LeftRow::Entry { idx, depth } => {
@@ -2083,26 +2153,34 @@ pub(crate) fn draw_response(
         );
         return;
     }
-    if !error.is_empty() {
-        // Render the runner error *through* the selectable response panel (not
-        // a plain Paragraph) so it can be mouse-selected and `y`-copied like any
-        // response body — the red fg is applied as the paragraph's fallback
-        // style, and the panel still owns wrapping/scrolling for long errors.
-        let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
-        app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
-        app.resp_panel
-            .set_content(content, inner.width.max(1) as usize);
-        app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
-        app.resp_scrollbar_area = Rect::default();
-        let visible_wrapped = app.resp_panel.visible_rows(inner.height);
-        app.resp_text_area = inner;
-        f.render_widget(
-            Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
-            inner,
-        );
-        return;
-    }
     if status == 0 {
+        // No response was received. A transport/parse failure (or a build error
+        // like the Body/Form conflict) leaves an error string but no response,
+        // so surface it here; otherwise show the neutral placeholder. A failed
+        // assert or status mismatch, by contrast, still produces a real
+        // response (status != 0) and is rendered in full below — with the
+        // failing checks marked — rather than replacing the response with the
+        // error text.
+        if !error.is_empty() {
+            // Render the runner error *through* the selectable response panel
+            // (not a plain Paragraph) so it can be mouse-selected and `y`-copied
+            // like any response body — the red fg is applied as the paragraph's
+            // fallback style, and the panel still owns wrapping/scrolling for
+            // long errors.
+            let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+            app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
+            app.resp_panel
+                .set_content(content, inner.width.max(1) as usize);
+            app.resp_max_scroll = app.resp_panel.clamp_scroll(inner.height);
+            app.resp_scrollbar_area = Rect::default();
+            let visible_wrapped = app.resp_panel.visible_rows(inner.height);
+            app.resp_text_area = inner;
+            f.render_widget(
+                Paragraph::new(visible_wrapped).style(Style::default().fg(th.err)),
+                inner,
+            );
+            return;
+        }
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
         app.resp_panel
@@ -2170,18 +2248,37 @@ pub(crate) fn draw_response(
         })
         .collect();
 
-    // Layout: status (1) · asserts (capped, keeping ≥1 body row) · body (rest).
-    let assert_h = (assert_lines.len() as u16).min(inner.height.saturating_sub(2));
+    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 body row)
+    // · body (rest). A runner error that *isn't* already spelled out by a
+    // failed assert row — a failed `[Captures]`, a transport oddity that still
+    // returned a response — gets one error-coloured line so it isn't lost now
+    // that a non-empty error no longer replaces the whole response. When an
+    // assert failed (passed < total) that ✗ row already carries the reason, so
+    // the extra line would just be noise and is skipped.
+    let show_err_line = !error.is_empty() && passed == total;
+    let err_h: u16 = u16::from(show_err_line);
+    let assert_h =
+        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h));
     let rows = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(err_h),
         Constraint::Length(assert_h),
         Constraint::Min(1),
     ])
     .split(inner);
 
     f.render_widget(Paragraph::new(Line::from(status_spans)), rows[0]);
+    if show_err_line {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{} {error}", s.req_error_prefix),
+                Style::default().fg(th.err),
+            )),
+            rows[1],
+        );
+    }
     if assert_h > 0 {
-        f.render_widget(Paragraph::new(assert_lines), rows[1]);
+        f.render_widget(Paragraph::new(assert_lines), rows[2]);
     }
 
     // Wrap long lines to the body width and clamp scrolling so the user can't
@@ -2192,7 +2289,7 @@ pub(crate) fn draw_response(
     // this is what keeps dragging a selection or scrolling responsive
     // regardless of how large an "obscenely large" response body is. The
     // end-of-row wrap marker makes a soft wrap read as one logical line.
-    let body_area = rows[2];
+    let body_area = rows[3];
     let width = body_area.width as usize;
     app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
     app.resp_panel.set_content(body.clone(), width);
@@ -2962,13 +3059,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             } else {
                 3
             };
-            let w = if ml {
-                (f.area().width * 8 / 10).max(30)
-            } else {
-                64
-            };
-            let area = centered_rect(w, h, f.area());
-            f.render_widget(Clear, area);
+            // Build the title/hint first so the box can be widened to fit it:
+            // long titles (e.g. the workspace "New report (path relative to
+            // workspace)" prompt — longer still in other languages) were being
+            // clipped by the panel border on the fixed-width single-line box.
             let mut hint = if matches!(kind, PromptKind::Raw(_)) {
                 format!("{title}  ({})", s.raw_mode_hint)
             } else if matches!(kind, PromptKind::RawJson(_)) {
@@ -2989,6 +3083,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             if secret_checkbox.is_some() {
                 hint.push_str(&format!("  ·  {}", s.env_still_secret_hint));
             }
+            let base_w = if ml {
+                (f.area().width * 8 / 10).max(30)
+            } else {
+                64
+            };
+            // Widen to fit the title on the top border — 2 columns for the
+            // corners plus a little breathing room — but never past the
+            // terminal width (centered_rect clamps too).
+            let title_w = Line::from(hint.as_str()).width() as u16;
+            let w = base_w.max(title_w.saturating_add(4)).min(f.area().width);
+            let area = centered_rect(w, h, f.area());
+            f.render_widget(Clear, area);
             let block = panel(hint, true, th);
             let inner = block.inner(area);
             f.render_widget(block, area);

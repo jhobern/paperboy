@@ -368,6 +368,7 @@ pub(crate) enum WizardTab {
     Cookies,
     Queries,
     Form,
+    Options,
     Body,
     Asserts,
     Captures,
@@ -377,11 +378,12 @@ pub(crate) enum WizardTab {
 impl WizardTab {
     /// All tabs, in their default display order — used to initialize a
     /// fresh `NewReq::tab_order` (which the user may subsequently reorder).
-    pub(crate) const ALL: [WizardTab; 9] = [
+    pub(crate) const ALL: [WizardTab; 10] = [
         WizardTab::All,
         WizardTab::Headers,
         WizardTab::Cookies,
         WizardTab::Queries,
+        WizardTab::Options,
         WizardTab::Form,
         WizardTab::Body,
         WizardTab::Asserts,
@@ -396,6 +398,7 @@ impl WizardTab {
             WizardTab::Cookies => s.field_cookies,
             WizardTab::Queries => s.field_queries,
             WizardTab::Form => s.field_form,
+            WizardTab::Options => s.field_options,
             WizardTab::Body => s.field_body,
             WizardTab::Asserts => s.field_asserts,
             WizardTab::Captures => s.field_captures,
@@ -415,6 +418,7 @@ impl WizardTab {
             WizardTab::Headers => NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
             WizardTab::Cookies => NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key),
             WizardTab::Queries => NewField::Kvd(KvdKind::Query, 0, HdrCol::Key),
+            WizardTab::Options => NewField::Kvd(KvdKind::Options, 0, HdrCol::Key),
             WizardTab::Form => NewField::FormField(0, FormCol::Key),
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::Assert(0),
@@ -431,6 +435,7 @@ impl WizardTab {
             WizardTab::Headers => NewField::AddKvd(KvdKind::Header),
             WizardTab::Cookies => NewField::AddKvd(KvdKind::Cookie),
             WizardTab::Queries => NewField::AddKvd(KvdKind::Query),
+            WizardTab::Options => NewField::AddKvd(KvdKind::Options),
             WizardTab::Form => NewField::AddFormField,
             WizardTab::Body => NewField::Body,
             WizardTab::Asserts => NewField::AddAssert,
@@ -447,6 +452,7 @@ pub(crate) struct NewReq {
     pub(crate) headers: KvdSection,
     pub(crate) cookies: KvdSection,
     pub(crate) queries: KvdSection,
+    pub(crate) options: KvdSection,
     pub(crate) form_fields: Vec<FormRow>,
     pub(crate) body: Editor,
     pub(crate) asserts: Vec<AssertRow>,
@@ -503,6 +509,11 @@ pub(crate) struct NewReq {
     pub(crate) assert_scroll: std::cell::Cell<usize>,
     pub(crate) capture_scroll: std::cell::Cell<usize>,
     pub(crate) report_scroll: std::cell::Cell<usize>,
+    /// Index of the first visible section in the combined "All" view when the
+    /// nine stacked sections are collectively taller than the dialog body.
+    /// Persisted between renders so the scroll position stays put, moving only
+    /// as far as needed to keep the focused section on screen.
+    pub(crate) all_scroll: std::cell::Cell<usize>,
     /// Directory Form file paths are resolved against for the existence check
     /// (the saved collection's own directory, per Hurl's "relative to the
     /// input Hurl file" rule); `None` (Scratch Space, unsaved) resolves
@@ -538,6 +549,7 @@ impl NewReq {
             headers: KvdSection::new(),
             cookies: KvdSection::new(),
             queries: KvdSection::new(),
+            options: KvdSection::new(),
             form_fields: Vec::new(),
             body: Editor::new("", true),
             asserts: Vec::new(),
@@ -563,6 +575,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: None,
             view_tab: WizardTab::All,
@@ -602,6 +615,8 @@ impl NewReq {
 
         let queries = header_rows_from_triples(&entry.queries);
 
+        let options = header_rows_from_triples(&entry.options);
+
         let form_fields = if entry.form_fields.is_empty() {
             Vec::new()
         } else {
@@ -621,15 +636,22 @@ impl NewReq {
                 })
                 .collect()
         };
-        let asserts = entry
-            .asserts
-            .iter()
-            .map(|a| {
-                let mut row = AssertRow::new();
-                row.expr = Editor::new(a, false);
-                row
-            })
-            .collect();
+        // Surface the response's `HTTP <code>` status expectation (stored as
+        // `expected_status`) as an editable `status == <code>` assert row at
+        // the top of the section, so it can be changed or removed like any
+        // other assert. `submit_new_request` folds it back into
+        // `expected_status` on save.
+        let mut asserts: Vec<AssertRow> = Vec::new();
+        if let Some(code) = entry.expected_status {
+            let mut row = AssertRow::new();
+            row.expr = Editor::new(&format!("status == {code}"), false);
+            asserts.push(row);
+        }
+        asserts.extend(entry.asserts.iter().map(|a| {
+            let mut row = AssertRow::new();
+            row.expr = Editor::new(a, false);
+            row
+        }));
         let captures = entry
             .captures
             .iter()
@@ -656,6 +678,7 @@ impl NewReq {
             headers,
             cookies,
             queries,
+            options,
             form_fields,
             body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
             asserts,
@@ -681,6 +704,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: Some((ci, ei)),
             view_tab: WizardTab::All,
@@ -904,6 +928,9 @@ impl NewReq {
             NewField::Kvd(KvdKind::Query, i, col) => {
                 self.queries.get_mut(i).and_then(|r| r.cell_mut(col))
             }
+            NewField::Kvd(KvdKind::Options, i, col) => {
+                self.options.get_mut(i).and_then(|r| r.cell_mut(col))
+            }
             NewField::FormField(i, col) => {
                 self.form_fields.get_mut(i).and_then(|r| r.cell_mut(col))
             }
@@ -915,6 +942,7 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
+            | NewField::AddKvd(KvdKind::Options)
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
@@ -1224,15 +1252,17 @@ impl NewReq {
             NewField::AddKvd(KvdKind::Cookie) => (5, usize::MAX, 0),
             NewField::Kvd(KvdKind::Query, i, c) => (6, i, hdr(c)),
             NewField::AddKvd(KvdKind::Query) => (6, usize::MAX, 0),
-            NewField::FormField(i, c) => (7, i, form(c)),
-            NewField::AddFormField => (7, usize::MAX, 0),
-            NewField::Body => (8, 0, 0),
-            NewField::Assert(i) => (9, i, 0),
-            NewField::AddAssert => (9, usize::MAX, 0),
-            NewField::Capture(i, c) => (10, i, if c == CapCol::Name { 0 } else { 1 }),
-            NewField::AddCapture => (10, usize::MAX, 0),
-            NewField::Report(i, c) => (11, i, if c == CapCol::Name { 0 } else { 1 }),
-            NewField::AddReport => (11, usize::MAX, 0),
+            NewField::Kvd(KvdKind::Options, i, c) => (7, i, hdr(c)),
+            NewField::AddKvd(KvdKind::Options) => (7, usize::MAX, 0),
+            NewField::FormField(i, c) => (8, i, form(c)),
+            NewField::AddFormField => (8, usize::MAX, 0),
+            NewField::Body => (9, 0, 0),
+            NewField::Assert(i) => (10, i, 0),
+            NewField::AddAssert => (10, usize::MAX, 0),
+            NewField::Capture(i, c) => (11, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddCapture => (11, usize::MAX, 0),
+            NewField::Report(i, c) => (12, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddReport => (12, usize::MAX, 0),
         }
     }
 
@@ -1354,6 +1384,9 @@ impl NewReq {
                 self.kvd_entry(KvdKind::Query)
             }
             NewField::Kvd(KvdKind::Query, ..) | NewField::AddKvd(KvdKind::Query) => {
+                self.kvd_entry(KvdKind::Options)
+            }
+            NewField::Kvd(KvdKind::Options, ..) | NewField::AddKvd(KvdKind::Options) => {
                 self.form_entry()
             }
             NewField::FormField(..) | NewField::AddFormField => NewField::Body,
@@ -1380,7 +1413,10 @@ impl NewReq {
             NewField::Kvd(KvdKind::Query, ..) | NewField::AddKvd(KvdKind::Query) => {
                 self.kvd_entry(KvdKind::Cookie)
             }
-            NewField::FormField(..) | NewField::AddFormField => self.kvd_entry(KvdKind::Query),
+            NewField::Kvd(KvdKind::Options, ..) | NewField::AddKvd(KvdKind::Options) => {
+                self.kvd_entry(KvdKind::Query)
+            }
+            NewField::FormField(..) | NewField::AddFormField => self.kvd_entry(KvdKind::Options),
             NewField::Body => self.form_entry(),
             NewField::Assert(..) | NewField::AddAssert => NewField::Body,
             NewField::Capture(..) | NewField::AddCapture => self.assert_entry(),
@@ -1397,6 +1433,7 @@ impl NewReq {
             WizardTab::Headers => self.kvd_entry(KvdKind::Header),
             WizardTab::Cookies => self.kvd_entry(KvdKind::Cookie),
             WizardTab::Queries => self.kvd_entry(KvdKind::Query),
+            WizardTab::Options => self.kvd_entry(KvdKind::Options),
             WizardTab::Form => self.form_entry(),
             WizardTab::Asserts => self.assert_entry(),
             WizardTab::Captures => self.capture_entry(),
@@ -1415,7 +1452,8 @@ impl NewReq {
             NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
             | NewField::Kvd(KvdKind::Cookie, _, col)
-            | NewField::Kvd(KvdKind::Query, _, col) => {
+            | NewField::Kvd(KvdKind::Query, _, col)
+            | NewField::Kvd(KvdKind::Options, _, col) => {
                 matches!(col, HdrCol::Key | HdrCol::Value | HdrCol::Desc)
             }
             NewField::FormField(_, col) => matches!(
@@ -1427,6 +1465,7 @@ impl NewReq {
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
+            | NewField::AddKvd(KvdKind::Options)
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
@@ -1494,6 +1533,227 @@ impl NewReq {
 /// the always-visible "+ Add ..." row.
 pub(crate) fn section_height(header_h: u16, row_count: usize) -> u16 {
     header_h + (row_count.min(5) as u16) + 1
+}
+
+/// Number of stacked sections in the combined "All" view (Headers, Cookies,
+/// Queries, Options, Form, Body, Asserts, Captures, Reports — in that order).
+pub(crate) const SECTION_COUNT: usize = 9;
+
+/// Map a [`WizardTab`] to its index in the stacked "All" view (the order the
+/// sections are drawn). `All` has no position of its own.
+pub(crate) fn wizard_tab_section_index(tab: WizardTab) -> Option<usize> {
+    Some(match tab {
+        WizardTab::All => return None,
+        WizardTab::Headers => 0,
+        WizardTab::Cookies => 1,
+        WizardTab::Queries => 2,
+        WizardTab::Options => 3,
+        WizardTab::Form => 4,
+        WizardTab::Body => 5,
+        WizardTab::Asserts => 6,
+        WizardTab::Captures => 7,
+        WizardTab::Reports => 8,
+    })
+}
+
+/// Whether section `i` (see [`wizard_tab_section_index`]) has no rows. The Body
+/// (index 5) is never "empty" for layout purposes — it always shows its editor.
+fn all_section_is_empty(form: &NewReq, i: usize) -> bool {
+    match i {
+        0 => form.headers.is_empty(),
+        1 => form.cookies.is_empty(),
+        2 => form.queries.is_empty(),
+        3 => form.options.is_empty(),
+        4 => form.form_fields.is_empty(),
+        5 => false,
+        6 => form.asserts.is_empty(),
+        7 => form.captures.is_empty(),
+        8 => form.reports.is_empty(),
+        _ => true,
+    }
+}
+
+/// Natural height section `i` wants in the stacked "All" view. An empty section
+/// collapses to a single combined "Label   + Add …" line; a populated one is a
+/// label line plus its [`section_height`] table. Body is always its label plus
+/// a fixed four-row editor.
+fn all_section_block_h(form: &NewReq, i: usize) -> u16 {
+    if i == 5 {
+        return 1 + 4; // Body: label + editor
+    }
+    let (count, header_h) = match i {
+        0 => (form.headers.len(), 1),
+        1 => (form.cookies.len(), 1),
+        2 => (form.queries.len(), 1),
+        3 => (form.options.len(), 1),
+        4 => (form.form_fields.len(), 1),
+        6 => (form.asserts.len(), 0),
+        7 => (form.captures.len(), 1),
+        8 => (form.reports.len(), 1),
+        _ => (0, 1),
+    };
+    if count == 0 {
+        1
+    } else {
+        1 + section_height(header_h, count)
+    }
+}
+
+/// Label, "+ Add …" text and Add-row focus target for section `i`'s compact
+/// (empty) rendering.
+fn all_section_empty_meta(
+    form: &NewReq,
+    i: usize,
+    s: &Strings,
+) -> (&'static str, &'static str, NewField) {
+    let _ = form;
+    match i {
+        0 => (
+            KvdKind::Header.title(s),
+            KvdKind::Header.add_label(s),
+            KvdKind::Header.add_field(),
+        ),
+        1 => (
+            KvdKind::Cookie.title(s),
+            KvdKind::Cookie.add_label(s),
+            KvdKind::Cookie.add_field(),
+        ),
+        2 => (
+            KvdKind::Query.title(s),
+            KvdKind::Query.add_label(s),
+            KvdKind::Query.add_field(),
+        ),
+        3 => (
+            KvdKind::Options.title(s),
+            KvdKind::Options.add_label(s),
+            KvdKind::Options.add_field(),
+        ),
+        4 => (s.field_form, s.add_form_field, NewField::AddFormField),
+        6 => (s.field_asserts, s.add_assert, NewField::AddAssert),
+        7 => (s.field_captures, s.add_capture, NewField::AddCapture),
+        8 => (s.field_reports, s.add_report, NewField::AddReport),
+        _ => (
+            s.field_headers,
+            s.add_header,
+            NewField::AddKvd(KvdKind::Header),
+        ),
+    }
+}
+
+/// The column at which the compact empty-section lines' `(＋ Add …)` actions
+/// start: the widest section label plus a small gap. Padding every label to
+/// this width lines the actions up in a single column in the stacked "All"
+/// view, regardless of the (varying, per-language) label lengths. Body is
+/// excluded — it never renders as a compact "＋ Add …" line.
+fn empty_section_add_col(s: &Strings) -> usize {
+    [
+        s.field_headers,
+        s.field_cookies,
+        s.field_queries,
+        s.field_options,
+        s.field_form,
+        s.field_asserts,
+        s.field_captures,
+        s.field_reports,
+    ]
+    .iter()
+    .map(|l| Span::raw(*l).width())
+    .max()
+    .unwrap_or(0)
+        + 3
+}
+
+/// Draw section `i` of the stacked "All" view into `area`. Empty sections
+/// render as one compact "Label   + Add …" line; populated ones split `area`
+/// into a label row and a table body and defer to the section's own drawer.
+fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+    if all_section_is_empty(form, i) {
+        let (label, add_label, add_field) = all_section_empty_meta(form, i, s);
+        draw_empty_section_line(
+            f,
+            area,
+            label,
+            add_label,
+            empty_section_add_col(s),
+            form.focus == add_field,
+            th,
+        );
+        return;
+    }
+    let label = Rect { height: 1, ..area };
+    let table = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    match i {
+        0 => draw_kvd_section(f, label, table, form, KvdKind::Header, s, th),
+        1 => draw_kvd_section(f, label, table, form, KvdKind::Cookie, s, th),
+        2 => draw_kvd_section(f, label, table, form, KvdKind::Query, s, th),
+        3 => draw_kvd_section(f, label, table, form, KvdKind::Options, s, th),
+        4 => draw_form_section(f, label, table, form, s, th),
+        5 => draw_body_section(f, label, table, form, s, th),
+        6 => draw_asserts_section(f, label, table, form, s, th),
+        7 => draw_captures_section(f, label, table, form, s, th),
+        8 => draw_reports_section(f, label, table, form, s, th),
+        _ => {}
+    }
+}
+
+/// Section-title colours: `(fg, bg)`. The focused section gets a solid accent
+/// bar — the same styling as the active tab in the section-tab bar — while the
+/// others get a subtle inset band in the app background colour (darker than the
+/// dialog's `panel` fill), so in the stacked "All" view it's obvious where each
+/// section begins and ends without the focused one being ambiguous.
+fn section_label_colors(focused: bool, th: &Theme) -> (Color, Color) {
+    if focused {
+        (th.bg, th.accent)
+    } else {
+        (th.dim, th.bg)
+    }
+}
+
+/// Fill a section's title line as a full-width coloured band (see
+/// [`section_label_colors`]). The `Paragraph`-level style paints the whole row
+/// width — not just the text cells — so the band reads as a continuous header
+/// strip that visually separates one stacked section from the next.
+fn draw_section_label(f: &mut Frame, area: Rect, text: &str, focused: bool, th: &Theme) {
+    let (fg, bg) = section_label_colors(focused, th);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_string(),
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(bg)),
+        area,
+    );
+}
+
+/// Render an empty "All"-view section as a single line: its label followed by
+/// the "+ Add …" action in parentheses, with the column-title row omitted
+/// (there are no rows to label). Parenthesising the action keeps it reading as
+/// a button rather than a run-on continuation of the label; padding the label
+/// to `add_col` display columns lines the actions up across sections despite
+/// their differing label widths. The whole line is the section's coloured title
+/// band (accent when focused), matching the filled title bands of the populated
+/// sections.
+fn draw_empty_section_line(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    add_label: &str,
+    add_col: usize,
+    focused: bool,
+    th: &Theme,
+) {
+    let (fg, bg) = section_label_colors(focused, th);
+    let text_style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let pad = add_col.saturating_sub(Span::raw(label).width());
+    let line = Line::from(vec![
+        Span::styled(format!("{label}{}", " ".repeat(pad)), text_style),
+        Span::styled(format!("({add_label})"), text_style),
+    ]);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
 pub(crate) fn draw_new_request(
@@ -1644,34 +1904,101 @@ pub(crate) fn draw_new_request(
     draw_wizard_tab_bar(f, rows[4], form.view_tab, &form.tab_order, s, th);
 
     if form.view_tab == WizardTab::All {
-        let sub = Layout::vertical([
-            Constraint::Length(1),                                         // headers label
-            Constraint::Length(section_height(1, form.headers.len())),     // headers table
-            Constraint::Length(1),                                         // cookies label
-            Constraint::Length(section_height(1, form.cookies.len())),     // cookies table
-            Constraint::Length(1),                                         // form label
-            Constraint::Length(section_height(1, form.queries.len())),     // queries table
-            Constraint::Length(1),                                         // form label
-            Constraint::Length(section_height(1, form.form_fields.len())), // form table
-            Constraint::Length(1),                                         // body label
-            Constraint::Length(4),                                         // body editor
-            Constraint::Length(1),                                         // asserts label
-            Constraint::Length(section_height(0, form.asserts.len())),     // asserts table
-            Constraint::Length(1),                                         // captures label
-            Constraint::Length(section_height(1, form.captures.len())),    // captures table
-            Constraint::Length(1),                                         // reports label
-            Constraint::Length(section_height(1, form.reports.len())),     // reports table
-        ])
-        .split(rows[5]);
+        // Natural height each section wants in the stacked "All" layout. Empty
+        // sections collapse to a single "Label   + Add …" line (no column-title
+        // row) — with nine sections stacked, the wasted chrome of an empty
+        // section's header/column-titles/Add rows would otherwise crowd out the
+        // populated ones. When the naturally-sized stack is still taller than
+        // the dialog body, the whole stack scrolls (whole sections at a time,
+        // keeping the focused one on screen) with a scrollbar in the reclaimed
+        // rightmost column.
+        let block_h: [u16; SECTION_COUNT] = std::array::from_fn(|i| all_section_block_h(form, i));
+        let total: u16 = block_h.iter().sum();
+        let vh = rows[5].height;
+        let overflow = total > vh;
 
-        draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th);
-        draw_kvd_section(f, sub[2], sub[3], form, KvdKind::Cookie, s, th);
-        draw_kvd_section(f, sub[4], sub[5], form, KvdKind::Query, s, th);
-        draw_form_section(f, sub[6], sub[7], form, s, th);
-        draw_body_section(f, sub[8], sub[9], form, s, th);
-        draw_asserts_section(f, sub[10], sub[11], form, s, th);
-        draw_captures_section(f, sub[12], sub[13], form, s, th);
-        draw_reports_section(f, sub[14], sub[15], form, s, th);
+        // Reserve the rightmost column for the form-level scrollbar while
+        // scrolling; sections then render one column narrower.
+        let body_area = if overflow {
+            Rect {
+                width: rows[5].width.saturating_sub(1),
+                ..rows[5]
+            }
+        } else {
+            rows[5]
+        };
+
+        // First visible section, moved only as far as needed to keep the
+        // focused section fully on screen.
+        let mut first = if overflow {
+            form.all_scroll.get().min(SECTION_COUNT - 1)
+        } else {
+            0
+        };
+        if overflow {
+            if let Some(fs) = form
+                .focus
+                .wizard_section()
+                .and_then(wizard_tab_section_index)
+            {
+                if fs < first {
+                    first = fs;
+                }
+                while first < fs && block_h[first..=fs].iter().sum::<u16>() > vh {
+                    first += 1;
+                }
+            }
+            // Avoid leaving dead space below the last section: pull the window
+            // back up while the entire remaining tail still fits.
+            while first > 0 && block_h[first - 1..].iter().sum::<u16>() <= vh {
+                first -= 1;
+            }
+        }
+        form.all_scroll.set(first);
+
+        // Stack sections downward from `first`, each at its natural height,
+        // while they fully fit in the body.
+        let mut used = 0u16;
+        let mut rendered = 0usize;
+        for i in first..SECTION_COUNT {
+            if used + block_h[i] > body_area.height {
+                break;
+            }
+            let sect = Rect {
+                x: body_area.x,
+                y: body_area.y + used,
+                width: body_area.width,
+                height: block_h[i],
+            };
+            draw_all_section(f, i, sect, form, s, th);
+            used += block_h[i];
+            rendered += 1;
+        }
+        // Viewport smaller than even one section: still show the top (focused)
+        // section, clamped to the available height.
+        if rendered == 0 && first < SECTION_COUNT {
+            draw_all_section(
+                f,
+                first,
+                Rect {
+                    height: body_area.height,
+                    ..body_area
+                },
+                form,
+                s,
+                th,
+            );
+        }
+
+        if overflow {
+            let bar = Rect {
+                x: rows[5].x + rows[5].width.saturating_sub(1),
+                y: rows[5].y,
+                width: 1,
+                height: vh,
+            };
+            draw_scrollbar(f, bar, SECTION_COUNT, rendered.max(1), first, th);
+        }
     } else {
         // A single section tab is active: give it essentially the whole
         // remaining dialog body instead of a fixed sliver, so long lists are
@@ -1687,6 +2014,9 @@ pub(crate) fn draw_new_request(
             WizardTab::Headers => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th),
             WizardTab::Cookies => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Cookie, s, th),
             WizardTab::Queries => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Query, s, th),
+            WizardTab::Options => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Options, s, th)
+            }
             WizardTab::Form => draw_form_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th),
             WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th),
@@ -1747,15 +2077,7 @@ fn draw_kvd_section(
 ) {
     let focused =
         matches!(form.focus, NewField::Kvd(k, ..) if k == kind) || form.focus == kind.add_field();
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            kind.title(s).to_string(),
-            Style::default()
-                .fg(if focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, kind.title(s), focused, th);
     draw_kvd_table(f, table, form, kind, s, th);
 }
 
@@ -1770,15 +2092,7 @@ fn draw_form_section(
 ) {
     let form_focused =
         matches!(form.focus, NewField::FormField(..)) || form.focus == NewField::AddFormField;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_form.to_string(),
-            Style::default()
-                .fg(if form_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_form, form_focused, th);
     draw_form_table(f, table, form, s, th);
 }
 
@@ -1794,15 +2108,7 @@ fn draw_body_section(
     th: &Theme,
 ) {
     let body_focused = form.focus == NewField::Body;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_body.to_string(),
-            Style::default()
-                .fg(if body_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_body, body_focused, th);
 
     let total = form.body.lines.len();
     let capacity = editor.height as usize;
@@ -1857,15 +2163,7 @@ fn draw_asserts_section(
 ) {
     let assert_focused =
         matches!(form.focus, NewField::Assert(_)) || form.focus == NewField::AddAssert;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_asserts.to_string(),
-            Style::default()
-                .fg(if assert_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_asserts, assert_focused, th);
     draw_assert_table(f, table, form, s, th);
 }
 
@@ -1880,15 +2178,7 @@ fn draw_captures_section(
 ) {
     let cap_focused =
         matches!(form.focus, NewField::Capture(..)) || form.focus == NewField::AddCapture;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_captures.to_string(),
-            Style::default()
-                .fg(if cap_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_captures, cap_focused, th);
     draw_capture_table(f, table, form, s, th);
 }
 
@@ -1903,15 +2193,7 @@ fn draw_reports_section(
 ) {
     let rep_focused =
         matches!(form.focus, NewField::Report(..)) || form.focus == NewField::AddReport;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_reports.to_string(),
-            Style::default()
-                .fg(if rep_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_reports, rep_focused, th);
     draw_report_table(f, table, form, s, th);
 }
 
@@ -2423,7 +2705,9 @@ fn draw_headerlike_table(
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Span only the scrollable data rows, not the pinned "+ Add …" line
+            // below them (which stays put and isn't part of the scroll region).
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(f, bar_area, rows.len(), data_rects.len().max(1), start, th);
     }
@@ -2777,7 +3061,8 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -2836,7 +3121,8 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             x: area.x,
             y: table_area.y,
             width: 1,
-            height: table_area.height,
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -2930,7 +3216,8 @@ pub(crate) fn draw_capture_table(
             x: area.x, // leftmost column: keep the scrollbar close to the data
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,
@@ -3019,7 +3306,8 @@ pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             x: area.x,
             y: table_area.y + header_h,
             width: 1,
-            height: table_area.height.saturating_sub(header_h),
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
         };
         draw_scrollbar(
             f,

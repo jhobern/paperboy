@@ -561,11 +561,23 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone(), true))
             .collect(),
+        // Per-request `[Options]` (retry, insecure, delay, …) genuinely affect
+        // the run, so carry them through to the executed entry.
+        options: base.options.clone(),
         body: resolved.body,
         expected_status: base.expected_status,
+        // Expected response version/headers/body are real (implicit) asserts in
+        // the source `.hurl`, so preserve them on the run entry too — dropping
+        // them would silently skip assertions the request author wrote.
+        response_version: base.response_version.clone(),
+        response_headers: base.response_headers.clone(),
+        response_body: base.response_body.clone(),
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),
+        // A transient copy that's only executed, never serialized — comments
+        // don't affect the run.
+        comments: Vec::new(),
         user_added: base.user_added,
         modified: base.modified,
         last_run: base.last_run,

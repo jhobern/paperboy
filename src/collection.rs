@@ -4,22 +4,52 @@
 //! live in the [`crate::hurl`] module.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::git_remote::GitOrigin;
 use crate::hurl::{HurlEntry, collection_to_hurl};
 use crate::tree::{self, Row};
 
+/// The label shown for a request row in the workspace tree: the leaf segment of
+/// its folder-encoded title (e.g. `Auth/Login` → `Login`, since the `Auth`
+/// folder is already its own tree row), falling back to the URL when the
+/// request is untitled.
+fn ws_request_label(entry: &HurlEntry) -> String {
+    let leaf = crate::tree::entry_path(&entry.title)
+        .pop()
+        .unwrap_or_default();
+    if leaf.is_empty() {
+        entry.url.clone()
+    } else {
+        leaf
+    }
+}
+
+/// Parse a collection file into the display labels of its requests, for listing
+/// a not-currently-loaded collection's requests in the workspace tree. Returns
+/// an empty vec when the file can't be read or parsed — the collection then
+/// simply shows no requests until it is opened.
+fn read_collection_labels(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            crate::postman::parse_collection(&content)
+                .iter()
+                .map(ws_request_label)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One row in the Workspace tab's file-tree request list (see
 /// [`Collection::ws_rows`]). Unlike [`Row`], which navigates the *virtual*
 /// folders encoded in request titles inside one file, this navigates the real
-/// filesystem under the workspace root and inlines the currently-open
-/// collection's requests directly beneath its file row (an accordion).
+/// filesystem under the workspace root and inlines expanded collections'
+/// requests directly beneath their file rows (an accordion).
 ///
 /// The tree is a real expand/collapse tree: `workspace_expanded` (on
-/// [`Collection`]) holds the set of open folders; visibility is derived
-/// depth-first from that set.
+/// [`Collection`]) holds the set of open folders *and* open collection files;
+/// visibility is derived depth-first from that set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsRow {
     /// A folder in the workspace tree.  `expanded` is true when the folder is
@@ -30,8 +60,9 @@ pub enum WsRow {
         depth: usize,
         expanded: bool,
     },
-    /// A collection file in the workspace tree.  `open` is true when this is
-    /// the currently-loaded file AND its inline requests are not collapsed.
+    /// A collection file in the workspace tree.  `open` is true when the file's
+    /// path is in the tab's `workspace_expanded` set, i.e. its inline request
+    /// names are shown beneath it (whether or not it is the loaded file).
     Collection {
         path: PathBuf,
         name: String,
@@ -45,10 +76,28 @@ pub enum WsRow {
         name: String,
         depth: usize,
     },
-    /// A request of the currently-open collection (index into `entries`),
-    /// shown indented under its [`WsRow::Collection`] row.
-    /// `depth` is the collection's depth + 1.
-    Request { idx: usize, depth: usize },
+    /// An environment file (`.vars`).  Selecting it loads the file as a global
+    /// environment (the same path as File → Load → Environment) rather than
+    /// trying to parse it as a collection.
+    Environment {
+        path: PathBuf,
+        name: String,
+        depth: usize,
+    },
+    /// A request shown indented under its [`WsRow::Collection`] row; `depth` is
+    /// the collection's depth + 1. `collection` is the owning file's path and
+    /// `idx` the request's position within it. When `loaded` is true the file
+    /// is the tab's currently-loaded collection, so `idx` indexes `entries` and
+    /// the row renders in full detail; when false the row is drawn from the
+    /// cached `name` only (see `workspace_titles`) and selecting it previews the
+    /// name — opening it (Enter/Right) loads that collection first.
+    Request {
+        collection: PathBuf,
+        idx: usize,
+        name: String,
+        depth: usize,
+        loaded: bool,
+    },
 }
 
 /// A loaded Hurl collection (one .hurl file).
@@ -127,17 +176,22 @@ pub struct Collection {
     /// commit rather than losing track of the workspace entirely — see
     /// `PersistedTab::into_collection`'s `PendingWorkspaceReload`.
     pub workspace_git_origin: Option<crate::tui::remote::WorkspaceGitOrigin>,
-    /// For a Workspace tab, the set of folder paths (absolute) that are
-    /// currently expanded in the file-tree.  A folder is visible when all its
-    /// ancestor folders are also in this set.  Persisted so the tree state
-    /// survives restarts.  Absolute paths in memory; serialised relative to
+    /// For a Workspace tab, the set of *expanded* node paths (absolute) in the
+    /// file-tree — both folders (whose child entries are shown) and collection
+    /// files (whose inline request names are shown). A node is visible when all
+    /// its ancestor folders are also in this set. Persisted so the tree state
+    /// survives restarts. Absolute paths in memory; serialised relative to
     /// `workspace_root` in [`crate::persistence`].
     pub workspace_expanded: HashSet<PathBuf>,
-    /// For a Workspace tab, whether the currently-loaded collection is
-    /// collapsed (its inline requests hidden) in the file-tree list. Toggled
-    /// by pressing Enter on its file row; reset to expanded whenever a new
-    /// file is loaded.  Not persisted.
-    pub workspace_collapsed: bool,
+    /// For a Workspace tab, cached request *names* (leaf titles) of expanded
+    /// collection files that are **not** the currently-loaded one — the loaded
+    /// file renders its rows straight from `entries`, so it needs no cache.
+    /// Lets [`Self::ws_rows`] list several collections' requests at once without
+    /// re-reading and parsing each file every frame. Populated when switching
+    /// away from a loaded file (from its live entries) and when restoring an
+    /// expanded collection from disk (see [`Self::rebuild_expanded_titles`]).
+    /// Derived state — not persisted.
+    pub workspace_titles: HashMap<PathBuf, Vec<String>>,
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -169,7 +223,7 @@ impl Collection {
             workspace_downloaded_from_git: false,
             workspace_git_origin: None,
             workspace_expanded: HashSet::new(),
-            workspace_collapsed: false,
+            workspace_titles: HashMap::new(),
         };
         c.sync_folder_to_selected();
         c
@@ -260,19 +314,23 @@ impl Collection {
                         name: entry.display_name,
                         depth: d,
                     });
+                } else if crate::workspace::is_env_file(&entry.path) {
+                    out.push(WsRow::Environment {
+                        path: entry.path,
+                        name: entry.display_name,
+                        depth: d,
+                    });
                 } else {
-                    let open = self.path.as_deref() == Some(entry.path.as_path())
-                        && !self.workspace_collapsed;
+                    let expanded = self.workspace_expanded.contains(&entry.path);
+                    let path = entry.path.clone();
                     out.push(WsRow::Collection {
                         path: entry.path,
                         name: entry.display_name,
                         depth: d,
-                        open,
+                        open: expanded,
                     });
-                    if open {
-                        out.extend(
-                            (0..self.entries.len()).map(|idx| WsRow::Request { idx, depth: d + 1 }),
-                        );
+                    if expanded {
+                        out.extend(self.request_rows_for(&path, d + 1));
                     }
                 }
             }
@@ -280,19 +338,91 @@ impl Collection {
         out
     }
 
-    /// Expand all ancestor folders of the currently-loaded file so it is
-    /// visible in the workspace tree, and un-collapse the accordion so its
-    /// inline requests are shown.  A no-op for a non-Workspace tab or when no
-    /// file is loaded.  Called by [`crate::tui::app`] after loading a file and
-    /// by [`crate::persistence`] when restoring state.
+    /// The request rows shown under an expanded collection at `path`, indented
+    /// to `depth`. For the currently-loaded file the rows come straight from
+    /// `entries` (full detail, `loaded: true`); for any other expanded
+    /// collection they come from the cached names in `workspace_titles`
+    /// (`loaded: false`), so several collections' requests can be listed at once
+    /// without re-parsing every file each frame. A collection with no cached
+    /// names yet contributes no rows.
+    fn request_rows_for(&self, path: &Path, depth: usize) -> Vec<WsRow> {
+        if self.path.as_deref() == Some(path) {
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(idx, e)| WsRow::Request {
+                    collection: path.to_path_buf(),
+                    idx,
+                    name: ws_request_label(e),
+                    depth,
+                    loaded: true,
+                })
+                .collect()
+        } else {
+            self.workspace_titles
+                .get(path)
+                .map(|names| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, name)| WsRow::Request {
+                            collection: path.to_path_buf(),
+                            idx,
+                            name: name.clone(),
+                            depth,
+                            loaded: false,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// Cache the loaded file's request names under its own path, derived from
+    /// the live `entries` (so in-memory edits/renames are reflected). Call this
+    /// just before switching the loaded file away, so a collection left
+    /// expanded keeps listing its requests from the cache.
+    pub fn snapshot_loaded_titles(&mut self) {
+        if let Some(path) = self.path.clone() {
+            let names = self.entries.iter().map(ws_request_label).collect();
+            self.workspace_titles.insert(path, names);
+        }
+    }
+
+    /// Re-read the request names of every expanded collection file that isn't
+    /// the currently-loaded one, populating `workspace_titles` from disk. Used
+    /// after restoring persisted state, where collections expanded last session
+    /// must list their requests without having been opened yet this session.
+    pub fn rebuild_expanded_titles(&mut self) {
+        let loaded = self.path.clone();
+        let paths: Vec<PathBuf> = self.workspace_expanded.iter().cloned().collect();
+        for p in paths {
+            if Some(&p) == loaded.as_ref()
+                || !p.is_file()
+                || crate::workspace::is_report_file(&p)
+                || crate::workspace::is_env_file(&p)
+            {
+                continue;
+            }
+            let names = read_collection_labels(&p);
+            self.workspace_titles.insert(p, names);
+        }
+    }
+
+    /// Expand all ancestor folders of the currently-loaded file, and the file
+    /// itself, so it (and its inline requests) are visible in the workspace
+    /// tree.  A no-op for a non-Workspace tab or when no file is loaded.  Called
+    /// by [`crate::tui::app`] after loading a file and by [`crate::persistence`]
+    /// when restoring state.
     pub fn expand_ancestors_for_path(&mut self) {
-        self.workspace_collapsed = false;
         let (Some(root), Some(path)) = (&self.workspace_root, &self.path) else {
             return;
         };
         // Clone to avoid the simultaneous &self borrow.
         let root = root.clone();
         let path = path.clone();
+        // The loaded file itself is expanded so its requests show by default.
+        self.workspace_expanded.insert(path.clone());
         if let Some(parent) = path.parent()
             && let Ok(rel) = parent.strip_prefix(&root)
         {
@@ -314,12 +444,18 @@ impl Collection {
         }
         let rows = self.ws_rows();
         let sel = self.selected_entry;
+        let loaded = self.path.clone();
         let target = rows
             .iter()
-            .position(|r| matches!(r, WsRow::Request { idx, .. } if *idx == sel))
+            .position(|r| {
+                matches!(r, WsRow::Request { collection, idx, .. }
+                    if *idx == sel && Some(collection) == loaded.as_ref())
+            })
             .or_else(|| {
-                rows.iter()
-                    .position(|r| matches!(r, WsRow::Collection { open: true, .. }))
+                rows.iter().position(|r| {
+                    matches!(r, WsRow::Collection { path, open: true, .. }
+                        if Some(path) == loaded.as_ref())
+                })
             })
             .unwrap_or(0);
         self.list_cursor = target.min(rows.len().saturating_sub(1));

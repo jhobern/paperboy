@@ -1450,8 +1450,7 @@ impl TuiApp {
             PromptKind::Raw(ci) => {
                 // Reparse the edited Hurl text back into the entry; on success
                 // this can change any field (Raw Mode exposes everything,
-                // including query_params/form_fields/cookies/basic_auth/
-                // expected_status, which the Edit Request wizard hides). On
+                // including query_params/form_fields/cookies/basic_auth). On
                 // failure, reopen the overlay with the user's text intact so
                 // they can fix it.
                 let entries = crate::hurl::parse_hurl(&text);
@@ -2110,6 +2109,10 @@ impl TuiApp {
             Ok(content) => {
                 let entries = crate::postman::parse_collection(&content);
                 if let Some(col) = self.collections.get_mut(collection_idx) {
+                    // Cache the outgoing file's request names first, so if it was
+                    // left expanded it keeps listing its requests from the cache
+                    // once it is no longer the loaded file.
+                    col.snapshot_loaded_titles();
                     col.entries = entries;
                     col.selected_entry = 0;
                     col.path = Some(path);

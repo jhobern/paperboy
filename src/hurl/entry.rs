@@ -136,6 +136,51 @@ pub enum RunStatus {
     Failed,
 }
 
+/// Where a preserved prose comment sits relative to an entry's structural
+/// blocks. Comments are anchored to the block they precede (rather than to an
+/// absolute line) so they round-trip to roughly the same place even when
+/// unrelated lines are added or removed above or below them — e.g. a comment
+/// written just before `[Asserts]` stays just before `[Asserts]`. The variants
+/// are listed in the order [`HurlEntry::to_hurl`] emits their blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommentAnchor {
+    /// Above the entry's title / method line (file- or entry-leading comments).
+    Lead,
+    /// In the header region, between the request line and the first block.
+    Headers,
+    BasicAuth,
+    Cookies,
+    Query,
+    Form,
+    /// Just before the request `[Options]` section.
+    Options,
+    Body,
+    /// Just before the `HTTP <status>` response line.
+    Response,
+    /// In the response-header region, between the `HTTP <status>` line and the
+    /// first response block (`[Asserts]`/`[Captures]`/response body).
+    ResponseHeaders,
+    Asserts,
+    Captures,
+    /// Just before the expected response body.
+    ResponseBody,
+    /// After every other block (trailing comments).
+    Trailing,
+}
+
+/// A prose comment recovered from a `.hurl` file that isn't otherwise
+/// represented in the model (i.e. not the title, a disabled `# key: value`
+/// row, or the `# [Reports]` block). Kept so comments aren't silently dropped
+/// on load: [`parse_hurl`](super::parse_hurl) captures them and
+/// [`HurlEntry::to_hurl`] re-emits them at their `anchor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryComment {
+    pub anchor: CommentAnchor,
+    /// The comment line verbatim, including its leading `#` (e.g. `# note` or a
+    /// `#####` banner), so decoration round-trips unchanged.
+    pub text: String,
+}
+
 /// A single request entry from a Hurl file, or a user-created request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HurlEntry {
@@ -158,8 +203,33 @@ pub struct HurlEntry {
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
     pub cookies: Vec<(String, String, bool)>,
+    /// Request `[Options]` rows: `(name, value, enabled)` — e.g. `retry: 3`,
+    /// `insecure: true`, `variable: host=example.net`. Behavioral per-request
+    /// options honoured by the runner (and `hurl_core`). A disabled row
+    /// round-trips as a `# name: value` comment, exactly like a disabled
+    /// header. `#[serde(default)]` keeps older saved states loadable.
+    #[serde(default)]
+    pub options: Vec<(String, String, bool)>,
     pub body: Option<String>,
     pub expected_status: Option<u16>,
+    /// Expected response HTTP version prefix, e.g. `HTTP/1.1`, taken from the
+    /// `HTTP/1.1 200` status line. `None` means the version-agnostic `HTTP`
+    /// keyword (any version, the common case). Preserved so it round-trips;
+    /// not surfaced in the request wizard. `#[serde(default)]` keeps older
+    /// saved states loadable.
+    #[serde(default)]
+    pub response_version: Option<String>,
+    /// Expected response headers: `(name, value, enabled)` implicit header
+    /// asserts written after the `HTTP <status>` line. Preserved so they
+    /// round-trip (and are checked by the runner); not surfaced in the
+    /// wizard. `#[serde(default)]` keeps older saved states loadable.
+    #[serde(default)]
+    pub response_headers: Vec<(String, String, bool)>,
+    /// Expected response body (the implicit body assert that follows the
+    /// response sections). Preserved so it round-trips; not surfaced in the
+    /// wizard. `#[serde(default)]` keeps older saved states loadable.
+    #[serde(default)]
+    pub response_body: Option<String>,
     /// (variable_name, query_expression) pairs, e.g. `("token", "jsonpath \"$.token\"")`.
     pub captures: Vec<(String, String)>,
     /// Raw `[Asserts]` expressions (e.g. `jsonpath "$.x" == "y"`), kept for
@@ -176,6 +246,14 @@ pub struct HurlEntry {
     /// `#[serde(default)]` keeps older saved requests loadable.
     #[serde(default)]
     pub reports: Vec<(String, String)>,
+    /// Prose comments recovered from a loaded `.hurl` file that aren't captured
+    /// by any other field (banners, notes, comments between blocks). Each is
+    /// anchored to the block it precedes (see [`CommentAnchor`]) so it
+    /// round-trips near its original place through
+    /// [`to_hurl`](HurlEntry::to_hurl). `#[serde(default)]` keeps older saved
+    /// requests (which had no comments field) loadable.
+    #[serde(default)]
+    pub comments: Vec<EntryComment>,
     /// `true` when the user created this request by hand in a collection other
     /// than the Scratch Space. UI-only and never written to `.hurl` files (which
     /// use the manual [`to_hurl`](HurlEntry::to_hurl) serializer); persisted in
@@ -270,7 +348,22 @@ impl HurlEntry {
     /// the response line follow. In practice an entry has either a body or
     /// request sections.
     pub fn to_hurl(&self) -> String {
+        use CommentAnchor::*;
         let mut out = String::new();
+        // Emit every preserved comment anchored to `anchor`, in stored order.
+        let push_comments = |out: &mut String, anchor: CommentAnchor| {
+            for c in self.comments.iter().filter(|c| c.anchor == anchor) {
+                out.push_str(&c.text);
+                out.push('\n');
+            }
+        };
+        push_comments(&mut out, Lead);
+        // File-leading comments are separated from the title/method by a blank
+        // line so they aren't re-absorbed into the title on the next load (the
+        // title is the *contiguous* comment block directly above the method).
+        if self.comments.iter().any(|c| c.anchor == Lead) {
+            out.push('\n');
+        }
         if !self.title.trim().is_empty() {
             out.push_str("# ");
             out.push_str(self.title.trim());
@@ -282,30 +375,29 @@ impl HurlEntry {
             self.method.as_str()
         };
         out.push_str(&format!("{method} {}\n", self.url));
+        push_comments(&mut out, Headers);
         for (k, v, enabled) in &self.headers {
             push_kv_line(&mut out, k, v, *enabled);
         }
-        if let Some(body) = &self.body {
-            out.push_str(body);
-            if !body.ends_with('\n') {
-                out.push('\n');
-            }
-        }
+        push_comments(&mut out, BasicAuth);
         if let Some((user, pass)) = &self.basic_auth {
             out.push_str(&format!("[BasicAuth]\n{user}: {pass}\n"));
         }
+        push_comments(&mut out, Cookies);
         if !self.cookies.is_empty() {
             out.push_str("[Cookies]\n");
             for (k, v, enabled) in &self.cookies {
                 push_kv_line(&mut out, k, v, *enabled);
             }
         }
+        push_comments(&mut out, Query);
         if !self.queries.is_empty() {
             out.push_str("[Query]\n");
             for (k, v, enabled) in &self.queries {
                 push_kv_line(&mut out, k, v, *enabled);
             }
         }
+        push_comments(&mut out, Form);
         if !self.form_fields.is_empty() {
             // Any enabled File field switches the whole section to `[Multipart]`
             // (Hurl's `[Form]` section is text-only); a Base64File also
@@ -328,18 +420,62 @@ impl HurlEntry {
                 push_line(&mut out, &form_field_line(f), f.enabled);
             }
         }
-        // The response section (delimited by the `HTTP <status>` line) is only
-        // needed to carry asserts/captures; use the wildcard `HTTP *` (any
-        // status, per the Hurl spec) when no explicit status was set so those
-        // sections still round-trip through parsing instead of being dropped.
-        // A `# [Reports]` block also lives in the response area, so emit the
-        // wildcard when reports are the only response-side metadata too.
-        if let Some(status) = self.expected_status {
-            out.push_str(&format!("HTTP {status}\n"));
-        } else if !self.asserts.is_empty() || !self.captures.is_empty() || !self.reports.is_empty()
-        {
-            out.push_str("HTTP *\n");
+        push_comments(&mut out, Options);
+        if !self.options.is_empty() {
+            out.push_str("[Options]\n");
+            for (k, v, enabled) in &self.options {
+                push_kv_line(&mut out, k, v, *enabled);
+            }
         }
+        // The request body must follow every request `[Section]`: `hurl_core`
+        // parses a request as headers → sections → body and stops at the body,
+        // so a section emitted *after* the body would be read as the start of
+        // the next entry (a parse error). Keeping the body last here lets a
+        // request carry both a body and, say, `[Options]` and still round-trip.
+        push_comments(&mut out, Body);
+        if let Some(body) = &self.body {
+            out.push_str(body);
+            if !body.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        push_comments(&mut out, Response);
+        // Response-side comments (anywhere from the `HTTP` line down to the
+        // expected body) force the `HTTP` line below so they stay in the
+        // response area instead of drifting up into the request's sections,
+        // where a `# k: v`-shaped comment could be re-read as a disabled row on
+        // the next load.
+        let has_response_comments = self.comments.iter().any(|c| {
+            matches!(
+                c.anchor,
+                Response | ResponseHeaders | Asserts | Captures | ResponseBody
+            )
+        });
+        // The `HTTP` line also carries the expected version (`HTTP/1.1`, …); an
+        // absent version is the version-agnostic `HTTP` keyword. It's emitted
+        // whenever there's *any* response-side content so headers, an expected
+        // body, an explicit version, asserts, captures, the reports block or a
+        // preserved comment all stay in — and are re-parsed from — the response
+        // area rather than being dropped or drifting into the request sections.
+        let version = self.response_version.as_deref().unwrap_or("HTTP");
+        let has_response_area = self.expected_status.is_some()
+            || self.response_version.is_some()
+            || !self.response_headers.is_empty()
+            || self.response_body.is_some()
+            || !self.asserts.is_empty()
+            || !self.captures.is_empty()
+            || !self.reports.is_empty()
+            || has_response_comments;
+        if let Some(status) = self.expected_status {
+            out.push_str(&format!("{version} {status}\n"));
+        } else if has_response_area {
+            out.push_str(&format!("{version} *\n"));
+        }
+        push_comments(&mut out, ResponseHeaders);
+        for (k, v, enabled) in &self.response_headers {
+            push_kv_line(&mut out, k, v, *enabled);
+        }
+        push_comments(&mut out, Asserts);
         if !self.asserts.is_empty() {
             out.push_str("[Asserts]\n");
             for a in &self.asserts {
@@ -347,10 +483,21 @@ impl HurlEntry {
                 out.push('\n');
             }
         }
+        push_comments(&mut out, Captures);
         if !self.captures.is_empty() {
             out.push_str("[Captures]\n");
             for (name, expr) in &self.captures {
                 out.push_str(&format!("{name}: {expr}\n"));
+            }
+        }
+        // The expected response body follows the response sections, mirroring
+        // the request body's placement after the request sections (`hurl_core`
+        // parses a response as headers → sections → body).
+        push_comments(&mut out, ResponseBody);
+        if let Some(body) = &self.response_body {
+            out.push_str(body);
+            if !body.ends_with('\n') {
+                out.push('\n');
             }
         }
         // Report fields: a comment-encoded pseudo-section. `hurl_core` treats
@@ -363,6 +510,7 @@ impl HurlEntry {
                 out.push_str(&format!("# {name}: {query}\n"));
             }
         }
+        push_comments(&mut out, Trailing);
         out
     }
 }
@@ -375,6 +523,28 @@ pub fn collection_to_hurl(entries: &[HurlEntry]) -> String {
         .map(HurlEntry::to_hurl)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Recognise a `status == <code>` assert expression and return the numeric
+/// status code it checks.
+///
+/// The Hurl `HTTP <code>` response line and a `status == <code>` assert are
+/// equivalent — both fail the entry unless the response status matches — and
+/// PaperBoy stores that check once, as [`HurlEntry::expected_status`]
+/// (serialized back out as the `HTTP <code>` line). This lets the request
+/// wizard surface the status expectation as an editable assert row and fold it
+/// back into `expected_status` on save.
+///
+/// Returns `None` for anything that isn't a plain equality on `status`
+/// (e.g. `status >= 200`, `status != 404`, or a `jsonpath` assert), which stay
+/// as ordinary `[Asserts]` rows. Whitespace around `status` and `==` is
+/// tolerated so the row survives light hand-editing.
+pub fn status_eq_code(expr: &str) -> Option<u16> {
+    let rest = expr.trim().strip_prefix("status")?;
+    // Require a boundary after `status` so `status_line`/`statusCode` don't
+    // match; the next thing must be the `==` operator (after any whitespace).
+    let rest = rest.trim_start().strip_prefix("==")?;
+    rest.trim().parse::<u16>().ok()
 }
 
 /// HTTP methods offered when creating a request.

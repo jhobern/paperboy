@@ -553,7 +553,10 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     press(&mut app, KeyCode::Tab); // empty cookie section -> AddQuery
     assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
 
-    press(&mut app, KeyCode::Tab); // empty query section -> AddFormField
+    press(&mut app, KeyCode::Tab); // empty query section -> AddOptions
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Options));
+
+    press(&mut app, KeyCode::Tab); // empty options section -> AddFormField
     assert_eq!(new_focus(&app), NewField::AddFormField);
 
     press(&mut app, KeyCode::Tab); // empty form section -> jump to Body
@@ -562,6 +565,8 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     // Shift+Tab from Body walks back through the same chain to URL.
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::AddFormField);
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Options));
     press(&mut app, KeyCode::BackTab);
     assert_eq!(new_focus(&app), NewField::AddKvd(KvdKind::Query));
     press(&mut app, KeyCode::BackTab);
@@ -599,6 +604,7 @@ fn open_form_on_form_field_kind(app: &mut TuiApp) {
     press(app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(app, KeyCode::Enter); // creates FormField(0, Key)
     press(app, KeyCode::Char('k')); // non-blank, or Tab skips the empty section
@@ -865,6 +871,46 @@ fn arrow_up_stops_at_every_section_it_passes_through_just_like_arrow_down_does()
 }
 
 #[test]
+fn arrow_up_from_the_first_cookie_stops_at_the_populated_headers_add_row() {
+    // Regression: with headers present, Up out of the first Cookie row used to
+    // jump straight onto the last header row, skipping the Headers section's
+    // pinned "+ Add header" line entirely. It must stop there first — mirroring
+    // Down (last header -> "+ Add header" -> first cookie) — and only step onto
+    // the last header row on the following Up.
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.headers = vec![
+        ("H0".to_string(), "v0".to_string(), true),
+        ("H1".to_string(), "v1".to_string(), true),
+    ];
+    entry.cookies = vec![("C0".to_string(), "cv0".to_string(), true)];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // open the Edit Request wizard
+
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.focus = NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key);
+    } else {
+        panic!("expected the Edit Request wizard to open");
+    }
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Header),
+        "Up from the first Cookie row must stop on the Headers '+ Add header' row"
+    );
+
+    press(&mut app, KeyCode::Up);
+    assert!(
+        matches!(new_focus(&app), NewField::Kvd(KvdKind::Header, 1, _)),
+        "the next Up steps onto the last (populated) header row, got {:?}",
+        new_focus(&app)
+    );
+}
+
+#[test]
 fn arrow_up_from_the_first_form_field_stops_at_cookies_then_headers_one_section_at_a_time() {
     // Same bug, but two empty sections in a row above the current one
     // (Cookies then Headers) — Up must stop at each in turn, never
@@ -877,14 +923,21 @@ fn arrow_up_from_the_first_form_field_stops_at_cookies_then_headers_one_section_
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Enter); // creates FormField(0, Key); headers/cookies still empty
 
     press(&mut app, KeyCode::Up);
     assert_eq!(
         new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "Up from the first Form row must stop at the empty Options section first"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
-        "Up from the first Form row must stop at the empty Queries section first"
+        "the next Up stops at the empty Queries section"
     );
     press(&mut app, KeyCode::Up);
     assert_eq!(
@@ -915,7 +968,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
     press(&mut app, KeyCode::Char('n'));
     // Walk straight to Body, then on to the (empty) Asserts and Captures
     // "Add" rows.
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -941,7 +994,7 @@ fn arrow_up_from_the_first_capture_row_stops_at_the_empty_asserts_section() {
 fn up_down_in_the_body_move_the_cursor_then_leave_at_the_edges() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::Tab); // Name -> ... -> Body (skips the blank sections)
     }
     assert_eq!(new_focus(&app), NewField::Body);
@@ -1162,6 +1215,7 @@ fn arrows_can_reach_the_enabled_checkbox_in_a_form_row() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery, blank
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key), blank
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -3372,6 +3426,41 @@ fn intact_secret_renders_fixed_eight_dots_regardless_of_length() {
     assert_eq!(
         short, 8,
         "exactly eight dots are shown (matching SECRET_MASK)"
+    );
+}
+
+#[test]
+fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    // The workspace "New report" prompt has a long title; on the fixed-width
+    // single-line box it used to be clipped by the panel border, hiding the
+    // trailing "Esc cancel" (and the box's own right edge).
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::Prompt {
+        kind: PromptKind::NewWorkspaceReport(0),
+        editor: super::editor::Editor::blank(),
+        title: s.workspace_new_report_title.to_string(),
+        mask: false,
+        reset_to: None,
+        secret_intact: false,
+        secret_checkbox: None,
+    });
+    let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    let full = format!(
+        "{}  ({})",
+        s.workspace_new_report_title, s.prompt_save_hint_sl
+    );
+    assert!(
+        out.contains(&full),
+        "the full prompt title should be visible (box widened to fit it):\n{out}"
     );
 }
 
@@ -5630,6 +5719,201 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     assert!(
         out.contains("got"),
         "the failing assert's actual value is shown:\n{out}"
+    );
+}
+
+/// A failed status assertion (e.g. `HTTP 200` but the server returned 500)
+/// still shows the full response — status line, the failing assert marked ✗,
+/// and the response body — instead of replacing everything with the error text.
+#[test]
+fn response_panel_shows_full_response_when_the_status_assert_fails() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 500,
+            status_text: "Internal Server Error".into(),
+            body: "{\"reason\":\"boom\"}".into(),
+            // A real failed assert sets `error` too — this is exactly what used
+            // to hide the whole response behind the error text.
+            error: "Expected status 200 but got 500".into(),
+            assert_results: vec![AssertOutcome {
+                expr: "status == 200".into(),
+                passed: false,
+                detail: "got 500".into(),
+            }],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("500"), "the actual status is shown:\n{out}");
+    assert!(
+        out.contains('\u{2717}'),
+        "the failing status assert shows a cross:\n{out}"
+    );
+    assert!(
+        out.contains("status == 200"),
+        "the failing assert expression is shown:\n{out}"
+    );
+    assert!(
+        out.contains("boom"),
+        "the response body is still visible on failure:\n{out}"
+    );
+}
+
+/// A failed explicit `[Asserts]` check against a 200 response keeps the whole
+/// response visible (body included), with the failing assert marked ✗ — the
+/// error text no longer takes over the panel.
+#[test]
+fn response_panel_shows_full_response_when_an_explicit_assert_fails() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{\"via\":\"bearer\"}".into(),
+            error: "assert failed".into(),
+            assert_results: vec![
+                AssertOutcome {
+                    expr: "status == 200".into(),
+                    passed: true,
+                    detail: String::new(),
+                },
+                AssertOutcome {
+                    expr: "jsonpath \"$.via\" == \"oauth2\"".into(),
+                    passed: false,
+                    detail: "got \"bearer\"".into(),
+                },
+            ],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("200 OK"), "status still shown:\n{out}");
+    assert!(
+        out.contains("1/2"),
+        "the assert badge counts the failure:\n{out}"
+    );
+    assert!(
+        out.contains('\u{2713}') && out.contains('\u{2717}'),
+        "the passing assert keeps its check and the failing one a cross:\n{out}"
+    );
+    assert!(
+        out.contains("bearer"),
+        "the response body is still visible on assert failure:\n{out}"
+    );
+}
+
+/// A runner error not represented by a failed assert (e.g. a failed
+/// `[Captures]` on an otherwise-passing 200 response) is surfaced as a single
+/// error-coloured line above the body, while the response itself stays visible.
+#[test]
+fn response_panel_shows_a_non_assert_error_line_but_keeps_the_body() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{\"ok\":true}".into(),
+            error: "capture token failed".into(),
+            assert_results: vec![AssertOutcome {
+                expr: "status == 200".into(),
+                passed: true,
+                detail: String::new(),
+            }],
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(out.contains("200 OK"), "status shown:\n{out}");
+    assert!(
+        out.contains("capture token failed"),
+        "the non-assert error is surfaced as its own line:\n{out}"
+    );
+    assert!(
+        out.contains("\"ok\""),
+        "the response body is still visible:\n{out}"
+    );
+}
+
+/// A transport failure that returned no response (status 0) still shows the
+/// error text — that behaviour is unchanged.
+#[test]
+fn response_panel_shows_the_error_when_there_is_no_response() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 0,
+            error: "Could not resolve host: example.invalid".into(),
+            ..Default::default()
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+
+    assert!(
+        out.contains("Could not resolve host"),
+        "a transport failure with no response still shows the error:\n{out}"
     );
 }
 
@@ -9056,8 +9340,9 @@ fn creating_a_request_returns_focus_to_the_requests_list() {
 }
 
 /// Editing an existing request through the wizard must not disturb fields
-/// the wizard doesn't expose (query params, basic auth, expected status)
-/// — only the fields shown in the form change.
+/// the wizard doesn't expose (query params, basic auth) — only the fields
+/// shown in the form change. The status expectation *is* now shown, as a
+/// `status == <code>` assert row, but survives untouched round-trips.
 #[test]
 fn editing_a_request_preserves_fields_the_wizard_does_not_expose() {
     let mut app = TuiApp::default();
@@ -9106,18 +9391,126 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "status == 200".chars() {
+    for ch in "jsonpath \"$.ok\" == \"yes\"".chars() {
         press(&mut app, KeyCode::Char(ch));
     }
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
     assert_eq!(e.len(), 1);
-    assert_eq!(e[0].asserts, vec!["status == 200".to_string()]);
+    assert_eq!(
+        e[0].asserts,
+        vec!["jsonpath \"$.ok\" == \"yes\"".to_string()]
+    );
+}
+
+/// `status_eq_code` recognises only a plain `status == <n>` equality (the
+/// canonical form of the Hurl `HTTP <n>` line); every other assert — other
+/// operators, a `jsonpath` on `status`, or a look-alike query name — stays an
+/// ordinary assert.
+#[test]
+fn status_eq_code_only_matches_a_plain_status_equality() {
+    use crate::hurl::status_eq_code;
+    assert_eq!(status_eq_code("status == 200"), Some(200));
+    assert_eq!(status_eq_code("  status==404 "), Some(404));
+    assert_eq!(status_eq_code("status >= 200"), None);
+    assert_eq!(status_eq_code("status != 500"), None);
+    assert_eq!(status_eq_code("jsonpath \"$.status\" == 200"), None);
+    assert_eq!(status_eq_code("statusCode == 200"), None);
+    assert_eq!(status_eq_code("status == 200 and more"), None);
+}
+
+/// The `HTTP <code>` response expectation (stored as `expected_status`) is
+/// surfaced in the wizard as an editable `status == <code>` assert row, ahead
+/// of any real asserts, so it reads and edits like the other checks.
+#[test]
+fn the_expected_status_appears_as_an_editable_assert_row() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    entry.asserts = vec!["jsonpath \"$.ok\" == \"yes\"".to_string()];
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    let form = form_ref(&app);
+    assert_eq!(form.asserts.len(), 2);
+    assert_eq!(form.asserts[0].expr.text(), "status == 200");
+    assert_eq!(form.asserts[1].expr.text(), "jsonpath \"$.ok\" == \"yes\"");
+}
+
+/// Editing the surfaced `status == <code>` row folds back into
+/// `expected_status` on save (it round-trips to the `HTTP <code>` line), and
+/// never leaks into the ordinary `[Asserts]` list.
+#[test]
+fn editing_the_status_assert_row_updates_the_expected_status() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.asserts[0].expr = super::editor::Editor::new("status == 404", false);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.expected_status, Some(404));
+    assert!(
+        e.asserts.is_empty(),
+        "the status row must not become an assert"
+    );
+}
+
+/// Removing the `status == <code>` row clears the status expectation entirely.
+#[test]
+fn deleting_the_status_assert_row_clears_the_expected_status() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.expected_status = Some(200);
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+    if let Some(Overlay::NewRequest(form)) = &mut app.overlay {
+        form.asserts.clear();
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert_eq!(app.collections[0].entries[0].expected_status, None);
+}
+
+/// A `status == <code>` typed into the asserts table becomes the request's
+/// `expected_status` rather than a literal assert, unifying the two ways of
+/// expressing a status check.
+#[test]
+fn a_typed_status_assert_becomes_the_expected_status() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    for ch in "http://h/x".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
+    press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
+    press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
+    press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
+    press(&mut app, KeyCode::Tab); // -> Body
+    press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
+    press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
+    for ch in "status == 201".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let e = &app.collections[0].entries;
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].expected_status, Some(201));
+    assert!(e[0].asserts.is_empty());
 }
 
 #[test]
@@ -9133,6 +9526,7 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField (form starts empty)
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
@@ -9181,6 +9575,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
     press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -9243,6 +9638,85 @@ fn creating_a_request_with_a_cookie_via_the_table() {
 }
 
 #[test]
+fn creating_a_request_with_an_option_via_the_table() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    for ch in "http://h/x".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> AddHeader, empty
+    press(&mut app, KeyCode::Tab); // -> AddCookie, empty
+    press(&mut app, KeyCode::Tab); // -> AddQuery, empty
+    press(&mut app, KeyCode::Tab); // -> AddOptions
+    press(&mut app, KeyCode::Enter); // -> Options(0, Key)
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Options, 0, HdrCol::Key)
+    );
+    for ch in "retry".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Tab); // -> Options(0, Value)
+    for ch in "3".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    let e = &app.collections[0].entries;
+    assert_eq!(e.len(), 1);
+    assert_eq!(
+        e[0].options,
+        vec![("retry".to_string(), "3".to_string(), true)]
+    );
+    // And the serialized request carries the `[Options]` section.
+    assert!(
+        e[0].to_hurl().contains("[Options]"),
+        "the option should serialize into an [Options] section:\n{}",
+        e[0].to_hurl()
+    );
+}
+
+#[test]
+fn editing_a_request_populates_and_preserves_the_options_section() {
+    // `[Options]` rows now round-trip through the wizard: they populate the
+    // editable table on open and survive a commit that changes nothing else.
+    let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+    entry.options = vec![
+        ("retry".to_string(), "3".to_string(), true),
+        ("insecure".to_string(), "true".to_string(), true),
+    ];
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the Edit Request wizard
+
+    // The data is populated from entry.options.
+    {
+        let form = form_ref(&app);
+        assert_eq!(form.options.len(), 2);
+        assert_eq!(form.options[0].key.text(), "retry");
+        assert_eq!(form.options[0].value.text(), "3");
+        assert_eq!(form.options[1].key.text(), "insecure");
+        assert_eq!(form.options[1].value.text(), "true");
+    }
+
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)); // commit unchanged
+
+    let e = &app.collections[0].entries;
+    assert_eq!(
+        e[0].options,
+        vec![
+            ("retry".to_string(), "3".to_string(), true),
+            ("insecure".to_string(), "true".to_string(), true),
+        ]
+    );
+}
+
+#[test]
 fn creating_a_request_with_a_text_form_field_via_the_table() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
@@ -9255,6 +9729,7 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
@@ -9290,6 +9765,7 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -9495,6 +9971,7 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     for ch in "avatar".chars() {
@@ -10154,6 +10631,7 @@ fn section_tab_confines_enter_navigation_to_that_section() {
     press(&mut app, KeyCode::PageDown); // -> Headers
     press(&mut app, KeyCode::PageDown); // -> Cookies
     press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
@@ -10256,6 +10734,13 @@ fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
         new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
         "queries start empty, so the entry point is the Add row"
+    );
+
+    press(&mut app, KeyCode::PageDown); // -> Options
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
 
     press(&mut app, KeyCode::PageDown); // -> Form
@@ -10406,7 +10891,7 @@ fn ctrl_left_right_are_a_third_alias_for_prev_next_tab_from_any_pane() {
 }
 
 #[test]
-fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
+fn alt_1_through_9_jump_directly_to_a_wizard_section_by_number() {
     // Alt, not Ctrl: Ctrl+<digit> has no standard control-code encoding,
     // so most terminals only report it with a modifier when the Kitty
     // keyboard protocol is active. Alt is sent as a plain ESC-prefix
@@ -10419,10 +10904,12 @@ fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
         ('1', NewField::AddKvd(KvdKind::Header)),
         ('2', NewField::AddKvd(KvdKind::Cookie)),
         ('3', NewField::AddKvd(KvdKind::Query)),
-        ('4', NewField::AddFormField),
-        ('5', NewField::Body),
-        ('6', NewField::AddAssert),
-        ('7', NewField::AddCapture),
+        ('4', NewField::AddKvd(KvdKind::Options)),
+        ('5', NewField::AddFormField),
+        ('6', NewField::Body),
+        ('7', NewField::AddAssert),
+        ('8', NewField::AddCapture),
+        ('9', NewField::AddReport),
     ];
     for (digit, expected) in cases {
         app.on_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT));
@@ -10436,18 +10923,18 @@ fn alt_1_through_7_jump_directly_to_a_wizard_section_by_number() {
     // Works regardless of which section-view tab is currently active,
     // not just from `All`.
     press(&mut app, KeyCode::PageDown); // -> Headers view tab
-    app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT));
+    app.on_key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT));
     assert_eq!(
         new_focus(&app),
         NewField::Body,
-        "Alt+5 still jumps to Body from a different section tab"
+        "Alt+6 still jumps to Body from a different section tab"
     );
 
     // Plain (unmodified) digits must still type into a text field
     // instead of being swallowed as a jump shortcut — this is exactly
     // the bug being guarded against (Ctrl+<digit> falling back to a
     // bare digit on terminals without keyboard-enhancement support).
-    // Focus is on Body (from the Alt+4 jump above); a bare '1' must be
+    // Focus is on Body (from the Alt+6 jump above); a bare '1' must be
     // typed into it, not reinterpreted as "jump to Headers".
     press(&mut app, KeyCode::Char('1'));
     assert!(
@@ -10479,6 +10966,12 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         new_focus(&app),
         NewField::AddKvd(KvdKind::Query),
         "queries start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(
@@ -10535,6 +11028,12 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         new_focus(&app),
         NewField::AddFormField,
         "form fields start empty, so the entry point is the Add row"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddKvd(KvdKind::Options),
+        "options start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
@@ -13233,6 +13732,122 @@ fn workspace_rows_list_folders_and_collections_and_inline_the_open_collections_r
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `.vars` environment file in the workspace is surfaced as its own
+/// `WsRow::Environment` row (not mis-classified as a collection), so selecting
+/// it can load it as an environment rather than trying to parse it as requests.
+#[test]
+fn a_vars_file_in_the_workspace_tree_is_an_environment_row_not_a_collection() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_env_row_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.hurl"), "GET https://example.com/a\n").unwrap();
+    std::fs::write(dir.join("staging.vars"), "BASE=https://staging\n").unwrap();
+
+    let (app, ci) = workspace_app(&dir);
+    let rows = app.collections[ci].ws_rows();
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, WsRow::Environment { name, .. } if name == "staging.vars")),
+        "staging.vars appears as an Environment row"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, WsRow::Collection { name, .. } if name == "staging.vars")),
+        "staging.vars is not mis-classified as a Collection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pressing Enter (or Right) on a `.vars` row loads it as a global environment,
+/// exactly like File → Load → Environment.
+#[test]
+fn opening_a_vars_row_loads_it_as_a_global_environment() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_env_open_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("staging.vars"),
+        "BASE=https://staging\nTOKEN=abc\n",
+    )
+    .unwrap();
+
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let rows = app.collections[ci].ws_rows();
+    let env_idx = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Environment { .. }))
+        .expect("an environment row exists");
+    app.collections[ci].list_cursor = env_idx;
+
+    assert!(app.global_envs.is_empty(), "no environments loaded yet");
+    app.on_enter();
+    assert_eq!(
+        app.global_envs.len(),
+        1,
+        "the .vars file was loaded as a global environment"
+    );
+    assert_eq!(app.global_envs[0].name, "staging");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Ctrl+F` on the workspace tree toggles the extension filter: off shows every
+/// file (e.g. a stray image / notes file), on hides everything but the
+/// workspace's own file types. The choice is persisted on the collection.
+#[test]
+fn ctrl_f_toggles_the_workspace_tree_extension_filter() {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_treefilter_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.hurl"), "GET https://example.com/a\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "just notes").unwrap();
+    std::fs::write(dir.join("logo.png"), "not an image really").unwrap();
+
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    assert!(
+        app.collections[ci].workspace_filter_hurl_json,
+        "the filter defaults on"
+    );
+    let has_noise = |app: &TuiApp| {
+        app.collections[ci].ws_rows().iter().any(|r| {
+            matches!(r, WsRow::Collection { name, .. } if name == "notes.txt" || name == "logo.png")
+        })
+    };
+    assert!(
+        !has_noise(&app),
+        "non-workspace files hidden while filter on"
+    );
+
+    // Ctrl+F turns the filter off — the stray files now show.
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(!app.collections[ci].workspace_filter_hurl_json);
+    assert!(
+        has_noise(&app),
+        "stray files visible once the filter is off"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceTreeFilter(false))
+    ));
+
+    // Ctrl+F again turns it back on.
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert!(app.collections[ci].workspace_filter_hurl_json);
+    assert!(!has_noise(&app), "stray files hidden again");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceTreeFilter(true))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn enter_on_a_workspace_folder_toggles_expand_collapse() {
     use crate::collection::WsRow;
@@ -13299,12 +13914,13 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
     let dir = workspace_temp_dir("ws_accordion");
     let (mut app, ci) = workspace_app(&dir);
     app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    let alpha = dir.join("alpha.hurl");
     app.focus = Pane::List;
 
     // The `alpha.hurl` collection row sits at index 1 (after `sub/`).
     app.collections[ci].list_cursor = 1;
     app.on_enter();
-    assert!(app.collections[ci].workspace_collapsed);
+    assert!(!app.collections[ci].workspace_expanded.contains(&alpha));
     let rows = app.collections[ci].ws_rows();
     assert!(
         !rows.iter().any(|r| matches!(r, WsRow::Request { .. })),
@@ -13315,7 +13931,7 @@ fn entering_the_open_collection_row_collapses_and_re_expands_its_requests() {
     // Enter again on the same row re-expands it.
     app.collections[ci].list_cursor = 1;
     app.on_enter();
-    assert!(!app.collections[ci].workspace_collapsed);
+    assert!(app.collections[ci].workspace_expanded.contains(&alpha));
     assert!(
         app.collections[ci]
             .ws_rows()
@@ -13466,7 +14082,8 @@ fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
     app.focus = Pane::List;
 
     // Collapse the open `alpha.hurl` (row index 1), then Right re-expands it.
-    app.collections[ci].workspace_collapsed = true;
+    let alpha = dir.join("alpha.hurl");
+    app.collections[ci].workspace_expanded.remove(&alpha);
     let alpha_row = app.collections[ci]
         .ws_rows()
         .iter()
@@ -13475,7 +14092,7 @@ fn right_arrow_expands_a_collapsed_collection_and_opens_a_different_one() {
     app.collections[ci].list_cursor = alpha_row;
     press(&mut app, KeyCode::Right);
     assert!(
-        !app.collections[ci].workspace_collapsed,
+        app.collections[ci].workspace_expanded.contains(&alpha),
         "Right on the collapsed loaded collection expands it"
     );
     assert!(
@@ -13737,6 +14354,379 @@ fn workspace_expanded_set_survives_persistence_round_trip() {
     let _ = HashSet::<std::path::PathBuf>::new(); // suppress unused import hint
 }
 
+/// A workspace with two root-level collection files, each holding two titled
+/// requests — used to exercise inline listing of *several* collections' request
+/// names in the tree at once.
+fn workspace_temp_dir_two_collections(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("one.hurl"),
+        "# Login\nGET https://example.com/login\n\n# Logout\nGET https://example.com/logout\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("two.hurl"),
+        "# Search\nGET https://example.com/search\n\n# Detail\nGET https://example.com/detail\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Names of the `WsRow::Request` rows for a given collection path, tagged with
+/// whether the row is `loaded` (drawn from live entries) or listed from cache.
+fn ws_request_names(app: &TuiApp, ci: usize, collection: &std::path::Path) -> Vec<(String, bool)> {
+    use crate::collection::WsRow;
+    app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .filter_map(|r| match r {
+            WsRow::Request {
+                collection: c,
+                name,
+                loaded,
+                ..
+            } if c == collection => Some((name, loaded)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Loading a second collection while the first is left expanded lists BOTH
+/// collections' request names at once: the loaded one from its live entries,
+/// the other from the cached names snapshotted when it was switched away.
+#[test]
+fn two_expanded_collections_both_list_their_request_names() {
+    let dir = workspace_temp_dir_two_collections("ws_two_cols");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Load one.hurl (auto-expands + becomes loaded), then two.hurl. one.hurl
+    // stays in the expanded set, now listing from cache; two.hurl is loaded.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+
+    assert!(app.collections[ci].workspace_expanded.contains(&one));
+    assert!(app.collections[ci].workspace_expanded.contains(&two));
+
+    let one_rows = ws_request_names(&app, ci, &one);
+    assert_eq!(
+        one_rows,
+        vec![("Login".to_string(), false), ("Logout".to_string(), false),],
+        "the not-loaded collection lists its request names from cache"
+    );
+
+    let two_rows = ws_request_names(&app, ci, &two);
+    assert_eq!(
+        two_rows,
+        vec![("Search".to_string(), true), ("Detail".to_string(), true),],
+        "the loaded collection lists its requests from live entries"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A collection expanded but never loaded this session lists its request names
+/// straight from disk once `rebuild_expanded_titles` populates the cache — the
+/// path used by persistence restore.
+#[test]
+fn a_never_loaded_expanded_collection_lists_names_from_disk() {
+    let dir = workspace_temp_dir_two_collections("ws_from_disk");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+
+    // Mark one.hurl expanded WITHOUT loading it, then rebuild the cache from
+    // disk (exactly what persistence restore does).
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    let rows = ws_request_names(&app, ci, &one);
+    assert_eq!(
+        rows,
+        vec![("Login".to_string(), false), ("Logout".to_string(), false),],
+        "a never-loaded expanded collection lists names read from disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enter on a request of an expanded-but-not-loaded collection loads that
+/// collection and lands the selection on that very request.
+#[test]
+fn entering_a_not_loaded_collections_request_loads_it_and_selects_that_request() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_enter_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Both expanded; two.hurl is the loaded one, so one.hurl's requests are the
+    // not-loaded rows.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Land the cursor on one.hurl's SECOND request ("Logout", idx 1).
+    let target = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Request { collection, idx: 1, loaded: false, .. } if *collection == one))
+        .expect("Logout row of the not-loaded one.hurl");
+    app.collections[ci].list_cursor = target;
+    app.on_enter();
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(one.as_path()),
+        "Enter loaded the not-loaded collection"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "and landed on the request that was under the cursor"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Highlighting (not opening) a request of a not-loaded collection only
+/// previews its name — it must NOT switch the loaded collection or move the
+/// selection into it.
+#[test]
+fn highlighting_a_not_loaded_collections_request_does_not_load_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_preview_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Move the cursor onto the collection row, then Down onto its first
+    // request — the real key path runs the highlight/preview reconcile.
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Down);
+    assert!(
+        matches!(
+            app.collections[ci]
+                .ws_rows()
+                .into_iter()
+                .nth(app.collections[ci].list_cursor),
+            Some(WsRow::Request { loaded: false, .. })
+        ),
+        "cursor landed on a not-loaded request row"
+    );
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(two.as_path()),
+        "highlighting a not-loaded request leaves the loaded collection untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Left on an expanded, not-loaded collection collapses it (removes it from the
+/// expanded set and hides its request rows), mirroring folder collapse.
+#[test]
+fn left_collapses_an_expanded_not_loaded_collection() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_collapse_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    // Cursor on the one.hurl collection row (expanded, not loaded).
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Left);
+
+    assert!(
+        !app.collections[ci].workspace_expanded.contains(&one),
+        "Left collapsed the not-loaded collection"
+    );
+    assert!(
+        ws_request_names(&app, ci, &one).is_empty(),
+        "its request rows are hidden after collapse"
+    );
+    // The loaded collection is unaffected.
+    assert_eq!(app.collections[ci].path.as_deref(), Some(two.as_path()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An expanded collection restored from persisted state lists its request names
+/// after `rebuild_expanded_titles` — the tree survives a restart without the
+/// collection ever being reopened.
+#[test]
+fn expanded_collection_lists_names_after_persistence_restore() {
+    use crate::persistence::PersistedTab;
+
+    let dir = workspace_temp_dir_two_collections("ws_persist_names");
+    let one = dir.join("one.hurl");
+
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    col.workspace_expanded.insert(one.clone());
+
+    let tab = PersistedTab::from_collection(&col, None);
+    let json = serde_json::to_string(&tab).expect("serialise");
+    let tab2: PersistedTab = serde_json::from_str(&json).expect("deserialise");
+    let (restored, _pending) = tab2.into_collection(None);
+
+    assert!(restored.workspace_expanded.contains(&one));
+    let rows: Vec<String> = {
+        use crate::collection::WsRow;
+        restored
+            .ws_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                WsRow::Request {
+                    collection, name, ..
+                } if collection == one => Some(name),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows,
+        vec!["Login".to_string(), "Logout".to_string()],
+        "restore rebuilt the cached names so the expanded collection lists them"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right on a request of an expanded-but-not-loaded collection loads that
+/// collection and lands on that request, mirroring Enter.
+#[test]
+fn right_on_a_not_loaded_collections_request_loads_it_and_selects_that_request() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_right_foreign");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+
+    let target = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Request { collection, idx: 1, loaded: false, .. } if *collection == one))
+        .expect("Logout row of the not-loaded one.hurl");
+    app.collections[ci].list_cursor = target;
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(app.collections[ci].path.as_deref(), Some(one.as_path()));
+    assert_eq!(app.collections[ci].selected_entry, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right on the title of a collection that was opened earlier but is no longer
+/// the loaded one (a different collection was opened since) refocuses it,
+/// making it the loaded collection again without collapsing it.
+#[test]
+fn right_on_an_open_but_not_loaded_collection_refocuses_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir_two_collections("ws_refocus");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Open one.hurl, then two.hurl — two is now loaded, one stays expanded but
+    // is no longer the loaded collection.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.focus = Pane::List;
+    assert_eq!(app.collections[ci].path.as_deref(), Some(two.as_path()));
+
+    // Cursor on one.hurl's (expanded, not-loaded) collection row.
+    let col_row = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .position(|r| matches!(&r, WsRow::Collection { path, open: true, .. } if *path == one))
+        .expect("expanded one.hurl collection row");
+    app.collections[ci].list_cursor = col_row;
+    press(&mut app, KeyCode::Right);
+
+    assert_eq!(
+        app.collections[ci].path.as_deref(),
+        Some(one.as_path()),
+        "Right refocused the previously-opened collection"
+    );
+    // It stays expanded and its requests are now the loaded rows.
+    assert!(app.collections[ci].workspace_expanded.contains(&one));
+    assert!(
+        ws_request_names(&app, ci, &one)
+            .iter()
+            .all(|(_, loaded)| *loaded),
+        "its requests now render from live entries"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The loaded collection's name renders in the accent colour (so it's clear
+/// which collection the coloured requests belong to); other collections render
+/// dim, matching their dim request names.
+#[test]
+fn the_loaded_collection_name_is_accent_and_others_are_dim() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = workspace_temp_dir_two_collections("ws_focus_colour");
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+    let two = dir.join("two.hurl");
+
+    // Both expanded; two.hurl is the loaded one.
+    app.load_workspace_file(ci, one.clone());
+    app.load_workspace_file(ci, two.clone());
+    app.active_tab = ci;
+
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| {
+        let area = f.area();
+        super::draw::draw_collection_left(f, area, &app, ci, &s, &th);
+    })
+    .unwrap();
+    let buf = term.backend().buffer();
+
+    assert_eq!(
+        fg_at_substr(buf, "two.hurl"),
+        Some(th.accent),
+        "the loaded collection's name is drawn in the accent colour"
+    );
+    assert_eq!(
+        fg_at_substr(buf, "one.hurl"),
+        Some(th.dim),
+        "a collection that isn't loaded is drawn dim"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_default() {
     let mut app = TuiApp::default();
@@ -13772,7 +14762,7 @@ fn the_workspace_picker_popup_renders_its_tree_filter_state_and_footer_hint() {
         ))),
         ..Default::default()
     };
-    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
@@ -18054,6 +19044,7 @@ fn tab_reaches_the_reports_section_after_captures() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert
@@ -18067,10 +19058,10 @@ fn tab_reaches_the_reports_section_after_captures() {
 }
 
 #[test]
-fn alt_8_jumps_to_the_reports_section() {
+fn alt_9_jumps_to_the_reports_section() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    app.on_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::ALT));
+    app.on_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT));
     assert_eq!(new_focus(&app), NewField::AddReport);
 }
 
@@ -18078,7 +19069,7 @@ fn alt_8_jumps_to_the_reports_section() {
 fn pagedown_cycles_to_the_reports_tab() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
@@ -18098,6 +19089,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert
@@ -18125,7 +19117,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
 fn deleting_the_last_report_row_leaves_the_section_empty() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown); // -> Reports
     }
     assert_eq!(new_focus(&app), NewField::AddReport);
@@ -18167,7 +19159,7 @@ fn editing_a_request_populates_and_renders_the_reports_section() {
     }
 
     // Switch to the Reports section tab (full-body) and confirm it renders.
-    for _ in 0..8 {
+    for _ in 0..9 {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
@@ -19886,4 +20878,207 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         data_row, 3,
         "with scroll=3, clicking y_off=1 should select data_row 3"
     );
+}
+
+#[cfg(test)]
+mod all_view_layout {
+    use super::*;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// A request whose headers sit under a blank line (the repro) parses into
+    /// seven headers; the combined "All" view must actually render them (the
+    /// regression showed the Headers table squeezed to zero data rows because
+    /// the nine stacked sections' chrome overflowed the dialog body).
+    #[test]
+    fn all_view_renders_header_rows_and_compacts_empty_sections() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry::from_fields("Get token", "POST", "{{ URL }}/oauth2", vec![], "");
+        entry.headers = vec![
+            ("Content-Length".into(), "0".into(), true),
+            ("User-Agent".into(), "crabman/0.1.0".into(), true),
+            ("Accept".into(), "*/*".into(), true),
+            ("Accept-Encoding".into(), "gzip, deflate, br".into(), true),
+            ("client_id".into(), "{{ CLIENT_ID }}".into(), true),
+            ("client_secret".into(), "{{ CLIENT_SECRET }}".into(), true),
+            ("grant_type".into(), "client_credentials".into(), true),
+        ];
+        // The default the wizard opens in (view_tab = All).
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        form.focus =
+            crate::tui::new_request::NewField::Capture(0, crate::tui::new_request::CapCol::Name);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let out = buffer_text(term.backend().buffer());
+
+        // At least five of the seven header keys must be visible (the section's
+        // own scrollbar caps it at five data rows, but zero is the bug).
+        let visible = [
+            "Content-Length",
+            "User-Agent",
+            "Accept",
+            "Accept-Encoding",
+            "client_id",
+        ]
+        .iter()
+        .filter(|k| out.contains(**k))
+        .count();
+        assert!(
+            visible >= 5,
+            "expected the Headers table to show its rows, saw {visible}:\n{out}"
+        );
+
+        // Empty sections collapse to a single "Label   + Add …" line: the Add
+        // action shares the Cookies label row rather than sitting under its own
+        // "Value"/"Description" column-title row (which is omitted when empty).
+        assert!(
+            out.lines()
+                .any(|l| l.contains(s.field_cookies) && l.contains("Add cookie")),
+            "empty Cookies section should render as one compact 'label + Add' line:\n{out}"
+        );
+    }
+
+    /// When the stacked sections are collectively taller than the dialog body,
+    /// the whole "All" view scrolls (whole sections at a time) to keep the
+    /// focused section on screen, and a scrollbar appears.
+    #[test]
+    fn all_view_scrolls_to_keep_the_focused_section_visible() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+
+        let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
+        entry.headers = (0..6)
+            .map(|i| (format!("SecretHeader{i}"), format!("v{i}"), true))
+            .collect();
+        entry.captures = (0..3)
+            .map(|i| (format!("cap{i}"), format!("jsonpath \"$.c{i}\"")))
+            .collect();
+        entry.reports = vec![
+            ("myreport".into(), "jsonpath \"$.overall\"".into()),
+            ("second".into(), "jsonpath \"$.second\"".into()),
+        ];
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+
+        // A short terminal forces the stack to overflow the dialog body.
+        let render = |form: &NewReq| {
+            let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            term.draw(|f| super::super::new_request::draw_new_request(f, form, &s, &th, true))
+                .unwrap();
+            buffer_text(term.backend().buffer())
+        };
+
+        // Focused on a Reports cell: Reports scrolls into view (and the top
+        // Headers section scrolls off), with a scrollbar thumb visible.
+        form.focus = NewField::Report(0, CapCol::Name);
+        let out = render(&form);
+        assert!(
+            out.contains("myreport"),
+            "the focused Reports section should be scrolled into view:\n{out}"
+        );
+        assert!(
+            !out.contains("SecretHeader0"),
+            "the far-away Headers section should have scrolled off:\n{out}"
+        );
+        assert!(
+            out.contains('\u{2588}'),
+            "a scrollbar thumb should appear when the stack overflows:\n{out}"
+        );
+
+        // Focusing a Header cell scrolls the top section back into view.
+        form.focus = NewField::Kvd(KvdKind::Header, 0, HdrCol::Key);
+        let out = render(&form);
+        assert!(
+            out.contains("SecretHeader0"),
+            "focusing a Header cell should scroll Headers back into view:\n{out}"
+        );
+    }
+
+    /// Each section's title is a full-width coloured band: the focused section
+    /// gets a solid accent bar, every other section a subtle inset band in the
+    /// app background colour, so it's clear where each section begins and ends.
+    #[test]
+    fn all_view_colours_section_title_bands() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry::from_fields("t", "POST", "http://h/x", vec![], "");
+        entry.headers = vec![("A".into(), "1".into(), true)];
+        entry.captures = vec![("tok".into(), "jsonpath \"$.tok\"".into())];
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        // Focus a Capture so the Captures title is the focused (accent) band
+        // while the Headers title stays an unfocused (background) band.
+        form.focus =
+            crate::tui::new_request::NewField::Capture(0, crate::tui::new_request::CapCol::Name);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+
+        // Find the row containing each section label and read the band's bg a
+        // few cells past the border (well inside the title text / fill).
+        let band_bg = |needle: &str| -> Option<ratatui::style::Color> {
+            for y in 0..buf.area.height {
+                let mut row = String::new();
+                for x in 0..buf.area.width {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                // Skip the section-tab bar (the only row listing "All"), which
+                // also contains every section name.
+                if row.contains(" All ") {
+                    continue;
+                }
+                if let Some(col) = row.find(needle) {
+                    return Some(buf[((col + 1) as u16, y)].bg);
+                }
+            }
+            None
+        };
+
+        assert_eq!(
+            band_bg(s.field_captures),
+            Some(th.accent),
+            "the focused Captures title should be a solid accent band"
+        );
+        assert_eq!(
+            band_bg(s.field_headers),
+            Some(th.bg),
+            "an unfocused section title should be an inset background band"
+        );
+    }
+
+    /// The compact empty-section lines pad their labels to a common width so the
+    /// "(＋ Add …)" actions all line up in one column, even though the section
+    /// labels differ in length (e.g. "Form" vs "Captures").
+    #[test]
+    fn all_view_aligns_empty_section_add_actions() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        // An all-empty request renders every section as a compact line.
+        let entry = HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "");
+        let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        let mut term = Terminal::new(TestBackend::new(90, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let out = buffer_text(term.backend().buffer());
+
+        // Column of the "(" in each compact line (measured from the line start).
+        let add_col = |label: &str| -> Option<usize> {
+            out.lines()
+                .find(|l| l.contains(label) && l.contains("Add "))
+                .and_then(|l| l.find('('))
+        };
+        let cols: Vec<usize> = ["Form", "Headers", "Captures", "Reports"]
+            .iter()
+            .filter_map(|l| add_col(l))
+            .collect();
+        assert_eq!(cols.len(), 4, "expected four compact section lines:\n{out}");
+        assert!(
+            cols.iter().all(|c| *c == cols[0]),
+            "the '(＋ Add …)' actions should all start at the same column, got {cols:?}:\n{out}"
+        );
+    }
 }

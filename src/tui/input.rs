@@ -835,6 +835,17 @@ impl TuiApp {
             // Ctrl+R (Requests list) reverts the selected request to its saved
             // on-disk version, discarding its in-memory edits (#19).
             KeyCode::Char('r') if ctrl && self.focus == Pane::List => self.begin_revert_request(),
+            // Ctrl+F (Workspace file-tree) toggles the extension filter that
+            // hides non-workspace files (images, build output, …) so the tree
+            // shows only `.hurl/.json/.vars/.trail`. Mirrors the picker's Tab
+            // toggle, but the tree can't reuse Tab (there it cycles focus).
+            KeyCode::Char('f')
+                if ctrl
+                    && self.focus == Pane::List
+                    && self.collections[self.active_tab].is_workspace() =>
+            {
+                self.toggle_workspace_tree_filter(self.active_tab);
+            }
             // Reopens the most recently closed tab. Deliberately a plain
             // unmodified key rather than a Ctrl+Shift combo: terminal emulators
             // commonly intercept Ctrl+Shift+T themselves (as "new tab") before
@@ -1076,15 +1087,44 @@ impl TuiApp {
                     }
                     // Already expanded: do nothing (use Left to collapse).
                     Some(crate::collection::WsRow::Folder { expanded: true, .. }) => {}
-                    Some(crate::collection::WsRow::Collection {
-                        path, open: false, ..
-                    }) => {
+                    // A collection row: (re)focus that collection. If it is
+                    // collapsed this also expands it; if it was opened earlier
+                    // but a *different* collection is now the loaded one, this
+                    // reloads and refocuses it; if it is already the loaded,
+                    // expanded collection this is a harmless no-op. Right never
+                    // collapses a collection (use Left or a second Enter).
+                    Some(crate::collection::WsRow::Collection { path, .. }) => {
                         if let Some(root) = self.collections[ci].workspace_root.clone() {
                             self.hide_embedded_report_for_root(&root);
                         }
                         self.activate_workspace_collection(ci, path);
                     }
-                    // The open collection or a request: scroll the URL.
+                    // A request of another (expanded but not loaded) collection:
+                    // Right loads that collection and lands on this request,
+                    // mirroring Enter. (Loading may be deferred by an
+                    // unsaved-edits prompt, in which case it lands on the first
+                    // request.)
+                    Some(crate::collection::WsRow::Request {
+                        collection,
+                        idx,
+                        loaded: false,
+                        ..
+                    }) => {
+                        self.open_workspace_collection(ci, collection.clone());
+                        if self.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                            let n = self.collections[ci].entries.len();
+                            self.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
+                            self.collections[ci].sync_folder_to_selected();
+                            self.collections[ci].sync_ws_cursor();
+                        }
+                    }
+                    // An environment file: Right opens it as a global
+                    // environment (mirrors Enter), same as File → Load → Env.
+                    Some(crate::collection::WsRow::Environment { path, .. }) => {
+                        self.open_workspace_environment(&path);
+                    }
+                    // The expanded collection, or a request of the loaded
+                    // collection: scroll the URL.
                     _ => self.scroll_list_h(4),
                 }
             }
@@ -1345,8 +1385,9 @@ impl TuiApp {
         if !col.is_workspace() || col.workspace_root.is_none() {
             return;
         }
-        let Some(crate::collection::WsRow::Request { idx, .. }) =
-            col.ws_rows().into_iter().nth(col.list_cursor)
+        let Some(crate::collection::WsRow::Request {
+            idx, loaded: true, ..
+        }) = col.ws_rows().into_iter().nth(col.list_cursor)
         else {
             return;
         };
@@ -1466,8 +1507,16 @@ impl TuiApp {
                     self.hide_embedded_report_for_root(&root);
                 }
                 if open {
-                    // The open collection's own row collapses the accordion.
-                    self.collections[ci].workspace_collapsed = true;
+                    // Enter on an expanded collection collapses it (hides its
+                    // request names), mirroring folders; the file may still be
+                    // the loaded one — collapsing only hides the tree rows.
+                    self.collections[ci].workspace_expanded.remove(&path);
+                    let len = self.collections[ci].ws_rows().len();
+                    if self.collections[ci].list_cursor >= len {
+                        self.collections[ci].list_cursor = len.saturating_sub(1);
+                    }
+                    self.workspace_select_highlighted(ci);
+                    self.save_state();
                 } else {
                     self.activate_workspace_collection(ci, path);
                 }
@@ -1482,26 +1531,87 @@ impl TuiApp {
                     self.focus = Pane::Main;
                 }
             }
-            crate::collection::WsRow::Request { .. } => {
-                self.focus = Pane::Main;
-                self.open_edit_request_wizard(ci);
+            crate::collection::WsRow::Environment { path, .. } => {
+                // Load the `.vars` file as a global environment — the same path
+                // as File → Load → Environment. Focus stays on the tree; the new
+                // environment appears in the Global Environments panel.
+                self.open_workspace_environment(&path);
+            }
+            crate::collection::WsRow::Request {
+                collection,
+                idx,
+                loaded,
+                ..
+            } => {
+                if loaded {
+                    // A request of the loaded collection: edit it, as before.
+                    self.focus = Pane::Main;
+                    self.open_edit_request_wizard(ci);
+                } else {
+                    // A request of another (expanded but not loaded) collection:
+                    // load that collection and land on this request. A second
+                    // Enter then edits it. If loading is deferred by an
+                    // unsaved-edits prompt, we land on the first request instead.
+                    self.open_workspace_collection(ci, collection.clone());
+                    if self.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                        let n = self.collections[ci].entries.len();
+                        self.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
+                        self.collections[ci].sync_folder_to_selected();
+                        self.collections[ci].sync_ws_cursor();
+                    }
+                }
             }
         }
     }
 
+    /// Load a workspace `.vars` file as a global environment (reusing the
+    /// File → Load → Environment code path). Reports a read error via the status
+    /// line if the file can't be read.
+    fn open_workspace_environment(&mut self, path: &std::path::Path) {
+        if let Some(p) = path.to_str() {
+            self.do_file_action(FileAction::LoadEnv, p);
+        }
+    }
+
+    /// Toggle the Workspace tree's extension filter (`Ctrl+F`): on shows only
+    /// the workspace's own file types (`.hurl/.json/.vars/.trail`); off shows
+    /// every file. Persisted via `workspace_filter_hurl_json` (shared with the
+    /// picker), so it survives across sessions and both surfaces agree.
+    fn toggle_workspace_tree_filter(&mut self, ci: usize) {
+        let on = {
+            let col = &mut self.collections[ci];
+            col.workspace_filter_hurl_json = !col.workspace_filter_hurl_json;
+            col.workspace_filter_hurl_json
+        };
+        // The visible row set changes with the filter; clamp the cursor to the
+        // new length and reconcile the right pane with the newly-highlighted row.
+        let len = self.collections[ci].ws_rows().len();
+        if self.collections[ci].list_cursor >= len {
+            self.collections[ci].list_cursor = len.saturating_sub(1);
+        }
+        self.workspace_select_highlighted(ci);
+        self.save_state();
+        self.status = Some(Status::WorkspaceTreeFilter(on));
+    }
+
     /// Reconcile a Workspace tab's right pane with whichever tree row is
     /// currently highlighted — highlighting *is* selecting, exactly as for
-    /// requests. A request row points `selected_entry` at it (the request shows
-    /// in the pane); a report row shows that report embedded in the pane (loaded
-    /// once, then retained); every other row (collection/folder) returns the
-    /// pane to the request/response view. Focus stays on the tree throughout.
-    /// Called on every cursor move within the tree and after expand/collapse.
+    /// requests. A request row of the *loaded* collection points `selected_entry`
+    /// at it (the request shows in the pane); a request of another expanded
+    /// collection is only previewed by name (loading is deferred to Enter/Right,
+    /// so the pane is left alone); a report row shows that report embedded in the
+    /// pane (loaded once, then retained); every other row (collection/folder)
+    /// returns the pane to the request/response view. Focus stays on the tree
+    /// throughout. Called on every cursor move within the tree and after
+    /// expand/collapse.
     fn workspace_select_highlighted(&mut self, ci: usize) {
         let cursor = self.collections[ci].list_cursor;
         let row = self.collections[ci].ws_rows().into_iter().nth(cursor);
         let root = self.collections[ci].workspace_root.clone();
         match row {
-            Some(crate::collection::WsRow::Request { idx, .. }) => {
+            Some(crate::collection::WsRow::Request {
+                idx, loaded: true, ..
+            }) => {
                 self.collections[ci].selected_entry = idx;
                 if let Some(root) = root {
                     self.hide_embedded_report_for_root(&root);
@@ -1522,8 +1632,9 @@ impl TuiApp {
 
     /// Handle Left on a Workspace tab's file-tree list row.
     ///
-    /// - Expanded folder → collapse it (cursor stays on the folder row).
-    /// - Collapsed folder, collection, report, or request → move the cursor to
+    /// - Expanded folder or expanded collection → collapse it (cursor stays on
+    ///   the row).
+    /// - Collapsed folder/collection, report, or request → move the cursor to
     ///   the nearest preceding row whose depth is one less than the current
     ///   row's depth (the "parent" in the tree hierarchy).  Root-level items
     ///   (depth 0) have no parent, so nothing happens.
@@ -1540,43 +1651,50 @@ impl TuiApp {
                 crate::collection::WsRow::Folder { depth, .. } => *depth,
                 crate::collection::WsRow::Collection { depth, .. } => *depth,
                 crate::collection::WsRow::Report { depth, .. } => *depth,
+                crate::collection::WsRow::Environment { depth, .. } => *depth,
                 crate::collection::WsRow::Request { depth, .. } => *depth,
             }
         }
 
-        match row {
+        // An expanded folder or collection collapses in place; the path is the
+        // key removed from `workspace_expanded` in both cases.
+        let expanded_path = match row {
             crate::collection::WsRow::Folder {
                 path,
                 expanded: true,
                 ..
-            } => {
-                // Collapse the expanded folder; cursor stays on it.
-                let path = path.clone();
-                self.collections[ci].workspace_expanded.remove(&path);
-                // The fold may have consumed visible rows below: clamp cursor.
-                let len = self.collections[ci].ws_rows().len();
-                if self.collections[ci].list_cursor >= len {
-                    self.collections[ci].list_cursor = len.saturating_sub(1);
-                }
-                self.workspace_select_highlighted(ci);
-                self.save_state();
             }
-            row => {
-                // Navigate to the parent: the nearest preceding row whose
-                // depth is current_depth - 1.  Root-level items (depth 0)
-                // have no parent; do nothing in that case.
-                let depth = row_depth(row);
-                if depth == 0 {
-                    return;
-                }
-                let parent_depth = depth - 1;
-                if let Some(parent_idx) = rows[..cursor]
-                    .iter()
-                    .rposition(|r| row_depth(r) == parent_depth)
-                {
-                    self.collections[ci].list_cursor = parent_idx;
-                    self.workspace_select_highlighted(ci);
-                }
+            | crate::collection::WsRow::Collection {
+                path, open: true, ..
+            } => Some(path.clone()),
+            _ => None,
+        };
+
+        if let Some(path) = expanded_path {
+            // Collapse the expanded node; cursor stays on it.
+            self.collections[ci].workspace_expanded.remove(&path);
+            // The fold may have consumed visible rows below: clamp cursor.
+            let len = self.collections[ci].ws_rows().len();
+            if self.collections[ci].list_cursor >= len {
+                self.collections[ci].list_cursor = len.saturating_sub(1);
+            }
+            self.workspace_select_highlighted(ci);
+            self.save_state();
+        } else {
+            // Navigate to the parent: the nearest preceding row whose depth is
+            // current_depth - 1.  Root-level items (depth 0) have no parent; do
+            // nothing in that case.
+            let depth = row_depth(row);
+            if depth == 0 {
+                return;
+            }
+            let parent_depth = depth - 1;
+            if let Some(parent_idx) = rows[..cursor]
+                .iter()
+                .rposition(|r| row_depth(r) == parent_depth)
+            {
+                self.collections[ci].list_cursor = parent_idx;
+                self.workspace_select_highlighted(ci);
             }
         }
     }
@@ -1587,8 +1705,10 @@ impl TuiApp {
     /// loading replaces its entries wholesale).
     fn activate_workspace_collection(&mut self, ci: usize, path: PathBuf) {
         if self.collections[ci].path.as_deref() == Some(path.as_path()) {
-            self.collections[ci].workspace_collapsed = false;
+            // Already the loaded file: just re-expand it so its requests show.
+            self.collections[ci].workspace_expanded.insert(path);
             self.collections[ci].sync_ws_cursor();
+            self.save_state();
         } else {
             self.open_workspace_collection(ci, path);
         }
@@ -1821,7 +1941,9 @@ impl TuiApp {
     /// Append the request built in the New Request form to the active tab, or
     /// (when `form.editing` is set) apply the edits back onto the existing
     /// entry in place — preserving fields the wizard doesn't expose
-    /// (`query_params`/`form_params`/`basic_auth`/`expected_status`).
+    /// (`query_params`/`form_params`/`basic_auth`). The response's `HTTP
+    /// <code>` status expectation *is* exposed, as a `status == <code>` assert
+    /// row that folds back into `expected_status` here.
     pub(crate) fn submit_new_request(&mut self, form: NewReq) {
         fn header_rows_to_triples(rows: &[HeaderRow]) -> Vec<(String, String, bool)> {
             rows.iter()
@@ -1851,6 +1973,7 @@ impl TuiApp {
         let headers: Vec<(String, String, bool)> = header_rows_to_triples(&form.headers);
         let cookies: Vec<(String, String, bool)> = header_rows_to_triples(&form.cookies);
         let queries: Vec<(String, String, bool)> = header_rows_to_triples(&form.queries);
+        let options: Vec<(String, String, bool)> = header_rows_to_triples(&form.options);
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
@@ -1881,12 +2004,24 @@ impl TuiApp {
                 }
             })
             .collect();
-        let asserts: Vec<String> = form
+        // Collect the assert rows, folding the first `status == <code>` row
+        // back into the response's `HTTP <code>` status expectation
+        // (`expected_status`). The wizard surfaces that expectation as an
+        // editable assert row (see the `NewReq` builder), so on save it must
+        // be pulled back out; the remaining rows are ordinary `[Asserts]`.
+        let mut expected_status: Option<u16> = None;
+        let mut asserts: Vec<String> = Vec::new();
+        for expr in form
             .asserts
             .iter()
             .map(|r| r.expr.text().trim().to_string())
             .filter(|e| !e.is_empty())
-            .collect();
+        {
+            match crate::hurl::status_eq_code(&expr) {
+                Some(code) if expected_status.is_none() => expected_status = Some(code),
+                _ => asserts.push(expr),
+            }
+        }
         let captures: Vec<(String, String)> = form
             .captures
             .iter()
@@ -1926,8 +2061,10 @@ impl TuiApp {
                 || entry.headers != headers
                 || entry.cookies != cookies
                 || entry.queries != queries
+                || entry.options != options
                 || entry.form_fields != form_fields
                 || entry.body != body
+                || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
                 || entry.reports != reports;
@@ -1938,8 +2075,10 @@ impl TuiApp {
                 entry.headers = headers;
                 entry.cookies = cookies;
                 entry.queries = queries;
+                entry.options = options;
                 entry.form_fields = form_fields;
                 entry.body = body;
+                entry.expected_status = expected_status;
                 entry.asserts = asserts;
                 entry.captures = captures;
                 entry.reports = reports;
@@ -1958,7 +2097,9 @@ impl TuiApp {
             HurlEntry::from_fields(&name, form.method(), &url, headers, &form.body.text());
         entry.cookies = cookies;
         entry.queries = queries;
+        entry.options = options;
         entry.form_fields = form_fields;
+        entry.expected_status = expected_status;
         entry.asserts = asserts;
         entry.captures = captures;
         entry.reports = reports;
@@ -4384,12 +4525,12 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='8') = key.code {
-            // Alt+1..8 jumps directly to a section by number
-            // (Headers/Cookies/Queries/Form/Body/Asserts/Captures/Reports),
-            // regardless of the current section-view tab — a direct-jump
-            // complement to Ctrl+Up/Down's sequential one. Alt (not
-            // Ctrl) because Ctrl+<digit> has no standard control-code
+        } else if alt && let KeyCode::Char(c @ '1'..='9') = key.code {
+            // Alt+1..9 jumps directly to a section by number
+            // (Headers/Cookies/Queries/Options/Form/Body/Asserts/Captures/
+            // Reports), regardless of the current section-view tab — a
+            // direct-jump complement to Ctrl+Up/Down's sequential one. Alt
+            // (not Ctrl) because Ctrl+<digit> has no standard control-code
             // encoding and most terminals only report it with a
             // modifier when the Kitty keyboard protocol is active;
             // Alt is sent as a plain ESC-prefix almost everywhere, so
@@ -4398,11 +4539,12 @@ impl TuiApp {
                 '1' => WizardTab::Headers,
                 '2' => WizardTab::Cookies,
                 '3' => WizardTab::Queries,
-                '4' => WizardTab::Form,
-                '5' => WizardTab::Body,
-                '6' => WizardTab::Asserts,
-                '7' => WizardTab::Captures,
-                _ => WizardTab::Reports, // '8'
+                '4' => WizardTab::Options,
+                '5' => WizardTab::Form,
+                '6' => WizardTab::Body,
+                '7' => WizardTab::Asserts,
+                '8' => WizardTab::Captures,
+                _ => WizardTab::Reports, // '9'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -4473,7 +4615,7 @@ impl TuiApp {
 
                             NewField::FormField(i - 1, target_col)
                         } else {
-                            form.up_into_kvd(KvdKind::Query)
+                            form.up_into_kvd(KvdKind::Options)
                         };
                     }
                     KeyCode::Down => {
