@@ -1669,11 +1669,41 @@ fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Stri
     }
 }
 
+/// Section-title colours: `(fg, bg)`. The focused section gets a solid accent
+/// bar — the same styling as the active tab in the section-tab bar — while the
+/// others get a subtle inset band in the app background colour (darker than the
+/// dialog's `panel` fill), so in the stacked "All" view it's obvious where each
+/// section begins and ends without the focused one being ambiguous.
+fn section_label_colors(focused: bool, th: &Theme) -> (Color, Color) {
+    if focused {
+        (th.bg, th.accent)
+    } else {
+        (th.dim, th.bg)
+    }
+}
+
+/// Fill a section's title line as a full-width coloured band (see
+/// [`section_label_colors`]). The `Paragraph`-level style paints the whole row
+/// width — not just the text cells — so the band reads as a continuous header
+/// strip that visually separates one stacked section from the next.
+fn draw_section_label(f: &mut Frame, area: Rect, text: &str, focused: bool, th: &Theme) {
+    let (fg, bg) = section_label_colors(focused, th);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_string(),
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(bg)),
+        area,
+    );
+}
+
 /// Render an empty "All"-view section as a single line: its label followed by
 /// the "+ Add …" action in parentheses, with the column-title row omitted
 /// (there are no rows to label). Parenthesising the action keeps it reading as
-/// a button rather than a run-on continuation of the label. Both go accent when
-/// the Add row is focused.
+/// a button rather than a run-on continuation of the label. The whole line is
+/// the section's coloured title band (accent when focused), matching the filled
+/// title bands of the populated sections.
 fn draw_empty_section_line(
     f: &mut Frame,
     area: Rect,
@@ -1682,18 +1712,13 @@ fn draw_empty_section_line(
     focused: bool,
     th: &Theme,
 ) {
-    let color = if focused { th.accent } else { th.dim };
+    let (fg, bg) = section_label_colors(focused, th);
+    let text_style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
     let line = Line::from(vec![
-        Span::styled(
-            format!("{label}   "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("({add_label})"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{label}   "), text_style),
+        Span::styled(format!("({add_label})"), text_style),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
 pub(crate) fn draw_new_request(
@@ -2017,15 +2042,7 @@ fn draw_kvd_section(
 ) {
     let focused =
         matches!(form.focus, NewField::Kvd(k, ..) if k == kind) || form.focus == kind.add_field();
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            kind.title(s).to_string(),
-            Style::default()
-                .fg(if focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, kind.title(s), focused, th);
     draw_kvd_table(f, table, form, kind, s, th);
 }
 
@@ -2040,15 +2057,7 @@ fn draw_form_section(
 ) {
     let form_focused =
         matches!(form.focus, NewField::FormField(..)) || form.focus == NewField::AddFormField;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_form.to_string(),
-            Style::default()
-                .fg(if form_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_form, form_focused, th);
     draw_form_table(f, table, form, s, th);
 }
 
@@ -2064,15 +2073,7 @@ fn draw_body_section(
     th: &Theme,
 ) {
     let body_focused = form.focus == NewField::Body;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_body.to_string(),
-            Style::default()
-                .fg(if body_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_body, body_focused, th);
 
     let total = form.body.lines.len();
     let capacity = editor.height as usize;
@@ -2127,15 +2128,7 @@ fn draw_asserts_section(
 ) {
     let assert_focused =
         matches!(form.focus, NewField::Assert(_)) || form.focus == NewField::AddAssert;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_asserts.to_string(),
-            Style::default()
-                .fg(if assert_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_asserts, assert_focused, th);
     draw_assert_table(f, table, form, s, th);
 }
 
@@ -2150,15 +2143,7 @@ fn draw_captures_section(
 ) {
     let cap_focused =
         matches!(form.focus, NewField::Capture(..)) || form.focus == NewField::AddCapture;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_captures.to_string(),
-            Style::default()
-                .fg(if cap_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_captures, cap_focused, th);
     draw_capture_table(f, table, form, s, th);
 }
 
@@ -2173,15 +2158,7 @@ fn draw_reports_section(
 ) {
     let rep_focused =
         matches!(form.focus, NewField::Report(..)) || form.focus == NewField::AddReport;
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            s.field_reports.to_string(),
-            Style::default()
-                .fg(if rep_focused { th.accent } else { th.dim })
-                .add_modifier(Modifier::BOLD),
-        )),
-        label,
-    );
+    draw_section_label(f, label, s.field_reports, rep_focused, th);
     draw_report_table(f, table, form, s, th);
 }
 

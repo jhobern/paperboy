@@ -20754,7 +20754,10 @@ mod all_view_layout {
             ("grant_type".into(), "client_credentials".into(), true),
         ];
         // The default the wizard opens in (view_tab = All).
-        let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        form.focus =
+            crate::tui::new_request::NewField::Capture(0, crate::tui::new_request::CapCol::Name);
         let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
         term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
             .unwrap();
@@ -20840,6 +20843,59 @@ mod all_view_layout {
         assert!(
             out.contains("SecretHeader0"),
             "focusing a Header cell should scroll Headers back into view:\n{out}"
+        );
+    }
+
+    /// Each section's title is a full-width coloured band: the focused section
+    /// gets a solid accent bar, every other section a subtle inset band in the
+    /// app background colour, so it's clear where each section begins and ends.
+    #[test]
+    fn all_view_colours_section_title_bands() {
+        let th = super::super::theme::theme(&Language::English);
+        let s = Strings::for_language(&Language::English);
+        let mut entry = HurlEntry::from_fields("t", "POST", "http://h/x", vec![], "");
+        entry.headers = vec![("A".into(), "1".into(), true)];
+        entry.captures = vec![("tok".into(), "jsonpath \"$.tok\"".into())];
+        let mut form =
+            NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+        // Focus a Capture so the Captures title is the focused (accent) band
+        // while the Headers title stays an unfocused (background) band.
+        form.focus =
+            crate::tui::new_request::NewField::Capture(0, crate::tui::new_request::CapCol::Name);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| super::super::new_request::draw_new_request(f, &form, &s, &th, true))
+            .unwrap();
+        let buf = term.backend().buffer();
+
+        // Find the row containing each section label and read the band's bg a
+        // few cells past the border (well inside the title text / fill).
+        let band_bg = |needle: &str| -> Option<ratatui::style::Color> {
+            for y in 0..buf.area.height {
+                let mut row = String::new();
+                for x in 0..buf.area.width {
+                    row.push_str(buf[(x, y)].symbol());
+                }
+                // Skip the section-tab bar (the only row listing "All"), which
+                // also contains every section name.
+                if row.contains(" All ") {
+                    continue;
+                }
+                if let Some(col) = row.find(needle) {
+                    return Some(buf[((col + 1) as u16, y)].bg);
+                }
+            }
+            None
+        };
+
+        assert_eq!(
+            band_bg(s.field_captures),
+            Some(th.accent),
+            "the focused Captures title should be a solid accent band"
+        );
+        assert_eq!(
+            band_bg(s.field_headers),
+            Some(th.bg),
+            "an unfocused section title should be an inset background band"
         );
     }
 }
