@@ -4,7 +4,6 @@
 //! Launched with `-r` / `--ratatui`.
 
 mod app;
-mod clipboard;
 mod draw;
 mod editor;
 mod git_save;
@@ -15,12 +14,10 @@ pub(crate) mod remote;
 mod report_highlight;
 mod report_nodes;
 mod reports;
-mod selection;
 #[cfg(test)]
 mod tests;
 pub(crate) mod theme;
 mod theme_editor;
-mod wrapcache;
 
 use ratatui::crossterm::event::{
     self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,

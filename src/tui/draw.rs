@@ -19,9 +19,9 @@ use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
 use super::theme::*;
-use super::wrapcache::TextPos;
 use std::sync::Arc;
 use tui_panel_select::WrapMarker;
+use tui_panel_select::wrapcache::TextPos;
 
 /// Marks a collection/environment title as loaded from git — shown before the
 /// name whenever `Collection::git_origin` / `env_git_origin` is set.
@@ -273,6 +273,7 @@ fn draw_report_columns_overlay(
     picker: &super::reports::ColumnPicker,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let title = format!("{}  ({})", s.report_columns_title, s.report_columns_hint);
     let n = picker.rows.len();
@@ -311,6 +312,22 @@ fn draw_report_columns_overlay(
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..picker.rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,
@@ -332,6 +349,7 @@ fn draw_report_node_request_overlay(
     form: &super::report_nodes::RequestForm,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     use super::report_nodes::FormRow;
     let rows = form.visible_rows();
@@ -423,6 +441,22 @@ fn draw_report_node_request_overlay(
         .centered(),
     );
     f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,
@@ -443,6 +477,7 @@ fn draw_report_node_envs_overlay(
     form: &super::report_nodes::EnvsForm,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     use super::report_nodes::EnvsRow;
     let rows = form.visible_rows();
@@ -516,6 +551,22 @@ fn draw_report_node_envs_overlay(
         .centered(),
     );
     f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,
@@ -536,6 +587,7 @@ fn draw_report_bind_overlay(
     picker: &super::reports::ReportBindPicker,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let title = format!("{}  ({})", s.report_bind_title, s.report_bind_hint);
     let n = picker.options.len();
@@ -572,6 +624,22 @@ fn draw_report_bind_overlay(
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..picker.options.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,
@@ -591,6 +659,7 @@ fn draw_report_node_menu_overlay(
     menu: &super::report_nodes::NodeMenu,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let hint = match menu.step {
         super::report_nodes::NodeMenuStep::PickKind => s.node_menu_hint,
@@ -627,6 +696,22 @@ fn draw_report_node_menu_overlay(
         lines.push(Line::from(Span::styled(opt.clone(), style)));
     }
     f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..menu.options.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
     if n > inner_h {
         let bar_area = Rect {
             x: area.x + area.width - 1,
@@ -639,6 +724,7 @@ fn draw_report_node_menu_overlay(
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
+    app.begin_mouse_frame();
     let s = Strings::for_language(&app.language);
     let th = app.theme();
 
@@ -725,8 +811,10 @@ fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
 pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     let base = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::raw(" ")];
+    let file_w = Line::from(mnemonic_spans(s.file_menu_label, base)).width() as u16;
     spans.extend(mnemonic_spans(s.file_menu_label, base));
     spans.push(Span::raw("   "));
+    let settings_w = Line::from(mnemonic_spans(s.options_menu_label, base)).width() as u16;
     spans.extend(mnemonic_spans(s.options_menu_label, base));
     if let Some(st) = &app.status {
         spans.push(Span::raw("     "));
@@ -743,6 +831,27 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
         area,
     );
+    let file_x = area.x.saturating_add(1);
+    if file_x < area.right() {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(file_x, area.y, file_w.min(area.right() - file_x), 1),
+            MouseHitTarget::MenuFile,
+        );
+    }
+    let settings_x = file_x.saturating_add(file_w).saturating_add(3);
+    if settings_x < area.right() {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(
+                settings_x,
+                area.y,
+                settings_w.min(area.right() - settings_x),
+                1,
+            ),
+            MouseHitTarget::MenuSettings,
+        );
+    }
 }
 
 pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
@@ -815,6 +924,7 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
     // bar scroll horizontally to keep the active tab visible when the tabs
     // overflow the available width (otherwise later tabs are unreachable).
     let mut spans: Vec<Span> = Vec::new();
+    let mut tab_hits: Vec<(usize, usize, usize)> = Vec::new();
     let mut pos = 0usize;
     let mut active_start = 0usize;
     let mut active_w = 0usize;
@@ -837,6 +947,7 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             active_start = pos;
             active_w = w;
         }
+        tab_hits.push((i, pos, w));
         spans.push(mk(name, app.active_tab == i));
         pos += w;
     }
@@ -864,6 +975,7 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             active_start = pos;
             active_w = w;
         }
+        tab_hits.push((idx, pos, w));
         spans.push(mk(name, app.active_tab == idx));
         pos += w;
     }
@@ -871,8 +983,8 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
     // Content width available inside the panel borders.
     let avail = area.width.saturating_sub(2) as usize;
 
-    let line = if total_w <= avail || avail == 0 {
-        Line::from(spans)
+    let (line, hit_scroll, hit_content_x, hit_content_w) = if total_w <= avail || avail == 0 {
+        (Line::from(spans), 0usize, area.x.saturating_add(1), avail)
     } else {
         // Scroll so the active tab is fully visible. Reserve up to two columns
         // for the ‹ / › overflow markers when deciding the target window, so
@@ -900,12 +1012,33 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         if show_right {
             out.push(Span::styled("\u{203a}", Style::default().fg(th.accent)));
         }
-        Line::from(out)
+        let content_x = area.x + 1 + u16::from(show_left);
+        (Line::from(out), scroll, content_x, content_w)
     };
     f.render_widget(
         Paragraph::new(line).block(panel(s.tabs_heading.to_string(), focused, th)),
         area,
     );
+    let hit_y = area.y.saturating_add(1);
+    for (idx, start, w) in tab_hits {
+        let end = start + w;
+        let win_start = hit_scroll;
+        let win_end = hit_scroll + hit_content_w;
+        let from = start.max(win_start);
+        let to = end.min(win_end);
+        if from < to {
+            app.push_mouse_hit(
+                MouseLayer::Base,
+                Rect::new(
+                    hit_content_x + (from - win_start) as u16,
+                    hit_y,
+                    (to - from) as u16,
+                    1,
+                ),
+                MouseHitTarget::Tab(idx),
+            );
+        }
+    }
 }
 
 pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &mut TuiApp, s: &Strings, th: &Theme) {
@@ -1260,6 +1393,36 @@ pub(crate) fn draw_collection_left(
         st.select(Some(sel));
     }
     f.render_stateful_widget(list, panes[0], &mut st);
+    let list_inner = Rect {
+        x: panes[0].x.saturating_add(1),
+        y: panes[0].y.saturating_add(1),
+        width: panes[0].width.saturating_sub(2),
+        height: panes[0].height.saturating_sub(2),
+    };
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        list_inner,
+        MouseHitTarget::FocusPane(Pane::List),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        list_inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::List),
+    );
+    let first = st.offset();
+    let visible = list_inner.height as usize;
+    for row in first..view_rows.len().min(first + visible) {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(
+                list_inner.x,
+                list_inner.y + (row - first) as u16,
+                list_inner.width,
+                1,
+            ),
+            MouseHitTarget::SelectListRow(row),
+        );
+    }
 
     // Environment panel
     draw_env_panel(f, panes[1], app, s, th);
@@ -1284,6 +1447,17 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .block(block)
         .wrap(Wrap { trim: false });
         f.render_widget(p, area);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            inner,
+            MouseHitTarget::FocusPane(Pane::GlobalEnv),
+        );
         return;
     }
     let sel = app
@@ -1371,6 +1545,31 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     let mut st = ListState::default();
     st.select(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::GlobalEnv),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::GlobalEnv),
+    );
+    let first = st.offset();
+    let visible = inner.height as usize;
+    for row in first..app.global_envs.len().min(first + visible) {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            MouseHitTarget::SelectGlobalEnvRow(row),
+        );
+    }
 }
 
 /// The popup listing one [`crate::environment::Environment`]'s vars (opened
@@ -1503,6 +1702,27 @@ pub(crate) fn draw_env_popup(
     let mut st = ListState::default();
     st.select(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
+    app.set_mouse_layer(MouseLayer::Overlay);
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    app.push_mouse_hit(
+        MouseLayer::Overlay,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::OverlayList),
+    );
+    let first = st.offset();
+    let visible = inner.height as usize;
+    for row in first..env.vars.len().min(first + visible) {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            MouseHitTarget::OverlayRow(row),
+        );
+    }
 }
 
 /// The colour for a substitution of the given [`SubstKind`].
@@ -1855,6 +2075,11 @@ pub(crate) fn draw_collection_main(
         app.main_text_area = Rect::default();
         app.main_shadow_icon_positions.clear();
         app.main_scrollbar_area = Rect::default();
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            inner,
+            MouseHitTarget::FocusPane(Pane::Main),
+        );
         f.render_widget(
             Paragraph::new(Line::styled(
                 s.no_requests_hint.to_string(),
@@ -2085,6 +2310,11 @@ pub(crate) fn draw_collection_main(
             th,
         );
         app.main_scrollbar_area = bar_area;
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            bar_area,
+            MouseHitTarget::Scroll(MouseScrollTarget::Main),
+        );
     } else {
         app.main_scrollbar_area = Rect::default();
     }
@@ -2093,6 +2323,16 @@ pub(crate) fn draw_collection_main(
     // map coordinates back to real, copyable text — scoped to this panel only.
     app.main_text_area = text_area;
     app.main_shadow_icon_positions = shadow_positions;
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        text_area,
+        MouseHitTarget::FocusPane(Pane::Main),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        text_area,
+        MouseHitTarget::Scroll(MouseScrollTarget::Main),
+    );
 
     f.render_widget(
         Paragraph::new(visible_wrapped).style(Style::default().fg(th.text)),
@@ -2320,6 +2560,11 @@ pub(crate) fn draw_response(
             th,
         );
         app.resp_scrollbar_area = bar_area;
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            bar_area,
+            MouseHitTarget::Scroll(MouseScrollTarget::Response),
+        );
     } else {
         app.resp_scrollbar_area = Rect::default();
     }
@@ -2327,6 +2572,16 @@ pub(crate) fn draw_response(
     // Cache the geometry so mouse selection can map coordinates back to real,
     // copyable text — scoped to this panel's own Rect only.
     app.resp_text_area = body_area;
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        body_area,
+        MouseHitTarget::FocusPane(Pane::Response),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        body_area,
+        MouseHitTarget::Scroll(MouseScrollTarget::Response),
+    );
 
     f.render_widget(
         Paragraph::new(visible_wrapped).style(Style::default().fg(th.text)),
@@ -2405,6 +2660,7 @@ fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &String
 }
 
 pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Theme) {
+    app.set_mouse_layer(MouseLayer::Overlay);
     // `ReportCellPopup` needs a mutable borrow of its `MultiSelectPanel` to
     // update scroll/content each frame, so it is handled before the immutable
     // `as_ref()` match below.
@@ -2414,32 +2670,37 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         panel,
     }) = app.overlay.as_mut()
     {
-        super::reports::draw_result_cell_popup_overlay(f, title, content, panel, s, th);
+        let inner = super::reports::draw_result_cell_popup_overlay(f, title, content, panel, s, th);
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            inner,
+            MouseHitTarget::Scroll(MouseScrollTarget::ReportCellPopup),
+        );
         return;
     }
     match app.overlay.as_ref().unwrap() {
         Overlay::FileMenu(sel) => {
             let items = file_menu_items(s);
-            draw_menu_popup(f, s.file_menu, &items, *sel, th);
+            draw_menu_popup(f, s.file_menu, &items, *sel, th, Some(app));
         }
         Overlay::FileLoadMenu(sel) => {
             let items = file_load_items(s);
-            draw_menu_popup(f, s.file_load_menu, &items, *sel, th);
+            draw_menu_popup(f, s.file_load_menu, &items, *sel, th, Some(app));
         }
         Overlay::FileSaveMenu(sel) => {
             let items = app.file_save_items();
             let labels: Vec<&str> = items.iter().map(|it| it.label(s)).collect();
-            draw_menu_popup(f, s.file_save_menu, &labels, *sel, th);
+            draw_menu_popup(f, s.file_save_menu, &labels, *sel, th, Some(app));
         }
         Overlay::FileLoadSource(kind, sel) => {
             let items = file_load_source_items(s);
             let title = format!("{} {}", s.file_load_menu, kind.name(s));
-            draw_menu_popup(f, &title, &items, *sel, th);
+            draw_menu_popup(f, &title, &items, *sel, th, Some(app));
         }
         Overlay::FileSaveDest(kind, sel) => {
             let items = file_save_dest_items(*kind, s);
             let title = format!("{} {}", s.file_save_menu, kind.name(s));
-            draw_menu_popup(f, &title, &items, *sel, th);
+            draw_menu_popup(f, &title, &items, *sel, th, Some(app));
         }
         Overlay::Options(sel) => {
             let items = [
@@ -2448,7 +2709,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.settings_item_preferences,
                 s.settings_item_clear,
             ];
-            draw_menu_popup(f, s.options_menu, &items, *sel, th);
+            draw_menu_popup(f, s.options_menu, &items, *sel, th, Some(app));
         }
         Overlay::Preferences(sel) => {
             let mark = |b: bool| if b { "[x]" } else { "[ ]" };
@@ -2486,7 +2747,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 run_all_batch_item.as_str(),
                 view_item.as_str(),
             ];
-            draw_menu_popup(f, s.preferences_menu, &items, *sel, th);
+            draw_menu_popup(f, s.preferences_menu, &items, *sel, th, Some(app));
         }
         Overlay::Confirm { action, sel } => {
             let question: String = match action {
@@ -2557,19 +2818,26 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .replace("{n}", &n.to_string())
                 }
             };
-            draw_confirm_popup(f, &question, &[s.confirm_yes, s.confirm_no], *sel, th);
+            draw_confirm_popup(
+                f,
+                &question,
+                &[s.confirm_yes, s.confirm_no],
+                *sel,
+                th,
+                Some(app),
+            );
         }
         Overlay::LanguageMenu(sel) => {
             let items = [s.lang_english, s.lang_french, s.lang_danish];
-            draw_menu_popup(f, s.language_label, &items, *sel, th);
+            draw_menu_popup(f, s.language_label, &items, *sel, th, Some(app));
         }
         Overlay::ThemeEditor(state) => {
             let entries = app.theme_picker_entries(s);
-            super::theme_editor::draw_theme_editor(f, state, &entries, s, th);
+            super::theme_editor::draw_theme_editor(f, state, &entries, s, th, Some(app));
         }
         Overlay::RequestViewMenu(sel) => {
             let items = [s.view_json_label, s.view_hurl_label];
-            draw_menu_popup(f, s.default_request_view_label, &items, *sel, th);
+            draw_menu_popup(f, s.default_request_view_label, &items, *sel, th, Some(app));
         }
         Overlay::Help(tab) => {
             // Widen the popup on spacious terminals so long descriptions
@@ -2989,6 +3257,33 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 };
                 draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
             }
+            if scroll <= 1 {
+                let tab_y = area.y + 1 + (1 - scroll);
+                if tab_y < area.bottom().saturating_sub(1) {
+                    let labels = [
+                        (0, s.help_tab_shortcuts),
+                        (1, s.help_tab_glossary),
+                        (2, s.help_tab_reports),
+                    ];
+                    let mut x = area.x.saturating_add(1);
+                    for (i, label) in labels {
+                        let w = label.chars().count() as u16 + 2;
+                        if x < area.right().saturating_sub(1) {
+                            app.push_mouse_hit(
+                                MouseLayer::Overlay,
+                                Rect::new(x, tab_y, w.min(area.right() - 1 - x), 1),
+                                MouseHitTarget::HelpTab(i),
+                            );
+                        }
+                        x = x.saturating_add(w).saturating_add(1);
+                    }
+                }
+            }
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::Help),
+            );
         }
         Overlay::ReportDryRun(preview) => {
             let box_w = f.area().width.saturating_sub(6).clamp(48, 96);
@@ -3025,21 +3320,26 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 };
                 draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
             }
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::ReportDryRun),
+            );
         }
         Overlay::ReportColumns(picker) => {
-            draw_report_columns_overlay(f, picker, s, th);
+            draw_report_columns_overlay(f, picker, s, th, Some(app));
         }
         Overlay::ReportBind(picker) => {
-            draw_report_bind_overlay(f, picker, s, th);
+            draw_report_bind_overlay(f, picker, s, th, Some(app));
         }
         Overlay::ReportNodeMenu(menu) => {
-            draw_report_node_menu_overlay(f, menu, s, th);
+            draw_report_node_menu_overlay(f, menu, s, th, Some(app));
         }
         Overlay::ReportNodeRequest(form) => {
-            draw_report_node_request_overlay(f, form, s, th);
+            draw_report_node_request_overlay(f, form, s, th, Some(app));
         }
         Overlay::ReportNodeEnvs(form) => {
-            draw_report_node_envs_overlay(f, form, s, th);
+            draw_report_node_envs_overlay(f, form, s, th, Some(app));
         }
         Overlay::Prompt {
             kind,
@@ -3152,6 +3452,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             } else {
                 Rect::default()
             };
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                editor_area,
+                MouseHitTarget::PromptEditor,
+            );
             if let Some((area, checked)) = checkbox_area {
                 let mark = if *checked { "[x]" } else { "[ ]" };
                 let fg = if *checked { th.pending } else { th.ok };
@@ -3160,6 +3465,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .style(Style::default().fg(fg)),
                     area,
                 );
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    area,
+                    MouseHitTarget::PromptSecretCheckbox,
+                );
             }
         }
         Overlay::Browser(action, ex) => {
@@ -3167,6 +3477,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let h = (f.area().height * 7 / 10).max(10);
             let area = centered_rect(w, h, f.area());
             f.render_widget(Clear, area);
+            app.set_mouse_layer(MouseLayer::Overlay);
             if action.is_save_to_folder() {
                 // Reserve a bordered filename box at the bottom that the user
                 // can Tab to and press Enter to save into the current folder.
@@ -3217,18 +3528,23 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         inner,
                     );
                 }
+                app.push_mouse_hit(MouseLayer::Overlay, inner, MouseHitTarget::BrowserNameField);
+                register_browser_hits(app, ex, rows[0]);
             } else {
                 ex.widget().render_ref(area, f.buffer_mut());
+                register_browser_hits(app, ex, area);
             }
         }
-        Overlay::NewRequest(form) => draw_new_request(f, form, s, th, app.enhanced_keys),
-        Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th),
-        Overlay::RemoteGit(w) => draw_remote_wizard(f, w, s, th),
-        Overlay::GitSave(w) => draw_git_save_wizard(f, w, s, th),
+        Overlay::NewRequest(form) => {
+            draw_new_request_with_hits(f, form, s, th, app.enhanced_keys, Some(app))
+        }
+        Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th, Some(app)),
+        Overlay::RemoteGit(w) => draw_remote_wizard_with_hits(f, w, s, th, Some(app)),
+        Overlay::GitSave(w) => draw_git_save_wizard_with_hits(f, w, s, th, Some(app)),
         Overlay::EnvPopup(popup) => draw_env_popup(f, app, popup, s, th),
         Overlay::EnvLinkPicker(picker) => draw_env_link_picker(f, app, picker, s, th),
-        Overlay::EnvCollision(collision) => draw_env_collision(f, collision, s, th),
-        Overlay::WorkspacePicker(picker) => draw_workspace_picker(f, picker, s, th),
+        Overlay::EnvCollision(collision) => draw_env_collision(f, collision, s, th, Some(app)),
+        Overlay::WorkspacePicker(picker) => draw_workspace_picker(f, picker, s, th, Some(app)),
         Overlay::CloseGitWorkspace { path, sel, .. } => {
             let question = s
                 .close_git_workspace_q
@@ -3238,7 +3554,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.close_git_workspace_delete,
                 s.close_git_workspace_cancel,
             ];
-            draw_confirm_popup(f, &question, &choices, *sel, th);
+            draw_confirm_popup(f, &question, &choices, *sel, th, Some(app));
         }
         Overlay::WorkspaceReloadConfirm { reload, sel, .. } => {
             let ref_label = if reload.origin.ref_kind == crate::git_remote::RefKind::Branch {
@@ -3254,7 +3570,14 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     &format!("[{ref_label}] {}", reload.origin.ref_name),
                 )
                 .replace("{url}", &reload.origin.repo_url);
-            draw_confirm_popup(f, &question, &[s.confirm_yes, s.confirm_no], *sel, th);
+            draw_confirm_popup(
+                f,
+                &question,
+                &[s.confirm_yes, s.confirm_no],
+                *sel,
+                th,
+                Some(app),
+            );
         }
         Overlay::WorkspaceReloadLoading { idx } => {
             let name = app
@@ -3277,7 +3600,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::WorkspaceStorageChoice { sel, .. } => {
             let choices = [s.git_workspace_storage_temp, s.git_workspace_storage_choose];
-            draw_confirm_popup(f, s.git_workspace_storage_q, &choices, *sel, th);
+            draw_confirm_popup(f, s.git_workspace_storage_q, &choices, *sel, th, Some(app));
         }
         Overlay::WorkspaceGitSaveUnsaved { sel, .. } => {
             let choices = [
@@ -3285,7 +3608,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.git_save_ws_unsaved_ignore,
                 s.git_save_ws_unsaved_cancel,
             ];
-            draw_confirm_popup(f, s.git_save_ws_unsaved_q, &choices, *sel, th);
+            draw_confirm_popup(f, s.git_save_ws_unsaved_q, &choices, *sel, th, Some(app));
         }
         Overlay::WorkspaceSwitchUnsaved { sel, .. } => {
             let choices = [
@@ -3293,16 +3616,54 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.ws_switch_unsaved_discard,
                 s.ws_switch_unsaved_cancel,
             ];
-            draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th);
+            draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th, Some(app));
         }
         // Handled by the early-return above — unreachable in practice.
         Overlay::ReportCellPopup { .. } => unreachable!("ReportCellPopup is drawn above"),
     }
 }
 
+fn register_browser_hits(app: &TuiApp, ex: &ratatui_explorer::FileExplorer, area: Rect) {
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    app.push_mouse_hit(
+        MouseLayer::Overlay,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::BrowserList),
+    );
+    let len = ex.files().len();
+    if len == 0 || inner.height == 0 {
+        return;
+    }
+    let visible = inner.height as usize;
+    let selected = ex.selected_idx().min(len - 1);
+    let first = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    for row in first..len.min(first + visible) {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            MouseHitTarget::BrowserListRow(row),
+        );
+    }
+}
+
 /// The "add environment variable" popup: a two-column `Key | Value` table with
 /// one editable row. The focused cell shows a cursor and a subtle background.
-pub(crate) fn draw_env_var_form(f: &mut Frame, form: &EnvVarForm, s: &Strings, th: &Theme) {
+pub(crate) fn draw_env_var_form(
+    f: &mut Frame,
+    form: &EnvVarForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     let area = centered_rect(70, 7, f.area());
     f.render_widget(Clear, area);
     let block = panel(s.env_add_var_title.to_string(), true, th);
@@ -3333,6 +3694,19 @@ pub(crate) fn draw_env_var_form(f: &mut Frame, form: &EnvVarForm, s: &Strings, t
     f.render_widget(lbl(s.hdr_value), head[1]);
     render_line_field(f, cells[0], &form.key, !form.on_value, false, th);
     render_line_field(f, cells[1], &form.value, form.on_value, false, th);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            cells[0],
+            MouseHitTarget::EnvVarField(false),
+        );
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            cells[1],
+            MouseHitTarget::EnvVarField(true),
+        );
+    }
 
     let hint = format!("Tab {} · {}", s.env_var_switch, s.prompt_save_hint_sl);
     f.render_widget(
@@ -3361,19 +3735,32 @@ pub(crate) fn draw_env_link_picker(
         }
     }));
     let items: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    draw_menu_popup(f, s.env_link_picker_title, &items, picker.sel, th);
+    draw_menu_popup(
+        f,
+        s.env_link_picker_title,
+        &items,
+        picker.sel,
+        th,
+        Some(app),
+    );
 }
 
 /// The 4-choice popup shown when loading an environment whose name collides
 /// with one already in the Global Environments list.
-pub(crate) fn draw_env_collision(f: &mut Frame, collision: &EnvCollision, s: &Strings, th: &Theme) {
+pub(crate) fn draw_env_collision(
+    f: &mut Frame,
+    collision: &EnvCollision,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     let items = [
         s.env_collision_replace,
         s.env_collision_keep_both,
         s.env_collision_abort,
         s.env_collision_rename,
     ];
-    draw_menu_popup(f, s.env_collision_title, &items, collision.sel, th);
+    draw_menu_popup(f, s.env_collision_title, &items, collision.sel, th, app);
 }
 
 /// The recursive file-tree popup used both to auto-prompt (when a Workspace
@@ -3386,6 +3773,7 @@ pub(crate) fn draw_workspace_picker(
     picker: &WorkspacePickerState,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let w = (f.area().width * 7 / 10).max(50);
     let h = (f.area().height * 7 / 10).max(10);
@@ -3397,7 +3785,7 @@ pub(crate) fn draw_workspace_picker(
         s.workspace_filter_off
     };
     let title = format!(
-        "{} — {} [{filter_label}]",
+        "{} [{filter_label}] — {}",
         s.workspace_picker_title,
         picker.root.display()
     );
@@ -3446,6 +3834,28 @@ pub(crate) fn draw_workspace_picker(
     let mut st = ListState::default();
     st.select(Some(picker.selected));
     f.render_stateful_widget(list, rows[0], &mut st);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            rows[0],
+            MouseHitTarget::Scroll(MouseScrollTarget::WorkspacePicker),
+        );
+        let first = st.offset();
+        let visible = rows[0].height as usize;
+        for row in first..picker.entries.len().min(first + visible) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(
+                    rows[0].x,
+                    rows[0].y + (row - first) as u16,
+                    rows[0].width,
+                    1,
+                ),
+                MouseHitTarget::WorkspacePickerRow(row),
+            );
+        }
+    }
     let hint = Paragraph::new(Line::styled(
         match picker.mode {
             WsPickerMode::AddRequest => s.workspace_picker_hint_add,
@@ -3495,7 +3905,17 @@ pub(crate) fn mnemonic_spans(label: &str, style: Style) -> Vec<Span<'static>> {
     vec![Span::styled(label.to_string(), style)]
 }
 
-pub(crate) fn draw_menu_popup(f: &mut Frame, title: &str, items: &[&str], sel: usize, th: &Theme) {
+pub(crate) fn draw_menu_popup(
+    f: &mut Frame,
+    title: &str,
+    items: &[&str],
+    sel: usize,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+    }
     let width = items
         .iter()
         .map(|i| i.len())
@@ -3522,6 +3942,28 @@ pub(crate) fn draw_menu_popup(f: &mut Frame, title: &str, items: &[&str], sel: u
     let mut st = ListState::default();
     st.select(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
+    if let Some(app) = app {
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            inner,
+            MouseHitTarget::Scroll(MouseScrollTarget::OverlayList),
+        );
+        let first = st.offset();
+        let visible = inner.height as usize;
+        for row in first..items.len().min(first + visible) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
 }
 
 /// A small confirmation popup with 2+ choices, laid out in a row and
@@ -3534,7 +3976,11 @@ pub(crate) fn draw_confirm_popup(
     choices: &[&str],
     sel: usize,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+    }
     let choices_len: usize = choices.iter().map(|c| c.len() + 3).sum();
     let q_lines: Vec<&str> = question.split('\n').collect();
     let max_line_len = q_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
@@ -3595,4 +4041,23 @@ pub(crate) fn draw_confirm_popup(
         Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center),
         rows[1],
     );
+    if let Some(app) = app {
+        let line_w = choices.iter().map(|c| c.chars().count() + 2).sum::<usize>()
+            + 3 * choices.len().saturating_sub(1);
+        let mut x = rows[1]
+            .x
+            .saturating_add(rows[1].width.saturating_sub(line_w as u16) / 2);
+        for (i, choice) in choices.iter().enumerate() {
+            if i > 0 {
+                x = x.saturating_add(3);
+            }
+            let w = choice.chars().count() as u16 + 2;
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(x, rows[1].y, w, 1),
+                MouseHitTarget::ConfirmChoice(i),
+            );
+            x = x.saturating_add(w);
+        }
+    }
 }

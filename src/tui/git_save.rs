@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
@@ -27,6 +27,7 @@ use crate::environment::Environment;
 use crate::git_remote::{self, RefKind, RemoteRefs};
 use crate::i18n::Strings;
 
+use super::app::{MouseHitTarget, MouseLayer, TuiApp};
 use super::draw::*;
 use super::editor::*;
 use super::remote::{WorkspaceGitFilter, WorkspaceGitOrigin};
@@ -383,7 +384,16 @@ pub(crate) fn spawn_git_save_push(
     rx
 }
 
-pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings, th: &Theme) {
+pub(crate) fn draw_git_save_wizard_with_hits(
+    f: &mut Frame,
+    w: &GitSaveWizard,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+    }
     let title = s.git_save_title;
     match &w.stage {
         GitSaveStage::Connect { field } => {
@@ -409,6 +419,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                 rows[0],
             );
             render_line_field(f, rows[1], &w.url, *field == 0, false, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[1],
+                    MouseHitTarget::GitSaveWizardRow(0),
+                );
+            }
             f.render_widget(
                 Paragraph::new(Span::styled(
                     s.git_token_label,
@@ -417,6 +434,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                 rows[3],
             );
             render_line_field(f, rows[4], &w.token, *field == 1, true, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[4],
+                    MouseHitTarget::GitSaveWizardRow(1),
+                );
+            }
             f.render_widget(
                 Paragraph::new(Line::styled(
                     s.git_connect_hint,
@@ -455,6 +479,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                 rows[0],
             );
             render_line_field(f, rows[1], &w.collection_path, *field == 0, false, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[1],
+                    MouseHitTarget::GitSaveWizardRow(0),
+                );
+            }
             if w.has_env {
                 let mark = if w.include_env { "[x]" } else { "[ ]" };
                 let cb_style = if *field == 1 {
@@ -472,6 +503,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                     )),
                     rows[3],
                 );
+                if let Some(app) = app {
+                    app.push_mouse_hit(
+                        MouseLayer::Overlay,
+                        rows[3],
+                        MouseHitTarget::GitSaveWizardRow(1),
+                    );
+                }
                 if w.include_env {
                     f.render_widget(
                         Paragraph::new(Span::styled(
@@ -481,6 +519,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                         rows[4],
                     );
                     render_line_field(f, rows[5], &w.env_path, *field == 2, false, th);
+                    if let Some(app) = app {
+                        app.push_mouse_hit(
+                            MouseLayer::Overlay,
+                            rows[5],
+                            MouseHitTarget::GitSaveWizardRow(2),
+                        );
+                    }
                 }
             }
             let hint_row = rows.len() - 1;
@@ -540,8 +585,22 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                 ])),
                 rows[0],
             );
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[0],
+                    MouseHitTarget::GitSaveWizardRow(0),
+                );
+            }
             f.render_widget(Paragraph::new(Span::raw("")), rows[1]);
             render_line_field(f, rows[2], &w.target_name, sel.is_none(), false, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[2],
+                    MouseHitTarget::GitSaveWizardRow(1),
+                );
+            }
             if dropdown_rows > 0 {
                 let items: Vec<ListItem> = branches
                     .iter()
@@ -560,6 +619,15 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                     })
                     .collect();
                 f.render_widget(List::new(items), rows[3]);
+                if let Some(app) = app {
+                    for i in 0..branches.len().min(5) {
+                        app.push_mouse_hit(
+                            MouseLayer::Overlay,
+                            Rect::new(rows[3].x, rows[3].y + i as u16, rows[3].width, 1),
+                            MouseHitTarget::GitSaveWizardRow(10 + i),
+                        );
+                    }
+                }
             }
             let hint_row = rows.len() - 1;
             f.render_widget(
@@ -590,6 +658,13 @@ pub(crate) fn draw_git_save_wizard(f: &mut Frame, w: &GitSaveWizard, s: &Strings
                 rows[0],
             );
             render_line_field(f, rows[1], &w.commit_msg, true, false, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[1],
+                    MouseHitTarget::GitSaveWizardRow(0),
+                );
+            }
             f.render_widget(
                 Paragraph::new(Line::styled(
                     s.git_save_commit_msg_hint,

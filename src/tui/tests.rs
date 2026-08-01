@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use crate::collection::Collection;
 use crate::git_remote::{RefKind, RemoteRefs};
@@ -15,7 +18,7 @@ use super::app::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use super::wrapcache::TextPos;
+use tui_panel_select::wrapcache::TextPos;
 
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL
 /// points at TEST-NET-1 (RFC 5737) so a started request hangs on connect,
@@ -32,6 +35,253 @@ fn app_in_main_pane() -> TuiApp {
     app.active_tab = 1;
     app.focus = Pane::Main;
     app
+}
+
+fn mouse_down(col: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn mouse_scroll_down(col: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn hit_rect(app: &TuiApp, target: MouseHitTarget) -> Rect {
+    app.mouse_hits
+        .borrow()
+        .iter()
+        .find(|hit| hit.target == target)
+        .map(|hit| hit.rect)
+        .unwrap()
+}
+
+#[test]
+fn mouse_click_visible_tab_activates_it_and_invalidates_hits() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("second".to_string(), Vec::new()));
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let rect = hit_rect(&app, MouseHitTarget::Tab(1));
+    app.on_mouse(mouse_down(rect.x, rect.y));
+
+    assert_eq!(app.active_tab, 1);
+    assert!(!app.mouse_hit_valid.get());
+}
+
+#[test]
+fn mouse_selects_request_and_environment_rows() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = vec![
+        HurlEntry {
+            url: "https://one.example".to_string(),
+            ..Default::default()
+        },
+        HurlEntry {
+            url: "https://two.example".to_string(),
+            ..Default::default()
+        },
+    ];
+    add_empty_global_env(&mut app, "dev");
+    add_empty_global_env(&mut app, "prod");
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let req = hit_rect(&app, MouseHitTarget::SelectListRow(1));
+    app.on_mouse(mouse_down(req.x, req.y));
+    assert_eq!(app.collections[0].selected_entry, 1);
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let env = hit_rect(&app, MouseHitTarget::SelectGlobalEnvRow(1));
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert_eq!(app.global_env_idx, 1);
+}
+
+#[test]
+fn mouse_wheel_over_list_moves_selection_without_stealing_focus() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = vec![
+        HurlEntry {
+            url: "https://one.example".to_string(),
+            ..Default::default()
+        },
+        HurlEntry {
+            url: "https://two.example".to_string(),
+            ..Default::default()
+        },
+    ];
+    app.focus = Pane::Main;
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let req = hit_rect(&app, MouseHitTarget::SelectListRow(0));
+    app.on_mouse(mouse_scroll_down(req.x, req.y));
+
+    assert_eq!(app.focus, Pane::Main);
+    assert_eq!(app.collections[0].selected_entry, 1);
+}
+
+#[test]
+fn overlay_miss_is_swallowed_without_falling_through() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::Options(0));
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    app.on_mouse(mouse_down(1, 0));
+
+    assert!(matches!(app.overlay, Some(Overlay::Options(0))));
+}
+
+#[test]
+fn wizard_mouse_adds_header_and_toggles_checkbox() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::NewRequest(Box::new(NewReq::new(
+        String::new(),
+        vec!["Request".to_string()],
+        0,
+        None,
+    ))));
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let add = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestActivate(NewField::AddKvd(KvdKind::Header)),
+    );
+    app.on_mouse(mouse_down(add.x, add.y));
+
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_ref() else {
+        panic!("wizard should stay open");
+    };
+    assert_eq!(form.headers.len(), 1);
+    assert!(form.headers[0].enabled);
+    assert!(
+        form.key_dropdown().is_some(),
+        "adding a header opens the suggestion dropdown"
+    );
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(app.mouse_top_layer.get(), MouseLayer::Popup);
+    let toggle = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestActivate(NewField::Kvd(KvdKind::Header, 0, HdrCol::Enabled)),
+    );
+    app.on_mouse(mouse_down(toggle.x, toggle.y));
+
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_ref() else {
+        panic!("wizard should stay open");
+    };
+    assert!(
+        form.headers[0].enabled,
+        "click outside popup dismisses without toggling the checkbox"
+    );
+    assert!(
+        form.key_dropdown().is_none(),
+        "click outside popup dismisses the suggestion dropdown"
+    );
+
+    app.on_mouse(mouse_down(toggle.x, toggle.y));
+
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_ref() else {
+        panic!("wizard should stay open");
+    };
+    assert!(
+        form.headers[0].enabled,
+        "queued click after dismissal should not close the wizard or toggle"
+    );
+    assert!(
+        form.key_dropdown().is_none(),
+        "queued click should leave the suggestion dropdown hidden"
+    );
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let toggle = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestActivate(NewField::Kvd(KvdKind::Header, 0, HdrCol::Enabled)),
+    );
+    app.on_mouse(mouse_down(toggle.x, toggle.y));
+
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_ref() else {
+        panic!("wizard should stay open");
+    };
+    assert!(!form.headers[0].enabled);
+}
+
+#[test]
+fn wizard_body_click_focuses_body_field_over_scroll_fallback() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut form = NewReq::new(String::new(), vec!["Request".to_string()], 0, None);
+    form.view_tab = WizardTab::Body;
+    form.body = super::editor::Editor::new("one\ntwo\nthree\nfour\nfive\nsix", true);
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+    let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let body = hit_rect(&app, MouseHitTarget::NewRequestField(NewField::Body));
+    app.on_mouse(mouse_down(body.x, body.y));
+
+    assert_eq!(new_focus(&app), NewField::Body);
+}
+
+#[test]
+fn wizard_scrolling_header_cell_click_focuses_cell_over_scroll_fallback() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut form = NewReq::new(String::new(), vec!["Request".to_string()], 0, None);
+    form.view_tab = WizardTab::Headers;
+    form.headers.clear();
+    for i in 0..8 {
+        let mut row = HeaderRow::new();
+        row.key = super::editor::Editor::new(&format!("Header{i}"), false);
+        row.value = super::editor::Editor::new(&format!("Value{i}"), false);
+        form.headers.push(row);
+    }
+
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+    let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    assert!(
+        app.mouse_hits.borrow().iter().any(|hit| {
+            hit.target == MouseHitTarget::Scroll(MouseScrollTarget::WizardKvd(KvdKind::Header))
+        }),
+        "headers table must be scrolling for this regression test"
+    );
+    let key = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestField(NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)),
+    );
+    app.on_mouse(mouse_down(key.x, key.y));
+
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key)
+    );
 }
 
 #[test]
@@ -6514,7 +6764,7 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
         .text_selection()
         .expect("dragging inside the response panel should start a selection");
     assert_eq!(sel.pane, Pane::Response);
-    let text = super::selection::extract_text(
+    let text = tui_panel_select::selection::extract_text(
         sel.anchor,
         sel.cursor,
         app.resp_panel.wrap().unwrap(),
@@ -6776,7 +7026,7 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     let sel = app
         .text_selection()
         .expect("dragging inside the Main panel should start a selection");
-    let selected = super::selection::extract_text(
+    let selected = tui_panel_select::selection::extract_text(
         sel.anchor,
         sel.cursor,
         app.main_panel.wrap().unwrap(),
@@ -7072,7 +7322,7 @@ fn main_panel_drag_extracts_the_expected_text() {
         .text_selection()
         .expect("dragging inside the Main panel should start a selection");
     assert_eq!(sel.pane, Pane::Main);
-    let text = super::selection::extract_text(
+    let text = tui_panel_select::selection::extract_text(
         sel.anchor,
         sel.cursor,
         app.main_panel.wrap().unwrap(),
@@ -7253,7 +7503,7 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
         sel.cursor.line, last_line,
         "held past the bottom, the cursor must sit on the very last line"
     );
-    let text = super::selection::extract_text(sel.anchor, sel.cursor, wrap, None)
+    let text = tui_panel_select::selection::extract_text(sel.anchor, sel.cursor, wrap, None)
         .expect("selection has text");
     assert!(
         text.ends_with(&format!("line{}", 199)),
@@ -7298,7 +7548,7 @@ fn dragging_past_the_edge_at_the_very_top_or_bottom_selects_the_whole_boundary_l
         "held past the top, the cursor must sit at the very start of that line"
     );
     let wrap = app.resp_panel.wrap().unwrap();
-    let text = super::selection::extract_text(sel.anchor, sel.cursor, wrap, None)
+    let text = tui_panel_select::selection::extract_text(sel.anchor, sel.cursor, wrap, None)
         .expect("selection has text");
     assert!(
         text.starts_with("line0"),
@@ -7515,7 +7765,7 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     };
     app.set_text_selection(Some(sel));
     let expected: String = long_line.chars().skip(10).take(10).collect();
-    let before_text = super::selection::extract_text(
+    let before_text = tui_panel_select::selection::extract_text(
         sel.anchor,
         sel.cursor,
         app.resp_panel.wrap().unwrap(),
@@ -7536,7 +7786,7 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     // The selection (still the same `TextPos`s — nothing invalidated it)
     // must still resolve to the exact same characters, even though they
     // may now be wrapped onto a different screen row.
-    let after_text = super::selection::extract_text(
+    let after_text = tui_panel_select::selection::extract_text(
         sel.anchor,
         sel.cursor,
         app.resp_panel.wrap().unwrap(),
@@ -7669,7 +7919,7 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
         "the first region is finalized, not discarded"
     );
     let wrap = app.resp_panel.wrap().unwrap();
-    let first_text = super::selection::extract_text(
+    let first_text = tui_panel_select::selection::extract_text(
         app.extra_selections()[0].anchor,
         app.extra_selections()[0].cursor,
         wrap,
@@ -7679,7 +7929,8 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
     let active = app
         .text_selection()
         .expect("the Alt-drag becomes the new active region");
-    let second_text = super::selection::extract_text(active.anchor, active.cursor, wrap, None);
+    let second_text =
+        tui_panel_select::selection::extract_text(active.anchor, active.cursor, wrap, None);
     assert_eq!(second_text.as_deref(), Some("second"));
 
     // Copying concatenates every region in document position order
@@ -20794,6 +21045,11 @@ fn mouse_click_on_header_row_does_not_select_a_cell() {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    assert_eq!(
+        app.mouse_hit_at(ratatui::layout::Position::new(area.x + 1, area.y)),
+        Some(MouseHitTarget::ReportResultsCell),
+        "the header click must exercise the ReportResultsCell dispatch path"
+    );
     // area.y is the header row in the inner rect.
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),

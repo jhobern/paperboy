@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.1.8] - 2026-08-01
+
+### Added
+
+- **Conventional mouse navigation across the TUI.** Visible tabs, menus,
+  request/environment rows, report grids and node outlines, request-wizard
+  fields/dropdowns, confirmation choices, browser rows, theme controls and
+  scrollable panels now respond to ordinary left-click and wheel input while
+  preserving the existing text selection, scrollbar dragging and keyboard
+  behaviour.
+
 
 ## [0.1.7] - 2026-07-30
 

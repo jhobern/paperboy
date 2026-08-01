@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
-use super::app::{Overlay, Pane, TuiApp};
+use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, TuiApp};
 use super::draw::panel;
 use super::editor::{
     Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
@@ -1597,7 +1597,7 @@ impl TuiApp {
     /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.
     /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
     /// the data-row/column count so it never points outside the grid.
-    fn result_cursor_move(&mut self, dr: i32, dc: i32) {
+    pub(crate) fn result_cursor_move(&mut self, dr: i32, dc: i32) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
@@ -1745,7 +1745,7 @@ impl TuiApp {
             // `y` copies the panel selection to the clipboard, or — when
             // nothing is selected — the entire cell content.
             KeyCode::Char('y') => {
-                use super::clipboard::copy_to_clipboard;
+                use tui_panel_select::clipboard::copy_to_clipboard;
                 let text = panel
                     .selected_text(None)
                     .filter(|t| !t.is_empty())
@@ -2426,7 +2426,7 @@ impl TuiApp {
         };
 
         if let Some(text) = copy {
-            super::clipboard::copy_to_clipboard(&text);
+            tui_panel_select::clipboard::copy_to_clipboard(&text);
             self.status = Some(crate::i18n::Status::Copied);
         }
         if let Some(text) = new_text {
@@ -3399,6 +3399,17 @@ fn draw_report_results(
     );
     app.report_pane_areas[ReportPane::Results.idx()] = inner;
     app.report_pane_bars[ReportPane::Results.idx()] = bar;
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        bar,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Results)),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::Main),
+    );
+    app.push_mouse_hit(MouseLayer::Base, inner, MouseHitTarget::ReportResultsCell);
 }
 
 /// Build the grid's styled lines: a bold header row of the resolved column
@@ -3694,7 +3705,7 @@ pub(crate) fn draw_result_cell_popup_overlay(
     panel: &mut MultiSelectPanel,
     s: &Strings,
     th: &Theme,
-) {
+) -> Rect {
     use super::draw::centered_rect;
     let box_w = f.area().width.saturating_sub(8).clamp(40, 90);
     // Convert the raw content into styled lines (one per line in the value).
@@ -3718,7 +3729,7 @@ pub(crate) fn draw_result_cell_popup_overlay(
     let area = centered_rect(box_w, box_h, f.area());
     f.render_widget(ratatui::widgets::Clear, area);
     let popup_title = format!("{title}  ({})", s.report_cell_popup_hint);
-    draw_report_panel(
+    let (inner, _bar) = draw_report_panel(
         f,
         area,
         super::draw::panel(popup_title, true, th),
@@ -3726,6 +3737,7 @@ pub(crate) fn draw_result_cell_popup_overlay(
         &content_lines,
         th,
     );
+    inner
 }
 /// cursor, on top of the already-rendered editor. Mirrors the horizontal /
 /// vertical scroll maths [`render_editor_highlighted`] uses so it lands exactly
@@ -3965,6 +3977,21 @@ fn draw_report_source(
     );
     app.report_pane_areas[ReportPane::Source.idx()] = inner;
     app.report_pane_bars[ReportPane::Source.idx()] = bar;
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        bar,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Source)),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::Main),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Source)),
+    );
 }
 
 fn draw_report_validation(
@@ -4014,6 +4041,16 @@ fn draw_report_validation(
     );
     app.report_pane_areas[ReportPane::Validation.idx()] = inner;
     app.report_pane_bars[ReportPane::Validation.idx()] = bar;
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        bar,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
+    );
 }
 
 #[cfg(test)]

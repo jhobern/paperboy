@@ -21,7 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::app::{Overlay, PromptKind, TuiApp};
+use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, PromptKind, TuiApp};
 use super::draw::panel;
 use super::editor::Editor;
 use super::new_request::draw_scrollbar;
@@ -1724,6 +1724,8 @@ pub(crate) fn draw_report_nodes(
     let block = panel(title, focused, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.report_pane_areas[crate::tui::reports::ReportPane::Source.idx()] = Rect::default();
+    app.report_pane_bars[crate::tui::reports::ReportPane::Source.idx()] = Rect::default();
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1759,6 +1761,20 @@ pub(crate) fn draw_report_nodes(
         .map(|(i, row)| render_node_row(row, i == sel, w, s, th))
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(
+            crate::tui::reports::ReportPane::Source,
+        )),
+    );
+    for row in first..rows.len().min(first + h) {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            MouseHitTarget::ReportNodeRow(row),
+        );
+    }
 
     if rows.len() > h {
         let bar = Rect {
