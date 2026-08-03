@@ -78,6 +78,14 @@ pub(crate) enum FileAction {
     /// other folder pickers; Enter writes `dir/<name>.report` (extension added
     /// when missing), seeded with the report's name.
     SaveReportChooseFolder,
+    /// Picking a DESTINATION FOLDER for "New Report" — creating a brand-new
+    /// empty report. Confirms like the other folder pickers (navigate to the
+    /// folder, Tab to the filename editor, Enter writes `dir/<name>.trail`);
+    /// the filename is seeded with `report.trail`. If the chosen folder lies
+    /// inside an open Workspace, the report is created embedded in that
+    /// workspace's tree; otherwise it opens as a standalone report tab. `Ctrl+N`
+    /// in this browser instead creates an unsaved scratch report tab (no file).
+    NewReportChooseFolder,
     /// Picking a SOURCE FOLDER for a `FOR … IN FILES/FOLDERS` node in the
     /// structured report editor. Confirms on `Space` (the current directory,
     /// like `OpenWorkspace`); the chosen path is written into the loop's
@@ -101,6 +109,7 @@ impl FileAction {
                 | FileAction::SaveReportCsvChooseFolder
                 | FileAction::SaveReportBaselineChooseFolder
                 | FileAction::SaveReportChooseFolder
+                | FileAction::NewReportChooseFolder
         )
     }
 }
@@ -134,12 +143,6 @@ pub(crate) enum PromptKind {
     /// `.hurl` extension is defaulted. Reached via `n` in the workspace
     /// destination picker.
     NewWorkspaceCollection(usize),
-    /// Naming a brand-new `.trail` file being created inside a Workspace tab
-    /// (the `usize` is the workspace collection index). Like
-    /// [`Self::NewWorkspaceCollection`] the typed text is a path relative to
-    /// the workspace root; subfolders are allowed and a `.trail` extension is
-    /// defaulted. Reached via `R` in the workspace destination picker.
-    NewWorkspaceReport(usize),
     /// Editing one report-flow node "as a line" in the structured node editor:
     /// the prompt is seeded with the node's single-line source form and, on
     /// commit, that text is re-parsed and swapped back into the flow at `path`
@@ -160,7 +163,6 @@ impl PromptKind {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
             PromptKind::NewWorkspaceCollection(_) => ".hurl",
-            PromptKind::NewWorkspaceReport(_) => ".trail",
             _ => "",
         }
     }
@@ -1072,6 +1074,13 @@ pub struct TuiApp {
     /// dragged around by loads of unrelated file types.
     pub(crate) last_env_dir: Option<PathBuf>,
 
+    /// One-shot start folder for the *new-report* folder browser
+    /// ([`FileAction::NewReportChooseFolder`]): the highlighted workspace folder
+    /// (or the workspace root) the "New Report" action was launched from.
+    /// Consumed and cleared by [`TuiApp::open_browser`]; falls back to
+    /// `last_browse_dir` when unset.
+    pub(crate) new_report_seed_dir: Option<PathBuf>,
+
     /// Directory the file browser started in the last time it was opened, so
     /// `^r` can snap it back there after wandering up/down the tree. Set by
     /// [`TuiApp::open_browser`]; only meaningful while a browser overlay is up.
@@ -1265,6 +1274,7 @@ impl Default for TuiApp {
             running_reports: std::collections::HashMap::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            new_report_seed_dir: None,
             browser_origin_dir: None,
             browser_forward_path: None,
             confirm_on_exit: true,
@@ -1766,7 +1776,6 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
-            PromptKind::NewWorkspaceReport(ci) => self.create_workspace_report(ci, text),
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
@@ -2084,6 +2093,11 @@ impl TuiApp {
             // real write through `FileAction::SaveReport`, so this never reaches
             // here.
             FileAction::SaveReportChooseFolder => {}
+            // Like the folder pickers above: the new-report destination is
+            // confirmed in `input.rs` (`browser_commit_save`), which routes
+            // creation through `create_report_at_path`, so this never reaches
+            // here.
+            FileAction::NewReportChooseFolder => {}
             // Like the folder pickers above: the loop's source folder is
             // confirmed with `Space` in `input.rs`
             // (`commit_report_node_folder`), so a file-Enter never reaches here.
@@ -2570,31 +2584,6 @@ impl TuiApp {
             kind: PromptKind::NewWorkspaceCollection(ci),
             editor: Editor::blank(),
             title: s.workspace_new_collection_title.to_string(),
-            mask: false,
-            reset_to: None,
-            secret_intact: false,
-            secret_checkbox: None,
-        });
-    }
-
-    /// Open the "name a new report" prompt for Workspace tab `ci` (see
-    /// [`PromptKind::NewWorkspaceReport`]). The typed text is a path relative
-    /// to the workspace root; `.trail` is ghosted as the default extension.
-    /// Mirrors [`Self::open_new_workspace_collection_prompt`].
-    pub(crate) fn open_new_workspace_report_prompt(&mut self, ci: usize) {
-        if self
-            .collections
-            .get(ci)
-            .and_then(|c| c.workspace_root.as_ref())
-            .is_none()
-        {
-            return;
-        }
-        let s = Strings::for_language(&self.language);
-        self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::NewWorkspaceReport(ci),
-            editor: Editor::blank(),
-            title: s.workspace_new_report_title.to_string(),
             mask: false,
             reset_to: None,
             secret_intact: false,

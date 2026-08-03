@@ -153,6 +153,16 @@ pub fn is_env_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("vars"))
 }
 
+/// Whether `path` is any file the Workspace tree surfaces — a collection
+/// (`.hurl`/`.json`), an environment (`.vars`) or a report (`.trail`). Exposed
+/// so the new-report folder chooser can *show* the same files (alongside
+/// folders) even though only folders are selectable there: seeing the
+/// workspace's own files makes it obvious the picker is scoped inside the
+/// workspace rather than browsing the wider filesystem.
+pub fn is_workspace_file(path: &Path) -> bool {
+    is_matching_file(path, true)
+}
+
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any
 /// needed subdirectories), skipping hidden (dot-prefixed) entries exactly
 /// like [`scan_workspace`] — used by "Save Workspace" to copy a Workspace's

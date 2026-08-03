@@ -721,6 +721,19 @@ impl TuiApp {
             return;
         }
         let full_path = root.join(&rel_path);
+        // Physical-containment guard. The `..`/absolute check above is purely
+        // lexical, so it can't catch a destination that *resolves* outside the
+        // workspace through a symlinked path component (a symlink is a `Normal`
+        // component and slips through). Resolve the deepest existing ancestor of
+        // the target and refuse to write if its real path escapes the real
+        // workspace root — otherwise a report that looks "inside" the workspace
+        // would land somewhere else entirely on disk.
+        if report_escapes_root(&root, &full_path) {
+            self.status = Some(Status::WorkspaceReportEscaped(
+                rel_path.display().to_string(),
+            ));
+            return;
+        }
         let s = Strings::for_language(&self.language);
         let mut report = Report::scratch(s.report_default_name);
         // Create any parent folders inside the workspace before writing.
@@ -744,6 +757,54 @@ impl TuiApp {
         self.status = Some(Status::WorkspaceReportCreated(
             rel_path.display().to_string(),
         ));
+    }
+
+    /// Create a brand-new empty report at the absolute `path` chosen in the
+    /// new-report folder browser, then open it. If `path` lies inside an open
+    /// Workspace tab's root, the report is created **embedded** in that
+    /// workspace's tree (reusing [`Self::create_workspace_report`], so it shows
+    /// in the tree and is workspace-aware); otherwise it's written and opened as
+    /// a **standalone** report tab bound to `path`. A missing extension defaults
+    /// to `.trail`.
+    pub(crate) fn create_report_at_path(&mut self, path: &std::path::Path) {
+        let mut path = path.to_path_buf();
+        if path.extension().is_none() {
+            path.set_extension("trail");
+        }
+        // Prefer creating inside an enclosing open workspace so the new report
+        // joins that tree and is workspace-aware. If several roots contain the
+        // path (nested workspaces), the deepest wins.
+        let enclosing = self
+            .collections
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| {
+                let root = c.workspace_root.as_ref()?;
+                let rel = path.strip_prefix(root).ok()?;
+                Some((ci, root.components().count(), rel.to_path_buf()))
+            })
+            .max_by_key(|(_, depth, _)| *depth);
+        if let Some((ci, _, rel)) = enclosing
+            && let Some(rel_str) = rel.to_str()
+        {
+            self.create_workspace_report(ci, rel_str.to_string());
+            return;
+        }
+        // Standalone: write the empty report and open it as its own tab.
+        let s = Strings::for_language(&self.language);
+        let mut report = Report::scratch(s.report_default_name);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.status = Some(Status::Error(format!("{}: {e}", parent.display())));
+            return;
+        }
+        if let Err(e) = report.save_local(&path) {
+            self.status = Some(Status::Error(e));
+            return;
+        }
+        self.open_loaded_report(report);
     }
 
     /// when possible, else as an absolute path) against each open collection's
@@ -4051,6 +4112,35 @@ fn draw_report_validation(
         inner,
         MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
     );
+}
+
+/// Whether writing to `target` would physically escape workspace `root` once
+/// symlinks are resolved. `target` (a not-yet-created file) is checked via its
+/// **deepest existing ancestor**: the closest parent that exists on disk is
+/// canonicalised and compared against the canonicalised `root`. A symlinked
+/// directory component therefore fails the check even though a lexical `..`
+/// scan would pass it, and any subfolders still to be created underneath a
+/// real, in-root ancestor are inherently contained. Returns `false` (don't
+/// block) when `root` can't be canonicalised — an open workspace root always
+/// exists, so that only happens in degenerate cases where the later write will
+/// surface the real error.
+fn report_escapes_root(root: &std::path::Path, target: &std::path::Path) -> bool {
+    let Ok(canon_root) = root.canonicalize() else {
+        return false;
+    };
+    let mut ancestor = target;
+    loop {
+        if ancestor.exists() {
+            return match ancestor.canonicalize() {
+                Ok(real) => !real.starts_with(&canon_root),
+                Err(_) => true,
+            };
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return true,
+        }
+    }
 }
 
 #[cfg(test)]

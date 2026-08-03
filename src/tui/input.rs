@@ -1455,7 +1455,16 @@ impl TuiApp {
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
             // Shift+R opens a brand-new PaperTrail report tab (report tabs live
-            // after the collection tabs in the same strip).
+            // after the collection tabs in the same strip). In a Workspace tab
+            // it instead opens the new-report folder browser, seeded to the
+            // highlighted folder (or the workspace root), so the report is
+            // created inside the workspace and shown in the tree — regardless of
+            // which pane holds focus, since "new report while viewing a
+            // workspace" always means "put it in the workspace". (The browser's
+            // Ctrl+N is the escape hatch for an unattached scratch report tab.)
+            KeyCode::Char('R') if self.collections[self.active_tab].is_workspace() => {
+                self.open_new_report_browser_for_tree(self.active_tab);
+            }
             KeyCode::Char('R') => self.new_report_tab(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.response_pct = self.response_pct.saturating_sub(5).max(15);
@@ -2150,6 +2159,55 @@ impl TuiApp {
                 }
             }
         }
+    }
+
+    /// Open the new-report folder browser for a Workspace tab's tree
+    /// (`Shift+R`). The browser starts in the highlighted folder (or the parent
+    /// folder of a highlighted file, or the workspace root), so confirming the
+    /// filename there creates the report inside the workspace — where it appears
+    /// in the tree. `Ctrl+N` inside the browser instead makes a scratch report.
+    fn open_new_report_browser_for_tree(&mut self, ci: usize) {
+        let col = &self.collections[ci];
+        let root = col.workspace_root.clone();
+        let seed = col
+            .ws_rows()
+            .into_iter()
+            .nth(col.list_cursor)
+            .and_then(|row| match row {
+                crate::collection::WsRow::Folder { path, .. } => Some(path),
+                crate::collection::WsRow::Collection { path, .. }
+                | crate::collection::WsRow::Report { path, .. }
+                | crate::collection::WsRow::Environment { path, .. } => {
+                    path.parent().map(|p| p.to_path_buf())
+                }
+                crate::collection::WsRow::Request { collection, .. } => {
+                    collection.parent().map(|p| p.to_path_buf())
+                }
+            })
+            .or(root);
+        self.new_report_seed_dir = seed;
+        self.open_browser(FileAction::NewReportChooseFolder);
+    }
+
+    /// The deepest open Workspace root that (lexically) contains `path`, if any.
+    /// "Deepest" so a report dropped inside a workspace nested within another
+    /// binds to the innermost one — the same rule
+    /// [`Self::create_report_at_path`] uses to choose the embed target.
+    fn deepest_ws_root_containing(&self, path: &Path) -> Option<PathBuf> {
+        self.collections
+            .iter()
+            .filter_map(|c| c.workspace_root.as_ref())
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    }
+
+    /// Whether the browser is the workspace-scoped new-report chooser sitting at
+    /// its enclosing workspace root — the point past which it must not ascend,
+    /// so the report can only ever land inside the workspace.
+    fn browser_confined_at_root(&self, action: FileAction, ex: &FileExplorer) -> bool {
+        action == FileAction::NewReportChooseFolder
+            && self.deepest_ws_root_containing(ex.cwd()).as_deref() == Some(ex.cwd().as_path())
     }
 
     /// Load a workspace `.vars` file as a global environment (reusing the
@@ -3322,6 +3380,14 @@ impl TuiApp {
                 let path = dir.join(file).to_string_lossy().into_owned();
                 self.save_as_path(FileAction::SaveReport, &path);
             }
+            FileAction::NewReportChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("trail");
+                }
+                let path = dir.join(file);
+                self.create_report_at_path(&path);
+            }
             _ => {}
         }
     }
@@ -3575,9 +3641,27 @@ impl TuiApp {
             }
             // Create a brand-new report in this workspace. Only in Browse mode
             // (a report can't be a move/copy/add-request target), mirroring the
-            // `n` new-collection action — see `open_new_workspace_report_prompt`.
+            // `n` new-collection action. Opens the new-report folder browser
+            // (seeded to the highlighted folder / workspace root) rather than a
+            // bare name prompt, so the user can choose where it lands — or press
+            // Ctrl+N there to keep it as an unattached scratch tab instead.
             KeyCode::Char('R') if picker.mode == WsPickerMode::Browse => {
-                self.open_new_workspace_report_prompt(picker.collection_idx);
+                let seed = picker
+                    .entries
+                    .get(picker.selected)
+                    .map(|e| {
+                        if e.is_dir {
+                            e.path.clone()
+                        } else {
+                            e.path
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| picker.root.clone())
+                        }
+                    })
+                    .unwrap_or_else(|| picker.root.clone());
+                self.new_report_seed_dir = Some(seed);
+                self.open_browser(FileAction::NewReportChooseFolder);
             }
             KeyCode::Enter => match picker.entries.get(picker.selected) {
                 Some(entry) if !entry.is_dir => {
@@ -3776,6 +3860,7 @@ impl TuiApp {
             FileAction::SaveReportBaselineChooseFolder => s.report_save_baseline_folder,
             FileAction::OpenReport => s.open_report,
             FileAction::SaveReportChooseFolder => s.save_report_folder,
+            FileAction::NewReportChooseFolder => s.new_report_folder,
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
             _ => s.browser_select_file,
         }
@@ -3788,6 +3873,8 @@ impl TuiApp {
             | FileAction::SaveReportCsvChooseFolder
             | FileAction::SaveReportBaselineChooseFolder
             | FileAction::SaveReportChooseFolder => s.browser_hint_collection_save,
+            // The new-report picker adds the `^n scratch tab` note.
+            FileAction::NewReportChooseFolder => s.browser_hint_new_report,
             // The load pickers get the `Tab all/matching` filter note.
             _ if browser_filters_by_ext(action) => s.browser_hint_filter,
             _ => s.browser_hint,
@@ -3839,6 +3926,13 @@ impl TuiApp {
                     | FileAction::SaveReportBaselineChooseFolder => {
                         report_dir.as_ref().or(self.last_browse_dir.as_ref())
                     }
+                    // New report: start in the workspace folder the action was
+                    // launched from (highlighted folder / workspace root), else
+                    // the shared last-browsed folder.
+                    FileAction::NewReportChooseFolder => self
+                        .new_report_seed_dir
+                        .as_ref()
+                        .or(self.last_browse_dir.as_ref()),
                     _ => self.last_browse_dir.as_ref(),
                 };
                 if let Some(dir) = reopen
@@ -3846,6 +3940,9 @@ impl TuiApp {
                 {
                     let _ = ex.set_cwd(dir);
                 }
+                // The seed dir is one-shot — clear it so a later browser opened
+                // for a different action doesn't inherit it.
+                self.new_report_seed_dir = None;
                 // Remember where the browser actually started so `^r` can jump
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
@@ -3866,6 +3963,9 @@ impl TuiApp {
                             self.default_report_baseline_filename()
                         }
                         FileAction::SaveReportChooseFolder => self.default_save_report_filename(),
+                        // A brand-new report always starts from a fresh default
+                        // name (never the active report's file name).
+                        FileAction::NewReportChooseFolder => "report.trail".to_string(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
@@ -3877,6 +3977,24 @@ impl TuiApp {
                 if browser_filters_by_ext(action) {
                     let _ = ex.set_filter_map(move |file| {
                         browser_keep_file(action, &file).then_some(file)
+                    });
+                }
+                // The new-report picker is a workspace-scoped *folder* chooser:
+                // only folders are selectable (the report name — and an optional
+                // `sub/name` path that creates a new subfolder — is typed in the
+                // inline field). We still *show* the workspace's own files
+                // (collections, environments, reports) greyed alongside the
+                // folders, so it's visually obvious the picker is scoped inside
+                // the workspace rather than browsing the wider filesystem;
+                // non-workspace files (e.g. a stray `notes.txt`) stay hidden.
+                // This filter is permanent for the action; unlike the ext
+                // filters it isn't Tab-toggleable, because Tab focuses the
+                // filename field. Enter on a shown file is inert (see
+                // `browser_key_handler`), so files remain non-selectable.
+                if action == FileAction::NewReportChooseFolder {
+                    let _ = ex.set_filter_map(|file| {
+                        (file.is_dir || crate::workspace::is_workspace_file(&file.path))
+                            .then_some(file)
                     });
                 }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
@@ -4743,6 +4861,18 @@ impl TuiApp {
         // bottom. Tab swaps focus between the folder list and that editor; a
         // focused editor swallows editing keys and saves on Enter.
         let save_folder = action.is_save_to_folder();
+        // Ctrl+N in the new-report browser abandons the folder choice and opens
+        // an unsaved scratch report tab instead — the "don't attach to a
+        // workspace" escape hatch. Handled first so it works even while the
+        // inline filename field has focus. Not re-showing the overlay closes it.
+        if action == FileAction::NewReportChooseFolder
+            && ctrl
+            && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+        {
+            self.browser_name_focused = false;
+            self.new_report_tab();
+            return;
+        }
         if save_folder && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.browser_name_focused = !self.browser_name_focused;
             self.overlay = Some(Overlay::Browser(action, ex));
@@ -4821,7 +4951,7 @@ impl TuiApp {
                     // only ever go deeper, so a run of Rights can't bounce
                     // back up once a retrace lands on "../". Use Left (or
                     // Enter) to ascend.
-                    if key.code == KeyCode::Enter {
+                    if key.code == KeyCode::Enter && !self.browser_confined_at_root(action, &ex) {
                         self.browser_ascend(&mut ex);
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
@@ -4851,6 +4981,7 @@ impl TuiApp {
                     FileAction::OpenWorkspace
                         | FileAction::SaveWorkspaceChooseFolder
                         | FileAction::SaveCollectionChooseFolder
+                        | FileAction::NewReportChooseFolder
                 ) {
                     // A Workspace root/destination (or a collection save
                     // destination) must be a folder, not a file — Enter on a
@@ -4858,6 +4989,10 @@ impl TuiApp {
                     // Tab to the filename field at the bottom and press Enter
                     // there to save into the current folder; `Space` picks the
                     // current folder as a Workspace root (OpenWorkspace).
+                    // `NewReportChooseFolder` shows the workspace's own files
+                    // for context but only folders are selectable, so Enter on
+                    // one of those files is likewise inert (the browser stays
+                    // open).
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else {
                     // A file is selected — remember its folder so the browser
@@ -4904,8 +5039,12 @@ impl TuiApp {
                 // Going up a level highlights the folder we just left
                 // (rather than "../"), so an accidental Left is undone by
                 // Right — instead of descending back into "../" and
-                // climbing another level.
-                self.browser_ascend(&mut ex);
+                // climbing another level. The workspace-scoped new-report
+                // chooser stops at the workspace root: the report must land
+                // inside the workspace, so there's nowhere higher to go.
+                if !self.browser_confined_at_root(action, &ex) {
+                    self.browser_ascend(&mut ex);
+                }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
             _ => {

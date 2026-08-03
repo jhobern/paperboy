@@ -3841,14 +3841,14 @@ fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
     let th = super::theme::theme(&Language::English);
     let s = Strings::for_language(&Language::English);
 
-    // The workspace "New report" prompt has a long title; on the fixed-width
-    // single-line box it used to be clipped by the panel border, hiding the
-    // trailing "Esc cancel" (and the box's own right edge).
+    // The workspace "New collection" prompt has a long title; on the
+    // fixed-width single-line box it used to be clipped by the panel border,
+    // hiding the trailing "Esc cancel" (and the box's own right edge).
     let mut app = TuiApp::default();
     app.overlay = Some(Overlay::Prompt {
-        kind: PromptKind::NewWorkspaceReport(0),
+        kind: PromptKind::NewWorkspaceCollection(0),
         editor: super::editor::Editor::blank(),
-        title: s.workspace_new_report_title.to_string(),
+        title: s.workspace_new_collection_title.to_string(),
         mask: false,
         reset_to: None,
         secret_intact: false,
@@ -3861,7 +3861,7 @@ fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
 
     let full = format!(
         "{}  ({})",
-        s.workspace_new_report_title, s.prompt_save_hint_sl
+        s.workspace_new_collection_title, s.prompt_save_hint_sl
     );
     assert!(
         out.contains(&full),
@@ -13517,7 +13517,7 @@ fn create_workspace_report_rejects_paths_escaping_the_root() {
 }
 
 #[test]
-fn capital_r_in_the_workspace_picker_opens_the_new_report_prompt() {
+fn capital_r_in_the_workspace_picker_opens_the_new_report_browser() {
     let dir = workspace_temp_dir("ws_picker_new_report");
     let mut col = Collection::new("ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -13526,17 +13526,391 @@ fn capital_r_in_the_workspace_picker_opens_the_new_report_prompt() {
     let ci = app.collections.len() - 1;
     app.active_tab = ci;
 
-    // A Browse-mode picker (the `w` flow) → `R` opens the new-report prompt.
+    // A Browse-mode picker (the `w` flow) → `R` opens the new-report *folder
+    // browser* (not a bare name prompt), seeded inside the workspace (to the
+    // highlighted folder), so the user chooses where the report lands.
     app.open_workspace_picker_for_active_tab();
     press(&mut app, KeyCode::Char('R'));
 
     match &app.overlay {
-        Some(Overlay::Prompt { kind, .. }) => {
-            assert!(matches!(kind, PromptKind::NewWorkspaceReport(idx) if *idx == ci));
+        Some(Overlay::Browser(action, ex)) => {
+            assert!(matches!(action, FileAction::NewReportChooseFolder));
+            assert!(
+                ex.cwd().starts_with(&dir),
+                "the browser starts inside the workspace (seed folder), got {:?}",
+                ex.cwd()
+            );
         }
-        _ => panic!("expected the new-report name prompt"),
+        _ => panic!("expected the new-report folder browser"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_standalone_writes_and_opens_a_plain_report_tab() {
+    let dir = temp_dir("new_report_standalone");
+    let mut app = TuiApp::default();
+    // No open Workspace encloses `dir`, so the report is written and opened as
+    // its own standalone strip tab bound to the file.
+    let path = dir.join("adhoc.trail");
+    app.create_report_at_path(&path);
+
+    assert!(path.is_file(), "the report is written to disk immediately");
+    assert_eq!(app.reports.len(), 1, "one report tab was opened");
+    let rt = &app.reports[0];
+    assert_eq!(
+        rt.report.path.as_deref(),
+        Some(path.as_path()),
+        "the tab is bound to the chosen path"
+    );
+    assert!(
+        rt.workspace_root.is_none(),
+        "a standalone report has no workspace root"
+    );
+    // Standalone reports occupy a strip slot after the collection tabs.
+    assert_eq!(app.tab_count(), 2, "a new strip tab was created");
+    assert!(app.active_is_report(), "the new report tab is active");
+    assert_eq!(app.active_report_index(), Some(0));
+    assert!(matches!(app.status, Some(crate::i18n::Status::Loaded)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_inside_a_workspace_creates_it_embedded() {
+    let dir = workspace_temp_dir("new_report_embedded");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // The chosen path lies inside the open Workspace root, so the report joins
+    // that tree (embedded) rather than opening as a separate strip tab.
+    let path = dir.join("reports").join("nightly.trail");
+    app.create_report_at_path(&path);
+
+    assert!(path.is_file(), "the report is written under the workspace");
+    assert_eq!(app.reports.len(), 1, "a report was opened");
+    let rt = &app.reports[0];
+    assert_eq!(rt.report.path.as_deref(), Some(path.as_path()));
+    assert!(
+        rt.workspace_root.is_some(),
+        "opened embedded in the workspace tab, not as a plain report tab"
+    );
+    assert_eq!(
+        app.active_tab, ci,
+        "the Workspace collection tab stays active"
+    );
+    assert_eq!(app.tab_count(), 2, "no new strip tab is created");
+    assert!(app.active_is_report(), "the Workspace tab shows the report");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceReportCreated(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_defaults_the_trail_extension() {
+    let dir = temp_dir("new_report_default_ext");
+    let mut app = TuiApp::default();
+    // A path with no extension gets `.trail` appended before it's written.
+    app.create_report_at_path(&dir.join("noext"));
+
+    let expected = dir.join("noext.trail");
+    assert!(expected.is_file(), "a missing extension defaults to .trail");
+    assert_eq!(
+        app.reports[0].report.path.as_deref(),
+        Some(expected.as_path())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctrl_n_in_the_new_report_browser_opens_a_scratch_report_tab() {
+    let dir = temp_dir("new_report_scratch");
+    // Start from a guaranteed-empty folder so the "nothing was written" check
+    // below can't trip over leftovers from an earlier aborted run.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    // Stand in the new-report folder browser, then Ctrl+N — the escape hatch
+    // that abandons the folder choice and makes an unsaved scratch report tab.
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "the browser overlay is closed");
+    assert_eq!(app.reports.len(), 1, "a scratch report tab was opened");
+    assert!(
+        app.reports[0].report.path.is_none(),
+        "a scratch report is unsaved (no file bound)"
+    );
+    assert!(
+        app.reports[0].workspace_root.is_none(),
+        "a scratch report isn't attached to any workspace"
+    );
+    assert!(app.active_is_report(), "the scratch report tab is active");
+    // Nothing was written to disk for the folder that was browsed.
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "no file was created in the browsed folder"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enter_in_the_new_report_browser_writes_and_opens_the_report() {
+    let dir = temp_dir("new_report_browser_commit");
+    let mut app = TuiApp::default();
+    // Drive the full browser flow: Tab to the filename field, type a name, Enter
+    // writes `dir/<name>.trail` and opens it (standalone, since `dir` is not a
+    // workspace).
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_name_focused, "Tab focuses the filename field");
+    app.browser_name = super::editor::Editor::new("smoke", false);
+    press(&mut app, KeyCode::Enter);
+
+    let expected = dir.join("smoke.trail");
+    assert!(expected.is_file(), "Enter writes the report to the folder");
+    assert_eq!(app.reports.len(), 1);
+    assert_eq!(
+        app.reports[0].report.path.as_deref(),
+        Some(expected.as_path())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn shift_r_in_a_workspace_opens_the_folder_browser_even_when_focus_is_not_the_tree() {
+    let dir = workspace_temp_dir("shift_r_ws_focus");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    // Focus is on the Main pane (e.g. the user is viewing a report body or the
+    // request/response), not the file tree. Shift+R must still open the
+    // workspace new-report browser so the report lands *in the workspace* —
+    // rather than falling through to a standalone scratch tab.
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
+        ),
+        "Shift+R in a workspace opens the folder browser regardless of focus"
+    );
+    assert_eq!(app.reports.len(), 0, "no standalone report tab was opened");
+
+    // Completing the browser creates the report embedded in the workspace.
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("smoke", false);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.reports.len(), 1);
+    assert!(
+        app.reports[0].workspace_root.is_some(),
+        "the report is embedded in the workspace, not a standalone tab"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_picker_shows_folders_and_workspace_files_but_hides_others() {
+    let dir = workspace_temp_dir("new_report_show_files");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    // Open the new-report chooser seeded at the workspace root. It shows the
+    // destination *folders* plus the workspace's own files (collections,
+    // environments, reports) for context — so it's visually obvious the
+    // picker is scoped inside the workspace — while non-workspace files
+    // (a stray `notes.txt`) stay hidden. Only folders are selectable.
+    app.new_report_seed_dir = Some(dir.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+    match &app.overlay {
+        Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) => {
+            let names: Vec<&String> = ex.files().iter().map(|f| &f.name).collect();
+            assert!(
+                ex.files().iter().any(|f| f.is_dir && f.name == "sub/"),
+                "the `sub/` folder is shown as a destination, got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.as_str() == "alpha.hurl"),
+                "the workspace's collection file is shown for context, got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.as_str() == "report.trail"),
+                "the workspace's report file is shown for context, got: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n.as_str() == "notes.txt"),
+                "non-workspace files are hidden, got: {names:?}"
+            );
+        }
+        _ => panic!("expected the new-report folder browser"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
+    let dir = workspace_temp_dir("new_report_enter_file");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    app.new_report_seed_dir = Some(dir.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+
+    // Move the selection onto a shown file (a collection) and press Enter:
+    // files are non-selectable here, so Enter is inert and the folder
+    // browser stays open (rather than closing or opening anything).
+    if let Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) = &mut app.overlay {
+        let idx = ex
+            .files()
+            .iter()
+            .position(|f| f.name == "alpha.hurl")
+            .expect("the collection file is listed");
+        ex.set_selected_idx(idx);
+    } else {
+        panic!("expected the new-report folder browser");
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
+        ),
+        "Enter on a non-selectable file leaves the new-report browser open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_browser_cannot_ascend_above_the_workspace_root() {
+    let dir = workspace_temp_dir("new_report_confine");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    // Start the browser one level down, inside the workspace's `sub/` folder.
+    let sub = dir.join("sub");
+    app.new_report_seed_dir = Some(sub.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+
+    // Left ascends within the workspace: `sub/` → the workspace root.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "ascended from sub/ back to the root")
+        }
+        _ => panic!("browser should stay open"),
+    }
+    // Left again at the root is inert — the report must stay inside the
+    // workspace, so there's nowhere higher to go.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "stayed put at the workspace root")
+        }
+        _ => panic!("browser should stay open"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_name_with_a_subfolder_path_creates_the_folder_embedded() {
+    let dir = workspace_temp_dir("new_report_subfolder");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // A `sub/name` filename creates the (new) subfolder and lands the report in
+    // it, embedded in the workspace — the "＋ new subfolder" affordance.
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("nightly/run", false);
+    press(&mut app, KeyCode::Enter);
+
+    let expected = dir.join("nightly").join("run.trail");
+    assert!(
+        expected.is_file(),
+        "the new subfolder and report were created"
+    );
+    assert_eq!(app.reports.len(), 1);
+    assert!(
+        app.reports[0].workspace_root.is_some(),
+        "the report is embedded in the workspace, not standalone"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceReportCreated(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn new_report_into_a_symlink_that_escapes_the_workspace_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = workspace_temp_dir("new_report_symlink_escape");
+    let outside = temp_dir("new_report_symlink_outside");
+    // A folder inside the workspace that is really a symlink pointing OUT of it.
+    // Lexically `escape/r.trail` looks contained; physically it resolves under
+    // `outside`, so the containment guard must refuse to write it.
+    let link = dir.join("escape");
+    let _ = std::fs::remove_file(&link);
+    symlink(&outside, &link).unwrap();
+
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    app.create_report_at_path(&link.join("r.trail"));
+
+    assert!(
+        app.reports.is_empty(),
+        "no report is opened for an escaping destination"
+    );
+    assert!(
+        !outside.join("r.trail").exists(),
+        "nothing is written outside the workspace"
+    );
+    assert!(
+        matches!(
+            app.status,
+            Some(crate::i18n::Status::WorkspaceReportEscaped(_))
+        ),
+        "the escape is reported to the user"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// Load `alpha.hurl` into a fresh Workspace tab so a request row is

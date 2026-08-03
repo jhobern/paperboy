@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.1.10] - 2026-08-03
+
+### Changed
+
+- **Creating a new report now goes through a destination-folder browser.**
+  Previously, `Shift+R` in a Workspace tab (and `R` in the workspace picker)
+  opened a bare "name a new report" prompt that only accepted a path relative
+  to the workspace root. Both now open a folder browser instead, seeded to the
+  highlighted folder (or the workspace root), so you navigate to where the
+  report should land and name it there (a missing extension defaults to
+  `.trail`). In a Workspace tab, `Shift+R` opens this browser no matter which
+  pane has focus — so a report started while viewing the workspace always lands
+  *in* the workspace. If the chosen folder lies inside an open Workspace, the
+  report is created **embedded** in that workspace's tree; otherwise it opens as
+  a **standalone** report tab bound to the file. Pressing `Ctrl+N` in the
+  browser is an escape hatch that abandons the folder choice and opens an
+  unsaved scratch report tab instead.
+
+  When launched from within a Workspace the browser is **scoped to that
+  workspace**: only folders are selectable and it can't navigate above the
+  workspace root, so a report can only land inside the workspace. The
+  workspace's own files (collections, environments and existing reports) are
+  shown alongside the folders — non-selectable — so it's visually clear the
+  picker is scoped inside the workspace. Typing a `subfolder/name` path in the
+  filename field creates the subfolder on the spot. A destination that
+  *resolves* outside the workspace once symlinks are followed — e.g. through a
+  symlinked folder — is refused rather than silently written outside the tree.
+
+- **Report tabs now use the same 📊 icon as reports in the Workspace tree**, so
+  a report reads the same whether it's a standalone tab or a workspace row.
+
+
+
 ## [0.1.9] - 2026-08-03
 
 ### Fixed

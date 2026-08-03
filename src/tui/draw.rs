@@ -962,13 +962,15 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(Span::raw("│"));
         pos += 1;
         // Unsaved edits get a trailing dot (with a leading space so it never
-        // crowds the name); the report icon leads.
+        // crowds the name); the report icon leads — the same 📊 icon the
+        // Workspace tree uses for report files (`REPORT_ICON`), so a report
+        // reads the same whether it's a standalone tab or a workspace row.
         let marker = if rt.report.dirty {
             format!(" {}", s.report_dirty_marker)
         } else {
             String::new()
         };
-        let name = format!("{}{}{}", s.report_tab_icon, rt.report.name, marker);
+        let name = format!("{REPORT_ICON} {}{}", rt.report.name, marker);
         let idx = report_base + slot;
         let w = name.chars().count() + 2;
         if app.active_tab == idx {

@@ -137,6 +137,7 @@ strings! {
     open_collection => "Load Collection…", "Charger une collection…", "Indlæs samling…";
     open_report => "Load Report…", "Charger un rapport…", "Indlæs rapport…";
     save_report_folder => "Save Report — Choose Destination Folder", "Enregistrer le rapport — Choisir le dossier de destination", "Gem rapport — Vælg destinationsmappe";
+    new_report_folder => "New Report — Choose Destination Folder", "Nouveau rapport — Choisir le dossier de destination", "Ny rapport — Vælg destinationsmappe";
     save_environment => "Save Environment…", "Enregistrer l'environnement…", "Gem miljø…";
     save_response => "Save Response…", "Enregistrer la réponse…", "Gem svar…";
     file_saved => "Saved.", "Enregistré.", "Gemt.";
@@ -161,9 +162,9 @@ strings! {
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
-    workspace_new_report_title => "New report (path relative to workspace)", "Nouveau rapport (chemin relatif au workspace)", "Ny rapport (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
+    workspace_report_escaped => "Destination '{name}' resolves outside the workspace — report not created.", "La destination « {name} » pointe hors du workspace — rapport non créé.", "Destinationen '{name}' peger uden for workspacet — rapport ikke oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
     workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
@@ -293,6 +294,7 @@ strings! {
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
     save_collection_folder => "Save Collection — Choose Destination Folder", "Enregistrer la collection — Choisir le dossier de destination", "Gem samling — Vælg destinationsmappe";
     browser_hint_collection_save => "Enter open folder · Tab file name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du fichier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab filnavn · ← overordnet · ^r nulstil · Esc annuller";
+    browser_hint_new_report => "Enter open folder · Tab name (use sub/name for a new folder) · ^n scratch tab · ← up · Esc cancel", "Entrée ouvrir dossier · Tab nom (sous-dossier/nom pour créer un dossier) · ^n onglet brouillon · ← remonter · Échap annuler", "Enter åbn mappe · Tab navn (undermappe/navn opretter en mappe) · ^n kladdefane · ← op · Esc annuller";
     browser_hint_workspace_save => "Enter open folder · Tab folder name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du dossier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab mappenavn · ← overordnet · ^r nulstil · Esc annuller";
     browser_filename_label => "File name", "Nom du fichier", "Filnavn";
     browser_foldername_label => "Folder name", "Nom du dossier", "Mappenavn";
@@ -494,7 +496,6 @@ strings! {
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
     status_not_report => "The active tab is not a report.", "L'onglet actif n'est pas un rapport.", "Den aktive fane er ikke en rapport.";
     report_bound_status => "Report bound to", "Rapport lié à", "Rapport bundet til";
-    report_tab_icon => "▤ ", "▤ ", "▤ ";
     report_source_heading => "Report Source", "Source du rapport", "Rapportkilde";
     report_validation_heading => "Validation", "Validation", "Validering";
     report_binding_heading => "Binding", "Liaison", "Binding";
@@ -675,6 +676,10 @@ pub enum Status {
     /// just-added request landed and that it still needs saving.
     WorkspaceCollectionCreated(String),
     WorkspaceReportCreated(String),
+    /// A "New Report" destination was refused because, once symlinks are
+    /// resolved, it lands outside the workspace root (holds the relative path
+    /// that was attempted). See [`crate::tui::reports`]'s containment guard.
+    WorkspaceReportEscaped(String),
     /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
     /// URL, which is the one field a request can't be saved without — the
     /// wizard is kept open (focused on the URL field) instead of silently
@@ -846,6 +851,9 @@ impl Status {
             }
             Status::WorkspaceReportCreated(name) => {
                 s.workspace_report_created.replace("{name}", name)
+            }
+            Status::WorkspaceReportEscaped(name) => {
+                s.workspace_report_escaped.replace("{name}", name)
             }
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
