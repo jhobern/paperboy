@@ -9,6 +9,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::hurl::{FormFieldKind, METHODS};
 use crate::i18n::Strings;
 
+use super::super::app::{
+    MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp, WizardDropdownKind,
+};
 use super::super::draw::*;
 use super::super::editor::*;
 use super::super::theme::*;
@@ -1666,7 +1669,15 @@ fn empty_section_add_col(s: &Strings) -> usize {
 /// Draw section `i` of the stacked "All" view into `area`. Empty sections
 /// render as one compact "Label   + Add …" line; populated ones split `area`
 /// into a label row and a table body and defer to the section's own drawer.
-fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+fn draw_all_section(
+    f: &mut Frame,
+    i: usize,
+    area: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     if all_section_is_empty(form, i) {
         let (label, add_label, add_field) = all_section_empty_meta(form, i, s);
         draw_empty_section_line(
@@ -1678,6 +1689,13 @@ fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Stri
             form.focus == add_field,
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::NewRequestActivate(add_field),
+            );
+        }
         return;
     }
     let label = Rect { height: 1, ..area };
@@ -1687,15 +1705,15 @@ fn draw_all_section(f: &mut Frame, i: usize, area: Rect, form: &NewReq, s: &Stri
         ..area
     };
     match i {
-        0 => draw_kvd_section(f, label, table, form, KvdKind::Header, s, th),
-        1 => draw_kvd_section(f, label, table, form, KvdKind::Cookie, s, th),
-        2 => draw_kvd_section(f, label, table, form, KvdKind::Query, s, th),
-        3 => draw_kvd_section(f, label, table, form, KvdKind::Options, s, th),
-        4 => draw_form_section(f, label, table, form, s, th),
-        5 => draw_body_section(f, label, table, form, s, th),
-        6 => draw_asserts_section(f, label, table, form, s, th),
-        7 => draw_captures_section(f, label, table, form, s, th),
-        8 => draw_reports_section(f, label, table, form, s, th),
+        0 => draw_kvd_section(f, label, table, form, KvdKind::Header, s, th, app),
+        1 => draw_kvd_section(f, label, table, form, KvdKind::Cookie, s, th, app),
+        2 => draw_kvd_section(f, label, table, form, KvdKind::Query, s, th, app),
+        3 => draw_kvd_section(f, label, table, form, KvdKind::Options, s, th, app),
+        4 => draw_form_section(f, label, table, form, s, th, app),
+        5 => draw_body_section(f, label, table, form, s, th, app),
+        6 => draw_asserts_section(f, label, table, form, s, th, app),
+        7 => draw_captures_section(f, label, table, form, s, th, app),
+        8 => draw_reports_section(f, label, table, form, s, th, app),
         _ => {}
     }
 }
@@ -1756,6 +1774,7 @@ fn draw_empty_section_line(
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
+#[cfg(test)]
 pub(crate) fn draw_new_request(
     f: &mut Frame,
     form: &NewReq,
@@ -1763,6 +1782,20 @@ pub(crate) fn draw_new_request(
     th: &Theme,
     enhanced: bool,
 ) {
+    draw_new_request_with_hits(f, form, s, th, enhanced, None);
+}
+
+pub(crate) fn draw_new_request_with_hits(
+    f: &mut Frame,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    enhanced: bool,
+    app: Option<&TuiApp>,
+) {
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+    }
     let w = (f.area().width * 7 / 10).max(52);
     let h = 36u16.min(f.area().height);
     let area = centered_rect(w, h, f.area());
@@ -1855,6 +1888,13 @@ pub(crate) fn draw_new_request(
         form.focus == NewField::Name,
         th,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            rows[0],
+            MouseHitTarget::NewRequestField(NewField::Name),
+        );
+    }
 
     if form.editing.is_none() {
         // Target collection row (cycler, no cursor).
@@ -1876,6 +1916,13 @@ pub(crate) fn draw_new_request(
             )),
             tcols[1],
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                rows[1],
+                MouseHitTarget::NewRequestActivate(NewField::Target),
+            );
+        }
     }
 
     // Method row (cycler, no cursor).
@@ -1899,9 +1946,26 @@ pub(crate) fn draw_new_request(
         )),
         cols[1],
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            rows[2],
+            MouseHitTarget::NewRequestActivate(NewField::Method),
+        );
+    }
 
     draw_url_row(f, rows[3], form, s, th);
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            rows[3],
+            MouseHitTarget::NewRequestField(NewField::Url),
+        );
+    }
     draw_wizard_tab_bar(f, rows[4], form.view_tab, &form.tab_order, s, th);
+    if let Some(app) = app {
+        register_wizard_tab_hits(app, rows[4], &form.tab_order, s);
+    }
 
     if form.view_tab == WizardTab::All {
         // Natural height each section wants in the stacked "All" layout. Empty
@@ -1927,6 +1991,16 @@ pub(crate) fn draw_new_request(
         } else {
             rows[5]
         };
+
+        if overflow {
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[5],
+                    MouseHitTarget::Scroll(MouseScrollTarget::WizardAllSections),
+                );
+            }
+        }
 
         // First visible section, moved only as far as needed to keep the
         // focused section fully on screen.
@@ -1970,7 +2044,7 @@ pub(crate) fn draw_new_request(
                 width: body_area.width,
                 height: block_h[i],
             };
-            draw_all_section(f, i, sect, form, s, th);
+            draw_all_section(f, i, sect, form, s, th, app);
             used += block_h[i];
             rendered += 1;
         }
@@ -1987,6 +2061,7 @@ pub(crate) fn draw_new_request(
                 form,
                 s,
                 th,
+                app,
             );
         }
 
@@ -2011,24 +2086,48 @@ pub(crate) fn draw_new_request(
         .split(rows[5]);
         match form.view_tab {
             WizardTab::All => unreachable!(),
-            WizardTab::Headers => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th),
-            WizardTab::Cookies => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Cookie, s, th),
-            WizardTab::Queries => draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Query, s, th),
-            WizardTab::Options => {
-                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Options, s, th)
+            WizardTab::Headers => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Header, s, th, app)
             }
-            WizardTab::Form => draw_form_section(f, sub[0], sub[1], form, s, th),
-            WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th),
-            WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th),
-            WizardTab::Captures => draw_captures_section(f, sub[0], sub[1], form, s, th),
-            WizardTab::Reports => draw_reports_section(f, sub[0], sub[1], form, s, th),
+            WizardTab::Cookies => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Cookie, s, th, app)
+            }
+            WizardTab::Queries => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Query, s, th, app)
+            }
+            WizardTab::Options => {
+                draw_kvd_section(f, sub[0], sub[1], form, KvdKind::Options, s, th, app)
+            }
+            WizardTab::Form => draw_form_section(f, sub[0], sub[1], form, s, th, app),
+            WizardTab::Body => draw_body_section(f, sub[0], sub[1], form, s, th, app),
+            WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th, app),
+            WizardTab::Captures => draw_captures_section(f, sub[0], sub[1], form, s, th, app),
+            WizardTab::Reports => draw_reports_section(f, sub[0], sub[1], form, s, th, app),
         }
     }
 
     // The header-name suggestion dropdown draws last so it overlays the form.
-    draw_key_suggestions(f, form, s, th);
-    draw_kind_dropdown(f, form, s, th);
-    draw_content_type_dropdown(f, form, s, th);
+    draw_key_suggestions(f, form, s, th, app);
+    draw_kind_dropdown(f, form, s, th, app);
+    draw_content_type_dropdown(f, form, s, th, app);
+}
+
+fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &Strings) {
+    let mut x = area.x;
+    for (i, tab) in order.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(1);
+        }
+        let w = tab.label(s).chars().count() as u16 + 2;
+        if x < area.right() {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(x, area.y, w.min(area.right() - x), 1),
+                MouseHitTarget::NewRequestTab(*tab),
+            );
+        }
+        x = x.saturating_add(w);
+    }
 }
 
 /// Draw the section-view tab bar (`All │ Headers │ Cookies │ Form │ Body │
@@ -2074,11 +2173,12 @@ fn draw_kvd_section(
     kind: KvdKind,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let focused =
         matches!(form.focus, NewField::Kvd(k, ..) if k == kind) || form.focus == kind.add_field();
     draw_section_label(f, label, kind.title(s), focused, th);
-    draw_kvd_table(f, table, form, kind, s, th);
+    draw_kvd_table_with_hits(f, table, form, kind, s, th, app);
 }
 
 /// Draw the Form label + table into the given (label, table) rects.
@@ -2089,11 +2189,12 @@ fn draw_form_section(
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let form_focused =
         matches!(form.focus, NewField::FormField(..)) || form.focus == NewField::AddFormField;
     draw_section_label(f, label, s.field_form, form_focused, th);
-    draw_form_table(f, table, form, s, th);
+    draw_form_table_with_hits(f, table, form, s, th, app);
 }
 
 /// Draw the Body label + editor into the given (label, editor) rects. Adds a
@@ -2106,6 +2207,7 @@ fn draw_body_section(
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let body_focused = form.focus == NewField::Body;
     draw_section_label(f, label, s.field_body, body_focused, th);
@@ -2150,6 +2252,18 @@ fn draw_body_section(
         };
         draw_scrollbar(f, bar_area, total, capacity, start, th);
     }
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            editor,
+            MouseHitTarget::Scroll(MouseScrollTarget::WizardBody),
+        );
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            text_area,
+            MouseHitTarget::NewRequestField(NewField::Body),
+        );
+    }
 }
 
 /// Draw the Asserts label + table into the given (label, table) rects.
@@ -2160,11 +2274,12 @@ fn draw_asserts_section(
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let assert_focused =
         matches!(form.focus, NewField::Assert(_)) || form.focus == NewField::AddAssert;
     draw_section_label(f, label, s.field_asserts, assert_focused, th);
-    draw_assert_table(f, table, form, s, th);
+    draw_assert_table_with_hits(f, table, form, s, th, app);
 }
 
 /// Draw the Captures label + table into the given (label, table) rects.
@@ -2175,11 +2290,12 @@ fn draw_captures_section(
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let cap_focused =
         matches!(form.focus, NewField::Capture(..)) || form.focus == NewField::AddCapture;
     draw_section_label(f, label, s.field_captures, cap_focused, th);
-    draw_capture_table(f, table, form, s, th);
+    draw_capture_table_with_hits(f, table, form, s, th, app);
 }
 
 /// Draw the Reports label + table into the given (label, table) rects.
@@ -2190,16 +2306,23 @@ fn draw_reports_section(
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let rep_focused =
         matches!(form.focus, NewField::Report(..)) || form.focus == NewField::AddReport;
     draw_section_label(f, label, s.field_reports, rep_focused, th);
-    draw_report_table(f, table, form, s, th);
+    draw_report_table_with_hits(f, table, form, s, th, app);
 }
 
 /// Draw the Text/File dropdown beneath the focused Form Kind cell, with the
 /// row's current kind highlighted.
-pub(crate) fn draw_kind_dropdown(f: &mut Frame, form: &NewReq, s: &Strings, th: &Theme) {
+pub(crate) fn draw_kind_dropdown(
+    f: &mut Frame,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     if !form.kind_dropdown_open() {
         return;
     }
@@ -2269,6 +2392,22 @@ pub(crate) fn draw_kind_dropdown(f: &mut Frame, form: &NewReq, s: &Strings, th: 
     let mut st = ListState::default();
     st.select(selected);
     f.render_stateful_widget(list, popup, &mut st);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Popup);
+        let inner = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        };
+        for row in 0..options.len().min(inner.height as usize) {
+            app.push_mouse_hit(
+                MouseLayer::Popup,
+                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                MouseHitTarget::NewRequestDropdown(WizardDropdownKind::FormKind, row),
+            );
+        }
+    }
 }
 
 /// Draw the content-type override dropdown beneath a `File`-kind Form row's
@@ -2277,7 +2416,13 @@ pub(crate) fn draw_kind_dropdown(f: &mut Frame, form: &NewReq, s: &Strings, th: 
 /// [`content_type_options`], both filtered down to whatever the user has
 /// typed so far (see [`NewReq::ctype_dropdown_entries`]). The row's current
 /// value is pre-selected when it matches one of the options.
-pub(crate) fn draw_content_type_dropdown(f: &mut Frame, form: &NewReq, s: &Strings, th: &Theme) {
+pub(crate) fn draw_content_type_dropdown(
+    f: &mut Frame,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     if !form.ctype_dropdown_open() {
         return;
     }
@@ -2346,10 +2491,33 @@ pub(crate) fn draw_content_type_dropdown(f: &mut Frame, form: &NewReq, s: &Strin
     let mut st = ListState::default();
     st.select(selected);
     f.render_stateful_widget(list, popup, &mut st);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Popup);
+        let inner = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        };
+        let first = st.offset();
+        for row in first..labels.len().min(first + inner.height as usize) {
+            app.push_mouse_hit(
+                MouseLayer::Popup,
+                Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+                MouseHitTarget::NewRequestDropdown(WizardDropdownKind::ContentType, row),
+            );
+        }
+    }
 }
 
 /// Draw the filterable header-name dropdown beneath the focused Key cell.
-pub(crate) fn draw_key_suggestions(f: &mut Frame, form: &NewReq, s: &Strings, th: &Theme) {
+pub(crate) fn draw_key_suggestions(
+    f: &mut Frame,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     let Some((_, sugs)) = form.key_dropdown() else {
         return;
     };
@@ -2409,6 +2577,23 @@ pub(crate) fn draw_key_suggestions(f: &mut Frame, form: &NewReq, s: &Strings, th
     let mut st = ListState::default();
     st.select(form.suggest_hi);
     f.render_stateful_widget(list, popup, &mut st);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Popup);
+        let inner = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        };
+        let first = st.offset();
+        for row in first..sugs.len().min(first + inner.height as usize) {
+            app.push_mouse_hit(
+                MouseLayer::Popup,
+                Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+                MouseHitTarget::NewRequestDropdown(WizardDropdownKind::HeaderName, row),
+            );
+        }
+    }
 }
 
 /// Compute the first visible index of a scrollable, `total`-item list so
@@ -2624,10 +2809,13 @@ fn draw_headerlike_table(
     key_cell_rect: Option<&std::cell::Cell<Option<Rect>>>,
     focused_idx: Option<usize>,
     is_col_focused: impl Fn(usize, HdrCol) -> bool,
+    field_for: impl Fn(usize, HdrCol) -> NewField,
     add_focused: bool,
+    add_field: NewField,
     add_label: &str,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     if let Some(kcr) = key_cell_rect {
         kcr.set(None);
@@ -2640,6 +2828,18 @@ fn draw_headerlike_table(
 
     let (en, kw, vw, dw) = header_widths(table_area.width);
     desc_visible.set(dw > 0);
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardKvd(match add_field {
+                    NewField::AddKvd(kind) => kind,
+                    _ => KvdKind::Header,
+                })),
+            );
+        }
+    }
 
     let lbl = |t: &str| {
         Paragraph::new(Span::styled(
@@ -2669,6 +2869,23 @@ fn draw_headerlike_table(
             is_col_focused(i, HdrCol::Enabled),
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[0],
+                MouseHitTarget::NewRequestActivate(field_for(i, HdrCol::Enabled)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[1],
+                MouseHitTarget::NewRequestField(field_for(i, HdrCol::Key)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[2],
+                MouseHitTarget::NewRequestField(field_for(i, HdrCol::Value)),
+            );
+        }
         draw_header_cell(f, cells[1], &row.key, is_col_focused(i, HdrCol::Key), th);
         draw_header_cell(
             f,
@@ -2679,6 +2896,13 @@ fn draw_headerlike_table(
         );
         if dw > 0 {
             draw_header_cell(f, cells[3], &row.desc, is_col_focused(i, HdrCol::Desc), th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    cells[3],
+                    MouseHitTarget::NewRequestField(field_for(i, HdrCol::Desc)),
+                );
+            }
         }
         // Remember the Key cell's position so the suggestion dropdown can
         // anchor beneath it (drawn later, on top of the form).
@@ -2698,6 +2922,13 @@ fn draw_headerlike_table(
         )),
         add_rect,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(add_field),
+        );
+    }
 
     if scrolling {
         let header_h = 1u16;
@@ -2718,6 +2949,7 @@ fn draw_headerlike_table(
 /// gets the key-cell rect tracking that anchors the header-name suggestion
 /// dropdown. Each section keeps its own Description-visibility and scroll state
 /// on its [`KvdSection`].
+#[cfg(test)]
 pub(crate) fn draw_kvd_table(
     f: &mut Frame,
     area: Rect,
@@ -2725,6 +2957,18 @@ pub(crate) fn draw_kvd_table(
     kind: KvdKind,
     s: &Strings,
     th: &Theme,
+) {
+    draw_kvd_table_with_hits(f, area, form, kind, s, th, None);
+}
+
+pub(crate) fn draw_kvd_table_with_hits(
+    f: &mut Frame,
+    area: Rect,
+    form: &NewReq,
+    kind: KvdKind,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let sec = form.kvd(kind);
     let focused_idx = match form.focus {
@@ -2742,10 +2986,13 @@ pub(crate) fn draw_kvd_table(
         key_cell_rect,
         focused_idx,
         |i, col| form.focus == NewField::Kvd(kind, i, col),
+        |i, col| NewField::Kvd(kind, i, col),
         form.focus == kind.add_field(),
+        kind.add_field(),
         kind.add_label(s),
         s,
         th,
+        app,
     );
 }
 
@@ -2847,7 +3094,19 @@ fn form_value_color(row: &FormRow, file_root: Option<&PathBuf>, th: &Theme) -> C
 /// Headers); the Content-Type column opens the MIME-type dropdown for
 /// `File`-kind rows; File-kind Value cells are colour-highlighted by
 /// whether the path resolves to a reachable file.
+#[cfg(test)]
 pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+    draw_form_table_with_hits(f, area, form, s, th, None);
+}
+
+pub(crate) fn draw_form_table_with_hits(
+    f: &mut Frame,
+    area: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     form.kind_cell_rect.set(None);
     form.ctype_cell_rect.set(None);
     let focused_idx = match form.focus {
@@ -2870,6 +3129,15 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
     form.form_desc_visible.set(dw > 0);
     form.form_ctype_visible.set(ctypew > 0);
     form.form_prefix_visible.set(prefixw > 0);
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardForm),
+            );
+        }
+    }
 
     let lbl = |t: &str| {
         Paragraph::new(Span::styled(
@@ -2922,6 +3190,18 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             form.focus == NewField::FormField(i, FormCol::Enabled),
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[0],
+                MouseHitTarget::NewRequestActivate(NewField::FormField(i, FormCol::Enabled)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[1],
+                MouseHitTarget::NewRequestField(NewField::FormField(i, FormCol::Key)),
+            );
+        }
         draw_header_cell(
             f,
             cells[1],
@@ -2951,6 +3231,13 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             if kind_focused {
                 form.kind_cell_rect.set(Some(cells[2]));
             }
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    cells[2],
+                    MouseHitTarget::NewRequestActivate(NewField::FormField(i, FormCol::Kind)),
+                );
+            }
         }
 
         let value_focused = form.focus == NewField::FormField(i, FormCol::Value);
@@ -2977,6 +3264,13 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             f.render_widget(
                 Paragraph::new(Span::styled(FOLDER_ICON, Style::default().fg(icon_color))),
                 icon_rect,
+            );
+        }
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[value_idx],
+                MouseHitTarget::NewRequestField(NewField::FormField(i, FormCol::Value)),
             );
         }
 
@@ -3013,6 +3307,15 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             if ctype_focused && row.kind == FormFieldKind::File {
                 form.ctype_cell_rect.set(Some(cells[ctype_idx]));
             }
+            if row.kind != FormFieldKind::Base64File
+                && let Some(app) = app
+            {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    cells[ctype_idx],
+                    MouseHitTarget::NewRequestField(NewField::FormField(i, FormCol::Ctype)),
+                );
+            }
         }
 
         if prefixw > 0 {
@@ -3036,11 +3339,25 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
             } else {
                 draw_header_cell(f, cells[prefix_idx], &row.base64_prefix, prefix_focused, th);
             }
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    cells[prefix_idx],
+                    MouseHitTarget::NewRequestField(NewField::FormField(i, FormCol::Prefix)),
+                );
+            }
         }
 
         if dw > 0 {
             let desc_focused = form.focus == NewField::FormField(i, FormCol::Desc);
             draw_header_cell(f, cells[desc_idx], &row.desc, desc_focused, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    cells[desc_idx],
+                    MouseHitTarget::NewRequestField(NewField::FormField(i, FormCol::Desc)),
+                );
+            }
         }
     }
 
@@ -3054,6 +3371,13 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
         )),
         add_rect,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(NewField::AddFormField),
+        );
+    }
 
     if scrolling {
         let header_h = 1u16;
@@ -3078,7 +3402,14 @@ pub(crate) fn draw_form_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Stri
 /// Draw the `[Asserts]` table: one raw Hurl assert expression per row, plus
 /// an "Add assert" hint line. No column header, so the whole area's height
 /// is available as scroll capacity.
-pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+pub(crate) fn draw_assert_table_with_hits(
+    f: &mut Frame,
+    area: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     let focused_idx = match form.focus {
         NewField::Assert(i) => Some(i),
         _ => None,
@@ -3092,6 +3423,15 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
     ) else {
         return;
     };
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardAsserts),
+            );
+        }
+    }
 
     for (slot, row_area) in data_rects.iter().enumerate() {
         let i = start + slot;
@@ -3102,6 +3442,13 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             form.focus == NewField::Assert(i),
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                *row_area,
+                MouseHitTarget::NewRequestField(NewField::Assert(i)),
+            );
+        }
     }
 
     let add_focused = form.focus == NewField::AddAssert;
@@ -3114,6 +3461,13 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
         )),
         add_rect,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(NewField::AddAssert),
+        );
+    }
 
     if scrolling {
         // Leftmost column: keep the scrollbar close to the data.
@@ -3137,12 +3491,13 @@ pub(crate) fn draw_assert_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
 
 /// Draw the `[Captures]` table: `Name | Expression` columns, plus an "Add
 /// capture" hint line.
-pub(crate) fn draw_capture_table(
+pub(crate) fn draw_capture_table_with_hits(
     f: &mut Frame,
     area: Rect,
     form: &NewReq,
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let focused_idx = match form.focus {
         NewField::Capture(i, _) => Some(i),
@@ -3166,6 +3521,15 @@ pub(crate) fn draw_capture_table(
             .spacing(1)
             .split(row_area)
     };
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardCaptures),
+            );
+        }
+    }
     let lbl = |t: &str| {
         Paragraph::new(Span::styled(
             t.to_string(),
@@ -3190,6 +3554,18 @@ pub(crate) fn draw_capture_table(
             form.focus == NewField::Capture(i, CapCol::Name),
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[0],
+                MouseHitTarget::NewRequestField(NewField::Capture(i, CapCol::Name)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[1],
+                MouseHitTarget::NewRequestField(NewField::Capture(i, CapCol::Expr)),
+            );
+        }
         draw_header_cell(
             f,
             cells[1],
@@ -3209,6 +3585,13 @@ pub(crate) fn draw_capture_table(
         )),
         add_rect,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(NewField::AddCapture),
+        );
+    }
 
     if scrolling {
         let header_h = 1u16;
@@ -3233,7 +3616,14 @@ pub(crate) fn draw_capture_table(
 /// Draw the `[Reports]` table: `Name | Expression` columns, plus an "Add
 /// report field" hint line. Structurally identical to [`draw_capture_table`]
 /// (a report field is authored just like a capture: `name: <hurl query>`).
-pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &Strings, th: &Theme) {
+pub(crate) fn draw_report_table_with_hits(
+    f: &mut Frame,
+    area: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
     let focused_idx = match form.focus {
         NewField::Report(i, _) => Some(i),
         _ => None,
@@ -3256,6 +3646,15 @@ pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             .spacing(1)
             .split(row_area)
     };
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardReports),
+            );
+        }
+    }
     let lbl = |t: &str| {
         Paragraph::new(Span::styled(
             t.to_string(),
@@ -3280,6 +3679,18 @@ pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
             form.focus == NewField::Report(i, CapCol::Name),
             th,
         );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[0],
+                MouseHitTarget::NewRequestField(NewField::Report(i, CapCol::Name)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[1],
+                MouseHitTarget::NewRequestField(NewField::Report(i, CapCol::Expr)),
+            );
+        }
         draw_header_cell(
             f,
             cells[1],
@@ -3299,6 +3710,13 @@ pub(crate) fn draw_report_table(f: &mut Frame, area: Rect, form: &NewReq, s: &St
         )),
         add_rect,
     );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(NewField::AddReport),
+        );
+    }
 
     if scrolling {
         let header_h = 1u16;

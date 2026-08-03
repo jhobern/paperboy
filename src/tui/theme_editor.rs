@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
-use super::app::TuiApp;
+use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp};
 use super::draw::{centered_rect, panel};
 use super::editor::{Editor, render_line_field};
 use super::theme::{THEME_COLOR_COUNT, Theme, ThemeSpec};
@@ -140,6 +140,7 @@ pub(crate) fn draw_theme_editor(
     entries: &[String],
     s: &Strings,
     th: &Theme,
+    app: Option<&TuiApp>,
 ) {
     let width = 64u16;
     let inner_h = THEME_COLOR_COUNT as u16 + 1; // a name row above one row per colour
@@ -156,6 +157,62 @@ pub(crate) fn draw_theme_editor(
 
     draw_picker(f, cols[0], st, entries, th);
     draw_fields(f, cols[1], st, s, th);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let list_inner = Rect {
+            x: cols[0].x.saturating_add(1),
+            y: cols[0].y.saturating_add(1),
+            width: cols[0].width.saturating_sub(2),
+            height: cols[0].height.saturating_sub(2),
+        };
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            list_inner,
+            MouseHitTarget::Scroll(MouseScrollTarget::ThemeEditor),
+        );
+        let visible = list_inner.height as usize;
+        let selected = st.list_idx.min(entries.len().saturating_sub(1));
+        let first = if selected >= visible {
+            selected + 1 - visible
+        } else {
+            0
+        };
+        for row in first..entries.len().min(first + visible) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(
+                    list_inner.x,
+                    list_inner.y + (row - first) as u16,
+                    list_inner.width,
+                    1,
+                ),
+                MouseHitTarget::ThemeEditorRow(row),
+            );
+        }
+        let fields_inner = Rect {
+            x: cols[1].x.saturating_add(1),
+            y: cols[1].y.saturating_add(1),
+            width: cols[1].width.saturating_sub(2),
+            height: cols[1].height.saturating_sub(2),
+        };
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            Rect::new(fields_inner.x, fields_inner.y, fields_inner.width, 1),
+            MouseHitTarget::ThemeEditorColor(THEME_COLOR_COUNT),
+        );
+        for row in 0..THEME_COLOR_COUNT.min(fields_inner.height.saturating_sub(1) as usize) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(
+                    fields_inner.x,
+                    fields_inner.y + 1 + row as u16,
+                    fields_inner.width,
+                    1,
+                ),
+                MouseHitTarget::ThemeEditorColor(row),
+            );
+        }
+    }
 
     let hint = Paragraph::new(Line::from(Span::styled(
         if st.pane == ThemePane::Fields {
@@ -172,7 +229,15 @@ pub(crate) fn draw_theme_editor(
         let base_names = entries.get(1..).unwrap_or(&[]);
         draw_new_theme_popup(f, popup, base_names, s, th);
     } else if let Some(cp) = &st.color_popup {
-        draw_color_popup(f, cp, s, th);
+        let inner = draw_color_popup(f, cp, s, th);
+        if let Some(app) = app {
+            app.set_mouse_layer(MouseLayer::Popup);
+            app.push_mouse_hit(
+                MouseLayer::Popup,
+                inner,
+                MouseHitTarget::ThemeEditorColorChoice(0),
+            );
+        }
     }
 }
 
@@ -348,7 +413,7 @@ fn draw_new_theme_popup(
     );
 }
 
-fn draw_color_popup(f: &mut Frame, cp: &ColorPopup, s: &Strings, th: &Theme) {
+fn draw_color_popup(f: &mut Frame, cp: &ColorPopup, s: &Strings, th: &Theme) -> Rect {
     let width = 46u16;
     let height = 9u16.min(f.area().height.max(6));
     let area = centered_rect(width, height, f.area());
@@ -374,6 +439,7 @@ fn draw_color_popup(f: &mut Frame, cp: &ColorPopup, s: &Strings, th: &Theme) {
         hint: Some(s.theme_color_popup_hint),
     };
     f.render_widget(cp.picker.widget(&style, &labels), inner);
+    inner
 }
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -391,7 +457,7 @@ impl TuiApp {
         entries
     }
 
-    fn theme_picker_len(&self) -> usize {
+    pub(crate) fn theme_picker_len(&self) -> usize {
         1 + self.all_themes().len()
     }
 

@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -11,6 +11,7 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
 use crate::git_remote::{self, RefKind, RemoteRefs};
 use crate::i18n::Strings;
 
+use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp};
 use super::draw::*;
 use super::editor::*;
 use super::theme::*;
@@ -489,7 +490,21 @@ pub(crate) fn draw_choice_popup(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, th: &Theme) {
+    draw_remote_wizard_with_hits(f, w, s, th, None);
+}
+
+pub(crate) fn draw_remote_wizard_with_hits(
+    f: &mut Frame,
+    w: &RemoteWizard,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+    }
     let title = match w.kind {
         RemoteKind::Collection => s.git_collection_menu,
         RemoteKind::Environment => s.git_env_menu,
@@ -525,6 +540,13 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
                 rows[0],
             );
             render_line_field(f, rows[1], &w.url, *field == 0, false, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[1],
+                    MouseHitTarget::RemoteWizardRow(0),
+                );
+            }
             if recent_rows > 0 {
                 let items: Vec<ListItem> = w
                     .recent
@@ -544,6 +566,15 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
                     })
                     .collect();
                 f.render_widget(List::new(items), rows[2]);
+                if let Some(app) = app {
+                    for i in 0..w.recent.len().min(5) {
+                        app.push_mouse_hit(
+                            MouseLayer::Overlay,
+                            Rect::new(rows[2].x, rows[2].y + i as u16, rows[2].width, 1),
+                            MouseHitTarget::RemoteWizardRow(10 + i),
+                        );
+                    }
+                }
             }
             f.render_widget(
                 Paragraph::new(Span::styled(
@@ -553,6 +584,13 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
                 rows[4],
             );
             render_line_field(f, rows[5], &w.token, *field == 1, true, th);
+            if let Some(app) = app {
+                app.push_mouse_hit(
+                    MouseLayer::Overlay,
+                    rows[5],
+                    MouseHitTarget::RemoteWizardRow(1),
+                );
+            }
             let hint = if recent_rows > 0 {
                 format!("{}  ·  {}", s.git_connect_hint, s.git_recent_hint)
             } else {
@@ -601,9 +639,11 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
         RemoteStage::PickRef { refs, filter, sel } => {
             let labels: Vec<String> = refs.iter().map(|r| r.label.clone()).collect();
             draw_filter_list(f, s, s.git_pick_ref_title, filter, &labels, *sel, th);
+            register_remote_filter_hits(f, app, filter, &labels, *sel);
         }
         RemoteStage::PickFile { files, filter, sel } => {
             draw_filter_list(f, s, s.git_pick_file_title, filter, files, *sel, th);
+            register_remote_filter_hits(f, app, filter, files, *sel);
         }
         RemoteStage::PickWorkspaceFilter { sel } => {
             let labels: Vec<&str> = WorkspaceGitFilter::ALL.iter().map(|f| f.label(s)).collect();
@@ -615,6 +655,30 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
                 s.git_workspace_filter_hint,
                 th,
             );
+            if let Some(app) = app {
+                let content_w = labels
+                    .iter()
+                    .map(|s| s.chars().count())
+                    .max()
+                    .unwrap_or(20)
+                    .max(s.git_pick_workspace_filter_title.chars().count());
+                let w = (content_w as u16 + 6).clamp(30, f.area().width.max(1));
+                let h = (labels.len() as u16 + 3).min(f.area().height.max(1));
+                let area = centered_rect(w, h, f.area());
+                let inner = Rect {
+                    x: area.x.saturating_add(1),
+                    y: area.y.saturating_add(1),
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(3),
+                };
+                for i in 0..labels.len().min(inner.height as usize) {
+                    app.push_mouse_hit(
+                        MouseLayer::Overlay,
+                        Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+                        MouseHitTarget::RemoteWizardRow(i),
+                    );
+                }
+            }
         }
         RemoteStage::Error(e) => {
             let width = (f.area().width * 6 / 10).max(40);
@@ -633,6 +697,61 @@ pub(crate) fn draw_remote_wizard(f: &mut Frame, w: &RemoteWizard, s: &Strings, t
             f.render_widget(
                 Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
                 rows[1],
+            );
+        }
+    }
+
+    fn register_remote_filter_hits(
+        f: &Frame,
+        app: Option<&TuiApp>,
+        filter: &str,
+        items: &[String],
+        sel: usize,
+    ) {
+        let Some(app) = app else {
+            return;
+        };
+        let w = (f.area().width * 7 / 10).max(50);
+        let h = (f.area().height * 7 / 10).max(10);
+        let area = centered_rect(w, h, f.area());
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        let vis = filter_indices(items.iter().map(|s| s.as_str()), filter);
+        if vis.is_empty() {
+            return;
+        }
+        let visible = rows[1].height as usize;
+        let selected = sel.min(vis.len() - 1);
+        let first = if selected >= visible {
+            selected + 1 - visible
+        } else {
+            0
+        };
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            rows[1],
+            MouseHitTarget::Scroll(MouseScrollTarget::RemoteWizard),
+        );
+        for row in first..vis.len().min(first + visible) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(
+                    rows[1].x,
+                    rows[1].y + (row - first) as u16,
+                    rows[1].width,
+                    1,
+                ),
+                MouseHitTarget::RemoteWizardRow(row),
             );
         }
     }

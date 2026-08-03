@@ -21,17 +21,21 @@ use crate::persistence::{
 use crate::request::{self, AppVars, build_request_json};
 
 use super::app::*;
-use super::clipboard::copy_to_clipboard;
 use super::editor::*;
+use super::git_save::{GitSaveStage, GitSaveTarget};
 use super::new_request::*;
 use super::remote::*;
 use super::reports::ReportPane;
 use super::reports::{ReportView, grid_col_at_x, result_column_widths};
-use super::selection;
+use super::theme::THEME_COLOR_COUNT;
+use super::theme_editor::ThemePane;
+use tui_panel_select::clipboard::copy_to_clipboard;
+use tui_panel_select::selection;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        self.last_mouse_row = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
@@ -87,9 +91,35 @@ impl TuiApp {
     /// usually Ctrl), so it's the one modifier that reliably reaches the app
     /// in both cases.
     pub(crate) fn on_mouse(&mut self, ev: MouseEvent) {
+        let point = Position::new(ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::ScrollUp => {
+                self.last_mouse_row = None;
+                self.on_mouse_wheel(point, -1);
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                self.last_mouse_row = None;
+                self.on_mouse_wheel(point, 1);
+                return;
+            }
+            _ => {}
+        }
         if self.overlay_is_raw_text_editor() {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                self.last_mouse_row = None;
+            }
             self.on_mouse_raw_text_editor(ev);
             return;
+        }
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && !ev.modifiers.contains(KeyModifiers::ALT)
+        {
+            if self.handle_mouse_down(point) {
+                return;
+            }
+        } else if matches!(ev.kind, MouseEventKind::Down(_)) {
+            self.last_mouse_row = None;
         }
         if self.overlay.is_some() {
             return;
@@ -100,7 +130,6 @@ impl TuiApp {
             self.on_mouse_report(ev);
             return;
         }
-        let point = Position::new(ev.column, ev.row);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A click on either panel's scrollbar jumps straight to that
@@ -156,6 +185,557 @@ impl TuiApp {
                 self.copy_selection_to_clipboard();
             }
             _ => {}
+        }
+    }
+
+    fn handle_mouse_down(&mut self, point: Position) -> bool {
+        let Some(target) = self.mouse_hit_at(point) else {
+            self.last_mouse_row = None;
+            if self.mouse_top_layer.get() == MouseLayer::Popup {
+                self.on_key(Self::mouse_key(KeyCode::Esc));
+                self.invalidate_mouse_hits();
+                return true;
+            }
+            return self.overlay.is_some();
+        };
+        let row_activation = match target {
+            MouseHitTarget::SelectListRow(_)
+            | MouseHitTarget::SelectGlobalEnvRow(_)
+            | MouseHitTarget::ReportNodeRow(_) => self.mouse_row_activation(target),
+            _ => {
+                self.last_mouse_row = None;
+                false
+            }
+        };
+        let mut keep_mouse_hits = false;
+        let consumed = match target {
+            MouseHitTarget::MenuFile => {
+                self.overlay = Some(Overlay::FileMenu(0));
+                true
+            }
+            MouseHitTarget::MenuSettings => {
+                self.overlay = Some(Overlay::Options(0));
+                true
+            }
+            MouseHitTarget::Tab(idx) => {
+                self.focus = Pane::Tabs;
+                self.activate_tab(idx);
+                true
+            }
+            MouseHitTarget::FocusPane(pane) => {
+                self.focus = pane;
+                !matches!(pane, Pane::Main | Pane::Response)
+            }
+            MouseHitTarget::SelectListRow(row) => {
+                self.select_row_in_pane(Pane::List, row);
+                if row_activation {
+                    self.on_enter();
+                } else {
+                    keep_mouse_hits = true;
+                }
+                true
+            }
+            MouseHitTarget::SelectGlobalEnvRow(row) => {
+                self.select_row_in_pane(Pane::GlobalEnv, row);
+                if row_activation {
+                    self.on_enter();
+                } else {
+                    keep_mouse_hits = true;
+                }
+                true
+            }
+            MouseHitTarget::RunRequest => {
+                self.primary_send();
+                true
+            }
+            MouseHitTarget::ReportResultsCell => self.on_mouse_results_cell_click(point.x, point.y),
+            MouseHitTarget::ReportNodeRow(row) => {
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.node_selected = row;
+                    }
+                    if row_activation {
+                        self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
+                    } else {
+                        keep_mouse_hits = true;
+                    }
+                }
+                true
+            }
+            MouseHitTarget::OverlayRow(row) => {
+                self.activate_mouse_overlay_row(row);
+                true
+            }
+            MouseHitTarget::ConfirmChoice(choice) => {
+                self.activate_mouse_confirm_choice(choice);
+                true
+            }
+            MouseHitTarget::HelpTab(tab) => {
+                self.overlay = Some(Overlay::Help(tab));
+                self.help_scroll = 0;
+                true
+            }
+            MouseHitTarget::PromptEditor => true,
+            MouseHitTarget::PromptSecretCheckbox => {
+                self.toggle_prompt_secret_checkbox();
+                true
+            }
+            MouseHitTarget::EnvVarField(on_value) => {
+                if let Some(Overlay::EnvVarForm(form)) = self.overlay.as_mut() {
+                    form.on_value = on_value;
+                }
+                true
+            }
+            MouseHitTarget::BrowserListRow(row) => {
+                self.click_browser_row(row);
+                true
+            }
+            MouseHitTarget::BrowserNameField => {
+                self.browser_name_focused = true;
+                true
+            }
+            MouseHitTarget::WorkspacePickerRow(row) => {
+                self.click_workspace_picker_row(row);
+                true
+            }
+            MouseHitTarget::NewRequestField(field) => {
+                self.focus_new_request_field(field);
+                true
+            }
+            MouseHitTarget::NewRequestActivate(field) => {
+                self.activate_new_request_field(field);
+                true
+            }
+            MouseHitTarget::NewRequestTab(tab) => {
+                self.click_new_request_tab(tab);
+                true
+            }
+            MouseHitTarget::NewRequestDropdown(kind, row) => {
+                self.click_new_request_dropdown(kind, row);
+                true
+            }
+            MouseHitTarget::ThemeEditorRow(row) => {
+                self.click_theme_editor_row(row);
+                true
+            }
+            MouseHitTarget::ThemeEditorColor(row) => {
+                self.click_theme_editor_color(row);
+                true
+            }
+            MouseHitTarget::ThemeEditorColorChoice(row) => {
+                self.click_theme_editor_color_choice(row);
+                true
+            }
+            MouseHitTarget::RemoteWizardRow(row) => {
+                self.click_remote_wizard_row(row);
+                true
+            }
+            MouseHitTarget::GitSaveWizardRow(row) => {
+                self.click_git_save_wizard_row(row);
+                true
+            }
+            MouseHitTarget::Scroll(MouseScrollTarget::Main) => {
+                self.focus = Pane::Main;
+                false
+            }
+            MouseHitTarget::Scroll(MouseScrollTarget::Response) => {
+                self.focus = Pane::Response;
+                false
+            }
+            MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(_)) => {
+                self.focus = Pane::Main;
+                false
+            }
+            MouseHitTarget::Scroll(_) => false,
+        };
+        if consumed && !keep_mouse_hits {
+            self.invalidate_mouse_hits();
+        }
+        consumed
+    }
+
+    fn mouse_row_activation(&mut self, target: MouseHitTarget) -> bool {
+        let activate = self.last_mouse_row == Some(target);
+        self.last_mouse_row = if activate { None } else { Some(target) };
+        activate
+    }
+
+    fn mouse_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn on_mouse_wheel(&mut self, point: Position, dir: i32) {
+        let Some(target) = self.mouse_scroll_target_at(point) else {
+            return;
+        };
+        let old_focus = self.focus;
+        match target {
+            MouseScrollTarget::List => {
+                let ci = self.active_tab;
+                if let Some(col) = self.collections.get(ci) {
+                    let len = if col.is_workspace() {
+                        col.ws_rows().len()
+                    } else {
+                        col.rows().len()
+                    };
+                    let cur = col.list_cursor;
+                    if len > 0 {
+                        let next = (cur as i32 + dir).clamp(0, len as i32 - 1) as usize;
+                        self.select_row_in_pane(Pane::List, next);
+                        self.focus = old_focus;
+                    }
+                }
+            }
+            MouseScrollTarget::GlobalEnv => {
+                let len = self.global_envs.len();
+                if len > 0 {
+                    let next = (self.global_env_idx as i32 + dir).clamp(0, len as i32 - 1) as usize;
+                    self.select_row_in_pane(Pane::GlobalEnv, next);
+                    self.focus = old_focus;
+                }
+            }
+            MouseScrollTarget::Main => {
+                let max = self.main_max_scroll as i32;
+                let next = (self.main_panel.scroll() as i32 + dir * 3).clamp(0, max) as u16;
+                self.main_panel.set_scroll(next);
+            }
+            MouseScrollTarget::Response => {
+                let max = self.resp_max_scroll as i32;
+                let next = (self.resp_panel.scroll() as i32 + dir * 3).clamp(0, max) as u16;
+                self.resp_panel.set_scroll(next);
+            }
+            MouseScrollTarget::ReportPane(pane) => {
+                if let Some(idx) = self.active_report_index() {
+                    if pane == ReportPane::Results
+                        && self.reports[idx].view == ReportView::Results
+                        && self.reports[idx].result.is_some()
+                    {
+                        self.result_cursor_move(dir, 0);
+                    } else if let Some(panel) = self.report_panel_mut(pane) {
+                        let next = (panel.scroll() as i32 + dir * 3)
+                            .max(0)
+                            .min(u16::MAX as i32);
+                        panel.set_scroll(next as u16);
+                    }
+                }
+            }
+            MouseScrollTarget::Help => {
+                self.help_scroll = if dir < 0 {
+                    self.help_scroll.saturating_sub(3)
+                } else {
+                    self.help_scroll.saturating_add(3)
+                };
+            }
+            MouseScrollTarget::ReportDryRun => {
+                self.dry_run_scroll = if dir < 0 {
+                    self.dry_run_scroll.saturating_sub(3)
+                } else {
+                    self.dry_run_scroll.saturating_add(3)
+                };
+            }
+            MouseScrollTarget::ReportCellPopup => self.scroll_result_cell_popup(dir * 3),
+            MouseScrollTarget::WizardBody
+            | MouseScrollTarget::WizardAllSections
+            | MouseScrollTarget::WizardKvd(_)
+            | MouseScrollTarget::WizardForm
+            | MouseScrollTarget::WizardAsserts
+            | MouseScrollTarget::WizardCaptures
+            | MouseScrollTarget::WizardReports => {
+                self.on_key(Self::mouse_key(if dir < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                }));
+            }
+            MouseScrollTarget::OverlayList
+            | MouseScrollTarget::BrowserList
+            | MouseScrollTarget::WorkspacePicker
+            | MouseScrollTarget::ThemeEditor
+            | MouseScrollTarget::RemoteWizard
+            | MouseScrollTarget::GitSaveWizard => {
+                self.on_key(Self::mouse_key(if dir < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                }));
+            }
+        }
+        self.invalidate_mouse_hits();
+    }
+
+    fn activate_mouse_overlay_row(&mut self, row: usize) {
+        match self.overlay.as_mut() {
+            Some(Overlay::FileMenu(sel))
+            | Some(Overlay::FileLoadMenu(sel))
+            | Some(Overlay::FileSaveMenu(sel))
+            | Some(Overlay::FileLoadSource(_, sel))
+            | Some(Overlay::FileSaveDest(_, sel))
+            | Some(Overlay::Options(sel))
+            | Some(Overlay::Preferences(sel))
+            | Some(Overlay::LanguageMenu(sel)) => *sel = row,
+            Some(Overlay::RequestViewMenu(sel)) => {
+                *sel = row.min(1);
+                self.apply_request_view(row.min(1));
+            }
+            Some(Overlay::EnvPopup(popup)) => {
+                popup.idx = row;
+                return;
+            }
+            Some(Overlay::EnvLinkPicker(picker)) => picker.sel = row,
+            Some(Overlay::EnvCollision(collision)) => collision.sel = row,
+            Some(Overlay::ReportColumns(picker)) => picker.selected = row,
+            Some(Overlay::ReportBind(picker)) => picker.selected = row,
+            Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
+            Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
+            Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
+            _ => return,
+        }
+        self.on_key(Self::mouse_key(KeyCode::Enter));
+    }
+
+    fn activate_mouse_confirm_choice(&mut self, choice: usize) {
+        match self.overlay.as_mut() {
+            Some(Overlay::Confirm { sel, .. })
+            | Some(Overlay::CloseGitWorkspace { sel, .. })
+            | Some(Overlay::WorkspaceReloadConfirm { sel, .. })
+            | Some(Overlay::WorkspaceStorageChoice { sel, .. })
+            | Some(Overlay::WorkspaceGitSaveUnsaved { sel, .. })
+            | Some(Overlay::WorkspaceSwitchUnsaved { sel, .. }) => {
+                *sel = choice;
+                self.on_key(Self::mouse_key(KeyCode::Enter));
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_prompt_secret_checkbox(&mut self) {
+        if let Some(Overlay::Prompt {
+            secret_checkbox: Some(checked),
+            ..
+        }) = self.overlay.as_mut()
+        {
+            *checked = !*checked;
+        }
+    }
+
+    fn scroll_result_cell_popup(&mut self, delta: i32) {
+        if let Some(Overlay::ReportCellPopup { panel, .. }) = self.overlay.as_mut() {
+            let next = (panel.scroll() as i32 + delta).max(0).min(u16::MAX as i32);
+            panel.set_scroll(next as u16);
+        }
+    }
+
+    fn click_browser_row(&mut self, row: usize) {
+        let Some(Overlay::Browser(action, mut ex)) = self.overlay.take() else {
+            return;
+        };
+        let len = ex.files().len();
+        if row >= len {
+            self.overlay = Some(Overlay::Browser(action, ex));
+            return;
+        }
+        let activate = ex.selected_idx() == row;
+        ex.set_selected_idx(row);
+        self.overlay = Some(Overlay::Browser(action, ex));
+        self.browser_name_focused = false;
+        if activate {
+            self.on_key(Self::mouse_key(KeyCode::Enter));
+        }
+    }
+
+    fn click_workspace_picker_row(&mut self, row: usize) {
+        let Some(Overlay::WorkspacePicker(mut picker)) = self.overlay.take() else {
+            return;
+        };
+        let activate = picker.selected == row;
+        if picker.entries.get(row).is_some_and(|entry| !entry.is_dir) {
+            picker.selected = row;
+        }
+        self.overlay = Some(Overlay::WorkspacePicker(picker));
+        if activate {
+            self.on_key(Self::mouse_key(KeyCode::Enter));
+        }
+    }
+
+    fn focus_new_request_field(&mut self, field: NewField) {
+        if let Some(Overlay::NewRequest(form)) = self.overlay.as_mut() {
+            let prev_focus = form.focus;
+            form.focus = field;
+            if form.focus != prev_focus {
+                form.suggest_hi = None;
+                let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
+                    if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                form.suggest_hidden = landed_on_populated_key;
+                let landed_on_kind = matches!(form.focus, NewField::FormField(i, FormCol::Kind)
+                    if form.form_fields.get(i).is_some());
+                form.kind_dropdown_hidden = landed_on_kind;
+                form.ctype_hi = None;
+                let landed_on_populated_ctype = matches!(form.focus, NewField::FormField(i, FormCol::Ctype)
+                    if form.form_fields.get(i).is_some_and(|r| !r.ctype.text().is_empty()));
+                form.ctype_dropdown_hidden = landed_on_populated_ctype;
+            }
+        }
+    }
+
+    fn activate_new_request_field(&mut self, field: NewField) {
+        self.focus_new_request_field(field);
+        self.on_key(Self::mouse_key(match field {
+            NewField::Method | NewField::Target => KeyCode::Char(' '),
+            NewField::Kvd(_, _, HdrCol::Enabled) | NewField::FormField(_, FormCol::Enabled) => {
+                KeyCode::Char(' ')
+            }
+            _ => KeyCode::Enter,
+        }));
+    }
+
+    fn click_new_request_tab(&mut self, tab: WizardTab) {
+        if let Some(Overlay::NewRequest(form)) = self.overlay.as_mut() {
+            form.view_tab = tab;
+            if tab != WizardTab::All {
+                form.focus = form.first_field_of(tab);
+            }
+        }
+    }
+
+    fn click_new_request_dropdown(&mut self, kind: WizardDropdownKind, row: usize) {
+        let s = Strings::for_language(&self.language);
+        let Some(Overlay::NewRequest(form)) = self.overlay.as_mut() else {
+            return;
+        };
+        match kind {
+            WizardDropdownKind::HeaderName => {
+                if let Some((_, sugs)) = form.key_dropdown() {
+                    if let Some(name) = sugs.get(row).copied() {
+                        form.suggest_hi = Some(row);
+                        form.accept_suggestion(name);
+                        form.focus_next(true, true);
+                    }
+                }
+            }
+            WizardDropdownKind::FormKind => {
+                if let NewField::FormField(i, FormCol::Kind) = form.focus
+                    && let Some(form_row) = form.form_fields.get_mut(i)
+                {
+                    form_row.kind = match row {
+                        1 => FormFieldKind::File,
+                        2 => FormFieldKind::Base64File,
+                        _ => FormFieldKind::Text,
+                    };
+                    form.kind_dropdown_hidden = true;
+                }
+            }
+            WizardDropdownKind::ContentType => {
+                form.ctype_hi = Some(row);
+                form.accept_content_type(&s);
+                form.focus_next(true, true);
+            }
+        }
+    }
+
+    fn click_theme_editor_row(&mut self, row: usize) {
+        let len = self.theme_picker_len();
+        if let Some(Overlay::ThemeEditor(st)) = self.overlay.as_mut() {
+            st.pane = ThemePane::List;
+            st.list_idx = row.min(len.saturating_sub(1));
+        }
+        self.on_key(Self::mouse_key(KeyCode::Enter));
+    }
+
+    fn click_theme_editor_color(&mut self, row: usize) {
+        if let Some(Overlay::ThemeEditor(st)) = self.overlay.as_mut() {
+            st.pane = ThemePane::Fields;
+            if row >= THEME_COLOR_COUNT {
+                st.name_focused = true;
+                return;
+            }
+            st.name_focused = false;
+            st.field = row.min(THEME_COLOR_COUNT - 1);
+        }
+        self.on_key(Self::mouse_key(KeyCode::Enter));
+    }
+
+    fn click_theme_editor_color_choice(&mut self, _row: usize) {
+        self.on_key(Self::mouse_key(KeyCode::Enter));
+    }
+
+    fn click_remote_wizard_row(&mut self, row: usize) {
+        let mut activate = false;
+        if let Some(Overlay::RemoteGit(w)) = self.overlay.as_mut() {
+            let recent_len = w.recent.len();
+            match &mut w.stage {
+                RemoteStage::Connect { field, recent_sel } => {
+                    if row == 0 || row == 1 {
+                        *field = row as u8;
+                        *recent_sel = None;
+                    } else if row >= 10 {
+                        let idx = row - 10;
+                        if idx < recent_len {
+                            *recent_sel = Some(idx);
+                            activate = true;
+                        }
+                    }
+                }
+                RemoteStage::PickRef { refs, sel, .. } => {
+                    if row < refs.len() {
+                        *sel = row;
+                        activate = true;
+                    }
+                }
+                RemoteStage::PickFile { files, sel, .. } => {
+                    if row < files.len() {
+                        *sel = row;
+                        activate = true;
+                    }
+                }
+                RemoteStage::PickWorkspaceFilter { sel } => {
+                    *sel = row.min(WorkspaceGitFilter::ALL.len().saturating_sub(1));
+                    activate = true;
+                }
+                _ => {}
+            }
+        }
+        if activate {
+            self.on_key(Self::mouse_key(KeyCode::Enter));
+        }
+    }
+
+    fn click_git_save_wizard_row(&mut self, row: usize) {
+        let mut activate = false;
+        if let Some(Overlay::GitSave(w)) = self.overlay.as_mut() {
+            match &mut w.stage {
+                GitSaveStage::Connect { field } => {
+                    *field = row.min(2) as u8;
+                }
+                GitSaveStage::ChoosePaths { field } => {
+                    *field = row.min(2) as u8;
+                    if row == 1 {
+                        w.include_env = !w.include_env;
+                    }
+                }
+                GitSaveStage::ChooseTarget { sel, refs } => {
+                    if row == 0 {
+                        w.target_kind = if w.target_kind == GitSaveTarget::Branch {
+                            GitSaveTarget::Tag
+                        } else {
+                            GitSaveTarget::Branch
+                        };
+                    } else if row == 1 {
+                        *sel = None;
+                    } else if row >= 10 {
+                        let idx = row - 10;
+                        let branch_len = refs.as_ref().map(|r| r.branches.len()).unwrap_or(0);
+                        if idx < branch_len {
+                            *sel = Some(idx);
+                            activate = true;
+                        }
+                    }
+                }
+                GitSaveStage::CommitMessage => {}
+                _ => {}
+            }
+        }
+        if activate {
+            self.on_key(Self::mouse_key(KeyCode::Enter));
         }
     }
 
@@ -1210,11 +1790,19 @@ impl TuiApp {
 
     pub(crate) fn cycle_tab(&mut self, forward: bool) {
         let total = self.tab_count();
-        self.active_tab = if forward {
+        let next = if forward {
             (self.active_tab + 1) % total
         } else {
             (self.active_tab + total - 1) % total
         };
+        self.activate_tab(next);
+    }
+
+    pub(crate) fn activate_tab(&mut self, idx: usize) {
+        if idx >= self.tab_count() {
+            return;
+        }
+        self.active_tab = idx;
         self.main_panel.set_scroll(0);
         self.list_hscroll = 0;
         // Global Environments selection/scroll state is independent of the
@@ -1569,7 +2157,19 @@ impl TuiApp {
     /// line if the file can't be read.
     fn open_workspace_environment(&mut self, path: &std::path::Path) {
         if let Some(p) = path.to_str() {
+            let before = self.global_envs.len();
             self.do_file_action(FileAction::LoadEnv, p);
+            if self.overlay.is_some() {
+                return;
+            }
+            if let Some(env) = self
+                .global_envs
+                .iter()
+                .skip(before)
+                .find(|env| env.path.as_deref() == Some(path))
+            {
+                self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env.id)));
+            }
         }
     }
 
@@ -1750,40 +2350,17 @@ impl TuiApp {
         match self.focus {
             Pane::Tabs => {}
             Pane::List => {
-                // Move within the current folder's rows, keeping
-                // `selected_entry` pointed at whichever request is highlighted
-                // so every other action (run, edit, delete, raw mode) keeps
-                // acting on it. Workspace tabs use the filesystem file-tree
-                // (`ws_rows`), ordinary tabs the title-folder tree (`rows`).
                 let cur = self.collections[ci].list_cursor;
-                if self.collections[ci].is_workspace() {
-                    let len = self.collections[ci].ws_rows().len();
-                    let next = step(cur, len, delta);
-                    self.collections[ci].list_cursor = next;
-                    // Highlighting is selecting: land on a request → it shows;
-                    // on a report → it embeds in the right pane; on anything
-                    // else → the pane returns to the request/response view.
-                    self.workspace_select_highlighted(ci);
+                let len = if self.collections[ci].is_workspace() {
+                    self.collections[ci].ws_rows().len()
                 } else {
-                    let rows = self.collections[ci].rows();
-                    let next = step(cur, rows.len(), delta);
-                    self.collections[ci].list_cursor = next;
-                    if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
-                        self.collections[ci].selected_entry = *idx;
-                    }
-                }
-                self.main_panel.set_scroll(0);
-                // Reset horizontal scroll so each newly selected name starts unscrolled.
-                self.list_hscroll = 0;
-                // The Main panel now shows a different entry's JSON; any
-                // selection over the previous one is stale.
-                self.clear_selections();
+                    self.collections[ci].rows().len()
+                };
+                self.select_row_in_pane(Pane::List, step(cur, len, delta));
             }
             Pane::GlobalEnv => {
                 let len = self.global_envs.len();
-                self.global_env_idx = step(self.global_env_idx, len, delta);
-                // Reset horizontal scroll so each newly selected entry starts unscrolled.
-                self.global_env_hscroll = 0;
+                self.select_row_in_pane(Pane::GlobalEnv, step(self.global_env_idx, len, delta));
             }
             Pane::Main => {
                 let max = self.main_max_scroll as i32;
@@ -1794,6 +2371,50 @@ impl TuiApp {
                 let max = self.resp_max_scroll as i32;
                 let next = (self.resp_panel.scroll() as i32 + delta).clamp(0, max) as u16;
                 self.resp_panel.set_scroll(next);
+            }
+        }
+    }
+
+    pub(crate) fn select_row_in_pane(&mut self, pane: Pane, absolute_index: usize) {
+        match pane {
+            Pane::List => {
+                let ci = self.active_tab;
+                if self.collections.get(ci).is_none() {
+                    return;
+                }
+                if self.collections[ci].is_workspace() {
+                    let len = self.collections[ci].ws_rows().len();
+                    if len == 0 {
+                        return;
+                    }
+                    self.collections[ci].list_cursor = absolute_index.min(len - 1);
+                    self.workspace_select_highlighted(ci);
+                } else {
+                    let rows = self.collections[ci].rows();
+                    if rows.is_empty() {
+                        return;
+                    }
+                    let next = absolute_index.min(rows.len() - 1);
+                    self.collections[ci].list_cursor = next;
+                    if let Some(crate::tree::Row::Entry(idx)) = rows.get(next) {
+                        self.collections[ci].selected_entry = *idx;
+                    }
+                }
+                self.focus = Pane::List;
+                self.main_panel.set_scroll(0);
+                self.list_hscroll = 0;
+                self.clear_selections();
+            }
+            Pane::GlobalEnv => {
+                if self.global_envs.is_empty() {
+                    return;
+                }
+                self.global_env_idx = absolute_index.min(self.global_envs.len() - 1);
+                self.focus = Pane::GlobalEnv;
+                self.global_env_hscroll = 0;
+            }
+            _ => {
+                self.focus = pane;
             }
         }
     }

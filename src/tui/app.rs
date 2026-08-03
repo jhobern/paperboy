@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -21,8 +22,8 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use super::wrapcache::TextPos;
 use tui_panel_select::MultiSelectPanel;
+use tui_panel_select::wrapcache::TextPos;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum FileAction {
@@ -592,6 +593,141 @@ pub(crate) enum Pane {
     Response,
 }
 
+/// Interaction layers in paint order. Mouse dispatch only considers hits from
+/// the topmost layer drawn in the last frame, so overlays never leak clicks to
+/// the UI underneath them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum MouseLayer {
+    Base,
+    Overlay,
+    Popup,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MouseScrollTarget {
+    List,
+    GlobalEnv,
+    Main,
+    Response,
+    ReportPane(crate::tui::reports::ReportPane),
+    Help,
+    ReportDryRun,
+    ReportCellPopup,
+    WizardBody,
+    WizardAllSections,
+    WizardKvd(KvdKind),
+    WizardForm,
+    WizardAsserts,
+    WizardCaptures,
+    WizardReports,
+    OverlayList,
+    BrowserList,
+    WorkspacePicker,
+    ThemeEditor,
+    RemoteWizard,
+    GitSaveWizard,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum WizardDropdownKind {
+    HeaderName,
+    FormKind,
+    ContentType,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MouseHitTarget {
+    MenuFile,
+    MenuSettings,
+    Tab(usize),
+    FocusPane(Pane),
+    SelectListRow(usize),
+    SelectGlobalEnvRow(usize),
+    RunRequest,
+    ReportResultsCell,
+    ReportNodeRow(usize),
+    OverlayRow(usize),
+    ConfirmChoice(usize),
+    HelpTab(usize),
+    PromptEditor,
+    PromptSecretCheckbox,
+    EnvVarField(bool),
+    BrowserListRow(usize),
+    BrowserNameField,
+    WorkspacePickerRow(usize),
+    NewRequestField(NewField),
+    NewRequestActivate(NewField),
+    NewRequestTab(WizardTab),
+    NewRequestDropdown(WizardDropdownKind, usize),
+    ThemeEditorRow(usize),
+    ThemeEditorColor(usize),
+    ThemeEditorColorChoice(usize),
+    RemoteWizardRow(usize),
+    GitSaveWizardRow(usize),
+    Scroll(MouseScrollTarget),
+}
+
+impl MouseHitTarget {
+    pub(crate) fn scroll_target(self) -> Option<MouseScrollTarget> {
+        match self {
+            MouseHitTarget::FocusPane(Pane::List) | MouseHitTarget::SelectListRow(_) => {
+                Some(MouseScrollTarget::List)
+            }
+            MouseHitTarget::FocusPane(Pane::GlobalEnv) | MouseHitTarget::SelectGlobalEnvRow(_) => {
+                Some(MouseScrollTarget::GlobalEnv)
+            }
+            MouseHitTarget::FocusPane(Pane::Main) => Some(MouseScrollTarget::Main),
+            MouseHitTarget::FocusPane(Pane::Response) => Some(MouseScrollTarget::Response),
+            MouseHitTarget::ReportResultsCell => Some(MouseScrollTarget::ReportPane(
+                crate::tui::reports::ReportPane::Results,
+            )),
+            MouseHitTarget::ReportNodeRow(_) => Some(MouseScrollTarget::ReportPane(
+                crate::tui::reports::ReportPane::Source,
+            )),
+            MouseHitTarget::OverlayRow(_) | MouseHitTarget::ConfirmChoice(_) => {
+                Some(MouseScrollTarget::OverlayList)
+            }
+            MouseHitTarget::BrowserListRow(_) => Some(MouseScrollTarget::BrowserList),
+            MouseHitTarget::WorkspacePickerRow(_) => Some(MouseScrollTarget::WorkspacePicker),
+            MouseHitTarget::NewRequestField(NewField::Body) => Some(MouseScrollTarget::WizardBody),
+            MouseHitTarget::NewRequestField(NewField::Kvd(kind, ..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddKvd(kind)) => {
+                Some(MouseScrollTarget::WizardKvd(kind))
+            }
+            MouseHitTarget::NewRequestField(NewField::FormField(..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddFormField) => {
+                Some(MouseScrollTarget::WizardForm)
+            }
+            MouseHitTarget::NewRequestField(NewField::Assert(_))
+            | MouseHitTarget::NewRequestActivate(NewField::AddAssert) => {
+                Some(MouseScrollTarget::WizardAsserts)
+            }
+            MouseHitTarget::NewRequestField(NewField::Capture(..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddCapture) => {
+                Some(MouseScrollTarget::WizardCaptures)
+            }
+            MouseHitTarget::NewRequestField(NewField::Report(..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddReport) => {
+                Some(MouseScrollTarget::WizardReports)
+            }
+            MouseHitTarget::ThemeEditorRow(_) | MouseHitTarget::ThemeEditorColor(_) => {
+                Some(MouseScrollTarget::ThemeEditor)
+            }
+            MouseHitTarget::RemoteWizardRow(_) => Some(MouseScrollTarget::RemoteWizard),
+            MouseHitTarget::GitSaveWizardRow(_) => Some(MouseScrollTarget::GitSaveWizard),
+            MouseHitTarget::Scroll(target) => Some(target),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MouseHit {
+    pub(crate) rect: Rect,
+    pub(crate) layer: MouseLayer,
+    pub(crate) target: MouseHitTarget,
+}
+
 /// Where `pane` ranks in top-to-bottom reading order among the panes that
 /// can hold a text selection — Main before Response — so a cross-panel copy
 /// concatenates them in reading order (see
@@ -1074,6 +1210,13 @@ pub struct TuiApp {
     /// once the save completes, is cancelled, or falls back to keeping a
     /// fresh git download temporary.
     pub(crate) pending_workspace_save: Option<PendingWorkspaceSave>,
+
+    /// Last row clicked by the mouse. Runtime-only: keyboard input, wheel
+    /// input, or any non-row mouse-down breaks the consecutive-click pair.
+    pub(crate) last_mouse_row: Option<MouseHitTarget>,
+    pub(crate) mouse_hits: RefCell<Vec<MouseHit>>,
+    pub(crate) mouse_top_layer: Cell<MouseLayer>,
+    pub(crate) mouse_hit_valid: Cell<bool>,
 }
 
 impl Default for TuiApp {
@@ -1148,11 +1291,75 @@ impl Default for TuiApp {
             pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
             pending_workspace_save: None,
+            last_mouse_row: None,
+            mouse_hits: RefCell::new(Vec::new()),
+            mouse_top_layer: Cell::new(MouseLayer::Base),
+            mouse_hit_valid: Cell::new(false),
         }
     }
 }
 
 impl TuiApp {
+    pub(crate) fn begin_mouse_frame(&self) {
+        self.mouse_hits.borrow_mut().clear();
+        self.mouse_top_layer.set(MouseLayer::Base);
+        self.mouse_hit_valid.set(true);
+    }
+
+    pub(crate) fn invalidate_mouse_hits(&self) {
+        self.mouse_hits.borrow_mut().clear();
+        self.mouse_top_layer.set(MouseLayer::Base);
+        self.mouse_hit_valid.set(false);
+    }
+
+    pub(crate) fn set_mouse_layer(&self, layer: MouseLayer) {
+        if layer > self.mouse_top_layer.get() {
+            self.mouse_top_layer.set(layer);
+        }
+    }
+
+    pub(crate) fn push_mouse_hit(&self, layer: MouseLayer, rect: Rect, target: MouseHitTarget) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.set_mouse_layer(layer);
+        let mut hits = self.mouse_hits.borrow_mut();
+        hits.push(MouseHit {
+            rect,
+            layer,
+            target,
+        });
+    }
+
+    pub(crate) fn mouse_hit_at(&self, point: ratatui::layout::Position) -> Option<MouseHitTarget> {
+        if !self.mouse_hit_valid.get() {
+            return None;
+        }
+        let layer = self.mouse_top_layer.get();
+        self.mouse_hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|hit| hit.layer == layer && hit.rect.contains(point))
+            .map(|hit| hit.target)
+    }
+
+    pub(crate) fn mouse_scroll_target_at(
+        &self,
+        point: ratatui::layout::Position,
+    ) -> Option<MouseScrollTarget> {
+        if !self.mouse_hit_valid.get() {
+            return None;
+        }
+        let layer = self.mouse_top_layer.get();
+        self.mouse_hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|hit| hit.layer == layer && hit.rect.contains(point))
+            .and_then(|hit| hit.target.scroll_target())
+    }
+
     /// Whether there's any text selection at all — in either the Request
     /// (`main_panel`) or Response (`resp_panel`) body, active or finalized.
     /// Used to gate the `y`/Esc shortcuts.
