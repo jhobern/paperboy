@@ -112,6 +112,161 @@ fn mouse_selects_request_and_environment_rows() {
 }
 
 #[test]
+fn mouse_second_click_on_global_env_row_opens_popup_without_redraw() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let dev_id = add_empty_global_env(&mut app, "dev");
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let env = hit_rect(&app, MouseHitTarget::SelectGlobalEnvRow(0));
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert_eq!(app.global_env_idx, 0);
+    assert!(app.overlay.is_none(), "first click only selects the row");
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    match &app.overlay {
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, dev_id),
+        _ => panic!("second click opens the selected environment popup"),
+    }
+}
+
+#[test]
+fn mouse_second_click_on_workspace_env_row_loads_and_opens_popup_without_redraw() {
+    use crate::collection::WsRow;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = workspace_temp_dir("mouse_ws_env");
+    let env_path = dir.join("staging.vars");
+    std::fs::write(&env_path, "BASE=https://staging\nTOKEN=abc\n").unwrap();
+
+    let (mut app, ci) = workspace_app(&dir);
+    app.collections[ci].workspace_auto_prompt_dismissed = true;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let rows = app.collections[ci].ws_rows();
+    let env_idx = rows
+        .iter()
+        .position(|r| matches!(r, WsRow::Environment { .. }))
+        .expect("an environment row exists");
+    app.collections[ci].list_cursor = env_idx;
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let env = hit_rect(&app, MouseHitTarget::SelectListRow(env_idx));
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert_eq!(app.collections[ci].list_cursor, env_idx);
+    assert!(
+        app.global_envs.is_empty(),
+        "first click does not load the env"
+    );
+    assert!(app.overlay.is_none(), "first click opens no examiner");
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert_eq!(app.global_envs.len(), 1);
+    assert_eq!(app.global_envs[0].path.as_deref(), Some(env_path.as_path()));
+    match &app.overlay {
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, app.global_envs[0].id),
+        _ => panic!("second click loads and opens the environment examiner"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mouse_second_click_on_report_node_row_configures_without_redraw() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = node_show_app(&["status", "overall"]);
+    app.reports[idx].node_selected = 1;
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let row = hit_rect(&app, MouseHitTarget::ReportNodeRow(1));
+
+    app.on_mouse(mouse_down(row.x, row.y));
+    assert_eq!(app.reports[idx].node_selected, 1);
+    assert!(app.overlay.is_none(), "first click only selects the node");
+
+    app.on_mouse(mouse_down(row.x, row.y));
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeRequest(_))),
+        "second click invokes the node's Enter action"
+    );
+}
+
+#[test]
+fn keyboard_event_between_row_clicks_breaks_mouse_activation_pair() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let env_id = add_empty_global_env(&mut app, "dev");
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let env = hit_rect(&app, MouseHitTarget::SelectGlobalEnvRow(0));
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert!(app.overlay.is_none(), "first click only arms the row");
+
+    app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    app.on_mouse(mouse_down(env.x, env.y));
+    assert!(
+        app.overlay.is_none(),
+        "keyboard input breaks the click pair"
+    );
+
+    app.on_mouse(mouse_down(env.x, env.y));
+    match &app.overlay {
+        Some(Overlay::EnvPopup(popup)) => assert_eq!(popup.env_id, env_id),
+        _ => panic!("third click starts a new pair and opens the popup"),
+    }
+}
+
+#[test]
+fn mouse_click_on_primary_run_hint_runs_only_from_primary_segment() {
+    use crate::i18n::Strings;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_in_main_pane();
+    app.enhanced_keys = false;
+    let s = Strings::for_language(&app.language);
+    let primary = format!("F5 {}", s.foot_run);
+    let run_all = format!("Alt+F5 {}", s.foot_run_all);
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let run = hit_rect(&app, MouseHitTarget::RunRequest);
+    let buf = term.backend().buffer();
+    let visible: String = (run.x..run.x + run.width)
+        .map(|x| buf[(x, run.y)].symbol())
+        .collect();
+    assert_eq!(visible, primary);
+    let row: String = (0..buf.area().width)
+        .map(|x| buf[(x, run.y)].symbol())
+        .collect();
+    let run_all_x = row.find(&run_all).expect("Run All hint is visible") as u16;
+    assert!(
+        run_all_x >= run.x + run.width,
+        "RunRequest hit stops before Run All"
+    );
+
+    app.on_mouse(mouse_down(run_all_x, run.y));
+    assert!(
+        !app.response.lock().unwrap().loading,
+        "Run All text is not part of the primary run hit"
+    );
+
+    app.on_mouse(mouse_down(run.x, run.y));
+    assert!(
+        app.response.lock().unwrap().loading,
+        "clicking the primary run hint starts the selected request"
+    );
+}
+
+#[test]
 fn mouse_wheel_over_list_moves_selection_without_stealing_focus() {
     use ratatui::{Terminal, backend::TestBackend};
 

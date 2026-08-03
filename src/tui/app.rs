@@ -643,6 +643,7 @@ pub(crate) enum MouseHitTarget {
     FocusPane(Pane),
     SelectListRow(usize),
     SelectGlobalEnvRow(usize),
+    RunRequest,
     ReportResultsCell,
     ReportNodeRow(usize),
     OverlayRow(usize),
@@ -1210,6 +1211,9 @@ pub struct TuiApp {
     /// fresh git download temporary.
     pub(crate) pending_workspace_save: Option<PendingWorkspaceSave>,
 
+    /// Last row clicked by the mouse. Runtime-only: keyboard input, wheel
+    /// input, or any non-row mouse-down breaks the consecutive-click pair.
+    pub(crate) last_mouse_row: Option<MouseHitTarget>,
     pub(crate) mouse_hits: RefCell<Vec<MouseHit>>,
     pub(crate) mouse_top_layer: Cell<MouseLayer>,
     pub(crate) mouse_hit_valid: Cell<bool>,
@@ -1287,6 +1291,7 @@ impl Default for TuiApp {
             pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
             pending_workspace_save: None,
+            last_mouse_row: None,
             mouse_hits: RefCell::new(Vec::new()),
             mouse_top_layer: Cell::new(MouseLayer::Base),
             mouse_hit_valid: Cell::new(false),

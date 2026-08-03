@@ -1356,7 +1356,8 @@ pub(crate) fn draw_collection_left(
     // global footer, which was getting overcrowded) since they act on
     // whichever collection is shown here regardless of which pane has focus.
     let run_key = if app.enhanced_keys { "^Enter/F5" } else { "F5" };
-    let mut run_hint = format!("{run_key} {} · Alt+F5 {}", s.foot_run, s.foot_run_all);
+    let run_primary_hint = format!("{run_key} {}", s.foot_run);
+    let mut run_hint = format!("{run_primary_hint} \u{00b7} Alt+F5 {}", s.foot_run_all);
     // Append the "p" link/unlink-environment hint too, but only when the
     // panel is wide enough to actually show it without the bottom border
     // text overflowing/wrapping onto the panel itself.
@@ -1421,6 +1422,20 @@ pub(crate) fn draw_collection_left(
                 1,
             ),
             MouseHitTarget::SelectListRow(row),
+        );
+    }
+    let run_hit_w = (Line::from(run_primary_hint).width().min(u16::MAX as usize) as u16)
+        .min(panes[0].width.saturating_sub(2));
+    if run_hit_w > 0 {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(
+                panes[0].x.saturating_add(1),
+                panes[0].y + panes[0].height.saturating_sub(1),
+                run_hit_w,
+                1,
+            ),
+            MouseHitTarget::RunRequest,
         );
     }
 

@@ -35,6 +35,7 @@ use tui_panel_select::{Motion, MultiSelectPanel};
 
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        self.last_mouse_row = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
@@ -90,21 +91,26 @@ impl TuiApp {
     /// usually Ctrl), so it's the one modifier that reliably reaches the app
     /// in both cases.
     pub(crate) fn on_mouse(&mut self, ev: MouseEvent) {
-        if self.overlay_is_raw_text_editor() {
-            self.on_mouse_raw_text_editor(ev);
-            return;
-        }
         let point = Position::new(ev.column, ev.row);
         match ev.kind {
             MouseEventKind::ScrollUp => {
+                self.last_mouse_row = None;
                 self.on_mouse_wheel(point, -1);
                 return;
             }
             MouseEventKind::ScrollDown => {
+                self.last_mouse_row = None;
                 self.on_mouse_wheel(point, 1);
                 return;
             }
             _ => {}
+        }
+        if self.overlay_is_raw_text_editor() {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                self.last_mouse_row = None;
+            }
+            self.on_mouse_raw_text_editor(ev);
+            return;
         }
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && !ev.modifiers.contains(KeyModifiers::ALT)
@@ -112,6 +118,8 @@ impl TuiApp {
             if self.handle_mouse_down(point) {
                 return;
             }
+        } else if matches!(ev.kind, MouseEventKind::Down(_)) {
+            self.last_mouse_row = None;
         }
         if self.overlay.is_some() {
             return;
@@ -182,6 +190,7 @@ impl TuiApp {
 
     fn handle_mouse_down(&mut self, point: Position) -> bool {
         let Some(target) = self.mouse_hit_at(point) else {
+            self.last_mouse_row = None;
             if self.mouse_top_layer.get() == MouseLayer::Popup {
                 self.on_key(Self::mouse_key(KeyCode::Esc));
                 self.invalidate_mouse_hits();
@@ -189,6 +198,16 @@ impl TuiApp {
             }
             return self.overlay.is_some();
         };
+        let row_activation = match target {
+            MouseHitTarget::SelectListRow(_)
+            | MouseHitTarget::SelectGlobalEnvRow(_)
+            | MouseHitTarget::ReportNodeRow(_) => self.mouse_row_activation(target),
+            _ => {
+                self.last_mouse_row = None;
+                false
+            }
+        };
+        let mut keep_mouse_hits = false;
         let consumed = match target {
             MouseHitTarget::MenuFile => {
                 self.overlay = Some(Overlay::FileMenu(0));
@@ -209,18 +228,37 @@ impl TuiApp {
             }
             MouseHitTarget::SelectListRow(row) => {
                 self.select_row_in_pane(Pane::List, row);
+                if row_activation {
+                    self.on_enter();
+                } else {
+                    keep_mouse_hits = true;
+                }
                 true
             }
             MouseHitTarget::SelectGlobalEnvRow(row) => {
                 self.select_row_in_pane(Pane::GlobalEnv, row);
+                if row_activation {
+                    self.on_enter();
+                } else {
+                    keep_mouse_hits = true;
+                }
+                true
+            }
+            MouseHitTarget::RunRequest => {
+                self.primary_send();
                 true
             }
             MouseHitTarget::ReportResultsCell => self.on_mouse_results_cell_click(point.x, point.y),
             MouseHitTarget::ReportNodeRow(row) => {
-                if let Some(idx) = self.active_report_index()
-                    && let Some(rt) = self.reports.get_mut(idx)
-                {
-                    rt.node_selected = row;
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.node_selected = row;
+                    }
+                    if row_activation {
+                        self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
+                    } else {
+                        keep_mouse_hits = true;
+                    }
                 }
                 true
             }
@@ -310,10 +348,16 @@ impl TuiApp {
             }
             MouseHitTarget::Scroll(_) => false,
         };
-        if consumed {
+        if consumed && !keep_mouse_hits {
             self.invalidate_mouse_hits();
         }
         consumed
+    }
+
+    fn mouse_row_activation(&mut self, target: MouseHitTarget) -> bool {
+        let activate = self.last_mouse_row == Some(target);
+        self.last_mouse_row = if activate { None } else { Some(target) };
+        activate
     }
 
     fn mouse_key(code: KeyCode) -> KeyEvent {
@@ -2113,7 +2157,19 @@ impl TuiApp {
     /// line if the file can't be read.
     fn open_workspace_environment(&mut self, path: &std::path::Path) {
         if let Some(p) = path.to_str() {
+            let before = self.global_envs.len();
             self.do_file_action(FileAction::LoadEnv, p);
+            if self.overlay.is_some() {
+                return;
+            }
+            if let Some(env) = self
+                .global_envs
+                .iter()
+                .skip(before)
+                .find(|env| env.path.as_deref() == Some(path))
+            {
+                self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env.id)));
+            }
         }
     }
 
