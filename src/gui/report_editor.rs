@@ -10,6 +10,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::i18n::Status;
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
@@ -17,9 +18,11 @@ use crate::report::edit::{
     parse_one_node, remove_node, replace_node, request_node,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt};
+use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
 use super::app::GuiApp;
+use super::report_run::{self, RowState, RunHandle, RunProgress};
 use super::theme::GuiTheme;
 
 /// Which of the two editor views is shown.
@@ -29,6 +32,8 @@ pub enum EditorView {
     Blocks,
     /// The raw `.trail` source text.
     Source,
+    /// The results grid from the last (or in-flight) run.
+    Results,
 }
 
 /// Where the editor's report is saved back to.
@@ -61,6 +66,15 @@ pub struct ReportEditor {
     pub undo: Vec<String>,
     /// Set when the blocks view needs its `line_buf` reseeded (selection moved).
     reseed_line: bool,
+    /// The last run's output (skeleton while streaming, finalized at the end),
+    /// rendered as a grid in [`EditorView::Results`].
+    pub result: Option<ReportResult>,
+    /// Live streaming state while a run is in flight; `None` when idle.
+    pub progress: Option<RunProgress>,
+    /// The in-flight run's handle (cancel flag + update channel); `None` when idle.
+    pub run: Option<RunHandle>,
+    /// Whether the current `result` has been exported since it was produced.
+    pub results_exported: bool,
 }
 
 /// The insert-palette popup state: where a new node lands, and whether we're on
@@ -90,6 +104,10 @@ impl ReportEditor {
             line_buf: None,
             undo: Vec::new(),
             reseed_line: true,
+            result: None,
+            progress: None,
+            run: None,
+            results_exported: false,
         };
         ed.reparse();
         ed
@@ -145,6 +163,88 @@ impl ReportEditor {
             self.reseed_line = true;
         }
     }
+
+    /// Whether a run is currently in flight.
+    fn is_running(&self) -> bool {
+        self.run.as_ref().is_some_and(|h| !h.finished())
+    }
+
+    /// Whether the report can be run right now: it parses and carries no
+    /// error-level diagnostics (an unbound collection is itself an error, so
+    /// this also gates on binding).
+    fn can_run(&self) -> bool {
+        self.flow.is_some()
+            && self
+                .diagnostics
+                .iter()
+                .all(|d| d.severity != Severity::Error)
+    }
+
+    /// Start a background run of the current flow, switching to the Results view.
+    /// A blocked run (unbound / no inputs) reports why in the status line.
+    fn start_run(&mut self, app: &mut GuiApp) {
+        let Some(flow) = self.flow.clone() else {
+            return;
+        };
+        match context::report_run_inputs(
+            &app.session.collections,
+            &app.session.global_envs,
+            app.session.active_env_id,
+            &flow,
+            self.report.path.as_deref(),
+        ) {
+            Ok(inputs) => {
+                self.result = None;
+                self.progress = None;
+                self.results_exported = false;
+                self.view = EditorView::Results;
+                self.run = Some(report_run::spawn(inputs));
+                app.session.status = Some(Status::ReportRunning);
+            }
+            Err(context::RunInputError::Unbound) => {
+                app.session.status = Some(Status::ReportRunBlocked(
+                    app.strings.report_run_unbound.to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Stop an in-flight run, retaining whatever partial grid has streamed in.
+    fn stop_run(&mut self, app: &mut GuiApp) {
+        if let Some(h) = &self.run {
+            h.cancel();
+        }
+        self.progress = None;
+        app.session.status = Some(Status::ReportRunStopped);
+    }
+
+    /// Drain the run channel this frame, folding streamed rows into the grid.
+    /// Returns `true` while the run is still live (so the caller keeps
+    /// repainting). Retires the handle once the run finishes or disconnects.
+    fn poll_run(&mut self, app: &mut GuiApp) -> bool {
+        let Some(handle) = self.run.as_mut() else {
+            return false;
+        };
+        match report_run::drain(handle, &mut self.result, &mut self.progress) {
+            report_run::Drained::Progress { done, total } => {
+                app.session.status = Some(Status::ReportRunProgress { done, total });
+            }
+            report_run::Drained::Done { rows, errors } => {
+                app.session.status = Some(Status::ReportRunDone { rows, errors });
+            }
+            report_run::Drained::Disconnected => {
+                self.run = None;
+                return false;
+            }
+            report_run::Drained::Idle => {}
+        }
+        if handle.finished() {
+            self.run = None;
+            false
+        } else {
+            true
+        }
+    }
 }
 
 /// A colour for a node's block, by category, blended toward a readable chip fill.
@@ -189,7 +289,27 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
     let mut close = false;
 
-    // ── Header: name, dirty marker, view toggle, Save / Close ──────────────
+    // Fold any streamed run updates into the grid, and keep repainting while a
+    // run is live so the grid fills in real time.
+    let running = ed.poll_run(app);
+    if running {
+        ui.ctx().request_repaint();
+    }
+
+    // Recompute diagnostics against the current collections/envs each frame
+    // (cheap; keeps the Run gate and panel live as the bound collection changes).
+    ed.diagnostics = match &ed.flow {
+        Some(flow) => context::report_diagnostics(
+            &app.session.collections,
+            &app.session.global_envs,
+            app.session.active_env_id,
+            flow,
+            ed.report.path.as_deref(),
+        ),
+        None => Vec::new(),
+    };
+
+    // ── Header: name, dirty marker, Run / Save / Close ─────────────────────
     ui.horizontal(|ui| {
         let mut title = RichText::new(&ed.report.name).strong().color(th.text);
         if ed.report.dirty {
@@ -213,10 +333,35 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             if save.clicked() {
                 save_report(&mut ed, app);
             }
+            // Run toggles to Stop while a run is in flight.
+            if ed.is_running() {
+                if ui
+                    .button(format!(
+                        "{} {}",
+                        super::icons::STOP,
+                        app.strings.gui_report_stop
+                    ))
+                    .clicked()
+                {
+                    ed.stop_run(app);
+                }
+            } else {
+                let run = ui.add_enabled(
+                    ed.can_run(),
+                    egui::Button::new(format!(
+                        "{} {}",
+                        super::icons::PLAY,
+                        app.strings.gui_report_run
+                    )),
+                );
+                if run.clicked() {
+                    ed.start_run(app);
+                }
+            }
         });
     });
 
-    // View toggle (Blocks | Source).
+    // View toggle (Blocks | Source | Results).
     ui.horizontal(|ui| {
         if super::widgets::selectable(
             ui,
@@ -236,25 +381,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         {
             ed.view = EditorView::Source;
         }
+        if super::widgets::selectable(
+            ui,
+            ed.view == EditorView::Results,
+            RichText::new(app.strings.gui_report_view_results),
+        )
+        .clicked()
+        {
+            ed.view = EditorView::Results;
+        }
     });
     ui.separator();
-
-    // Recompute diagnostics against the current collections/envs each frame
-    // (cheap; keeps the panel live as the bound collection changes).
-    ed.diagnostics = match &ed.flow {
-        Some(flow) => context::report_diagnostics(
-            &app.session.collections,
-            &app.session.global_envs,
-            app.session.active_env_id,
-            flow,
-            ed.report.path.as_deref(),
-        ),
-        None => Vec::new(),
-    };
 
     match ed.view {
         EditorView::Source => source_view(&mut ed, app, ui),
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
+        EditorView::Results => results_view(&mut ed, app, ui),
     }
 
     // Global keys: Ctrl+Z undo (both views); Delete on the blocks view is
@@ -266,6 +408,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     if !close {
         app.report_editor = Some(ed);
     }
+    // (A dropped `ed` cancels any in-flight run via `RunHandle`'s `Drop`.)
 }
 
 /// The raw `.trail` source editor + validation panel.
@@ -298,6 +441,183 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
         });
     ui.separator();
     diagnostics_panel(ed, app, ui);
+}
+
+/// The results grid from the last (or in-flight) run, plus an Export button.
+fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
+    let th = app.theme;
+
+    ui.horizontal(|ui| {
+        if ed.is_running() {
+            ui.colored_label(
+                th.pending,
+                format!(
+                    "{} {}",
+                    super::icons::RUNNING,
+                    app.strings.gui_report_running
+                ),
+            );
+        }
+        if let Some(prog) = &ed.progress {
+            ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let has_rows = ed.result.as_ref().is_some_and(|r| !r.rows.is_empty());
+            let export = ui.add_enabled(
+                has_rows,
+                egui::Button::new(format!(
+                    "{} {}",
+                    super::icons::EXPORT,
+                    app.strings.gui_report_export
+                )),
+            );
+            if export.clicked() {
+                open_export_dialog(app);
+            }
+        });
+    });
+    ui.separator();
+
+    let Some(result) = ed.result.as_ref() else {
+        ui.add_space(8.0);
+        ui.colored_label(th.dim, app.strings.gui_report_no_results);
+        return;
+    };
+
+    // Resolve columns via the flow header's `columns:` directive (falling back
+    // to the discovered column order when the flow doesn't parse or names none).
+    let header = ed
+        .flow
+        .as_ref()
+        .map(|f| f.header.clone())
+        .unwrap_or_default();
+    let columns = result.resolved_columns(&header);
+    if columns.is_empty() {
+        ui.add_space(8.0);
+        ui.colored_label(th.dim, app.strings.gui_report_no_results);
+        return;
+    }
+
+    // Run-level errors (unresolved requests, producer problems) above the grid.
+    if !result.errors.is_empty() {
+        for e in &result.errors {
+            ui.colored_label(th.err, format!("{} {e}", super::icons::FAIL));
+        }
+        ui.add_space(2.0);
+    }
+
+    let states = ed.progress.as_ref().map(|p| p.states.as_slice());
+    results_grid(app, ui, result, &columns, states);
+}
+
+/// Render the results as a scrollable table: a header row, one row per data row
+/// (greyed/marked by its streaming [`RowState`]), then any STATISTICS summary
+/// rows. Mirrors the TUI's `report_grid_lines` semantics.
+fn results_grid(
+    app: &GuiApp,
+    ui: &mut egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+    states: Option<&[RowState]>,
+) {
+    let th = app.theme;
+    let show_icons = states.is_some();
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("report_results_grid")
+                .striped(true)
+                .spacing(egui::vec2(14.0, 3.0))
+                .show(ui, |ui| {
+                    // Header row.
+                    if show_icons {
+                        ui.label(" ");
+                    }
+                    for col in columns {
+                        ui.label(RichText::new(&col.header).strong().color(th.accent));
+                    }
+                    ui.end_row();
+
+                    // Data rows.
+                    for (i, row) in result.rows.iter().enumerate() {
+                        let state = states.and_then(|s| s.get(i)).copied();
+                        if show_icons {
+                            let (glyph, colour) = match state {
+                                Some(RowState::Running) => (super::icons::RUNNING, th.pending),
+                                Some(RowState::Finished) => (super::icons::PASS, th.ok),
+                                _ => (super::icons::ROW_SCHEDULED, th.dim),
+                            };
+                            ui.colored_label(colour, glyph);
+                        }
+                        let text_col = match state {
+                            Some(RowState::Running) => th.pending,
+                            Some(RowState::Scheduled) => th.dim,
+                            _ => th.text,
+                        };
+                        for col in columns {
+                            let cell = flatten_cell(&col.value(row, &result.no_match_marker));
+                            ui.label(RichText::new(truncate_cell(&cell)).color(text_col))
+                                .on_hover_text(cell);
+                        }
+                        ui.end_row();
+                    }
+
+                    // STATISTICS summary rows (a footer, distinguished by italic accent).
+                    for srow in result.summary_rows(columns) {
+                        if show_icons {
+                            ui.label(" ");
+                        }
+                        for (c, _col) in columns.iter().enumerate() {
+                            let cell = flatten_cell(&srow.text_cell(c));
+                            ui.label(
+                                RichText::new(truncate_cell(&cell))
+                                    .italics()
+                                    .color(th.accent),
+                            )
+                            .on_hover_text(cell);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// Collapse a cell's newlines to a single line (a response body can be huge).
+fn flatten_cell(value: &str) -> String {
+    if value.contains(['\n', '\r']) {
+        value.replace("\r\n", "⏎").replace(['\n', '\r'], "⏎")
+    } else {
+        value.to_string()
+    }
+}
+
+/// Per-cell display cap so one wide cell can't push the grid off-screen; the
+/// full value is available on hover. Mirrors the TUI's `MAX_COL_WIDTH`.
+fn truncate_cell(value: &str) -> String {
+    const MAX: usize = 48;
+    if value.chars().count() > MAX {
+        let mut s: String = value.chars().take(MAX - 1).collect();
+        s.push('…');
+        s
+    } else {
+        value.to_string()
+    }
+}
+
+/// Open the Save dialog for exporting the active report's results, defaulting to
+/// a `.csv` beside the report (or in the current dir for a scratch report).
+fn open_export_dialog(app: &mut GuiApp) {
+    let default = app
+        .report_editor
+        .as_ref()
+        .and_then(|e| e.report.path.as_ref())
+        .map(|p| p.with_extension("csv"))
+        .unwrap_or_else(|| std::path::PathBuf::from("report.csv"));
+    app.dialog = Some(super::app::Dialog::SaveFile {
+        kind: super::app::SaveKind::ReportResults,
+        path: default.to_string_lossy().into_owned(),
+        error: None,
+    });
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.

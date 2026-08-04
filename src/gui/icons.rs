@@ -54,3 +54,9 @@ pub const SAVE: &str = p::FLOPPY_DISK;
 pub const CARET_UP: &str = p::CARET_UP;
 /// Delete a selected report block.
 pub const TRASH: &str = p::TRASH;
+/// Stop an in-flight report run.
+pub const STOP: &str = p::STOP;
+/// Export a report's results to a file.
+pub const EXPORT: &str = p::EXPORT;
+/// A row queued in the streaming results grid (formerly `·`).
+pub const ROW_SCHEDULED: &str = p::DOT_OUTLINE;

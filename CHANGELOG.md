@@ -56,6 +56,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   flow-editing and validation logic is shared with the terminal UI, so both
   front-ends stay in lock-step.
 
+- **Running PaperTrail reports from the GUI.** The report editor now has a
+  **Run** button that executes the report against its bound collection on a
+  background thread (so the window stays responsive), streaming results into a
+  live **Results** grid: the projected rows appear immediately (greyed), each
+  row un-greys and fills as its requests complete — several at once under a
+  `PARALLEL` loop — and the finalized table (including any `ENVS`/baseline
+  comparison collapse and `STATISTICS(…)` summary rows) replaces it at the end.
+  **Stop** cancels a run in flight while keeping the rows completed so far, and
+  **Export…** writes the results to CSV, JSON, HTML or XLSX (chosen by the file
+  extension). Running reuses the same front-end-agnostic executor and run-input
+  assembly as the terminal UI, so a report produces identical results in either
+  front-end.
+
 - **Workspaces in the GUI.** *File → Open workspace…* points the GUI at a
   folder of collections and shows its filesystem tree in the left panel, exactly
   like the terminal UI: folders expand and collapse, collection files list their

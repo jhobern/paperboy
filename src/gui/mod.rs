@@ -15,6 +15,7 @@ mod icons;
 mod menu;
 mod remote;
 mod report_editor;
+mod report_run;
 mod reports;
 mod requests;
 mod response;

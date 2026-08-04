@@ -414,6 +414,7 @@ fn save_file_dialog(
         SaveKind::Collection => app.strings.gui_save_collection_title,
         SaveKind::Environment(_) => app.strings.gui_save_environment_title,
         SaveKind::Response => app.strings.gui_save_response_title,
+        SaveKind::ReportResults => app.strings.gui_save_results_title,
     };
     let lbl_path = app.strings.gui_file_path;
     let lbl_save = app.strings.gui_save;
@@ -447,6 +448,16 @@ fn save_file_dialog(
         return;
     }
     if submit {
+        // Report results export writes format-specific *bytes* (chosen by the
+        // file extension), so it takes its own path rather than the text branch.
+        if matches!(kind, SaveKind::ReportResults) {
+            match export_report_results(app, &path) {
+                Ok(()) => return,
+                Err(e) => error = Some(e),
+            }
+            app.dialog = Some(Dialog::SaveFile { kind, path, error });
+            return;
+        }
         let content = match kind {
             SaveKind::Collection => Some(app.session.collections[app.active_ci()].to_hurl()),
             SaveKind::Environment(id) => app
@@ -456,6 +467,7 @@ fn save_file_dialog(
                 .find(|e| e.id == id)
                 .map(|e| e.to_vars_text()),
             SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
+            SaveKind::ReportResults => None,
         };
         match content {
             Some(text) => match std::fs::write(&path, text) {
@@ -474,6 +486,7 @@ fn save_file_dialog(
                             }
                         }
                         SaveKind::Response => {}
+                        SaveKind::ReportResults => {}
                     }
                     app.session.save();
                     return;
@@ -484,6 +497,38 @@ fn save_file_dialog(
         }
     }
     app.dialog = Some(Dialog::SaveFile { kind, path, error });
+}
+
+/// Write the open report editor's last-run results to `path`, choosing the
+/// output format from the file extension (csv / json / html / xlsx). Marks the
+/// results exported so a rerun won't warn about discarding them.
+fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let writer = crate::report::writer::writer_for_extension(ext)
+        .ok_or_else(|| format!("{} {ext}", app.strings.gui_unsupported_format))?;
+    let ed = app
+        .report_editor
+        .as_ref()
+        .ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
+    let result = ed
+        .result
+        .as_ref()
+        .ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
+    let header = ed
+        .flow
+        .as_ref()
+        .map(|f| f.header.clone())
+        .unwrap_or_default();
+    let bytes = writer.write(result, &header)?;
+    std::fs::write(path, bytes).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    if let Some(ed) = app.report_editor.as_mut() {
+        ed.results_exported = true;
+    }
+    app.session.status = Some(crate::i18n::Status::ReportExported(path.to_string()));
+    Ok(())
 }
 
 fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mut text: String) {

@@ -73,6 +73,8 @@ pub enum SaveKind {
     /// Save the Global Environment with this id to a `.vars` file.
     Environment(u64),
     Response,
+    /// Export the open report editor's last run results (format by extension).
+    ReportResults,
 }
 
 #[derive(Clone)]

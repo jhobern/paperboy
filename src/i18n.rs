@@ -752,6 +752,8 @@ strings! {
     gui_save_collection_title => "Save collection", "Enregistrer la collection", "Gem samling";
     gui_save_environment_title => "Save environment", "Enregistrer l'environnement", "Gem miljø";
     gui_save_response_title => "Save response", "Enregistrer la réponse", "Gem svar";
+    gui_save_results_title => "Export report results", "Exporter les résultats du rapport", "Eksportér rapportresultater";
+    gui_unsupported_format => "Unsupported format:", "Format non pris en charge\u{a0}:", "Ikke-understøttet format:";
     gui_save => "Save", "Enregistrer", "Gem";
     gui_nothing_to_save => "Nothing to save.", "Rien à enregistrer.", "Intet at gemme.";
     gui_rename => "Rename", "Renommer", "Omdøb";
@@ -774,6 +776,12 @@ strings! {
     gui_report_move_up => "Move up", "Monter", "Flyt op";
     gui_report_move_down => "Move down", "Descendre", "Flyt ned";
     gui_report_delete_block => "Delete", "Supprimer", "Slet";
+    gui_report_view_results => "Results", "Résultats", "Resultater";
+    gui_report_run => "Run", "Exécuter", "Kør";
+    gui_report_stop => "Stop", "Arrêter", "Stop";
+    gui_report_export => "Export…", "Exporter…", "Eksportér…";
+    gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
+    gui_report_running => "Running…", "Exécution…", "Kører…";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
