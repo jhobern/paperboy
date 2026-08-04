@@ -1452,6 +1452,7 @@ impl TuiApp {
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.overlay = Some(Overlay::Help(0));
                 self.help_scroll = 0;
+                self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
             // Shift+R opens a brand-new PaperTrail report tab (report tabs live
@@ -3097,6 +3098,8 @@ impl TuiApp {
                 Some(name) => self.status = Some(Status::EnvReverted(name)),
                 None => self.status = Some(Status::NothingToRevert),
             },
+            // Confirmed discarding unexported report results: start the rerun.
+            ConfirmAction::RerunReport => self.start_active_report_run(),
         }
     }
 
@@ -3974,6 +3977,9 @@ impl TuiApp {
                 // (a collection can't be a `.trail`, etc.); `Tab` toggles it via
                 // `browser_key_handler`. On by default each time the picker opens.
                 self.browser_filter_on = true;
+                // Start with an empty type-to-filter query each time the picker
+                // opens (see `browser_key_handler`).
+                self.browser_query.clear();
                 if browser_filters_by_ext(action) {
                     let _ = ex.set_filter_map(move |file| {
                         browser_keep_file(action, &file).then_some(file)
@@ -4007,11 +4013,15 @@ impl TuiApp {
         // Three tabs: 0 = Shortcuts, 1 = Glossary, 2 = Reports.
         const HELP_TABS: usize = 3;
         match key.code {
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            // Tab switching keeps the active filter (so a search can be checked
+            // against each tab in turn). Arrow Left/Right switch tabs too; the
+            // `h`/`l` letter aliases were dropped so those letters can be typed
+            // into the filter instead.
+            KeyCode::Tab | KeyCode::Right => {
                 self.overlay = Some(Overlay::Help((tab + 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::BackTab | KeyCode::Left => {
                 self.overlay = Some(Overlay::Help((tab + HELP_TABS - 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
@@ -4044,6 +4054,32 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Help(tab));
                 self.help_scroll = u16::MAX;
             }
+            // Type-to-filter: printable characters extend the query and jump
+            // back to the top so the first match is visible. A leading space
+            // would just be noise, so it's ignored when the query is empty.
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !(c == ' ' && self.help_query.is_empty()) =>
+            {
+                self.help_query.push(c);
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            KeyCode::Backspace => {
+                self.help_query.pop();
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            // First Esc clears an active filter; a second Esc (empty query)
+            // falls through to the catch-all and closes Help. Mirrors the
+            // load-browser filter's clear-then-close behaviour.
+            KeyCode::Esc if !self.help_query.is_empty() => {
+                self.help_query.clear();
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            // Any other key (Esc with no filter, Enter, q, …) leaves the overlay
+            // taken (see `on_key_overlay`) and so closes Help.
             _ => {}
         }
     }
@@ -4850,6 +4886,40 @@ impl TuiApp {
         }
     }
 
+    /// Reapply the load browser's file filter from the current extension-filter
+    /// toggle and the type-to-filter query. Directories always pass so the tree
+    /// stays navigable; files must satisfy the extension set (when the toggle is
+    /// on) and contain the query as a case-insensitive substring. When neither
+    /// constraint is active the filter is removed entirely so every file shows.
+    fn apply_browser_filter(&self, action: FileAction, ex: &mut FileExplorer) {
+        let filter_on = self.browser_filter_on && browser_filters_by_ext(action);
+        let query = self.browser_query.to_ascii_lowercase();
+        if !filter_on && query.is_empty() {
+            let _ = ex.remove_filter_map();
+            return;
+        }
+        let _ = ex.set_filter_map(move |file| {
+            if file.is_dir {
+                return Some(file);
+            }
+            if filter_on && !browser_keep_file(action, &file) {
+                return None;
+            }
+            if !query.is_empty() {
+                let name = file
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !name.contains(&query) {
+                    return None;
+                }
+            }
+            Some(file)
+        });
+    }
+
     fn browser_key_handler(
         &mut self,
         key: KeyEvent,
@@ -4879,17 +4949,46 @@ impl TuiApp {
             return;
         }
         // On a load picker, Tab toggles the extension filter (show all ↔ only
-        // matching files) so an oddly-named file can still be picked.
+        // matching files) so an oddly-named file can still be picked. Routed
+        // through `apply_browser_filter` so any active type-to-filter query is
+        // preserved across the toggle.
         if browser_filters_by_ext(action) && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.browser_filter_on = !self.browser_filter_on;
-            if self.browser_filter_on {
-                let _ =
-                    ex.set_filter_map(move |file| browser_keep_file(action, &file).then_some(file));
-            } else {
-                let _ = ex.remove_filter_map();
-            }
+            self.apply_browser_filter(action, &mut ex);
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
+        }
+        // Type-to-filter for the load pickers: printable keys narrow the file
+        // list by name (case-insensitive substring) on top of the extension
+        // filter, so a crowded folder can be sifted by just typing. Handled
+        // before the generic key match below so letters that double as vim
+        // motions here (h/j/k/l/q) filter instead of navigating. Backspace
+        // trims the query; the first Esc clears it (a second Esc, with an empty
+        // query, then cancels via the generic handler).
+        if browser_filters_by_ext(action) && !save_folder {
+            match key.code {
+                KeyCode::Char(c)
+                    if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+                {
+                    self.browser_query.push(c);
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                KeyCode::Backspace if !self.browser_query.is_empty() => {
+                    self.browser_query.pop();
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                KeyCode::Esc if !self.browser_query.is_empty() => {
+                    self.browser_query.clear();
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                _ => {}
+            }
         }
         if save_folder && self.browser_name_focused {
             match key.code {
@@ -5056,6 +5155,19 @@ impl TuiApp {
     }
 
     fn new_request_key_handler(&mut self, key: KeyEvent, mut form: Box<NewReq>) {
+        // Terminals without the keyboard-enhancement protocol deliver Backspace
+        // (and Ctrl+Backspace) as Ctrl+H — `Char('h')`+CONTROL. Left as-is, a
+        // text-entry cell's generic `Char(c) => insert(c)` arm types a literal
+        // `h` when the user presses Backspace (the reported bug). Normalise it to
+        // a plain Backspace up front so every field deletes instead, mirroring
+        // the multiline editor's own Ctrl+H handling.
+        let key = if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+        {
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+        } else {
+            key
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
         let prev_focus = form.focus;

@@ -342,6 +342,18 @@ impl HurlEntry {
         }
     }
 
+    /// The key of the first enabled `[Form]`/`[Multipart]` file field with an
+    /// empty path, if any. Such a field serializes to an invalid `file,;` line
+    /// that PaperBoy's own parser rejects, so an entry carrying one can't be
+    /// written to a reloadable `.hurl`. (Disabled rows round-trip as comments,
+    /// so they never break parsing — only enabled ones are checked.)
+    pub fn first_empty_file_field(&self) -> Option<&str> {
+        self.form_fields
+            .iter()
+            .find(|f| f.enabled && f.kind.is_multipart() && f.value.trim().is_empty())
+            .map(|f| f.key.as_str())
+    }
+
     /// Serialize this entry to Hurl text. Ordered so it round-trips through
     /// [`parse_hurl`](super::parse_hurl): a body (which must be JSON/quoted to
     /// be re-detected) is emitted right after the headers; request sections and

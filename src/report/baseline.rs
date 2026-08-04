@@ -51,10 +51,10 @@ pub struct BaselineRow {
 }
 
 impl BaselineRow {
-    /// Reconstruct an in-memory [`ReportRow`] from the snapshot — used both to
-    /// feed the diff and to emit a `no candidate` row for a snapshot key the
-    /// current run didn't produce.
-    fn to_row(&self) -> ReportRow {
+    /// Reconstruct an in-memory [`ReportRow`] from the snapshot — used to feed
+    /// the diff, to emit a `no candidate` row for a snapshot key the current run
+    /// didn't produce, and to inject a `FILE(…)` role's rows in [`super::run`].
+    pub(crate) fn to_row(&self) -> ReportRow {
         ReportRow {
             cells: self.cells.clone(),
             vars: self.vars.clone(),

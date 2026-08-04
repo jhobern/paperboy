@@ -39,6 +39,100 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 - **Report tabs now use the same 📊 icon as reports in the Workspace tree**, so
   a report reads the same whether it's a standalone tab or a workspace row.
 
+### Added
+
+- **JSON cell values are pretty-printed in the report cell viewer.** Drilling
+  into a report-grid cell whose entire value is a single JSON document (`Enter`
+  on the cell) now shows it indented, one field per line, instead of a dense
+  single line. Cells that aren't whole-value JSON are shown unchanged.
+
+- **Type-to-filter in the load browsers.** In the Open Collection / Load
+  Environment / Open Report file dialogs, start typing to filter the visible
+  files by name (case-insensitive substring) on top of the existing extension
+  filter. Backspace trims the query and the first Esc clears it (a second Esc
+  then closes the dialog); an active filter is shown beneath the list.
+
+- **Inserting a node in the report node editor opens its configure view
+  immediately.** Picking a kind from the node palette now drops you straight
+  into that node's most helpful editor — the same view `Enter` opens on an
+  existing node — instead of the raw line prompt: a `FOR … IN FILES`/`FOLDERS`
+  loop opens the source-folder browser (choosing the folder is the whole point
+  of the loop), and a `FOR … IN ENVS` loop opens the baseline/comparison/mode
+  popup. Kinds without a dedicated form yet (report-var, assignment, list) still
+  open the line prompt.
+
+- **Reuse a saved baseline snapshot inside an `ENVS` comparison with
+  `FILE(…)`.** A `BASELINE(…)`/`COMPARISON(…)` role argument may now be
+  `FILE("path")` instead of an environment name — e.g.
+  `FOR TARGET IN ENVS BASELINE(FILE("prod.baseline")), COMPARISON("staging")`.
+  The named `.baseline` snapshot (the same kind exported from the results grid,
+  resolved relative to `# root:`) is loaded once and stands in for a live run of
+  that role, so a fixed reference can be compared against without re-running it;
+  the live comparison env still runs each time. Accepted on both roles, so you
+  can diff live-vs-snapshot either way, or snapshot-vs-snapshot. In the ENVS
+  configure overlay, press `f` on a role to turn it into a `FILE` reference and
+  cycle it through the snapshots found in the report's directory. This is the
+  loop-scoped counterpart of the report-wide `# baseline:` directive.
+
+- **Rerunning a report warns before discarding unexported results.** Running a
+  report again (`r` / `F5`) when the current results haven't been saved anywhere
+  since the run that produced them now asks to confirm first — the results would
+  otherwise be replaced with no way to get them back. Exporting the results
+  (CSV / JSON / HTML / XLSX) or saving a `.baseline` snapshot counts as saving
+  them, so the next rerun goes straight through; the warning also never
+  interrupts cancelling a run that's still in flight.
+
+- **The Help window (`?` / `F1`) is now searchable.** Start typing to filter
+  every tab's entries down to those whose shortcut/keyword or description
+  contains what you typed (case-insensitively), keeping each match's section
+  heading and dropping sections with nothing left; the active filter is echoed
+  under the tab strip. The filter persists as you switch tabs (`Tab` / `←→`), so
+  a search can be checked against the Shortcuts, Glossary and Reports views in
+  turn; Backspace trims it, the first `Esc` clears it and a second `Esc` closes
+  Help. Scrolling (`↑↓` / `PgUp` / `PgDn` / `Home` / `End`) and the grouped,
+  titled sections are unchanged.
+
+### Changed (backlog)
+
+- **The report results footer no longer explains the arrow keys.** The
+  `↑/↓/←/→ cursor` segment was dropped from the results hint line (the arrow
+  keys are self-evident); the `Enter` drill-down / `v` / `x` / `B` hints remain.
+
+- **Selected rows in the request, workspace and environment lists no longer show
+  a leading `› ` caret.** The selected row is already highlighted, so the caret
+  was redundant; dropping it reclaims two columns of width for the row text.
+
+### Fixed
+
+- **A collection that fails to parse now explains *why* instead of just "not a
+  valid collection".** When a `.hurl` file can't be loaded, the status (and the
+  CLI/`--batch` and report-runner messages) now name the offending line and the
+  concrete reason from the parser — e.g. `line 54: parsing filename` for a
+  `[Multipart]` `file,;` with an empty filename — so a single malformed line
+  that makes `hurl_core` reject the whole file is easy to find. A failed Postman
+  JSON import still shows the generic message (a Hurl-parse reason would be
+  meaningless there).
+
+- **PaperBoy no longer writes a `.hurl` file it can't read back.** A
+  `[Multipart]`/`[Form]` file field left with no file path used to serialize to
+  an invalid `file,;` line — which PaperBoy's own parser then rejected on
+  reload, stranding the whole collection. Saving such a collection (locally, to
+  a Workspace, when moving/copying a request between files, or when pushing to
+  git) is now refused with a message naming the request and the empty field, so
+  the problem is fixed before it reaches disk.
+
+- **The load-browser filter strip now matches the theme.** The one-line
+  "Filter: …" strip shown beneath the file list while type-to-filtering was
+  drawn on the terminal's default background (and as a single flat accent
+  colour), so it stood out from the rest of the dialog. It now fills the theme
+  panel background with a dim label + accent query, like the export-format strip
+  and the Help filter.
+
+- **Backspace in the request wizard's Asserts/Captures/Reports cells no longer
+  types a literal `h`.** On terminals without the keyboard-enhancement protocol
+  `Backspace` arrives as `Ctrl+H`; the wizard's text cells now treat that as a
+  delete (matching the multiline editor) instead of inserting an `h`.
+
 
 
 ## [0.1.9] - 2026-08-03

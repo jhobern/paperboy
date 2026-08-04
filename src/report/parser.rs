@@ -13,7 +13,7 @@ use nom::{
 
 use crate::report::flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ParallelSpec, Pattern, Producer,
-    ReportFlow, ReportStmt, ResponseFmt, WithItem,
+    ReportFlow, ReportStmt, ResponseFmt, RoleRef, WithItem,
 };
 
 /*
@@ -610,12 +610,12 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
     let mut baseline = Vec::new();
     let mut comparisons = Vec::new();
     let mut baseline_show = Vec::new();
-    for (is_baseline, mut names, mut show) in roles {
+    for (is_baseline, mut refs, mut show) in roles {
         if is_baseline {
-            baseline.append(&mut names);
+            baseline.append(&mut refs);
             baseline_show.append(&mut show);
         } else {
-            comparisons.append(&mut names);
+            comparisons.append(&mut refs);
         }
     }
     Ok((
@@ -630,12 +630,13 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
 
 /// One `BASELINE(...) [SHOW(...)]` / `COMPARISON(...)` role.
 ///
-/// Returns `(is_baseline, names, show_fields)`.  `SHOW` after `COMPARISON` is a
+/// Returns `(is_baseline, refs, show_fields)`.  Each ref is a [`RoleRef`] — a
+/// live env name or a `FILE("…")` snapshot.  `SHOW` after `COMPARISON` is a
 /// hard parse error (returned as `nom::Err::Failure`) so it can't be silently
 /// swallowed by the surrounding `alt`.
-fn role(i: &str) -> IResult<&str, (bool, Vec<String>, Vec<String>)> {
+fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<String>)> {
     let (i, is_baseline) = alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON"))))(i)?;
-    let (i, names) = paren_list1(string_lit)(i)?;
+    let (i, refs) = paren_list1(role_ref)(i)?;
     // SHOW(…) is only legal on a BASELINE role.  If we see SHOW after a
     // COMPARISON, surface it as a Failure (not a soft Error) so the user gets a
     // clear rejection rather than a silent parse-stop.
@@ -651,7 +652,22 @@ fn role(i: &str) -> IResult<&str, (bool, Vec<String>, Vec<String>)> {
         }
         (i, Vec::new())
     };
-    Ok((i, (is_baseline, names, show)))
+    Ok((i, (is_baseline, refs, show)))
+}
+
+/// A single role argument: a `FILE("…")` snapshot reference, or a bare quoted
+/// environment name.  `FILE` is matched first (a bare env name can't start with
+/// `FILE(` — it is a quoted string), and only ever here in argument position,
+/// so it never collides with the `FILE` loop-variable name in `FOR FILE IN
+/// FILES`.
+fn role_ref(i: &str) -> IResult<&str, RoleRef> {
+    alt((map(file_ref, RoleRef::File), map(string_lit, RoleRef::Env)))(i)
+}
+
+/// `FILE("path")` — the snapshot path inside a role argument.
+fn file_ref(i: &str) -> IResult<&str, String> {
+    let (i, _) = kw("FILE")(i)?;
+    delimited(sym('('), string_lit, sym(')'))(i)
 }
 
 // ---------------------------------------------------------------------------
@@ -749,7 +765,7 @@ fn with_block_head(i: &str) -> IResult<&str, ()> {
 mod tests {
     use super::*;
     use crate::report::flow::{
-        Binder, Element, EnvClause, FlowNode, ParallelSpec, Producer, ReportStmt, WithItem,
+        Binder, Element, EnvClause, FlowNode, ParallelSpec, Producer, ReportStmt, RoleRef, WithItem,
     };
 
     /// Parse, then serialize, then parse again — the two ASTs must match, so the
@@ -910,14 +926,51 @@ mod tests {
             assert_eq!(
                 clause,
                 &EnvClause::Roles {
-                    baseline: vec!["prod-au".into()],
-                    comparisons: vec!["staging-au".into(), "staging-eu".into()],
+                    baseline: vec![RoleRef::Env("prod-au".into())],
+                    comparisons: vec![
+                        RoleRef::Env("staging-au".into()),
+                        RoleRef::Env("staging-eu".into()),
+                    ],
                     baseline_show: vec![],
                 }
             );
         } else {
             panic!("expected ForEnvs roles");
         }
+    }
+
+    #[test]
+    fn envs_roles_accept_file_snapshots() {
+        // FILE("…") is accepted in both BASELINE and COMPARISON argument
+        // positions, parsed as a RoleRef::File, and round-trips through the
+        // serializer.
+        let flow = assert_round_trips(
+            "FOR TARGET IN ENVS BASELINE(FILE(\"prod.baseline\")), COMPARISON(\"staging\", FILE(\"old.baseline\"))\n    REQUEST r\nEND\n",
+        );
+        if let FlowNode::ForEnvs { clause, .. } = &flow.nodes[0] {
+            assert_eq!(
+                clause,
+                &EnvClause::Roles {
+                    baseline: vec![RoleRef::File("prod.baseline".into())],
+                    comparisons: vec![
+                        RoleRef::Env("staging".into()),
+                        RoleRef::File("old.baseline".into()),
+                    ],
+                    baseline_show: vec![],
+                }
+            );
+        } else {
+            panic!("expected ForEnvs roles with FILE");
+        }
+    }
+
+    #[test]
+    fn file_snapshot_role_does_not_shadow_the_file_loop_var() {
+        // `FILE` as a loop variable (`FOR FILE IN FILES`) is an identifier, not
+        // the argument-position `FILE(…)` keyword, so both parse in one flow.
+        assert_round_trips(
+            "FOR FILE IN FILES \"docs\"\n    FOR TARGET IN ENVS BASELINE(FILE(\"b.baseline\")), COMPARISON(\"staging\")\n        REQUEST r\n    END\nEND\n",
+        );
     }
 
     #[test]
@@ -1226,8 +1279,8 @@ mod tests {
             assert_eq!(
                 clause,
                 &EnvClause::Roles {
-                    baseline: vec!["p".into()],
-                    comparisons: vec!["s".into()],
+                    baseline: vec![RoleRef::Env("p".into())],
+                    comparisons: vec![RoleRef::Env("s".into())],
                     baseline_show: vec!["Time".into()],
                 }
             );

@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt};
+use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -434,7 +434,17 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
                     "a role clause needs at least one COMPARISON environment",
                 ));
             }
-            baseline.iter().chain(comparisons.iter()).collect()
+            // Only live env-name refs are checked against the loaded set; a
+            // `FILE(…)` snapshot is a path resolved (and reported non-fatally if
+            // missing) at run time, not an environment.
+            baseline
+                .iter()
+                .chain(comparisons.iter())
+                .filter_map(|r| match r {
+                    RoleRef::Env(n) => Some(n),
+                    RoleRef::File(_) => None,
+                })
+                .collect()
         }
     };
     if let Some(loaded) = ctx.env_names {

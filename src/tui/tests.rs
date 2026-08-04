@@ -4112,8 +4112,11 @@ fn help_popup_any_other_key_closes_it_from_either_tab() {
         overlay: Some(Overlay::Help(1)),
         ..Default::default()
     };
-    press(&mut app, KeyCode::Char('q'));
-    assert!(app.overlay.is_none(), "q closes Help from the Glossary tab");
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.overlay.is_none(),
+        "Enter closes Help from the Glossary tab"
+    );
 }
 
 #[test]
@@ -4397,6 +4400,131 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
     assert!(
         text.contains("copy the selection"),
         "the copy-selection shortcut description still appears (possibly wrapped)"
+    );
+}
+
+/// Typing in the Help popup filters its entries to those matching the query
+/// (against both the key column and the description), keeping the enclosing
+/// section heading and dropping sections with no matches. The active filter is
+/// echoed under the tab strip. (#4)
+#[test]
+fn help_type_to_filter_narrows_entries_to_the_query() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?')); // open Help on the Shortcuts tab
+    for c in "grow".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.help_query, "grow", "typing builds the filter query");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help(0))),
+        "typing keeps Help open on its current tab"
+    );
+
+    let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains(&format!("{}grow", s.help_filter_label)),
+        "the active filter is echoed under the tab strip"
+    );
+    assert!(
+        text.contains(s.help_resize),
+        "a matching entry ('shrink / grow response pane') is kept"
+    );
+    assert!(
+        text.contains(s.help_group_panels),
+        "the matching entry's section heading is kept"
+    );
+    assert!(
+        !text.contains(s.help_focus),
+        "a non-matching entry is filtered out"
+    );
+    assert!(
+        !text.contains(s.help_group_navigation),
+        "a section with no matches is dropped entirely"
+    );
+}
+
+/// The filter query survives switching tabs (so a search can be checked against
+/// each view), Backspace trims it, the first Esc clears it and a second Esc then
+/// closes Help. (#4)
+#[test]
+fn help_filter_persists_across_tabs_and_esc_clears_then_closes() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    for c in "zip".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    // "zip" only appears in the Reports tab's grammar, so switch there.
+    press(&mut app, KeyCode::Tab); // Glossary
+    press(&mut app, KeyCode::Tab); // Reports
+    assert!(matches!(app.overlay, Some(Overlay::Help(2))));
+    assert_eq!(app.help_query, "zip", "the filter survives tab switches");
+
+    let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains(s.help_grammar_zip),
+        "the matching grammar entry is kept"
+    );
+    assert!(
+        !text.contains(s.help_grammar_collection),
+        "a non-matching grammar entry is filtered out"
+    );
+
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.help_query, "zi", "Backspace trims the query");
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.help_query, "", "the first Esc clears the filter");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help(2))),
+        "clearing the filter leaves Help open"
+    );
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.overlay.is_none(),
+        "a second Esc (empty filter) closes Help"
+    );
+}
+
+/// A filter that matches nothing on the current tab shows an explanatory line
+/// rather than a blank void. (#4)
+#[test]
+fn help_filter_with_no_matches_shows_a_message() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    for c in "zzqx".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("No entries match"),
+        "an empty result set explains itself"
     );
 }
 
@@ -8366,6 +8494,87 @@ fn saving_a_collection_clears_the_user_added_markers() {
 }
 
 #[test]
+fn saving_a_collection_with_an_empty_multipart_file_field_is_refused() {
+    use crate::i18n::Status;
+    // PaperBoy created these files, so it must be able to read back anything it
+    // writes. A `[Multipart]` file field with no path serializes to an invalid
+    // `file,;` line that its own parser rejects — so the save is refused with a
+    // clear message rather than writing an unreadable file.
+    let dir = temp_dir("savecol_emptyfile");
+    let path = dir.join("out.hurl");
+
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".into(),
+        method: "POST".into(),
+        url: "http://h/upload".into(),
+        form_fields: vec![crate::hurl::FormField {
+            key: "photo".into(),
+            value: String::new(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+        }],
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".into(), vec![entry]));
+    app.active_tab = 1;
+
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    assert!(
+        !path.exists(),
+        "PaperBoy refuses to write a file it couldn't reload"
+    );
+    match &app.status {
+        Some(Status::SaveUnreadableEmptyFile { req, field }) => {
+            assert_eq!(req, "upload");
+            assert_eq!(field, "photo");
+        }
+        other => panic!("expected SaveUnreadableEmptyFile, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn saving_a_collection_with_a_filled_multipart_file_field_round_trips() {
+    use crate::i18n::Status;
+    // The guard only blocks an *empty* path: a real file path saves and reloads
+    // cleanly (so we haven't over-blocked valid multipart requests).
+    let dir = temp_dir("savecol_filledfile");
+    let path = dir.join("out.hurl");
+
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".into(),
+        method: "POST".into(),
+        url: "http://h/upload".into(),
+        form_fields: vec![crate::hurl::FormField {
+            key: "photo".into(),
+            value: "photo.jpg".into(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+        }],
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".into(), vec![entry]));
+    app.active_tab = 1;
+
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    assert!(path.exists(), "a valid multipart request writes normally");
+    assert!(matches!(app.status, Some(Status::Saved)));
+    let reloaded = crate::hurl::parse_hurl(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(reloaded.len(), 1, "the saved file reloads cleanly");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn saving_an_environment_clears_new_and_modified_markers() {
     let dir = temp_dir("saveenv");
     let path = dir.join("out.vars");
@@ -8459,6 +8668,72 @@ fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
     press(&mut app, KeyCode::Tab);
     assert!(app.browser_filter_on);
     assert!(!names(&app).iter().any(|n| n == "notes.txt"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Typing in a load browser filters the file list by name (case-insensitive
+/// substring) on top of the extension filter; Backspace trims the query and the
+/// first Esc clears it (leaving the picker open). Directories stay visible so
+/// the tree remains navigable.
+#[test]
+fn load_browser_type_to_filter_narrows_by_name() {
+    let dir = temp_dir("typefilter");
+    for f in ["api.hurl", "auth.hurl", "data.json"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    app.open_browser(FileAction::OpenCollection);
+    assert!(app.browser_query.is_empty(), "query starts empty");
+
+    // Type "au": only auth.hurl contains it; api.hurl and data.json don't.
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.browser_query, "au");
+    let shown = names(&app);
+    assert!(
+        shown.iter().any(|n| n == "auth.hurl"),
+        "matching file shown"
+    );
+    assert!(
+        !shown.iter().any(|n| n == "api.hurl") && !shown.iter().any(|n| n == "data.json"),
+        "non-matching files hidden: {shown:?}"
+    );
+    assert!(
+        shown.iter().any(|n| n == "sub/"),
+        "directories stay visible for navigation"
+    );
+
+    // Backspace widens the query back to "a": now all three files match.
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.browser_query, "a");
+    let shown = names(&app);
+    assert!(
+        ["api.hurl", "auth.hurl", "data.json"]
+            .iter()
+            .all(|f| shown.iter().any(|n| n == f)),
+        "all files containing 'a' shown: {shown:?}"
+    );
+
+    // First Esc clears the filter but keeps the picker open.
+    press(&mut app, KeyCode::Esc);
+    assert!(app.browser_query.is_empty(), "Esc cleared the query");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Browser(..))),
+        "the picker stays open after clearing the filter"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -10343,6 +10618,41 @@ fn pressing_enter_to_confirm_the_kind_dropdown_stays_on_the_kind_cell() {
     // Tab still advances focus normally, once the dropdown is closed.
     press(&mut app, KeyCode::Tab);
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
+}
+
+#[test]
+fn ctrl_h_deletes_in_an_assert_cell_instead_of_typing_a_literal_h() {
+    // On terminals without the keyboard-enhancement protocol, Backspace arrives
+    // as Ctrl+H (`Char('h')`+CONTROL). It must delete the previous character in
+    // a wizard text cell — not insert a stray `h` (the reported bug).
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::PageDown); // -> Headers
+    press(&mut app, KeyCode::PageDown); // -> Cookies
+    press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
+    press(&mut app, KeyCode::PageDown); // -> Form
+    press(&mut app, KeyCode::PageDown); // -> Body
+    press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Enter); // add a blank assert row
+    assert_eq!(new_focus(&app), NewField::Assert(0));
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(form_ref(&app).asserts[0].expr.text(), "ab");
+
+    // Ctrl+H (how Backspace can arrive) deletes rather than inserting.
+    app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        form_ref(&app).asserts[0].expr.text(),
+        "a",
+        "Ctrl+H deletes the last char and never types a literal 'h'"
+    );
+    assert_eq!(
+        new_focus(&app),
+        NewField::Assert(0),
+        "focus stays on the cell"
+    );
 }
 
 // ── Content-type dropdown (File-kind Form rows) ─────────────────────────
@@ -18602,6 +18912,155 @@ fn report_export_format_follows_the_typed_extension() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A completed run leaves its results *unexported*, so rerunning first asks to
+/// confirm (the on-screen results would otherwise vanish) rather than starting
+/// straight away (#2). The warning is a [`ConfirmAction::RerunReport`] popup and
+/// no run is spawned until it's confirmed.
+#[test]
+fn rerunning_a_report_warns_when_results_are_unexported() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(
+        !app.reports[idx].results_exported,
+        "a fresh run's results start unexported"
+    );
+    assert!(app.rerun_would_discard_unexported());
+
+    app.run_active_report();
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::RerunReport,
+                ..
+            })
+        ),
+        "rerun over unexported results should ask to confirm first"
+    );
+    assert!(
+        app.running_reports.is_empty(),
+        "no run should start until the warning is confirmed"
+    );
+}
+
+/// Exporting the results (here as CSV) marks them saved, so a later rerun no
+/// longer warns (#2).
+#[test]
+fn exporting_report_results_clears_the_rerun_warning() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-rerun-export-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.trail");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(app.rerun_would_discard_unexported());
+
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
+    assert!(
+        app.reports[idx].results_exported,
+        "a successful export marks the results saved"
+    );
+    assert!(
+        !app.rerun_would_discard_unexported(),
+        "exported results need no rerun warning"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Saving a `.baseline` snapshot also persists the results, so it clears the
+/// rerun warning too (#2).
+#[test]
+fn saving_a_report_baseline_clears_the_rerun_warning() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-rerun-baseline-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.trail");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(app.rerun_would_discard_unexported());
+
+    app.browser_commit_save(
+        FileAction::SaveReportBaselineChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
+    assert!(
+        app.reports[idx].results_exported,
+        "saving a baseline snapshot marks the results saved"
+    );
+    assert!(!app.rerun_would_discard_unexported());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Exporting before a run reports why nothing can be written and does NOT open
 /// the folder picker.
 #[test]
@@ -20294,8 +20753,60 @@ fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
     assert!(app.pending_node_folder.is_some(), "the node is parked");
 }
 
-/// Confirming a folder pick writes the chosen directory into the loop's
-/// producer and re-serializes the flow.
+/// Inserting a `FILES`/`FOLDERS` loop from the palette jumps straight into the
+/// folder picker rather than the raw line prompt — a loop's source directory is
+/// the whole point, so the user should choose it immediately.
+#[test]
+fn report_node_inserting_a_files_loop_opens_the_folder_picker_immediately() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    // Selection starts on Begin (row 0); `a` opens the insert palette.
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
+    // FILES is index 4 in NodeKind::ALL; Down four times, then commit the kind.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
+        ),
+        "inserting a FILES loop opens the folder picker straight away"
+    );
+    assert!(app.pending_node_folder.is_some(), "the new node is parked");
+    assert!(
+        app.reports[idx].report.text.contains("IN FILES"),
+        "the FILES loop template was inserted: {:?}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Inserting a `FOR … IN ENVS` loop from the palette opens the ENVS configure
+/// popup (baseline / comparison / mode) straight away — the same view Enter
+/// opens on an existing ENVS node — rather than the raw line prompt, so every
+/// freshly-inserted node lands in its most helpful editor.
+#[test]
+fn report_node_inserting_an_envs_loop_opens_the_configure_popup_immediately() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    // Selection starts on Begin (row 0); `a` opens the insert palette.
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
+    // ENVS is index 6 in NodeKind::ALL; Down six times, then commit the kind.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeEnvs(_))),
+        "inserting a FOR … IN ENVS loop opens the baseline/comparison popup straight away"
+    );
+    assert!(
+        app.reports[idx].report.text.contains("IN ENVS"),
+        "the ENVS loop template was inserted: {:?}",
+        app.reports[idx].report.text
+    );
+}
 #[test]
 fn report_node_folder_commit_writes_into_the_loop_producer() {
     let (mut app, idx) = node_editor_app(&["upload"]);
@@ -21420,6 +21931,47 @@ fn enter_on_cursor_opens_cell_popup() {
     let _ = idx;
 }
 
+/// A cell whose whole value is a compact JSON document is pretty-printed in the
+/// drill-down popup (indented, one field per line) so it's readable; other
+/// cells are left untouched.
+#[test]
+fn cell_popup_pretty_prints_a_json_cell() {
+    use crate::report::model::{ReportResult, ReportRow};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut row = ReportRow::default();
+    row.cells
+        .insert("Body".to_string(), r#"{"a":1,"b":[2,3]}"#.to_string());
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: vec!["Body".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    press(&mut app, KeyCode::Enter); // initialise cursor at (0,0)
+    press(&mut app, KeyCode::Enter); // open the popup
+    match &app.overlay {
+        Some(Overlay::ReportCellPopup { content, .. }) => {
+            assert!(
+                content.contains('\n') && content.contains("\"a\": 1"),
+                "JSON cell should be pretty-printed; got: {content:?}"
+            );
+        }
+        _ => panic!("expected Overlay::ReportCellPopup"),
+    }
+}
+
 #[test]
 fn enter_with_no_cursor_initialises_cursor_and_does_not_open_popup() {
     let (mut app, idx) = report_with_multi_row_result();
@@ -21864,6 +22416,27 @@ mod all_view_layout {
         assert!(
             cols.iter().all(|c| *c == cols[0]),
             "the '(＋ Add …)' actions should all start at the same column, got {cols:?}:\n{out}"
+        );
+    }
+
+    #[test]
+    fn loading_an_invalid_hurl_collection_reports_the_parse_reason() {
+        // A `[Multipart]` `file,;` with an empty filename makes `hurl_core`
+        // reject the whole file. Loading it should surface the concrete line +
+        // reason, not just the generic "no requests found" message.
+        let mut app = TuiApp::default();
+        let content = "# upload\nPOST http://h/upload\n[Multipart]\nphoto: file,;\n";
+        let ok = app.load_collection_text("bad".to_string(), content, None);
+        assert!(!ok, "an invalid collection does not load");
+        let s = crate::i18n::Strings::for_language(&Language::English);
+        let text = app.status.as_ref().expect("a status is set").text(&s);
+        assert!(
+            text.contains(s.file_not_collection_prefix),
+            "the message uses the collection-invalid prefix: {text}"
+        );
+        assert!(
+            text.contains("line 4") && text.to_lowercase().contains("filename"),
+            "the message names the offending line and reason: {text}"
         );
     }
 }

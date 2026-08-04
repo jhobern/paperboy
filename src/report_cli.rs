@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::environment::{looks_like_env, parse_vars};
-use crate::postman::parse_collection;
+use crate::postman::{looks_like_postman, parse_collection};
 use crate::report::flow::Header;
 use crate::report::producers::resolve_path;
 use crate::report::report::{expand_output_tokens, name_has_output_token};
@@ -96,7 +96,16 @@ pub fn run(
     };
     let entries = parse_collection(&col_content);
     if entries.is_empty() {
-        eprintln!("error: no requests found in '{collection_path}'");
+        // As in `cli.rs`: prefer the concrete Hurl parse reason (line + what's
+        // wrong) when the source is Hurl — one malformed line rejects the whole
+        // file, so "no requests found" alone hides the real cause.
+        match (!looks_like_postman(&col_content))
+            .then(|| crate::hurl::parse_hurl_error(&col_content))
+            .flatten()
+        {
+            Some(why) => eprintln!("error: no requests found in '{collection_path}' — {why}"),
+            None => eprintln!("error: no requests found in '{collection_path}'"),
+        }
         return 1;
     }
 

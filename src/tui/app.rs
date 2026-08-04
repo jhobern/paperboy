@@ -582,6 +582,12 @@ pub(crate) enum ConfirmAction {
     /// values. Holds the env id. Raised by `Ctrl+R` in the entries popup only
     /// when the env has unsaved changes.
     RevertEnv(u64),
+    /// Rerun the active report when its current on-screen results haven't been
+    /// exported (CSV/JSON/HTML/XLSX or a `.baseline` snapshot) since the run
+    /// that produced them — confirming discards the unsaved results. Acts on the
+    /// active report tab. Raised only when [`ReportTab::results_exported`] is
+    /// false and no run is in flight (#2).
+    RerunReport,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1037,6 +1043,13 @@ pub struct TuiApp {
     /// switched. Lets a Help body taller than the terminal be scrolled with
     /// Up/Down instead of those keys just closing the popup.
     pub(crate) help_scroll: u16,
+    /// Case-insensitive substring filter typed into the open Help popup, or
+    /// empty for "show everything". Applied to every tab's entries (matched
+    /// against both the key/label column and the description) so a user can
+    /// type part of a shortcut or word to narrow a long reference down to the
+    /// lines that mention it. Reset when Help is (re)opened; the first Esc
+    /// clears it and a second Esc then closes Help.
+    pub(crate) help_query: String,
     /// Vertical scroll offset for the report dry-run preview overlay
     /// ([`Overlay::ReportDryRun`]) — reset to 0 when the preview is opened.
     /// Kept on the app (like [`Self::help_scroll`]) so the immutable overlay
@@ -1188,6 +1201,12 @@ pub struct TuiApp {
     /// (`.hurl`/`.json`, `.vars`/`.env*`, `.trail`). On by default; `Tab`
     /// toggles it so an oddly-named file can still be picked. Runtime-only.
     pub(crate) browser_filter_on: bool,
+    /// Type-to-filter query for the local load browser (Open Collection / Load
+    /// Environment / Open Report): printable keys accumulate here and narrow the
+    /// file list to names containing this substring (case-insensitive), on top
+    /// of the extension filter. Backspace trims it, Esc clears it (then cancels
+    /// on a second press), and it resets whenever the browser opens. Runtime-only.
+    pub(crate) browser_query: String,
     /// Which pane focus returns to when the New/Edit Request wizard closes
     /// (whether saved or cancelled). Opening the wizard temporarily moves
     /// focus onto the Main panel so the request preview shows behind it, but
@@ -1265,6 +1284,7 @@ impl Default for TuiApp {
             status: None,
             overlay: None,
             help_scroll: 0,
+            help_query: String::new(),
             dry_run_scroll: 0,
             quit: false,
             pending_env: Vec::new(),
@@ -1296,6 +1316,7 @@ impl Default for TuiApp {
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             browser_filter_on: true,
+            browser_query: String::new(),
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
             pending_workspace_reloads: std::collections::VecDeque::new(),
@@ -1959,6 +1980,12 @@ impl TuiApp {
             },
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
+                // Refuse to write a file PaperBoy couldn't read back: a file
+                // field with no path serializes to an invalid `file,;` line.
+                if let Some((req, field)) = self.collections[ci].first_empty_file_field() {
+                    self.status = Some(Status::SaveUnreadableEmptyFile { req, field });
+                    return;
+                }
                 let text = self.collections[ci].to_hurl();
                 if let Some(parent) = PathBuf::from(path).parent()
                     && !parent.as_os_str().is_empty()
@@ -2123,7 +2150,22 @@ impl TuiApp {
     ) -> bool {
         let entries = crate::postman::parse_collection(content);
         if entries.is_empty() {
-            self.status = Some(Status::NotCollection);
+            // Prefer the concrete Hurl parse reason (line + what's wrong) over
+            // the generic "no requests found": a single malformed line — e.g. a
+            // `[Multipart]` `file,;` with an empty filename — makes `hurl_core`
+            // reject the *entire* file, so pointing at the offending line is far
+            // more actionable. We only do this for Hurl source, not a failed
+            // Postman import, where a Hurl-parse reason would be nonsense.
+            let s = Strings::for_language(&self.language);
+            let reason = if crate::postman::looks_like_postman(content) {
+                None
+            } else {
+                crate::hurl::parse_hurl_error(content)
+            };
+            self.status = Some(match reason {
+                Some(why) => Status::Error(format!("{} {why}", s.file_not_collection_prefix)),
+                None => Status::NotCollection,
+            });
             return false;
         }
         let mut col = Collection::new(name, entries);
@@ -2441,6 +2483,15 @@ impl TuiApp {
             is_move,
         } = transfer;
         let method = entry.method.clone();
+        // Refuse to write a request PaperBoy couldn't read back: a file field
+        // with no path serializes to an invalid `file,;` line.
+        if let Some(field) = entry.first_empty_file_field() {
+            self.status = Some(Status::SaveUnreadableEmptyFile {
+                req: entry.title.clone(),
+                field: field.to_string(),
+            });
+            return;
+        }
         let dest_name = dest_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3243,6 +3294,12 @@ impl TuiApp {
         let Some(path) = self.collections[ci].path.clone() else {
             return false;
         };
+        // Refuse to write a file PaperBoy couldn't read back (see
+        // `SaveCollection`): an empty-path file field breaks reparsing.
+        if let Some((req, field)) = self.collections[ci].first_empty_file_field() {
+            self.status = Some(Status::SaveUnreadableEmptyFile { req, field });
+            return false;
+        }
         let text = self.collections[ci].to_hurl();
         match std::fs::write(&path, text) {
             Ok(()) => {
@@ -3785,6 +3842,19 @@ impl TuiApp {
                                 }
                             }
                             GitSaveSource::Collection => {
+                                // Refuse to push a file PaperBoy couldn't read
+                                // back (see `SaveCollection`): an empty-path
+                                // file field breaks reparsing.
+                                if let Some((req, field)) =
+                                    self.collections[ci].first_empty_file_field()
+                                {
+                                    let s = Strings::for_language(&self.language);
+                                    w.stage = GitSaveStage::Error(
+                                        Status::SaveUnreadableEmptyFile { req, field }.text(&s),
+                                    );
+                                    self.overlay = Some(Overlay::GitSave(w));
+                                    return;
+                                }
                                 let col = &self.collections[ci];
                                 let mut files = vec![(w.collection_path.text(), col.to_hurl())];
                                 if w.include_env

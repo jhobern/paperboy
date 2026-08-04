@@ -243,6 +243,36 @@ impl Pattern {
     }
 }
 
+/// One environment role argument: either a named environment run live each
+/// time, or a previously-exported snapshot loaded once and reused in place of a
+/// live run. `FILE(…)` only appears in argument position inside a role clause
+/// (`BASELINE(…)`/`COMPARISON(…)`), where a bare string would otherwise mean an
+/// environment *name* — so it disambiguates "load this saved snapshot" from
+/// "run this named environment". Every other path in the grammar (`FILES`,
+/// `FOLDERS`, `TUPLES FROM`, header directives) is already unambiguously a path
+/// by keyword/position and stays a bare string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleRef {
+    /// A named environment, run live for this role.
+    Env(String),
+    /// A saved baseline snapshot file (resolved like producer paths, relative to
+    /// `# root:`/the report dir). Its rows stand in for a live run of this role,
+    /// so no environment is executed for it.
+    File(String),
+}
+
+impl RoleRef {
+    /// The comparison *target* identity this ref contributes: a named env is
+    /// keyed by its name, a snapshot by its (relative) path. Used to align the
+    /// injected/produced rows against the role sets in [`super::compare`].
+    pub fn target(&self) -> &str {
+        match self {
+            RoleRef::Env(n) => n,
+            RoleRef::File(p) => p,
+        }
+    }
+}
+
 /// The environment clause of `FOR … IN ENVS …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvClause {
@@ -250,12 +280,15 @@ pub enum EnvClause {
     Plain(Vec<String>),
     /// `BASELINE("prod") SHOW(Time), COMPARISON("staging", …)`.
     ///
+    /// Each role argument is a [`RoleRef`]: a live environment name or a
+    /// `FILE("…")` snapshot to reuse in place of running it.
+    ///
     /// `baseline_show` names the baseline fields to copy into each candidate row
     /// under `baseline.<alias>.<field>` (only for aliases the candidate already
     /// emits that field).  Empty when no `SHOW(…)` clause is present.
     Roles {
-        baseline: Vec<String>,
-        comparisons: Vec<String>,
+        baseline: Vec<RoleRef>,
+        comparisons: Vec<RoleRef>,
         baseline_show: Vec<String>,
     },
 }
@@ -500,7 +533,7 @@ fn env_clause_text(c: &EnvClause) -> String {
         } => {
             let mut parts = Vec::new();
             if !baseline.is_empty() {
-                let names: Vec<String> = baseline.iter().map(|s| quote(s)).collect();
+                let names: Vec<String> = baseline.iter().map(role_ref_text).collect();
                 let mut token = format!("BASELINE({})", names.join(", "));
                 if !baseline_show.is_empty() {
                     token.push_str(&format!(" SHOW({})", baseline_show.join(", ")));
@@ -508,11 +541,20 @@ fn env_clause_text(c: &EnvClause) -> String {
                 parts.push(token);
             }
             if !comparisons.is_empty() {
-                let names: Vec<String> = comparisons.iter().map(|s| quote(s)).collect();
+                let names: Vec<String> = comparisons.iter().map(role_ref_text).collect();
                 parts.push(format!("COMPARISON({})", names.join(", ")));
             }
             parts.join(", ")
         }
+    }
+}
+
+/// Render a single role argument: a bare quoted env name, or `FILE("…")` for a
+/// snapshot reference.
+fn role_ref_text(r: &RoleRef) -> String {
+    match r {
+        RoleRef::Env(n) => quote(n),
+        RoleRef::File(p) => format!("FILE({})", quote(p)),
     }
 }
 

@@ -528,15 +528,22 @@ fn draw_report_node_envs_overlay(
                 } else {
                     entry.name.as_str()
                 };
+                // A snapshot reference reads as `FILE(‹…›)` so it mirrors the
+                // grammar it serializes to; a live env is just `‹name›`.
+                let value = if entry.file {
+                    format!("{}(‹{shown}›)", s.report_node_envs_file)
+                } else {
+                    format!("‹{shown}›")
+                };
                 let text = if form.compare {
                     let role = if entry.baseline {
                         s.report_node_envs_baseline
                     } else {
                         s.report_node_envs_comparison
                     };
-                    format!("  [{role}] ‹{shown}›")
+                    format!("  [{role}] {value}")
                 } else {
-                    format!("  ‹{shown}›")
+                    format!("  {value}")
                 };
                 Line::from(Span::styled(text, base))
             }
@@ -1097,10 +1104,12 @@ pub(crate) fn draw_collection_left(
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
     let smap = crate::request::subst_map(col, env.as_ref());
-    // Columns available for the URL text (after the border, highlight symbol,
-    // user-added marker and the fixed method column). Recorded so h-scrolling
-    // can be clamped to stop once the URL's end is visible (no blank overscroll).
-    let url_w = panes[0].width.saturating_sub(2 + 2 + 2 + 5);
+    // Columns available for the URL text (after the border, user-added marker
+    // and the fixed method column). The selected row is shown highlighted
+    // rather than with a leftmost caret, so no column is reserved for one.
+    // Recorded so h-scrolling can be clamped to stop once the URL's end is
+    // visible (no blank overscroll).
+    let url_w = panes[0].width.saturating_sub(2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -1382,15 +1391,12 @@ pub(crate) fn draw_collection_left(
         .title(Line::from(title_spans))
         .style(Style::default().bg(th.panel))
         .title_bottom(Line::styled(run_hint, Style::default().fg(th.dim)));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(th.accent)
-                .fg(th.bg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(th.accent)
+            .fg(th.bg)
+            .add_modifier(Modifier::BOLD),
+    );
     let mut st = ListState::default();
     if !view_rows.is_empty() {
         st.select(Some(sel));
@@ -1480,10 +1486,11 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     let sel = app
         .global_env_idx
         .min(app.global_envs.len().saturating_sub(1));
-    // Columns available for the name text (after the border, highlight
-    // symbol, the leftmost pencil column and the active-marker column); used
-    // to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2 + 2);
+    // Columns available for the name text (after the border, the leftmost
+    // pencil column and the active-marker column). The selected row is shown
+    // highlighted rather than with a leftmost caret, so no column is reserved
+    // for one. Used to clamp scrolling.
+    let text_w = area.width.saturating_sub(2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
     let sel_len = app
         .global_envs
@@ -1557,8 +1564,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .collect();
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD))
-        .highlight_symbol("› ");
+        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
     let mut st = ListState::default();
     st.select(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
@@ -2834,6 +2840,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .replace("{e}", &name)
                         .replace("{n}", &n.to_string())
                 }
+                ConfirmAction::RerunReport => s.confirm_rerun_report_q.to_string(),
             };
             draw_confirm_popup(
                 f,
@@ -2862,6 +2869,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // to whatever's actually available on narrow terminals).
             let box_w = f.area().width.saturating_sub(6).clamp(64, 100);
             let inner_w = (box_w as usize).saturating_sub(2); // minus the left/right border
+
+            // Active type-to-filter query (see `TuiApp::help_query`). A row is
+            // kept when any of its text columns contains the query (case-
+            // insensitively); an empty query keeps everything.
+            let query = app.help_query.to_ascii_lowercase();
+            let filtering = !query.is_empty();
+            let matches = |texts: &[&str]| -> bool {
+                query.is_empty()
+                    || texts
+                        .iter()
+                        .any(|t| t.to_ascii_lowercase().contains(query.as_str()))
+            };
 
             let tab_bar = |active: usize| {
                 Line::from(vec![
@@ -3016,12 +3035,19 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     ),
                 ];
                 let mut body = Vec::new();
-                for (i, (heading, entries)) in groups.iter().enumerate() {
-                    if i > 0 {
+                for (heading, entries) in groups.iter() {
+                    let kept: Vec<&(&str, &str)> = entries
+                        .iter()
+                        .filter(|(k, d)| matches(&[k, d, heading]))
+                        .collect();
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    if !body.is_empty() {
                         body.push(Line::raw(""));
                     }
                     body.push(help_section_divider(heading, inner_w, th));
-                    for &(shortcut, desc) in entries.iter() {
+                    for &(shortcut, desc) in kept {
                         body.extend(help_entry_lines(shortcut, desc, inner_w));
                     }
                 }
@@ -3029,7 +3055,27 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             };
 
             let glossary_body = || {
-                let mut body = vec![help_section_divider(s.glossary_heading, inner_w, th)];
+                let render_group =
+                    |body: &mut Vec<Line<'static>>,
+                     heading: &str,
+                     entries: &[(&str, Color, &str, &str)]| {
+                        let kept: Vec<&(&str, Color, &str, &str)> = entries
+                            .iter()
+                            .filter(|(_, _, label, desc)| matches(&[label, desc, heading]))
+                            .collect();
+                        if kept.is_empty() {
+                            return;
+                        }
+                        if !body.is_empty() {
+                            body.push(Line::raw(""));
+                        }
+                        body.push(help_section_divider(heading, inner_w, th));
+                        for &&(icon, color, label, desc) in kept.iter() {
+                            body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
+                        }
+                    };
+
+                let mut body: Vec<Line<'static>> = Vec::new();
                 let entries: [(&str, Color, &str, &str); 5] = [
                     (
                         "\u{25cf}",
@@ -3062,14 +3108,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_desc_shadowed,
                     ),
                 ];
-                for (icon, color, label, desc) in entries {
-                    body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
-                }
+                render_group(&mut body, s.glossary_heading, &entries);
                 // A second group covers every other icon shown around the
                 // app (list rows, tab bar, form editor) so this one tab is
                 // a complete legend rather than just the substitution dots.
-                body.push(Line::raw(""));
-                body.push(help_section_divider(s.glossary_heading_icons, inner_w, th));
                 let icon_entries: [(&str, Color, &str, &str); 9] = [
                     (
                         "\u{270e}",
@@ -3121,9 +3163,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_desc_scroll_hint,
                     ),
                 ];
-                for (icon, color, label, desc) in icon_entries {
-                    body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
-                }
+                render_group(&mut body, s.glossary_heading_icons, &icon_entries);
                 body
             };
 
@@ -3131,29 +3171,49 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // Render one titled group whose descriptions all align to that
                 // group's own widest key (so long grammar left-hand sides don't
                 // shove their descriptions out of line with the short ones).
+                // Under an active filter, only matching rows are kept and a
+                // group with no matches is dropped entirely.
                 let group = |body: &mut Vec<Line<'static>>,
                              heading: &'static str,
                              entries: &[(&'static str, &'static str)]| {
+                    let kept: Vec<&(&'static str, &'static str)> = entries
+                        .iter()
+                        .filter(|(k, d)| matches(&[k, d, heading]))
+                        .collect();
+                    if kept.is_empty() {
+                        return;
+                    }
+                    if !body.is_empty() {
+                        body.push(Line::raw(""));
+                    }
                     body.push(help_section_divider(heading, inner_w, th));
-                    let key_col = entries
+                    let key_col = kept
                         .iter()
                         .map(|(k, _)| k.chars().count())
                         .max()
                         .unwrap_or(0)
                         .clamp(6, 34);
-                    for &(code, desc) in entries {
+                    for &&(code, desc) in kept.iter() {
                         body.extend(help_entry_lines_col(code, desc, key_col, inner_w));
                     }
                 };
 
-                let mut body = vec![help_section_divider(
-                    s.help_reports_about_heading,
-                    inner_w,
-                    th,
-                )];
-                for para in [s.help_reports_about_1, s.help_reports_about_2] {
-                    body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
-                    body.push(Line::raw(""));
+                let mut body: Vec<Line<'static>> = Vec::new();
+                // The prose intro is orientation, not a searchable entry, so it's
+                // hidden while filtering to keep the results tight.
+                if !filtering {
+                    body.push(help_section_divider(
+                        s.help_reports_about_heading,
+                        inner_w,
+                        th,
+                    ));
+                    for para in [s.help_reports_about_1, s.help_reports_about_2] {
+                        body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
+                        body.push(Line::raw(""));
+                    }
+                    // Drop the trailing blank so the first group's own leading
+                    // blank isn't doubled up.
+                    body.pop();
                 }
 
                 group(
@@ -3177,7 +3237,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("→", s.help_report_complete),
                     ],
                 );
-                body.push(Line::raw(""));
                 group(
                     &mut body,
                     s.help_reports_grammar_heading,
@@ -3193,7 +3252,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
                     ],
                 );
-                body.push(Line::raw(""));
                 group(
                     &mut body,
                     s.help_reports_loops_heading,
@@ -3221,25 +3279,53 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 ),
                 tab_bar(*tab),
             ];
-            lines.extend(match *tab {
+            // Show the active filter (and let the user see what they've typed)
+            // on its own line just under the tab strip.
+            if filtering {
+                lines.push(Line::from(vec![
+                    Span::styled(s.help_filter_label, Style::default().fg(th.dim)),
+                    Span::styled(
+                        app.help_query.clone(),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            let body = match *tab {
                 0 => shortcuts_body(),
                 1 => glossary_body(),
                 _ => reports_body(),
-            });
+            };
+            // A filter that matches nothing on this tab would otherwise leave a
+            // blank void — say so, and point out the filter spans every tab.
+            if filtering && body.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    s.help_filter_no_matches,
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                lines.extend(body);
+            }
 
-            // All three tabs share one fixed height (the tallest body) so
-            // switching tabs doesn't resize the popup out from under the user
-            // — a stable box makes the tab strip read as one steady window
-            // rather than a jarring resize on every switch. `centered_rect`
+            // With no filter, all three tabs share one fixed height (the
+            // tallest body) so switching tabs doesn't resize the popup out
+            // from under the user — a stable box makes the tab strip read as
+            // one steady window rather than a jarring resize on every switch.
+            // Under a filter the bodies shrink to the matches, so the popup is
+            // sized to the current (filtered) content instead. `centered_rect`
             // further caps this to the terminal's own height on small
             // terminals, in which case the body is scrolled (Up/Down) with a
             // scrollbar on the right border rather than clipping off the
             // bottom silently.
-            let content_len = lines
-                .len()
-                .max(2 + shortcuts_body().len())
-                .max(2 + glossary_body().len())
-                .max(2 + reports_body().len());
+            let content_len = if filtering {
+                lines.len()
+            } else {
+                lines
+                    .len()
+                    .max(2 + shortcuts_body().len())
+                    .max(2 + glossary_body().len())
+                    .max(2 + reports_body().len())
+            };
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
@@ -3547,6 +3633,29 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 }
                 app.push_mouse_hit(MouseLayer::Overlay, inner, MouseHitTarget::BrowserNameField);
                 register_browser_hits(app, ex, rows[0]);
+            } else if !app.browser_query.is_empty() {
+                // An active type-to-filter query gets a one-line strip beneath
+                // the list so it's obvious the list is being filtered (and by
+                // what) rather than mysteriously short.
+                let rows =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+                ex.widget().render_ref(rows[0], f.buffer_mut());
+                register_browser_hits(app, ex, rows[0]);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
+                        Span::styled(
+                            app.browser_query.clone(),
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                    // Fill the theme panel background (like the export-format
+                    // strip and the Help filter) so the strip blends with the
+                    // explorer's own `th.panel` block instead of showing the
+                    // terminal's default background.
+                    .style(Style::default().bg(th.panel)),
+                    rows[1],
+                );
             } else {
                 ex.widget().render_ref(area, f.buffer_mut());
                 register_browser_hits(app, ex, area);

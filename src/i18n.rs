@@ -104,6 +104,7 @@ strings! {
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
+    confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
     confirm_yes => "Yes", "Oui", "Ja";
     confirm_no => "No", "Non", "Nej";
     file_menu => "File", "Fichier", "Fil";
@@ -145,6 +146,8 @@ strings! {
     file_no_response => "No response to save.", "Aucune réponse à enregistrer.", "Intet svar at gemme.";
     file_error_prefix => "Error:", "Erreur :", "Fejl:";
     file_not_collection => "Not a valid collection file (no requests found).", "Fichier de collection invalide (aucune requête trouvée).", "Ikke en gyldig samlingsfil (ingen anmodninger fundet).";
+    file_not_collection_prefix => "Not a valid collection file —", "Fichier de collection invalide —", "Ikke en gyldig samlingsfil —";
+    save_unreadable_empty_file => "Won't save — the multipart file field '{field}' in '{req}' has no file path, which PaperBoy couldn't read back. Pick a file or remove the field.", "Enregistrement refusé — le champ fichier multipart « {field} » dans « {req} » n'a pas de chemin, que PaperBoy ne pourrait pas relire. Choisissez un fichier ou supprimez le champ.", "Gemmer ikke — multipart-filfeltet '{field}' i '{req}' har ingen filsti, som PaperBoy ikke kunne læse igen. Vælg en fil, eller fjern feltet.";
     file_not_environment => "Not a valid environment file (expected KEY=value lines).", "Fichier d'environnement invalide (lignes CLÉ=valeur attendues).", "Ikke en gyldig miljøfil (forventede NØGLE=værdi-linjer).";
     open_workspace => "Choose Workspace Folder…", "Choisir le dossier Workspace…", "Vælg Workspace-mappe…";
     browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · ^r nulstil · Esc annuller";
@@ -299,6 +302,7 @@ strings! {
     browser_filename_label => "File name", "Nom du fichier", "Filnavn";
     browser_foldername_label => "Folder name", "Nom du dossier", "Mappenavn";
     browser_name_hint => "Enter save · Esc back to list", "Entrée enregistrer · Échap retour à la liste", "Enter gem · Esc tilbage til listen";
+    browser_filter_label => "Filter: ", "Filtre : ", "Filter: ";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
     git_workspace_storage_q => "Workspace downloaded. Keep it in a temporary folder, or save it to a permanent location now?", "Workspace téléchargé. Le garder dans un dossier temporaire, ou l'enregistrer dans un emplacement permanent maintenant ?", "Workspace downloadet. Behold den i en midlertidig mappe, eller gem den på en permanent placering nu?";
@@ -356,7 +360,9 @@ strings! {
     help_heading => "PaperBoy — Terminal UI", "PaperBoy — Interface Terminal", "PaperBoy — Terminalgrænseflade";
     help_tab_shortcuts => "Shortcuts", "Raccourcis", "Genveje";
     help_tab_glossary => "Glossary", "Glossaire", "Ordliste";
-    help_tab_switch_hint => "Tab / ←→ to switch view", "Tab / ←→ pour changer de vue", "Tab / ←→ for at skifte visning";
+    help_tab_switch_hint => "Tab / ←→ switch view · type to filter", "Tab / ←→ changer de vue · tapez pour filtrer", "Tab / ←→ skift visning · skriv for at filtrere";
+    help_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    help_filter_no_matches => "No entries match — the filter applies per tab, so try another view (Tab / ←→).", "Aucune entrée ne correspond — le filtre s'applique par onglet, essayez une autre vue (Tab / ←→).", "Ingen poster matcher — filteret gælder pr. fane, så prøv en anden visning (Tab / ←→).";
     glossary_heading => "Substitution colours & icons — Request JSON/Hurl view", "Couleurs et icônes de substitution — vue Requête JSON/Hurl", "Substitutionsfarver & ikoner — Request JSON/Hurl-visning";
     glossary_label_literal => "literal", "littéral", "literal";
     glossary_desc_literal => "A plain literal value from the active Environment, substituted directly.", "Une valeur littérale simple de l'environnement actif, substituée directement.", "En simpel literal værdi fra det aktive miljø, indsat direkte.";
@@ -448,7 +454,7 @@ strings! {
     help_report_focus_cycle => "cycle focus: editor → results → editor (tree included for workspace reports)", "faire défiler le focus : éditeur → résultats → éditeur (arbre inclus pour les rapports d'espace de travail)", "skift fokus: editor → resultater → editor (træ inkluderet for workspace-rapporter)";
     help_report_workspace_tree => "in a workspace report: ↑↓ move the pinned tree · Enter open a report/collection · ←/→ up/into a folder", "dans un rapport d'espace de travail : ↑↓ déplacer l'arbre épinglé · Entrée ouvrir un rapport/une collection · ←/→ monter/entrer dans un dossier", "i en arbejdsområderapport: ↑↓ flyt det fastgjorte træ · Enter åbn en rapport/samling · ←/→ op/ind i en mappe";
     help_report_export => "export the last run (CSV / JSON / HTML / xlsx by extension)", "exporter la dernière exécution (CSV / JSON / HTML / xlsx selon l'extension)", "eksportér den seneste kørsel (CSV / JSON / HTML / xlsx efter filtype)";
-    help_report_baseline => "save the last run as a .baseline snapshot to compare future runs against", "enregistrer la dernière exécution comme instantané .baseline pour comparer les exécutions futures", "gem den seneste kørsel som et .baseline-øjebliksbillede at sammenligne fremtidige kørsler med";
+    help_report_baseline => "save the last run as a .baseline snapshot — reference it later with BASELINE(FILE) or COMPARISON(FILE)", "enregistrer la dernière exécution comme instantané .baseline — à réutiliser via BASELINE(FILE) ou COMPARISON(FILE)", "gem den seneste kørsel som et .baseline-øjebliksbillede — genbrug det med BASELINE(FILE) eller COMPARISON(FILE)";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
     help_report_bind => "bind the report to one of the open collections", "lier le rapport à l'une des collections ouvertes", "bind rapporten til en af de åbne samlinger";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
@@ -490,7 +496,7 @@ strings! {
     prompt_reset_hint => "^R reset", "^R réinitialiser", "^R nulstil";
     browser_select_file => "Select file", "Sélectionner un fichier", "Vælg fil";
     browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
-    browser_hint_filter => "Enter open · Tab all/matching · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · Tab tous/correspondants · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · Tab alle/matchende · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
+    browser_hint_filter => "Enter open · Tab all/matching · type to filter · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · Tab tous/correspondants · taper pour filtrer · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · Tab alle/matchende · skriv for at filtrere · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
@@ -513,7 +519,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "↑/↓/←/→ cursor · Enter drill-down · v source · x export · B baseline", "↑/↓/←/→ curseur · Entrée exploration · v source · x export · B référence", "↑/↓/←/→ markør · Enter udforsk · v kilde · x export · B basislinje";
+    report_hint_results => "Enter drill-down · v source · x export · B baseline", "Entrée exploration · v source · x export · B référence", "Enter udforsk · v kilde · x export · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -590,13 +596,14 @@ strings! {
     report_node_alias_label => "Alias", "Alias", "Alias";
     report_node_alias_none => "(request name)", "(nom de la requête)", "(forespørgselsnavn)";
     report_node_envs_title => "Configure ENVS loop", "Configurer la boucle ENVS", "Konfigurer ENVS-løkke";
-    report_node_envs_hint => "↑↓ move · ←/→ pick env · b baseline · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · n tilføj · x fjern · Enter anvend · Esc annuller";
+    report_node_envs_hint => "↑↓ move · ←/→ pick env · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
     report_node_envs_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
     report_node_envs_mode_label => "Mode", "Mode", "Tilstand";
     report_node_envs_mode_plain => "Iterate", "Itérer", "Iterér";
     report_node_envs_mode_roles => "Compare", "Comparer", "Sammenlign";
     report_node_envs_baseline => "Baseline", "Référence", "Basislinje";
     report_node_envs_comparison => "Comparison", "Comparaison", "Sammenligning";
+    report_node_envs_file => "FILE", "FILE", "FILE";
     report_node_envs_none => "no environments loaded — load one to pick", "aucun environnement chargé — en charger un pour choisir", "ingen miljøer indlæst — indlæs et for at vælge";
 }
 
@@ -703,6 +710,14 @@ pub enum Status {
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
+    /// A collection save was refused because a `[Multipart]` file field has no
+    /// file path: it would serialize to an invalid `file,;` line that
+    /// PaperBoy's own parser rejects, so the file couldn't be reloaded. Holds
+    /// the request title and the offending field key.
+    SaveUnreadableEmptyFile {
+        req: String,
+        field: String,
+    },
     /// A theme was saved (created or updated) from the Theme editor; names it.
     ThemeSaved(String),
     /// A custom theme was deleted from the Theme editor; names it.
@@ -868,6 +883,10 @@ impl Status {
                 .request_copied
                 .replace("{m}", method)
                 .replace("{dest}", dest),
+            Status::SaveUnreadableEmptyFile { req, field } => s
+                .save_unreadable_empty_file
+                .replace("{field}", field)
+                .replace("{req}", req),
             Status::ThemeSaved(name) => format!("{} {name}", s.theme_saved),
             Status::ThemeDeleted(name) => format!("{} {name}", s.theme_deleted),
             Status::ThemeNameRequired => s.theme_name_required.to_string(),

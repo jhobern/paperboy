@@ -20,7 +20,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
-use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, TuiApp};
+use super::app::{
+    ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, TuiApp,
+};
 use super::draw::panel;
 use super::editor::{
     Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
@@ -187,6 +189,12 @@ pub(crate) struct ReportTab {
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
+    /// Whether the current [`result`](Self::result) has been exported (CSV / JSON
+    /// / HTML / XLSX) since it was produced. Set `false` every time a run yields
+    /// a fresh result and `true` once an export of it completes, so a rerun can
+    /// warn before it discards results the user hasn't saved anywhere. A result
+    /// that's only ever been viewed on screen counts as unexported.
+    pub(crate) results_exported: bool,
     /// Live streaming state while a background run is in flight: which of the
     /// pre-built skeleton rows have been filled yet (so the grid greys the
     /// pending ones) and the path→row-index lookup that routes each streamed row
@@ -351,6 +359,7 @@ impl ReportTab {
             node_selected: 0,
             node_undo: Vec::new(),
             result: None,
+            results_exported: false,
             run_progress: None,
             results_panel,
             cell_cursor: None,
@@ -1077,9 +1086,41 @@ impl TuiApp {
     /// validation errors) reports why in the status bar and keeps the source
     /// view; the delivered result is folded in by [`Self::poll_report_run_updates`].
     pub(crate) fn run_active_report(&mut self) {
+        // Guard against a rerun silently discarding on-screen results the user
+        // hasn't saved anywhere: ask first (#2). A run already in flight, or a
+        // report with nothing worth keeping, skips straight through.
+        if self.rerun_would_discard_unexported() {
+            self.overlay = Some(Overlay::Confirm {
+                action: ConfirmAction::RerunReport,
+                sel: 0,
+            });
+            return;
+        }
+        self.start_active_report_run();
+    }
+
+    /// Start (or cancel) a run of the active report without the unexported-result
+    /// guard. Reached directly once the rerun warning has been confirmed, and by
+    /// [`Self::run_active_report`] when there's nothing to warn about.
+    pub(crate) fn start_active_report_run(&mut self) {
         if let Some((report_id, inputs)) = self.prepare_report_run() {
             self.spawn_report_run(report_id, inputs, |file_root| LiveRunner { file_root });
         }
+    }
+
+    /// Whether pressing "run" on the active report would throw away results the
+    /// user hasn't exported. True only when the active report holds a result
+    /// that hasn't been saved since it was produced *and* no run is currently in
+    /// flight — a second `r` during a run is a cancel (handled in
+    /// [`Self::prepare_report_run`]), not a rerun, so it must not be gated.
+    pub(crate) fn rerun_would_discard_unexported(&self) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        let rt = &self.reports[idx];
+        rt.result.is_some()
+            && !rt.results_exported
+            && !self.running_reports.contains_key(&rt.report.id)
     }
 
     /// Test seam: start a background run of the active report with an injected
@@ -1312,6 +1353,9 @@ impl TuiApp {
                     .collect();
                 let rt = &mut self.reports[idx];
                 rt.result = Some(result);
+                // A fresh run's output starts life unexported, so a later rerun
+                // can warn before discarding it (#2).
+                rt.results_exported = false;
                 rt.run_progress = Some(RunProgress {
                     states: vec![RowState::Scheduled; n],
                     index,
@@ -1402,6 +1446,9 @@ impl TuiApp {
                 let rows = result.rows.len();
                 let errors = result.errors.len();
                 rt.result = Some(result);
+                // The finalized result supersedes the skeleton and is likewise
+                // unexported until the user saves it somewhere (#2).
+                rt.results_exported = false;
                 // The finalized grid may have different columns/rows than the
                 // streamed skeleton — reset cursor so it starts fresh.
                 rt.cell_cursor = None;
@@ -1439,6 +1486,7 @@ impl TuiApp {
                 let errors = result.errors.len();
                 let rt = &mut self.reports[idx];
                 rt.result = Some(result);
+                rt.results_exported = false;
                 rt.cell_cursor = None;
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
@@ -1557,7 +1605,12 @@ impl TuiApp {
             }
         };
         match std::fs::write(path, bytes) {
-            Ok(()) => self.status = Some(Status::ReportExported(path.display().to_string())),
+            Ok(()) => {
+                // The result now lives on disk, so a rerun needn't warn about
+                // discarding it (#2).
+                self.reports[idx].results_exported = true;
+                self.status = Some(Status::ReportExported(path.display().to_string()));
+            }
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
         }
     }
@@ -1609,7 +1662,12 @@ impl TuiApp {
         };
         let baseline = crate::report::Baseline::from_result(result);
         match baseline.save(path) {
-            Ok(()) => self.status = Some(Status::ReportBaselineSaved(path.display().to_string())),
+            Ok(()) => {
+                // Saving a baseline snapshot persists the result to disk, so a
+                // rerun needn't warn about discarding it (#2).
+                self.reports[idx].results_exported = true;
+                self.status = Some(Status::ReportBaselineSaved(path.display().to_string()));
+            }
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
         }
     }
@@ -1745,6 +1803,10 @@ impl TuiApp {
         let title = col_def.header.clone();
         // Full (unflattened) cell value — may be multi-line.
         let content = col_def.value(data_row, &result.no_match_marker);
+        // Pretty-print the cell when its whole trimmed value is a single JSON
+        // document (e.g. a captured response body), so drilling into it shows
+        // an indented, one-field-per-line view instead of a dense single line.
+        let content = pretty_print_json_cell(&content);
         let mut panel = Box::new(MultiSelectPanel::new());
         // Wrap mode so long values wrap to multiple lines inside the popup.
         panel.set_wrap_mode(WrapMode::Wrap);
@@ -2640,6 +2702,24 @@ const INDENT_UNIT: &str = "    ";
 /// current line's indentation onto a freshly-inserted newline).
 fn leading_ws(line: &str) -> String {
     line.chars().take_while(|c| c.is_whitespace()).collect()
+}
+
+/// Pretty-print `raw` when its whole trimmed text is a single valid JSON
+/// document, so a drilled-into cell holding a JSON body is shown indented (one
+/// field per line) instead of a dense single line. Content that isn't valid
+/// JSON — or is only partially JSON — is returned unchanged, so plain text,
+/// numbers and multi-value cells are never mangled.
+fn pretty_print_json_cell(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // A bare scalar like `42` or `"x"` is technically valid JSON but gains
+    // nothing from pretty-printing; only objects/arrays are worth reflowing.
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return raw.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.to_string()),
+        Err(_) => raw.to_string(),
+    }
 }
 
 /// If the editor's current line now reads exactly `END` (ignoring case and
@@ -3839,7 +3919,7 @@ fn draw_editor_ghost(f: &mut Frame, area: Rect, ed: &Editor, ghost: &str, th: &T
 /// report file or an explicit `# root:`). When unanchored — a never-saved
 /// scratch report with no `# root:` — paths resolve against the process working
 /// directory, which the UI flags so the user knows to save or set `# root:`.
-fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
+pub(crate) fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
     if let Ok(flow) = report.flow()
         && let Some(r) = flow.header.root()
         && !r.trim().is_empty()

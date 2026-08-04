@@ -234,6 +234,17 @@ impl Collection {
         collection_to_hurl(&self.entries)
     }
 
+    /// The first enabled `[Form]`/`[Multipart]` file field with an empty path,
+    /// as `(request title, field key)`. Such a field serializes to an invalid
+    /// `file,;` line that PaperBoy's own Hurl parser rejects, so a file written
+    /// with one couldn't be reloaded. Saves are refused until it's filled in.
+    pub fn first_empty_file_field(&self) -> Option<(String, String)> {
+        self.entries.iter().find_map(|e| {
+            e.first_empty_file_field()
+                .map(|k| (e.title.clone(), k.to_string()))
+        })
+    }
+
     /// Discard the cached request-JSON preview so it is rebuilt from the current
     /// entry and environment. Call after the environment changes (e.g. reloaded)
     /// so freshly-resolved values flow into the next request.

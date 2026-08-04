@@ -28,7 +28,7 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, WithItem,
+    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, RoleRef, WithItem,
 };
 use crate::report::parse_flow;
 
@@ -383,8 +383,8 @@ impl NodeKind {
                 // kick the user out of the node editor). The names are just
                 // placeholders the user replaces with real loaded environments.
                 clause: EnvClause::Roles {
-                    baseline: vec!["baseline".into()],
-                    comparisons: vec!["candidate".into()],
+                    baseline: vec![RoleRef::Env("baseline".into())],
+                    comparisons: vec![RoleRef::Env("candidate".into())],
                     baseline_show: Vec::new(),
                 },
                 body: Vec::new(),
@@ -671,9 +671,12 @@ pub(crate) enum EnvsRow {
 
 /// One chosen environment in the [`EnvsForm`]. `baseline` is only meaningful in
 /// Compare mode (at most one entry is the baseline; the rest are comparisons).
+/// `file` marks a `FILE("…")` snapshot reference (a saved baseline reused in
+/// place of a live run) rather than a loaded environment name.
 pub(crate) struct EnvEntry {
     pub(crate) name: String,
     pub(crate) baseline: bool,
+    pub(crate) file: bool,
 }
 
 /// The `FOR … IN ENVS` configure form ([`Overlay::ReportNodeEnvs`]), reached
@@ -694,6 +697,11 @@ pub(crate) struct EnvsForm {
     pub(crate) entries: Vec<EnvEntry>,
     /// Loaded environment names the env rows cycle through (empty ⇒ no picker).
     pub(crate) choices: Vec<String>,
+    /// Discovered `.baseline` snapshot paths (relative to the report root) that a
+    /// `FILE(…)` role entry cycles through — the file analogue of [`Self::choices`].
+    /// Seeded from the report directory plus any snapshot paths already in the
+    /// clause, so an existing `FILE(…)` value is always in the cycle.
+    pub(crate) snapshots: Vec<String>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
     /// Field suffixes from `BASELINE(…) SHOW(…)`.  The form has no editing UI
@@ -704,12 +712,15 @@ pub(crate) struct EnvsForm {
 
 impl EnvsForm {
     /// Build the form from a node's current variable and [`EnvClause`].
+    /// `choices` are the loaded environment names an env entry cycles through;
+    /// `snapshots` are the discovered `.baseline` paths a `FILE(…)` entry cycles.
     fn build(
         report_id: u64,
         path: Vec<usize>,
         var: String,
         clause: &EnvClause,
         choices: Vec<String>,
+        mut snapshots: Vec<String>,
     ) -> Self {
         let (compare, mut entries, baseline_show) = match clause {
             EnvClause::Plain(names) => (
@@ -719,6 +730,7 @@ impl EnvsForm {
                     .map(|n| EnvEntry {
                         name: n.clone(),
                         baseline: false,
+                        file: false,
                     })
                     .collect::<Vec<_>>(),
                 Vec::new(),
@@ -728,26 +740,31 @@ impl EnvsForm {
                 comparisons,
                 baseline_show,
             } => {
-                let mut es: Vec<EnvEntry> = baseline
-                    .iter()
-                    .map(|n| EnvEntry {
-                        name: n.clone(),
-                        baseline: true,
-                    })
-                    .collect();
-                es.extend(comparisons.iter().map(|n| EnvEntry {
-                    name: n.clone(),
-                    baseline: false,
-                }));
+                let entry = |r: &RoleRef, is_baseline: bool| EnvEntry {
+                    name: r.target().to_string(),
+                    baseline: is_baseline,
+                    file: matches!(r, RoleRef::File(_)),
+                };
+                let mut es: Vec<EnvEntry> = baseline.iter().map(|r| entry(r, true)).collect();
+                es.extend(comparisons.iter().map(|r| entry(r, false)));
                 (true, es, baseline_show.clone())
             }
         };
+        // Ensure any snapshot path already used by a FILE entry is in the cycle,
+        // even if it no longer exists on disk (so an existing value survives and
+        // is reachable by cycling).
+        for e in &entries {
+            if e.file && !e.name.trim().is_empty() && !snapshots.iter().any(|s| s == &e.name) {
+                snapshots.push(e.name.clone());
+            }
+        }
         // The clause always keeps at least one entry so it can't serialize to an
         // empty (unparseable) `FOR VAR IN ENVS `.
         if entries.is_empty() {
             entries.push(EnvEntry {
                 name: choices.first().cloned().unwrap_or_default(),
                 baseline: compare,
+                file: false,
             });
         }
         EnvsForm {
@@ -757,6 +774,7 @@ impl EnvsForm {
             compare,
             entries,
             choices,
+            snapshots,
             selected: 0,
             baseline_show,
         }
@@ -772,20 +790,48 @@ impl EnvsForm {
         self.visible_rows().len().saturating_sub(1)
     }
 
-    /// Cycle one entry's environment name through the loaded names (a no-op when
-    /// none are loaded, so a fresh template's placeholders survive).
+    /// Cycle one entry's value through the loaded environment names (or, for a
+    /// `FILE(…)` entry, the discovered snapshot paths) — a no-op when the
+    /// relevant list is empty, so a fresh template's placeholders survive.
     fn cycle_entry(&mut self, i: usize, forward: bool) {
-        let n = self.choices.len();
+        let list = if self.entries[i].file {
+            &self.snapshots
+        } else {
+            &self.choices
+        };
+        let n = list.len();
         if n == 0 {
             return;
         }
         let cur = &self.entries[i].name;
-        let next = match self.choices.iter().position(|c| c == cur) {
+        let next = match list.iter().position(|c| c == cur) {
             Some(p) if forward => (p + 1) % n,
             Some(p) => (p + n - 1) % n,
             None => 0,
         };
-        self.entries[i].name = self.choices[next].clone();
+        self.entries[i].name = list[next].clone();
+    }
+
+    /// Toggle whether entry `i` is a `FILE(…)` snapshot reference (Compare mode
+    /// only — a plain `ENVS` list can't hold snapshots). Switching sets the
+    /// entry's value to the first item of the newly-relevant list so it starts
+    /// valid, unless it already matches one.
+    fn toggle_file(&mut self, i: usize) {
+        if !self.compare {
+            return;
+        }
+        let becoming_file = !self.entries[i].file;
+        self.entries[i].file = becoming_file;
+        let list = if becoming_file {
+            &self.snapshots
+        } else {
+            &self.choices
+        };
+        if !list.iter().any(|c| c == &self.entries[i].name)
+            && let Some(first) = list.first()
+        {
+            self.entries[i].name = first.clone();
+        }
     }
 
     /// Toggle whether entry `i` is the baseline (Compare mode only). Enforces
@@ -816,6 +862,7 @@ impl EnvsForm {
         self.entries.push(EnvEntry {
             name: self.choices.first().cloned().unwrap_or_default(),
             baseline: false,
+            file: false,
         });
     }
 
@@ -838,17 +885,24 @@ impl EnvsForm {
     /// empty (nothing named) — the caller then leaves the node unchanged rather
     /// than writing an unparseable clause.
     fn clause(&self) -> Option<EnvClause> {
-        let named = |want_baseline: Option<bool>| -> Vec<String> {
-            self.entries
-                .iter()
-                .filter(|e| want_baseline.is_none_or(|b| e.baseline == b))
-                .map(|e| e.name.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .collect()
-        };
         if self.compare {
-            let baseline = named(Some(true));
-            let comparisons = named(Some(false));
+            let refs = |want_baseline: bool| -> Vec<RoleRef> {
+                self.entries
+                    .iter()
+                    .filter(|e| e.baseline == want_baseline)
+                    .filter(|e| !e.name.trim().is_empty())
+                    .map(|e| {
+                        let name = e.name.trim().to_string();
+                        if e.file {
+                            RoleRef::File(name)
+                        } else {
+                            RoleRef::Env(name)
+                        }
+                    })
+                    .collect()
+            };
+            let baseline = refs(true);
+            let comparisons = refs(false);
             if baseline.is_empty() && comparisons.is_empty() {
                 return None;
             }
@@ -858,7 +912,12 @@ impl EnvsForm {
                 baseline_show: self.baseline_show.clone(),
             })
         } else {
-            let names = named(None);
+            let names: Vec<String> = self
+                .entries
+                .iter()
+                .map(|e| e.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
             if names.is_empty() {
                 return None;
             }
@@ -1230,9 +1289,32 @@ impl TuiApp {
             }
         };
         let choices: Vec<String> = self.global_envs.iter().map(|e| e.name.clone()).collect();
-        let form = EnvsForm::build(report_id, path, var, &clause, choices);
+        let snapshots = self.discover_report_snapshots(idx);
+        let form = EnvsForm::build(report_id, path, var, &clause, choices, snapshots);
         self.overlay = Some(Overlay::ReportNodeEnvs(Box::new(form)));
         true
+    }
+
+    /// List the `.baseline` snapshot files in report `idx`'s root directory as
+    /// paths relative to that root — the candidates a `FILE(…)` role entry cycles
+    /// through in the ENVS form. Relative so they match the `# root:`-relative
+    /// resolution the runtime uses; empty on any I/O error (the form then just
+    /// offers no snapshots, exactly like no loaded environments).
+    fn discover_report_snapshots(&self, idx: usize) -> Vec<String> {
+        let (root, _) = super::reports::report_base_dir(&self.reports[idx].report);
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "baseline")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Finish an [`EnvsForm`]: rebuild the `FOR … IN ENVS` node from it (keeping
@@ -1268,8 +1350,9 @@ impl TuiApp {
     /// Key handling for the ENVS configure form ([`Overlay::ReportNodeEnvs`]).
     /// ↑/↓ (or Tab) move between rows; the Var row takes identifier characters;
     /// the Mode row toggles Iterate/Compare with Space/←/→; env rows cycle the
-    /// environment with Space/←/→, set the baseline with `b`, add with `n` and
-    /// remove with `x`/Del; Enter applies, Esc cancels.
+    /// environment (or snapshot, for a `FILE` entry) with Space/←/→, set the
+    /// baseline with `b`, toggle a `FILE(…)` snapshot reference with `f`, add
+    /// with `n` and remove with `x`/Del; Enter applies, Esc cancels.
     pub(crate) fn report_node_envs_key_handler(&mut self, key: KeyEvent, mut form: Box<EnvsForm>) {
         let keep = |app: &mut TuiApp, form| {
             app.overlay = Some(Overlay::ReportNodeEnvs(form));
@@ -1314,6 +1397,7 @@ impl TuiApp {
                             KeyCode::Char(' ') | KeyCode::Right => form.cycle_entry(ei, true),
                             KeyCode::Left => form.cycle_entry(ei, false),
                             KeyCode::Char('b') => form.toggle_baseline(ei),
+                            KeyCode::Char('f') => form.toggle_file(ei),
                             KeyCode::Char('n') => {
                                 form.add_entry();
                                 form.selected = form.last_row();
@@ -1524,10 +1608,15 @@ impl TuiApp {
             menu.report_kind = report_kind;
             self.overlay = Some(Overlay::ReportNodeMenu(Box::new(menu)));
         } else if let Some(node) = kind.template() {
-            let path = self.apply_node_insert(idx, &menu.pos, node);
-            // Templates carry placeholder fields — open the line prompt so the
-            // user fills them in immediately.
-            self.open_report_node_line_prompt(idx, &path);
+            self.apply_node_insert(idx, &menu.pos, node);
+            // Land the freshly-inserted node straight in its most helpful
+            // editor — the very view Enter would open on it. `apply_node_insert`
+            // already selected the new node, so `configure_selected_node` routes
+            // on its kind: the ENVS baseline/comparison/mode popup for a
+            // `FOR … IN ENVS` loop, the source-folder browser for FILES/FOLDERS,
+            // and the raw line editor for the kinds without a dedicated form yet
+            // (ReportVar / Assign / List).
+            self.configure_selected_node(idx);
         }
     }
 
@@ -1960,11 +2049,11 @@ mod tests {
     fn envs_form_round_trip_preserves_baseline_show() {
         // Build an EnvsForm from a Roles clause that carries SHOW(Time).
         let clause = EnvClause::Roles {
-            baseline: vec!["prod".into()],
-            comparisons: vec!["staging".into()],
+            baseline: vec![RoleRef::Env("prod".into())],
+            comparisons: vec![RoleRef::Env("staging".into())],
             baseline_show: vec!["Time".into()],
         };
-        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![]);
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![], vec![]);
         assert_eq!(form.baseline_show, vec!["Time".to_string()]);
 
         // clause() must hand it back intact — no silent drop.
@@ -1972,10 +2061,59 @@ mod tests {
         assert_eq!(
             rebuilt,
             EnvClause::Roles {
-                baseline: vec!["prod".into()],
-                comparisons: vec!["staging".into()],
+                baseline: vec![RoleRef::Env("prod".into())],
+                comparisons: vec![RoleRef::Env("staging".into())],
                 baseline_show: vec!["Time".into()],
             }
         );
+    }
+
+    #[test]
+    fn envs_form_preserves_and_rebuilds_a_file_role() {
+        // A FILE(…) role must survive a build → clause() round-trip, and its path
+        // must be reachable in the snapshot cycle even when not on disk.
+        let clause = EnvClause::Roles {
+            baseline: vec![RoleRef::File("prod.baseline".into())],
+            comparisons: vec![RoleRef::Env("staging".into())],
+            baseline_show: vec![],
+        };
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![], vec![]);
+        assert!(
+            form.snapshots.iter().any(|s| s == "prod.baseline"),
+            "existing FILE path must be seeded into the cycle"
+        );
+        let rebuilt = form.clause().expect("clause must be Some");
+        assert_eq!(rebuilt, clause);
+    }
+
+    #[test]
+    fn envs_form_toggle_file_switches_a_role_to_a_snapshot() {
+        // Toggling `f` on an env entry makes it a FILE role that picks the first
+        // discovered snapshot; toggling back returns it to a live env.
+        let clause = EnvClause::Roles {
+            baseline: vec![RoleRef::Env("prod".into())],
+            comparisons: vec![RoleRef::Env("staging".into())],
+            baseline_show: vec![],
+        };
+        let mut form = EnvsForm::build(
+            1,
+            vec![],
+            "T".into(),
+            &clause,
+            vec!["prod".into(), "staging".into()],
+            vec!["snap.baseline".into()],
+        );
+        form.toggle_file(0);
+        assert!(form.entries[0].file);
+        assert_eq!(form.entries[0].name, "snap.baseline");
+        match form.clause().expect("clause") {
+            EnvClause::Roles { baseline, .. } => {
+                assert_eq!(baseline, vec![RoleRef::File("snap.baseline".into())]);
+            }
+            other => panic!("expected roles, got {other:?}"),
+        }
+        form.toggle_file(0);
+        assert!(!form.entries[0].file);
+        assert_eq!(form.entries[0].name, "prod");
     }
 }
