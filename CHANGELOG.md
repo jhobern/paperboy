@@ -41,6 +41,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`WITH` fields can now rename intrinsics, carry statistics, and use quoted
+  names.** In a `REPORT REQUEST … WITH … END` block, a field's value may be an
+  intrinsic name (`HttpStatus`, `Time`, `Asserts`, `Error`, `Response`) to alias
+  that intrinsic under a friendlier column — e.g. `Status: HttpStatus` — instead
+  of only accepting a Hurl query. A field may append its own
+  `STATISTICS(MEAN, …)` clause (identical to a `columns:` statistics clause,
+  attached to the field's `alias.name` column), and a field name may be a quoted
+  string so a column header can contain spaces (`"Response Time": Time`). All
+  three compose: `"Response Time": Time STATISTICS(MEAN, MEDIAN)`.
+
+- **A configure wizard for `FOR … IN FILES` loops, and a `PARALLEL` toggle on
+  every loop wizard.** In the report node editor, `Enter` on a `FILES` loop now
+  opens a structured form — like the `ENVS` one — to set the loop variable, pick
+  the source folder (the file picker is a keystroke away, and pre-selected for a
+  freshly-inserted loop), type an optional `MATCH` glob, and toggle whether the
+  loop runs `PARALLEL`. The `ENVS` wizard gained the same `PARALLEL` checkbox, so
+  a loop's concurrency can be set from the node editor instead of by hand.
+
 - **JSON cell values are pretty-printed in the report cell viewer.** Drilling
   into a report-grid cell whose entire value is a single JSON document (`Enter`
   on the cell) now shows it indented, one field per line, instead of a dense
@@ -92,7 +110,42 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   Help. Scrolling (`↑↓` / `PgUp` / `PgDn` / `Home` / `End`) and the grouped,
   titled sections are unchanged.
 
+- **`Ctrl+↑` / `Ctrl+↓` page the report results cursor.** In a results grid the
+  Ctrl-modified up/down arrows now move the cell cursor a whole screenful at a
+  time (clamped to the grid), so a long report can be traversed quickly without
+  holding an arrow key. Plain arrows still step one cell; `Ctrl+←/→` still cycle
+  tabs for a standalone report.
+
+- **The Response pane now shows the request duration.** Alongside the status
+  line it reports the transfer time (e.g. `Time: 123 ms`) — the same figure a
+  report surfaces as the per-request "Time" column — for the selected entry's
+  last run.
+
+- **Summary statistics for report columns with `STATISTICS(…)`.** A column can
+  now request one or more summary statistics — numeric `MEAN`/`MEDIAN`/`MIN`/
+  `MAX`/`SUM`/`STDDEV`, `MODE` and `COUNT` (any column), or `DISTRIBUTION` (a
+  per-value count for a categorical column such as an overall verdict). Attach
+  them inline in the `columns:` directive
+  (`proc.Time AS "Time (ms)" STATISTICS(MEAN, MEDIAN)`) or on a `REPORT`
+  statement (`REPORT Overall AS Verdict STATISTICS(DISTRIBUTION)`); the computed
+  values are appended as footer rows below the data, and shown in the in-app
+  grid (styled as an italic-accent footer) and in every CSV/JSON/HTML export. In
+  the **xlsx** export the numeric statistic cells are written as **live
+  spreadsheet formulas** (`AVERAGE`, `MEDIAN`, `SUM`, `MIN`, `MAX`, `STDEVP`,
+  `MODE`, `COUNT`, `COUNTIF`) over the data range, so they recalculate if you
+  edit the sheet. The `FILES`/`ENVS` loop wizards are unaffected. The Reports
+  Help tab (`?`) documents the new `STATISTICS`/`HIDE`/`BASELINE(FILE(…))` forms,
+  and a from-scratch guide covering every PaperTrail feature lives at
+  `docs/reports/00-tutorial.md`. See `docs/reports/02-grammar.md` §8.1.
+
 ### Changed (backlog)
+
+- **Report column titles stay pinned while scrolling.** The results grid's
+  header row now stays fixed at the top of the pane as the data rows scroll
+  underneath it, so you can always see which column you're reading in a long
+  report. Mouse-wheel and `Ctrl+↑/↓` paging scroll the body without disturbing
+  the header, and clicking the header row still starts a text selection rather
+  than selecting a cell.
 
 - **The report results footer no longer explains the arrow keys.** The
   `↑/↓/←/→ cursor` segment was dropped from the results hint line (the arrow
@@ -102,7 +155,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   a leading `› ` caret.** The selected row is already highlighted, so the caret
   was redundant; dropping it reclaims two columns of width for the row text.
 
+- **Exporting a report's results moved from `x` to `Ctrl+S`.** A bare `x` in a
+  report view used to export the last run, but `x` deletes the selected
+  environment/request one pane away in the collection view, so the shared key
+  felt unsafe. Export is now `Ctrl+S` (the help window, results hint line and
+  `paper_trail.md` reference are updated to match); `x` no longer does anything
+  in a report view.
+
 ### Fixed
+
+- **Arrowing up out of the request wizard's Body returns to the column you were
+  editing.** Leaving the multiline Body upward used to drop onto the Form
+  section's "+ Add" row, losing the table cell you came from. It now returns to
+  the exact Headers/Cookies/Queries/Options or Form cell (row *and* column) that
+  was last focused, falling back to the old section-step only when no table cell
+  has been visited.
 
 - **A collection that fails to parse now explains *why* instead of just "not a
   valid collection".** When a `.hurl` file can't be loaded, the status (and the
@@ -132,6 +199,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   types a literal `h`.** On terminals without the keyboard-enhancement protocol
   `Backspace` arrives as `Ctrl+H`; the wizard's text cells now treat that as a
   delete (matching the multiline editor) instead of inserting an `h`.
+
+- **The mouse wheel now scrolls a report results grid freely.** With a cell
+  highlighted, the wheel used to be pinned — every frame re-centred the view on
+  the selected cell, so scrolling snapped straight back. The wheel now scrolls
+  the viewport directly (leaving the cursor put, even off-screen); the view only
+  re-centres when keyboard navigation actually moves the cursor.
+
+- **The report cell drill-down popup grows to fit long values.** A cell whose
+  value is one long line (e.g. a big JSON body) used to open a two-line popup
+  because the box was sized by logical line count, ignoring soft-wrapping. It is
+  now sized to the wrapped row count (still capped at the terminal height), so
+  there's far less scrolling inside the popup.
+
+- **Numeric report columns export as real numbers in `.xlsx`.** Every cell used
+  to be written as text (with a leading `'` guard), so a column like `Time`
+  couldn't be summed or averaged in a spreadsheet. Columns whose every value is
+  a number are now written as numbers; identifier-like values (empty, or with
+  redundant leading zeros) and mixed columns stay text. CSV export is unchanged.
+
+- **The Response pane no longer shows "Sending…" for idle requests.** While one
+  request was in flight, *every* request's Response pane showed the sending
+  spinner because it was driven by a single shared flag — so you couldn't look
+  at another request's last response until the send finished. Sending state is
+  now tracked per request: only the request that's actually in flight shows the
+  spinner, and selecting any other request shows its own last response.
 
 
 

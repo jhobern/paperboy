@@ -41,6 +41,7 @@ strings! {
     sending => "Sending…", "Envoi en cours…", "Sender…";
     response_heading => "Response", "Réponse", "Svar";
     status_label => "Status:", "Statut :", "Status:";
+    response_time_label => "Time:", "Durée :", "Tid:";
     no_response_yet => "Run a request to see the response.", "Exécutez une requête pour voir la réponse.", "Kør en anmodning for at se svaret.";
     req_error_prefix => "Request error:", "Erreur de requête :", "Anmodningsfejl:";
     options_menu => "Settings", "Paramètres", "Indstillinger";
@@ -471,6 +472,9 @@ strings! {
     help_grammar_request => "send a request by name (no output row)", "envoyer une requête par son nom (sans ligne de sortie)", "send en anmodning ved navn (ingen outputrække)";
     help_grammar_report => "send a request and add its fields as columns", "envoyer une requête et ajouter ses champs comme colonnes", "send en anmodning og tilføj dens felter som kolonner";
     help_grammar_show => "keep only these response fields (drop a heavy Response)", "ne garder que ces champs de réponse (retirer une réponse volumineuse)", "behold kun disse svarfelter (drop et tungt Response)";
+    help_grammar_hide => "drop these response fields (applied last)", "retirer ces champs de réponse (appliqué en dernier)", "fjern disse svarfelter (anvendes sidst)";
+    help_grammar_statistics => "summary footer for a column: MEAN/MEDIAN/… or DISTRIBUTION", "pied de résumé d'une colonne : MEAN/MEDIAN/… ou DISTRIBUTION", "opsummeringsfod for en kolonne: MEAN/MEDIAN/… eller DISTRIBUTION";
+    help_grammar_with => "field may alias an intrinsic, add STATISTICS, or be quoted", "un champ peut aliaser un intrinsèque, STATISTICS, ou être cité", "et felt kan aliasere en intrinsic, STATISTICS eller citeres";
     help_grammar_parallel => "prefix a FOR to run its iterations concurrently", "préfixer un FOR pour exécuter ses itérations en parallèle", "sæt foran et FOR for at køre dets gentagelser samtidigt";
     help_grammar_for => "loop over a source, binding VAR each pass; END closes it", "boucler sur une source, en liant VAR à chaque passage ; END la ferme", "gennemløb en kilde og bind VAR hver gang; END lukker den";
     help_grammar_for_tuple => "destructure each tuple into several variables", "décomposer chaque tuple en plusieurs variables", "udpak hver tuple i flere variabler";
@@ -483,6 +487,7 @@ strings! {
     help_grammar_zip => "pair sources positionally (must be equal length)", "apparier les sources par position (longueurs égales)", "par kilder positionelt (skal have samme længde)";
     help_grammar_concat => "append sources end-to-end (same arity)", "concaténer les sources bout à bout (même arité)", "sammenkæd kilder efter hinanden (samme aritet)";
     help_grammar_envs => "loop over environments (BASELINE/COMPARISON to diff)", "boucler sur des environnements (BASELINE/COMPARISON pour comparer)", "gennemløb miljøer (BASELINE/COMPARISON for at sammenligne)";
+    help_grammar_baseline_file => "use a saved .baseline snapshot as a role instead of a live env", "utiliser un instantané .baseline enregistré comme rôle au lieu d'un environnement", "brug et gemt .baseline-øjebliksbillede som rolle i stedet for et live-miljø";
     help_grammar_result => "diff column: candidate vs baseline env, per reported field", "colonne de différence : candidat vs référence, par champ rapporté", "forskelskolonne: kandidat vs. reference, pr. rapporteret felt";
     new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 opret · Esc annuller";
     edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 gem · Esc annuller";
@@ -519,7 +524,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · v source · x export · B baseline", "Entrée exploration · v source · x export · B référence", "Enter udforsk · v kilde · x export · B basislinje";
+    report_hint_results => "Enter drill-down · v source · Ctrl+S export · B baseline", "Entrée exploration · v source · Ctrl+S export · B référence", "Enter udforsk · v kilde · Ctrl+S export · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -605,6 +610,15 @@ strings! {
     report_node_envs_comparison => "Comparison", "Comparaison", "Sammenligning";
     report_node_envs_file => "FILE", "FILE", "FILE";
     report_node_envs_none => "no environments loaded — load one to pick", "aucun environnement chargé — en charger un pour choisir", "ingen miljøer indlæst — indlæs et for at vælge";
+    report_node_parallel_label => "Run PARALLEL", "Exécuter en PARALLÈLE", "Kør PARALLELT";
+    checkbox_checked => "[x]", "[x]", "[x]";
+    checkbox_unchecked => "[ ]", "[ ]", "[ ]";
+    report_node_files_title => "Configure FILES loop", "Configurer la boucle FILES", "Konfigurer FILES-løkke";
+    report_node_files_hint => "↑↓ move · Space folder/parallel · type var/match · Enter apply · Esc cancel", "↑↓ déplacer · Espace dossier/parallèle · saisir var/match · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum mappe/parallel · skriv var/match · Enter anvend · Esc annuller";
+    report_node_files_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
+    report_node_files_folder_label => "Folder", "Dossier", "Mappe";
+    report_node_files_match_label => "Match (glob)", "Filtre (glob)", "Match (glob)";
+    report_node_files_none => "no folder chosen — Space to pick", "aucun dossier choisi — Espace pour choisir", "ingen mappe valgt — Mellemrum for at vælge";
 }
 
 /// A language-independent status / notification message. It stores *what*

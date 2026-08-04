@@ -982,6 +982,73 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     assert_eq!(new_focus(&app), NewField::Url);
 }
 
+#[test]
+fn up_from_body_returns_to_last_table_cell_not_add_row() {
+    // Query section has a data row; user is editing its Value cell, then
+    // moves down into the multiline Body. Arrowing back up must return to
+    // that exact Query Value cell rather than dropping onto a "+ Add" row.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Enter); // creates Query(0, Key)
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Right); // -> Query(0, Value)
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Query, 0, HdrCol::Value)
+    );
+
+    // Jump down through the empty Options and Form sections into the Body.
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(new_focus(&app), NewField::Body);
+
+    // Up out of the Body returns to the remembered Query Value cell.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Query, 0, HdrCol::Value)
+    );
+}
+
+#[test]
+fn up_from_body_returns_to_last_form_field_column() {
+    // Same behaviour for the Form section directly above the Body: leaving
+    // the Body upward returns to the last-focused Form cell's column/row.
+    let mut app = TuiApp::default();
+    open_form_on_form_field_kind(&mut app); // FormField(0, Kind)
+    press(&mut app, KeyCode::Right); // -> FormField(0, Value)
+    let cell = new_focus(&app);
+    assert!(matches!(cell, NewField::FormField(0, _)));
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)); // -> Body
+    assert_eq!(new_focus(&app), NewField::Body);
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(new_focus(&app), cell);
+}
+
+#[test]
+fn up_from_body_without_table_history_falls_back_to_add_row() {
+    // With no table cell ever focused (empty sections), Up from the Body
+    // keeps the original behaviour of stepping to the section above.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..9 {
+        press(&mut app, KeyCode::Tab); // walk to Body through empty sections
+    }
+    assert_eq!(new_focus(&app), NewField::Body);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(new_focus(&app), NewField::AddFormField);
+}
+
 fn header_enabled(app: &TuiApp, i: usize) -> bool {
     match app.overlay.as_ref().unwrap() {
         Overlay::NewRequest(f) => f.headers[i].enabled,
@@ -4553,6 +4620,9 @@ fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
         s.help_grammar_collection,
         s.help_grammar_for_tuple,
         s.help_grammar_zip,
+        s.help_grammar_statistics,
+        s.help_grammar_with,
+        s.help_grammar_baseline_file,
     ] {
         assert!(
             text.contains(expected),
@@ -6252,6 +6322,96 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     assert!(
         out.contains("got"),
         "the failing assert's actual value is shown:\n{out}"
+    );
+}
+
+/// #3: the Response pane shows the request's duration when the runner reported
+/// one (the same figure reports surface as the per-request "Time" column).
+#[test]
+fn response_panel_shows_response_time() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{}".into(),
+            duration_ms: Some(123),
+            ..Default::default()
+        });
+    }
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("123 ms"),
+        "the response time should be shown:\n{out}"
+    );
+}
+
+/// #2: while one entry is in flight, selecting a *different* entry shows that
+/// entry's own last response — not a blanket "Sending…". Only the in-flight
+/// entry (its `last_run` is `Running`) shows the spinner.
+#[test]
+fn response_panel_shows_other_entrys_response_while_one_is_sending() {
+    use crate::hurl::RunStatus;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    {
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default()); // entry 0 — in flight
+        col.entries.push(HurlEntry::default()); // entry 1 — already finished
+        // Entry 0 is mid-send.
+        col.entries[0].last_run = RunStatus::Running;
+        // Entry 1 has a finished response.
+        col.entries[1].last_run = RunStatus::Passed;
+        col.entries[1].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{}".into(),
+            ..Default::default()
+        });
+    }
+
+    // Select the *finished* entry 1: it must show its response, not "Sending…".
+    app.collections[ci].selected_entry = 1;
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("200 OK"),
+        "the finished entry's response should be shown while another sends:\n{out}"
+    );
+    assert!(
+        !out.contains(s.sending),
+        "the finished entry must not show the sending spinner:\n{out}"
+    );
+
+    // Select the in-flight entry 0: now the spinner is shown.
+    app.collections[ci].selected_entry = 0;
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains(s.sending),
+        "the in-flight entry should show the sending spinner:\n{out}"
     );
 }
 
@@ -18848,6 +19008,52 @@ fn report_export_writes_a_csv_next_to_the_report() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The report export key is `Ctrl+S`, not a bare `x` (which deletes an
+/// environment/request one pane away in the collection view). `Ctrl+S` opens
+/// the export folder picker; a plain `x` in a report view does nothing.
+#[test]
+fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // A bare `x` must not open the export picker (nor do anything else).
+    app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(
+        app.overlay.is_none(),
+        "a plain `x` should be inert in a report view, not export"
+    );
+
+    // Ctrl+S opens the report-CSV export folder picker.
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::SaveReportCsvChooseFolder, _))
+        ),
+        "Ctrl+S should open the report-CSV export picker"
+    );
+}
+
 /// The export filename's extension selects the output format: typing an
 /// `.xlsx`/`.json`/`.html` name writes that format, not CSV.
 #[test]
@@ -19703,6 +19909,7 @@ fn report_with_result(text: &str, column_order: &[&str]) -> (TuiApp, usize) {
         column_order: column_order.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     (app, idx)
 }
@@ -20744,18 +20951,27 @@ fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
     press(&mut app, KeyCode::Down); // select the FOR head (row 1)
     press(&mut app, KeyCode::Enter);
     assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))),
+        "Enter opens the FILES configure wizard"
+    );
+    // The Folder row opens the browser with Space.
+    if let Some(Overlay::ReportNodeFiles(form)) = &mut app.overlay {
+        form.selected = 1; // Folder row
+    }
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
         matches!(
             app.overlay,
             Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
         ),
-        "Enter opens the node folder picker"
+        "the Folder row opens the node folder picker"
     );
     assert!(app.pending_node_folder.is_some(), "the node is parked");
 }
 
-/// Inserting a `FILES`/`FOLDERS` loop from the palette jumps straight into the
-/// folder picker rather than the raw line prompt — a loop's source directory is
-/// the whole point, so the user should choose it immediately.
+/// Inserting a `FILES` loop from the palette jumps straight into the configure
+/// wizard (folder pre-selected) rather than the raw line prompt — mirroring the
+/// ENVS loop, so every freshly-inserted node lands in its most helpful editor.
 #[test]
 fn report_node_inserting_a_files_loop_opens_the_folder_picker_immediately() {
     let (mut app, idx) = node_editor_app(&["upload"]);
@@ -20768,13 +20984,17 @@ fn report_node_inserting_a_files_loop_opens_the_folder_picker_immediately() {
     }
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(
-            app.overlay,
-            Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
-        ),
-        "inserting a FILES loop opens the folder picker straight away"
+        matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))),
+        "inserting a FILES loop opens the configure wizard straight away"
     );
-    assert!(app.pending_node_folder.is_some(), "the new node is parked");
+    // A dir-less fresh loop pre-selects the Folder row so the picker is one
+    // keystroke away.
+    if let Some(Overlay::ReportNodeFiles(form)) = &app.overlay {
+        assert_eq!(
+            form.selected, 1,
+            "Folder row is pre-selected for a fresh loop"
+        );
+    }
     assert!(
         app.reports[idx].report.text.contains("IN FILES"),
         "the FILES loop template was inserted: {:?}",
@@ -21132,8 +21352,9 @@ fn report_node_envs_form_cycles_loaded_environments() {
         );
     }
 
-    // Rows: 0 Var, 1 Mode, 2 Env(0) baseline, 3 Env(1) comparison.
+    // Rows: 0 Var, 1 Mode, 2 Parallel, 3 Env(0) baseline, 4 Env(1) comparison.
     press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Parallel
     press(&mut app, KeyCode::Down); // Env(0)
     press(&mut app, KeyCode::Down); // Env(1) — the comparison
     press(&mut app, KeyCode::Right); // staging -> candidate
@@ -21186,8 +21407,88 @@ fn report_node_envs_form_mode_toggle_rewrites_the_clause() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Workspace-aware reports: opening a `.trail` from a Workspace tab's tree
+/// Toggling the ENVS form's PARALLEL row marks (and unmarks) the loop as
+/// `PARALLEL`, preserving the clause and body.
+#[test]
+fn report_node_envs_form_toggles_parallel() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "prod");
+    add_empty_global_env(&mut app, "staging");
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    press(&mut app, KeyCode::Down); // select the FOR … IN ENVS node
+    press(&mut app, KeyCode::Enter); // open the form
+    press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Parallel row
+    press(&mut app, KeyCode::Char(' ')); // toggle PARALLEL on
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("PARALLEL FOR TARGET IN ENVS"),
+        "the loop is now PARALLEL: {text:?}"
+    );
+    assert!(
+        text.contains("BASELINE(\"prod\")") && text.contains("REQUEST upload"),
+        "the clause and body are preserved: {text:?}"
+    );
+}
+
+/// The FILES configure wizard edits the loop variable, `MATCH` glob and
+/// PARALLEL toggle, writing them all back on apply.
+#[test]
+fn report_node_files_form_edits_var_match_and_parallel() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR FILE IN FILES \"docs\"\n    REPORT REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the FOR head
+    press(&mut app, KeyCode::Enter); // open the FILES wizard
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))));
+
+    // Var row (selected first for a loop with a dir): append to the variable.
+    if let Some(Overlay::ReportNodeFiles(form)) = &app.overlay {
+        assert_eq!(form.selected, 0, "an existing loop selects the Var row");
+    }
+    press(&mut app, KeyCode::Backspace); // FILE -> FIL
+    press(&mut app, KeyCode::Backspace); // FIL -> FI
+    press(&mut app, KeyCode::Backspace); // FI -> F
+    press(&mut app, KeyCode::Backspace); // F -> (empty)
+    press(&mut app, KeyCode::Char('D'));
+    press(&mut app, KeyCode::Char('O'));
+    press(&mut app, KeyCode::Char('C')); // var = "DOC"
+
+    // Down to Match row, type a glob.
+    press(&mut app, KeyCode::Down); // Folder
+    press(&mut app, KeyCode::Down); // Match
+    press(&mut app, KeyCode::Char('*'));
+    press(&mut app, KeyCode::Char('.'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Char('g'));
+
+    // Down to Parallel, toggle it on.
+    press(&mut app, KeyCode::Down); // Parallel
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("PARALLEL FOR DOC IN FILES \"docs\" MATCH \"*.jpg\""),
+        "var, MATCH and PARALLEL all applied: {text:?}"
+    );
+    assert!(
+        text.contains("REPORT REQUEST upload"),
+        "the body is preserved: {text:?}"
+    );
+}
+
 // embeds it in that tab's *right pane* while the single collection-side tree
 // stays on the left driving navigation. No duplicate tree, no separate report
 // tab — the report just replaces the request/response view in place.
@@ -21816,6 +22117,7 @@ fn report_with_multi_row_result() -> (TuiApp, usize) {
         column_order: cols.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
@@ -21907,6 +22209,160 @@ fn result_cell_cursor_end_jumps_to_last_row() {
     assert_eq!(row, 2, "End must jump to the last row");
 }
 
+/// Build a report whose results grid has `n` data rows (single column) so the
+/// grid is taller than any test terminal and can actually scroll.
+fn report_with_n_rows(n: usize) -> (TuiApp, usize) {
+    use crate::report::model::{ReportResult, ReportRow};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut rows = Vec::new();
+    for r in 0..n {
+        let mut row = ReportRow::default();
+        row.cells.insert("Col1".to_string(), format!("r{r}"));
+        rows.push(row);
+    }
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: vec!["Col1".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats: Default::default(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    (app, idx)
+}
+
+/// #4: the mouse wheel scrolls the results *viewport* without dragging the cell
+/// cursor along, and — crucially — a subsequent draw does NOT yank the scroll
+/// back to keep the (unmoved) cursor visible. Before the fix the draw
+/// re-centred on the cursor every frame, so the wheel appeared frozen.
+#[test]
+fn mouse_wheel_scrolls_results_without_recentering_on_cursor() {
+    use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 3 {
+        return; // pane not visible at this size — skip
+    }
+
+    // Keyboard-navigate to the last row so the panel auto-scrolls down.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::End);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let scroll_after_kbd = app.reports[idx].results_panel.scroll();
+    assert!(
+        scroll_after_kbd > 0,
+        "navigating to the last row should have scrolled the grid down"
+    );
+    let cursor_before = app.reports[idx].cell_cursor;
+
+    // Wheel up several notches over the grid.
+    let mid = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    };
+    for _ in 0..3 {
+        app.on_mouse(mid);
+    }
+    let scroll_after_wheel = app.reports[idx].results_panel.scroll();
+    assert!(
+        scroll_after_wheel < scroll_after_kbd,
+        "the wheel should scroll the viewport up"
+    );
+    assert_eq!(
+        app.reports[idx].cell_cursor, cursor_before,
+        "the wheel must not move the cell cursor"
+    );
+
+    // Re-draw: the scroll must stay where the wheel left it (not snap back to
+    // the still-off-screen cursor).
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.reports[idx].results_panel.scroll(),
+        scroll_after_wheel,
+        "a redraw must not re-centre the viewport on the unmoved cursor"
+    );
+}
+
+/// #4: Ctrl+Down / Ctrl+Up move the cell cursor a whole page at a time.
+#[test]
+fn ctrl_arrows_page_the_result_cursor() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 4 {
+        return;
+    }
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert!(
+        row > 1,
+        "Ctrl+Down should page down more than a single row (got {row})"
+    );
+    let paged_down = row;
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    let (row_up, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert!(
+        row_up < paged_down,
+        "Ctrl+Up should page back up (from {paged_down} to {row_up})"
+    );
+}
+
+/// #10: the drill-down popup sizes its height to the *wrapped* row count, so a
+/// long single-line value gets a tall box rather than a two-line one. Compares
+/// the inner height returned for a long value against a short value.
+#[test]
+fn drill_down_popup_grows_for_long_wrapped_values() {
+    use ratatui::{Terminal, backend::TestBackend};
+    use tui_panel_select::MultiSelectPanel;
+
+    let s = crate::i18n::Strings::for_language(&Language::English);
+    let th = crate::tui::theme::preset_for_language(&Language::English).to_theme();
+
+    let measure = |content: &str| -> u16 {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut panel = MultiSelectPanel::new();
+        let mut h = 0u16;
+        term.draw(|f| {
+            let inner = super::reports::draw_result_cell_popup_overlay(
+                f, "Body", content, &mut panel, &s, &th,
+            );
+            h = inner.height;
+        })
+        .unwrap();
+        h
+    };
+
+    let short = measure("small");
+    // A single logical line long enough to wrap across many rows in an ~80-col
+    // popup.
+    let long = measure(&"x".repeat(600));
+    assert!(
+        long > short,
+        "a long wrapped value should get a taller popup (long={long}, short={short})"
+    );
+}
+
 #[test]
 fn enter_on_cursor_opens_cell_popup() {
     let (mut app, idx) = report_with_multi_row_result();
@@ -21957,6 +22413,7 @@ fn cell_popup_pretty_prints_a_json_cell() {
         column_order: vec!["Body".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     press(&mut app, KeyCode::Enter); // initialise cursor at (0,0)
@@ -22151,6 +22608,117 @@ fn mouse_click_on_header_row_does_not_select_a_cell() {
     let _ = term;
 }
 
+/// #9: the grid's column-header row stays pinned at the top of the pane while
+/// the data rows scroll underneath it. After navigating far enough down that
+/// the panel scrolls, the header text (column names) must still be rendered on
+/// the first inner row.
+#[test]
+fn report_header_stays_pinned_while_body_scrolls() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 3 {
+        return; // pane not visible at this size — skip
+    }
+
+    // Navigate to the last row so the body scrolls well past the top.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::End);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(
+        app.reports[idx].results_panel.scroll() > 0,
+        "navigating to the last row should have scrolled the body down"
+    );
+
+    // The pinned header row (inner row 0 == area.y) must still show "Col1".
+    let buf = term.backend().buffer();
+    let header: String = (area.x..area.x + area.width)
+        .map(|x| buf[(x, area.y)].symbol().to_string())
+        .collect();
+    assert!(
+        header.contains("Col1"),
+        "the column header must stay pinned at the top after scrolling (got {header:?})"
+    );
+}
+
+/// A `STATISTICS(…)` request appends summary rows below the data: the grid must
+/// render the stat's label (in the first column) and its computed value, styled
+/// distinctly (accent + italic) so it reads as a footer rather than data.
+#[test]
+fn report_statistics_render_a_summary_footer_row() {
+    use crate::report::model::{ReportResult, ReportRow, StatKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Two columns so the stat label lands in the (non-value) first column: a
+    // non-numeric Name and a numeric Time carrying STATISTICS(MEAN).
+    let mut rows = Vec::new();
+    for (name, time) in [("a", "100"), ("b", "200"), ("c", "300")] {
+        let mut row = ReportRow::default();
+        row.cells.insert("Name".to_string(), name.to_string());
+        row.cells.insert("Time".to_string(), time.to_string());
+        rows.push(row);
+    }
+    let mut column_stats = std::collections::HashMap::new();
+    column_stats.insert("Time".to_string(), vec![StatKind::Mean]);
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: vec!["Name".to_string(), "Time".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats,
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+
+    let accent = app.theme().accent;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+
+    // The whole rendered buffer should contain the "Mean" label and its value
+    // "200" ((100+200+300)/3), and at least one italic accent cell (the footer
+    // style, distinct from the bold-only header).
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert!(
+        text.contains("Mean"),
+        "the summary footer must show the 'Mean' stat label"
+    );
+    assert!(
+        text.contains("200"),
+        "the summary footer must show the computed mean value 200"
+    );
+    let mut italic_accent = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            if cell.fg == accent && cell.modifier.contains(ratatui::style::Modifier::ITALIC) {
+                italic_accent = true;
+            }
+        }
+    }
+    assert!(
+        italic_accent,
+        "the summary footer rows should be styled in italic accent"
+    );
+}
+
 /// With scroll > 0, the row mapping must account for the scroll offset so
 /// the click lands on the correct logical data row.
 #[test]
@@ -22184,6 +22752,7 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         column_order: vec!["A".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
@@ -22196,16 +22765,14 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         return;
     }
 
-    // Manually set scroll to 3 so the inner header (y_off 0) now shows grid
-    // line 3 (which is data row 2, since grid_row = y_off + scroll = 0 + 3;
-    // but grid_row 0 is header, 1 = data0, 2 = data1, 3 = data2).
-    // The first visible data row is at y_off 1: grid_row = 1 + 3 = 4 → data row 3.
+    // Manually set the panel's DATA-ROW scroll to 3 so the first data row shown
+    // just under the pinned header (y_off 1) is data row 3.
     app.reports[idx].results_panel.set_scroll(3);
 
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: area.x + 1,
-        row: area.y + 1, // y_off = 1, grid_row = 1 + 3 = 4, data_row = 3
+        row: area.y + 1, // y_off = 1 → data_row = (1 - 1) + scroll(3) = 3
         modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
     });
     let (data_row, _) = app.reports[idx]

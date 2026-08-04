@@ -665,6 +665,8 @@ pub(crate) enum EnvsRow {
     Var,
     /// The Iterate (`Plain`) vs Compare (`Roles`) mode toggle.
     Mode,
+    /// The `PARALLEL` on/off toggle (run iterations concurrently).
+    Parallel,
     /// One environment entry (index into [`EnvsForm::entries`]).
     Env(usize),
 }
@@ -693,6 +695,8 @@ pub(crate) struct EnvsForm {
     pub(crate) var: String,
     /// `false` = Iterate (`Plain`), `true` = Compare (`Roles`).
     pub(crate) compare: bool,
+    /// `true` when the loop is marked `PARALLEL` (iterations run concurrently).
+    pub(crate) parallel: bool,
     /// The chosen environments, in row order.
     pub(crate) entries: Vec<EnvEntry>,
     /// Loaded environment names the env rows cycle through (empty ⇒ no picker).
@@ -719,6 +723,7 @@ impl EnvsForm {
         path: Vec<usize>,
         var: String,
         clause: &EnvClause,
+        parallel: bool,
         choices: Vec<String>,
         mut snapshots: Vec<String>,
     ) -> Self {
@@ -772,6 +777,7 @@ impl EnvsForm {
             path,
             var,
             compare,
+            parallel,
             entries,
             choices,
             snapshots,
@@ -781,7 +787,7 @@ impl EnvsForm {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<EnvsRow> {
-        let mut rows = vec![EnvsRow::Var, EnvsRow::Mode];
+        let mut rows = vec![EnvsRow::Var, EnvsRow::Mode, EnvsRow::Parallel];
         rows.extend((0..self.entries.len()).map(EnvsRow::Env));
         rows
     }
@@ -858,6 +864,11 @@ impl EnvsForm {
         }
     }
 
+    /// Flip the `PARALLEL` marker on/off.
+    fn toggle_parallel(&mut self) {
+        self.parallel = !self.parallel;
+    }
+
     fn add_entry(&mut self) {
         self.entries.push(EnvEntry {
             name: self.choices.first().cloned().unwrap_or_default(),
@@ -923,6 +934,103 @@ impl EnvsForm {
             }
             Some(EnvClause::Plain(names))
         }
+    }
+}
+
+/// One row of the [`FilesForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesRow {
+    /// The loop variable name (a free identifier, editable inline).
+    Var,
+    /// The source folder — activating it opens the file picker.
+    Folder,
+    /// The optional `MATCH "glob"` filter (editable text; empty ⇒ no `MATCH`).
+    Match,
+    /// The `PARALLEL` on/off toggle (run iterations concurrently).
+    Parallel,
+}
+
+/// The `FOR … IN FILES` configure form ([`Overlay::ReportNodeFiles`]), reached
+/// with Enter on a `FILES` loop node — the file analogue of [`EnvsForm`]. It
+/// picks the loop variable, the source folder (via the file picker), an
+/// optional `MATCH` glob, and whether the loop runs `PARALLEL`.
+pub(crate) struct FilesForm {
+    /// The report being edited (looked up by id, resilient to tab reorder).
+    pub(crate) report_id: u64,
+    /// Path of the node this edits.
+    pub(crate) path: Vec<usize>,
+    /// The loop variable name.
+    pub(crate) var: String,
+    /// The source directory the loop reads from (as authored — may be relative
+    /// to the report). Chosen via the folder picker on the Folder row.
+    pub(crate) dir: String,
+    /// The `MATCH "glob"` filter (empty ⇒ no `MATCH` clause).
+    pub(crate) glob: String,
+    /// `true` when the loop is marked `PARALLEL` (iterations run concurrently).
+    pub(crate) parallel: bool,
+    /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
+    pub(crate) selected: usize,
+}
+
+impl FilesForm {
+    /// Build the form from a `FILES` loop's current variable, directory, glob
+    /// and parallel marker. A freshly-inserted loop (empty `dir`) starts with
+    /// the Folder row selected so the picker is one keystroke away — the source
+    /// directory is the whole point of the loop.
+    fn build(
+        report_id: u64,
+        path: Vec<usize>,
+        var: String,
+        dir: String,
+        glob: Option<String>,
+        parallel: bool,
+    ) -> Self {
+        let selected = if dir.trim().is_empty() { 1 } else { 0 };
+        FilesForm {
+            report_id,
+            path,
+            var,
+            dir,
+            glob: glob.unwrap_or_default(),
+            parallel,
+            selected,
+        }
+    }
+
+    pub(crate) fn visible_rows(&self) -> Vec<FilesRow> {
+        vec![
+            FilesRow::Var,
+            FilesRow::Folder,
+            FilesRow::Match,
+            FilesRow::Parallel,
+        ]
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    fn var_or_default(&self) -> String {
+        let v = self.var.trim();
+        if v.is_empty() {
+            "FILE".to_string()
+        } else {
+            v.to_string()
+        }
+    }
+
+    /// The `MATCH` glob as an `Option` (trimmed; empty ⇒ `None`).
+    fn glob_opt(&self) -> Option<String> {
+        let g = self.glob.trim();
+        if g.is_empty() {
+            None
+        } else {
+            Some(g.to_string())
+        }
+    }
+
+    fn toggle_parallel(&mut self) {
+        self.parallel = !self.parallel;
     }
 }
 
@@ -1147,6 +1255,9 @@ impl TuiApp {
         if self.open_report_node_envs(idx) {
             return;
         }
+        if self.open_report_node_files(idx) {
+            return;
+        }
         if self.open_report_node_folder(idx) {
             return;
         }
@@ -1279,18 +1390,23 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (var, clause) = {
+        let (var, clause, parallel) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
             match node_at(&flow, &path) {
-                Some(FlowNode::ForEnvs { var, clause, .. }) => (var.clone(), clause.clone()),
+                Some(FlowNode::ForEnvs {
+                    var,
+                    clause,
+                    parallel,
+                    ..
+                }) => (var.clone(), clause.clone(), parallel.is_some()),
                 _ => return false, // not an ENVS loop
             }
         };
         let choices: Vec<String> = self.global_envs.iter().map(|e| e.name.clone()).collect();
         let snapshots = self.discover_report_snapshots(idx);
-        let form = EnvsForm::build(report_id, path, var, &clause, choices, snapshots);
+        let form = EnvsForm::build(report_id, path, var, &clause, parallel, choices, snapshots);
         self.overlay = Some(Overlay::ReportNodeEnvs(Box::new(form)));
         true
     }
@@ -1318,9 +1434,11 @@ impl TuiApp {
     }
 
     /// Finish an [`EnvsForm`]: rebuild the `FOR … IN ENVS` node from it (keeping
-    /// the node's body and `PARALLEL` marker untouched) and write it back. A
-    /// no-op when the form describes no environments (so the node is never
-    /// replaced by an unparseable empty clause).
+    /// the node's body untouched) and write it back. A no-op when the form
+    /// describes no environments (so the node is never replaced by an
+    /// unparseable empty clause). The `PARALLEL` marker is taken from the
+    /// form's toggle (preserving any explicit `PARALLEL(n)` degree already on
+    /// the node when the toggle stays on).
     pub(crate) fn apply_report_node_envs(&mut self, form: EnvsForm) {
         let Some(idx) = self.report_index_by_id(form.report_id) else {
             return;
@@ -1328,8 +1446,9 @@ impl TuiApp {
         let Some(clause) = form.clause() else {
             return;
         };
-        // Preserve the existing node's body + parallel; only var/clause change.
-        let (body, parallel) = {
+        // Preserve the existing node's body and any explicit PARALLEL degree;
+        // only var/clause and the parallel on/off state change here.
+        let (body, existing_parallel) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return;
             };
@@ -1338,6 +1457,11 @@ impl TuiApp {
                 _ => return,
             }
         };
+        let parallel = if form.parallel {
+            Some(existing_parallel.unwrap_or_default())
+        } else {
+            None
+        };
         let node = FlowNode::ForEnvs {
             var: form.var_or_default(),
             clause,
@@ -1345,6 +1469,187 @@ impl TuiApp {
             parallel,
         };
         self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Open the `FOR … IN FILES` configure form for the selected node. Returns
+    /// `true` when the selection is a single-variable `FILES` loop (so the
+    /// caller stops trying other forms), `false` otherwise — a `FOLDERS` loop or
+    /// a tuple-pattern loop falls through to the plain folder browser.
+    fn open_report_node_files(&mut self, idx: usize) -> bool {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return false;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else {
+            return false;
+        };
+        let path = row.path.clone();
+        let report_id = self.reports[idx].report.id;
+        let (var, dir, glob, parallel) = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return false;
+            };
+            match node_at(&flow, &path) {
+                Some(FlowNode::ForEach {
+                    pattern,
+                    producer: Producer::Files { dir, glob },
+                    parallel,
+                    ..
+                }) if pattern.is_single() => (
+                    pattern.named().next().unwrap_or("FILE").to_string(),
+                    dir.clone(),
+                    glob.clone(),
+                    parallel.is_some(),
+                ),
+                _ => return false, // not a single-var FILES loop
+            }
+        };
+        let form = FilesForm::build(report_id, path, var, dir, glob, parallel);
+        self.overlay = Some(Overlay::ReportNodeFiles(Box::new(form)));
+        true
+    }
+
+    /// Finish a [`FilesForm`]: rebuild the `FOR … IN FILES` node from it
+    /// (keeping the node's body untouched) and write it back.
+    pub(crate) fn apply_report_node_files(&mut self, form: &FilesForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let (body, existing_parallel) = {
+            let Ok(flow) = self.reports[idx].report.flow() else {
+                return;
+            };
+            match node_at(&flow, &form.path) {
+                Some(FlowNode::ForEach { body, parallel, .. }) => (body.clone(), *parallel),
+                _ => return,
+            }
+        };
+        let parallel = if form.parallel {
+            Some(existing_parallel.unwrap_or_default())
+        } else {
+            None
+        };
+        let node = FlowNode::ForEach {
+            pattern: Pattern::single(form.var_or_default()),
+            producer: Producer::Files {
+                dir: form.dir.clone(),
+                glob: form.glob_opt(),
+            },
+            body,
+            parallel,
+        };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the FILES configure form ([`Overlay::ReportNodeFiles`]).
+    /// ↑/↓ (or Tab) move between rows; the Var/Match rows take typed characters;
+    /// the Folder row opens the file picker (applying the form's other fields
+    /// first so they aren't lost); the Parallel row toggles with Space/←/→;
+    /// Enter applies, Esc cancels.
+    pub(crate) fn report_node_files_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut form: Box<FilesForm>,
+    ) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeFiles(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                if rows.get(sel).copied() == Some(FilesRow::Folder) {
+                    // Persist the rest of the form, then hand off to the folder
+                    // picker (which writes the chosen dir back into this node).
+                    self.apply_report_node_files(&form);
+                    self.open_files_form_folder(&form);
+                } else {
+                    self.apply_report_node_files(&form);
+                }
+            }
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    Some(FilesRow::Var) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => form.var.push(c),
+                            KeyCode::Backspace => {
+                                form.var.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(FilesRow::Match) => {
+                        match key.code {
+                            KeyCode::Char(c) => form.glob.push(c),
+                            KeyCode::Backspace => {
+                                form.glob.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(FilesRow::Folder) => {
+                        if matches!(key.code, KeyCode::Char(' ')) {
+                            self.apply_report_node_files(&form);
+                            self.open_files_form_folder(&form);
+                        } else {
+                            keep(self, form);
+                        }
+                    }
+                    Some(FilesRow::Parallel) => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                        ) {
+                            form.toggle_parallel();
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
+
+    /// Park the FILES node and open the folder browser to pick its source
+    /// directory (reusing the same [`crate::tui::app::FileAction::PickReportNodeFolder`]
+    /// flow the plain folder key uses), seeded to the loop's current folder.
+    fn open_files_form_folder(&mut self, form: &FilesForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let start = {
+            let p = std::path::Path::new(&form.dir);
+            if !form.dir.trim().is_empty() && p.is_dir() {
+                Some(p.to_path_buf())
+            } else if let Some(base) = self.active_report_base_dir() {
+                let joined = base.join(&form.dir);
+                Some(if joined.is_dir() { joined } else { base })
+            } else {
+                None
+            }
+        };
+        if let Some(dir) = start {
+            self.last_browse_dir = Some(dir);
+        }
+        self.pending_node_folder = Some((form.report_id, form.path.clone()));
+        let _ = idx;
+        self.open_browser(crate::tui::app::FileAction::PickReportNodeFolder);
     }
 
     /// Key handling for the ENVS configure form ([`Overlay::ReportNodeEnvs`]).
@@ -1389,6 +1694,15 @@ impl TuiApp {
                             KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
                         ) {
                             form.toggle_mode();
+                        }
+                        keep(self, form);
+                    }
+                    Some(EnvsRow::Parallel) => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                        ) {
+                            form.toggle_parallel();
                         }
                         keep(self, form);
                     }
@@ -2037,7 +2351,7 @@ mod tests {
     fn parse_one_node_accepts_report_var_as() {
         use crate::report::flow::{FlowNode, ReportStmt};
         match parse_one_node("REPORT FILE AS \"Pretty name\"", false) {
-            Some(FlowNode::Report(ReportStmt::VarAs { var, name })) => {
+            Some(FlowNode::Report(ReportStmt::VarAs { var, name, .. })) => {
                 assert_eq!(var, "FILE");
                 assert_eq!(name, "Pretty name");
             }
@@ -2053,7 +2367,7 @@ mod tests {
             comparisons: vec![RoleRef::Env("staging".into())],
             baseline_show: vec!["Time".into()],
         };
-        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![], vec![]);
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, false, vec![], vec![]);
         assert_eq!(form.baseline_show, vec!["Time".to_string()]);
 
         // clause() must hand it back intact — no silent drop.
@@ -2077,7 +2391,7 @@ mod tests {
             comparisons: vec![RoleRef::Env("staging".into())],
             baseline_show: vec![],
         };
-        let form = EnvsForm::build(1, vec![], "T".into(), &clause, vec![], vec![]);
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, false, vec![], vec![]);
         assert!(
             form.snapshots.iter().any(|s| s == "prod.baseline"),
             "existing FILE path must be seeded into the cycle"
@@ -2100,6 +2414,7 @@ mod tests {
             vec![],
             "T".into(),
             &clause,
+            false,
             vec!["prod".into(), "staging".into()],
             vec!["snap.baseline".into()],
         );

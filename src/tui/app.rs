@@ -480,6 +480,12 @@ pub(crate) enum Overlay {
     /// `Enter` on a `FOR … IN ENVS` node. See
     /// [`crate::tui::report_nodes::EnvsForm`].
     ReportNodeEnvs(Box<crate::tui::report_nodes::EnvsForm>),
+    /// The structured node editor's `FOR … IN FILES` configure form
+    /// ([`Overlay::ReportNodeFiles`]): picks the loop variable, the source
+    /// folder (via the file picker), an optional `MATCH` glob and the
+    /// `PARALLEL` toggle. Opened with `Enter` on a `FOR … IN FILES` node. See
+    /// [`crate::tui::report_nodes::FilesForm`].
+    ReportNodeFiles(Box<crate::tui::report_nodes::FilesForm>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -1447,6 +1453,14 @@ impl TuiApp {
         // one would be stale.
         self.clear_selections();
         self.begin_request();
+        // Mark just this entry as in-flight so the Response pane shows the
+        // spinner only while *this* selected entry is sending — selecting a
+        // different entry mid-send now shows that entry's own last response
+        // rather than a blanket "Sending…".
+        let selected = self.collections[col_idx].selected_entry;
+        if let Some(entry) = self.collections[col_idx].entries.get_mut(selected) {
+            entry.last_run = RunStatus::Running;
+        }
         if let Some(rx) = request::run_collection(
             &self.collections[col_idx],
             env.as_ref(),
@@ -1535,9 +1549,11 @@ impl TuiApp {
         let mut still = Vec::new();
         for rx in std::mem::take(&mut self.pending_batch_runs) {
             let mut disconnected = false;
+            let mut run_col_id: Option<u64> = None;
             loop {
                 match rx.try_recv() {
                     Ok(update) => {
+                        run_col_id = Some(update.col_id);
                         if let Some(col) =
                             self.collections.iter_mut().find(|c| c.id == update.col_id)
                         {
@@ -1556,9 +1572,13 @@ impl TuiApp {
                                 entry.last_run = match result {
                                     Some(true) => RunStatus::Passed,
                                     Some(false) => RunStatus::Failed,
-                                    // The runner never reached this entry (batch
-                                    // stopped early) — back to "hasn't run".
-                                    None => RunStatus::NotRun,
+                                    // The runner hasn't reached this entry *yet*
+                                    // in this streaming pass — it's still in
+                                    // flight, so keep it "Running" (the Response
+                                    // pane shows the spinner only for Running
+                                    // entries). Unreached-because-stopped-early
+                                    // is reset to NotRun once the run ends (below).
+                                    None => RunStatus::Running,
                                 };
                                 // Only overwrite when this pass actually reached
                                 // the entry — an unreached entry keeps whatever
@@ -1586,6 +1606,19 @@ impl TuiApp {
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         disconnected = true;
                         break;
+                    }
+                }
+            }
+            // The run has ended: any entry still marked "Running" was never
+            // reached (the run stopped early / the collection failed to parse),
+            // so drop it back to "hasn't run" rather than leaving it spinning.
+            if disconnected
+                && let Some(col_id) = run_col_id
+                && let Some(col) = self.collections.iter_mut().find(|c| c.id == col_id)
+            {
+                for entry in col.entries.iter_mut() {
+                    if entry.last_run == RunStatus::Running {
+                        entry.last_run = RunStatus::NotRun;
                     }
                 }
             }

@@ -521,6 +521,17 @@ fn draw_report_node_envs_overlay(
                 format!("{}: ‹{}›", s.report_node_envs_mode_label, mode_label),
                 base,
             )),
+            EnvsRow::Parallel => {
+                let mark = if form.parallel {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{} {}", mark, s.report_node_parallel_label),
+                    base,
+                ))
+            }
             EnvsRow::Env(ei) => {
                 let entry = &form.entries[ei];
                 let shown = if entry.name.is_empty() {
@@ -585,10 +596,117 @@ fn draw_report_node_envs_overlay(
     }
 }
 
-/// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
-/// simple selectable list of the open collections, each showing its display
-/// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
-/// re-points the active report's `# collection:` header at it.
+/// Draw the FILES-loop configure overlay ([`Overlay::ReportNodeFiles`]): the
+/// loop variable, the source folder (opened via the file picker), an optional
+/// `MATCH` glob and the `PARALLEL` toggle — the file analogue of the ENVS
+/// overlay above.
+fn draw_report_node_files_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::FilesForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::FilesRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            FilesRow::Var => {
+                let mut text = format!("{}: {}", s.report_node_files_var_label, form.var);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            FilesRow::Folder => {
+                let shown = if form.dir.trim().is_empty() {
+                    s.report_node_files_none
+                } else {
+                    form.dir.as_str()
+                };
+                Line::from(Span::styled(
+                    format!("{}: ‹{shown}›", s.report_node_files_folder_label),
+                    base,
+                ))
+            }
+            FilesRow::Match => {
+                let mut text = format!("{}: {}", s.report_node_files_match_label, form.glob);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            FilesRow::Parallel => {
+                let mark = if form.parallel {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{} {}", mark, s.report_node_parallel_label),
+                    base,
+                ))
+            }
+        };
+        lines.push(line);
+    }
+    let block = panel(s.report_node_files_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_files_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 fn draw_report_bind_overlay(
     f: &mut Frame,
     picker: &super::reports::ReportBindPicker,
@@ -2376,18 +2494,19 @@ pub(crate) fn draw_response(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // The in-flight spinner is still driven by the single shared "live"
-    // response slot (no per-entry concept of "currently sending"), but once
-    // a request has finished, the actual status/body/asserts shown always
-    // come from the *selected entry's own* last response — not whichever
-    // entry happened to finish last — so switching entries after a batch
-    // "Run All" shows the right result for each one.
-    let loading = app.response.lock().unwrap().loading;
+    // The in-flight spinner now tracks the *selected entry* rather than a single
+    // shared "loading" flag: an entry is "sending" while its `last_run` is
+    // `Running`. So a request that's still in flight shows the spinner, while
+    // selecting a *different* entry (whether idle or already finished) shows
+    // that entry's own last response — even if some other request is mid-send.
     let entry = app
         .collections
         .get(ci)
         .and_then(|col| col.entries.get(col.selected_entry));
-    let (status, status_text, body, error, asserts) =
+    let loading = entry
+        .map(|e| e.last_run == RunStatus::Running)
+        .unwrap_or(false);
+    let (status, status_text, body, error, asserts, duration) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
                 r.status,
@@ -2395,8 +2514,16 @@ pub(crate) fn draw_response(
                 r.body.clone(),
                 r.error.clone(),
                 r.assert_results.clone(),
+                r.duration_ms,
             ),
-            None => (0, String::new(), Arc::from(""), String::new(), Vec::new()),
+            None => (
+                0,
+                String::new(),
+                Arc::from(""),
+                String::new(),
+                Vec::new(),
+                None,
+            ),
         };
 
     if loading {
@@ -2485,6 +2612,15 @@ pub(crate) fn draw_response(
         status_spans.push(Span::styled(
             format!("[Asserts] {mark} {passed}/{total}"),
             Style::default().fg(badge).add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Response time, when the runner reported one — the same figure reports
+    // show as the per-request "Time" column, surfaced here for a single run.
+    if let Some(ms) = duration {
+        status_spans.push(Span::raw("   "));
+        status_spans.push(Span::styled(
+            format!("{} {ms} ms", s.response_time_label),
+            Style::default().fg(th.dim),
         ));
     }
 
@@ -3015,7 +3151,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
-                            ("x (report)", s.help_report_export),
+                            ("Ctrl+S (report)", s.help_report_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
                             ("b (report)", s.help_report_bind),
@@ -3229,7 +3365,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
-                        ("x", s.help_report_export),
+                        ("Ctrl+S", s.help_report_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),
@@ -3248,6 +3384,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("REQUEST NAME", s.help_grammar_request),
                         ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
                         ("REPORT REQUEST NAME SHOW(a, b)", s.help_grammar_show),
+                        ("REPORT REQUEST NAME HIDE(a, b)", s.help_grammar_hide),
+                        (
+                            "REPORT COL AS N STATISTICS(MEAN)",
+                            s.help_grammar_statistics,
+                        ),
+                        ("WITH Name: query [STATISTICS]", s.help_grammar_with),
                         ("Result", s.help_grammar_result),
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
                     ],
@@ -3267,6 +3409,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("ZIP(a, b, …)", s.help_grammar_zip),
                         ("CONCAT(a, b, …)", s.help_grammar_concat),
                         ("ENVS \"au\", \"eu\"", s.help_grammar_envs),
+                        (
+                            "BASELINE(FILE(\"snap.baseline\"))",
+                            s.help_grammar_baseline_file,
+                        ),
                     ],
                 );
                 body
@@ -3443,6 +3589,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeEnvs(form) => {
             draw_report_node_envs_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeFiles(form) => {
+            draw_report_node_files_overlay(f, form, s, th, Some(app));
         }
         Overlay::Prompt {
             kind,

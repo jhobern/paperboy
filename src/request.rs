@@ -15,8 +15,8 @@ use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
 use crate::http::ApiResponse;
 use crate::hurl::{
-    EntryOutcome, FormField, HurlEntry, RunOutput, collection_to_hurl, expand_base64_form_fields,
-    run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
+    EntryOutcome, FormField, HurlEntry, RunOutput, RunStatus, collection_to_hurl,
+    expand_base64_form_fields, run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -503,6 +503,11 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
 pub struct CaptureUpdate {
     pub col_id: u64,
     pub entry_idx: usize,
+    /// Whether the runner considered this entry a pass (status expectation,
+    /// asserts and transport all satisfied) — mirrors `EntryOutcome::ok`, so
+    /// the front-end can stamp the entry's pass/fail marker without re-deriving
+    /// it from the response.
+    pub ok: bool,
     pub values: HashMap<String, String>,
     pub response: ApiResponse,
 }
@@ -682,12 +687,14 @@ pub fn run_collection(
                 r.body = Arc::from(eo.body);
                 r.headers = eo.headers;
                 r.assert_results = eo.asserts;
+                r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
                 let values: HashMap<String, String> = eo.captures.into_iter().collect();
                 let _ = tx.send(CaptureUpdate {
                     col_id,
                     entry_idx,
+                    ok: eo.ok,
                     values,
                     response: r.clone(),
                 });
@@ -712,6 +719,7 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         error: eo.error.clone().unwrap_or_default(),
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
+        duration_ms: Some(eo.duration_ms),
     }
 }
 
@@ -886,6 +894,15 @@ pub fn drain_capture_updates(
                             col.invalidate_request_json();
                             if let Some(entry) = col.entries.get_mut(update.entry_idx) {
                                 entry.last_response = Some(update.response.clone());
+                                // The send finished — stamp the pass/fail marker
+                                // and clear the "sending" (Running) state so the
+                                // Response pane stops showing the spinner for
+                                // this entry (only the still-in-flight entry does).
+                                entry.last_run = if update.ok {
+                                    RunStatus::Passed
+                                } else {
+                                    RunStatus::Failed
+                                };
                             }
                         }
                     }
@@ -1372,6 +1389,7 @@ mod tests {
         tx.send(CaptureUpdate {
             col_id: target,
             entry_idx: 0,
+            ok: true,
             values,
             response,
         })

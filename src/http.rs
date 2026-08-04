@@ -25,6 +25,12 @@ pub struct ApiResponse {
     pub headers: Vec<(String, String)>,
     /// Results of evaluating the run entry's `[Asserts]` against this response.
     pub assert_results: Vec<AssertOutcome>,
+    /// Wall-clock duration of the HTTP transfer for this request, in
+    /// milliseconds, as reported by the Hurl runner (the same figure reports
+    /// surface as the per-request "Time" column). `None` when unknown — e.g. a
+    /// response constructed before a run completed, or a transport error with
+    /// no timing.
+    pub duration_ms: Option<u64>,
 }
 
 impl ApiResponse {
@@ -37,5 +43,6 @@ impl ApiResponse {
         self.error.clear();
         self.headers.clear();
         self.assert_results.clear();
+        self.duration_ms = None;
     }
 }

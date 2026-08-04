@@ -463,6 +463,11 @@ pub(crate) struct NewReq {
     pub(crate) reports: Vec<ReportRow>,
     pub(crate) method_idx: usize,
     pub(crate) focus: NewField,
+    /// The last Headers/Cookies/Queries/Options or Form table cell the user
+    /// focused. Used so arrowing up out of the multiline Body returns to that
+    /// exact column/row rather than dropping onto the section's "+ Add" row
+    /// (which loses the column the user was last editing).
+    pub(crate) last_table_cell: Option<NewField>,
     /// Target collection tab (index) the request will be added to, and the
     /// display names to cycle through.
     pub(crate) target_idx: usize,
@@ -560,6 +565,7 @@ impl NewReq {
             reports: Vec::new(),
             method_idx: 0,
             focus: NewField::Name,
+            last_table_cell: None,
             target_idx: target_idx.min(target_names.len().saturating_sub(1)),
             target_names,
             base_url,
@@ -689,6 +695,7 @@ impl NewReq {
             reports,
             method_idx,
             focus: NewField::Name,
+            last_table_cell: None,
             target_idx: ci.min(target_names.len().saturating_sub(1)),
             target_names,
             base_url,
@@ -1217,6 +1224,18 @@ impl NewReq {
                 || (c == FormCol::Ctype && self.form_fields[i].kind == FormFieldKind::Base64File))
         {
             self.focus_next(forward, wrap);
+        }
+    }
+
+    /// The last table cell the user focused (a Headers/Cookies/Queries/Options
+    /// row cell or a Form-field cell), but only if that row still exists.
+    /// Returns `None` if nothing was ever focused in a table or the remembered
+    /// row has since been removed.
+    pub(crate) fn valid_last_table_cell(&self) -> Option<NewField> {
+        match self.last_table_cell? {
+            f @ NewField::Kvd(kind, i, _) if i < self.kvd(kind).len() => Some(f),
+            f @ NewField::FormField(i, _) if i < self.form_fields.len() => Some(f),
+            _ => None,
         }
     }
 

@@ -15,6 +15,7 @@ use crate::report::flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ParallelSpec, Pattern, Producer,
     ReportFlow, ReportStmt, ResponseFmt, RoleRef, WithItem,
 };
+use crate::report::model::StatKind;
 
 /*
 GRAMMAR:
@@ -371,27 +372,55 @@ fn report_vars(i: &str) -> IResult<&str, ReportStmt> {
     map(paren_list1(ident), ReportStmt::Vars)(i)
 }
 
-/// `REPORT "<template>" AS <name>`.
+/// `REPORT "<template>" AS <name> [STATISTICS(…)]`.
 fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
-    map(
-        pair(string_lit, preceded(kw("AS"), str_or_word)),
-        |(template, name)| ReportStmt::Computed { template, name },
-    )(i)
+    let (i, template) = string_lit(i)?;
+    let (i, name) = preceded(kw("AS"), str_or_word)(i)?;
+    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
+    Ok((
+        i,
+        ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        },
+    ))
 }
 
-/// `REPORT <var> [AS <name>]` — a single variable column, optionally renamed.
-/// A bareword source (vs. `report_computed`'s quoted string) is what marks this
-/// as a *variable* reference rather than a literal template.
+/// `REPORT <var> [AS <name>] [STATISTICS(…)]` — a single variable column,
+/// optionally renamed and/or summarised. A bareword source (vs.
+/// `report_computed`'s quoted string) is what marks this as a *variable*
+/// reference rather than a literal template. `STATISTICS(…)` without an explicit
+/// `AS` uses the variable name as the column header.
 fn report_single(i: &str) -> IResult<&str, ReportStmt> {
     let (i, var) = ident(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
+    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
     Ok((
         i,
-        match alias {
-            Some(name) => ReportStmt::VarAs { var, name },
-            None => ReportStmt::Vars(vec![var]),
+        match (alias, stats.is_empty()) {
+            (Some(name), _) => ReportStmt::VarAs { var, name, stats },
+            (None, false) => {
+                let name = var.clone();
+                ReportStmt::VarAs { var, name, stats }
+            }
+            (None, true) => ReportStmt::Vars(vec![var]),
         },
     ))
+}
+
+/// `STATISTICS(stat, …)` — the summary-statistics clause on a `REPORT … AS …`.
+fn statistics_clause(i: &str) -> IResult<&str, Vec<StatKind>> {
+    preceded(kw("STATISTICS"), paren_list1(stat_kind))(i)
+}
+
+/// One statistic keyword inside a `STATISTICS(…)` clause.
+fn stat_kind(i: &str) -> IResult<&str, StatKind> {
+    let (rest, w) = str_or_word(i)?;
+    match StatKind::parse(&w) {
+        Some(k) => Ok((rest, k)),
+        None => Err(perr(i)),
+    }
 }
 
 fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
@@ -426,11 +455,24 @@ fn with_item(i: &str) -> IResult<&str, WithItem> {
     ))(i)
 }
 
-/// `name: <rest of line>` — a full Hurl query (may contain `:` and quotes).
+/// A `WITH` field name: a quoted string (for multi-word / spaced names like
+/// `"Response Time"`) or a bareword identifier. Unlike a general `word`, the
+/// bareword form stops at the `:` separator.
+fn with_field_name(i: &str) -> IResult<&str, String> {
+    alt((string_lit, ident))(i)
+}
+
+/// `name: <rest of line> [STATISTICS(…)]` — a full Hurl query (may contain `:`
+/// and quotes) or an intrinsic name, with an optional trailing statistics
+/// clause. `name` may be quoted to allow spaces.
 fn with_field(i: &str) -> IResult<&str, WithItem> {
-    let (i, name) = ident(i)?;
+    let (i, name) = with_field_name(i)?;
     let (i, _) = sym(':')(i)?;
-    let (i, query) = not_line_ending(i)?;
+    let (i, rest) = not_line_ending(i)?;
+    // Peel an optional trailing `STATISTICS(…)` off the query text (the same
+    // whole-word, outside-quotes rule the `columns:` directive uses), leaving
+    // the bare query.
+    let (query, stats) = crate::report::model::split_statistics(rest);
     let query = query.trim();
     if query.is_empty() {
         return Err(perr(i));
@@ -440,6 +482,7 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
         WithItem::Field {
             name,
             query: query.to_string(),
+            stats,
         },
     ))
 }
@@ -974,6 +1017,36 @@ mod tests {
     }
 
     #[test]
+    fn with_field_supports_quoted_names_and_statistics() {
+        // A multi-word quoted field name, an intrinsic-name query (`Time`), and
+        // a trailing `STATISTICS(…)` clause all parse and round-trip.
+        let flow = assert_round_trips(
+            "REPORT REQUEST analyze AS proc WITH\n    \"Response Time\": Time STATISTICS(MEAN, MEDIAN)\n    Status: HttpStatus\nEND\n",
+        );
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { with, .. }) => {
+                match &with[0] {
+                    WithItem::Field { name, query, stats } => {
+                        assert_eq!(name, "Response Time");
+                        assert_eq!(query, "Time");
+                        assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
+                    }
+                    other => panic!("expected field, got {other:?}"),
+                }
+                // The plain field keeps an empty stats vec.
+                assert!(matches!(&with[1], WithItem::Field { stats, .. } if stats.is_empty()));
+            }
+            other => panic!("expected REPORT REQUEST, got {other:?}"),
+        }
+        // The stats attach to the field's output column (`alias.field`).
+        let cs = flow.column_stats();
+        assert_eq!(
+            cs.get("proc.Response Time"),
+            Some(&vec![StatKind::Mean, StatKind::Median])
+        );
+    }
+
+    #[test]
     fn report_forms_round_trip() {
         // AS alias + RESPONSE + WITH block
         let flow = assert_round_trips(
@@ -1012,7 +1085,7 @@ mod tests {
         // be quoted, and the whole thing round-trips.
         let flow = assert_round_trips("REPORT FILE AS \"Pretty name\"\n");
         match &flow.nodes[0] {
-            FlowNode::Report(ReportStmt::VarAs { var, name }) => {
+            FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => {
                 assert_eq!(var, "FILE");
                 assert_eq!(name, "Pretty name");
             }
@@ -1303,5 +1376,39 @@ mod tests {
             .is_err(),
             "SHOW after COMPARISON should not parse"
         );
+    }
+
+    #[test]
+    fn report_statistics_clause_parses_and_round_trips() {
+        use crate::report::model::StatKind;
+        // `REPORT <var> AS <name> STATISTICS(a, b)` — the clause is parsed onto
+        // the statement, collected into the flow's column stats by header, and
+        // emitted back verbatim on serialization.
+        let flow = assert_round_trips(
+            "REPORT Time AS \"Response time\" STATISTICS(MEAN, MEDIAN)\nREPORT Overall AS Verdict STATISTICS(DISTRIBUTION)\n",
+        );
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
+                assert_eq!(var, "Time");
+                assert_eq!(name, "Response time");
+                assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
+            }
+            other => panic!("expected VarAs with stats, got {other:?}"),
+        }
+        let cs = flow.column_stats();
+        assert_eq!(
+            cs.get("Response time"),
+            Some(&vec![StatKind::Mean, StatKind::Median])
+        );
+        assert_eq!(cs.get("Verdict"), Some(&vec![StatKind::Distribution]));
+    }
+
+    #[test]
+    fn report_statistics_without_as_uses_var_as_header() {
+        use crate::report::model::StatKind;
+        // Without an AS rename the variable name is the column header the stats
+        // attach to.
+        let flow = parse_flow("REPORT Time STATISTICS(SUM)\n").expect("parse");
+        assert_eq!(flow.column_stats().get("Time"), Some(&vec![StatKind::Sum]));
     }
 }

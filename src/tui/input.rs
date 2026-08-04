@@ -405,18 +405,18 @@ impl TuiApp {
                 self.resp_panel.set_scroll(next);
             }
             MouseScrollTarget::ReportPane(pane) => {
-                if let Some(idx) = self.active_report_index() {
-                    if pane == ReportPane::Results
-                        && self.reports[idx].view == ReportView::Results
-                        && self.reports[idx].result.is_some()
-                    {
-                        self.result_cursor_move(dir, 0);
-                    } else if let Some(panel) = self.report_panel_mut(pane) {
-                        let next = (panel.scroll() as i32 + dir * 3)
-                            .max(0)
-                            .min(u16::MAX as i32);
-                        panel.set_scroll(next as u16);
-                    }
+                if self.active_report_index().is_some()
+                    && let Some(panel) = self.report_panel_mut(pane)
+                {
+                    // Scroll the panel directly (including the results grid):
+                    // the wheel moves the *viewport*, leaving the cell cursor
+                    // where it is even if that scrolls it off-screen. The draw
+                    // code only re-centres on the cursor after keyboard
+                    // navigation, so the wheel is no longer fought each frame.
+                    let next = (panel.scroll() as i32 + dir * 3)
+                        .max(0)
+                        .min(u16::MAX as i32);
+                    panel.set_scroll(next as u16);
                 }
             }
             MouseScrollTarget::Help => {
@@ -488,6 +488,7 @@ impl TuiApp {
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
             Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
+            Some(Overlay::ReportNodeFiles(form)) => form.selected = row,
             _ => return,
         }
         self.on_key(Self::mouse_key(KeyCode::Enter));
@@ -902,13 +903,13 @@ impl TuiApp {
     /// click should fall through to the text-selection handler.
     ///
     /// Geometry: `report_pane_areas[Results]` is set to `inner` (the rect
-    /// returned by `block.inner(area)` in `draw_report_panel`), meaning the
-    /// border has already been stripped.  The whole `lines` vec — header at
-    /// index 0, data rows at 1..n — is rendered into `inner` scrolled by
-    /// `results_panel.scroll()`.  Therefore:
-    ///   y_off = row − area.y   (0 == header row when scroll == 0)
-    ///   grid_row = y_off + scroll   (no −1 for border)
-    ///   data_row = grid_row − 1    (only valid when grid_row >= 1)
+    /// returned by `block.inner(area)`), meaning the border has already been
+    /// stripped. When a result is shown the header row (grid line 0) is *pinned*
+    /// at inner row 0 and only the data rows below it scroll, so
+    /// `results_panel.scroll()` is a DATA-ROW offset. Therefore:
+    ///   y_off = row − area.y
+    ///   y_off == 0            → the pinned header row (fall through to select)
+    ///   data_row = (y_off − 1) + scroll   (for y_off >= 1)
     fn on_mouse_results_cell_click(&mut self, col: u16, row: u16) -> bool {
         let Some(idx) = self.active_report_index() else {
             return false;
@@ -929,13 +930,12 @@ impl TuiApp {
         let Some(result) = &self.reports[idx].result else {
             return false;
         };
-        let scroll = self.reports[idx].results_panel.scroll() as usize;
-        let grid_row = y_off + scroll;
-        if grid_row == 0 {
-            // Header row — fall through to text selection.
+        if y_off == 0 {
+            // Pinned header row — fall through to text selection.
             return false;
         }
-        let data_row = grid_row - 1;
+        let scroll = self.reports[idx].results_panel.scroll() as usize;
+        let data_row = (y_off - 1) + scroll;
         if data_row >= result.rows.len() {
             return false;
         }
@@ -1360,6 +1360,7 @@ impl TuiApp {
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
             Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
+            Overlay::ReportNodeFiles(form) => self.report_node_files_key_handler(key, form),
         }
     }
 
@@ -5171,6 +5172,13 @@ impl TuiApp {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
         let prev_focus = form.focus;
+        // Remember the last table cell (Headers/Cookies/Queries/Options row or
+        // Form-field cell) the user was on, so leaving the multiline Body
+        // upward can return to that exact column/row instead of dropping onto
+        // the section's "+ Add" row (which loses the column being edited).
+        if matches!(form.focus, NewField::Kvd(..) | NewField::FormField(..)) {
+            form.last_table_cell = Some(form.focus);
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let submit = key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Enter);
@@ -5785,7 +5793,19 @@ impl TuiApp {
                             _ => true, // single-line fields always move sections
                         };
                         if leave {
-                            form.focus_next(down, true);
+                            // Arrowing up out of the multiline Body returns to
+                            // the last table cell the user was editing (its
+                            // exact column/row) rather than the section's
+                            // "+ Add" row; other cases fall back to normal
+                            // section navigation.
+                            if !down
+                                && form.focus == NewField::Body
+                                && let Some(cell) = form.valid_last_table_cell()
+                            {
+                                form.focus = cell;
+                            } else {
+                                form.focus_next(down, true);
+                            }
                         }
                     } else if let Some(ed) = form.active_editor() {
                         let single = !ed.multiline;
