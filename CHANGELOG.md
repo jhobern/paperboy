@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.2.0] - 2026-08-04
+
+### Added
+
+- **A native graphical front-end (`-g` / `--gui`).** PaperBoy now ships a
+  desktop GUI (built on eframe/egui) alongside the terminal UI and the headless
+  CLI runner — all three drive the *same* shared core (collections,
+  environments, the Hurl request model, request running, git-remote load/save,
+  themes and translations), so anything you build in one front-end round-trips
+  through the others. Launch it with `paperboy -g`. The terminal UI remains the
+  default when no flag is given.
+
+  The GUI mirrors the TUI feature-for-feature: a Postman-style layout with a
+  collapsible collection/folder tree, the request editor (Params, Headers,
+  Body, Auth, Cookies, Options, Asserts, Captures and a resolved-request Code
+  view), the response viewer (Body/Headers/Asserts), the Global Environments
+  panel (activate, link, edit variables, resolve `env:` / `ssm:` / `op://`
+  secrets), report tabs, the theme editor, and loading/saving collections and
+  environments to a git remote with no local clone. **Tab** cycles the panels
+  in the same order as the terminal UI (Tabs → List → Main → GlobalEnv →
+  Response), and **Shift+Tab** cycles backwards.
+
+  Interactions that needed keyboard shortcuts in the terminal become native GUI
+  gestures: panels are resized by dragging their splitters (rather than with
+  keys), selection, scrolling and clipboard use the platform's own handling, and
+  collection tabs switch by clicking. Every built-in and custom **theme** applies
+  to the GUI unchanged (the shared RGB `ThemeSpec` is mapped onto egui's visual
+  style), and all GUI text flows through the existing `i18n` table, so English,
+  French and Danish are all covered. GUI icons (the tree's folder/file/report/
+  environment glyphs, the run/close/add controls and the pass/fail markers) are
+  drawn from a bundled **Phosphor** icon font, so they render consistently on
+  every machine rather than depending on which emoji fonts the host has
+  installed.
+
+  > The PaperTrail node editor is intentionally not part of the GUI yet — it
+  > arrives in a later step. Existing reports are still shown and preserved.
+
+- **Workspaces in the GUI.** *File → Open workspace…* points the GUI at a
+  folder of collections and shows its filesystem tree in the left panel, exactly
+  like the terminal UI: folders expand and collapse, collection files list their
+  requests inline, and selecting a request opens it in the editor on the right
+  (double-click runs it). Selecting a `.vars` file loads it as a global
+  environment, and selecting a `.trail` report opens it read-only in the centre
+  pane (the interactive node editor is still step 2). The expand/collapse state
+  is the same set the terminal UI persists, so a workspace opened in one
+  front-end round-trips through the other.
+
+
 ## [0.1.10] - 2026-08-03
 
 ### Changed

@@ -2396,31 +2396,14 @@ impl TuiApp {
     /// — only the Requests-list panel title does that, deriving its display
     /// name straight from `path` (see `draw::draw_collection_left`).
     pub(crate) fn load_workspace_file(&mut self, collection_idx: usize, path: PathBuf) {
-        let Some(col) = self.collections.get(collection_idx) else {
+        let Some(col) = self.collections.get_mut(collection_idx) else {
             return;
         };
-        let workspace_root = col.workspace_root.clone();
-        let filter = col.workspace_filter_hurl_json;
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let entries = crate::postman::parse_collection(&content);
-                if let Some(col) = self.collections.get_mut(collection_idx) {
-                    // Cache the outgoing file's request names first, so if it was
-                    // left expanded it keeps listing its requests from the cache
-                    // once it is no longer the loaded file.
-                    col.snapshot_loaded_titles();
-                    col.entries = entries;
-                    col.selected_entry = 0;
-                    col.path = Some(path);
-                    col.workspace_root = workspace_root;
-                    col.workspace_filter_hurl_json = filter;
-                    col.invalidate_request_json();
-                    col.sync_folder_to_selected();
-                    // Expand all ancestor folders of the newly-loaded file so
-                    // it is visible in the tree (and un-collapse its accordion).
-                    col.expand_ancestors_for_path();
-                    col.sync_ws_cursor();
-                }
+        // The read+parse+tree-sync is shared with the GUI (see
+        // `Collection::load_workspace_file`); the terminal UI only adds its own
+        // focus/status/persistence handling around it.
+        match col.load_workspace_file(path) {
+            Ok(()) => {
                 self.active_tab = collection_idx;
                 self.focus = Pane::List;
                 self.status = Some(Status::Loaded);
@@ -3066,25 +3049,17 @@ impl TuiApp {
     /// Every theme offered in the Theme editor, in display order: the built-in
     /// presets first, then the user's own custom themes.
     pub(crate) fn all_themes(&self) -> Vec<crate::tui::theme::ThemeSpec> {
-        let mut themes = crate::tui::theme::builtin_presets();
-        themes.extend(self.custom_themes.iter().cloned());
-        themes
-    }
-
-    /// Look a theme up by name across presets and custom themes.
-    pub(crate) fn find_theme(&self, name: &str) -> Option<crate::tui::theme::ThemeSpec> {
-        self.all_themes().into_iter().find(|t| t.name == name)
+        crate::session::all_themes(&self.custom_themes)
     }
 
     /// The theme spec currently in effect: the manually-chosen theme if set
     /// (and still present), otherwise the current language's preset.
     pub(crate) fn active_theme_spec(&self) -> crate::tui::theme::ThemeSpec {
-        if let Some(name) = &self.active_theme
-            && let Some(spec) = self.find_theme(name)
-        {
-            return spec;
-        }
-        crate::tui::theme::preset_for_language(&self.language)
+        crate::session::active_theme_spec(
+            self.active_theme.as_deref(),
+            &self.custom_themes,
+            &self.language,
+        )
     }
 
     /// The runtime [`Theme`](crate::tui::theme::Theme) to draw with. While the
@@ -3113,30 +3088,7 @@ impl TuiApp {
     /// the collection's own Linked Environment's vars on any name collision
     /// (Linked wins). `None` when neither is set.
     pub(crate) fn effective_env(&self, ci: usize) -> Option<Environment> {
-        let linked = self
-            .collections
-            .get(ci)
-            .and_then(|c| c.linked_env_id)
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        let active = self
-            .active_env_id
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        match (linked, active) {
-            (None, None) => None,
-            (Some(env), None) | (None, Some(env)) => Some(env.clone()),
-            (Some(linked), Some(active)) => {
-                let mut merged = active.clone();
-                for lv in &linked.vars {
-                    match merged.vars.iter_mut().find(|v| v.key == lv.key) {
-                        Some(existing) => *existing = lv.clone(),
-                        None => merged.vars.push(lv.clone()),
-                    }
-                }
-                merged.id = linked.id;
-                merged.name = linked.name.clone();
-                Some(merged)
-            }
-        }
+        crate::session::effective_env(&self.collections, &self.global_envs, ci, self.active_env_id)
     }
 
     /// Keys defined in *both* the active collection's linked Environment and
@@ -3145,25 +3097,12 @@ impl TuiApp {
     /// silently shadowed. Used to flag such substitutions in the Request
     /// viewer with a warning icon so the collision isn't invisible.
     pub(crate) fn shadowed_env_keys(&self, ci: usize) -> std::collections::HashSet<String> {
-        let linked = self
-            .collections
-            .get(ci)
-            .and_then(|c| c.linked_env_id)
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        let active = self
-            .active_env_id
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        match (linked, active) {
-            // A collection linked to the very environment that's also active
-            // shadows nothing — the same value would be substituted either way.
-            (Some(linked), Some(active)) if linked.id != active.id => linked
-                .vars
-                .iter()
-                .filter(|lv| active.vars.iter().any(|av| av.key == lv.key))
-                .map(|lv| lv.key.clone())
-                .collect(),
-            _ => std::collections::HashSet::new(),
-        }
+        crate::session::shadowed_env_keys(
+            &self.collections,
+            &self.global_envs,
+            ci,
+            self.active_env_id,
+        )
     }
 
     /// Apply the user's choice on an [`Overlay::EnvCollision`] popup,

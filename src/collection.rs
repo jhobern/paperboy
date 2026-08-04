@@ -400,6 +400,28 @@ impl Collection {
         }
     }
 
+    /// Load a workspace collection file (Hurl or Postman JSON) at `path` into
+    /// this tab, replacing its currently-loaded requests. Front-end agnostic —
+    /// it only mutates this `Collection` (both the terminal UI and the GUI call
+    /// it, then add their own focus/status handling). The tab's
+    /// `workspace_root`/`workspace_filter_hurl_json` are left untouched. Caches
+    /// the outgoing file's request names first so a still-expanded previous file
+    /// keeps listing its requests, then re-syncs the tree cursor/selection and
+    /// expands the new file's ancestors so it's visible.
+    pub fn load_workspace_file(&mut self, path: PathBuf) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(&path)?;
+        let entries = crate::postman::parse_collection(&content);
+        self.snapshot_loaded_titles();
+        self.entries = entries;
+        self.selected_entry = 0;
+        self.path = Some(path);
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        self.expand_ancestors_for_path();
+        self.sync_ws_cursor();
+        Ok(())
+    }
+
     /// Re-read the request names of every expanded collection file that isn't
     /// the currently-loaded one, populating `workspace_titles` from disk. Used
     /// after restoring persisted state, where collections expanded last session

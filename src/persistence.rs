@@ -337,7 +337,7 @@ impl PersistedTab {
 /// *source text* is snapshotted (like [`PersistedTab`] snapshots collection
 /// entries) so an unsaved scratch report survives a restart; `path`/`git_origin`
 /// keep "Save" targeting the right place after a restart.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct PersistedReport {
     pub name: String,
     #[serde(default)]

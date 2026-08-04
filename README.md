@@ -6,18 +6,25 @@ for requests, `.vars` files for environments — so everything can be committed,
 diffed, and shared through a normal git repository. There is no hosted
 service and nothing runs outside your machine.
 
-It ships as a single binary with two front-ends:
+It ships as a single binary with three front-ends:
 
 - **Terminal UI** (default) — a full interactive client for building,
   editing, running and organizing requests.
+- **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
+  with the same features and layout as the terminal UI, using mouse gestures
+  (drag to resize panels, click to switch tabs) instead of shortcuts.
 - **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
   prints the results, for scripts and CI.
+
+All three drive the same shared core, so collections, environments, themes and
+git-remote workflows behave identically across them.
 
 ## Contents
 
 - [Installing & running](#installing--running)
 - [Core concepts](#core-concepts)
 - [Features](#features)
+- [Graphical UI](#graphical-ui)
 - [Working with collections & environments](#working-with-collections--environments)
 - [Loading & saving via git](#loading--saving-via-git)
 - [Secrets & environment variables](#secrets--environment-variables)
@@ -31,6 +38,7 @@ From the `paperboy` directory:
 
 ```sh
 cargo run            # launch the terminal UI
+cargo run -- --gui   # launch the graphical UI
 cargo build --release
 ```
 
@@ -181,6 +189,37 @@ cargo build --release
   way automatically; native Hurl collections get the same behavior for free
   simply by naming requests with `/` in them. Creating a new request while
   browsing a folder prefills the Name field with that folder's path.
+
+## Graphical UI
+
+Run `paperboy -g` (or `cargo run -- --gui`) to open the native desktop
+front-end instead of the terminal UI. It is built on
+[eframe/egui](https://github.com/emilk/egui) and drives the exact same core as
+the terminal UI, so it is feature-for-feature equivalent — collection tabs, the
+folder tree, the request editor (Params, Headers, Body, Auth, Cookies, Options,
+Asserts, Captures, and a resolved-request Code view), the response viewer
+(Body / Headers / Asserts), the Global Environments panel (activate, link, edit
+variables, resolve `env:` / `ssm:` / `op://` secrets), report tabs, the theme
+editor, and loading/saving collections and environments to a git remote with no
+local clone.
+
+What changes is how you interact with it:
+
+- **Tab** cycles the focused panel in the same order as the terminal UI
+  (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
+  backwards — so the muscle memory carries over.
+- **Panels are resized by dragging** their splitters, rather than with keyboard
+  shortcuts.
+- **Selection, scrolling and the clipboard** use the platform's native
+  handling; **collection tabs switch by clicking**; folders collapse/expand by
+  clicking their header.
+- **Every theme applies unchanged** — built-in language presets and custom
+  themes are read from the same `ThemeSpec` and mapped onto egui's visual
+  style, and the whole GUI is translated (English / French / Danish) through
+  the same `i18n` table as the terminal UI.
+
+> The PaperTrail node editor is not part of the GUI yet (it arrives in a later
+> step); existing reports are still shown and preserved.
 
 ## Working with collections & environments
 

@@ -619,6 +619,197 @@ strings! {
     report_node_files_folder_label => "Folder", "Dossier", "Mappe";
     report_node_files_match_label => "Match (glob)", "Filtre (glob)", "Match (glob)";
     report_node_files_none => "no folder chosen — Space to pick", "aucun dossier choisi — Espace pour choisir", "ingen mappe valgt — Mellemrum for at vælge";
+
+    // ── GUI front-end strings ────────────────────────────────────────────────
+    // Clean (mnemonic-free) labels for the graphical client. The terminal UI's
+    // rows above embed `(X)` keyboard-mnemonic hints, so the GUI needs its own
+    // wording; kept here so all three languages stay in one table.
+    gui_untitled => "Untitled", "Sans titre", "Uden titel";
+    gui_new_collection => "New collection", "Nouvelle collection", "Ny samling";
+    gui_env_label => "Env:", "Env\u{a0}:", "Miljø:";
+    gui_theme_status_label => "Theme:", "Thème\u{a0}:", "Tema:";
+    gui_none_dash => "—", "—", "—";
+    // Editor sections.
+    gui_sec_params => "Params", "Paramètres", "Parametre";
+    gui_sec_headers => "Headers", "En-têtes", "Headere";
+    gui_sec_body => "Body", "Corps", "Body";
+    gui_sec_auth => "Auth", "Auth", "Auth";
+    gui_sec_cookies => "Cookies", "Cookies", "Cookies";
+    gui_sec_options => "Options", "Options", "Indstillinger";
+    gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
+    gui_sec_captures => "Captures", "Captures", "Optagelser";
+    gui_sec_code => "Code", "Code", "Code";
+    gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
+    gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";
+    gui_form_mutually_exclusive => "This request uses form fields (below). A raw body and form fields are mutually exclusive.", "Cette requête utilise des champs de formulaire (ci-dessous). Un corps brut et des champs de formulaire sont mutuellement exclusifs.", "Denne anmodning bruger formularfelter (nedenfor). En rå brødtekst og formularfelter udelukker hinanden.";
+    gui_raw_body_hint => "Raw request body (JSON, text, …)", "Corps brut de la requête (JSON, texte, …)", "Rå anmodningstekst (JSON, tekst, …)";
+    gui_basic_auth => "Basic authentication", "Authentification basique", "Basisgodkendelse";
+    gui_username => "Username", "Nom d'utilisateur", "Brugernavn";
+    gui_password => "Password", "Mot de passe", "Adgangskode";
+    gui_per_request_options => "Per-request Hurl options (e.g. retry: 3, insecure: true)", "Options Hurl par requête (p. ex. retry: 3, insecure: true)", "Hurl-indstillinger pr. anmodning (f.eks. retry: 3, insecure: true)";
+    gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
+    gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
+    gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
+    gui_add_assert => "+ Add assert", "+ Ajouter une assertion", "+ Tilføj assertion";
+    gui_add_field => "+ Add field", "+ Ajouter un champ", "+ Tilføj felt";
+    gui_base64_prefix => "base64 prefix", "préfixe base64", "base64-præfiks";
+    gui_no_requests_editor => "This collection has no requests.", "Cette collection ne contient aucune requête.", "Denne samling har ingen anmodninger.";
+    gui_new_request => "New request", "Nouvelle requête", "Ny anmodning";
+    gui_new_request_btn => "New request", "Nouvelle requête", "Ny anmodning";
+    gui_send => "Send", "Envoyer", "Send";
+    gui_kind_text => "Text", "Texte", "Tekst";
+    gui_kind_file => "File", "Fichier", "Fil";
+    gui_kind_base64 => "Base64", "Base64", "Base64";
+    // Field hints.
+    gui_hint_key => "key", "clé", "nøgle";
+    gui_hint_value => "value", "valeur", "værdi";
+    gui_hint_header => "Header", "En-tête", "Header";
+    gui_hint_name => "name", "nom", "navn";
+    gui_hint_query => "query", "requête", "forespørgsel";
+    gui_hint_option => "option", "option", "indstilling";
+    gui_hint_field => "field", "champ", "felt";
+    gui_hint_key_upper => "KEY", "CLÉ", "NØGLE";
+    // Response viewer.
+    gui_error => "Error", "Erreur", "Fejl";
+    gui_no_response_yet => "No response yet", "Aucune réponse", "Intet svar endnu";
+    gui_copy => "Copy", "Copier", "Kopiér";
+    gui_copy_body => "Copy body", "Copier le corps", "Kopiér brødtekst";
+    gui_empty_body => "(empty body)", "(corps vide)", "(tom brødtekst)";
+    gui_no_headers => "(no headers)", "(aucun en-tête)", "(ingen headere)";
+    gui_no_assertions => "No assertions on this request.", "Aucune assertion pour cette requête.", "Ingen assertioner på denne anmodning.";
+    // Environments panel.
+    gui_environments => "Environments", "Environnements", "Miljøer";
+    gui_load_ellipsis => "Load…", "Charger…", "Indlæs…";
+    gui_load_vars_tooltip => "Load a .vars file", "Charger un fichier .vars", "Indlæs en .vars-fil";
+    gui_new_environment => "New environment", "Nouvel environnement", "Nyt miljø";
+    gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
+    gui_active => "Active", "Actif", "Aktiv";
+    gui_active_tooltip => "Use this environment for substitution", "Utiliser cet environnement pour la substitution", "Brug dette miljø til substitution";
+    gui_linked => "Linked", "Lié", "Tilknyttet";
+    gui_linked_tooltip => "Pin to the active collection (overrides Active)", "Épingler à la collection active (remplace Actif)", "Fastgør til den aktive samling (tilsidesætter Aktiv)";
+    gui_delete => "Delete", "Supprimer", "Slet";
+    gui_save_ellipsis => "Save…", "Enregistrer…", "Gem…";
+    gui_add_variable => "+ Add variable", "+ Ajouter une variable", "+ Tilføj variabel";
+    gui_resolving => "resolving…", "résolution…", "løser…";
+    gui_unresolved => "unresolved", "non résolu", "uløst";
+    // Requests tree.
+    gui_add_request => "Add request", "Ajouter une requête", "Tilføj anmodning";
+    gui_run_all => "Run All", "Tout exécuter", "Kør alle";
+    gui_run_all_tooltip => "Run every request in order", "Exécuter toutes les requêtes dans l'ordre", "Kør alle anmodninger i rækkefølge";
+    gui_no_requests_tree => "No requests yet — click Add to create one.", "Aucune requête — cliquez sur Ajouter pour en créer une.", "Ingen anmodninger endnu — klik på Tilføj for at oprette en.";
+    gui_untitled_request => "(untitled)", "(sans titre)", "(uden titel)";
+    gui_run => "Run", "Exécuter", "Kør";
+    gui_rename_ellipsis => "Rename…", "Renommer…", "Omdøb…";
+    // Shared widgets.
+    gui_add => "+ Add", "+ Ajouter", "+ Tilføj";
+    gui_remove => "Remove", "Supprimer", "Fjern";
+    // Menu bar.
+    gui_menu_file => "File", "Fichier", "Fil";
+    gui_menu_view => "View", "Affichage", "Vis";
+    gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
+    gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";
+    gui_open_collection_ellipsis => "Open collection…", "Ouvrir une collection…", "Åbn samling…";
+    gui_import_postman => "Import Postman…", "Importer Postman…", "Importér Postman…";
+    gui_open_environment_ellipsis => "Open environment…", "Ouvrir un environnement…", "Åbn miljø…";
+    gui_open_workspace_ellipsis => "Open workspace…", "Ouvrir un espace de travail…", "Åbn workspace…";
+    gui_save_collection_ellipsis => "Save collection…", "Enregistrer la collection…", "Gem samling…";
+    gui_save_response_ellipsis => "Save response…", "Enregistrer la réponse…", "Gem svar…";
+    gui_load_from_git => "Load from Git…", "Charger depuis Git…", "Indlæs fra Git…";
+    gui_save_collection_git => "Save collection to Git…", "Enregistrer la collection sur Git…", "Gem samling til Git…";
+    gui_set_base_url => "Set base URL…", "Définir l'URL de base…", "Angiv basis-URL…";
+    gui_close_tab => "Close tab", "Fermer l'onglet", "Luk fane";
+    gui_quit => "Quit", "Quitter", "Afslut";
+    gui_language => "Language", "Langue", "Sprog";
+    gui_theme_menu => "Theme", "Thème", "Tema";
+    gui_follow_language => "Follow language", "Suivre la langue", "Følg sproget";
+    gui_new_custom_theme => "New custom theme…", "Nouveau thème personnalisé…", "Nyt brugerdefineret tema…";
+    gui_edit_current_theme => "Edit current theme…", "Modifier le thème actuel…", "Rediger nuværende tema…";
+    gui_preferences => "Preferences", "Préférences", "Præferencer";
+    gui_confirm_on_exit => "Confirm on exit", "Confirmer à la sortie", "Bekræft ved afslutning";
+    gui_confirm_on_clear => "Confirm on clear", "Confirmer avant de fermer", "Bekræft ved lukning";
+    gui_confirm_delete_env => "Confirm deleting an environment", "Confirmer la suppression d'un environnement", "Bekræft sletning af et miljø";
+    gui_run_all_batch => "Run All in batch mode", "Tout exécuter en mode batch", "Kør alle i batch-tilstand";
+    gui_default_code_hurl => "Default Code view: Hurl", "Vue Code par défaut\u{a0}: Hurl", "Standard Code-visning: Hurl";
+    gui_request_response => "Request / Response", "Requête / Réponse", "Anmodning / Svar";
+    gui_reports => "Reports", "Rapports", "Rapporter";
+    gui_send_tooltip => "Send the selected request (Ctrl+Enter / F5)", "Envoyer la requête sélectionnée (Ctrl+Entrée / F5)", "Send den valgte anmodning (Ctrl+Enter / F5)";
+    gui_custom => "Custom", "Personnalisé", "Brugerdefineret";
+    gui_default_env_name => "Environment", "Environnement", "Miljø";
+    // Dialogs.
+    gui_open_collection_title => "Open collection", "Ouvrir une collection", "Åbn samling";
+    gui_open_environment_title => "Open environment", "Ouvrir un environnement", "Åbn miljø";
+    gui_open_workspace_title => "Open workspace folder", "Ouvrir un dossier d'espace de travail", "Åbn workspace-mappe";
+    gui_not_a_folder => "That path is not a folder.", "Ce chemin n'est pas un dossier.", "Den sti er ikke en mappe.";
+    gui_workspace_filter => "Filter", "Filtre", "Filter";
+    gui_workspace_filter_tooltip => "Toggle showing only .hurl/.json/.vars/.trail files", "Basculer l'affichage des seuls fichiers .hurl/.json/.vars/.trail", "Skift visning af kun .hurl/.json/.vars/.trail-filer";
+    gui_close => "Close", "Fermer", "Luk";
+    gui_file_path => "File path:", "Chemin du fichier\u{a0}:", "Filsti:";
+    gui_open => "Open", "Ouvrir", "Åbn";
+    gui_cancel => "Cancel", "Annuler", "Annuller";
+    gui_could_not_parse => "Could not parse that file.", "Impossible d'analyser ce fichier.", "Kunne ikke fortolke den fil.";
+    gui_could_not_read => "Could not read file:", "Impossible de lire le fichier\u{a0}:", "Kunne ikke læse filen:";
+    gui_could_not_write => "Could not write file:", "Impossible d'écrire le fichier\u{a0}:", "Kunne ikke skrive filen:";
+    gui_save_collection_title => "Save collection", "Enregistrer la collection", "Gem samling";
+    gui_save_environment_title => "Save environment", "Enregistrer l'environnement", "Gem miljø";
+    gui_save_response_title => "Save response", "Enregistrer la réponse", "Gem svar";
+    gui_save => "Save", "Enregistrer", "Gem";
+    gui_nothing_to_save => "Nothing to save.", "Rien à enregistrer.", "Intet at gemme.";
+    gui_rename => "Rename", "Renommer", "Omdøb";
+    gui_name => "Name", "Nom", "Navn";
+    gui_base_url_title => "Base URL", "URL de base", "Basis-URL";
+    gui_new_env_name_title => "New environment name", "Nom du nouvel environnement", "Navn på nyt miljø";
+    gui_new_collection_name_title => "New collection name", "Nom de la nouvelle collection", "Navn på ny samling";
+    gui_ok => "OK", "OK", "OK";
+    gui_theme_editor_title => "Theme editor", "Éditeur de thème", "Tema-editor";
+    gui_apply => "Apply", "Appliquer", "Anvend";
+    // Reports panel.
+    gui_close_reports => "Close reports", "Fermer les rapports", "Luk rapporter";
+    gui_no_reports => "No reports in this session.", "Aucun rapport dans cette session.", "Ingen rapporter i denne session.";
+    gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
+    gui_empty_paren => "(empty)", "(vide)", "(tom)";
+    gui_papertrail_note => "The PaperTrail node editor arrives in step 2. These reports are preserved with the session.", "L'éditeur de nœuds PaperTrail arrive à l'étape 2. Ces rapports sont conservés avec la session.", "PaperTrail-nodeeditoren kommer i trin 2. Disse rapporter bevares med sessionen.";
+    // Git remote flow (used by remote.rs).
+    gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
+    gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
+    gui_git_connect => "Connect", "Se connecter", "Forbind";
+    gui_git_branches => "Branches", "Branches", "Grene";
+    gui_git_tags => "Tags", "Étiquettes", "Tags";
+    gui_git_browse_files => "Browse files", "Parcourir les fichiers", "Gennemse filer";
+    gui_git_back => "Back", "Retour", "Tilbage";
+    gui_git_filter => "Filter", "Filtrer", "Filter";
+    gui_git_load => "Load", "Charger", "Indlæs";
+    gui_git_save => "Save", "Enregistrer", "Gem";
+    gui_git_branch => "Branch", "Branche", "Gren";
+    gui_git_path => "Path in repo", "Chemin dans le dépôt", "Sti i lageret";
+    gui_git_commit_message => "Commit message", "Message de commit", "Commit-besked";
+    gui_git_show_all_files => "Show all files", "Afficher tous les fichiers", "Vis alle filer";
+    gui_git_pick_ref => "Pick a branch or tag", "Choisir une branche ou une étiquette", "Vælg en gren eller et tag";
+    gui_git_load_title => "Load from Git", "Charger depuis Git", "Indlæs fra Git";
+    gui_git_save_collection_title => "Save collection to Git", "Enregistrer la collection sur Git", "Gem samling til Git";
+    gui_git_connecting => "Connecting to remote…", "Connexion au dépôt distant…", "Forbinder til fjernlager…";
+    gui_git_fetching_files => "Fetching file list…", "Récupération de la liste des fichiers…", "Henter filliste…";
+    gui_git_loading_file => "Loading selected file…", "Chargement du fichier sélectionné…", "Indlæser valgt fil…";
+    gui_git_saving => "Saving to remote…", "Enregistrement sur le dépôt distant…", "Gemmer til fjernlager…";
+    gui_git_fetched_at => "Fetched at", "Récupéré à", "Hentet ved";
+    gui_git_no_files => "No .hurl or .vars files match. Enable “Show all files” to browse everything.", "Aucun fichier .hurl ou .vars ne correspond. Activez « Afficher tous les fichiers » pour tout parcourir.", "Ingen .hurl- eller .vars-filer matcher. Slå “Vis alle filer” til for at gennemse alt.";
+    gui_git_checkout_gone => "The temporary checkout was cleaned up. Go Back and Browse files again to retry.", "L'extraction temporaire a été nettoyée. Revenez en arrière et parcourez à nouveau les fichiers pour réessayer.", "Den midlertidige udtjekning blev ryddet op. Gå tilbage og gennemse filer igen for at prøve igen.";
+    gui_git_update_prefix => "Update", "Mettre à jour", "Opdater";
+    gui_git_err_no_file => "No file was selected.", "Aucun fichier n'a été sélectionné.", "Ingen fil blev valgt.";
+    gui_git_err_no_ref => "No branch or tag was selected.", "Aucune branche ou étiquette n'a été sélectionnée.", "Ingen gren eller tag blev valgt.";
+    gui_git_err_not_env => "The selected file is not a valid .vars environment.", "Le fichier sélectionné n'est pas un environnement .vars valide.", "Den valgte fil er ikke et gyldigt .vars-miljø.";
+    gui_git_err_not_collection => "The selected file is not a valid collection.", "Le fichier sélectionné n'est pas une collection valide.", "Den valgte fil er ikke en gyldig samling.";
+    gui_git_err_collection_missing => "Collection not found.", "Collection introuvable.", "Samling ikke fundet.";
+    gui_git_err_collection_closed => "Collection was closed before the save finished.", "La collection a été fermée avant la fin de l'enregistrement.", "Samlingen blev lukket, før lagringen var færdig.";
+    gui_git_err_unexpected_save => "Unexpected save result while loading.", "Résultat d'enregistrement inattendu pendant le chargement.", "Uventet lagringsresultat under indlæsning.";
+    gui_git_err_unexpected_load => "Unexpected load result while saving.", "Résultat de chargement inattendu pendant l'enregistrement.", "Uventet indlæsningsresultat under lagring.";
+    gui_git_err_worker_ended => "Background git operation ended unexpectedly.", "L'opération git en arrière-plan s'est terminée de manière inattendue.", "Baggrunds-git-handlingen sluttede uventet.";
+    gui_git_err_url_required => "Repository URL is required.", "L'URL du dépôt est requise.", "Lager-URL er påkrævet.";
+    gui_git_err_pick_ref_first => "Choose a branch or tag first.", "Choisissez d'abord une branche ou une étiquette.", "Vælg først en gren eller et tag.";
+    gui_git_err_browse_again => "Browse files again before loading.", "Parcourez à nouveau les fichiers avant de charger.", "Gennemse filer igen før indlæsning.";
+    gui_git_err_pick_file => "Choose a file to load.", "Choisissez un fichier à charger.", "Vælg en fil at indlæse.";
+    gui_git_err_branch_required => "Branch is required.", "La branche est requise.", "Gren er påkrævet.";
+    gui_git_err_path_required => "Path in repository is required.", "Le chemin dans le dépôt est requis.", "Sti i lageret er påkrævet.";
+    gui_git_err_path_relative => "Path must be relative and must not contain “..”.", "Le chemin doit être relatif et ne doit pas contenir « .. ».", "Stien skal være relativ og må ikke indeholde “..”.";
 }
 
 /// A language-independent status / notification message. It stores *what*

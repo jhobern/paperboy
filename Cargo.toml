@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -45,3 +45,19 @@ chrono = { version = "0.4", default-features = false, features = [
 # integrations we don't use, keeping the dependency tree small.
 rust_xlsxwriter = { version = "0.96.0", default-features = false }
 nom = "7.0"
+# Native GUI front-end (eframe = egui + winit + wgpu). Shares the same
+# front-end-agnostic core (`session`, `request`, `collection`, `environment`,
+# `theme`, …) as the terminal UI, so the two never duplicate logic. egui is
+# immediate-mode like ratatui, so the panel model and RGB theming map across
+# directly. `egui_extras` provides the table/grid builders the panels use.
+eframe = "0.35"
+egui_extras = "0.35"
+# Phosphor icon font for the GUI. egui's bundled emoji/symbol fonts don't
+# actually contain the folder/file/report/key/caret glyphs the tree needs (they
+# render as empty "tofu" boxes on many systems), so we register the Phosphor
+# icon set at startup and draw all GUI icons from it — guaranteed to render
+# regardless of the host's installed fonts. `default-features = false` +
+# `regular` bundles only the one weight we use.
+egui-phosphor = { version = "0.13", default-features = false, features = [
+    "regular",
+] }
