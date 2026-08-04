@@ -79,6 +79,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   terminal UI persists, so a workspace opened in one front-end round-trips
   through the other.
 
+- **A drag-and-drop block palette for the GUI report editor.** The Blocks view
+  now has an always-visible palette split into **Blocks** (base statements —
+  `REQUEST`, `REPORT` variable, an assignment, `LIST`, and the three `FOR`
+  loops) and **Modifiers** (`REPORT`, `PARALLEL`, `WITH`, `AS`). Drag a base
+  block into the report and the existing blocks slide apart to open an animated
+  gap with a placeholder showing exactly where it will land. A report line is
+  now *composed* from several chips rather than one opaque row: dropping the
+  `REPORT` modifier onto a `REQUEST` turns it into a reported request
+  (`[REPORT] [REQUEST …]`), `PARALLEL` onto a `FOR` runs it concurrently, `WITH`
+  adds an ad-hoc field to a report request, and `AS` names a report column — and
+  each attached modifier shows as its own chip with a `×` to detach it. A
+  modifier only highlights and accepts a drop where it is valid for the block it
+  is over. Picking a request from the name picker now renames in place, keeping
+  a report request's `AS` / `WITH` / `RESPONSE` modifiers intact. The
+  compositional edit operations live in the shared flow-editing core, so they
+  are available to both front-ends.
+
 
 ## [0.1.10] - 2026-08-03
 

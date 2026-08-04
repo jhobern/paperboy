@@ -585,6 +585,10 @@ strings! {
     node_kind_for_folders => "FOR … IN FOLDERS — loop over folders", "FOR … IN FOLDERS — boucler sur des dossiers", "FOR … IN FOLDERS — løkke over mapper";
     node_kind_for_envs => "FOR … IN ENVS — loop over environments", "FOR … IN ENVS — boucler sur des environnements", "FOR … IN ENVS — løkke over miljøer";
     node_kind_list => "LIST — declare a list", "LIST — déclarer une liste", "LIST — erklær en liste";
+    node_mod_report => "REPORT — report a request", "REPORT — rapporter une requête", "REPORT — rapportér en forespørgsel";
+    node_mod_parallel => "PARALLEL — run a loop concurrently", "PARALLEL — exécuter une boucle en parallèle", "PARALLEL — kør en løkke samtidigt";
+    node_mod_with => "WITH — add a field to a report request", "WITH — ajouter un champ à une requête de rapport", "WITH — tilføj et felt til en rapportforespørgsel";
+    node_mod_as => "AS — name a report column", "AS — nommer une colonne du rapport", "AS — navngiv en rapportkolonne";
     report_node_edit_title => "Edit Node Line", "Modifier la ligne du nœud", "Rediger nodelinje";
     report_node_edit_hint => "Enter apply · Esc cancel", "Entrée appliquer · Échap annuler", "Enter anvend · Esc annuller";
     report_node_line_invalid => "Not a valid statement", "Instruction non valide", "Ikke en gyldig sætning";
@@ -773,6 +777,10 @@ strings! {
     gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
     gui_report_view_source => "Source", "Source", "Kilde";
     gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
+    gui_report_palette_blocks => "Blocks", "Blocs", "Blokke";
+    gui_report_palette_hint => "Drag a block into the report", "Glissez un bloc dans le rapport", "Træk en blok ind i rapporten";
+    gui_report_palette_mods => "Modifiers", "Modificateurs", "Modifikatorer";
+    gui_report_palette_mods_hint => "Drop onto a block to attach", "Déposez sur un bloc pour l'attacher", "Slip på en blok for at tilføje";
     gui_report_move_up => "Move up", "Monter", "Flyt op";
     gui_report_move_down => "Move down", "Descendre", "Flyt ned";
     gui_report_delete_block => "Delete", "Supprimer", "Slet";

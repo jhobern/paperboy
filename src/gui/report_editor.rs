@@ -14,10 +14,11 @@ use crate::i18n::Status;
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
-    self, InsertPos, NodeKind, RowKind, flatten, insert_node, insert_pos_after, move_node, node_at,
-    parse_one_node, remove_node, replace_node, request_node,
+    self, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier, detach_modifier,
+    flatten, insert_node, insert_pos_after, move_node, node_at, parse_one_node, remove_node,
+    replace_node, request_node, set_request_name,
 };
-use crate::report::flow::{FlowNode, ReportFlow, ReportStmt};
+use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
@@ -247,24 +248,198 @@ impl ReportEditor {
     }
 }
 
-/// A colour for a node's block, by category, blended toward a readable chip fill.
-fn node_color(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Color32 {
-    if let Some(ok) = req_ok {
-        return if ok { th.ok } else { th.pending };
-    }
-    match node {
-        FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. } => th.accent,
-        FlowNode::Request { .. } => th.ok,
-        FlowNode::Report(ReportStmt::Request { .. }) => th.ok,
-        FlowNode::Report(_) => th.subst,
-        FlowNode::Assign { .. } => th.accent,
-        FlowNode::ListDecl { .. } => th.pending,
-    }
-}
-
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// A colour for a palette block, by category — matches [`node_chips`] so a
+/// palette chip reads the same colour as the block it inserts.
+fn kind_color(kind: NodeKind, th: &GuiTheme) -> Color32 {
+    match kind {
+        NodeKind::Request | NodeKind::ReportRequest => th.ok,
+        NodeKind::ReportVar => th.subst,
+        NodeKind::Assign => th.accent,
+        NodeKind::ForFiles | NodeKind::ForFolders | NodeKind::ForEnvs => th.accent,
+        NodeKind::List => th.pending,
+    }
+}
+
+/// Build the [`FlowNode`] a dropped/clicked palette `kind` inserts. Request
+/// kinds pick up a default name from the bound collection (first request, else a
+/// `request` placeholder shown amber until the user edits it inline).
+fn node_for_kind(kind: NodeKind, titles: &[String]) -> FlowNode {
+    if kind.needs_request() {
+        let name = titles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "request".to_string());
+        request_node(&name, matches!(kind, NodeKind::ReportRequest))
+    } else {
+        kind.template()
+            .unwrap_or_else(|| request_node("request", false))
+    }
+}
+
+/// One chip in a row's chip cluster (a compositional block is drawn as several
+/// chips side by side). Exactly one chip per node is the *base* (the editable
+/// subject: click it to select the row for inline editing); the rest are
+/// modifier chips, each of which may carry a detach (`×`) action.
+struct Chip {
+    text: String,
+    color: Color32,
+    /// The editable subject chip (selects the row + drives the inline editor).
+    is_base: bool,
+    /// `Some(which)` shows a `×` that detaches this modifier from the node.
+    detach: Option<DetachWhich>,
+}
+
+impl Chip {
+    fn base(text: String, color: Color32) -> Chip {
+        Chip {
+            text,
+            color,
+            is_base: true,
+            detach: None,
+        }
+    }
+    fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
+        Chip {
+            text,
+            color,
+            is_base: false,
+            detach: Some(which),
+        }
+    }
+    /// A modifier chip that cannot be detached (removing it would break the
+    /// node, e.g. the required `AS` name of a computed column).
+    fn fixed(text: String, color: Color32) -> Chip {
+        Chip {
+            text,
+            color,
+            is_base: false,
+            detach: None,
+        }
+    }
+}
+
+/// Decompose a node into its chip cluster: the leading modifier chips, the
+/// editable base chip, and any trailing modifier chips (`AS`, `WITH …`).
+fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip> {
+    let req_col = |ok: Option<bool>| match ok {
+        Some(true) => th.ok,
+        Some(false) => th.pending,
+        None => th.ok,
+    };
+    match node {
+        FlowNode::Request { name } => {
+            vec![Chip::base(format!("REQUEST {name}"), req_col(req_ok))]
+        }
+        FlowNode::Report(ReportStmt::Request {
+            name,
+            alias,
+            response_fmt,
+            show,
+            hide,
+            with,
+        }) => {
+            let mut chips = vec![Chip::modifier(
+                "REPORT".into(),
+                th.subst,
+                DetachWhich::Report,
+            )];
+            // Fold the clauses that have no palette block of their own (RESPONSE
+            // / SHOW / HIDE — edited in Source view) into the base request chip.
+            let mut base = format!("REQUEST {name}");
+            if let Some(fmt) = response_fmt {
+                base.push_str(match fmt {
+                    crate::report::flow::ResponseFmt::Raw => " RESPONSE RAW",
+                    crate::report::flow::ResponseFmt::Pretty => " RESPONSE PRETTY",
+                });
+            }
+            if !show.is_empty() {
+                base.push_str(&format!(" SHOW({})", show.join(", ")));
+            }
+            if !hide.is_empty() {
+                base.push_str(&format!(" HIDE({})", hide.join(", ")));
+            }
+            chips.push(Chip::base(base, req_col(req_ok)));
+            if let Some(a) = alias {
+                chips.push(Chip::modifier(format!("AS {a}"), th.subst, DetachWhich::As));
+            }
+            for (i, w) in with.iter().enumerate() {
+                let text = match w {
+                    WithItem::Field { name, .. } => format!("WITH {name}"),
+                    WithItem::ResponseFmt(fmt) => format!(
+                        "WITH RESPONSE {}",
+                        match fmt {
+                            crate::report::flow::ResponseFmt::Raw => "RAW",
+                            crate::report::flow::ResponseFmt::Pretty => "PRETTY",
+                        }
+                    ),
+                };
+                chips.push(Chip::modifier(text, th.subst, DetachWhich::With(i)));
+            }
+            chips
+        }
+        FlowNode::Report(ReportStmt::Vars(vars)) => {
+            let text = if vars.len() == 1 {
+                vars[0].clone()
+            } else {
+                format!("({})", vars.join(", "))
+            };
+            vec![
+                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
+                Chip::base(text, th.subst),
+            ]
+        }
+        FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => vec![
+            Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
+            Chip::base(var.clone(), th.subst),
+            Chip::modifier(format!("AS {name}"), th.subst, DetachWhich::As),
+        ],
+        FlowNode::Report(ReportStmt::Computed { template, name, .. }) => vec![
+            Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
+            Chip::base(format!("\"{template}\""), th.subst),
+            // A computed column requires its AS name, so this chip is fixed.
+            Chip::fixed(format!("AS {name}"), th.subst),
+        ],
+        FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
+            let col = if matches!(node, FlowNode::Assign { .. }) {
+                th.accent
+            } else {
+                th.pending
+            };
+            vec![Chip::base(node.label(), col)]
+        }
+        FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
+            let mut chips = Vec::new();
+            if let Some(spec) = parallel {
+                let text = match spec.degree {
+                    None => "PARALLEL".to_string(),
+                    Some(n) => format!("PARALLEL({n})"),
+                };
+                // The head label already embeds the PARALLEL prefix; strip it so
+                // it is not duplicated by the base chip below.
+                chips.push(Chip::modifier(text, th.accent, DetachWhich::Parallel));
+            }
+            let full = node.label();
+            let head = match parallel {
+                Some(spec) => {
+                    let prefix = match spec.degree {
+                        None => "PARALLEL".to_string(),
+                        Some(n) => format!("PARALLEL({n})"),
+                    };
+                    full.strip_prefix(&prefix)
+                        .map(|s| s.trim_start().to_string())
+                        .unwrap_or(full)
+                }
+                None => full,
+            };
+            chips.push(Chip::base(head, th.accent));
+            chips
+        }
+    }
 }
 
 /// An action collected while rendering the (borrow-frozen) blocks, applied to
@@ -274,11 +449,42 @@ enum Act {
     OpenPalette(InsertPos),
     ClosePalette,
     PickKind(NodeKind),
-    InsertRequest { report: bool, name: String },
+    InsertRequest {
+        report: bool,
+        name: String,
+    },
     MoveUp,
     MoveDown,
     Delete,
-    CommitLine { path: Vec<usize>, text: String },
+    CommitLine {
+        path: Vec<usize>,
+        text: String,
+    },
+    /// A palette block was dragged and dropped at `pos` (from the always-visible
+    /// palette list). The node is built at drop time so request kinds pick up a
+    /// default name from the bound collection.
+    DropNode {
+        pos: InsertPos,
+        node: FlowNode,
+    },
+    /// A modifier chip (REPORT / PARALLEL / WITH / AS) was dragged onto the node
+    /// at `path`, attaching it (see [`attach_modifier`]).
+    AttachMod {
+        path: Vec<usize>,
+        modifier: Modifier,
+    },
+    /// A modifier chip's `×` was clicked, detaching it from the node at `path`
+    /// (see [`detach_modifier`]).
+    DetachMod {
+        path: Vec<usize>,
+        which: DetachWhich,
+    },
+    /// The request-name picker chose `name` for the node at `path`, renamed in
+    /// place so a report request keeps its `AS` / `WITH` / `RESPONSE` modifiers.
+    RenameRequest {
+        path: Vec<usize>,
+        name: String,
+    },
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -719,21 +925,50 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     });
     ui.separator();
 
-    // The insert palette, shown inline when open.
+    // The insert palette popup (the click-based Add flow, with request-name
+    // picking) is shown inline when open — complementary to the always-visible
+    // drag palette below.
     if ed.palette.is_some() {
         palette_panel(ed, app, ui, &titles, &mut acts);
     }
 
-    // The stacked blocks.
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for row in &rows {
-                let selected = row.path == ed.selection
-                    && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
-                block_row(ed, app, ui, row, selected, &titles, &mut acts);
-            }
+    // ── Two panes: the always-visible drag palette (left) and the report's
+    // stacked blocks (right). Blocks are dropped from the palette onto a row to
+    // insert after it (onto a FOR header inserts inside it; onto Begin inserts
+    // at the top). Reserve room for the diagnostics panel below.
+    let diag_h = (ed.diagnostics.len().max(1) as f32 * 18.0 + 12.0).min(160.0);
+    let body_h = (ui.available_height() - diag_h - 12.0).max(120.0);
+    ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
+        ui.horizontal_top(|ui| {
+            const PALETTE_W: f32 = 168.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(PALETTE_W, body_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width(PALETTE_W);
+                    ui.set_max_width(PALETTE_W);
+                    egui::ScrollArea::vertical()
+                        .id_salt("pt_palette")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| palette_list(app, ui));
+                },
+            );
+            ui.separator();
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("pt_blocks")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, row) in rows.iter().enumerate() {
+                            let selected = row.path == ed.selection
+                                && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
+                            let drop_pos = insert_pos_after(&rows, i);
+                            block_row(ed, app, ui, row, i, selected, &drop_pos, &titles, &mut acts);
+                        }
+                    });
+            });
         });
+    });
 
     // Delete key removes the selection (but not while a text field has focus).
     let typing = ui.memory(|m| m.focused().is_some());
@@ -748,62 +983,200 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let _ = th;
 }
 
-/// Render one flattened row as a colour-coded, indented block. Leaf and loop
+/// The base blocks the palette offers, in display order. Each drops in as a new
+/// statement row. `ReportRequest` is intentionally absent — a reported request
+/// is now composed by dropping the `REPORT` modifier onto a `REQUEST`.
+const BASE_KINDS: [NodeKind; 7] = [
+    NodeKind::Request,
+    NodeKind::ReportVar,
+    NodeKind::Assign,
+    NodeKind::ForFiles,
+    NodeKind::ForFolders,
+    NodeKind::ForEnvs,
+    NodeKind::List,
+];
+
+/// The always-visible palette, split into two groups: **Blocks** (base
+/// statements, dragged into the gaps between rows to insert a new line) and
+/// **Modifiers** (dragged *onto* a row to attach REPORT / PARALLEL / WITH / AS).
+/// Drag-only — the toolbar's "Add block" popup still covers click-based insert.
+fn palette_list(app: &GuiApp, ui: &mut egui::Ui) {
+    let th = app.theme;
+    ui.label(
+        RichText::new(app.strings.gui_report_palette_blocks)
+            .strong()
+            .color(th.text),
+    );
+    ui.colored_label(th.dim, app.strings.gui_report_palette_hint);
+    ui.add_space(2.0);
+    for (i, kind) in BASE_KINDS.into_iter().enumerate() {
+        let base = kind_color(kind, &th);
+        let id = ui.id().with(("pt_base_chip", i));
+        ui.dnd_drag_source(id, kind, |ui| {
+            palette_chip(ui, &th, kind.label(&app.strings), base);
+        });
+        ui.add_space(4.0);
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(app.strings.gui_report_palette_mods)
+            .strong()
+            .color(th.text),
+    );
+    ui.colored_label(th.dim, app.strings.gui_report_palette_mods_hint);
+    ui.add_space(2.0);
+    for (i, m) in Modifier::ALL.into_iter().enumerate() {
+        let base = modifier_color(m, &th);
+        let id = ui.id().with(("pt_mod_chip", i));
+        ui.dnd_drag_source(id, m, |ui| {
+            palette_chip(ui, &th, m.label(&app.strings), base);
+        });
+        ui.add_space(4.0);
+    }
+}
+
+/// One rounded, category-tinted palette chip.
+fn palette_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, base: Color32) {
+    let frame = egui::Frame::NONE
+        .fill(mix(th.panel, base, 0.22))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, base, 0.5)))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .corner_radius(6);
+    frame.show(ui, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).color(base)).selectable(false));
+    });
+}
+
+/// The palette colour for a modifier chip.
+fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
+    match m {
+        Modifier::Report | Modifier::With | Modifier::As => th.subst,
+        Modifier::Parallel => th.accent,
+    }
+}
+
+/// Render one flattened row as a horizontal cluster of chips (a compositional
+/// block: the base subject plus any attached `REPORT` / `PARALLEL` / `WITH` /
+/// `AS` modifier chips). The row is both a **modifier drop zone** (drop a
+/// modifier chip onto it to attach) and sits above a **base insert strip** that
+/// opens an animated gap when a base block is dragged over it. Leaf and loop
 /// heads carry an inline single-line editor when selected.
+#[allow(clippy::too_many_arguments)]
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
     ui: &mut egui::Ui,
     row: &edit::NodeRow,
+    row_index: usize,
     selected: bool,
+    drop_pos: &InsertPos,
     titles: &[String],
     acts: &mut Vec<Act>,
 ) {
     let th = app.theme;
-    ui.horizontal(|ui| {
+    // A cheap owned copy of the node so the chip cluster / applicability checks
+    // don't hold a borrow of `ed` across the inline editor (which needs `&mut`).
+    let node = ed
+        .flow
+        .as_ref()
+        .and_then(|f| node_at(f, &row.path))
+        .cloned();
+
+    let inner = ui.horizontal(|ui| {
         ui.add_space(row.depth as f32 * 16.0);
-
-        let (label, base) = match row.kind {
-            RowKind::Begin => (app.strings.report_node_begin.to_string(), th.accent),
-            RowKind::LoopEnd => ("END".to_string(), th.accent),
-            RowKind::LoopHead => (row.label.clone(), th.accent),
-            RowKind::Leaf => {
-                let node = ed.flow.as_ref().and_then(|f| node_at(f, &row.path));
-                let colour = node
-                    .map(|n| node_color(n, row.req_ok, &th))
-                    .unwrap_or(th.text);
-                (row.label.clone(), colour)
+        match row.kind {
+            RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
+            RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent),
+            RowKind::Leaf | RowKind::LoopHead => {
+                let chips = node
+                    .as_ref()
+                    .map(|n| node_chips(n, row.req_ok, &th))
+                    .unwrap_or_default();
+                for chip in &chips {
+                    render_chip(ui, &th, chip, selected, &row.path, acts);
+                }
             }
-        };
-
-        // The coloured chip: a rounded frame tinted by the block's category,
-        // outlined in the selection colour when selected.
-        let fill = if selected {
-            th.select_bg
-        } else {
-            mix(th.panel, base, 0.22)
-        };
-        let stroke = if selected {
-            egui::Stroke::new(1.5, th.select_fg)
-        } else {
-            egui::Stroke::new(1.0, mix(th.panel, base, 0.5))
-        };
-        let text_col = if selected { th.select_fg } else { base };
-        let frame = egui::Frame::NONE
-            .fill(fill)
-            .stroke(stroke)
-            .inner_margin(egui::Margin::symmetric(8, 3))
-            .corner_radius(6);
-        let resp = frame
-            .show(ui, |ui| {
-                ui.label(RichText::new(&label).color(text_col));
-            })
-            .response
-            .interact(egui::Sense::click());
-        if resp.clicked() {
-            acts.push(Act::Select(row.path.clone()));
         }
     });
+    let cluster = inner.response.rect;
+
+    // ── Modifier drop zone: dropping a modifier chip onto a real node attaches
+    // it. Only reacts to `Modifier` payloads, so it never competes with the base
+    // insert strip below (which reacts to `NodeKind`).
+    if let Some(n) = &node
+        && matches!(row.kind, RowKind::Leaf | RowKind::LoopHead)
+    {
+        let zresp = ui.interact(
+            cluster,
+            ui.id().with(("pt_modzone", row_index)),
+            egui::Sense::hover(),
+        );
+        if let Some(m) = zresp.dnd_hover_payload::<Modifier>()
+            && m.applies_to(n)
+        {
+            ui.painter().rect_stroke(
+                cluster.expand(2.0),
+                egui::CornerRadius::same(6),
+                egui::Stroke::new(2.0, th.accent),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if let Some(m) = zresp.dnd_release_payload::<Modifier>()
+            && m.applies_to(n)
+        {
+            acts.push(Act::AttachMod {
+                path: row.path.clone(),
+                modifier: *m,
+            });
+        }
+    }
+
+    // ── Base insert strip: a full-width strip over the row that, when a base
+    // block is dragged over it, opens an animated gap below the row (the
+    // existing blocks slide down to make room) with a dashed placeholder where
+    // the new block will land. The strip is sized to include the currently-open
+    // gap (read from last frame) so the pointer stays over it as the gap opens —
+    // avoiding open/close flicker at the seam.
+    const GAP_H: f32 = 30.0;
+    let gap_id = ui.id().with(("pt_gap", row_index));
+    let prev_gap: f32 = ui.ctx().data(|d| d.get_temp(gap_id)).unwrap_or(0.0);
+    let strip = egui::Rect::from_x_y_ranges(
+        ui.max_rect().x_range(),
+        cluster.top()..=cluster.bottom() + prev_gap,
+    );
+    let strip_resp = ui.interact(
+        strip,
+        ui.id().with(("pt_drop", row_index)),
+        egui::Sense::hover(),
+    );
+    let hovering_base = strip_resp.dnd_hover_payload::<NodeKind>().is_some();
+    let gap =
+        ui.ctx()
+            .animate_value_with_time(gap_id, if hovering_base { GAP_H } else { 0.0 }, 0.12);
+    ui.ctx().data_mut(|d| d.insert_temp(gap_id, gap));
+    if let Some(kind) = strip_resp.dnd_release_payload::<NodeKind>() {
+        acts.push(Act::DropNode {
+            pos: drop_pos.clone(),
+            node: node_for_kind(*kind, titles),
+        });
+    }
+    if gap > 0.5 {
+        let indent = row.depth as f32 * 16.0;
+        let top = cluster.bottom() + 2.0;
+        let ph = egui::Rect::from_min_max(
+            egui::pos2(strip.left() + indent, top),
+            egui::pos2(strip.right() - 8.0, top + gap - 4.0),
+        );
+        ui.painter().rect(
+            ph,
+            egui::CornerRadius::same(6),
+            mix(th.panel, th.accent, 0.18),
+            egui::Stroke::new(1.5, th.accent),
+            egui::StrokeKind::Inside,
+        );
+        ui.add_space(gap);
+    }
 
     // Inline editor for the selected concrete node.
     if selected && matches!(row.kind, RowKind::Leaf | RowKind::LoopHead) {
@@ -811,6 +1184,67 @@ fn block_row(
             ui.add_space(row.depth as f32 * 16.0 + 8.0);
             inline_node_editor(ed, app, ui, row, titles, acts);
         });
+    }
+}
+
+/// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
+fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32) {
+    egui::Frame::NONE
+        .fill(mix(th.panel, color, 0.22))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, color, 0.5)))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+        });
+}
+
+/// Render one [`Chip`]. The base chip is click-to-select and shows the selection
+/// outline; a modifier chip shows a `×` that detaches it.
+fn render_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    chip: &Chip,
+    selected: bool,
+    path: &[usize],
+    acts: &mut Vec<Act>,
+) {
+    let hot = chip.is_base && selected;
+    let fill = if hot {
+        th.select_bg
+    } else {
+        mix(th.panel, chip.color, 0.22)
+    };
+    let stroke = if hot {
+        egui::Stroke::new(1.5, th.select_fg)
+    } else {
+        egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5))
+    };
+    let text_col = if hot { th.select_fg } else { chip.color };
+    let resp = egui::Frame::NONE
+        .fill(fill)
+        .stroke(stroke)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(&chip.text).color(text_col)).selectable(false));
+            if let Some(which) = chip.detach {
+                let x = ui.add(
+                    egui::Button::new(RichText::new("×").color(text_col))
+                        .small()
+                        .frame(false),
+                );
+                if x.clicked() {
+                    acts.push(Act::DetachMod {
+                        path: path.to_vec(),
+                        which,
+                    });
+                }
+            }
+        })
+        .response;
+    if chip.is_base && resp.interact(egui::Sense::click()).clicked() {
+        acts.push(Act::Select(path.to_vec()));
     }
 }
 
@@ -837,13 +1271,9 @@ fn inline_node_editor(
         ui.label(RichText::new(app.strings.node_pick_request_title).color(th.dim));
         for name in titles {
             if ui.selectable_label(false, name).clicked() {
-                let report = matches!(
-                    ed.flow.as_ref().and_then(|f| node_at(f, &row.path)),
-                    Some(FlowNode::Report(_))
-                );
-                acts.push(Act::CommitLine {
+                acts.push(Act::RenameRequest {
                     path: row.path.clone(),
-                    text: request_node(name, report).header_line(),
+                    name: name.clone(),
                 });
             }
         }
@@ -1030,6 +1460,36 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                         replace_node(flow, &path, node);
                     });
                 }
+                ed.reseed_line = true;
+            }
+            Act::DropNode { pos, node } => {
+                ed.edit_flow(|flow| insert_node(flow, &pos, node));
+                let mut sel = pos.parent.clone();
+                sel.push(pos.index);
+                ed.selection = sel;
+                ed.reseed_line = true;
+            }
+            Act::AttachMod { path, modifier } => {
+                ed.edit_flow(|flow| {
+                    attach_modifier(flow, &path, modifier);
+                });
+                ed.selection = path;
+                ed.reseed_line = true;
+            }
+            Act::DetachMod { path, which } => {
+                ed.edit_flow(|flow| {
+                    if detach_modifier(flow, &path, which) {
+                        remove_node(flow, &path);
+                    }
+                });
+                ed.selection = Vec::new();
+                ed.reseed_line = true;
+            }
+            Act::RenameRequest { path, name } => {
+                ed.edit_flow(|flow| {
+                    set_request_name(flow, &path, &name);
+                });
+                ed.selection = path;
                 ed.reseed_line = true;
             }
         }

@@ -12,7 +12,7 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef,
+    EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, WithItem,
 };
 use crate::report::parse_flow;
 
@@ -403,6 +403,199 @@ pub(crate) fn request_node(name: &str, report: bool) -> FlowNode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compositional modifiers (the drag-on chips: REPORT / PARALLEL / WITH / AS)
+// ---------------------------------------------------------------------------
+
+/// A modifier that a compositional block editor drags *onto* an existing node
+/// to attach it. Unlike a [`NodeKind`] (a whole new statement), a modifier
+/// transforms the node it lands on: `REPORT` wraps a `REQUEST`/marks a report,
+/// `PARALLEL` marks a loop concurrent, `WITH` adds an ad-hoc field to a report
+/// request, and `AS` names/aliases a report column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Modifier {
+    Report,
+    Parallel,
+    With,
+    As,
+}
+
+impl Modifier {
+    pub(crate) const ALL: [Modifier; 4] = [
+        Modifier::Report,
+        Modifier::Parallel,
+        Modifier::With,
+        Modifier::As,
+    ];
+
+    /// The palette label for this modifier.
+    pub(crate) fn label(self, s: &Strings) -> &'static str {
+        match self {
+            Modifier::Report => s.node_mod_report,
+            Modifier::Parallel => s.node_mod_parallel,
+            Modifier::With => s.node_mod_with,
+            Modifier::As => s.node_mod_as,
+        }
+    }
+
+    /// Whether this modifier can be attached to `node` (drives both the drop
+    /// highlight and whether a release does anything). A modifier that is
+    /// already present, or nonsensical for the node, is not applicable.
+    pub(crate) fn applies_to(self, node: &FlowNode) -> bool {
+        match self {
+            // REPORT wraps a plain (send-only) request into a reported one. A
+            // variable is reported the moment it exists (there is no bare
+            // variable node), so REPORT is only *attachable* to a `REQUEST`.
+            Modifier::Report => matches!(node, FlowNode::Request { .. }),
+            // PARALLEL marks a not-yet-parallel loop concurrent.
+            Modifier::Parallel => matches!(
+                node,
+                FlowNode::ForEach { parallel: None, .. } | FlowNode::ForEnvs { parallel: None, .. }
+            ),
+            // WITH adds an ad-hoc field to a report request.
+            Modifier::With => matches!(node, FlowNode::Report(ReportStmt::Request { .. })),
+            // AS names a report column: an as-less report request, or a
+            // single-variable `REPORT <var>` (which becomes `REPORT <var> AS …`).
+            Modifier::As => match node {
+                FlowNode::Report(ReportStmt::Request { alias, .. }) => alias.is_none(),
+                FlowNode::Report(ReportStmt::Vars(vars)) => vars.len() == 1,
+                _ => false,
+            },
+        }
+    }
+}
+
+/// Which attached modifier a detach (the chip's `×`) targets. `With` carries the
+/// index of the field to drop, since a report request can hold several.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DetachWhich {
+    Report,
+    Parallel,
+    As,
+    With(usize),
+}
+
+/// Attach `m` to the node at `path` (see [`Modifier::applies_to`]). No-op when
+/// the modifier does not apply. Returns whether anything changed.
+pub(crate) fn attach_modifier(flow: &mut ReportFlow, path: &[usize], m: Modifier) -> bool {
+    let Some(node) = node_at_mut(flow, path) else {
+        return false;
+    };
+    if !m.applies_to(node) {
+        return false;
+    }
+    match m {
+        Modifier::Report => {
+            if let FlowNode::Request { name } = node {
+                let name = std::mem::take(name);
+                *node = FlowNode::Report(ReportStmt::Request {
+                    name,
+                    alias: None,
+                    response_fmt: None,
+                    show: Vec::new(),
+                    hide: Vec::new(),
+                    with: Vec::new(),
+                });
+            }
+        }
+        Modifier::Parallel => match node {
+            FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
+                *parallel = Some(ParallelSpec::default());
+            }
+            _ => {}
+        },
+        Modifier::With => {
+            if let FlowNode::Report(ReportStmt::Request { with, .. }) = node {
+                with.push(WithItem::Field {
+                    name: "field".into(),
+                    query: "HttpStatus".into(),
+                    stats: Vec::new(),
+                });
+            }
+        }
+        Modifier::As => match node {
+            FlowNode::Report(ReportStmt::Request { alias, .. }) => {
+                *alias = Some("alias".into());
+            }
+            FlowNode::Report(ReportStmt::Vars(vars)) if vars.len() == 1 => {
+                let var = vars.remove(0);
+                *node = FlowNode::Report(ReportStmt::VarAs {
+                    var,
+                    name: "name".into(),
+                    stats: Vec::new(),
+                });
+            }
+            _ => {}
+        },
+    }
+    true
+}
+
+/// Rename the request the node at `path` references, in place — preserving all
+/// of a report request's modifiers (`AS` alias, `WITH` fields, `RESPONSE` /
+/// `SHOW` / `HIDE`). Works for both a plain `REQUEST` and a `REPORT REQUEST`.
+/// Returns whether anything changed.
+pub(crate) fn set_request_name(flow: &mut ReportFlow, path: &[usize], name: &str) -> bool {
+    match node_at_mut(flow, path) {
+        Some(FlowNode::Request { name: n })
+        | Some(FlowNode::Report(ReportStmt::Request { name: n, .. })) => {
+            *n = name.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+/// whole node should now be *removed* — detaching `REPORT` from a reported
+/// variable/computed column leaves no valid statement behind (there is no bare
+/// variable node), so the caller drops the row entirely.
+pub(crate) fn detach_modifier(flow: &mut ReportFlow, path: &[usize], which: DetachWhich) -> bool {
+    let Some(node) = node_at_mut(flow, path) else {
+        return false;
+    };
+    match which {
+        DetachWhich::Report => match node {
+            // A reported request keeps sending: downgrade to a plain REQUEST.
+            FlowNode::Report(ReportStmt::Request { name, .. }) => {
+                let name = std::mem::take(name);
+                *node = FlowNode::Request { name };
+                false
+            }
+            // A reported variable/computed column has nothing left without
+            // REPORT — signal the caller to remove the row.
+            FlowNode::Report(_) => true,
+            _ => false,
+        },
+        DetachWhich::Parallel => {
+            match node {
+                FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
+                    *parallel = None;
+                }
+                _ => {}
+            }
+            false
+        }
+        DetachWhich::As => {
+            match node {
+                FlowNode::Report(ReportStmt::Request { alias, .. }) => *alias = None,
+                FlowNode::Report(ReportStmt::VarAs { var, .. }) => {
+                    let var = std::mem::take(var);
+                    *node = FlowNode::Report(ReportStmt::Vars(vec![var]));
+                }
+                _ => {}
+            }
+            false
+        }
+        DetachWhich::With(i) => {
+            if let FlowNode::Report(ReportStmt::Request { with, .. }) = node
+                && i < with.len()
+            {
+                with.remove(i);
+            }
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +723,123 @@ mod tests {
                 assert_eq!(name, "Pretty name");
             }
             other => panic!("expected a VarAs node, got {other:?}"),
+        }
+    }
+
+    // ── Compositional modifiers ────────────────────────────────────────────
+
+    #[test]
+    fn report_modifier_wraps_and_unwraps_a_request() {
+        let mut f = flow("REQUEST login\n");
+        assert!(Modifier::Report.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(attach_modifier(&mut f, &[0], Modifier::Report));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::Report(ReportStmt::Request { .. }))
+        ));
+        // REPORT no longer applies (already reported); detaching restores the send.
+        assert!(!Modifier::Report.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::Report));
+        assert!(matches!(node_at(&f, &[0]), Some(FlowNode::Request { .. })));
+    }
+
+    #[test]
+    fn detaching_report_from_a_variable_asks_to_remove_the_row() {
+        let mut f = flow("REPORT userId\n");
+        // A reported variable has nothing valid left without REPORT.
+        assert!(detach_modifier(&mut f, &[0], DetachWhich::Report));
+    }
+
+    #[test]
+    fn parallel_modifier_toggles_a_loop() {
+        let mut f = flow("FOR X IN FILES \"/d\"\n    REQUEST A\nEND\n");
+        assert!(Modifier::Parallel.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(attach_modifier(&mut f, &[0], Modifier::Parallel));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::ForEach {
+                parallel: Some(_),
+                ..
+            })
+        ));
+        // Body is preserved and PARALLEL no longer applies.
+        assert!(!Modifier::Parallel.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::Parallel));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::ForEach { parallel: None, .. })
+        ));
+    }
+
+    #[test]
+    fn with_modifier_adds_and_removes_a_report_request_field() {
+        let mut f = flow("REPORT REQUEST analyze\n");
+        assert!(Modifier::With.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(attach_modifier(&mut f, &[0], Modifier::With));
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
+                assert_eq!(with.len(), 1);
+            }
+            other => panic!("expected a report request with a field, got {other:?}"),
+        }
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::With(0)));
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request { with, .. })) => assert!(with.is_empty()),
+            other => panic!("expected an empty WITH, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_modifier_names_a_request_alias_and_a_variable_column() {
+        // On a report request → sets the alias.
+        let mut f = flow("REPORT REQUEST analyze\n");
+        assert!(attach_modifier(&mut f, &[0], Modifier::As));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::Report(ReportStmt::Request { alias: Some(_), .. }))
+        ));
+        // AS no longer applies once aliased.
+        assert!(!Modifier::As.applies_to(node_at(&f, &[0]).unwrap()));
+
+        // On a single-variable REPORT → becomes a VarAs column.
+        let mut g = flow("REPORT userId\n");
+        assert!(Modifier::As.applies_to(node_at(&g, &[0]).unwrap()));
+        assert!(attach_modifier(&mut g, &[0], Modifier::As));
+        assert!(matches!(
+            node_at(&g, &[0]),
+            Some(FlowNode::Report(ReportStmt::VarAs { .. }))
+        ));
+        // Detaching AS returns it to a bare REPORT <var>.
+        assert!(!detach_modifier(&mut g, &[0], DetachWhich::As));
+        assert!(matches!(
+            node_at(&g, &[0]),
+            Some(FlowNode::Report(ReportStmt::Vars(_)))
+        ));
+    }
+
+    #[test]
+    fn modifiers_do_not_apply_where_they_make_no_sense() {
+        let f = flow("k = v\n");
+        let n = node_at(&f, &[0]).unwrap();
+        assert!(!Modifier::Report.applies_to(n));
+        assert!(!Modifier::Parallel.applies_to(n));
+        assert!(!Modifier::With.applies_to(n));
+        assert!(!Modifier::As.applies_to(n));
+    }
+
+    #[test]
+    fn renaming_a_report_request_preserves_its_modifiers() {
+        let mut f = flow("REPORT REQUEST analyze AS proc WITH\n    latency: Time\nEND\n");
+        assert!(set_request_name(&mut f, &[0], "verify"));
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            })) => {
+                assert_eq!(name, "verify");
+                assert_eq!(alias.as_deref(), Some("proc"));
+                assert_eq!(with.len(), 1);
+            }
+            other => panic!("expected the report request kept its modifiers, got {other:?}"),
         }
     }
 }
