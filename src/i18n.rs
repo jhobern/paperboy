@@ -765,9 +765,15 @@ strings! {
     // Reports panel.
     gui_close_reports => "Close reports", "Fermer les rapports", "Luk rapporter";
     gui_no_reports => "No reports in this session.", "Aucun rapport dans cette session.", "Ingen rapporter i denne session.";
+    gui_new_report => "New report", "Nouveau rapport", "Ny rapport";
     gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
-    gui_empty_paren => "(empty)", "(vide)", "(tom)";
-    gui_papertrail_note => "The PaperTrail node editor arrives in step 2. These reports are preserved with the session.", "L'éditeur de nœuds PaperTrail arrive à l'étape 2. Ces rapports sont conservés avec la session.", "PaperTrail-nodeeditoren kommer i trin 2. Disse rapporter bevares med sessionen.";
+    // PaperTrail block editor (report_editor.rs).
+    gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
+    gui_report_view_source => "Source", "Source", "Kilde";
+    gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
+    gui_report_move_up => "Move up", "Monter", "Flyt op";
+    gui_report_move_down => "Move down", "Descendre", "Flyt ned";
+    gui_report_delete_block => "Delete", "Supprimer", "Slet";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";

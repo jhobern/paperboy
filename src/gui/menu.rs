@@ -370,7 +370,7 @@ fn open_file_dialog(
             if p.is_dir() {
                 app.session.open_workspace(p);
                 app.focus = super::Focus::List;
-                app.workspace_report = None;
+                app.report_editor = None;
                 return; // success closes the dialog
             }
             error = Some(app.strings.gui_not_a_folder.to_string());

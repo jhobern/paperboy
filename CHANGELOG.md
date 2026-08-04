@@ -42,18 +42,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   every machine rather than depending on which emoji fonts the host has
   installed.
 
-  > The PaperTrail node editor is intentionally not part of the GUI yet — it
-  > arrives in a later step. Existing reports are still shown and preserved.
+- **A Scratch-style PaperTrail report editor in the GUI.** Report tabs (and
+  `.trail` files opened from a workspace) now open in an interactive editor that
+  mirrors the terminal UI's node editor. A **Blocks** view shows the report flow
+  as stacked, nested, colour-coded blocks — assignments, list declarations,
+  request and report steps, and `for` loops — that you add from a palette,
+  reorder (move up/down), delete, and edit inline (either as a single grammar
+  line or, for request steps, by picking a request from the bound collection).
+  A **Source** view exposes the raw `.trail` text; the two round-trip through
+  the same parsed flow, so an edit in one is reflected in the other. A live
+  validation panel flags parse errors and diagnostics against the bound
+  collection and environments, and **Ctrl+Z** undoes structural edits. The pure
+  flow-editing and validation logic is shared with the terminal UI, so both
+  front-ends stay in lock-step.
 
 - **Workspaces in the GUI.** *File → Open workspace…* points the GUI at a
   folder of collections and shows its filesystem tree in the left panel, exactly
   like the terminal UI: folders expand and collapse, collection files list their
   requests inline, and selecting a request opens it in the editor on the right
   (double-click runs it). Selecting a `.vars` file loads it as a global
-  environment, and selecting a `.trail` report opens it read-only in the centre
-  pane (the interactive node editor is still step 2). The expand/collapse state
-  is the same set the terminal UI persists, so a workspace opened in one
-  front-end round-trips through the other.
+  environment, and selecting a `.trail` report opens it in the PaperTrail block
+  editor in the centre pane. The expand/collapse state is the same set the
+  terminal UI persists, so a workspace opened in one front-end round-trips
+  through the other.
 
 
 ## [0.1.10] - 2026-08-03

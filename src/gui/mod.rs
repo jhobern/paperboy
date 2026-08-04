@@ -14,6 +14,7 @@ mod environments;
 mod icons;
 mod menu;
 mod remote;
+mod report_editor;
 mod reports;
 mod requests;
 mod response;

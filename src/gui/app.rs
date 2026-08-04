@@ -9,7 +9,9 @@ use crate::i18n::Strings;
 use crate::session::Session;
 
 use super::theme::GuiTheme;
-use super::{Focus, editor, environments, menu, remote, reports, requests, response};
+use super::{
+    Focus, editor, environments, menu, remote, report_editor, reports, requests, response,
+};
 
 /// Which section of the request editor (centre-top) is shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,10 +103,10 @@ pub struct GuiApp {
     pub show_hurl: bool,
     /// Report row selected in the reports panel, if the reports view is open.
     pub show_reports: bool,
-    /// A PaperTrail report (`.trail`) selected from a Workspace tree, shown
-    /// read-only in the right pane. `(path, name, text)`. The interactive node
-    /// editor is deferred to step 2, so this is a plain viewer for now.
-    pub workspace_report: Option<super::requests::OpenReport>,
+    /// The open PaperTrail report editor (Scratch-style blocks + source view),
+    /// if any. Opened from the reports list or a Workspace tree `.trail` file;
+    /// takes over the centre pane while present. See [`report_editor`].
+    pub report_editor: Option<report_editor::ReportEditor>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
 }
@@ -140,7 +142,7 @@ impl GuiApp {
             strings,
             show_hurl: false,
             show_reports: false,
-            workspace_report: None,
+            report_editor: None,
             remote: super::remote::RemoteUi::default(),
         }
     }
@@ -291,7 +293,15 @@ impl GuiApp {
                 if resp.clicked() {
                     self.session.activate_tab(i);
                     self.focus = Focus::Tabs;
-                    self.workspace_report = None;
+                    // Close a Workspace-opened report editor when leaving its
+                    // tab; a standalone (session) report stays open.
+                    if self
+                        .report_editor
+                        .as_ref()
+                        .is_some_and(|e| e.is_workspace())
+                    {
+                        self.report_editor = None;
+                    }
                     self.session.save();
                 }
                 // Middle-click closes a tab (not the built-in Request tab).
@@ -431,18 +441,14 @@ impl eframe::App for GuiApp {
             });
 
         // Centre: request editor (top) + response (bottom), the reports view,
-        // or a Workspace-selected PaperTrail report (read-only).
+        // or the open PaperTrail report editor (blocks / source).
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.show_reports {
-                self.panel_frame(ui, Focus::Main, |app, ui| reports::ui(app, ui));
+            if self.report_editor.is_some() {
+                self.panel_frame(ui, Focus::Main, |app, ui| report_editor::ui(app, ui));
                 return;
             }
-            if self.workspace_report.is_some()
-                && self.session.collections[self.active_ci()].is_workspace()
-            {
-                self.panel_frame(ui, Focus::Main, |app, ui| {
-                    requests::report_view(app, ui);
-                });
+            if self.show_reports {
+                self.panel_frame(ui, Focus::Main, |app, ui| reports::ui(app, ui));
                 return;
             }
             let avail = ui.available_height();

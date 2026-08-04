@@ -284,47 +284,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 /// Row indentation per tree depth, in pixels.
 const WS_INDENT: f32 = 14.0;
 
-/// A PaperTrail report (`.trail`) selected from a Workspace tree, shown
-/// read-only in the centre pane. The interactive node editor is step 2.
-pub struct OpenReport {
-    pub path: PathBuf,
-    pub name: String,
-    pub text: String,
-}
-
-/// Read-only viewer for a Workspace-selected `.trail` report, shown in the
-/// centre pane in place of the request editor while a report row is selected.
-pub fn report_view(app: &mut GuiApp, ui: &mut egui::Ui) {
-    let theme = app.theme;
-    let (name, text) = match &app.workspace_report {
-        Some(r) => (r.name.clone(), r.text.clone()),
-        None => return,
-    };
-    let lbl_close = format!("{} {}", super::icons::CLOSE, app.strings.gui_close);
-    let note = app.strings.gui_papertrail_note;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&name).strong().color(theme.text));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(lbl_close).clicked() {
-                app.workspace_report = None;
-            }
-        });
-    });
-    ui.colored_label(theme.dim, note);
-    ui.separator();
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let mut t = text;
-            ui.add(
-                egui::TextEdit::multiline(&mut t)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .interactive(false),
-            );
-        });
-}
-
 /// An action collected while rendering the (immutably-read) workspace tree,
 /// applied to the session afterwards.
 enum WsAction {
@@ -402,7 +361,10 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
     }
     let selected_entry = app.session.collections[ci].selected_entry;
     let loaded_path = app.session.collections[ci].path.clone();
-    let report_path = app.workspace_report.as_ref().map(|r| r.path.clone());
+    let report_path = app
+        .report_editor
+        .as_ref()
+        .and_then(|e| e.path().map(std::path::Path::to_path_buf));
 
     let mut actions: Vec<WsAction> = Vec::new();
     egui::ScrollArea::vertical()
@@ -563,7 +525,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             } else {
                 app.session.load_workspace_file(ci, path);
             }
-            app.workspace_report = None;
+            app.report_editor = None;
             app.focus = super::Focus::List;
             app.session.save();
         }
@@ -586,7 +548,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 col.sync_folder_to_selected();
                 col.invalidate_request_json();
             }
-            app.workspace_report = None;
+            app.report_editor = None;
             app.focus = super::Focus::List;
         }
         WsAction::RunRequest {
@@ -602,26 +564,24 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 let n = app.session.collections[ci].entries.len();
                 app.session.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
             }
-            app.workspace_report = None;
+            app.report_editor = None;
             app.run_active();
         }
-        WsAction::OpenReport(path) => match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("report")
-                    .to_string();
-                app.workspace_report = Some(OpenReport { path, name, text });
+        WsAction::OpenReport(path) => match crate::report::Report::load_local(&path) {
+            Ok(report) => {
+                app.report_editor = Some(super::report_editor::ReportEditor::new(
+                    super::report_editor::ReportOrigin::Workspace,
+                    report,
+                ));
                 app.focus = super::Focus::Main;
             }
             Err(e) => {
-                app.session.status = Some(crate::i18n::Status::Error(e.to_string()));
+                app.session.status = Some(crate::i18n::Status::Error(e));
             }
         },
         WsAction::OpenEnv(path) => {
             app.session.open_workspace_environment(&path);
-            app.workspace_report = None;
+            app.report_editor = None;
         }
     }
 }

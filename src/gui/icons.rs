@@ -47,3 +47,10 @@ pub const WARNING: &str = p::WARNING;
 pub const GIT: &str = p::GIT_BRANCH;
 /// The "active" marker on the linked Global Environment (formerly `●`).
 pub const ACTIVE: &str = p::DOT;
+
+/// Save action (report editor Save button).
+pub const SAVE: &str = p::FLOPPY_DISK;
+/// Move a selected report block up in its list.
+pub const CARET_UP: &str = p::CARET_UP;
+/// Delete a selected report block.
+pub const TRASH: &str = p::TRASH;

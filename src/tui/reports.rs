@@ -31,13 +31,13 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
-use crate::report::flow::{Header, ReportFlow};
+use crate::report::flow::Header;
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
 use crate::report::parser::opens_block;
 use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
-use crate::report::validate::{Context, Diagnostic, Severity, validate};
+use crate::report::validate::{Diagnostic, Severity};
 use crate::report::writer::{CsvWriter, writer_for_extension};
 use crate::report::{expand_output_tokens, name_has_output_token};
 use std::collections::HashMap;
@@ -96,18 +96,12 @@ impl ReportRunUpdate {
     }
 }
 
-/// Everything a report run needs, owned (no borrow of `TuiApp`), so the whole
-/// run can be moved onto a background thread. Assembled on the main thread by
-/// [`TuiApp::build_report_run_inputs`]; the worker rebuilds a [`RunContext`]
-/// that borrows these.
-struct ReportRunInputs {
-    flow: ReportFlow,
-    entries: Vec<crate::hurl::HurlEntry>,
-    base_vars: HashMap<String, String>,
-    named_envs: HashMap<String, HashMap<String, String>>,
-    root: Option<PathBuf>,
-    file_root: Option<PathBuf>,
-}
+// Everything a report run needs, owned (no borrow of `TuiApp`), so the whole
+// run can be moved onto a background thread. Defined in the front-end-agnostic
+// `report::context` (shared with the GUI) and assembled on the main thread by
+// [`TuiApp::build_report_run_inputs`]; the worker rebuilds a [`RunContext`]
+// that borrows these.
+use crate::report::context::ReportRunInputs;
 
 /// Wraps a real [`EntryRunner`] with a cancel flag so a running report can be
 /// stopped mid-flight: once `cancel` flips, every subsequent request returns a
@@ -852,82 +846,18 @@ impl TuiApp {
             match rt.report.flow() {
                 Err(e) => (Some(e.to_string()), Some(e.line), Vec::new()),
                 Ok(flow) => {
-                    let bound = self.resolve_bound_collection(&rt.report);
-                    let titles: Option<Vec<String>> = bound.map(|ci| {
-                        self.collections[ci]
-                            .entries
-                            .iter()
-                            .map(|e| e.title.clone())
-                            .collect()
-                    });
-                    // Each entry's [Reports] field names, so a SHOW(...) selector
-                    // can be validated against what the request can produce.
-                    let fields: Option<Vec<(String, Vec<String>)>> = bound.map(|ci| {
-                        self.collections[ci]
-                            .entries
-                            .iter()
-                            .map(|e| {
-                                (
-                                    e.title.clone(),
-                                    e.reports.iter().map(|(n, _)| n.clone()).collect(),
-                                )
-                            })
-                            .collect()
-                    });
-                    let env_names: Vec<String> =
-                        self.global_envs.iter().map(|e| e.name.clone()).collect();
-                    // Anchor the filesystem checks (e.g. the `# baseline:`
-                    // snapshot existence warning) at the report's resolved base
-                    // directory, but only when it's anchored (saved / `# root:`)
-                    // so a scratch report doesn't warn against the CWD.
-                    let (base_dir, anchored) = report_base_dir(&rt.report);
-
-                    // Variable-availability analysis: compute the effective base
-                    // variable names. Mirrors `build_report_run_inputs` — a
-                    // `# environment:` directive names a single env; otherwise
-                    // fall back to the bound collection's active+pinned merge.
-                    // `None` when the collection is unbound (check skipped).
-                    let base_var_names: Option<Vec<String>> =
-                        match (bound, flow.header.environment()) {
-                            (_, Some(name)) => {
-                                let name = name.trim();
-                                self.global_envs
-                                    .iter()
-                                    .find(|e| e.name == name)
-                                    .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
-                            }
-                            (Some(ci), None) => Some(
-                                self.effective_env(ci)
-                                    .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
-                                    .unwrap_or_default(),
-                            ),
-                            (None, _) => None,
-                        };
-                    // Union of ALL loaded env variable names — used
-                    // conservatively inside `FOR … IN ENVS` bodies so we don't
-                    // false-warn when any of the named envs might supply a var.
-                    let mut all_env_var_names: Vec<String> = self
-                        .global_envs
-                        .iter()
-                        .flat_map(|e| e.vars.iter().map(|v| v.key.clone()))
-                        .collect();
-                    all_env_var_names.sort();
-                    all_env_var_names.dedup();
-                    // The bound collection's entries, for `{{VAR}}` scanning
-                    // and capture-name extraction.
-                    let request_entries_owned: Option<Vec<crate::hurl::HurlEntry>> =
-                        bound.map(|ci| self.collections[ci].entries.clone());
-
-                    let ctx = Context {
-                        request_titles: titles.as_deref(),
-                        env_names: Some(&env_names),
-                        request_fields: fields.as_deref(),
-                        root: anchored.then_some(base_dir.as_path()),
-                        base_var_names: base_var_names.as_deref(),
-                        all_env_var_names: Some(&all_env_var_names),
-                        request_entries: request_entries_owned.as_deref(),
-                    };
-                    (None, None, validate(&flow, &ctx))
+                    // The full validation-context assembly (bound collection,
+                    // request titles / [Reports] fields, env names + variable
+                    // availability, filesystem anchoring) lives in the shared
+                    // `report::context` so the GUI validates identically.
+                    let diags = crate::report::context::report_diagnostics(
+                        &self.collections,
+                        &self.global_envs,
+                        self.active_env_id,
+                        &flow,
+                        rt.report.path.as_deref(),
+                    );
+                    (None, None, diags)
                 }
             }
         };
@@ -1022,68 +952,18 @@ impl TuiApp {
         let s = Strings::for_language(&self.language);
         let rt = self.reports.get(idx).ok_or(s.report_run_unbound)?;
         let flow = rt.report.flow().map_err(|e| e.to_string())?;
-        let ci = self
-            .resolve_bound_collection(&rt.report)
-            .ok_or(s.report_run_unbound)?;
-
-        // Base variable layer. A `# environment:` directive names a single
-        // loaded environment to use for a plain, no-comparison run — that env
-        // alone, so the run is reproducible regardless of what's active/pinned
-        // in the app. Without it, fall back to the bound collection's effective
-        // (active global + pinned) environment. Loop bindings / assignments
-        // layer on top of this inside the interpreter either way.
-        let base_vars = match flow
-            .header
-            .environment()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-        {
-            Some(name) => self
-                .global_envs
-                .iter()
-                .find(|e| e.name == name)
-                .map(flatten_env)
-                .unwrap_or_default(),
-            None => self
-                .effective_env(ci)
-                .map(|env| flatten_env(&env))
-                .unwrap_or_default(),
-        };
-        // Every loaded global environment is selectable by name in a `FOR … IN
-        // ENVS` loop.
-        let named_envs = self
-            .global_envs
-            .iter()
-            .map(|e| (e.name.clone(), flatten_env(e)))
-            .collect();
-        // Relative producer paths resolve against `# root:` if set, else the
-        // report file's own directory.
-        let report_dir = rt
-            .report
-            .path
-            .as_deref()
-            .and_then(|p| p.parent())
-            .map(std::path::Path::to_path_buf);
-        let root = match flow.header.root() {
-            Some(r) if !r.trim().is_empty() => Some(resolve_ref_path(rt.report.path.as_deref(), r)),
-            _ => report_dir,
-        };
-        // The live runner is rooted at the bound collection's directory so
-        // relative form-file paths in its requests resolve as they would when
-        // the request is sent by hand.
-        let file_root = self.collections[ci]
-            .path
-            .as_deref()
-            .and_then(|p| p.parent())
-            .map(std::path::Path::to_path_buf);
-
-        Ok(ReportRunInputs {
-            flow,
-            entries: self.collections[ci].entries.clone(),
-            base_vars,
-            named_envs,
-            root,
-            file_root,
+        // The actual assembly (bound-collection resolution, base/named env
+        // layers, producer root, runner file-root) lives in the shared
+        // `report::context` so the GUI runs reports identically.
+        crate::report::context::report_run_inputs(
+            &self.collections,
+            &self.global_envs,
+            self.active_env_id,
+            &flow,
+            rt.report.path.as_deref(),
+        )
+        .map_err(|e| match e {
+            crate::report::context::RunInputError::Unbound => s.report_run_unbound.to_string(),
         })
     }
 
@@ -2909,29 +2789,11 @@ fn env_name_partial(line: &str) -> Option<NamePartial> {
     }
 }
 
-/// Join a `# collection:` reference against the report's own directory (when the
-/// ref is relative and the report has a known path), so relative links stay
-/// valid regardless of the process's working directory.
-fn resolve_ref_path(report_path: Option<&std::path::Path>, cref: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(cref);
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
-    if let Some(dir) = report_path.and_then(|rp| rp.parent()) {
-        return dir.join(p);
-    }
-    p.to_path_buf()
-}
-
-/// Compare two paths, canonicalising when possible (so `./a.hurl` and an
-/// absolute form of the same file match) but falling back to a plain equality
-/// check for paths that don't yet exist on disk.
-fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
+// The pure path/env helpers used to assemble a report's run and validation
+// contexts live in the front-end-agnostic `report::context` module so the GUI
+// shares one implementation; re-exported here under their historical names so
+// this file's call sites (and tests) read unchanged.
+use crate::report::context::{paths_equal, resolve_ref_path};
 
 /// Compute the `# collection:` reference to store when BINDing a report to a
 /// loaded collection, preferring a path **relative to the report's own
@@ -2992,15 +2854,6 @@ fn relative_path(from_dir: &std::path::Path, to: &std::path::Path) -> Option<std
     } else {
         Some(rel)
     }
-}
-
-/// Flatten an [`Environment`](crate::environment::Environment) into a plain
-/// `KEY → value` map for the interpreter's variable layers.
-fn flatten_env(env: &crate::environment::Environment) -> std::collections::HashMap<String, String> {
-    env.vars
-        .iter()
-        .map(|v| (v.key.clone(), v.value.clone()))
-        .collect()
 }
 
 /// Where an exported CSV lands: alongside a saved report (same stem, `.csv`
@@ -4132,16 +3985,16 @@ fn draw_editor_ghost(f: &mut Frame, area: Rect, ed: &Editor, ghost: &str, th: &T
 /// scratch report with no `# root:` — paths resolve against the process working
 /// directory, which the UI flags so the user knows to save or set `# root:`.
 pub(crate) fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
-    if let Ok(flow) = report.flow()
-        && let Some(r) = flow.header.root()
-        && !r.trim().is_empty()
-    {
-        return (resolve_ref_path(report.path.as_deref(), r), true);
+    match report.flow() {
+        Ok(flow) => crate::report::context::report_base_dir(&flow, report.path.as_deref()),
+        // A report whose text doesn't parse still has a directory to anchor
+        // filesystem checks against (or falls back to the working directory,
+        // unanchored) — mirror the shared helper's non-`# root:` branches.
+        Err(_) => match report.path.as_deref().and_then(|p| p.parent()) {
+            Some(dir) => (dir.to_path_buf(), true),
+            None => (std::env::current_dir().unwrap_or_default(), false),
+        },
     }
-    if let Some(dir) = report.path.as_deref().and_then(|p| p.parent()) {
-        return (dir.to_path_buf(), true);
-    }
-    (std::env::current_dir().unwrap_or_default(), false)
 }
 
 fn draw_report_binding(
