@@ -1504,6 +1504,17 @@ fn release_payload<T: std::any::Any + Send + Sync>(
 /// nested-field indents so they all line up at the same depth.
 const INDENT_STEP: f32 = 24.0;
 
+/// The report path of the block currently being dragged for reordering (an
+/// active `DragItem::Row` payload), if any. Read at the start of a row's render
+/// from the payload set last frame, so the dragged block can be lifted out of
+/// its slot and floated under the cursor (see [`block_row`]).
+fn dragged_row_path(ctx: &egui::Context) -> Option<Vec<usize>> {
+    egui::DragAndDrop::payload::<DragItem>(ctx).and_then(|d| match &*d {
+        DragItem::Row(p) => Some(p.clone()),
+        _ => None,
+    })
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -1542,7 +1553,14 @@ fn block_row(
     // The whole block is the request line plus any nested WITH block; capture
     // both its first-line rect (for the modifier drop zone) and its full rect
     // (for the insert strip) so a drop lands *after the whole block*.
-    let block = ui.vertical(|ui| {
+    //
+    // When this block is the one being dragged for reordering, lift it out of
+    // its slot and paint it into a floating (Tooltip-order) layer that follows
+    // the pointer — so it reads as physically picked up, leaving an empty slot
+    // where it was. This mirrors egui's own `dnd_drag_source`, which we can't
+    // use directly here because the drag handle is an inner chip, not the row.
+    let dragging_this = dragged_row_path(ui.ctx()).as_deref() == Some(row.path.as_slice());
+    let block_body = |ui: &mut egui::Ui| -> egui::Rect {
         // Top-align the chip cluster (rather than the default centre alignment):
         // every chip is the same height, so top-alignment keeps them level while
         // avoiding egui's horizontal-centre re-centring, which otherwise drifts
@@ -1577,7 +1595,31 @@ fn block_row(
             with_block(ui, &th, s, &row.path, row.depth, &with_items, acts);
         }
         inner.response.rect
-    });
+    };
+    let block = if dragging_this {
+        let layer_id = egui::LayerId::new(
+            egui::Order::Tooltip,
+            ui.id().with(("pt_drag_block", row_index)),
+        );
+        let ir = ui.scope_builder(
+            egui::UiBuilder::new()
+                .layer_id(layer_id)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            block_body,
+        );
+        // Move the floating layer's shapes so the block is centred on the
+        // pointer (the slot it was allocated in stays blank).
+        if let Some(p) = ui.ctx().pointer_interact_pos() {
+            let delta = p - ir.response.rect.center();
+            ui.ctx().transform_layer_shapes(
+                layer_id,
+                egui::emath::TSTransform::from_translation(delta),
+            );
+        }
+        ir
+    } else {
+        ui.vertical(block_body)
+    };
     let cluster = block.inner;
     let block_rect = block.response.rect;
 
@@ -2751,5 +2793,30 @@ mod tests {
         assert_eq!(pretty_json_cell("just text"), "just text");
         // Invalid JSON that merely starts like an object is returned unchanged.
         assert_eq!(pretty_json_cell("{not json"), "{not json");
+    }
+
+    /// The floating-drag lift only applies to a whole-row (`DragItem::Row`)
+    /// drag, and reports exactly the path being dragged; a modifier-chip drag
+    /// (`DragItem::Chip`) must not lift a row.
+    #[test]
+    fn dragged_row_path_tracks_only_row_drags() {
+        let ctx = egui::Context::default();
+        assert_eq!(dragged_row_path(&ctx), None, "no drag → no lifted row");
+
+        egui::DragAndDrop::set_payload(&ctx, DragItem::Row(vec![1, 2]));
+        assert_eq!(dragged_row_path(&ctx), Some(vec![1, 2]));
+
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            DragItem::Chip {
+                path: vec![0],
+                which: DetachWhich::Report,
+            },
+        );
+        assert_eq!(
+            dragged_row_path(&ctx),
+            None,
+            "a modifier-chip drag must not lift a row"
+        );
     }
 }

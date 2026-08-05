@@ -192,6 +192,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   substituted, so the buffer edits cleanly). This brings the GUI in line with the
   terminal UI's editable raw Hurl/JSON views.
 
+- **GUI report blocks now lift and float while you drag them.** Dragging a block
+  in the PaperTrail block editor now picks it up: the block follows the pointer
+  in a floating layer and its original slot goes blank, so it reads as physically
+  moved rather than staying put with only a payload cursor. On drop it lands in
+  the target gap as before. (The whole line — including any nested `WITH` fields
+  — floats together.)
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of
