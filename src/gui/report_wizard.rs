@@ -28,6 +28,46 @@ pub enum Wizard {
     Request(RequestForm),
     Envs(EnvsForm),
     Files(FilesForm),
+    Assign(AssignForm),
+    List(ListForm),
+    Folders(FoldersForm),
+    /// Fallback for kinds without a dedicated form (reported variables, computed
+    /// columns, exotic producers): edit the raw statement text.
+    Raw(RawForm),
+}
+
+/// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
+pub struct AssignForm {
+    path: Vec<usize>,
+    key: String,
+    value: String,
+}
+
+/// The `LIST NAME = [ … ]` form: a name and one list-literal scalar per line.
+/// Only a list-literal producer is edited here; any other producer falls back to
+/// the [`RawForm`].
+pub struct ListForm {
+    path: Vec<usize>,
+    name: String,
+    /// The list elements, one per line (scalars; tuples are written `a, b`).
+    values: String,
+}
+
+/// The `FOR … IN FOLDERS "dir"` form: loop variable, source folder and the
+/// `PARALLEL` toggle. Any `WITH role="glob"` clauses are preserved verbatim.
+pub struct FoldersForm {
+    path: Vec<usize>,
+    var: String,
+    dir: String,
+    parallel: bool,
+}
+
+/// The generic fallback form: the node's single statement line, edited as text
+/// and re-parsed on apply (the old inline line editor, now a modal).
+pub struct RawForm {
+    path: Vec<usize>,
+    text: String,
+    is_loop: bool,
 }
 
 /// The request form: pick the name, toggle whether it is *reported*, and — when
@@ -190,11 +230,11 @@ impl FilesForm {
 // Opening a wizard for a node
 // ---------------------------------------------------------------------------
 
-/// Open the appropriate configure wizard for the node at `path`, if it is one of
-/// the form-backed kinds (request / ENVS loop / single-variable FILES loop).
-/// Other kinds (assignments, lists, FOLDERS loops, computed columns) have no
-/// wizard and are edited via the inline line editor, so this is a no-op for
-/// them.
+/// Open the appropriate configure wizard for the node at `path`. Requests, ENVS
+/// loops, single-variable FILES loops, assignments, list literals and FOLDERS
+/// loops each get a purpose-built form; every other kind (reported variables,
+/// computed columns, exotic producers) falls back to a raw single-line editor,
+/// so no node is ever left without a way to edit it.
 pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
     let Some(flow) = ed.flow.clone() else {
         return;
@@ -218,10 +258,104 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
             pattern,
             producer: Producer::Files { .. },
             ..
-        } if pattern.is_single() => Wizard::Files(build_files(path.to_vec(), &node)),
-        _ => return,
+        } if single_named_binder(pattern).is_some() => {
+            Wizard::Files(build_files(path.to_vec(), &node))
+        }
+        FlowNode::ForEach {
+            pattern,
+            producer: Producer::Folders { .. },
+            ..
+        } if single_named_binder(pattern).is_some() => {
+            Wizard::Folders(build_folders(path.to_vec(), &node))
+        }
+        FlowNode::Assign { key, value } => Wizard::Assign(AssignForm {
+            path: path.to_vec(),
+            key: key.clone(),
+            value: value.clone(),
+        }),
+        FlowNode::ListDecl {
+            name,
+            producer: Producer::List(elems),
+        } if elems
+            .iter()
+            .all(|e| matches!(e, crate::report::flow::Element::Scalar(_))) =>
+        {
+            Wizard::List(ListForm {
+                path: path.to_vec(),
+                name: name.clone(),
+                values: list_values_text(elems),
+            })
+        }
+        _ => Wizard::Raw(RawForm {
+            path: path.to_vec(),
+            text: node.header_line(),
+            is_loop: node.is_loop(),
+        }),
     };
     ed.wizard = Some(wiz);
+}
+
+/// The single *named* binder of a `FOR X IN …` pattern, if the pattern is
+/// exactly one named binder. `FOR _ IN …` (a discard) and multi-binder patterns
+/// return `None`, so they route to the raw editor rather than a form that would
+/// silently rename or flatten them.
+fn single_named_binder(pattern: &Pattern) -> Option<&str> {
+    if pattern.is_single() {
+        pattern.named().next()
+    } else {
+        None
+    }
+}
+
+/// Render list-literal *scalar* elements as one line each. Only called for
+/// all-scalar lists (tuples route to the raw editor), so this round-trips
+/// losslessly with [`parse_list_values`].
+fn list_values_text(elems: &[crate::report::flow::Element]) -> String {
+    use crate::report::flow::Element;
+    elems
+        .iter()
+        .map(|e| match e {
+            Element::Scalar(s) => s.clone(),
+            // Unreachable for the List form (guarded to all-scalar), but keep a
+            // sensible rendering rather than panicking.
+            Element::Tuple(parts) => parts.join(", "),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse the multiline values box back into scalar list elements: one element
+/// per non-empty line, taken verbatim (no comma splitting), so a scalar is never
+/// silently turned into a tuple.
+fn parse_list_values(text: &str) -> Vec<crate::report::flow::Element> {
+    use crate::report::flow::Element;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| Element::Scalar(l.to_string()))
+        .collect()
+}
+
+fn build_folders(path: Vec<usize>, node: &FlowNode) -> FoldersForm {
+    let (var, dir, parallel) = match node {
+        FlowNode::ForEach {
+            pattern,
+            producer: Producer::Folders { dir, .. },
+            parallel,
+            ..
+        } => (
+            pattern.named().next().unwrap_or("FOLDER").to_string(),
+            dir.clone(),
+            parallel.is_some(),
+        ),
+        _ => unreachable!("build_folders called on a non-FOLDERS node"),
+    };
+    FoldersForm {
+        path,
+        var,
+        dir,
+        parallel,
+    }
 }
 
 fn build_request(
@@ -476,6 +610,10 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
             Wizard::Request(f) => request_ui(ui, &th, s, f),
             Wizard::Envs(f) => envs_ui(ui, &th, s, f),
             Wizard::Files(f) => files_ui(ui, &th, s, f),
+            Wizard::Assign(f) => assign_ui(ui, &th, s, f),
+            Wizard::List(f) => list_ui(ui, &th, s, f),
+            Wizard::Folders(f) => folders_ui(ui, &th, s, f),
+            Wizard::Raw(f) => raw_ui(ui, &th, s, f),
         }
         ui.add_space(8.0);
         ui.separator();
@@ -718,9 +856,90 @@ fn files_ui(
     );
 }
 
-// ---------------------------------------------------------------------------
-// Applying a wizard
-// ---------------------------------------------------------------------------
+fn assign_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut AssignForm,
+) {
+    ui.heading(RichText::new(s.node_assign_title).color(th.text));
+    ui.add_space(4.0);
+    egui::Grid::new("pt_assign_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new(s.node_form_var).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.key).desired_width(220.0));
+            ui.end_row();
+            ui.label(RichText::new(s.node_form_value).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.value).desired_width(220.0));
+            ui.end_row();
+        });
+}
+
+fn list_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut ListForm,
+) {
+    ui.heading(RichText::new(s.node_list_title).color(th.text));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(s.node_form_list_name).color(th.dim));
+        ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(200.0));
+    });
+    ui.add_space(6.0);
+    ui.label(RichText::new(s.node_form_list_values).color(th.dim));
+    ui.add(
+        egui::TextEdit::multiline(&mut f.values)
+            .desired_width(f32::INFINITY)
+            .desired_rows(5)
+            .font(egui::TextStyle::Monospace),
+    );
+}
+
+fn folders_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut FoldersForm,
+) {
+    ui.heading(RichText::new(s.node_folders_title).color(th.text));
+    ui.add_space(4.0);
+    egui::Grid::new("pt_folders_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new(s.report_node_files_var_label).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.var).desired_width(220.0));
+            ui.end_row();
+            ui.label(RichText::new(s.report_node_files_folder_label).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
+            ui.end_row();
+        });
+    ui.checkbox(
+        &mut f.parallel,
+        RichText::new(s.report_node_parallel_label).color(th.text),
+    );
+}
+
+fn raw_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut RawForm,
+) {
+    ui.heading(RichText::new(s.node_raw_title).color(th.text));
+    ui.add_space(4.0);
+    ui.label(RichText::new(s.node_form_raw).color(th.dim));
+    ui.add(
+        egui::TextEdit::multiline(&mut f.text)
+            .desired_width(f32::INFINITY)
+            .desired_rows(2)
+            .font(egui::TextStyle::Monospace),
+    );
+}
 
 fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
     let Some(wiz) = ed.wizard.as_ref() else {
@@ -771,6 +990,66 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 parallel,
             };
             ed.wizard_apply(app, &path, node);
+        }
+        Wizard::Assign(f) => {
+            let path = f.path.clone();
+            let key = f.key.trim();
+            if key.is_empty() {
+                return;
+            }
+            let node = FlowNode::Assign {
+                key: key.to_string(),
+                value: f.value.clone(),
+            };
+            ed.wizard_apply(app, &path, node);
+        }
+        Wizard::List(f) => {
+            let path = f.path.clone();
+            let name = f.name.trim();
+            if name.is_empty() {
+                return;
+            }
+            let node = FlowNode::ListDecl {
+                name: name.to_string(),
+                producer: Producer::List(parse_list_values(&f.values)),
+            };
+            ed.wizard_apply(app, &path, node);
+        }
+        Wizard::Folders(f) => {
+            let path = f.path.clone();
+            // Preserve the loop body and any WITH role globs; only var/dir and
+            // the parallel toggle are edited here.
+            let (body, roles, existing_parallel) =
+                match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+                    Some(FlowNode::ForEach {
+                        body,
+                        producer: Producer::Folders { roles, .. },
+                        parallel,
+                        ..
+                    }) => (body.clone(), roles.clone(), *parallel),
+                    _ => return,
+                };
+            let parallel = f.parallel.then(|| existing_parallel.unwrap_or_default());
+            let node = FlowNode::ForEach {
+                pattern: Pattern::single(if f.var.trim().is_empty() {
+                    "FOLDER".to_string()
+                } else {
+                    f.var.trim().to_string()
+                }),
+                producer: Producer::Folders {
+                    dir: f.dir.clone(),
+                    roles,
+                },
+                body,
+                parallel,
+            };
+            ed.wizard_apply(app, &path, node);
+        }
+        Wizard::Raw(f) => {
+            let path = f.path.clone();
+            if let Some(node) = crate::report::edit::parse_one_node(&f.text, f.is_loop) {
+                ed.wizard_apply(app, &path, node);
+            }
         }
     }
 }

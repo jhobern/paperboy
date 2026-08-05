@@ -580,7 +580,7 @@ strings! {
     node_kind_request => "REQUEST — send a request", "REQUEST — envoyer une requête", "REQUEST — send en forespørgsel";
     node_kind_report_request => "REPORT REQUEST — send and report its fields", "REPORT REQUEST — envoyer et rapporter ses champs", "REPORT REQUEST — send og rapportér dens felter";
     node_kind_report_var => "REPORT — report a variable", "REPORT — rapporter une variable", "REPORT — rapportér en variabel";
-    node_kind_assign => "SET — assign a variable", "SET — affecter une variable", "SET — tildel en variabel";
+    node_kind_assign => "VARIABLE — set VAR = VALUE", "VARIABLE — définir VAR = VALEUR", "VARIABLE — sæt VAR = VÆRDI";
     node_kind_for_files => "FOR … IN FILES — loop over files", "FOR … IN FILES — boucler sur des fichiers", "FOR … IN FILES — løkke over filer";
     node_kind_for_folders => "FOR … IN FOLDERS — loop over folders", "FOR … IN FOLDERS — boucler sur des dossiers", "FOR … IN FOLDERS — løkke over mapper";
     node_kind_for_envs => "FOR … IN ENVS — loop over environments", "FOR … IN ENVS — boucler sur des environnements", "FOR … IN ENVS — løkke over miljøer";
@@ -795,6 +795,16 @@ strings! {
     node_form_show => "Show fields (all ticked = show all)", "Afficher les champs (tous cochés = tout afficher)", "Vis felter (alle markeret = vis alle)";
     node_envs_environments => "Environments", "Environnements", "Miljøer";
     node_envs_add => "Add environment", "Ajouter un environnement", "Tilføj miljø";
+    // VARIABLE / LIST / FOLDERS / raw-line node wizards (GUI).
+    node_assign_title => "Set variable", "Définir une variable", "Sæt variabel";
+    node_form_var => "Variable", "Variable", "Variabel";
+    node_form_value => "Value", "Valeur", "Værdi";
+    node_list_title => "Configure list", "Configurer la liste", "Konfigurer liste";
+    node_form_list_name => "List name", "Nom de la liste", "Listenavn";
+    node_form_list_values => "Values (one per line)", "Valeurs (une par ligne)", "Værdier (én pr. linje)";
+    node_folders_title => "Configure FOLDERS loop", "Configurer la boucle FOLDERS", "Konfigurer FOLDERS-løkke";
+    node_raw_title => "Edit line", "Modifier la ligne", "Redigér linje";
+    node_form_raw => "Statement text", "Texte de l'instruction", "Sætningstekst";
     gui_report_view_results => "Results", "Résultats", "Resultater";
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";

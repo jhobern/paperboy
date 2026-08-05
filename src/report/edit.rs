@@ -443,10 +443,12 @@ impl Modifier {
     /// already present, or nonsensical for the node, is not applicable.
     pub(crate) fn applies_to(self, node: &FlowNode) -> bool {
         match self {
-            // REPORT wraps a plain (send-only) request into a reported one. A
-            // variable is reported the moment it exists (there is no bare
-            // variable node), so REPORT is only *attachable* to a `REQUEST`.
-            Modifier::Report => matches!(node, FlowNode::Request { .. }),
+            // REPORT wraps a plain (send-only) request into a reported one, or
+            // reports the variable a `SET` assignment defines (by inserting a
+            // sibling `REPORT (VAR)` after it — see `report_assignment`).
+            Modifier::Report => {
+                matches!(node, FlowNode::Request { .. } | FlowNode::Assign { .. })
+            }
             // PARALLEL marks a not-yet-parallel loop concurrent.
             Modifier::Parallel => matches!(
                 node,
@@ -537,6 +539,38 @@ pub(crate) fn attach_modifier(flow: &mut ReportFlow, path: &[usize], m: Modifier
     true
 }
 
+/// Report the variable a `SET` assignment at `path` defines: insert a
+/// `REPORT (KEY)` statement immediately after the assignment (which itself
+/// stays, since it is what actually sets the variable), returning the new
+/// statement's path. A no-op (`None`) when `path` is not an `Assign`. This is
+/// what dropping the `REPORT` modifier onto a `VARIABLE` block does — unlike a
+/// request (transformed in place), an assignment needs a *separate* report
+/// line.
+pub(crate) fn report_assignment(flow: &mut ReportFlow, path: &[usize]) -> Option<Vec<usize>> {
+    let key = match node_at(flow, path)? {
+        FlowNode::Assign { key, .. } => key.clone(),
+        _ => return None,
+    };
+    let (last, rest) = path.split_last()?;
+    let mut existing = rest.to_vec();
+    existing.push(last + 1);
+    // Idempotent: if a `REPORT (KEY)` line already immediately follows the
+    // assignment, don't stack another duplicate column — just select it.
+    if let Some(FlowNode::Report(ReportStmt::Vars(vars))) = node_at(flow, &existing)
+        && vars.as_slice() == [key.clone()]
+    {
+        return Some(existing);
+    }
+    let pos = InsertPos {
+        parent: rest.to_vec(),
+        index: last + 1,
+    };
+    insert_node(flow, &pos, FlowNode::Report(ReportStmt::Vars(vec![key])));
+    let mut new = rest.to_vec();
+    new.push(last + 1);
+    Some(new)
+}
+
 /// Rename the request the node at `path` references, in place — preserving all
 /// of a report request's modifiers (`AS` alias, `WITH` fields, `RESPONSE` /
 /// `SHOW` / `HIDE`). Works for both a plain `REQUEST` and a `REPORT REQUEST`.
@@ -546,6 +580,39 @@ pub(crate) fn set_request_name(flow: &mut ReportFlow, path: &[usize], name: &str
         Some(FlowNode::Request { name: n })
         | Some(FlowNode::Report(ReportStmt::Request { name: n, .. })) => {
             *n = name.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Set the environment name of one `BASELINE`/`COMPARISON` role reference of a
+/// `FOR … IN ENVS` comparison loop at `path`. `baseline` selects the role list;
+/// `index` is the position within that list. Only rewrites an `Env(…)` ref (a
+/// `FILE(…)` snapshot ref is left unchanged). Returns whether anything changed.
+pub(crate) fn set_env_role(
+    flow: &mut ReportFlow,
+    path: &[usize],
+    baseline: bool,
+    index: usize,
+    name: &str,
+) -> bool {
+    let Some(FlowNode::ForEnvs {
+        clause:
+            EnvClause::Roles {
+                baseline: b,
+                comparisons: c,
+                ..
+            },
+        ..
+    }) = node_at_mut(flow, path)
+    else {
+        return false;
+    };
+    let list = if baseline { b } else { c };
+    match list.get_mut(index) {
+        Some(r @ RoleRef::Env(_)) => {
+            *r = RoleRef::Env(name.to_string());
             true
         }
         _ => false,
@@ -899,7 +966,10 @@ mod tests {
     fn modifiers_do_not_apply_where_they_make_no_sense() {
         let f = flow("k = v\n");
         let n = node_at(&f, &[0]).unwrap();
-        assert!(!Modifier::Report.applies_to(n));
+        // REPORT now applies to a plain assignment (dropping it inserts a
+        // sibling `REPORT (VAR)` line — see `report_assignment`); the loop /
+        // request-only modifiers still do not.
+        assert!(Modifier::Report.applies_to(n));
         assert!(!Modifier::Parallel.applies_to(n));
         assert!(!Modifier::With.applies_to(n));
         assert!(!Modifier::As.applies_to(n));
@@ -998,5 +1068,78 @@ mod tests {
         assert!(move_node_to(&mut f, &[0], &pos).is_none());
         // The tree is untouched.
         assert!(matches!(&f.nodes[0], FlowNode::ForEach { .. }));
+    }
+
+    #[test]
+    fn report_assignment_inserts_a_sibling_report_after_the_set() {
+        let mut f = flow("TOKEN=abc\nREQUEST A\n");
+        let new = report_assignment(&mut f, &[0]).expect("assign is reportable");
+        // A new REPORT (TOKEN) lands right after the assignment.
+        assert_eq!(new, vec![1]);
+        assert!(matches!(&f.nodes[0], FlowNode::Assign { key, .. } if key == "TOKEN"));
+        match &f.nodes[1] {
+            FlowNode::Report(ReportStmt::Vars(vars)) => {
+                assert_eq!(vars, &vec!["TOKEN".to_string()])
+            }
+            other => panic!("expected REPORT (TOKEN), got {other:?}"),
+        }
+        // The assignment survives (it still defines the variable), and the
+        // request that followed is pushed down by one.
+        assert!(matches!(&f.nodes[2], FlowNode::Request { .. }));
+    }
+
+    #[test]
+    fn report_assignment_is_a_no_op_on_a_non_assignment() {
+        let mut f = flow("REQUEST A\n");
+        assert!(report_assignment(&mut f, &[0]).is_none());
+        assert_eq!(f.nodes.len(), 1);
+    }
+
+    #[test]
+    fn report_assignment_is_idempotent_when_already_reported() {
+        let mut f = flow("TOKEN=abc\n");
+        let first = report_assignment(&mut f, &[0]).expect("assign is reportable");
+        assert_eq!(first, vec![1]);
+        assert_eq!(f.nodes.len(), 2);
+        // Dropping REPORT again selects the existing report line instead of
+        // stacking a duplicate column.
+        let again = report_assignment(&mut f, &[0]).expect("still reportable");
+        assert_eq!(again, vec![1]);
+        assert_eq!(f.nodes.len(), 2);
+    }
+
+    #[test]
+    fn set_env_role_rewrites_one_live_environment_reference() {
+        let mut f =
+            flow("FOR E IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REQUEST A\nEND\n");
+        // Repoint the comparison env; the baseline is untouched.
+        assert!(set_env_role(&mut f, &[0], false, 0, "canary"));
+        match &f.nodes[0] {
+            FlowNode::ForEnvs {
+                clause:
+                    EnvClause::Roles {
+                        baseline,
+                        comparisons,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(baseline, &vec![RoleRef::Env("prod".into())]);
+                assert_eq!(comparisons, &vec![RoleRef::Env("canary".into())]);
+            }
+            other => panic!("expected an ENVS compare loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_env_role_leaves_file_snapshots_and_plain_loops_alone() {
+        // A FILE(…) snapshot ref is not a live env name, so it is not rewritten.
+        let mut f = flow(
+            "FOR E IN ENVS BASELINE(FILE(\"snap.baseline\")), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        );
+        assert!(!set_env_role(&mut f, &[0], true, 0, "prod"));
+        // A plain (non-compare) ENVS loop has no role lists to edit.
+        let mut g = flow("FOR E IN ENVS \"dev\", \"prod\"\n    REQUEST A\nEND\n");
+        assert!(!set_env_role(&mut g, &[0], false, 0, "stage"));
     }
 }

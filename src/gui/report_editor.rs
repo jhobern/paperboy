@@ -15,8 +15,8 @@ use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
     self, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier, detach_modifier,
-    flatten, insert_node, insert_pos_after, move_node, node_at, parse_one_node, remove_node,
-    replace_node, request_node, set_request_name,
+    flatten, insert_node, insert_pos_after, move_node, node_at, remove_node, replace_node,
+    report_assignment, request_node, set_request_name,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::model::ReportResult;
@@ -60,13 +60,8 @@ pub struct ReportEditor {
     pub selection: Vec<usize>,
     /// When `Some`, the insert palette is open, inserting at this position.
     pub palette: Option<PaletteState>,
-    /// The inline "edit as line" buffer for the selected block: its path and the
-    /// editable single-line form. Reset whenever the selection changes.
-    pub line_buf: Option<(Vec<usize>, String)>,
     /// Snapshots of `report.text` for undo (Ctrl+Z), newest last.
     pub undo: Vec<String>,
-    /// Set when the blocks view needs its `line_buf` reseeded (selection moved).
-    reseed_line: bool,
     /// The last run's output (skeleton while streaming, finalized at the end),
     /// rendered as a grid in [`EditorView::Results`].
     pub result: Option<ReportResult>,
@@ -105,9 +100,7 @@ impl ReportEditor {
             diagnostics: Vec::new(),
             selection: Vec::new(),
             palette: None,
-            line_buf: None,
             undo: Vec::new(),
-            reseed_line: true,
             result: None,
             progress: None,
             run: None,
@@ -165,7 +158,6 @@ impl ReportEditor {
         if let Some(prev) = self.undo.pop() {
             self.report.set_text(prev);
             self.reparse();
-            self.reseed_line = true;
         }
     }
 
@@ -177,7 +169,6 @@ impl ReportEditor {
             replace_node(flow, path, node);
         });
         self.selection = path.to_vec();
-        self.reseed_line = true;
         sync_back(self, app);
     }
 
@@ -314,15 +305,39 @@ enum DragItem {
 
 /// One chip in a row's chip cluster (a compositional block is drawn as several
 /// chips side by side). Exactly one chip per node is the *base* (the editable
-/// subject: click it to select the row for inline editing); the rest are
-/// modifier chips, each of which may carry a detach (`×`) action.
+/// subject: click it to select the row, double-click to open its wizard); the
+/// rest are modifier chips, each of which may carry a detach (`×`) action.
 struct Chip {
     text: String,
     color: Color32,
-    /// The editable subject chip (selects the row + drives the inline editor).
+    /// The editable subject chip (selects the row; its wizard opens on
+    /// double-click; it is the row's drag handle for reordering).
     is_base: bool,
     /// `Some(which)` shows a `×` that detaches this modifier from the node.
     detach: Option<DetachWhich>,
+    /// An optional inline dropdown replacing part of the chip label with a
+    /// picker (e.g. the request name, or a BASELINE/COMPARISON environment).
+    edit: ChipEdit,
+}
+
+/// The inline picker a chip hosts, if any. The chip still shows a keyword prefix
+/// (`REQUEST`, `BASELINE`, …) as a drag/select handle; the enumerable part
+/// becomes a combo box the user picks from.
+#[derive(Clone)]
+enum ChipEdit {
+    None,
+    /// A request-name dropdown: the prefix is `REQUEST`, the combo lists the
+    /// bound collection's request titles. Carries the current name.
+    Request {
+        name: String,
+    },
+    /// A `BASELINE`/`COMPARISON` environment dropdown for the role ref at
+    /// `index` (an `Env(…)` ref); the combo lists the loaded environments.
+    EnvRole {
+        baseline: bool,
+        index: usize,
+        name: String,
+    },
 }
 
 impl Chip {
@@ -332,6 +347,7 @@ impl Chip {
             color,
             is_base: true,
             detach: None,
+            edit: ChipEdit::None,
         }
     }
     fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
@@ -340,6 +356,7 @@ impl Chip {
             color,
             is_base: false,
             detach: Some(which),
+            edit: ChipEdit::None,
         }
     }
     /// A modifier chip that cannot be detached (removing it would break the
@@ -350,6 +367,34 @@ impl Chip {
             color,
             is_base: false,
             detach: None,
+            edit: ChipEdit::None,
+        }
+    }
+    /// The request base chip, whose name is picked from an inline dropdown.
+    fn request(name: &str, color: Color32) -> Chip {
+        Chip {
+            text: format!("REQUEST {name}"),
+            color,
+            is_base: true,
+            detach: None,
+            edit: ChipEdit::Request {
+                name: name.to_string(),
+            },
+        }
+    }
+    /// A `BASELINE`/`COMPARISON` chip carrying a single-environment dropdown.
+    fn env_role(baseline: bool, index: usize, name: &str, color: Color32) -> Chip {
+        let kw = if baseline { "BASELINE" } else { "COMPARISON" };
+        Chip {
+            text: format!("{kw}({name})"),
+            color,
+            is_base: false,
+            detach: None,
+            edit: ChipEdit::EnvRole {
+                baseline,
+                index,
+                name: name.to_string(),
+            },
         }
     }
 }
@@ -364,7 +409,7 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
     };
     match node {
         FlowNode::Request { name } => {
-            vec![Chip::base(format!("REQUEST {name}"), req_col(req_ok))]
+            vec![Chip::request(name, req_col(req_ok))]
         }
         FlowNode::Report(ReportStmt::Request {
             name,
@@ -379,7 +424,7 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                 th.subst,
                 DetachWhich::Report,
             )];
-            chips.push(Chip::base(format!("REQUEST {name}"), req_col(req_ok)));
+            chips.push(Chip::request(name, req_col(req_ok)));
             // RESPONSE / SHOW / HIDE are their own detachable chips so a long
             // reported request reads as a row of small, legible clauses rather
             // than one dense line.
@@ -493,13 +538,21 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
             } = node
             {
                 chips.push(Chip::base(format!("FOR {var} IN ENVS"), th.accent));
-                if !baseline.is_empty() {
+                // A single live-environment role becomes an inline dropdown; any
+                // other shape (multiple refs, or a FILE snapshot) stays a fixed
+                // chip edited through the ENVS wizard.
+                use crate::report::flow::RoleRef;
+                if let [RoleRef::Env(name)] = baseline.as_slice() {
+                    chips.push(Chip::env_role(true, 0, name, th.pending));
+                } else if !baseline.is_empty() {
                     chips.push(Chip::fixed(
                         format!("BASELINE({})", role_refs_text(baseline)),
                         th.pending,
                     ));
                 }
-                if !comparisons.is_empty() {
+                if let [RoleRef::Env(name)] = comparisons.as_slice() {
+                    chips.push(Chip::env_role(false, 0, name, th.pending));
+                } else if !comparisons.is_empty() {
                     chips.push(Chip::fixed(
                         format!("COMPARISON({})", role_refs_text(comparisons)),
                         th.pending,
@@ -540,10 +593,6 @@ enum Act {
     MoveUp,
     MoveDown,
     Delete,
-    CommitLine {
-        path: Vec<usize>,
-        text: String,
-    },
     /// A palette block was dragged and dropped at `pos` (from the always-visible
     /// palette list). The node is built at drop time so request kinds pick up a
     /// default name from the bound collection.
@@ -567,6 +616,14 @@ enum Act {
     /// place so a report request keeps its `AS` / `WITH` / `RESPONSE` modifiers.
     RenameRequest {
         path: Vec<usize>,
+        name: String,
+    },
+    /// A `BASELINE`/`COMPARISON` env dropdown picked `name` for the role ref at
+    /// `index` of the ENVS loop at `path` (see [`edit::set_env_role`]).
+    SetEnvRole {
+        path: Vec<usize>,
+        baseline: bool,
+        index: usize,
         name: String,
     },
     /// An existing block was dragged from `from` onto a drop strip, relocating
@@ -740,7 +797,6 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
                     ed.undo.push(ed.report.text.clone());
                 }
                 ed.set_text(text);
-                ed.reseed_line = true;
             }
         });
     ui.separator();
@@ -959,14 +1015,6 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let resolves = |name: &str| titles.iter().any(|t| t == name);
     let rows = flatten(&flow, &resolves);
 
-    // Clamp / reseed the inline line editor when the selection points at a
-    // concrete editable node.
-    if ed.reseed_line {
-        ed.line_buf =
-            node_at(&flow, &ed.selection).map(|n| (ed.selection.clone(), n.header_line()));
-        ed.reseed_line = false;
-    }
-
     let mut acts: Vec<Act> = Vec::new();
 
     // Toolbar for the current selection.
@@ -1063,6 +1111,11 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                             let drop_pos = insert_pos_after(&rows, i);
                             block_row(ed, app, ui, row, i, selected, &drop_pos, &titles, &mut acts);
                         }
+                        // The empty space under the last row is itself a drop
+                        // target: dropping a base block (or an existing row)
+                        // anywhere below the report appends it as the last
+                        // top-level line.
+                        tail_drop_zone(ui, &th, flow.nodes.len(), &titles, &mut acts);
                     });
             });
         });
@@ -1082,16 +1135,17 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 /// The base blocks the palette offers, in display order. Each drops in as a new
-/// statement row. `ReportRequest` is intentionally absent — a reported request
-/// is now composed by dropping the `REPORT` modifier onto a `REQUEST`.
-const BASE_KINDS: [NodeKind; 7] = [
+/// statement row. `ReportRequest` and `ReportVar` are intentionally absent — a
+/// reported request is composed by dropping the `REPORT` modifier onto a
+/// `REQUEST`, and a reported variable by dropping `REPORT` onto a `VARIABLE`
+/// (`Assign`) block, so there is a single `REPORT` in the palette.
+const BASE_KINDS: [NodeKind; 6] = [
     NodeKind::Request,
-    NodeKind::ReportVar,
     NodeKind::Assign,
+    NodeKind::List,
     NodeKind::ForFiles,
     NodeKind::ForFolders,
     NodeKind::ForEnvs,
-    NodeKind::List,
 ];
 
 /// The always-visible palette, split into two groups: **Blocks** (base
@@ -1245,6 +1299,14 @@ fn block_row(
     acts: &mut Vec<Act>,
 ) {
     let th = app.theme;
+    // Loaded environment names — the choices a BASELINE/COMPARISON dropdown
+    // offers. Cheap to gather; only consulted by env-role chips.
+    let env_choices: Vec<String> = app
+        .session
+        .global_envs
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
     // A cheap owned copy of the node so the chip cluster / applicability checks
     // don't hold a borrow of `ed` across the inline editor (which needs `&mut`).
     let node = ed
@@ -1264,7 +1326,16 @@ fn block_row(
                     .map(|n| node_chips(n, row.req_ok, &th))
                     .unwrap_or_default();
                 for chip in &chips {
-                    render_chip(ui, &th, chip, selected, &row.path, acts);
+                    render_chip(
+                        ui,
+                        &th,
+                        chip,
+                        selected,
+                        &row.path,
+                        titles,
+                        &env_choices,
+                        acts,
+                    );
                 }
             }
         }
@@ -1277,8 +1348,13 @@ fn block_row(
     if let Some(n) = &node
         && matches!(row.kind, RowKind::Leaf | RowKind::LoopHead)
     {
+        // The modifier drop zone spans the whole line to the right of the base
+        // chip (not just the chips), so a modifier can be dropped anywhere on
+        // the row rather than having to hit the small cluster exactly.
+        let zone_rect =
+            egui::Rect::from_x_y_ranges(cluster.left()..=ui.max_rect().right(), cluster.y_range());
         let zresp = ui.interact(
-            cluster,
+            zone_rect,
             ui.id().with(("pt_modzone", row_index)),
             egui::Sense::hover(),
         );
@@ -1286,7 +1362,7 @@ fn block_row(
             && m.applies_to(n)
         {
             ui.painter().rect_stroke(
-                cluster.expand(2.0),
+                zone_rect.expand(2.0),
                 egui::CornerRadius::same(6),
                 egui::Stroke::new(2.0, th.accent),
                 egui::StrokeKind::Outside,
@@ -1364,13 +1440,61 @@ fn block_row(
         );
         ui.add_space(gap);
     }
+}
 
-    // Inline editor for the selected concrete node.
-    if selected && matches!(row.kind, RowKind::Leaf | RowKind::LoopHead) {
-        ui.horizontal(|ui| {
-            ui.add_space(row.depth as f32 * 16.0 + 8.0);
-            inline_node_editor(ed, app, ui, row, titles, acts);
+/// A catch-all drop target filling the empty space beneath the last row: a base
+/// block dropped here is appended as the last top-level line, and an existing
+/// row dragged here is moved to the end. `top_len` is the current number of
+/// top-level nodes (the append index). A no-op when there is no spare vertical
+/// space (the report already fills / overflows the viewport — the last row's own
+/// insert strip covers appending in that case).
+fn tail_drop_zone(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    top_len: usize,
+    titles: &[String],
+    acts: &mut Vec<Act>,
+) {
+    let remaining = ui.available_size_before_wrap();
+    if remaining.y < 6.0 {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(remaining, egui::Sense::hover());
+    let resp = ui.interact(rect, ui.id().with("pt_tail_drop"), egui::Sense::hover());
+    let end = InsertPos {
+        parent: Vec::new(),
+        index: top_len,
+    };
+    let hovering = resp.dnd_hover_payload::<NodeKind>().is_some()
+        || resp
+            .dnd_hover_payload::<DragItem>()
+            .is_some_and(|d| matches!(&*d, DragItem::Row(_)));
+    if hovering {
+        let mark = egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() - 8.0, 26.0));
+        ui.painter().rect(
+            mark,
+            egui::CornerRadius::same(6),
+            mix(th.panel, th.accent, 0.18),
+            egui::Stroke::new(1.5, th.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if let Some(kind) = release_payload::<NodeKind>(&resp) {
+        acts.push(Act::DropNode {
+            pos: end,
+            node: node_for_kind(*kind, titles),
         });
+    } else if let Some(item) = release_payload::<DragItem>(&resp) {
+        // Moving the row that is *already* last to the end is a no-op — skip it
+        // so it doesn't push a redundant undo entry / mark the report dirty.
+        if let DragItem::Row(from) = &*item
+            && from.as_slice() != [top_len.saturating_sub(1)]
+        {
+            acts.push(Act::MoveNode {
+                from: from.clone(),
+                pos: end,
+            });
+        }
     }
 }
 
@@ -1396,8 +1520,61 @@ fn render_chip(
     chip: &Chip,
     selected: bool,
     path: &[usize],
+    titles: &[String],
+    env_choices: &[String],
     acts: &mut Vec<Act>,
 ) {
+    // Chips that host an inline dropdown draw a keyword prefix (the drag/select
+    // handle) plus a combo box; they only fall back to a plain label when there
+    // is nothing to pick from.
+    match &chip.edit {
+        ChipEdit::Request { name } if !titles.is_empty() => {
+            combo_chip(
+                ui,
+                th,
+                chip,
+                selected,
+                path,
+                "REQUEST",
+                name,
+                titles,
+                acts,
+                |picked| Act::RenameRequest {
+                    path: path.to_vec(),
+                    name: picked,
+                },
+            );
+            return;
+        }
+        ChipEdit::EnvRole {
+            baseline,
+            index,
+            name,
+        } if !env_choices.is_empty() => {
+            let kw = if *baseline { "BASELINE" } else { "COMPARISON" };
+            let (baseline, index) = (*baseline, *index);
+            combo_chip(
+                ui,
+                th,
+                chip,
+                selected,
+                path,
+                kw,
+                name,
+                env_choices,
+                acts,
+                move |picked| Act::SetEnvRole {
+                    path: path.to_vec(),
+                    baseline,
+                    index,
+                    name: picked,
+                },
+            );
+            return;
+        }
+        _ => {}
+    }
+
     let hot = chip.is_base && selected;
     let fill = if hot {
         th.select_bg
@@ -1458,52 +1635,74 @@ fn render_chip(
     }
 }
 
-/// The inline editor shown under a selected block: a request-name picker for
-/// request nodes, else the universal editable single-line form.
-fn inline_node_editor(
-    ed: &mut ReportEditor,
-    app: &GuiApp,
+/// Render a chip whose enumerable part is an inline dropdown. The keyword
+/// `prefix` (e.g. `REQUEST`) is the drag/select handle so the combo below it
+/// stays free to open without starting a drag; picking a new value emits the
+/// action `make_act(value)`.
+#[allow(clippy::too_many_arguments)]
+fn combo_chip(
     ui: &mut egui::Ui,
-    row: &edit::NodeRow,
-    titles: &[String],
+    th: &GuiTheme,
+    chip: &Chip,
+    selected: bool,
+    path: &[usize],
+    prefix: &str,
+    current: &str,
+    choices: &[String],
     acts: &mut Vec<Act>,
+    make_act: impl FnOnce(String) -> Act,
 ) {
-    let th = app.theme;
-    let is_request = ed
-        .flow
-        .as_ref()
-        .and_then(|f| node_at(f, &row.path))
-        .map(|n| n.request_name().is_some())
-        .unwrap_or(false);
-
-    // A request node also offers a quick name picker seeded from the collection.
-    if is_request && !titles.is_empty() {
-        ui.label(RichText::new(app.strings.node_pick_request_title).color(th.dim));
-        for name in titles {
-            if ui.selectable_label(false, name).clicked() {
-                acts.push(Act::RenameRequest {
-                    path: row.path.clone(),
-                    name: name.clone(),
+    let hot = chip.is_base && selected;
+    let fill = if hot {
+        th.select_bg
+    } else {
+        mix(th.panel, chip.color, 0.22)
+    };
+    let stroke = if hot {
+        egui::Stroke::new(1.5, th.select_fg)
+    } else {
+        egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5))
+    };
+    let text_col = if hot { th.select_fg } else { chip.color };
+    let mut picked: Option<String> = None;
+    let handle = egui::Frame::NONE
+        .fill(fill)
+        .stroke(stroke)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .corner_radius(6)
+        .show(ui, |ui| {
+            // The keyword prefix is the interactive handle (drag to reorder,
+            // click to select, double-click to open the wizard).
+            let handle = ui.add(
+                egui::Label::new(RichText::new(prefix).color(text_col))
+                    .selectable(false)
+                    .sense(egui::Sense::click_and_drag()),
+            );
+            egui::ComboBox::from_id_salt((path, prefix))
+                .selected_text(RichText::new(current).color(text_col))
+                .show_ui(ui, |ui| {
+                    for c in choices {
+                        if ui.selectable_label(c == current, c).clicked() {
+                            picked = Some(c.clone());
+                        }
+                    }
                 });
-            }
-        }
-    }
+            handle
+        })
+        .inner;
 
-    // The universal single-line editor (full grammar coverage).
-    if let Some((path, buf)) = ed.line_buf.as_mut()
-        && *path == row.path
+    if handle.dragged() {
+        handle.dnd_set_drag_payload(DragItem::Row(path.to_vec()));
+    }
+    if handle.double_clicked() {
+        acts.push(Act::OpenWizard(path.to_vec()));
+    } else if handle.clicked() {
+        acts.push(Act::Select(path.to_vec()));
+    }
+    if let Some(name) = picked
+        && name != current
     {
-        let resp = ui.add(
-            egui::TextEdit::singleline(buf)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace),
-        );
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            acts.push(Act::CommitLine {
-                path: row.path.clone(),
-                text: buf.clone(),
-            });
-        }
+        acts.push(make_act(name));
     }
 }
 
@@ -1541,7 +1740,7 @@ fn palette_panel(
 
             match pick_request {
                 None => {
-                    for kind in NodeKind::ALL {
+                    for kind in BASE_KINDS {
                         if ui.selectable_label(false, kind.label(s)).clicked() {
                             acts.push(Act::PickKind(kind));
                         }
@@ -1616,7 +1815,6 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
         match act {
             Act::Select(path) => {
                 ed.selection = path;
-                ed.reseed_line = true;
             }
             Act::OpenPalette(pos) => {
                 ed.palette = Some(PaletteState {
@@ -1632,11 +1830,15 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                         p.pick_request = Some(matches!(kind, NodeKind::ReportRequest));
                     }
                 } else if let Some(node) = kind.template() {
-                    insert_at_palette(ed, node);
+                    if let Some(sel) = insert_at_palette(ed, node) {
+                        super::report_wizard::open(ed, app, &sel);
+                    }
                 }
             }
             Act::InsertRequest { report, name } => {
-                insert_at_palette(ed, request_node(&name, report));
+                if let Some(sel) = insert_at_palette(ed, request_node(&name, report)) {
+                    super::report_wizard::open(ed, app, &sel);
+                }
             }
             Act::MoveUp | Act::MoveDown => {
                 let up = matches!(act, Act::MoveUp);
@@ -1648,7 +1850,6 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 if let Some(ns) = new_sel {
                     ed.selection = ns;
                 }
-                ed.reseed_line = true;
             }
             Act::Delete => {
                 let path = ed.selection.clone();
@@ -1656,35 +1857,43 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     remove_node(flow, &path);
                 });
                 ed.selection = Vec::new();
-                ed.reseed_line = true;
-            }
-            Act::CommitLine { path, text } => {
-                let prefer_loop = ed
-                    .flow
-                    .as_ref()
-                    .and_then(|f| node_at(f, &path))
-                    .map(FlowNode::is_loop)
-                    .unwrap_or(false);
-                if let Some(node) = parse_one_node(&text, prefer_loop) {
-                    ed.edit_flow(|flow| {
-                        replace_node(flow, &path, node);
-                    });
-                }
-                ed.reseed_line = true;
             }
             Act::DropNode { pos, node } => {
                 ed.edit_flow(|flow| insert_node(flow, &pos, node));
                 let mut sel = pos.parent.clone();
                 sel.push(pos.index);
-                ed.selection = sel;
-                ed.reseed_line = true;
+                ed.selection = sel.clone();
+                // Placing a new block opens its configure wizard straight away
+                // so the user can fill it in (pick a request, set VAR=VALUE, …)
+                // without a second click.
+                super::report_wizard::open(ed, app, &sel);
             }
             Act::AttachMod { path, modifier } => {
-                ed.edit_flow(|flow| {
-                    attach_modifier(flow, &path, modifier);
-                });
-                ed.selection = path;
-                ed.reseed_line = true;
+                // REPORT on a VARIABLE (`Assign`) doesn't transform it (the
+                // assignment must stay to define the variable) — it inserts a
+                // sibling `REPORT (VAR)` line right after it. Every other
+                // modifier transforms its node in place.
+                let assign_report = modifier == Modifier::Report
+                    && matches!(
+                        ed.flow.as_ref().and_then(|f| node_at(f, &path)),
+                        Some(FlowNode::Assign { .. })
+                    );
+                if assign_report {
+                    let mut new_sel = None;
+                    ed.edit_flow(|flow| {
+                        new_sel = report_assignment(flow, &path);
+                    });
+                    ed.selection = new_sel.unwrap_or(path);
+                } else {
+                    ed.edit_flow(|flow| {
+                        attach_modifier(flow, &path, modifier);
+                    });
+                    ed.selection = path;
+                }
+                // Dropping a modifier chip (WITH/AS/REPORT/…) opens the affected
+                // node's wizard so the new clause can be filled in immediately.
+                let sel = ed.selection.clone();
+                super::report_wizard::open(ed, app, &sel);
             }
             Act::DetachMod { path, which } => {
                 ed.edit_flow(|flow| {
@@ -1693,14 +1902,23 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     }
                 });
                 ed.selection = Vec::new();
-                ed.reseed_line = true;
             }
             Act::RenameRequest { path, name } => {
                 ed.edit_flow(|flow| {
                     set_request_name(flow, &path, &name);
                 });
                 ed.selection = path;
-                ed.reseed_line = true;
+            }
+            Act::SetEnvRole {
+                path,
+                baseline,
+                index,
+                name,
+            } => {
+                ed.edit_flow(|flow| {
+                    edit::set_env_role(flow, &path, baseline, index, &name);
+                });
+                ed.selection = path;
             }
             Act::MoveNode { from, pos } => {
                 let mut new_sel = None;
@@ -1710,14 +1928,12 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 if let Some(ns) = new_sel {
                     ed.selection = ns;
                 }
-                ed.reseed_line = true;
             }
             Act::DeletePath(path) => {
                 ed.edit_flow(|flow| {
                     remove_node(flow, &path);
                 });
                 ed.selection = Vec::new();
-                ed.reseed_line = true;
             }
             Act::OpenWizard(path) => super::report_wizard::open(ed, app, &path),
         }
@@ -1725,18 +1941,18 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
     sync_back(ed, app);
 }
 
-/// Insert `node` at the open palette's position, select it, and close the palette.
-fn insert_at_palette(ed: &mut ReportEditor, node: FlowNode) {
-    let Some(p) = ed.palette.take() else {
-        return;
-    };
+/// Insert `node` at the open palette's position, select it, close the palette,
+/// and return the new node's path (so the caller can open its wizard). `None`
+/// when no palette was open.
+fn insert_at_palette(ed: &mut ReportEditor, node: FlowNode) -> Option<Vec<usize>> {
+    let p = ed.palette.take()?;
     let pos = p.pos.clone();
     ed.edit_flow(|flow| insert_node(flow, &pos, node));
     // Select the newly inserted node.
     let mut sel = pos.parent.clone();
     sel.push(pos.index);
-    ed.selection = sel;
-    ed.reseed_line = true;
+    ed.selection = sel.clone();
+    Some(sel)
 }
 
 /// Mirror a Session-origin editor's text back into `session.reports` on every

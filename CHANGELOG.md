@@ -113,6 +113,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   line. The wizard, detach and move operations all run through the shared
   flow-editing core, so the terminal UI and GUI stay in lock-step.
 
+- **Everything-is-a-drop-target, wizard-on-drop and inline pickers for the GUI
+  report editor.** Placing blocks is now far more forgiving and guided. A
+  modifier chip (`WITH`, `AS`, `REPORT`, …) can be dropped **anywhere along its
+  line** — the whole row to the right of the base block accepts it — and a block
+  dropped in the **empty space beneath the last line** simply becomes the last
+  line, so you no longer have to hit a thin strip. Dropping a new block (or
+  attaching a modifier) now **opens its configuration wizard straight away**, so
+  you fill it in there rather than in a separate step. The palette's two
+  overlapping `REPORT` entries are combined: a plain **VARIABLE** block sets
+  `VAR = VALUE`, and the single `REPORT` modifier now drops onto either a
+  request *or* a variable (adding a `REPORT (VAR)` line after the assignment).
+  Every node kind now has a wizard — assignments, lists and `FOLDERS` loops get
+  purpose-built forms, and anything else falls back to a raw-line editor — so no
+  block is ever left uneditable, and the old always-on raw text box under a
+  selected line is gone. Finally, enumerable fields are now **inline dropdowns
+  right on the chip**: a request chip's name and a `BASELINE`/`COMPARISON`
+  environment are picked from a combo box (of the bound collection's requests /
+  the loaded environments) without opening the wizard at all. These edits use
+  the shared flow-editing core, keeping both front-ends in lock-step.
+
 
 ## [0.1.10] - 2026-08-03
 
