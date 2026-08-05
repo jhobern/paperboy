@@ -1674,6 +1674,64 @@ fn ctrl_e_toggles_enabled_without_moving_focus() {
     );
 }
 
+/// Scan the whole terminal buffer for the first cell whose glyph is `ch` and
+/// return its foreground colour — a small helper for asserting on the colour a
+/// particular character was drawn in.
+fn find_cell_fg(buf: &ratatui::buffer::Buffer, ch: char) -> Option<ratatui::style::Color> {
+    let target = ch.to_string();
+    let area = *buf.area();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell((x, y))
+                && cell.symbol() == target
+            {
+                return Some(cell.fg);
+            }
+        }
+    }
+    None
+}
+
+/// A disabled request row (checkbox unticked) renders its key in the dim
+/// colour so it reads as inactive — the terminal-side mirror of the GUI's
+/// greyed-out disabled key/value editors.
+#[test]
+fn a_disabled_header_row_renders_its_key_dimmed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app); // focus Header(0, Key)
+    for ch in "Zydeco".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    // Move focus off the key so it renders via the non-focused (coloured)
+    // path rather than as the live editor.
+    press(&mut app, KeyCode::Tab); // -> Header(0, Value)
+
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+    // Enabled: the key text is drawn in the normal text colour.
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let enabled_fg = find_cell_fg(term.backend().buffer(), 'Z')
+        .expect("the header key's first char should be on screen");
+    assert_eq!(
+        enabled_fg, th.text,
+        "an enabled row's key uses the normal text colour"
+    );
+
+    // Ctrl+E disables the row (from any of its columns); the key greys out.
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert!(!header_enabled(&app, 0), "Ctrl+E disabled the row");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let disabled_fg = find_cell_fg(term.backend().buffer(), 'Z')
+        .expect("the header key's first char should still be on screen");
+    assert_eq!(
+        disabled_fg, th.dim,
+        "a disabled row's key is greyed out to read as inactive"
+    );
+}
+
 #[test]
 fn arrows_can_reach_the_enabled_checkbox_in_a_form_row() {
     // The checkbox is the leftmost visual column of the Form table too,

@@ -2789,11 +2789,21 @@ pub(crate) fn header_cell_rects(area: Rect, en: u16, kw: u16, vw: u16, dw: u16) 
     Layout::horizontal(cons).spacing(1).split(area).to_vec()
 }
 
-pub(crate) fn draw_header_cell(f: &mut Frame, area: Rect, ed: &Editor, focused: bool, th: &Theme) {
+pub(crate) fn draw_header_cell(
+    f: &mut Frame,
+    area: Rect,
+    ed: &Editor,
+    focused: bool,
+    enabled: bool,
+    th: &Theme,
+) {
     if focused {
         render_editor(f, area, ed, false, th);
     } else {
-        render_clipped_line(f, area, &ed.text(), th.text, th);
+        // A disabled row (checkbox unticked) isn't sent, so grey its text to
+        // read as inactive — mirrored in the GUI's key/value editors.
+        let color = if enabled { th.text } else { th.dim };
+        render_clipped_line(f, area, &ed.text(), color, th);
     }
 }
 
@@ -2905,16 +2915,31 @@ fn draw_headerlike_table(
                 MouseHitTarget::NewRequestField(field_for(i, HdrCol::Value)),
             );
         }
-        draw_header_cell(f, cells[1], &row.key, is_col_focused(i, HdrCol::Key), th);
+        draw_header_cell(
+            f,
+            cells[1],
+            &row.key,
+            is_col_focused(i, HdrCol::Key),
+            row.enabled,
+            th,
+        );
         draw_header_cell(
             f,
             cells[2],
             &row.value,
             is_col_focused(i, HdrCol::Value),
+            row.enabled,
             th,
         );
         if dw > 0 {
-            draw_header_cell(f, cells[3], &row.desc, is_col_focused(i, HdrCol::Desc), th);
+            draw_header_cell(
+                f,
+                cells[3],
+                &row.desc,
+                is_col_focused(i, HdrCol::Desc),
+                row.enabled,
+                th,
+            );
             if let Some(app) = app {
                 app.push_mouse_hit(
                     MouseLayer::Overlay,
@@ -3226,6 +3251,7 @@ pub(crate) fn draw_form_table_with_hits(
             cells[1],
             &row.key,
             form.focus == NewField::FormField(i, FormCol::Key),
+            row.enabled,
             th,
         );
 
@@ -3242,7 +3268,13 @@ pub(crate) fn draw_form_table_with_hits(
                 Paragraph::new(Span::styled(
                     format!("{} \u{25be}", label),
                     Style::default()
-                        .fg(if kind_focused { th.accent } else { th.text })
+                        .fg(if kind_focused {
+                            th.accent
+                        } else if row.enabled {
+                            th.text
+                        } else {
+                            th.dim
+                        })
                         .add_modifier(Modifier::BOLD),
                 )),
                 cells[2],
@@ -3275,7 +3307,13 @@ pub(crate) fn draw_form_table_with_hits(
         if value_focused {
             render_editor(f, text_rect, &row.value, false, th);
         } else {
-            let color = form_value_color(row, form.file_root.as_ref(), th);
+            // Disabled rows read as inactive (grey), overriding the usual
+            // file-validity colouring of the value.
+            let color = if row.enabled {
+                form_value_color(row, form.file_root.as_ref(), th)
+            } else {
+                th.dim
+            };
             render_clipped_line(f, text_rect, &row.value.text(), color, th);
         }
         if let Some(icon_rect) = file_icon_rect {
@@ -3321,7 +3359,14 @@ pub(crate) fn draw_form_table_with_hits(
                     cells[ctype_idx],
                 );
             } else {
-                draw_header_cell(f, cells[ctype_idx], &row.ctype, ctype_focused, th);
+                draw_header_cell(
+                    f,
+                    cells[ctype_idx],
+                    &row.ctype,
+                    ctype_focused,
+                    row.enabled,
+                    th,
+                );
             }
             if ctype_focused && row.kind == FormFieldKind::File {
                 form.ctype_cell_rect.set(Some(cells[ctype_idx]));
@@ -3356,7 +3401,14 @@ pub(crate) fn draw_form_table_with_hits(
                     cells[prefix_idx],
                 );
             } else {
-                draw_header_cell(f, cells[prefix_idx], &row.base64_prefix, prefix_focused, th);
+                draw_header_cell(
+                    f,
+                    cells[prefix_idx],
+                    &row.base64_prefix,
+                    prefix_focused,
+                    row.enabled,
+                    th,
+                );
             }
             if let Some(app) = app {
                 app.push_mouse_hit(
@@ -3369,7 +3421,7 @@ pub(crate) fn draw_form_table_with_hits(
 
         if dw > 0 {
             let desc_focused = form.focus == NewField::FormField(i, FormCol::Desc);
-            draw_header_cell(f, cells[desc_idx], &row.desc, desc_focused, th);
+            draw_header_cell(f, cells[desc_idx], &row.desc, desc_focused, row.enabled, th);
             if let Some(app) = app {
                 app.push_mouse_hit(
                     MouseLayer::Overlay,
@@ -3459,6 +3511,7 @@ pub(crate) fn draw_assert_table_with_hits(
             *row_area,
             &form.asserts[i].expr,
             form.focus == NewField::Assert(i),
+            true,
             th,
         );
         if let Some(app) = app {
@@ -3571,6 +3624,7 @@ pub(crate) fn draw_capture_table_with_hits(
             cells[0],
             &row.name,
             form.focus == NewField::Capture(i, CapCol::Name),
+            true,
             th,
         );
         if let Some(app) = app {
@@ -3590,6 +3644,7 @@ pub(crate) fn draw_capture_table_with_hits(
             cells[1],
             &row.expr,
             form.focus == NewField::Capture(i, CapCol::Expr),
+            true,
             th,
         );
     }
@@ -3696,6 +3751,7 @@ pub(crate) fn draw_report_table_with_hits(
             cells[0],
             &row.name,
             form.focus == NewField::Report(i, CapCol::Name),
+            true,
             th,
         );
         if let Some(app) = app {
@@ -3715,6 +3771,7 @@ pub(crate) fn draw_report_table_with_hits(
             cells[1],
             &row.expr,
             form.focus == NewField::Report(i, CapCol::Expr),
+            true,
             th,
         );
     }

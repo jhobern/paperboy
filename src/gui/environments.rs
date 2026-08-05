@@ -221,8 +221,14 @@ fn var_editor(
         .show(ui, |ui| {
             for i in 0..vars.len() {
                 let source = vars[i].source;
-                if super::widgets::sized_key(ui, key_w, &mut vars[i].key, s.gui_hint_key_upper)
-                    .changed()
+                if super::widgets::sized_key(
+                    ui,
+                    key_w,
+                    &mut vars[i].key,
+                    s.gui_hint_key_upper,
+                    theme.text,
+                )
+                .changed()
                 {
                     changed = true;
                 }

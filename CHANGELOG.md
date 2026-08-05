@@ -172,6 +172,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `[`/`]` tab-cycling reminder) so it no longer overflows on a narrow terminal —
   the keys themselves still work.
 
+- **Disabled request rows now read as greyed-out in both front-ends.** A
+  key/value row whose enable checkbox is unticked (a header, query param,
+  cookie, option or multipart form field) isn't sent, so its key and value are
+  now drawn in the dim colour — obvious at a glance that it's inactive, instead
+  of looking identical to an active row. Applied in the GUI's key/value editors
+  and mirrored in the terminal UI's request wizard.
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of

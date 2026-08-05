@@ -636,8 +636,21 @@ fn form_editor(
                 if ui.checkbox(&mut fields[i].enabled, "").changed() {
                     changed = true;
                 }
-                if super::widgets::sized_key(ui, key_w, &mut fields[i].key, s.gui_hint_field)
-                    .changed()
+                // Grey a disabled form field's key/value so it reads as inactive
+                // (it isn't sent), matching the terminal UI.
+                let row_color = if fields[i].enabled {
+                    theme.text
+                } else {
+                    theme.dim
+                };
+                if super::widgets::sized_key(
+                    ui,
+                    key_w,
+                    &mut fields[i].key,
+                    s.gui_hint_field,
+                    row_color,
+                )
+                .changed()
                 {
                     changed = true;
                 }
@@ -680,6 +693,7 @@ fn form_editor(
                         .add(
                             egui::TextEdit::singleline(&mut fields[i].value)
                                 .desired_width(f32::INFINITY)
+                                .text_color(row_color)
                                 .hint_text(hint),
                         )
                         .changed()

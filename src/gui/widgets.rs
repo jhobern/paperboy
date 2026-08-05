@@ -38,9 +38,20 @@ pub fn split_key_width(ui: &egui::Ui, reserved: f32) -> f32 {
 /// alone renders as a ~24px sliver. [`egui::Ui::add_sized`] instead *allocates*
 /// a `key_w`-wide rect up front and fits the field to it, so the key honours
 /// the [`split_key_width`] split regardless of the grid's column feedback.
-pub fn sized_key(ui: &mut egui::Ui, key_w: f32, text: &mut String, hint: &str) -> egui::Response {
+pub fn sized_key(
+    ui: &mut egui::Ui,
+    key_w: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+) -> egui::Response {
     let h = ui.spacing().interact_size.y;
-    ui.add_sized([key_w, h], egui::TextEdit::singleline(text).hint_text(hint))
+    ui.add_sized(
+        [key_w, h],
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .text_color(color),
+    )
 }
 
 /// A selectable label whose footprint never changes between the
@@ -200,7 +211,10 @@ pub fn kv_editor(
                 if ui.checkbox(&mut rows[i].2, "").changed() {
                     changed = true;
                 }
-                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint);
+                // A disabled row (checkbox unticked) isn't sent, so grey its
+                // key/value out to read as inactive — matching the terminal UI.
+                let row_color = if rows[i].2 { theme.text } else { theme.dim };
+                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, row_color);
                 if k.changed() {
                     changed = true;
                 }
@@ -215,6 +229,7 @@ pub fn kv_editor(
                     let v = ui.add(
                         egui::TextEdit::singleline(&mut rows[i].1)
                             .hint_text(val_hint)
+                            .text_color(row_color)
                             .desired_width(f32::INFINITY),
                     );
                     if v.changed() {
@@ -259,7 +274,7 @@ pub fn pair_editor(
         .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..rows.len() {
-                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint);
+                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, theme.text);
                 if k.changed() {
                     changed = true;
                 }
@@ -363,7 +378,9 @@ mod tests {
                         .min_col_width(0.0)
                         .show(ui, |ui| {
                             ui.checkbox(&mut true, "");
-                            rendered = sized_key(ui, key_w, &mut text, "").rect.width();
+                            rendered = sized_key(ui, key_w, &mut text, "", Color32::PLACEHOLDER)
+                                .rect
+                                .width();
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
