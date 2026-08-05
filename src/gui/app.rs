@@ -39,19 +39,6 @@ pub enum ResponseSection {
 
 /// A modal dialog currently shown over the main UI.
 pub enum Dialog {
-    /// Open a file (collection / environment / report). Holds the current path
-    /// text and what kind of file is being opened.
-    OpenFile {
-        kind: OpenKind,
-        path: String,
-        error: Option<String>,
-    },
-    /// Save the active collection / environment / response to a path.
-    SaveFile {
-        kind: SaveKind,
-        path: String,
-        error: Option<String>,
-    },
     /// Rename a request or collection tab.
     Rename { target: RenameTarget, text: String },
     /// The theme editor.

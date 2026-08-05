@@ -2,7 +2,7 @@
 //! theme editor. Everything the terminal UI reaches through its `:`-menu and
 //! wizards, driven through the shared [`crate::session::Session`].
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use eframe::egui::{self, Align2, RichText};
 
@@ -54,39 +54,23 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             .button(app.strings.gui_open_collection_ellipsis)
             .clicked()
         {
-            app.dialog = Some(Dialog::OpenFile {
-                kind: OpenKind::Collection,
-                path: String::new(),
-                error: None,
-            });
+            open_via_picker(app, OpenKind::Collection);
             ui.close();
         }
         if ui.button(app.strings.gui_import_postman).clicked() {
             // Same loader — it auto-detects Postman JSON vs. Hurl.
-            app.dialog = Some(Dialog::OpenFile {
-                kind: OpenKind::Collection,
-                path: String::new(),
-                error: None,
-            });
+            open_via_picker(app, OpenKind::Collection);
             ui.close();
         }
         if ui
             .button(app.strings.gui_open_environment_ellipsis)
             .clicked()
         {
-            app.dialog = Some(Dialog::OpenFile {
-                kind: OpenKind::Environment,
-                path: String::new(),
-                error: None,
-            });
+            open_via_picker(app, OpenKind::Environment);
             ui.close();
         }
         if ui.button(app.strings.gui_open_workspace_ellipsis).clicked() {
-            app.dialog = Some(Dialog::OpenFile {
-                kind: OpenKind::Workspace,
-                path: String::new(),
-                error: None,
-            });
+            open_via_picker(app, OpenKind::Workspace);
             ui.close();
         }
         ui.separator();
@@ -94,25 +78,11 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             .button(app.strings.gui_save_collection_ellipsis)
             .clicked()
         {
-            let ci = app.active_ci();
-            let path = app.session.collections[ci]
-                .path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            app.dialog = Some(Dialog::SaveFile {
-                kind: SaveKind::Collection,
-                path,
-                error: None,
-            });
+            save_via_picker(app, SaveKind::Collection);
             ui.close();
         }
         if ui.button(app.strings.gui_save_response_ellipsis).clicked() {
-            app.dialog = Some(Dialog::SaveFile {
-                kind: SaveKind::Response,
-                path: String::new(),
-                error: None,
-            });
+            save_via_picker(app, SaveKind::Response);
             ui.close();
         }
         ui.separator();
@@ -296,8 +266,6 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         return;
     };
     match dialog {
-        Dialog::OpenFile { kind, path, error } => open_file_dialog(app, ctx, kind, path, error),
-        Dialog::SaveFile { kind, path, error } => save_file_dialog(app, ctx, kind, path, error),
         Dialog::Rename { target, text } => rename_dialog(app, ctx, target, text),
         Dialog::Prompt { kind, text } => prompt_dialog(app, ctx, kind, text),
         Dialog::Theme(state) => theme_dialog(app, ctx, *state),
@@ -316,187 +284,177 @@ fn modal<R>(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui) ->
         .unwrap()
 }
 
-fn open_file_dialog(
-    app: &mut GuiApp,
-    ctx: &egui::Context,
-    kind: OpenKind,
-    mut path: String,
-    mut error: Option<String>,
-) {
+/// Open a collection / environment / workspace through a native OS picker.
+/// Replaces the old type-a-path modal — a menu click pops the native chooser,
+/// and a successful pick loads immediately; failures show a native error alert.
+pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
     let title = match kind {
         OpenKind::Collection => app.strings.gui_open_collection_title,
         OpenKind::Environment => app.strings.gui_open_environment_title,
         OpenKind::Workspace => app.strings.gui_open_workspace_title,
     };
-    let lbl_path = app.strings.gui_file_path;
-    let lbl_open = app.strings.gui_open;
-    let lbl_cancel = app.strings.gui_cancel;
-    let err_col = app.theme.err;
-    let hint = if kind == OpenKind::Workspace {
-        "/path/to/folder"
-    } else {
-        "/path/to/file"
+    let picked = match kind {
+        OpenKind::Workspace => super::filepick::pick_folder(title, None),
+        OpenKind::Collection => super::filepick::pick_file(
+            title,
+            None,
+            &[
+                (app.strings.gui_filter_collections, &["hurl", "json"]),
+                (app.strings.gui_filter_all, &["*"]),
+            ],
+        ),
+        OpenKind::Environment => super::filepick::pick_file(
+            title,
+            None,
+            &[
+                (app.strings.gui_filter_environments, &["vars", "env"]),
+                (app.strings.gui_filter_all, &["*"]),
+            ],
+        ),
     };
-    let (keep, submit) = modal(ctx, title, |ui| {
-        ui.label(lbl_path);
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut path)
-                .desired_width(420.0)
-                .hint_text(hint),
-        );
-        if let Some(err) = &error {
-            ui.colored_label(err_col, err);
-        }
-        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let mut keep = true;
-        let mut go = submit;
-        ui.horizontal(|ui| {
-            if ui.button(lbl_open).clicked() {
-                go = true;
-            }
-            if ui.button(lbl_cancel).clicked() {
-                keep = false;
-            }
-        });
-        (keep, go)
-    });
-
-    if !keep {
+    let Some(path) = picked else {
         return; // cancelled
+    };
+    if let Err(msg) = apply_open(app, kind, &path) {
+        super::filepick::error_alert(title, &msg);
     }
-    if submit {
-        if kind == OpenKind::Workspace {
-            let p = PathBuf::from(&path);
-            if p.is_dir() {
-                app.session.open_workspace(p);
-                app.focus = super::Focus::List;
-                app.report_editor = None;
-                return; // success closes the dialog
-            }
-            error = Some(app.strings.gui_not_a_folder.to_string());
-            app.dialog = Some(Dialog::OpenFile { kind, path, error });
-            return;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let name = file_stem(&path);
-                let ok = match kind {
-                    OpenKind::Collection => {
-                        app.session
-                            .load_collection_text(name, &content, Some(PathBuf::from(&path)))
-                    }
-                    OpenKind::Environment => app
-                        .session
-                        .load_environment_text(name, &content, Some(PathBuf::from(&path)), None)
-                        .is_some(),
-                    // Handled above with an early return (a folder, not a file).
-                    OpenKind::Workspace => unreachable!(),
-                };
-                if ok {
-                    return; // success closes the dialog
-                }
-                error = Some(app.strings.gui_could_not_parse.to_string());
-            }
-            Err(e) => error = Some(format!("{} {e}", app.strings.gui_could_not_read)),
-        }
-    }
-    app.dialog = Some(Dialog::OpenFile { kind, path, error });
 }
 
-fn save_file_dialog(
-    app: &mut GuiApp,
-    ctx: &egui::Context,
-    kind: SaveKind,
-    mut path: String,
-    mut error: Option<String>,
-) {
+/// Load the chosen path as the given kind, returning a user-facing error string
+/// on failure (bad folder / unreadable / unparseable). The success side effects
+/// (loading into the session, refocusing) mirror the old dialog's submit path.
+fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), String> {
+    if kind == OpenKind::Workspace {
+        if path.is_dir() {
+            app.session.open_workspace(path.to_path_buf());
+            app.focus = super::Focus::List;
+            app.report_editor = None;
+            return Ok(());
+        }
+        return Err(app.strings.gui_not_a_folder.to_string());
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("{} {e}", app.strings.gui_could_not_read))?;
+    let name = file_stem(&path_str);
+    let ok = match kind {
+        OpenKind::Collection => {
+            app.session
+                .load_collection_text(name, &content, Some(path.to_path_buf()))
+        }
+        OpenKind::Environment => app
+            .session
+            .load_environment_text(name, &content, Some(path.to_path_buf()), None)
+            .is_some(),
+        OpenKind::Workspace => unreachable!(),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(app.strings.gui_could_not_parse.to_string())
+    }
+}
+
+/// Save the active collection / environment / response / report results through
+/// a native OS save picker.
+pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
     let title = match kind {
         SaveKind::Collection => app.strings.gui_save_collection_title,
         SaveKind::Environment(_) => app.strings.gui_save_environment_title,
         SaveKind::Response => app.strings.gui_save_response_title,
         SaveKind::ReportResults => app.strings.gui_save_results_title,
     };
-    let lbl_path = app.strings.gui_file_path;
-    let lbl_save = app.strings.gui_save;
-    let lbl_cancel = app.strings.gui_cancel;
-    let err_col = app.theme.err;
-    let (keep, submit) = modal(ctx, title, |ui| {
-        ui.label(lbl_path);
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut path)
-                .desired_width(420.0)
-                .hint_text("/path/to/file"),
-        );
-        if let Some(err) = &error {
-            ui.colored_label(err_col, err);
-        }
-        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let mut keep = true;
-        let mut go = submit;
-        ui.horizontal(|ui| {
-            if ui.button(lbl_save).clicked() {
-                go = true;
-            }
-            if ui.button(lbl_cancel).clicked() {
-                keep = false;
-            }
+    // Seed the dialog from any remembered path (collections/environments) and a
+    // sensible default filename.
+    let current = match kind {
+        SaveKind::Collection => app.session.collections[app.active_ci()]
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        SaveKind::Environment(id) => app
+            .session
+            .global_envs
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        // Default a results export to `<report>.csv` beside the report (or the
+        // current dir for a scratch report).
+        SaveKind::ReportResults => app
+            .report_editor
+            .as_ref()
+            .and_then(|e| e.report.path.as_ref())
+            .map(|p| p.with_extension("csv").to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        SaveKind::Response => String::new(),
+    };
+    let dir = super::filepick::seed_dir(&current);
+    let default_name = std::path::Path::new(&current)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| match kind {
+            SaveKind::Collection => "collection.hurl".into(),
+            SaveKind::Environment(_) => "environment.vars".into(),
+            SaveKind::Response => "response.txt".into(),
+            SaveKind::ReportResults => "results.csv".into(),
         });
-        (keep, go)
-    });
+    let filters: &[super::filepick::Filter] = match kind {
+        SaveKind::Collection => &[("Hurl", &["hurl"]), ("All files", &["*"])],
+        SaveKind::Environment(_) => &[("Vars", &["vars"]), ("All files", &["*"])],
+        SaveKind::ReportResults => &[
+            ("CSV", &["csv"]),
+            ("JSON", &["json"]),
+            ("HTML", &["html"]),
+            ("Excel", &["xlsx"]),
+        ],
+        SaveKind::Response => &[("All files", &["*"])],
+    };
+    let Some(path) = super::filepick::save_file(title, dir.as_deref(), &default_name, filters)
+    else {
+        return; // cancelled
+    };
+    if let Err(msg) = apply_save(app, kind, &path) {
+        super::filepick::error_alert(title, &msg);
+    }
+}
 
-    if !keep {
-        return;
+/// Write the given kind to `path`, returning a user-facing error on failure.
+fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), String> {
+    let path_str = path.to_string_lossy();
+    // Report results export writes format-specific bytes (chosen by extension).
+    if matches!(kind, SaveKind::ReportResults) {
+        return export_report_results(app, &path_str);
     }
-    if submit {
-        // Report results export writes format-specific *bytes* (chosen by the
-        // file extension), so it takes its own path rather than the text branch.
-        if matches!(kind, SaveKind::ReportResults) {
-            match export_report_results(app, &path) {
-                Ok(()) => return,
-                Err(e) => error = Some(e),
+    let content = match kind {
+        SaveKind::Collection => Some(app.session.collections[app.active_ci()].to_hurl()),
+        SaveKind::Environment(id) => app
+            .session
+            .global_envs
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.to_vars_text()),
+        SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
+        SaveKind::ReportResults => None,
+    };
+    let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    // Remember the path for collections/environments.
+    match kind {
+        SaveKind::Collection => {
+            let ci = app.active_ci();
+            app.session.collections[ci].path = Some(path.to_path_buf());
+        }
+        SaveKind::Environment(id) => {
+            if let Some(e) = app.session.global_envs.iter_mut().find(|e| e.id == id) {
+                e.path = Some(path.to_path_buf());
             }
-            app.dialog = Some(Dialog::SaveFile { kind, path, error });
-            return;
         }
-        let content = match kind {
-            SaveKind::Collection => Some(app.session.collections[app.active_ci()].to_hurl()),
-            SaveKind::Environment(id) => app
-                .session
-                .global_envs
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.to_vars_text()),
-            SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
-            SaveKind::ReportResults => None,
-        };
-        match content {
-            Some(text) => match std::fs::write(&path, text) {
-                Ok(()) => {
-                    // Remember the path for collections/environments.
-                    let pb = PathBuf::from(&path);
-                    match kind {
-                        SaveKind::Collection => {
-                            let ci = app.active_ci();
-                            app.session.collections[ci].path = Some(pb);
-                        }
-                        SaveKind::Environment(id) => {
-                            if let Some(e) = app.session.global_envs.iter_mut().find(|e| e.id == id)
-                            {
-                                e.path = Some(pb);
-                            }
-                        }
-                        SaveKind::Response => {}
-                        SaveKind::ReportResults => {}
-                    }
-                    app.session.save();
-                    return;
-                }
-                Err(e) => error = Some(format!("{} {e}", app.strings.gui_could_not_write)),
-            },
-            None => error = Some(app.strings.gui_nothing_to_save.to_string()),
-        }
+        SaveKind::Response | SaveKind::ReportResults => {}
     }
-    app.dialog = Some(Dialog::SaveFile { kind, path, error });
+    app.session.save();
+    Ok(())
 }
 
 /// Write the open report editor's last-run results to `path`, choosing the

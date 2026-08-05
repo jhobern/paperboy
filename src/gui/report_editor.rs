@@ -1147,20 +1147,11 @@ fn truncate_cell(value: &str) -> String {
     }
 }
 
-/// Open the Save dialog for exporting the active report's results, defaulting to
-/// a `.csv` beside the report (or in the current dir for a scratch report).
+/// Open the native save picker for exporting the active report's results,
+/// defaulting to a `.csv` beside the report (or in the current dir for a scratch
+/// report).
 fn open_export_dialog(app: &mut GuiApp) {
-    let default = app
-        .report_editor
-        .as_ref()
-        .and_then(|e| e.report.path.as_ref())
-        .map(|p| p.with_extension("csv"))
-        .unwrap_or_else(|| std::path::PathBuf::from("report.csv"));
-    app.dialog = Some(super::app::Dialog::SaveFile {
-        kind: super::app::SaveKind::ReportResults,
-        path: default.to_string_lossy().into_owned(),
-        error: None,
-    });
+    super::menu::save_via_picker(app, super::app::SaveKind::ReportResults);
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.

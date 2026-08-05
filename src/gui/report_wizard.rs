@@ -887,7 +887,17 @@ fn files_ui(
             ui.add(egui::TextEdit::singleline(&mut f.var).desired_width(220.0));
             ui.end_row();
             ui.label(RichText::new(s.report_node_files_folder_label).color(th.dim));
-            ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
+                if ui.button(s.gui_browse).clicked() {
+                    if let Some(p) = super::filepick::pick_folder(
+                        s.report_node_files_folder_label,
+                        super::filepick::seed_dir(&f.dir).as_deref(),
+                    ) {
+                        f.dir = p.to_string_lossy().into_owned();
+                    }
+                }
+            });
             ui.end_row();
             ui.label(RichText::new(s.report_node_files_match_label).color(th.dim));
             ui.add(egui::TextEdit::singleline(&mut f.glob).desired_width(220.0));
@@ -958,7 +968,17 @@ fn folders_ui(
             ui.add(egui::TextEdit::singleline(&mut f.var).desired_width(220.0));
             ui.end_row();
             ui.label(RichText::new(s.report_node_files_folder_label).color(th.dim));
-            ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
+                if ui.button(s.gui_browse).clicked() {
+                    if let Some(p) = super::filepick::pick_folder(
+                        s.report_node_files_folder_label,
+                        super::filepick::seed_dir(&f.dir).as_deref(),
+                    ) {
+                        f.dir = p.to_string_lossy().into_owned();
+                    }
+                }
+            });
             ui.end_row();
         });
     ui.checkbox(

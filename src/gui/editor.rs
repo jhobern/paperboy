@@ -849,6 +849,20 @@ fn form_editor(
                     {
                         remove = Some(i);
                     }
+                    // File/Base64 values are paths — offer a native file picker
+                    // (the terminal UI has its in-app browser for the same).
+                    if matches!(kind, FormFieldKind::File | FormFieldKind::Base64File)
+                        && ui.button(s.gui_browse).clicked()
+                    {
+                        if let Some(p) = super::filepick::pick_file(
+                            s.gui_browse,
+                            super::filepick::seed_dir(&fields[i].value).as_deref(),
+                            &[],
+                        ) {
+                            fields[i].value = p.to_string_lossy().into_owned();
+                            changed = true;
+                        }
+                    }
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut fields[i].value)

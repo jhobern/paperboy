@@ -748,13 +748,15 @@ strings! {
     // Dialogs.
     gui_open_collection_title => "Open collection", "Ouvrir une collection", "Åbn samling";
     gui_open_environment_title => "Open environment", "Ouvrir un environnement", "Åbn miljø";
+    gui_filter_collections => "Collections (Hurl / Postman)", "Collections (Hurl / Postman)", "Samlinger (Hurl / Postman)";
+    gui_filter_environments => "Environments", "Environnements", "Miljøer";
+    gui_filter_all => "All files", "Tous les fichiers", "Alle filer";
+    gui_browse => "Browse…", "Parcourir…", "Gennemse…";
     gui_open_workspace_title => "Open workspace folder", "Ouvrir un dossier d'espace de travail", "Åbn workspace-mappe";
     gui_not_a_folder => "That path is not a folder.", "Ce chemin n'est pas un dossier.", "Den sti er ikke en mappe.";
     gui_workspace_filter => "Filter", "Filtre", "Filter";
     gui_workspace_filter_tooltip => "Toggle showing only .hurl/.json/.vars/.trail files", "Basculer l'affichage des seuls fichiers .hurl/.json/.vars/.trail", "Skift visning af kun .hurl/.json/.vars/.trail-filer";
     gui_close => "Close", "Fermer", "Luk";
-    gui_file_path => "File path:", "Chemin du fichier\u{a0}:", "Filsti:";
-    gui_open => "Open", "Ouvrir", "Åbn";
     gui_cancel => "Cancel", "Annuler", "Annuller";
     gui_could_not_parse => "Could not parse that file.", "Impossible d'analyser ce fichier.", "Kunne ikke fortolke den fil.";
     gui_could_not_read => "Could not read file:", "Impossible de lire le fichier\u{a0}:", "Kunne ikke læse filen:";

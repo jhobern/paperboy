@@ -12,7 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
-- **A native graphical front-end (`-g` / `--gui`).** PaperBoy now ships a
+- **Native file & folder pickers in the GUI.** Every place the GUI chooses a
+  path now opens the operating system's own file dialog instead of a typed-path
+  text box: opening a collection, environment or workspace folder; saving a
+  collection, environment, response or exported report results; picking the
+  folder for a report's `FOR … IN FILES` / `FOLDERS` node; and choosing the
+  file for a `File` / `Base64` form field. (The terminal UI keeps its in-app
+  browser overlay, which is the right fit for a terminal.)
+
   desktop GUI (built on eframe/egui) alongside the terminal UI and the headless
   CLI runner — all three drive the *same* shared core (collections,
   environments, the Hurl request model, request running, git-remote load/save,

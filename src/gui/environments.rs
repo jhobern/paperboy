@@ -54,11 +54,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     super::widgets::panel_header(ui, &theme, lbl_environments, |ui| {
         if ui.button(lbl_load).on_hover_text(tip_load).clicked() {
-            app.dialog = Some(Dialog::OpenFile {
-                kind: OpenKind::Environment,
-                path: String::new(),
-                error: None,
-            });
+            super::menu::open_via_picker(app, OpenKind::Environment);
         }
         if ui
             .button(super::icons::PLUS)
@@ -178,19 +174,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         app.session.delete_environment(id);
     }
     if let Some(id) = save {
-        let path = app
-            .session
-            .global_envs
-            .iter()
-            .find(|e| e.id == id)
-            .and_then(|e| e.path.as_ref())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        app.dialog = Some(Dialog::SaveFile {
-            kind: SaveKind::Environment(id),
-            path,
-            error: None,
-        });
+        super::menu::save_via_picker(app, SaveKind::Environment(id));
     }
     if changed {
         for col in &mut app.session.collections {

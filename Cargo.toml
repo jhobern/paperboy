@@ -66,3 +66,14 @@ egui-phosphor = { version = "0.13", default-features = false, features = [
 # decode `assets/paperboy_logo.png` into an `egui::IconData` / `ColorImage`.
 # Pure-Rust `png` backend only — no C toolchain, matching the rest of the build.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Native OS file/folder picker for the GUI's open/save flows and any path field
+# (collections/workspaces/environments, `FOR … IN FILES/FOLDERS` folders, and
+# Form/Multipart File/Base64 values). Default features use the XDG Desktop
+# Portal backend via `pollster` (a synchronous `FileDialog`), so it needs no
+# system GTK `-dev` libraries — matching the rest of this self-contained build.
+# The terminal UI keeps its own in-app browser overlay (the right UX for a
+# terminal); rfd is GUI-only.
+rfd = { version = "0.17", default-features = false, features = [
+    "xdg-portal",
+    "wayland",
+] }

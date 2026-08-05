@@ -11,6 +11,7 @@
 mod app;
 mod editor;
 mod environments;
+mod filepick;
 mod icons;
 mod menu;
 mod remote;
