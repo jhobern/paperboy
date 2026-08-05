@@ -31,6 +31,7 @@ use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
 use tui_panel_select::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
+use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
 impl TuiApp {
@@ -1263,12 +1264,65 @@ impl TuiApp {
             self.main_panel
                 .selected_parts(Some(&self.main_shadow_icon_positions)),
         );
-        parts.extend(self.resp_panel.selected_parts(None));
+        // In the Response pane's compact overview, a drag selects *shortened*
+        // text — but a copy must still yield the untruncated values, so expand
+        // the selection back through the compaction map (see
+        // `resp_full_selected_parts`). Outside compact mode there's nothing to
+        // expand and we take the panel's own extracted text directly.
+        if self.response_compact {
+            parts.extend(self.resp_full_selected_parts());
+        } else {
+            parts.extend(self.resp_panel.selected_parts(None));
+        }
         if parts.is_empty() {
             None
         } else {
             Some(parts.join("\n\n"))
         }
+    }
+
+    /// The Response pane's selection, expanded so a drag over the *compacted*
+    /// overview copies the untruncated values (the "hard mode" of the compact
+    /// feature for a partial selection, complementing the whole-panel copy in
+    /// [`whole_panel_text`]). Each selected region's logical positions are in
+    /// compacted-text coordinates; they're translated through
+    /// `resp_compact_line_maps` into full-body coordinates and handed to a
+    /// throwaway panel loaded with the full body, so the crate's own
+    /// multi-region extraction produces the text. Falls back to the live
+    /// panel's `selected_parts` whenever there's no map to expand through
+    /// (e.g. a frame that didn't draw a compactable body).
+    fn resp_full_selected_parts(&self) -> Vec<String> {
+        let maps = &self.resp_compact_line_maps;
+        if maps.is_empty() || self.resp_full_body.is_empty() {
+            return self.resp_panel.selected_parts(None);
+        }
+        // Translate one compacted position to its full-body counterpart,
+        // clamping into the line map so an out-of-range column can't panic.
+        let translate = |pos: TextPos| -> TextPos {
+            let Some(line_map) = maps.get(pos.line) else {
+                return pos;
+            };
+            if line_map.is_empty() {
+                return pos;
+            }
+            let idx = pos.col.min(line_map.len() - 1);
+            TextPos::new(pos.line, line_map[idx])
+        };
+        let mut regions: Vec<(TextPos, TextPos)> = self.resp_panel.finalized_selections();
+        if let Some(active) = self.resp_panel.active_selection() {
+            regions.push(active);
+        }
+        if regions.is_empty() {
+            return Vec::new();
+        }
+        // Extraction reads logical lines, so the wrap width is irrelevant here;
+        // a wide width just avoids any wrapping while the cache is built.
+        let mut scratch = MultiSelectPanel::new();
+        scratch.set_content(self.resp_full_body.clone(), usize::from(u16::MAX));
+        for (anchor, cursor) in regions {
+            scratch.push_finalized(translate(anchor), translate(cursor));
+        }
+        scratch.selected_parts(None)
     }
 
     /// Copy every active text selection region to the clipboard via OSC 52

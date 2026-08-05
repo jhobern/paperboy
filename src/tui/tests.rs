@@ -7413,6 +7413,66 @@ fn response_compact_view_shortens_the_display_but_copy_still_yields_the_full_bod
     assert!(shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
 }
 
+/// Hard mode for a *partial* selection: drag-selecting a compacted value in the
+/// Response overview and copying it yields the untruncated string, not the
+/// shortened "head...tail" shown on screen. The selection's logical positions
+/// (in compacted-text coordinates) are translated back through the compaction
+/// map before extraction (see `resp_full_selected_parts`).
+#[test]
+fn dragging_a_compacted_value_copies_the_full_untruncated_string() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let full = "{\n  \"tok\": \"abcdefghijklmnopqrstuvwxyz0123456789\"\n}";
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: full.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    // Turn the compact overview on, then lay the panel out (which builds the
+    // compaction map used to translate the selection).
+    press(&mut app, KeyCode::Char('c'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    assert!(area.width > 12 && area.height > 1, "body must render");
+
+    // The value literal is on the second logical line: `  "tok": "abcd...6789"`.
+    // Its opening quote is at column 9 (2 spaces + `"tok"` + `: `). Drag from
+    // there out to the right edge so the whole compacted literal is selected.
+    let open_col = 9u16;
+    let end_col = area.width - 1;
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), open_col));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), end_col));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end_col));
+
+    // On screen the selection is the shortened literal...
+    let shown = app.resp_panel.selected_parts(None).join("");
+    assert!(
+        shown.contains("abcd...6789"),
+        "the on-screen selection is compacted: {shown}"
+    );
+    // ...but the copied text is the full, untruncated value.
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert_eq!(copied, "\"abcdefghijklmnopqrstuvwxyz0123456789\"");
+}
+
 #[test]
 fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus() {
     use ratatui::{Terminal, backend::TestBackend};

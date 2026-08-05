@@ -1009,6 +1009,11 @@ pub struct TuiApp {
     /// panel is showing the compacted overview. Empty when the current frame
     /// isn't showing a compactable body (loading / no-response / error).
     pub(crate) resp_full_body: Arc<str>,
+    /// Per-line column map from the *compacted* Response body back to the full
+    /// body, rebuilt alongside `resp_full_body` each frame the compact overview
+    /// is drawn. Lets a drag-selection over compacted text copy the untruncated
+    /// value (see `resp_full_selected_parts`). Empty when not compacting.
+    pub(crate) resp_compact_line_maps: Vec<Vec<usize>>,
     /// The exact screen Rect the Request JSON panel's scrollbar thumb/track
     /// was last rendered into (one column, on the panel's right border),
     /// used to hit-test mouse clicks/drags for click-to-jump and
@@ -1289,6 +1294,7 @@ impl Default for TuiApp {
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
             resp_full_body: Arc::from(""),
+            resp_compact_line_maps: Vec::new(),
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,

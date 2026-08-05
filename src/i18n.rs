@@ -349,9 +349,6 @@ strings! {
     foot_env_activate => "activate/deactivate", "activer/désactiver", "aktivér/deaktivér";
     foot_env_link => "link env", "lier env", "link miljø";
     foot_new => "New Request/Var", "Nouvelle requête/var", "Ny forespørgsel/var";
-    foot_reload_var => "Reload var", "Recharger var", "Genindlæs var";
-    foot_file => "File", "Fichier", "Fil";
-    foot_options => "Settings", "Paramètres", "Indstillinger";
     foot_rename => "rename", "renommer", "omdøb";
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";

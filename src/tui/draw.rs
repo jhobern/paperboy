@@ -2538,6 +2538,7 @@ pub(crate) fn draw_response(
     // the whole-panel `y`-copy consults to return the untruncated body while the
     // panel shows the compacted overview.
     app.resp_full_body = Arc::from("");
+    app.resp_compact_line_maps = Vec::new();
 
     if loading {
         app.resp_max_scroll = 0;
@@ -2709,8 +2710,9 @@ pub(crate) fn draw_response(
     // `y`-copy still returns the untruncated text (see `whole_panel_text`).
     if app.response_compact {
         app.resp_full_body = body.clone();
-        let compacted: Arc<str> = Arc::from(crate::shared_utils::compact_long_strings(&body));
-        app.resp_panel.set_content(compacted, width);
+        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&body);
+        app.resp_compact_line_maps = line_maps;
+        app.resp_panel.set_content(Arc::from(compacted), width);
     } else {
         app.resp_panel.set_content(body.clone(), width);
     }
@@ -2786,10 +2788,6 @@ pub(crate) fn draw_footer(
         format!("↑↓ {}", s.foot_move),
         format!("Enter {}", s.foot_edit),
         format!("n {}", s.foot_new),
-        format!("r {}", s.foot_reload_var),
-        format!("f {}", s.foot_file),
-        format!("s {}", s.foot_options),
-        format!("[ / ], ^←/→ {}", s.help_prev_next_tab),
         format!("F2 {}", s.foot_rename),
         format!("x {}", s.foot_close),
     ];

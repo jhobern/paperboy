@@ -161,6 +161,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   untruncated body**. The truncation itself lives in the shared core, so both
   front-ends stay in lock-step.
 
+- **The compact overview now copies the full string even from a partial
+  selection (TUI).** Previously only a whole-panel copy of the compacted
+  Response view returned the untruncated body; drag-selecting a shortened
+  `"head…tail"` value copied exactly what was on screen. The compaction now
+  records a column map back to the full body, so a drag-selection over compacted
+  text copies the **full, untruncated** value(s) it covers. The `c` compact-view
+  toggle is also listed in the `?` help panel. The terminal footer drops four
+  rarely-needed shortcut hints (`r` reload-var, `f` file, `s` settings and the
+  `[`/`]` tab-cycling reminder) so it no longer overflows on a narrow terminal —
+  the keys themselves still work.
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of
