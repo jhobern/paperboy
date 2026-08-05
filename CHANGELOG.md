@@ -206,6 +206,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   blank gap where they were, so it reads as physically picking up the entire
   loop (matching how a single block already behaved).
 
+- **A dragged block now leaves a dashed "ghost" where it came from.** While a
+  block (or a whole `FOR` loop) floats under the pointer, its original slot is
+  marked with a faint dashed placeholder, so a block picked up by accident is
+  obviously reversible — the outline shows where it started and where dropping
+  it back would return it.
+
 - **GUI report editor: the end-of-list drop marker now matches a block's
   height.** When you drag a block (or a new palette block) past the last row,
   the highlighted "drop here" mark at the bottom of the report is now sized to a

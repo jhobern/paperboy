@@ -1523,6 +1523,34 @@ fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
     row_path.starts_with(dragged)
 }
 
+/// Paint a faint dashed "ghost" of a block into the current (base) layer,
+/// marking the slot a dragged block was lifted from. So if a block was picked
+/// up by accident, there's an obvious outline showing where it came from and
+/// where dropping it back would return it.
+fn paint_origin_ghost(painter: &egui::Painter, rect: egui::Rect, th: &GuiTheme) {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return;
+    }
+    let r = rect.expand(1.0);
+    painter.rect_filled(r, egui::CornerRadius::same(6), mix(th.panel, th.dim, 0.12));
+    // A dashed outline (four dashed edges) reads as "empty slot / drop back
+    // here" rather than a solid block.
+    for shape in egui::Shape::dashed_line(
+        &[
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+            r.left_top(),
+        ],
+        egui::Stroke::new(1.0, th.dim),
+        4.0,
+        3.0,
+    ) {
+        painter.add(shape);
+    }
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -1628,6 +1656,9 @@ fn block_row(
                 .layout(egui::Layout::top_down(egui::Align::Min)),
             block_body,
         );
+        // Leave a dashed ghost in the (now blank) origin slot so the lift is
+        // obviously reversible — dropping the block back here restores it.
+        paint_origin_ghost(ui.painter(), ir.response.rect, &th);
         // Only the head row sets the transform (the last writer would otherwise
         // win): it centres the head on the pointer so the rest of the loop hangs
         // below it, exactly as the single-block case centres its one row.
@@ -2868,5 +2899,20 @@ mod tests {
             !row_is_lifted(&[2], &[20]),
             "prefix is index-wise, not textual"
         );
+    }
+
+    #[test]
+    fn origin_ghost_paints_without_panicking() {
+        let ctx = egui::Context::default();
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // A normal slot draws a ghost; a degenerate rect is a safe no-op.
+            paint_origin_ghost(
+                ui.painter(),
+                egui::Rect::from_min_size(egui::pos2(4.0, 4.0), egui::vec2(80.0, 22.0)),
+                &th,
+            );
+            paint_origin_ghost(ui.painter(), egui::Rect::ZERO, &th);
+        });
     }
 }
