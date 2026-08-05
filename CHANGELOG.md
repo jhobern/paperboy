@@ -199,6 +199,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the target gap as before. (The whole line — including any nested `WITH` fields
   — floats together.)
 
+- **GUI report editor: the end-of-list drop marker now matches a block's
+  height.** When you drag a block (or a new palette block) past the last row,
+  the highlighted "drop here" mark at the bottom of the report is now sized to a
+  full block instead of a fixed 26px sliver, so it matches the insert-strip gap
+  and reads as the same-sized ghost of the block being dropped.
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of

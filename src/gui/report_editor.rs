@@ -1830,7 +1830,12 @@ fn tail_drop_zone(
             .dnd_hover_payload::<DragItem>()
             .is_some_and(|d| matches!(&*d, DragItem::Row(_)));
     if hovering {
-        let mark = egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() - 8.0, 26.0));
+        // Match the insert-strip placeholder's fully-open height (a block's own
+        // `chip_h` plus the same padding, less the 4px inset) so the tail ghost
+        // is the same size as the block being dropped, not a fixed sliver.
+        let ghost_h = chip_h(ui) + 6.0;
+        let mark =
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() - 8.0, ghost_h));
         ui.painter().rect(
             mark,
             egui::CornerRadius::same(6),
