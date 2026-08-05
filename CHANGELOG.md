@@ -195,6 +195,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   PaperBoy logo** rather than a generic icon; it is written only if absent and
   never blocks launch.
 
+- **GUI PaperTrail chip polish: aligned dropdown labels, matched field
+  backgrounds, and a distinct `REPORT` colour.** The keyword label on a chip
+  that hosts a dropdown (`BASELINE`/`COMPARISON`/`REQUEST`) is now **vertically
+  centred against the combo-box text** rather than floating above it. The
+  editable **`AS` alias field** now paints with the same lighter fill as the
+  neighbouring combo-box buttons instead of the darker sunken text-edit
+  background, so a report line reads uniformly. And a report's **substituted
+  values** (the reported variables and computed templates) are now drawn in the
+  plain text colour, leaving the **`REPORT`** keyword its substitution colour so
+  the two are no longer indistinguishable — matching the terminal highlighter,
+  where reported values are plain identifiers.
+
 
 ## [0.1.10] - 2026-08-03
 

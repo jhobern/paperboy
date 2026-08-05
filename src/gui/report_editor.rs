@@ -515,19 +515,22 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
             } else {
                 format!("({})", vars.join(", "))
             };
+            // The reported value is a plain identifier (a loop var / raw name),
+            // so it reads in the neutral text colour — matching the terminal UI
+            // and keeping it distinct from the `REPORT` keyword's own colour.
             vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-                Chip::base(text, th.subst),
+                Chip::base(text, th.text),
             ]
         }
         FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-            Chip::base(var.clone(), th.subst),
+            Chip::base(var.clone(), th.text),
             Chip::alias(name, th.pending, Some(DetachWhich::As)),
         ],
         FlowNode::Report(ReportStmt::Computed { template, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-            Chip::base(format!("\"{template}\""), th.subst),
+            Chip::base(format!("\"{template}\""), th.text),
             // A computed column requires its AS name, so this chip is fixed
             // (inline-editable, but not detachable).
             Chip::alias(name, th.pending, None),
@@ -1773,6 +1776,10 @@ fn inline_text_edit(
     let resp = ui.add(
         egui::TextEdit::singleline(&mut buf)
             .hint_text(hint)
+            // Match the fill a combo-box chip (BASELINE/COMPARISON/REQUEST) uses
+            // for its button, so an inline field (the AS alias) doesn't read as
+            // a darker, sunken box beside them.
+            .background_color(ui.visuals().widgets.inactive.weak_bg_fill)
             .desired_width(width),
     );
     if resp.lost_focus() {
@@ -1985,13 +1992,20 @@ fn combo_chip(
     // A combo box already renders at the tallest chip height, so this chip does
     // not grow its row (which would only inflate the combo box further).
     let handle = chip_shell(ui, fill, stroke, false, |ui| {
-        // The keyword prefix is the interactive handle (drag to reorder,
-        // click to select, double-click to open the wizard).
-        let handle = ui.add(
-            egui::Label::new(RichText::new(prefix).color(text_col))
-                .selectable(false)
-                .sense(egui::Sense::click_and_drag()),
-        );
+        // The keyword prefix is the interactive handle (drag to reorder, click
+        // to select, double-click to open the wizard). It must be added *before*
+        // the combo (so it sits on the left), but the combo is taller and only
+        // sets the row height once it is added — a plain label placed first
+        // would therefore be "centred" in a still-short row and end up sitting
+        // above the combo's text. So we reserve the prefix's slot now (as the
+        // drag handle) but defer painting the text until the combo has set the
+        // row height, then paint it vertically centred against the combo.
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let galley = ui
+            .painter()
+            .layout_no_wrap(prefix.to_string(), font, text_col);
+        let gsize = galley.size();
+        let (label_rect, handle) = ui.allocate_exact_size(gsize, egui::Sense::click_and_drag());
         egui::ComboBox::from_id_salt((path, prefix))
             .selected_text(RichText::new(current).color(text_col))
             .show_ui(ui, |ui| {
@@ -2005,6 +2019,12 @@ fn combo_chip(
                     }
                 }
             });
+        let cy = ui.min_rect().center().y;
+        ui.painter().galley(
+            egui::pos2(label_rect.left(), cy - gsize.y / 2.0),
+            galley,
+            text_col,
+        );
         handle
     });
 
