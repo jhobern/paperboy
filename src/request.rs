@@ -427,8 +427,8 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
 /// applies to every request, not just the one currently selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RequestView {
-    #[default]
     Json,
+    #[default]
     Hurl,
 }
 

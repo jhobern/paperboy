@@ -205,6 +205,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   full block instead of a fixed 26px sliver, so it matches the insert-strip gap
   and reads as the same-sized ghost of the block being dropped.
 
+- **The GUI request "Code" section is now called "Raw Request" and opens on
+  Hurl by default.** The renamed section (Raw Request / Requête brute / Rå
+  anmodning) still toggles between the Hurl source and the resolved-JSON
+  preview, but now honours the **Default Request View** preference for which one
+  it opens on — and that preference now defaults to **Hurl**, PaperBoy's native
+  request format, instead of JSON. Both front-ends share the preference, so the
+  terminal UI's Main panel also renders and copies Hurl out of the box.
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of

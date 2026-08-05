@@ -641,7 +641,7 @@ strings! {
     gui_sec_options => "Options", "Options", "Indstillinger";
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
-    gui_sec_code => "Code", "Code", "Code";
+    gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
     gui_code_parse_error => "Invalid request text — edits not applied.", "Texte de requête invalide — modifications non appliquées.", "Ugyldig anmodningstekst — ændringer ikke anvendt.";
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";

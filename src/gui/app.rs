@@ -6,6 +6,7 @@ use std::time::Duration;
 use eframe::egui::{self, Key, Modifiers};
 
 use crate::i18n::Strings;
+use crate::request::RequestView;
 use crate::session::Session;
 
 use super::theme::GuiTheme;
@@ -186,6 +187,7 @@ impl GuiApp {
         });
 
         let session = Session::restored();
+        let session_view_is_hurl = session.default_request_view == RequestView::Hurl;
         let strings = Strings::for_language(&session.language);
         let theme = GuiTheme::from_spec(&session.active_theme_spec());
         Self {
@@ -197,7 +199,7 @@ impl GuiApp {
             dialog: None,
             theme,
             strings,
-            show_hurl: false,
+            show_hurl: session_view_is_hurl,
             code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,

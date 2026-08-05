@@ -1881,17 +1881,17 @@ fn default_request_view_setting_round_trips() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
-        RequestView::Json,
-        "defaults to JSON"
+        RequestView::Hurl,
+        "defaults to Hurl"
     );
-    app.default_request_view = RequestView::Hurl;
+    app.default_request_view = RequestView::Json;
 
     let snapshot = app.to_persisted();
     let mut restored = TuiApp::default();
     restored.apply_persisted(snapshot);
     assert_eq!(
         restored.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "the view preference survives a round trip"
     );
 
@@ -1901,7 +1901,7 @@ fn default_request_view_setting_round_trips() {
     restored2.apply_persisted(back);
     assert_eq!(
         restored2.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "the view preference survives JSON (de)serialization"
     );
 }
@@ -2195,8 +2195,8 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
-        RequestView::Json,
-        "defaults to JSON"
+        RequestView::Hurl,
+        "defaults to Hurl"
     );
 
     press(&mut app, KeyCode::Char('s')); // Options (sel 0)
@@ -2215,26 +2215,26 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     press(&mut app, KeyCode::Enter); // open the Default Request View submenu
     assert!(
-        matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
-        "opens a submenu preselecting the current view (JSON = 0)"
+        matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
+        "opens a submenu preselecting the current view (Hurl = 1)"
     );
-    assert_eq!(
-        app.default_request_view,
-        RequestView::Json,
-        "opening the submenu doesn't change anything yet"
-    );
-
-    press(&mut app, KeyCode::Down); // -> Hurl (hovering already applies it live)
     assert_eq!(
         app.default_request_view,
         RequestView::Hurl,
-        "hovering over Hurl previews it immediately"
+        "opening the submenu doesn't change anything yet"
+    );
+
+    press(&mut app, KeyCode::Up); // -> JSON (hovering already applies it live)
+    assert_eq!(
+        app.default_request_view,
+        RequestView::Json,
+        "hovering over JSON previews it immediately"
     );
     press(&mut app, KeyCode::Enter); // just returns to Preferences now; nothing left to confirm
     assert_eq!(
         app.default_request_view,
-        RequestView::Hurl,
-        "selecting Hurl in the submenu sets the view"
+        RequestView::Json,
+        "selecting JSON in the submenu sets the view"
     );
     assert!(
         matches!(app.overlay, Some(Overlay::Preferences(5))),
@@ -2243,12 +2243,12 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
     assert!(app.confirm_on_clear, "unrelated settings are untouched");
 
-    // Re-opening the submenu preselects Hurl (index 1) this time, and Esc
+    // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
     press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(5)
     assert!(
-        matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
-        "preselects Hurl (index 1)"
+        matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
+        "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
@@ -2257,7 +2257,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     );
     assert_eq!(
         app.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "Esc doesn't change the setting"
     );
 }
@@ -2277,27 +2277,27 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
     press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
-    press(&mut app, KeyCode::Enter); // open the submenu, preselects JSON (0)
-    assert_eq!(app.default_request_view, RequestView::Json);
+    press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
+    assert_eq!(app.default_request_view, RequestView::Hurl);
 
-    press(&mut app, KeyCode::Down); // hover onto Hurl
-    assert_eq!(
-        app.default_request_view,
-        RequestView::Hurl,
-        "hovering onto Hurl previews it immediately"
-    );
-    press(&mut app, KeyCode::Up); // hover back onto JSON
+    press(&mut app, KeyCode::Up); // hover onto JSON
     assert_eq!(
         app.default_request_view,
         RequestView::Json,
-        "hovering back onto JSON restores it immediately"
+        "hovering onto JSON previews it immediately"
+    );
+    press(&mut app, KeyCode::Down); // hover back onto Hurl
+    assert_eq!(
+        app.default_request_view,
+        RequestView::Hurl,
+        "hovering back onto Hurl restores it immediately"
     );
 
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
     assert!(matches!(app.overlay, Some(Overlay::Preferences(5))));
-    assert_eq!(app.default_request_view, RequestView::Json);
+    assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
 #[test]
@@ -7139,6 +7139,7 @@ fn request_json_panel_wraps_long_lines_instead_of_truncating() {
 
     let token: String = (0..100).map(|i| format!("{i:03}")).collect();
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     app.collections[ci].entries =
         vec![HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "")];
@@ -7183,6 +7184,7 @@ fn request_json_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selec
 
     let token: String = (0..100).map(|i| format!("{i:03}")).collect();
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     app.collections[ci].entries =
         vec![HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "")];
@@ -7536,6 +7538,7 @@ fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus(
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
@@ -7894,6 +7897,7 @@ fn main_panel_drag_extracts_the_expected_text() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
