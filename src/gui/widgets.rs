@@ -337,7 +337,6 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::Language;
 
     /// A bare `desired_width` key field collapses to a sliver inside a grid
     /// whose last column fills; `sized_key` must instead render at the full
@@ -368,7 +367,7 @@ mod tests {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.button("x");
+                                    let _ = ui.button("x");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut value)
                                             .desired_width(f32::INFINITY),

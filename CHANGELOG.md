@@ -217,6 +217,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   field is now allocated its width up front so the ~40/60 key/value split
   actually takes effect.
 
+- **GUI report block editor: deeper nesting indent, stable selection, and
+  click-to-deselect.** Statements inside a `FOR`/`PARALLEL`/`WITH` block are now
+  indented further (per-level step widened) so nesting is easier to read at a
+  glance. Selecting a block now **recolours it in place** without changing its
+  size or position — the selection outline previously used a thicker stroke that
+  expanded the chip by a pixel and nudged it and its neighbours. And **clicking
+  any empty space in the block pane deselects** the current block (matching the
+  usual editor gesture), so you're no longer stuck with a block selected.
+
 
 ## [0.1.10] - 2026-08-03
 

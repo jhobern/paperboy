@@ -1181,6 +1181,16 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                     .id_salt("pt_blocks")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // A click on empty space in the blocks pane deselects.
+                        // This background sense is registered *before* the rows
+                        // so the chips (added on top, each sensing its own
+                        // click) win clicks that land on them; the background
+                        // only fires where no chip caught the click.
+                        let bg = ui.interact(
+                            ui.max_rect(),
+                            ui.id().with("pt_bg_deselect"),
+                            egui::Sense::click(),
+                        );
                         for (i, row) in rows.iter().enumerate() {
                             let selected = row.path == ed.selection
                                 && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
@@ -1192,6 +1202,9 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                         // anywhere below the report appends it as the last
                         // top-level line.
                         tail_drop_zone(ui, &th, flow.nodes.len(), &titles, &mut acts);
+                        if bg.clicked() && !ed.selection.is_empty() {
+                            acts.push(Act::Select(Vec::new()));
+                        }
                     });
             });
         });
@@ -1373,6 +1386,12 @@ fn release_payload<T: std::any::Any + Send + Sync>(
     resp.dnd_release_payload::<T>()
 }
 
+/// Horizontal indent applied per nesting level in the block editor, so a
+/// statement inside a `FOR`/`PARALLEL`/`WITH` block sits clearly further right
+/// than its parent. Used for both the chip clusters and the drop-placeholder /
+/// nested-field indents so they all line up at the same depth.
+const INDENT_STEP: f32 = 24.0;
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -1417,7 +1436,7 @@ fn block_row(
         // avoiding egui's horizontal-centre re-centring, which otherwise drifts
         // each successive chip on the line progressively lower.
         let inner = ui.horizontal_top(|ui| {
-            ui.add_space(row.depth as f32 * 16.0);
+            ui.add_space(row.depth as f32 * INDENT_STEP);
             match row.kind {
                 RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
                 RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent),
@@ -1534,7 +1553,7 @@ fn block_row(
         }
     }
     if gap > 0.5 {
-        let indent = row.depth as f32 * 16.0;
+        let indent = row.depth as f32 * INDENT_STEP;
         let top = block_rect.bottom() + 2.0;
         let ph = egui::Rect::from_min_max(
             egui::pos2(strip.left() + indent, top),
@@ -1566,7 +1585,7 @@ fn with_block(
     items: &[WithItem],
     acts: &mut Vec<Act>,
 ) {
-    let field_indent = (depth as f32 + 1.0) * 16.0;
+    let field_indent = (depth as f32 + 1.0) * INDENT_STEP;
     let fill = mix(th.panel, th.subst, 0.22);
     let stroke = egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.5));
     for (i, item) in items.iter().enumerate() {
@@ -1624,7 +1643,7 @@ fn with_block(
         }
     });
     ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 16.0);
+        ui.add_space(depth as f32 * INDENT_STEP);
         static_chip(ui, th, "END", th.accent);
     });
 }
@@ -1733,9 +1752,14 @@ fn chip_shell<R>(
 /// highlight.
 fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> (Color32, egui::Stroke, Color32) {
     if chip.is_base && selected {
+        // Keep the stroke *width* identical to the unselected state (only the
+        // colour and fill change): a thicker stroke would expand the frame by a
+        // pixel and shift the chip and its neighbours, so selecting a block
+        // would visibly nudge it. Selection must recolour in place, never
+        // resize or move.
         (
             th.select_bg,
-            egui::Stroke::new(1.5, th.select_fg),
+            egui::Stroke::new(1.0, th.select_fg),
             th.select_fg,
         )
     } else {
@@ -2459,7 +2483,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
-        let s = Strings::for_language(&Language::English);
+        let s = crate::i18n::Strings::for_language(&Language::English);
         let mut h = 0.0;
         for _ in 0..3 {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -2514,7 +2538,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
-        let s = Strings::for_language(&Language::English);
+        let s = crate::i18n::Strings::for_language(&Language::English);
         let mut tops: Vec<f32> = Vec::new();
         for _ in 0..3 {
             tops.clear();
@@ -2559,5 +2583,48 @@ mod tests {
                 "chip {i} top {t} drifted from first chip top {first}: {tops:?}"
             );
         }
+    }
+
+    #[test]
+    fn selecting_a_block_keeps_its_size_and_position() {
+        // Selecting a base chip must only recolour it, never resize or move it
+        // (a thicker selection stroke used to expand the frame by a pixel and
+        // nudge the chip and its neighbours).
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::for_language(&Language::English);
+        let mut unsel = egui::Rect::ZERO;
+        let mut sel = egui::Rect::ZERO;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut acts = Vec::new();
+                let chip = Chip::base("REQUEST".into(), th.subst);
+                unsel = ui
+                    .horizontal_top(|ui| {
+                        render_chip(ui, &th, &s, &chip, false, &[0], &[], &[], &mut acts)
+                    })
+                    .response
+                    .rect;
+                sel = ui
+                    .horizontal_top(|ui| {
+                        render_chip(ui, &th, &s, &chip, true, &[0], &[], &[], &mut acts)
+                    })
+                    .response
+                    .rect;
+            });
+        }
+        assert!(
+            (unsel.width() - sel.width()).abs() < 0.5,
+            "selected width {} vs unselected {}",
+            sel.width(),
+            unsel.width()
+        );
+        assert!(
+            (unsel.height() - sel.height()).abs() < 0.5,
+            "selected height {} vs unselected {}",
+            sel.height(),
+            unsel.height()
+        );
     }
 }
