@@ -1384,7 +1384,11 @@ fn block_row(
     // both its first-line rect (for the modifier drop zone) and its full rect
     // (for the insert strip) so a drop lands *after the whole block*.
     let block = ui.vertical(|ui| {
-        let inner = ui.horizontal(|ui| {
+        // Top-align the chip cluster (rather than the default centre alignment):
+        // every chip is the same height, so top-alignment keeps them level while
+        // avoiding egui's horizontal-centre re-centring, which otherwise drifts
+        // each successive chip on the line progressively lower.
+        let inner = ui.horizontal_top(|ui| {
             ui.add_space(row.depth as f32 * 16.0);
             match row.kind {
                 RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
@@ -2400,5 +2404,61 @@ mod tests {
             (label - alias).abs() < 0.5,
             "label {label} vs alias {alias}"
         );
+    }
+
+    #[test]
+    fn chips_on_a_line_stay_vertically_aligned() {
+        // Reproduce `block_row`'s chip cluster (a top-aligned horizontal row of
+        // mixed label / combo / text-field chips) and confirm every chip sits at
+        // the same vertical position — i.e. the line does not "cascade" each
+        // successive chip lower, which the default centre-aligned row does.
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let mut tops: Vec<f32> = Vec::new();
+        for _ in 0..3 {
+            tops.clear();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                // The same layout `block_row` uses for the chip cluster.
+                ui.horizontal_top(|ui| {
+                    let mut acts = Vec::new();
+                    let staging = vec!["eapi_staging".to_string()];
+                    let dev = vec!["eapi_dev".to_string()];
+                    let dfa = vec!["dfa_result".to_string()];
+                    let chips: Vec<(Chip, &[String])> = vec![
+                        (Chip::base("FOR".into(), th.subst), &[]),
+                        (Chip::env_role(true, 0, "eapi_staging", th.subst), &staging),
+                        (Chip::env_role(false, 1, "eapi_dev", th.subst), &dev),
+                        (
+                            Chip::modifier(
+                                "RESPONSE PRETTY".into(),
+                                th.subst,
+                                DetachWhich::Response,
+                            ),
+                            &[],
+                        ),
+                        (Chip::request("dfa_result", th.subst), &dfa),
+                        (
+                            Chip::alias("Environment", th.subst, Some(DetachWhich::As)),
+                            &[],
+                        ),
+                    ];
+                    for (chip, envs) in &chips {
+                        let r = ui.scope(|ui| {
+                            render_chip(ui, &th, &s, chip, false, &[0], envs, envs, &mut acts)
+                        });
+                        tops.push(r.response.rect.top());
+                    }
+                });
+            });
+        }
+        let first = tops[0];
+        for (i, t) in tops.iter().enumerate() {
+            assert!(
+                (t - first).abs() < 0.5,
+                "chip {i} top {t} drifted from first chip top {first}: {tops:?}"
+            );
+        }
     }
 }
