@@ -642,6 +642,7 @@ strings! {
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Code", "Code", "Code";
+    gui_code_parse_error => "Invalid request text — edits not applied.", "Texte de requête invalide — modifications non appliquées.", "Ugyldig anmodningstekst — ændringer ikke anvendt.";
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";
     gui_form_mutually_exclusive => "This request uses form fields (below). A raw body and form fields are mutually exclusive.", "Cette requête utilise des champs de formulaire (ci-dessous). Un corps brut et des champs de formulaire sont mutuellement exclusifs.", "Denne anmodning bruger formularfelter (nedenfor). En rå brødtekst og formularfelter udelukker hinanden.";

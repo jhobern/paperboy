@@ -91,6 +91,22 @@ pub enum PromptKind {
     NewCollectionName,
 }
 
+/// Editable-code-view state for the request editor's Code section. Holds the
+/// live text buffer the user edits (Hurl or resolved JSON) plus the identity of
+/// the `(collection, entry, showing-Hurl)` it currently reflects. The buffer is
+/// refreshed from the entry when you switch entry/representation or return to
+/// the Code tab, but is otherwise the source of truth while you edit it (so
+/// keystrokes are never clobbered by a re-render of the canonical text).
+#[derive(Default)]
+pub struct CodeEdit {
+    pub buf: String,
+    /// `(collection index, entry index, showing Hurl)` the buffer reflects, or
+    /// `None` when the Code tab isn't the active section.
+    pub key: Option<(usize, usize, bool)>,
+    /// The last parse error, shown beneath the editor; cleared on a good parse.
+    pub error: Option<String>,
+}
+
 pub struct GuiApp {
     pub session: Session,
     pub focus: Focus,
@@ -108,6 +124,8 @@ pub struct GuiApp {
     /// Show the raw request as Hurl (vs. the resolved JSON preview) in the Code
     /// section. Mirrors the terminal UI's `RequestView` toggle.
     pub show_hurl: bool,
+    /// Editable-code-view buffer state for the request editor's Code section.
+    pub code_edit: CodeEdit,
     /// Report row selected in the reports panel, if the reports view is open.
     pub show_reports: bool,
     /// The open PaperTrail report editor (Scratch-style blocks + source view),
@@ -180,6 +198,7 @@ impl GuiApp {
             theme,
             strings,
             show_hurl: false,
+            code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,
             remote: super::remote::RemoteUi::default(),

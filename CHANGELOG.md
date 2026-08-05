@@ -179,6 +179,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   of looking identical to an active row. Applied in the GUI's key/value editors
   and mirrored in the terminal UI's request wizard.
 
+- **The GUI request Code view is now editable.** The **Code** tab (Hurl source
+  or the resolved-JSON preview) was previously read-only; it is now a full-width
+  editor that fills the panel at a fixed size (rather than shrinking to fit its
+  text). Edits are re-parsed on the fly straight back into the request — Hurl via
+  the shared Hurl parser, JSON via the request-JSON round-trip — so typing a new
+  header, method or body updates the rest of the editor live. Your text stays put
+  while you type (it only re-syncs from the request when you switch request or
+  representation, or leave and return to the tab), and an unparseable edit keeps
+  your text on screen with an inline error rather than discarding it. `{{ VAR }}`
+  placeholders are still colour-coded by resolution status (without being
+  substituted, so the buffer edits cleanly). This brings the GUI in line with the
+  terminal UI's editable raw Hurl/JSON views.
+
 - **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
   request view, and clearer report chips.** The desktop GUI now shows the
   PaperBoy logo as its window/taskbar icon and in the status bar (in place of

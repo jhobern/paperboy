@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, FontId, RichText, TextFormat};
 
 use crate::hurl::{FormField, FormFieldKind, HurlEntry};
 use crate::i18n::Strings;
-use crate::request::{SubstInfo, SubstKind, build_request_json};
+use crate::request::{SubstInfo, SubstKind, apply_request_json, build_request_json};
 
 use super::app::{EditorSection, GuiApp};
 use super::theme::GuiTheme;
@@ -57,57 +57,6 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
     }
 }
 
-/// Build a colour-coded [`LayoutJob`] for a request preview: each known
-/// `{{ VAR }}` is substituted with its resolved value (coloured by status) or,
-/// when unavailable, kept as the placeholder in its status colour; unknown
-/// placeholders keep the default colour. A shadowed key gets a leading
-/// [`SHADOW_ICON`]. `seen` records which statuses appeared, for the legend.
-fn highlight_code(
-    text: &str,
-    vars: &HashMap<String, SubstInfo>,
-    shadowed: &HashSet<String>,
-    th: &GuiTheme,
-    seen: &mut SubstSeen,
-) -> LayoutJob {
-    let font = FontId::monospace(12.0);
-    let fmt = |color: Color32| TextFormat::simple(font.clone(), color);
-    let mut job = LayoutJob::default();
-    let mut rest = text;
-    while let Some(open) = rest.find("{{") {
-        let Some(close_rel) = rest[open + 2..].find("}}") else {
-            break;
-        };
-        let close = open + 2 + close_rel;
-        let end = close + 2;
-        let inner = rest[open + 2..close].trim();
-        if open > 0 {
-            job.append(&rest[..open], 0.0, fmt(th.text));
-        }
-        match vars.get(inner) {
-            Some(info) => {
-                seen.mark(info.kind);
-                let color = subst_color(info.kind, th);
-                match &info.shown {
-                    Some(val) => {
-                        if shadowed.contains(inner) {
-                            job.append(SHADOW_ICON, 0.0, fmt(th.pending));
-                            seen.shadowed = true;
-                        }
-                        job.append(val, 0.0, fmt(color));
-                    }
-                    None => job.append(&rest[open..end], 0.0, fmt(color)),
-                }
-            }
-            None => job.append(&rest[open..end], 0.0, fmt(th.text)),
-        }
-        rest = &rest[end..];
-    }
-    if !rest.is_empty() {
-        job.append(rest, 0.0, fmt(th.text));
-    }
-    job
-}
-
 /// Render the substitution legend (coloured dots for each status present, plus
 /// the shadowed hint) beneath the Code preview, matching the terminal UI.
 fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings) {
@@ -132,6 +81,226 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             );
         }
     });
+}
+
+/// Colour-code every `{{ VAR }}` token *in place* — i.e. without substituting
+/// its value or inserting any marker — so the produced [`LayoutJob`] lays out
+/// exactly the characters it was given. This is what an editable Code buffer
+/// needs: egui's `TextEdit` layouter must return a galley for the buffer's own
+/// text (a length change would corrupt the cursor). Known placeholders are
+/// tinted by resolution status; unknown ones keep the default colour. `seen`
+/// records which statuses appeared, for the legend.
+fn highlight_code_editable(
+    text: &str,
+    vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+    th: &GuiTheme,
+    font: FontId,
+    seen: &mut SubstSeen,
+) -> LayoutJob {
+    let fmt = |color: Color32| TextFormat::simple(font.clone(), color);
+    let mut job = LayoutJob::default();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let Some(close_rel) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        let end = close + 2;
+        let inner = rest[open + 2..close].trim();
+        if open > 0 {
+            job.append(&rest[..open], 0.0, fmt(th.text));
+        }
+        let token = &rest[open..end];
+        match vars.get(inner) {
+            Some(info) => {
+                seen.mark(info.kind);
+                if shadowed.contains(inner) {
+                    seen.shadowed = true;
+                }
+                job.append(token, 0.0, fmt(subst_color(info.kind, th)));
+            }
+            None => job.append(token, 0.0, fmt(th.text)),
+        }
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        job.append(rest, 0.0, fmt(th.text));
+    }
+    job
+}
+
+/// Re-parse edited Code-view `text` back into the selected entry. On success it
+/// applies the result (preserving the UI-only `user_added` flag for Hurl; the
+/// JSON view carries over the fields it doesn't expose from the current entry)
+/// and clears the error; on failure it keeps the buffer untouched and records
+/// the parse error. Returns whether the entry actually changed.
+fn apply_code_edit(
+    session: &mut crate::session::Session,
+    code_edit: &mut super::app::CodeEdit,
+    strings: &Strings,
+    ci: usize,
+    sel: usize,
+    show_hurl: bool,
+    text: &str,
+) -> bool {
+    if show_hurl {
+        let entries = crate::hurl::parse_hurl(text);
+        if entries.len() == 1 {
+            let mut parsed = entries.into_iter().next().unwrap();
+            let entry = &mut session.collections[ci].entries[sel];
+            // `user_added` is UI-only and never written to Hurl text, so a
+            // reparse always drops it; carry it over from the live entry.
+            parsed.user_added = entry.user_added;
+            *entry = parsed;
+            code_edit.error = None;
+            true
+        } else {
+            code_edit.error = Some(
+                crate::hurl::parse_hurl_error(text)
+                    .unwrap_or_else(|| strings.gui_code_parse_error.to_string()),
+            );
+            false
+        }
+    } else {
+        let base = session.collections[ci].entries[sel].clone();
+        match apply_request_json(&base, text) {
+            Ok(parsed) => {
+                session.collections[ci].entries[sel] = parsed;
+                code_edit.error = None;
+                true
+            }
+            Err(e) => {
+                code_edit.error = Some(e);
+                false
+            }
+        }
+    }
+}
+
+/// The editable Code section: a full-height `TextEdit` holding either the Hurl
+/// source or the resolved-JSON preview of the selected request, re-parsed on
+/// every edit back into the entry. The buffer is the source of truth while you
+/// type (never clobbered mid-edit); it re-syncs from the entry when you switch
+/// request/representation or return to the tab. A parse failure keeps your text
+/// and shows the error instead of discarding it. Returns whether the entry
+/// changed.
+#[allow(clippy::too_many_arguments)]
+fn draw_code_section(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    theme: &GuiTheme,
+    ci: usize,
+    sel: usize,
+    code_show_hurl: &mut bool,
+    subst_vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+
+    // Representation toggle (Hurl source vs. resolved JSON), mirroring the TUI.
+    ui.horizontal(|ui| {
+        if widgets::selectable(ui, !*code_show_hurl, "JSON").clicked() {
+            *code_show_hurl = false;
+            app.code_edit.key = None;
+        }
+        if widgets::selectable(ui, *code_show_hurl, "Hurl").clicked() {
+            *code_show_hurl = true;
+            app.code_edit.key = None;
+        }
+    });
+    ui.add_space(4.0);
+
+    // Re-sync the buffer from the entry when it reflects a different
+    // request/representation than we're now showing; otherwise leave the user's
+    // in-progress edits untouched.
+    let key = (ci, sel, *code_show_hurl);
+    if app.code_edit.key != Some(key) {
+        let entry = &app.session.collections[ci].entries[sel];
+        app.code_edit.buf = if *code_show_hurl {
+            entry.to_hurl()
+        } else {
+            build_request_json(entry)
+        };
+        app.code_edit.key = Some(key);
+        app.code_edit.error = None;
+    }
+
+    // Legend: which substitution statuses appear in the current buffer.
+    let mut seen = SubstSeen::default();
+    let _ = highlight_code_editable(
+        &app.code_edit.buf,
+        subst_vars,
+        shadowed,
+        theme,
+        FontId::monospace(12.0),
+        &mut seen,
+    );
+
+    // A fixed-height editor that fills the panel (not shrink-wrapped to its
+    // text), leaving room below for the legend and any parse error.
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+    let reserved = 44.0
+        + if app.code_edit.error.is_some() {
+            24.0
+        } else {
+            0.0
+        };
+    let editor_h = (ui.available_height() - reserved).max(row_h * 6.0);
+    let rows = (editor_h / row_h).floor().max(6.0) as usize;
+
+    let subst_vars_l = subst_vars;
+    let shadowed_l = shadowed;
+    let theme_l = theme;
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let mut s = SubstSeen::default();
+        let mut job = highlight_code_editable(
+            buf.as_str(),
+            subst_vars_l,
+            shadowed_l,
+            theme_l,
+            font,
+            &mut s,
+        );
+        job.wrap.max_width = wrap;
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+
+    let resp = egui::ScrollArea::vertical()
+        .max_height(editor_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut app.code_edit.buf)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(rows)
+                    .layouter(&mut layouter),
+            )
+        });
+
+    if resp.inner.changed() {
+        let text = app.code_edit.buf.clone();
+        if apply_code_edit(
+            &mut app.session,
+            &mut app.code_edit,
+            &app.strings,
+            ci,
+            sel,
+            *code_show_hurl,
+            &text,
+        ) {
+            changed = true;
+        }
+    }
+
+    ui.add_space(4.0);
+    if let Some(err) = &app.code_edit.error {
+        ui.colored_label(theme.err, format!("\u{26a0} {err}"));
+    }
+    subst_legend(ui, &seen, theme, &app.strings);
+    changed
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -304,81 +473,72 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
 
     // ── Section body ──────────────────────────────────────────────────────
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let entry = &mut app.session.collections[ci].entries[sel];
-            let st = &app.strings;
-            match section {
-                EditorSection::All => {
-                    // The combined view stacks every section, mirroring the TUI
-                    // wizard's default "All" tab so the whole request is visible
-                    // and editable without switching tabs.
-                    const STACK: [EditorSection; 8] = [
-                        EditorSection::Params,
-                        EditorSection::Headers,
-                        EditorSection::Body,
-                        EditorSection::Auth,
-                        EditorSection::Cookies,
-                        EditorSection::Options,
-                        EditorSection::Asserts,
-                        EditorSection::Captures,
-                    ];
-                    for (i, sec) in STACK.iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(8.0);
-                            ui.separator();
+    // The editable Code buffer only mirrors the Code tab; drop its identity
+    // whenever we leave so returning to Code re-syncs from the entry (which may
+    // have been edited from another section in the meantime).
+    if section != EditorSection::Code {
+        app.code_edit.key = None;
+    }
+    if section == EditorSection::Code {
+        // The Code editor needs mutable access to both `app.code_edit` and the
+        // collection (to apply reparsed text), so it can't run inside the
+        // closure below that borrows the selected entry.
+        if draw_code_section(
+            app,
+            ui,
+            &theme,
+            ci,
+            sel,
+            &mut code_show_hurl,
+            &subst_vars,
+            &shadowed,
+        ) {
+            changed = true;
+        }
+    } else {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let entry = &mut app.session.collections[ci].entries[sel];
+                let st = &app.strings;
+                match section {
+                    EditorSection::All => {
+                        // The combined view stacks every section, mirroring the
+                        // TUI wizard's default "All" tab so the whole request is
+                        // visible and editable without switching tabs.
+                        const STACK: [EditorSection; 8] = [
+                            EditorSection::Params,
+                            EditorSection::Headers,
+                            EditorSection::Body,
+                            EditorSection::Auth,
+                            EditorSection::Cookies,
+                            EditorSection::Options,
+                            EditorSection::Asserts,
+                            EditorSection::Captures,
+                        ];
+                        for (i, sec) in STACK.iter().enumerate() {
+                            if i > 0 {
+                                ui.add_space(8.0);
+                                ui.separator();
+                            }
+                            ui.label(
+                                RichText::new(section_title(*sec, st))
+                                    .strong()
+                                    .color(theme.text),
+                            );
+                            if draw_section(*sec, ui, &theme, st, entry) {
+                                changed = true;
+                            }
                         }
-                        ui.label(
-                            RichText::new(section_title(*sec, st))
-                                .strong()
-                                .color(theme.text),
-                        );
-                        if draw_section(*sec, ui, &theme, st, entry) {
+                    }
+                    other => {
+                        if draw_section(other, ui, &theme, st, entry) {
                             changed = true;
                         }
                     }
                 }
-                EditorSection::Code => {
-                    ui.horizontal(|ui| {
-                        if super::widgets::selectable(ui, !code_show_hurl, "JSON").clicked() {
-                            code_show_hurl = false;
-                        }
-                        if super::widgets::selectable(ui, code_show_hurl, "Hurl").clicked() {
-                            code_show_hurl = true;
-                        }
-                    });
-                    let code = if code_show_hurl {
-                        entry.to_hurl()
-                    } else {
-                        build_request_json(entry)
-                    };
-                    ui.add_space(4.0);
-                    // Substitute + colour-code every `{{ VAR }}` (matching the
-                    // terminal UI's request preview); the shown text is what a
-                    // copy/selection yields, not the raw template.
-                    let mut seen = SubstSeen::default();
-                    let job = highlight_code(&code, &subst_vars, &shadowed, &theme, &mut seen);
-                    egui::Frame::new()
-                        .fill(theme.sunken())
-                        .inner_margin(6.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(job)
-                                    .selectable(true)
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        });
-                    ui.add_space(4.0);
-                    subst_legend(ui, &seen, &theme, st);
-                }
-                other => {
-                    if draw_section(other, ui, &theme, st, entry) {
-                        changed = true;
-                    }
-                }
-            }
-        });
+            });
+    }
 
     app.show_hurl = code_show_hurl;
     if changed {
@@ -734,4 +894,126 @@ fn form_editor(
         changed = true;
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Language;
+    use crate::session::Session;
+    use eframe::egui::FontId;
+
+    fn session_with_entry() -> Session {
+        let mut s = Session::default();
+        let mut e = HurlEntry::default();
+        e.method = "GET".into();
+        e.url = "https://example.com/api".into();
+        e.title = "Demo".into();
+        s.collections[0].entries = vec![e];
+        s.collections[0].selected_entry = 0;
+        s
+    }
+
+    /// The in-place highlighter is used as a `TextEdit` layouter, so its galley
+    /// must lay out *exactly* the buffer's characters — a length change would
+    /// desync the cursor. This asserts the produced job text is identical to
+    /// the input, `{{ VAR }}` tokens included (i.e. never substituted).
+    #[test]
+    fn editable_highlighter_preserves_the_buffer_text_verbatim() {
+        let th = GuiTheme::from_spec(&Session::default().active_theme_spec());
+        let vars = HashMap::new();
+        let shadowed = HashSet::new();
+        let mut seen = SubstSeen::default();
+        for text in [
+            "GET https://x/{{ host }}/api\nAuthorization: {{ token }}",
+            "no placeholders here",
+            "trailing {{ unclosed",
+            "{{a}}{{b}} back to back",
+        ] {
+            let job = highlight_code_editable(
+                text,
+                &vars,
+                &shadowed,
+                &th,
+                FontId::monospace(12.0),
+                &mut seen,
+            );
+            assert_eq!(job.text, text, "layouter must not alter the buffer text");
+        }
+    }
+
+    #[test]
+    fn editing_the_hurl_buffer_roundtrips_a_new_header_into_the_entry() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let mut code = super::super::app::CodeEdit::default();
+
+        // The same request, plus one extra header, serialised back to Hurl.
+        let mut edited = session.collections[0].entries[0].clone();
+        edited.headers.push(("X-Test".into(), "hello".into(), true));
+        let text = edited.to_hurl();
+
+        let changed = apply_code_edit(&mut session, &mut code, &strings, 0, 0, true, &text);
+        assert!(changed, "a valid edit should report a change");
+        assert!(code.error.is_none(), "a valid edit clears the error");
+        let hdrs = &session.collections[0].entries[0].headers;
+        assert!(
+            hdrs.iter().any(|(k, v, _)| k == "X-Test" && v == "hello"),
+            "expected the new header to be applied, got {hdrs:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_hurl_keeps_the_entry_and_records_an_error() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let before = session.collections[0].entries[0].clone();
+        let mut code = super::super::app::CodeEdit::default();
+
+        // Lowercase "not" is not a valid HTTP method → zero parsed entries.
+        let changed = apply_code_edit(
+            &mut session,
+            &mut code,
+            &strings,
+            0,
+            0,
+            true,
+            "not a request",
+        );
+        assert!(!changed, "an unparseable edit must not report a change");
+        assert!(code.error.is_some(), "an unparseable edit records an error");
+        let entry = &session.collections[0].entries[0];
+        assert_eq!(entry.method, before.method);
+        assert_eq!(entry.url, before.url);
+        assert_eq!(entry.headers, before.headers);
+    }
+
+    #[test]
+    fn editing_the_json_buffer_roundtrips_the_method_into_the_entry() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let mut code = super::super::app::CodeEdit::default();
+
+        let mut edited = session.collections[0].entries[0].clone();
+        edited.method = "POST".into();
+        let text = build_request_json(&edited);
+
+        let changed = apply_code_edit(&mut session, &mut code, &strings, 0, 0, false, &text);
+        assert!(changed, "a valid JSON edit should report a change");
+        assert!(code.error.is_none());
+        assert_eq!(session.collections[0].entries[0].method, "POST");
+    }
+
+    #[test]
+    fn invalid_json_keeps_the_entry_and_records_an_error() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let before_method = session.collections[0].entries[0].method.clone();
+        let mut code = super::super::app::CodeEdit::default();
+
+        let changed = apply_code_edit(&mut session, &mut code, &strings, 0, 0, false, "{ not json");
+        assert!(!changed, "malformed JSON must not report a change");
+        assert!(code.error.is_some(), "malformed JSON records an error");
+        assert_eq!(session.collections[0].entries[0].method, before_method);
+    }
 }
