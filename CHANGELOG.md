@@ -212,6 +212,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   obviously reversible — the outline shows where it started and where dropping
   it back would return it.
 
+- **A `REPORT REQUEST … WITH` now reads as one enclosed unit.** A report request
+  that carries a `WITH … END` block is drawn inside a single subtle bordered
+  container spanning the request line and all its `WITH` fields, so it's clear
+  the whole thing is one block you drop *around* — never into the middle of its
+  `WITH` statements. (Dropping near it already landed after the whole unit; the
+  border makes that visually obvious.)
+
 - **GUI report editor: the end-of-list drop marker now matches a block's
   height.** When you drag a block (or a new palette block) past the last row,
   the highlighted "drop here" mark at the bottom of the report is now sized to a

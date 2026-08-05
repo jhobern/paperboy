@@ -1635,7 +1635,24 @@ fn block_row(
             }
         });
         if !with_items.is_empty() {
-            with_block(ui, &th, s, &row.path, row.depth, &with_items, acts);
+            let cluster = inner.response.rect;
+            let with_rect = with_block(ui, &th, s, &row.path, row.depth, &with_items, acts);
+            // Enclose the request line and its WITH fields in one subtle border
+            // so the block reads as a single unit — you drop *around* it, never
+            // into the middle of its WITH statements. The border hugs from the
+            // request line's indent down past the `END` footer.
+            let indent = row.depth as f32 * INDENT_STEP;
+            let unit = egui::Rect::from_min_max(
+                egui::pos2(cluster.left() + indent, cluster.top()),
+                egui::pos2(cluster.right().max(with_rect.right()), with_rect.bottom()),
+            )
+            .expand(3.0);
+            ui.painter().rect_stroke(
+                unit,
+                egui::CornerRadius::same(6),
+                egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.55)),
+                egui::StrokeKind::Outside,
+            );
         }
         inner.response.rect
     };
@@ -1790,68 +1807,72 @@ fn with_block(
     depth: usize,
     items: &[WithItem],
     acts: &mut Vec<Act>,
-) {
+) -> egui::Rect {
     let field_indent = (depth as f32 + 1.0) * INDENT_STEP;
     let fill = mix(th.panel, th.subst, 0.22);
     let stroke = egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.5));
-    for (i, item) in items.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_space(field_indent);
-            let text = match item {
-                WithItem::Field { name, query, .. } => format!("{name}: {query}"),
-                WithItem::ResponseFmt(fmt) => format!(
-                    "RESPONSE {}",
-                    match fmt {
-                        crate::report::flow::ResponseFmt::Raw => "RAW",
-                        crate::report::flow::ResponseFmt::Pretty => "PRETTY",
+    ui.vertical(|ui| {
+        for (i, item) in items.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_space(field_indent);
+                let text = match item {
+                    WithItem::Field { name, query, .. } => format!("{name}: {query}"),
+                    WithItem::ResponseFmt(fmt) => format!(
+                        "RESPONSE {}",
+                        match fmt {
+                            crate::report::flow::ResponseFmt::Raw => "RAW",
+                            crate::report::flow::ResponseFmt::Pretty => "PRETTY",
+                        }
+                    ),
+                };
+                let lbl = chip_shell(ui, fill, stroke, true, |ui| {
+                    let lbl = ui.add(
+                        egui::Label::new(RichText::new(&text).color(th.subst))
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                    );
+                    if detach_x(ui, th.subst) {
+                        acts.push(Act::RemoveWith {
+                            path: path.to_vec(),
+                            index: i,
+                        });
                     }
-                ),
-            };
-            let lbl = chip_shell(ui, fill, stroke, true, |ui| {
-                let lbl = ui.add(
-                    egui::Label::new(RichText::new(&text).color(th.subst))
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
-                );
-                if detach_x(ui, th.subst) {
-                    acts.push(Act::RemoveWith {
+                    lbl
+                });
+                // Only `name: query` fields have a wizard; a bare `WITH RESPONSE`
+                // item is edited/removed via its `×` only.
+                if lbl.clicked() && matches!(item, WithItem::Field { .. }) {
+                    acts.push(Act::EditWith {
                         path: path.to_vec(),
                         index: i,
                     });
                 }
-                lbl
             });
-            // Only `name: query` fields have a wizard; a bare `WITH RESPONSE`
-            // item is edited/removed via its `×` only.
-            if lbl.clicked() && matches!(item, WithItem::Field { .. }) {
-                acts.push(Act::EditWith {
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(field_indent);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("{} {}", super::icons::PLUS, s.gui_report_with_add))
+                            .color(th.subst),
+                    )
+                    .small(),
+                )
+                .clicked()
+            {
+                acts.push(Act::AddWith {
                     path: path.to_vec(),
-                    index: i,
                 });
             }
         });
-    }
-    ui.horizontal(|ui| {
-        ui.add_space(field_indent);
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{} {}", super::icons::PLUS, s.gui_report_with_add))
-                        .color(th.subst),
-                )
-                .small(),
-            )
-            .clicked()
-        {
-            acts.push(Act::AddWith {
-                path: path.to_vec(),
-            });
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * INDENT_STEP);
-        static_chip(ui, th, "END", th.accent);
-    });
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * INDENT_STEP);
+            static_chip(ui, th, "END", th.accent);
+        });
+    })
+    .response
+    .rect
 }
 
 /// A catch-all drop target filling the empty space beneath the last row: a base
