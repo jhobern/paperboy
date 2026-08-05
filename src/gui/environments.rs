@@ -210,7 +210,7 @@ fn var_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
-    // Give the key ~35% of the free width so it grows with the panel instead of
+    // Give the key ~40% of the free width so it grows with the panel instead of
     // staying a fixed sliver next to the filling value (see `split_key_width`).
     let key_w = super::widgets::split_key_width(ui, 42.0);
     egui::Grid::new("env_vars")
@@ -221,12 +221,7 @@ fn var_editor(
         .show(ui, |ui| {
             for i in 0..vars.len() {
                 let source = vars[i].source;
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut vars[i].key)
-                            .desired_width(key_w)
-                            .hint_text(s.gui_hint_key_upper),
-                    )
+                if super::widgets::sized_key(ui, key_w, &mut vars[i].key, s.gui_hint_key_upper)
                     .changed()
                 {
                     changed = true;

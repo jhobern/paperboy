@@ -207,6 +207,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the two are no longer indistinguishable — matching the terminal highlighter,
   where reported values are plain identifiers.
 
+- **GUI key fields now grow with the panel instead of collapsing to a sliver.**
+  In every key/value table (request Headers, Params, Cookies, Options, Captures,
+  the Body form/multipart fields and the environment variable editor) the
+  **key** text box now reliably takes ~40% of a row's free width (the value
+  fills the rest). A bare `TextEdit` clamps its width to the grid cell's
+  available width, which stays tiny for a non-last column whose neighbour fills,
+  so the key rendered as a ~24px sliver regardless of the intended split; the
+  field is now allocated its width up front so the ~40/60 key/value split
+  actually takes effect.
+
 
 ## [0.1.10] - 2026-08-03
 

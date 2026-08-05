@@ -623,7 +623,7 @@ fn form_editor(
     // aligned across rows: the kind ComboBox is taller than the text cells, so
     // laying each row out independently let the dropdowns and values drift down
     // the further right they sat. The grid pins them to shared column edges and
-    // gives the key ~35% of the free width (the value fills the rest as the
+    // gives the key ~40% of the free width (the value fills the rest as the
     // last column — see `widgets::split_key_width`).
     let key_w = super::widgets::split_key_width(ui, 160.0);
     egui::Grid::new("form_fields")
@@ -636,12 +636,7 @@ fn form_editor(
                 if ui.checkbox(&mut fields[i].enabled, "").changed() {
                     changed = true;
                 }
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut fields[i].key)
-                            .desired_width(key_w)
-                            .hint_text(s.gui_hint_field),
-                    )
+                if super::widgets::sized_key(ui, key_w, &mut fields[i].key, s.gui_hint_field)
                     .changed()
                 {
                     changed = true;

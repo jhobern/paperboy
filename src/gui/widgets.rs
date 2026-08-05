@@ -17,15 +17,30 @@ pub const METHODS: [&str; 8] = [
 /// otherwise eats *all* free width, so a fixed-width key reads as "tiny key,
 /// huge value". Instead we reserve the row's fixed controls (`reserved`:
 /// checkbox, remove ✕, column spacing) and split the remaining free width
-/// ~35% key / ~65% value — the value still fills whatever is left. The result
-/// is clamped so the key never collapses to nothing and never starves the
-/// value of at least half the free space.
+/// ~40% key / ~60% value — the value still fills whatever is left. The result
+/// is clamped so the key never collapses to nothing and never grows past ~half
+/// the free space. (The `.min(max_key)` on the lower bound keeps
+/// [`f32::clamp`] from panicking when a cramped panel makes `max_key < 90`.)
 ///
 /// Call this **before** building the grid: inside a grid cell `available_width`
 /// reports the column width, not the panel width.
 pub fn split_key_width(ui: &egui::Ui, reserved: f32) -> f32 {
     let usable = (ui.available_width() - reserved).max(120.0);
-    (usable * 0.35).clamp(90.0, usable * 0.5)
+    let max_key = usable * 0.5;
+    (usable * 0.40).clamp(90.0_f32.min(max_key), max_key)
+}
+
+/// A key/value row's **key** text field, forced to exactly `key_w` wide.
+///
+/// A bare `TextEdit::singleline` clamps its `desired_width` to the cell's
+/// `available_width`, which stays tiny for a non-last grid column (the last,
+/// filling column grabs the row's free width first). So `desired_width(key_w)`
+/// alone renders as a ~24px sliver. [`egui::Ui::add_sized`] instead *allocates*
+/// a `key_w`-wide rect up front and fits the field to it, so the key honours
+/// the [`split_key_width`] split regardless of the grid's column feedback.
+pub fn sized_key(ui: &mut egui::Ui, key_w: f32, text: &mut String, hint: &str) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    ui.add_sized([key_w, h], egui::TextEdit::singleline(text).hint_text(hint))
 }
 
 /// A selectable label whose footprint never changes between the
@@ -173,7 +188,7 @@ pub fn kv_editor(
     //
     // The key must grow too (a fixed-width key next to a filling value reads as
     // "tiny key, huge value"): after reserving the fixed controls (checkbox, ✕,
-    // column spacing) the free width is split ~35% key / ~65% value.
+    // column spacing) the free width is split ~40% key / ~60% value.
     let key_w = split_key_width(ui, 72.0);
     egui::Grid::new(id)
         .num_columns(3)
@@ -185,11 +200,7 @@ pub fn kv_editor(
                 if ui.checkbox(&mut rows[i].2, "").changed() {
                     changed = true;
                 }
-                let k = ui.add(
-                    egui::TextEdit::singleline(&mut rows[i].0)
-                        .hint_text(key_hint)
-                        .desired_width(key_w),
-                );
+                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint);
                 if k.changed() {
                     changed = true;
                 }
@@ -239,7 +250,7 @@ pub fn pair_editor(
     let mut remove: Option<usize> = None;
     // See `kv_editor`: the value fills only as the last column, so the remove ✕
     // shares the value cell (right-aligned) rather than being its own column,
-    // and the key takes ~35% of the free width so it grows too.
+    // and the key takes ~40% of the free width so it grows too.
     let key_w = split_key_width(ui, 42.0);
     egui::Grid::new(id)
         .num_columns(2)
@@ -248,11 +259,7 @@ pub fn pair_editor(
         .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..rows.len() {
-                let k = ui.add(
-                    egui::TextEdit::singleline(&mut rows[i].0)
-                        .hint_text(key_hint)
-                        .desired_width(key_w),
-                );
+                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint);
                 if k.changed() {
                     changed = true;
                 }
@@ -324,5 +331,67 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
         200..=299 => theme.ok,
         400..=599 => theme.err,
         _ => theme.pending,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Language;
+
+    /// A bare `desired_width` key field collapses to a sliver inside a grid
+    /// whose last column fills; `sized_key` must instead render at the full
+    /// [`split_key_width`] width. Regression test for "the key field is tiny".
+    fn measure_key(screen_w: f32) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        let mut key_w = 0.0;
+        let mut rendered = 0.0;
+        let mut text = "Content-Type".to_string();
+        let mut value = "application/json".to_string();
+        for _ in 0..4 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(screen_w, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    key_w = split_key_width(ui, 72.0);
+                    egui::Grid::new("t")
+                        .num_columns(3)
+                        .min_col_width(0.0)
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut true, "");
+                            rendered = sized_key(ui, key_w, &mut text, "").rect.width();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.button("x");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut value)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                },
+                            );
+                            ui.end_row();
+                        });
+                },
+            );
+        }
+        (key_w, rendered)
+    }
+
+    #[test]
+    fn key_field_renders_at_the_computed_split_width() {
+        let (key_w, rendered) = measure_key(600.0);
+        // The key must fill (near enough) the computed width, not collapse to
+        // the ~24px minimum a bare grid cell would give it.
+        assert!(key_w > 150.0, "split width should be substantial: {key_w}");
+        assert!(
+            (rendered - key_w).abs() < 2.0,
+            "key rendered {rendered}, expected ~{key_w}"
+        );
     }
 }
