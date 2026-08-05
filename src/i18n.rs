@@ -805,6 +805,14 @@ strings! {
     node_folders_title => "Configure FOLDERS loop", "Configurer la boucle FOLDERS", "Konfigurer FOLDERS-løkke";
     node_raw_title => "Edit line", "Modifier la ligne", "Redigér linje";
     node_form_raw => "Statement text", "Texte de l'instruction", "Sætningstekst";
+    // WITH-field wizard + inline block-editor helpers (GUI).
+    node_with_title => "Report field (WITH)", "Champ de rapport (WITH)", "Rapportfelt (WITH)";
+    node_with_name => "Column name", "Nom de colonne", "Kolonnenavn";
+    node_with_query => "Query", "Requête", "Forespørgsel";
+    node_with_query_hint => "e.g. HttpStatus or jsonpath \"$.field\"", "ex. HttpStatus ou jsonpath \"$.field\"", "f.eks. HttpStatus eller jsonpath \"$.field\"";
+    gui_report_with_add => "Add field", "Ajouter un champ", "Tilføj felt";
+    gui_report_filter_hint => "Filter…", "Filtrer…", "Filtrér…";
+    gui_report_alias_hint => "alias", "alias", "alias";
     gui_report_view_results => "Results", "Résultats", "Resultater";
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";

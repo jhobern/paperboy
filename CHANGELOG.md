@@ -133,6 +133,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the loaded environments) without opening the wizard at all. These edits use
   the shared flow-editing core, keeping both front-ends in lock-step.
 
+- **Uniform chips, an editable `WITH` block and a filterable request picker for
+  the GUI report editor.** A round of polish makes the block editor feel more
+  direct. Every chip is now laid out to the **same height**, so a row no longer
+  grows taller where it hosts a dropdown or text field, and the drop **ghost
+  matches that height** so the gap that opens is exactly the size of the block
+  being dropped. A modifier chip's `×` now reliably **detaches** it (its click is
+  no longer swallowed by the chip's drag handle). An `AS` alias is edited **in
+  place** through a small text field right on the chip, and a report request's
+  `WITH … END` fields now render as a **nested block** under the line — like a
+  `for` loop — where each `name: query` field has an *add-field* affordance and a
+  little wizard, rather than being crammed onto the line. The request picker is
+  now a single **filterable combo** with a type-to-narrow search box, mirroring
+  the terminal UI's request filter. Finally, the delete target is a distinct
+  full-width **trash bar** that only appears while you are dragging a block or
+  chip, so it never reads as just another palette block. The `WITH`/alias edits
+  run through the shared flow-editing core, keeping both front-ends in lock-step.
+
 
 ## [0.1.10] - 2026-08-03
 

@@ -618,6 +618,73 @@ pub(crate) fn set_env_role(
         _ => false,
     }
 }
+
+/// Set the `AS` alias/name of a reported node at `path`. For a `REPORT REQUEST`
+/// the alias is optional, so an empty `text` clears it; for a `REPORT var AS …`
+/// or computed column the name is required, so an empty `text` is rejected
+/// (returns `false`, leaving the name untouched). Returns whether it changed.
+pub(crate) fn set_report_alias(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    match node_at_mut(flow, path) {
+        Some(FlowNode::Report(ReportStmt::Request { alias, .. })) => {
+            *alias = (!t.is_empty()).then(|| t.to_string());
+            true
+        }
+        Some(FlowNode::Report(ReportStmt::VarAs { name, .. }))
+        | Some(FlowNode::Report(ReportStmt::Computed { name, .. })) => {
+            if t.is_empty() {
+                return false;
+            }
+            *name = t.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Append a new `WITH` field (a `name: query` column) to the report-request at
+/// `path`, returning its index. A no-op (`None`) when the node is not a report
+/// request.
+pub(crate) fn add_with_field(
+    flow: &mut ReportFlow,
+    path: &[usize],
+    name: &str,
+    query: &str,
+) -> Option<usize> {
+    if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path) {
+        with.push(WithItem::Field {
+            name: name.to_string(),
+            query: query.to_string(),
+            stats: Vec::new(),
+        });
+        Some(with.len() - 1)
+    } else {
+        None
+    }
+}
+
+/// Overwrite the `name`/`query` of the `WITH` *field* at `index` of the
+/// report-request at `path`, preserving any `STATISTICS(…)`. Returns whether it
+/// changed (`false` if the node/index is not a `WITH` field).
+pub(crate) fn set_with_field(
+    flow: &mut ReportFlow,
+    path: &[usize],
+    index: usize,
+    name: &str,
+    query: &str,
+) -> bool {
+    if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path)
+        && let Some(WithItem::Field {
+            name: n, query: q, ..
+        }) = with.get_mut(index)
+    {
+        *n = name.to_string();
+        *q = query.to_string();
+        true
+    } else {
+        false
+    }
+}
 /// whole node should now be *removed* — detaching `REPORT` from a reported
 /// variable/computed column leaves no valid statement behind (there is no bare
 /// variable node), so the caller drops the row entirely.
@@ -1141,5 +1208,67 @@ mod tests {
         // A plain (non-compare) ENVS loop has no role lists to edit.
         let mut g = flow("FOR E IN ENVS \"dev\", \"prod\"\n    REQUEST A\nEND\n");
         assert!(!set_env_role(&mut g, &[0], false, 0, "stage"));
+    }
+
+    #[test]
+    fn set_report_alias_sets_clears_and_requires() {
+        // A report request's alias is optional: set, then clear with "".
+        let mut f = flow("REPORT REQUEST analyze AS Result\n");
+        assert!(set_report_alias(&mut f, &[0], "Renamed"));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::Report(ReportStmt::Request { alias: Some(a), .. })) if a == "Renamed"
+        ));
+        assert!(set_report_alias(&mut f, &[0], "   "));
+        assert!(matches!(
+            node_at(&f, &[0]),
+            Some(FlowNode::Report(ReportStmt::Request { alias: None, .. }))
+        ));
+
+        // A reported-variable column's name is required: empty is rejected.
+        let mut g = flow("REPORT userId AS Id\n");
+        assert!(set_report_alias(&mut g, &[0], "UserId"));
+        assert!(matches!(
+            node_at(&g, &[0]),
+            Some(FlowNode::Report(ReportStmt::VarAs { name, .. })) if name == "UserId"
+        ));
+        assert!(!set_report_alias(&mut g, &[0], ""));
+        assert!(matches!(
+            node_at(&g, &[0]),
+            Some(FlowNode::Report(ReportStmt::VarAs { name, .. })) if name == "UserId"
+        ));
+    }
+
+    #[test]
+    fn add_and_set_with_field_edit_the_with_block() {
+        let mut f = flow("REPORT REQUEST analyze RESPONSE PRETTY\n");
+        // Append two fields; indices come back in order.
+        assert_eq!(
+            add_with_field(&mut f, &[0], "Status", "HttpStatus"),
+            Some(0)
+        );
+        assert_eq!(
+            add_with_field(&mut f, &[0], "Body", "jsonpath \"$.x\""),
+            Some(1)
+        );
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request { with, .. })) => assert_eq!(with.len(), 2),
+            other => panic!("expected a report request, got {other:?}"),
+        }
+        // Rewrite the first field's name/query in place.
+        assert!(set_with_field(&mut f, &[0], 0, "Code", "HttpStatus"));
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
+                assert!(matches!(
+                    &with[0],
+                    WithItem::Field { name, query, .. } if name == "Code" && query == "HttpStatus"
+                ));
+            }
+            other => panic!("expected a report request, got {other:?}"),
+        }
+        // A non-request node has no WITH block to add to.
+        let mut g = flow("REPORT userId\n");
+        assert_eq!(add_with_field(&mut g, &[0], "X", "Y"), None);
+        assert!(!set_with_field(&mut g, &[0], 0, "X", "Y"));
     }
 }

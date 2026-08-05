@@ -144,13 +144,19 @@ impl ReportEditor {
 
     /// Push the current text onto the undo stack, then apply a structural edit
     /// to the AST via `f` and re-serialize. Keeps the two views round-tripping.
+    /// A no-op edit (one whose re-serialized text is unchanged) is dropped
+    /// entirely — it neither marks the report dirty nor pushes an undo entry, so
+    /// inline commits (e.g. blurring an `AS` field without changing it) are free.
     fn edit_flow(&mut self, f: impl FnOnce(&mut ReportFlow)) {
         let Some(mut flow) = self.flow.clone() else {
             return;
         };
-        self.undo.push(self.report.text.clone());
         f(&mut flow);
-        self.set_text(flow.to_text());
+        let new_text = flow.to_text();
+        if new_text != self.report.text {
+            self.undo.push(self.report.text.clone());
+            self.set_text(new_text);
+        }
     }
 
     /// Undo the last structural edit (or source change captured on the stack).
@@ -169,6 +175,15 @@ impl ReportEditor {
             replace_node(flow, path, node);
         });
         self.selection = path.to_vec();
+        sync_back(self, app);
+    }
+
+    /// Commit an arbitrary in-place flow mutation (undo-tracked) and mirror it
+    /// back into the session — the wizard module's path for edits that tweak
+    /// *part* of a node (e.g. a single `WITH` field) rather than replacing it
+    /// wholesale like [`Self::wizard_apply`].
+    pub(super) fn commit_edit(&mut self, app: &mut GuiApp, f: impl FnOnce(&mut ReportFlow)) {
+        self.edit_flow(f);
         sync_back(self, app);
     }
 
@@ -338,6 +353,11 @@ enum ChipEdit {
         index: usize,
         name: String,
     },
+    /// An inline editable `AS <alias>` field: the prefix is `AS`, followed by a
+    /// text box that commits the alias/name on blur.
+    Alias {
+        text: String,
+    },
 }
 
 impl Chip {
@@ -397,6 +417,20 @@ impl Chip {
             },
         }
     }
+    /// An `AS <alias>` chip whose alias is edited inline. `detach` is `Some(As)`
+    /// for an optional alias (a report request / reported variable) and `None`
+    /// for a required one (a computed column, whose `AS` name can't be removed).
+    fn alias(text: &str, color: Color32, detach: Option<DetachWhich>) -> Chip {
+        Chip {
+            text: String::new(),
+            color,
+            is_base: false,
+            detach,
+            edit: ChipEdit::Alias {
+                text: text.to_string(),
+            },
+        }
+    }
 }
 
 /// Decompose a node into its chip cluster: the leading modifier chips, the
@@ -450,20 +484,14 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                 ));
             }
             if let Some(a) = alias {
-                chips.push(Chip::modifier(format!("AS {a}"), th.subst, DetachWhich::As));
+                chips.push(Chip::alias(a, th.subst, Some(DetachWhich::As)));
             }
-            for (i, w) in with.iter().enumerate() {
-                let text = match w {
-                    WithItem::Field { name, .. } => format!("WITH {name}"),
-                    WithItem::ResponseFmt(fmt) => format!(
-                        "WITH RESPONSE {}",
-                        match fmt {
-                            crate::report::flow::ResponseFmt::Raw => "RAW",
-                            crate::report::flow::ResponseFmt::Pretty => "PRETTY",
-                        }
-                    ),
-                };
-                chips.push(Chip::modifier(text, th.subst, DetachWhich::With(i)));
+            // The `WITH … END` fields are rendered as a *nested block* under the
+            // request line (see `with_block` in `block_row`); the line itself
+            // only carries the opening `WITH` keyword so it reads like the
+            // textual form (`… SHOW(Time) WITH`).
+            if !with.is_empty() {
+                chips.push(Chip::fixed("WITH".into(), th.subst));
             }
             chips
         }
@@ -481,13 +509,14 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
         FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
             Chip::base(var.clone(), th.subst),
-            Chip::modifier(format!("AS {name}"), th.subst, DetachWhich::As),
+            Chip::alias(name, th.subst, Some(DetachWhich::As)),
         ],
         FlowNode::Report(ReportStmt::Computed { template, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
             Chip::base(format!("\"{template}\""), th.subst),
-            // A computed column requires its AS name, so this chip is fixed.
-            Chip::fixed(format!("AS {name}"), th.subst),
+            // A computed column requires its AS name, so this chip is fixed
+            // (inline-editable, but not detachable).
+            Chip::alias(name, th.subst, None),
         ],
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
             let col = if matches!(node, FlowNode::Assign { .. }) {
@@ -636,6 +665,28 @@ enum Act {
     DeletePath(Vec<usize>),
     /// Open the configure wizard for the node at `path`.
     OpenWizard(Vec<usize>),
+    /// The inline `AS` field committed a new alias/name for the node at `path`
+    /// (see [`edit::set_report_alias`]).
+    SetAlias {
+        path: Vec<usize>,
+        text: String,
+    },
+    /// The nested `WITH` block's "add field" affordance: open the WITH-field
+    /// wizard for a new field on the report request at `path`.
+    AddWith {
+        path: Vec<usize>,
+    },
+    /// Edit the existing `WITH` field at `index` of the report request at `path`
+    /// (open its wizard).
+    EditWith {
+        path: Vec<usize>,
+        index: usize,
+    },
+    /// Remove the `WITH` item at `index` of the report request at `path`.
+    RemoveWith {
+        path: Vec<usize>,
+        index: usize,
+    },
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -1096,7 +1147,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                     egui::ScrollArea::vertical()
                         .id_salt("pt_palette")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| palette_list(app, ui, &mut acts));
+                        .show(ui, |ui| palette_list(app, ui));
                 },
             );
             ui.separator();
@@ -1127,6 +1178,14 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         acts.push(Act::Delete);
     }
 
+    // The delete drop target lives here — a distinct full-width bar that only
+    // appears while a block/chip is being dragged, so it never reads as just
+    // another palette block.
+    if egui::DragAndDrop::has_payload_of_type::<DragItem>(ui.ctx()) {
+        ui.add_space(4.0);
+        trash_bar(app, ui, &mut acts);
+    }
+
     ui.separator();
     diagnostics_panel(ed, app, ui);
 
@@ -1151,9 +1210,10 @@ const BASE_KINDS: [NodeKind; 6] = [
 /// The always-visible palette, split into two groups: **Blocks** (base
 /// statements, dragged into the gaps between rows to insert a new line) and
 /// **Modifiers** (dragged *onto* a row to attach REPORT / PARALLEL / WITH / AS).
-/// A trash bin at the foot deletes a block or detaches a modifier dropped on it.
 /// Drag-only — the toolbar's "Add block" popup still covers click-based insert.
-fn palette_list(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+/// (The delete drop target is a separate bar shown at the foot of the editor
+/// while dragging — see [`trash_bar`].)
+fn palette_list(app: &GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
     ui.label(
         RichText::new(app.strings.gui_report_palette_blocks)
@@ -1187,15 +1247,13 @@ fn palette_list(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         });
         ui.add_space(4.0);
     }
-
-    ui.add_space(10.0);
-    trash_bin(app, ui, acts);
 }
 
-/// The trash bin drop target at the foot of the palette. It reacts only to an
-/// in-report [`DragItem`]: a dropped row is deleted, a dropped modifier chip is
-/// detached from its node. Highlights while such a drag hovers it.
-fn trash_bin(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+/// The delete drop target: a distinct full-width bar shown at the foot of the
+/// editor *only while a block/chip is being dragged*, so it never reads as just
+/// another palette block. It reacts only to an in-report [`DragItem`]: a dropped
+/// row is deleted, a dropped modifier chip is detached from its node.
+fn trash_bar(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
     let th = app.theme;
     let frame = egui::Frame::NONE
         .fill(mix(th.panel, th.err, 0.14))
@@ -1205,11 +1263,11 @@ fn trash_bin(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
     let resp = frame
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.vertical_centered(|ui| {
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "{} {}",
+                            "{}  {}",
                             super::icons::TRASH,
                             app.strings.gui_report_trash
                         ))
@@ -1299,6 +1357,7 @@ fn block_row(
     acts: &mut Vec<Act>,
 ) {
     let th = app.theme;
+    let s = &app.strings;
     // Loaded environment names — the choices a BASELINE/COMPARISON dropdown
     // offers. Cheap to gather; only consulted by env-role chips.
     let env_choices: Vec<String> = app
@@ -1314,33 +1373,50 @@ fn block_row(
         .as_ref()
         .and_then(|f| node_at(f, &row.path))
         .cloned();
+    // The report-request's `WITH … END` fields, rendered as a nested block under
+    // the line (GUI-only — the shared `flatten` never emits WITH rows).
+    let with_items: Vec<WithItem> = match &node {
+        Some(FlowNode::Report(ReportStmt::Request { with, .. })) => with.clone(),
+        _ => Vec::new(),
+    };
 
-    let inner = ui.horizontal(|ui| {
-        ui.add_space(row.depth as f32 * 16.0);
-        match row.kind {
-            RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
-            RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent),
-            RowKind::Leaf | RowKind::LoopHead => {
-                let chips = node
-                    .as_ref()
-                    .map(|n| node_chips(n, row.req_ok, &th))
-                    .unwrap_or_default();
-                for chip in &chips {
-                    render_chip(
-                        ui,
-                        &th,
-                        chip,
-                        selected,
-                        &row.path,
-                        titles,
-                        &env_choices,
-                        acts,
-                    );
+    // The whole block is the request line plus any nested WITH block; capture
+    // both its first-line rect (for the modifier drop zone) and its full rect
+    // (for the insert strip) so a drop lands *after the whole block*.
+    let block = ui.vertical(|ui| {
+        let inner = ui.horizontal(|ui| {
+            ui.add_space(row.depth as f32 * 16.0);
+            match row.kind {
+                RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
+                RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent),
+                RowKind::Leaf | RowKind::LoopHead => {
+                    let chips = node
+                        .as_ref()
+                        .map(|n| node_chips(n, row.req_ok, &th))
+                        .unwrap_or_default();
+                    for chip in &chips {
+                        render_chip(
+                            ui,
+                            &th,
+                            s,
+                            chip,
+                            selected,
+                            &row.path,
+                            titles,
+                            &env_choices,
+                            acts,
+                        );
+                    }
                 }
             }
+        });
+        if !with_items.is_empty() {
+            with_block(ui, &th, s, &row.path, row.depth, &with_items, acts);
         }
+        inner.response.rect
     });
-    let cluster = inner.response.rect;
+    let cluster = block.inner;
+    let block_rect = block.response.rect;
 
     // ── Modifier drop zone: dropping a modifier chip onto a real node attaches
     // it. Only reacts to `Modifier` payloads, so it never competes with the base
@@ -1348,9 +1424,9 @@ fn block_row(
     if let Some(n) = &node
         && matches!(row.kind, RowKind::Leaf | RowKind::LoopHead)
     {
-        // The modifier drop zone spans the whole line to the right of the base
-        // chip (not just the chips), so a modifier can be dropped anywhere on
-        // the row rather than having to hit the small cluster exactly.
+        // The modifier drop zone spans the whole first line to the right of the
+        // base chip (not just the chips), so a modifier can be dropped anywhere
+        // on the row rather than having to hit the small cluster exactly.
         let zone_rect =
             egui::Rect::from_x_y_ranges(cluster.left()..=ui.max_rect().right(), cluster.y_range());
         let zresp = ui.interact(
@@ -1378,18 +1454,19 @@ fn block_row(
         }
     }
 
-    // ── Base insert strip: a full-width strip over the row that, when a base
-    // block is dragged over it, opens an animated gap below the row (the
+    // ── Base insert strip: a full-width strip over the block that, when a base
+    // block is dragged over it, opens an animated gap below the block (the
     // existing blocks slide down to make room) with a dashed placeholder where
     // the new block will land. The strip is sized to include the currently-open
     // gap (read from last frame) so the pointer stays over it as the gap opens —
-    // avoiding open/close flicker at the seam.
-    const GAP_H: f32 = 30.0;
+    // avoiding open/close flicker at the seam. The gap height matches a single
+    // block so the ghost is the same size as the block being dropped.
+    let gap_h = chip_h(ui) + 10.0;
     let gap_id = ui.id().with(("pt_gap", row_index));
     let prev_gap: f32 = ui.ctx().data(|d| d.get_temp(gap_id)).unwrap_or(0.0);
     let strip = egui::Rect::from_x_y_ranges(
         ui.max_rect().x_range(),
-        cluster.top()..=cluster.bottom() + prev_gap,
+        block_rect.top()..=block_rect.bottom() + prev_gap,
     );
     let strip_resp = ui.interact(
         strip,
@@ -1407,7 +1484,7 @@ fn block_row(
     let hovering_base = hovering_new || hovering_move;
     let gap =
         ui.ctx()
-            .animate_value_with_time(gap_id, if hovering_base { GAP_H } else { 0.0 }, 0.12);
+            .animate_value_with_time(gap_id, if hovering_base { gap_h } else { 0.0 }, 0.12);
     ui.ctx().data_mut(|d| d.insert_temp(gap_id, gap));
     if let Some(kind) = release_payload::<NodeKind>(&strip_resp) {
         acts.push(Act::DropNode {
@@ -1426,7 +1503,7 @@ fn block_row(
     }
     if gap > 0.5 {
         let indent = row.depth as f32 * 16.0;
-        let top = cluster.bottom() + 2.0;
+        let top = block_rect.bottom() + 2.0;
         let ph = egui::Rect::from_min_max(
             egui::pos2(strip.left() + indent, top),
             egui::pos2(strip.right() - 8.0, top + gap - 4.0),
@@ -1440,6 +1517,84 @@ fn block_row(
         );
         ui.add_space(gap);
     }
+}
+
+/// Render the `WITH … END` fields of a report-request as a nested block under
+/// its line (indented one level): each field is an editable `name: query` row
+/// with a `×` to remove it, followed by an "add field" affordance and an `END`
+/// footer aligned to the request line. This is a **GUI-only** view over
+/// [`ReportStmt::Request::with`] — the shared [`flatten`] deliberately doesn't
+/// emit WITH rows, so this never affects the TUI or the flow's drop-index maths.
+fn with_block(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    path: &[usize],
+    depth: usize,
+    items: &[WithItem],
+    acts: &mut Vec<Act>,
+) {
+    let field_indent = (depth as f32 + 1.0) * 16.0;
+    let fill = mix(th.panel, th.subst, 0.22);
+    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.5));
+    for (i, item) in items.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_space(field_indent);
+            let text = match item {
+                WithItem::Field { name, query, .. } => format!("{name}: {query}"),
+                WithItem::ResponseFmt(fmt) => format!(
+                    "RESPONSE {}",
+                    match fmt {
+                        crate::report::flow::ResponseFmt::Raw => "RAW",
+                        crate::report::flow::ResponseFmt::Pretty => "PRETTY",
+                    }
+                ),
+            };
+            let lbl = chip_shell(ui, fill, stroke, true, |ui| {
+                let lbl = ui.add(
+                    egui::Label::new(RichText::new(&text).color(th.subst))
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                if detach_x(ui, th.subst) {
+                    acts.push(Act::RemoveWith {
+                        path: path.to_vec(),
+                        index: i,
+                    });
+                }
+                lbl
+            });
+            // Only `name: query` fields have a wizard; a bare `WITH RESPONSE`
+            // item is edited/removed via its `×` only.
+            if lbl.clicked() && matches!(item, WithItem::Field { .. }) {
+                acts.push(Act::EditWith {
+                    path: path.to_vec(),
+                    index: i,
+                });
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(field_indent);
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} {}", super::icons::PLUS, s.gui_report_with_add))
+                        .color(th.subst),
+                )
+                .small(),
+            )
+            .clicked()
+        {
+            acts.push(Act::AddWith {
+                path: path.to_vec(),
+            });
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 16.0);
+        static_chip(ui, th, "END", th.subst);
+    });
 }
 
 /// A catch-all drop target filling the empty space beneath the last row: a base
@@ -1498,25 +1653,129 @@ fn tail_drop_zone(
     }
 }
 
-/// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
-fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32) {
+/// The uniform content height every chip reserves — the natural height of the
+/// tallest inline control a chip can host, a combo box (`interact_size.y` grown
+/// by the app's larger `button_padding`, rounded up to a whole pixel). Shorter
+/// controls are lifted to this height so a plain-label chip is exactly as tall
+/// as one hosting a combo box or a text field.
+fn chip_h(ui: &egui::Ui) -> f32 {
+    let sp = ui.spacing();
+    let row = ui.text_style_height(&egui::TextStyle::Button);
+    (sp.interact_size.y.max(row + 2.0 * sp.button_padding.y)).ceil()
+}
+
+/// Lay out a chip's content inside a rounded, tinted frame of uniform height.
+///
+/// A combo box grows to fill whatever vertical space its row offers, so it
+/// already renders at the tallest chip height on its own — pass `grow = false`
+/// for a chip that hosts one. Every *other* control (a plain label, a text
+/// field) is shorter, so `grow = true` reserves a [`chip_h`]-tall row and
+/// centres the content in it, lifting those chips to exactly the same height as
+/// a combo-box chip. Returns the content closure's value.
+fn chip_shell<R>(
+    ui: &mut egui::Ui,
+    fill: Color32,
+    stroke: egui::Stroke,
+    grow: bool,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let h = chip_h(ui);
     egui::Frame::NONE
-        .fill(mix(th.panel, color, 0.22))
-        .stroke(egui::Stroke::new(1.0, mix(th.panel, color, 0.5)))
+        .fill(fill)
+        .stroke(stroke)
         .inner_margin(egui::Margin::symmetric(8, 3))
         .corner_radius(6)
         .show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
-        });
+            ui.horizontal(|ui| {
+                if grow {
+                    ui.set_min_height(h);
+                }
+                content(ui)
+            })
+            .inner
+        })
+        .inner
+}
+
+/// The fill / stroke / text colours for a chip, honouring the selected-base
+/// highlight.
+fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> (Color32, egui::Stroke, Color32) {
+    if chip.is_base && selected {
+        (
+            th.select_bg,
+            egui::Stroke::new(1.5, th.select_fg),
+            th.select_fg,
+        )
+    } else {
+        (
+            mix(th.panel, chip.color, 0.22),
+            egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5)),
+            chip.color,
+        )
+    }
+}
+
+/// A small frameless `×` button. Returns whether it was clicked. Kept separate
+/// from the chip's drag handle so its click is never stolen by a frame-wide
+/// drag interaction (the bug where the detach `×` did nothing).
+fn detach_x(ui: &mut egui::Ui, col: Color32) -> bool {
+    ui.add(
+        egui::Button::new(RichText::new("×").color(col))
+            .small()
+            .frame(false),
+    )
+    .clicked()
+}
+
+/// An inline single-line text field that commits on blur. The in-progress buffer
+/// lives in egui temp memory keyed by `id` (so it survives across frames while
+/// focused) and is dropped once committed / idle, keeping the field synced to
+/// the AST. Returns `Some(trimmed value)` on the frame focus is lost.
+fn inline_text_edit(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    current: &str,
+    hint: &str,
+    width: f32,
+) -> Option<String> {
+    let mut buf = ui
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| current.to_string());
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .hint_text(hint)
+            .desired_width(width),
+    );
+    if resp.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(id));
+        Some(buf.trim().to_string())
+    } else if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, buf));
+        None
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+        None
+    }
+}
+
+/// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
+fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32) {
+    let fill = mix(th.panel, color, 0.22);
+    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.5));
+    chip_shell(ui, fill, stroke, true, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+    });
 }
 
 /// Render one [`Chip`]. The base chip is click-to-select, double-click-to-open
 /// the wizard, and a drag source that relocates or bins its whole row; a
 /// modifier chip shows a `×` that detaches it and is itself a drag source that
 /// bins the modifier.
+#[allow(clippy::too_many_arguments)]
 fn render_chip(
     ui: &mut egui::Ui,
     th: &GuiTheme,
+    s: &crate::i18n::Strings,
     chip: &Chip,
     selected: bool,
     path: &[usize],
@@ -1524,20 +1783,22 @@ fn render_chip(
     env_choices: &[String],
     acts: &mut Vec<Act>,
 ) {
-    // Chips that host an inline dropdown draw a keyword prefix (the drag/select
-    // handle) plus a combo box; they only fall back to a plain label when there
-    // is nothing to pick from.
+    // Chips that host an inline control draw a keyword prefix (the drag/select
+    // handle) plus a combo box / text field; they only fall back to a plain
+    // label when there is nothing to pick from.
     match &chip.edit {
         ChipEdit::Request { name } if !titles.is_empty() => {
             combo_chip(
                 ui,
                 th,
+                s,
                 chip,
                 selected,
                 path,
                 "REQUEST",
                 name,
                 titles,
+                true,
                 acts,
                 |picked| Act::RenameRequest {
                     path: path.to_vec(),
@@ -1556,12 +1817,14 @@ fn render_chip(
             combo_chip(
                 ui,
                 th,
+                s,
                 chip,
                 selected,
                 path,
                 kw,
                 name,
                 env_choices,
+                false,
                 acts,
                 move |picked| Act::SetEnvRole {
                     path: path.to_vec(),
@@ -1572,124 +1835,149 @@ fn render_chip(
             );
             return;
         }
+        ChipEdit::Alias { text } => {
+            alias_chip(ui, th, s, chip, path, text, acts);
+            return;
+        }
         _ => {}
     }
 
-    let hot = chip.is_base && selected;
-    let fill = if hot {
-        th.select_bg
-    } else {
-        mix(th.panel, chip.color, 0.22)
-    };
-    let stroke = if hot {
-        egui::Stroke::new(1.5, th.select_fg)
-    } else {
-        egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5))
-    };
-    let text_col = if hot { th.select_fg } else { chip.color };
-    let resp = egui::Frame::NONE
-        .fill(fill)
-        .stroke(stroke)
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(&chip.text).color(text_col)).selectable(false));
-            if let Some(which) = chip.detach {
-                let x = ui.add(
-                    egui::Button::new(RichText::new("×").color(text_col))
-                        .small()
-                        .frame(false),
-                );
-                if x.clicked() {
-                    acts.push(Act::DetachMod {
-                        path: path.to_vec(),
-                        which,
-                    });
-                }
-            }
-        })
-        .response;
-
-    // Every chip is a drag source (base → its whole row; a detachable modifier →
-    // itself), so it can be dragged onto a drop strip (reorder) or the trash bin.
-    let sensed = resp.interact(egui::Sense::click_and_drag());
-    if sensed.dragged() {
-        let payload = if chip.is_base {
-            DragItem::Row(path.to_vec())
-        } else if let Some(which) = chip.detach {
-            DragItem::Chip {
+    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
+    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+        // The label is the drag/select handle, kept separate from the `×`
+        // button so the button's click is never stolen by the drag sense.
+        let handle = ui.add(
+            egui::Label::new(RichText::new(&chip.text).color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        if let Some(which) = chip.detach
+            && detach_x(ui, text_col)
+        {
+            acts.push(Act::DetachMod {
                 path: path.to_vec(),
                 which,
-            }
-        } else {
-            DragItem::Row(path.to_vec())
+            });
+        }
+        handle
+    });
+
+    if handle.dragged() {
+        let payload = match (chip.is_base, chip.detach) {
+            (false, Some(which)) => DragItem::Chip {
+                path: path.to_vec(),
+                which,
+            },
+            _ => DragItem::Row(path.to_vec()),
         };
-        sensed.dnd_set_drag_payload(payload);
+        handle.dnd_set_drag_payload(payload);
     }
     if chip.is_base {
-        if sensed.double_clicked() {
+        if handle.double_clicked() {
             acts.push(Act::OpenWizard(path.to_vec()));
-        } else if sensed.clicked() {
+        } else if handle.clicked() {
             acts.push(Act::Select(path.to_vec()));
         }
     }
 }
 
+/// Render an `AS <alias>` chip: an `AS` prefix (the drag/detach handle) followed
+/// by an inline text field that commits the alias/name on blur.
+fn alias_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    path: &[usize],
+    current: &str,
+    acts: &mut Vec<Act>,
+) {
+    let (fill, stroke, text_col) = chip_colors(th, chip, false);
+    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+        let handle = ui.add(
+            egui::Label::new(RichText::new("AS").color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        let id = ui.make_persistent_id(("pt_alias", path));
+        if let Some(text) = inline_text_edit(ui, id, current, s.gui_report_alias_hint, 96.0)
+            && text != current
+        {
+            acts.push(Act::SetAlias {
+                path: path.to_vec(),
+                text,
+            });
+        }
+        if let Some(which) = chip.detach
+            && detach_x(ui, text_col)
+        {
+            acts.push(Act::DetachMod {
+                path: path.to_vec(),
+                which,
+            });
+        }
+        handle
+    });
+
+    if handle.dragged() {
+        let payload = match chip.detach {
+            Some(which) => DragItem::Chip {
+                path: path.to_vec(),
+                which,
+            },
+            None => DragItem::Row(path.to_vec()),
+        };
+        handle.dnd_set_drag_payload(payload);
+    }
+}
+
 /// Render a chip whose enumerable part is an inline dropdown. The keyword
-/// `prefix` (e.g. `REQUEST`) is the drag/select handle so the combo below it
+/// `prefix` (e.g. `REQUEST`) is the drag/select handle so the combo beside it
 /// stays free to open without starting a drag; picking a new value emits the
-/// action `make_act(value)`.
+/// action `make_act(value)`. When `filter` is set the dropdown gains a search
+/// box that narrows the choices as you type (the TUI-style request picker).
 #[allow(clippy::too_many_arguments)]
 fn combo_chip(
     ui: &mut egui::Ui,
     th: &GuiTheme,
+    s: &crate::i18n::Strings,
     chip: &Chip,
     selected: bool,
     path: &[usize],
     prefix: &str,
     current: &str,
     choices: &[String],
+    filter: bool,
     acts: &mut Vec<Act>,
     make_act: impl FnOnce(String) -> Act,
 ) {
-    let hot = chip.is_base && selected;
-    let fill = if hot {
-        th.select_bg
-    } else {
-        mix(th.panel, chip.color, 0.22)
-    };
-    let stroke = if hot {
-        egui::Stroke::new(1.5, th.select_fg)
-    } else {
-        egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5))
-    };
-    let text_col = if hot { th.select_fg } else { chip.color };
+    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
     let mut picked: Option<String> = None;
-    let handle = egui::Frame::NONE
-        .fill(fill)
-        .stroke(stroke)
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
-        .show(ui, |ui| {
-            // The keyword prefix is the interactive handle (drag to reorder,
-            // click to select, double-click to open the wizard).
-            let handle = ui.add(
-                egui::Label::new(RichText::new(prefix).color(text_col))
-                    .selectable(false)
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            egui::ComboBox::from_id_salt((path, prefix))
-                .selected_text(RichText::new(current).color(text_col))
-                .show_ui(ui, |ui| {
+    // A combo box already renders at the tallest chip height, so this chip does
+    // not grow its row (which would only inflate the combo box further).
+    let handle = chip_shell(ui, fill, stroke, false, |ui| {
+        // The keyword prefix is the interactive handle (drag to reorder,
+        // click to select, double-click to open the wizard).
+        let handle = ui.add(
+            egui::Label::new(RichText::new(prefix).color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        egui::ComboBox::from_id_salt((path, prefix))
+            .selected_text(RichText::new(current).color(text_col))
+            .show_ui(ui, |ui| {
+                if filter {
+                    filtered_choices(ui, s, path, prefix, current, choices, &mut picked);
+                } else {
                     for c in choices {
                         if ui.selectable_label(c == current, c).clicked() {
                             picked = Some(c.clone());
                         }
                     }
-                });
-            handle
-        })
-        .inner;
+                }
+            });
+        handle
+    });
 
     if handle.dragged() {
         handle.dnd_set_drag_payload(DragItem::Row(path.to_vec()));
@@ -1704,6 +1992,51 @@ fn combo_chip(
     {
         acts.push(make_act(name));
     }
+}
+
+/// The filtered body of a request dropdown: an auto-focused search field at the
+/// top, then the choices narrowed (case-insensitively) by what's typed —
+/// mirroring the terminal UI's type-to-filter request picker. Sets `*picked`
+/// when a match is clicked.
+fn filtered_choices(
+    ui: &mut egui::Ui,
+    s: &crate::i18n::Strings,
+    path: &[usize],
+    prefix: &str,
+    current: &str,
+    choices: &[String],
+    picked: &mut Option<String>,
+) {
+    let filt_id = ui.make_persistent_id(("pt_chip_filter", path, prefix));
+    let mut q = ui
+        .data(|d| d.get_temp::<String>(filt_id))
+        .unwrap_or_default();
+    let te = ui.add(
+        egui::TextEdit::singleline(&mut q)
+            .hint_text(s.gui_report_filter_hint)
+            .desired_width(200.0),
+    );
+    // Focus the filter the frame the dropdown opens (nothing else is focused
+    // yet) so the user can just start typing, like the TUI picker.
+    if q.is_empty() && ui.memory(|m| m.focused().is_none()) {
+        te.request_focus();
+    }
+    ui.data_mut(|d| d.insert_temp(filt_id, q.clone()));
+    ui.separator();
+    let needle = q.to_lowercase();
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .show(ui, |ui| {
+            for c in choices
+                .iter()
+                .filter(|c| needle.is_empty() || c.to_lowercase().contains(&needle))
+            {
+                if ui.selectable_label(c == current, c).clicked() {
+                    *picked = Some(c.clone());
+                    ui.data_mut(|d| d.remove::<String>(filt_id));
+                }
+            }
+        });
 }
 
 /// The insert palette: pick a node kind, then (for request kinds) a name.
@@ -1869,6 +2202,14 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 super::report_wizard::open(ed, app, &sel);
             }
             Act::AttachMod { path, modifier } => {
+                // Dropping WITH opens the WITH-field wizard directly (append on
+                // OK) rather than attaching a placeholder field, so a cancelled
+                // drop leaves no empty `field: HttpStatus` behind.
+                if modifier == Modifier::With {
+                    ed.selection = path.clone();
+                    super::report_wizard::open_with_field(ed, &path, None);
+                    continue;
+                }
                 // REPORT on a VARIABLE (`Assign`) doesn't transform it (the
                 // assignment must stay to define the variable) — it inserts a
                 // sibling `REPORT (VAR)` line right after it. Every other
@@ -1890,8 +2231,9 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     });
                     ed.selection = path;
                 }
-                // Dropping a modifier chip (WITH/AS/REPORT/…) opens the affected
-                // node's wizard so the new clause can be filled in immediately.
+                // Dropping a modifier chip (AS/REPORT/PARALLEL) opens the
+                // affected node's wizard so the new clause can be filled in
+                // immediately.
                 let sel = ed.selection.clone();
                 super::report_wizard::open(ed, app, &sel);
             }
@@ -1936,6 +2278,26 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 ed.selection = Vec::new();
             }
             Act::OpenWizard(path) => super::report_wizard::open(ed, app, &path),
+            Act::SetAlias { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_report_alias(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::AddWith { path } => {
+                ed.selection = path.clone();
+                super::report_wizard::open_with_field(ed, &path, None);
+            }
+            Act::EditWith { path, index } => {
+                ed.selection = path.clone();
+                super::report_wizard::open_with_field(ed, &path, Some(index));
+            }
+            Act::RemoveWith { path, index } => {
+                ed.edit_flow(|flow| {
+                    detach_modifier(flow, &path, DetachWhich::With(index));
+                });
+                ed.selection = path;
+            }
         }
     }
     sync_back(ed, app);
@@ -1979,4 +2341,64 @@ fn save_report(ed: &mut ReportEditor, app: &mut GuiApp) {
     sync_back(ed, app);
     app.session.save();
     app.session.status = Some(crate::i18n::Status::Saved);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{Language, Strings};
+
+    /// Render a single chip in isolation and return the height of the frame it
+    /// draws. Runs a few frames so egui's sizing settles, and matches the GUI's
+    /// enlarged `button_padding` so combo/text-field chips are measured at the
+    /// same size they render at in the app.
+    fn chip_height(build: impl Fn(&mut egui::Ui, &GuiTheme, &Strings, &mut Vec<Act>)) -> f32 {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let mut h = 0.0;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal(|ui| {
+                    let mut acts = Vec::new();
+                    let r = ui.scope(|ui| build(ui, &th, &s, &mut acts));
+                    h = r.response.rect.height();
+                });
+            });
+        }
+        h
+    }
+
+    #[test]
+    fn all_chip_kinds_render_at_the_same_height() {
+        // A plain label chip.
+        let label = chip_height(|ui, th, s, acts| {
+            let chip = Chip::base("REPORT".into(), th.subst);
+            render_chip(ui, th, s, &chip, false, &[0], &[], &[], acts);
+        });
+        // A chip hosting a combo box (the request picker).
+        let combo = chip_height(|ui, th, s, acts| {
+            let chip = Chip::request("oauth2", th.subst);
+            let titles = vec!["oauth2".to_string()];
+            render_chip(ui, th, s, &chip, false, &[0], &titles, &[], acts);
+        });
+        // A chip hosting an inline text field (the AS alias).
+        let alias = chip_height(|ui, th, s, acts| {
+            let chip = Chip::alias("Env", th.subst, Some(DetachWhich::As));
+            render_chip(ui, th, s, &chip, false, &[0], &[], &[], acts);
+        });
+
+        assert!(label > 0.0 && combo > 0.0 && alias > 0.0);
+        // All three must be the same height (uniform chips), within a sub-pixel
+        // rounding tolerance.
+        assert!(
+            (label - combo).abs() < 0.5,
+            "label {label} vs combo {combo}"
+        );
+        assert!(
+            (label - alias).abs() < 0.5,
+            "label {label} vs alias {alias}"
+        );
+    }
 }

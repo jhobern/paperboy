@@ -34,6 +34,8 @@ pub enum Wizard {
     /// Fallback for kinds without a dedicated form (reported variables, computed
     /// columns, exotic producers): edit the raw statement text.
     Raw(RawForm),
+    /// One `name: query` field of a report request's `WITH … END` block.
+    WithField(WithFieldForm),
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -68,6 +70,17 @@ pub struct RawForm {
     path: Vec<usize>,
     text: String,
     is_loop: bool,
+}
+
+/// The `WITH` *field* form: one `name: query` column of a report request's
+/// `WITH … END` block. `index` is `Some` when editing an existing field and
+/// `None` when adding a new one (appended on apply). The request node itself is
+/// left in place — only the one field is added/rewritten.
+pub struct WithFieldForm {
+    path: Vec<usize>,
+    index: Option<usize>,
+    name: String,
+    query: String,
 }
 
 /// The request form: pick the name, toggle whether it is *reported*, and — when
@@ -293,6 +306,35 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
         }),
     };
     ed.wizard = Some(wiz);
+}
+
+/// Open the `WITH`-field wizard for the report request at `path`. `index` is
+/// `Some` to edit an existing `name: query` field (seeding the form from it) and
+/// `None` to add a new one. Only a report request has a `WITH` block, so any
+/// other node (or an out-of-range / non-`Field` index) opens an empty new-field
+/// form defensively rather than doing nothing.
+pub fn open_with_field(ed: &mut ReportEditor, path: &[usize], index: Option<usize>) {
+    let existing = index.and_then(|i| {
+        ed.flow
+            .as_ref()
+            .and_then(|f| node_at(f, path))
+            .and_then(|n| match n {
+                FlowNode::Report(ReportStmt::Request { with, .. }) => with.get(i).cloned(),
+                _ => None,
+            })
+    });
+    let (index, name, query) = match existing {
+        Some(WithItem::Field { name, query, .. }) => (index, name, query),
+        // Editing a non-field (bare `WITH RESPONSE`) or a stale index falls
+        // through to a fresh append rather than silently doing nothing.
+        _ => (None, String::new(), String::new()),
+    };
+    ed.wizard = Some(Wizard::WithField(WithFieldForm {
+        path: path.to_vec(),
+        index,
+        name,
+        query,
+    }));
 }
 
 /// The single *named* binder of a `FOR X IN …` pattern, if the pattern is
@@ -614,6 +656,7 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
             Wizard::List(f) => list_ui(ui, &th, s, f),
             Wizard::Folders(f) => folders_ui(ui, &th, s, f),
             Wizard::Raw(f) => raw_ui(ui, &th, s, f),
+            Wizard::WithField(f) => with_field_ui(ui, &th, s, f),
         }
         ui.add_space(8.0);
         ui.separator();
@@ -941,6 +984,33 @@ fn raw_ui(
     );
 }
 
+fn with_field_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut WithFieldForm,
+) {
+    ui.heading(RichText::new(s.node_with_title).color(th.text));
+    ui.add_space(4.0);
+    egui::Grid::new("pt_with_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new(s.node_with_name).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(220.0));
+            ui.end_row();
+
+            ui.label(RichText::new(s.node_with_query).color(th.dim));
+            ui.add(
+                egui::TextEdit::singleline(&mut f.query)
+                    .hint_text(s.node_with_query_hint)
+                    .desired_width(220.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.end_row();
+        });
+}
+
 fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
     let Some(wiz) = ed.wizard.as_ref() else {
         return;
@@ -1050,6 +1120,26 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             if let Some(node) = crate::report::edit::parse_one_node(&f.text, f.is_loop) {
                 ed.wizard_apply(app, &path, node);
             }
+        }
+        Wizard::WithField(f) => {
+            let path = f.path.clone();
+            let name = f.name.trim().to_string();
+            let query = f.query.trim().to_string();
+            // A field needs both a column name and a query; an incomplete form
+            // is dropped rather than writing a broken `WITH` item.
+            if name.is_empty() || query.is_empty() {
+                return;
+            }
+            let index = f.index;
+            ed.commit_edit(app, |flow| match index {
+                Some(i) => {
+                    crate::report::edit::set_with_field(flow, &path, i, &name, &query);
+                }
+                None => {
+                    crate::report::edit::add_with_field(flow, &path, &name, &query);
+                }
+            });
+            ed.selection = path;
         }
     }
 }
