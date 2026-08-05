@@ -2163,14 +2163,7 @@ fn render_chip(
     });
 
     if handle.dragged() {
-        let payload = match (chip.is_base, chip.detach) {
-            (false, Some(which)) => DragItem::Chip {
-                path: path.to_vec(),
-                which,
-            },
-            _ => DragItem::Row(path.to_vec()),
-        };
-        handle.dnd_set_drag_payload(payload);
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
     }
     if chip.is_base {
         if handle.double_clicked() {
@@ -2178,7 +2171,39 @@ fn render_chip(
         } else if handle.clicked() {
             acts.push(Act::Select(path.to_vec()));
         }
+    } else if chip_opens_wizard_on_click(chip) && handle.clicked() {
+        // SHOW / HIDE / RESPONSE are edited through the request wizard's field
+        // pickers, so a plain click on one of these chips opens that wizard
+        // (dragging it still detaches it — see `chip_drag_payload`).
+        acts.push(Act::OpenWizard(path.to_vec()));
     }
+}
+
+/// Choose the drag payload for a chip. Holding Ctrl/Cmd forces moving the whole
+/// line/subtree from *any* chip (`DragItem::Row`); otherwise a detachable
+/// modifier chip is picked up on its own to detach it (`DragItem::Chip`), and
+/// every other chip (the editable base, the request handle, fixed keywords)
+/// moves the line. This is the "plain-drag detaches a chip, Ctrl-drag moves the
+/// line" behaviour, applied uniformly across every draggable chip.
+fn chip_drag_payload(ui: &egui::Ui, chip: &Chip, path: &[usize]) -> DragItem {
+    let force_row = ui.input(|i| i.modifiers.command);
+    match (force_row, chip.is_base, chip.detach) {
+        (false, false, Some(which)) => DragItem::Chip {
+            path: path.to_vec(),
+            which,
+        },
+        _ => DragItem::Row(path.to_vec()),
+    }
+}
+
+/// Whether a plain click on this (non-base) chip should open the request wizard
+/// to edit it. True for the `SHOW` / `HIDE` / `RESPONSE` clauses, whose fields
+/// are picked in the request wizard rather than typed inline.
+fn chip_opens_wizard_on_click(chip: &Chip) -> bool {
+    matches!(
+        chip.detach,
+        Some(DetachWhich::Show | DetachWhich::Hide | DetachWhich::Response)
+    )
 }
 
 /// Render an `AS <alias>` chip: an `AS` prefix (the drag/detach handle) followed
@@ -2220,14 +2245,7 @@ fn alias_chip(
     });
 
     if handle.dragged() {
-        let payload = match chip.detach {
-            Some(which) => DragItem::Chip {
-                path: path.to_vec(),
-                which,
-            },
-            None => DragItem::Row(path.to_vec()),
-        };
-        handle.dnd_set_drag_payload(payload);
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
     }
 }
 
@@ -2904,6 +2922,80 @@ mod tests {
             None,
             "a modifier-chip drag must not lift a row"
         );
+    }
+
+    #[test]
+    fn chip_drag_payload_detaches_plainly_and_moves_the_line_with_ctrl() {
+        let ctx = egui::Context::default();
+        let base = Chip::base("REQUEST x".into(), egui::Color32::WHITE);
+        let modi = Chip::modifier("SHOW(Time)".into(), egui::Color32::WHITE, DetachWhich::Show);
+        let path = vec![1usize];
+
+        // Plain drag: the base chip moves the whole line, a modifier chip is
+        // picked up on its own to detach it.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(matches!(
+                chip_drag_payload(ui, &base, &path),
+                DragItem::Row(p) if p == path
+            ));
+            assert!(matches!(
+                chip_drag_payload(ui, &modi, &path),
+                DragItem::Chip {
+                    which: DetachWhich::Show,
+                    ..
+                }
+            ));
+        });
+
+        // Ctrl/Cmd held: *any* chip — even a detachable modifier — moves the
+        // whole line/subtree instead of detaching.
+        let ctrl = egui::RawInput {
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(ctrl, |ui| {
+            assert!(matches!(
+                chip_drag_payload(ui, &modi, &path),
+                DragItem::Row(p) if p == path
+            ));
+            assert!(matches!(
+                chip_drag_payload(ui, &base, &path),
+                DragItem::Row(p) if p == path
+            ));
+        });
+    }
+
+    #[test]
+    fn only_show_hide_response_chips_open_the_wizard_on_click() {
+        assert!(chip_opens_wizard_on_click(&Chip::modifier(
+            "SHOW".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Show
+        )));
+        assert!(chip_opens_wizard_on_click(&Chip::modifier(
+            "HIDE".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Hide
+        )));
+        assert!(chip_opens_wizard_on_click(&Chip::modifier(
+            "RESPONSE".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Response
+        )));
+        // REPORT / WITH / plain base chips are not opened this way.
+        assert!(!chip_opens_wizard_on_click(&Chip::modifier(
+            "REPORT".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Report
+        )));
+        assert!(!chip_opens_wizard_on_click(&Chip::base(
+            "x".into(),
+            egui::Color32::WHITE
+        )));
     }
 
     #[test]

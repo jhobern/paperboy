@@ -192,6 +192,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   substituted, so the buffer edits cleanly). This brings the GUI in line with the
   terminal UI's editable raw Hurl/JSON views.
 
+- **PaperTrail chips: plain-drag detaches, Ctrl-drag moves the line, and
+  SHOW/HIDE/RESPONSE are click-to-edit.** You no longer have to grab the base
+  block to rearrange a report line, and every chip is now individually useful.
+  Plain-dragging a modifier chip (e.g. `RESPONSE PRETTY`, `SHOW(Time)`, an `AS`
+  alias) picks up *that chip* to detach it; holding **Ctrl/Cmd** while dragging
+  *any* chip lifts the whole line (or subtree) to move it — so a long
+  `REPORT REQUEST … RESPONSE PRETTY SHOW(Time) …` can be reordered by grabbing
+  any of its chips, not just the `REQUEST` one. Clicking a `SHOW`, `HIDE` or
+  `RESPONSE` chip now opens the request wizard on its field pickers so you can
+  change which fields are shown/hidden without retyping the clause.
+
 - **PaperTrail block palette adds SHOW, HIDE, RESPONSE and a computed-column
   block.** Auditing the drag/drop report editor turned up constructs you could
   render but not *create* from the palette. You can now drop **RESPONSE** (adds a
