@@ -355,6 +355,7 @@ strings! {
     foot_rename => "rename", "renommer", "omdøb";
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
+    foot_compact => "compact", "compact", "kompakt";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
     help_title => "Help", "Aide", "Hjælp";
@@ -430,6 +431,7 @@ strings! {
     help_copy_request => "copy request to another collection (workspace, List pane)", "copier la requête vers une autre collection (espace de travail, volet Liste)", "kopiér anmodning til en anden samling (arbejdsområde, Liste-rude)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
+    help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";
@@ -678,6 +680,8 @@ strings! {
     gui_no_response_yet => "No response yet", "Aucune réponse", "Intet svar endnu";
     gui_copy => "Copy", "Copier", "Kopiér";
     gui_copy_body => "Copy body", "Copier le corps", "Kopiér brødtekst";
+    gui_compact => "Compact", "Compact", "Kompakt";
+    gui_compact_hint => "Shorten long string values to a \"head…tail\" overview (copying still yields the full body)", "Raccourcir les longues valeurs de chaîne en un aperçu « début…fin » (la copie renvoie toujours le corps complet)", "Forkort lange strengværdier til et \"start…slut\"-overblik (kopiering giver stadig hele brødteksten)";
     gui_empty_body => "(empty body)", "(corps vide)", "(tom brødtekst)";
     gui_no_headers => "(no headers)", "(aucun en-tête)", "(ingen headere)";
     gui_no_assertions => "No assertions on this request.", "Aucune assertion pour cette requête.", "Ingen assertioner på denne anmodning.";

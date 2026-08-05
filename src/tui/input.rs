@@ -1156,6 +1156,14 @@ impl TuiApp {
     /// they're a purely visual annotation, so a copied/pasted request must
     /// never actually contain one.
     pub(crate) fn whole_panel_text(&self, pane: Pane) -> Option<String> {
+        // With the Response compact overview on, the panel holds the *shortened*
+        // text; the whole-panel copy fallback must still yield the untruncated
+        // body (the "hard mode" of the compact-view feature), so consult the
+        // cached full body first. `resp_full_body` is only non-empty on frames
+        // that actually drew a compactable body.
+        if pane == Pane::Response && self.response_compact && !self.resp_full_body.is_empty() {
+            return Some(self.resp_full_body.to_string());
+        }
         let text = self.panel(pane)?.whole_text()?;
         if text.is_empty() {
             return None;
@@ -1401,6 +1409,15 @@ impl TuiApp {
             // single source of truth for "would `y` do anything right now",
             // shared with the footer hint so they can't drift apart.
             KeyCode::Char('y') if self.can_copy() => self.copy_selection_to_clipboard(),
+            // `c` (Response pane) toggles the compact overview: long string
+            // literals in the body are shortened to a `"head...tail"` form so a
+            // body full of long opaque values (tokens, hashes, base64) can be
+            // skimmed. Display-only — a whole-panel `y`-copy still yields the
+            // full body (see `whole_panel_text`). Scoped to the Response pane so
+            // it doesn't clash with `c`'s Requests-list "copy to workspace".
+            KeyCode::Char('c') if self.focus == Pane::Response => {
+                self.response_compact = !self.response_compact;
+            }
             // Shift+Arrow moves the *end* of an active selection, letting
             // the user fine-tune (or start extending, one line/char at a
             // time) a selection begun with the mouse, without redoing the

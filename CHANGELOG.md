@@ -150,6 +150,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   chip, so it never reads as just another palette block. The `WITH`/alias edits
   run through the shared flow-editing core, keeping both front-ends in lock-step.
 
+- **A resizable report validation panel and a Response "compact view".** The
+  report editor's validation panel can now be **dragged taller** (GUI) / shows
+  many more problems at once and scrolls (TUI), so a report with a long list of
+  errors no longer hides them below the fold. The response viewer gains a
+  **compact view** toggle — a button in the GUI, the `c` key in the terminal UI
+  (while the Response pane is focused) — that shortens long string *values* to a
+  `"head…tail"` overview so a body full of opaque tokens/hashes/base64 can be
+  skimmed at a glance. It is display-only: copying still yields the **full,
+  untruncated body**. The truncation itself lives in the shared core, so both
+  front-ends stay in lock-step.
+
 
 ## [0.1.10] - 2026-08-03
 

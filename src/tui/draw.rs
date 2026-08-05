@@ -871,7 +871,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     draw_topbar(f, rows[1], app, &s, &th);
     draw_tabs(f, rows[2], app, &s, &th);
     draw_body(f, rows[3], app, &s, &th);
-    draw_footer(f, rows[4], &s, &th, app.can_copy());
+    draw_footer(
+        f,
+        rows[4],
+        &s,
+        &th,
+        app.can_copy(),
+        app.focus == Pane::Response,
+    );
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
@@ -2526,6 +2533,12 @@ pub(crate) fn draw_response(
             ),
         };
 
+    // Cleared here so every early-return path (loading / no-response / error)
+    // leaves it empty; only the compact body branch below sets it. This is what
+    // the whole-panel `y`-copy consults to return the untruncated body while the
+    // panel shows the compacted overview.
+    app.resp_full_body = Arc::from("");
+
     if loading {
         app.resp_max_scroll = 0;
         app.resp_text_area = Rect::default();
@@ -2691,7 +2704,16 @@ pub(crate) fn draw_response(
     let body_area = rows[3];
     let width = body_area.width as usize;
     app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
-    app.resp_panel.set_content(body.clone(), width);
+    // Compact view (toggled with `c`) shortens long string literals for
+    // skimming. It's display-only: cache the full body so a whole-panel
+    // `y`-copy still returns the untruncated text (see `whole_panel_text`).
+    if app.response_compact {
+        app.resp_full_body = body.clone();
+        let compacted: Arc<str> = Arc::from(crate::shared_utils::compact_long_strings(&body));
+        app.resp_panel.set_content(compacted, width);
+    } else {
+        app.resp_panel.set_content(body.clone(), width);
+    }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
@@ -2748,7 +2770,14 @@ pub(crate) fn draw_response(
     );
 }
 
-pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, can_copy: bool) {
+pub(crate) fn draw_footer(
+    f: &mut Frame,
+    area: Rect,
+    s: &Strings,
+    th: &Theme,
+    can_copy: bool,
+    can_compact: bool,
+) {
     // Run/Run All (F5 / Alt+F5) now live on the Collections panel's bottom
     // border (see draw_collection_left), and the base-URL row above already
     // shows its own "b" hint — kept out of here to leave room for the rest.
@@ -2770,6 +2799,11 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, ca
     // Response panel that currently has focus (see `TuiApp::can_copy`).
     if can_copy {
         hint.push(format!("y {}", s.foot_copy_selection));
+    }
+    // `c` toggles the Response body's compact overview — only meaningful (and
+    // only shown) while the Response pane holds focus.
+    if can_compact {
+        hint.push(format!("c {}", s.foot_compact));
     }
     hint.push(format!("? {}", s.foot_help));
     hint.push(format!("q {}", s.foot_quit));
@@ -3135,6 +3169,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("", s.help_row_toggle_delete),
                             ("y", s.help_copy_selection),
+                            ("c (Response pane)", s.help_compact),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],

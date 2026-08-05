@@ -998,6 +998,17 @@ pub struct TuiApp {
     /// which is what keeps dragging a selection or scrolling responsive even
     /// for an "obscenely large" body.
     pub(crate) resp_panel: MultiSelectPanel,
+    /// When true, the Response body view shortens long string literals to a
+    /// `"head...tail"` overview (see
+    /// [`crate::shared_utils::compact_long_strings`]). Toggled with `c` while
+    /// the Response pane is focused. Display-only: `resp_full_body` keeps the
+    /// untruncated text so a whole-panel `y`-copy still yields the full body.
+    pub(crate) response_compact: bool,
+    /// The full (untruncated) Response body cached each frame the normal body is
+    /// drawn, so the whole-panel copy fallback can return it even while the
+    /// panel is showing the compacted overview. Empty when the current frame
+    /// isn't showing a compactable body (loading / no-response / error).
+    pub(crate) resp_full_body: Arc<str>,
     /// The exact screen Rect the Request JSON panel's scrollbar thumb/track
     /// was last rendered into (one column, on the panel's right border),
     /// used to hit-test mouse clicks/drags for click-to-jump and
@@ -1276,6 +1287,8 @@ impl Default for TuiApp {
             main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
             resp_panel: MultiSelectPanel::new(),
+            response_compact: false,
+            resp_full_body: Arc::from(""),
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,

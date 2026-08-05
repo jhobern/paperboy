@@ -4400,7 +4400,7 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         overlay: Some(Overlay::Help(0)),
         ..Default::default()
     };
-    let mut term = Terminal::new(TestBackend::new(120, 80)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 82)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
@@ -4757,7 +4757,7 @@ fn help_popup_shows_a_scrollbar_and_clamps_scroll_when_the_body_is_taller_than_t
         overlay: Some(Overlay::Help(0)),
         ..Default::default()
     };
-    let mut term2 = Terminal::new(TestBackend::new(120, 80)).unwrap();
+    let mut term2 = Terminal::new(TestBackend::new(120, 82)).unwrap();
     term2
         .draw(|f| super::draw::draw_overlay(f, &mut app2, &s, &th))
         .unwrap();
@@ -7355,6 +7355,64 @@ fn whole_panel_text_returns_the_full_response_body_when_the_response_panel_has_f
     );
 }
 
+/// Toggling the Response compact view (`c`) shortens long string values in
+/// the *displayed* panel, but a whole-panel `y`-copy still returns the full,
+/// untruncated body — the "hard mode" of the feature.
+#[test]
+fn response_compact_view_shortens_the_display_but_copy_still_yields_the_full_body() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let full = "{\n  \"tok\": \"abcdefghijklmnopqrstuvwxyz0123456789\"\n}";
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: full.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+    // Compact off: the panel shows the full body verbatim.
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+
+    // `c` toggles the compact overview.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.response_compact, "c should turn compact view on");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    // The displayed text is now shortened ("head...tail") and no longer holds
+    // the full value, while short keys are untouched.
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(
+        shown.contains("abcd...6789"),
+        "compact display should show head...tail, got: {shown}"
+    );
+    assert!(!shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(shown.contains("\"tok\""), "short keys stay intact");
+
+    // Hard mode: copying the whole panel still yields the untruncated body.
+    let copied = app
+        .whole_panel_text(Pane::Response)
+        .expect("response panel has content");
+    assert_eq!(copied, full);
+
+    // Toggling back restores the full display.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(!app.response_compact);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+}
+
 #[test]
 fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -7382,7 +7440,6 @@ fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus(
         "y should copy the whole request JSON since the Main panel has focus"
     );
 }
-
 /// Copying the Main panel's JSON body must return the *substituted*
 /// value the user actually sees on screen (e.g. a resolved `{{ TOKEN }}`
 /// environment variable shown in a header value), not the raw

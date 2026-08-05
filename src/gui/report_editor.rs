@@ -74,6 +74,11 @@ pub struct ReportEditor {
     /// When `Some`, a node-configure wizard (request / envs / files) is open as
     /// a modal over the blocks view.
     pub wizard: Option<super::report_wizard::Wizard>,
+    /// Height (px) reserved for the validation panel at the bottom of the
+    /// Blocks / Source views. User-adjustable by dragging the splitter above it
+    /// (the GUI's stand-in for a fixed panel), so a report with many validation
+    /// errors can be given as much room as needed.
+    pub diag_h: f32,
 }
 
 /// The insert-palette popup state: where a new node lands, and whether we're on
@@ -106,6 +111,7 @@ impl ReportEditor {
             run: None,
             results_exported: false,
             wizard: None,
+            diag_h: 132.0,
         };
         ed.reparse();
         ed
@@ -828,8 +834,9 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // Reserve room for the diagnostics panel at the bottom, then let the editor
     // fill the rest. Keeping the editor above avoids nesting egui panels inside
     // the centre panel (which egui 0.35 disallows in a `panel_frame` closure).
-    let diag_h = (ed.diagnostics.len().max(1) as f32 * 18.0 + 12.0).min(160.0);
-    let edit_h = (ui.available_height() - diag_h - 8.0).max(80.0);
+    let avail = ui.available_height();
+    let diag_h = ed.diag_h.clamp(48.0, (avail - 100.0).max(48.0));
+    let edit_h = (avail - diag_h - 8.0).max(80.0);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .max_height(edit_h)
@@ -850,7 +857,7 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
                 ed.set_text(text);
             }
         });
-    ui.separator();
+    diag_splitter(ed, ui);
     diagnostics_panel(ed, app, ui);
 }
 
@@ -1133,8 +1140,9 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     // stacked blocks (right). Blocks are dropped from the palette onto a row to
     // insert after it (onto a FOR header inserts inside it; onto Begin inserts
     // at the top). Reserve room for the diagnostics panel below.
-    let diag_h = (ed.diagnostics.len().max(1) as f32 * 18.0 + 12.0).min(160.0);
-    let body_h = (ui.available_height() - diag_h - 12.0).max(120.0);
+    let avail = ui.available_height();
+    let diag_h = ed.diag_h.clamp(48.0, (avail - 120.0).max(48.0));
+    let body_h = (avail - diag_h - 12.0).max(120.0);
     ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
         ui.horizontal_top(|ui| {
             const PALETTE_W: f32 = 168.0;
@@ -1186,7 +1194,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         trash_bar(app, ui, &mut acts);
     }
 
-    ui.separator();
+    diag_splitter(ed, ui);
     diagnostics_panel(ed, app, ui);
 
     apply_block_actions(ed, app, acts);
@@ -2116,6 +2124,35 @@ fn palette_panel(
 }
 
 /// The diagnostics panel: parse error line, then validation warnings/errors.
+/// A thin draggable handle above the validation panel. Dragging it up/down
+/// grows or shrinks the panel (`ed.diag_h`), the GUI's replacement for a fixed
+/// panel height: a report with many validation errors can be given as much room
+/// as the user wants. Drag *up* (negative Δy) enlarges the panel.
+fn diag_splitter(ed: &mut ReportEditor, ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    if resp.dragged() {
+        ed.diag_h = (ed.diag_h - resp.drag_delta().y).clamp(48.0, 600.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    // A short grab bar centred in the strip, brightened while hovered/dragged so
+    // the resize affordance reads as interactive.
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let w = (rect.width() * 0.25).clamp(40.0, 160.0);
+    let x0 = rect.center().x - w / 2.0;
+    ui.painter()
+        .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
 fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
     ui.add_space(4.0);
@@ -2126,7 +2163,6 @@ fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     );
     egui::ScrollArea::vertical()
         .id_salt("report_diags")
-        .max_height(120.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if ed.diagnostics.is_empty() && ed.parse_error.is_none() {

@@ -14,6 +14,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_no_response,
         lbl_copy,
         lbl_copy_body,
+        lbl_compact,
+        lbl_compact_hint,
         lbl_empty_body,
         lbl_no_headers,
         lbl_no_assertions,
@@ -28,6 +30,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_no_response_yet,
             s.gui_copy,
             s.gui_copy_body,
+            s.gui_compact,
+            s.gui_compact_hint,
             s.gui_empty_body,
             s.gui_no_headers,
             s.gui_no_assertions,
@@ -81,6 +85,20 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if ui.button(lbl_copy).on_hover_text(lbl_copy_body).clicked() {
                     ui.ctx().copy_text(body.to_string());
                 }
+                // Compact toggle — only meaningful on the Body section. It is
+                // display-only: the Copy button above always yields the full
+                // body, so a copied value is never truncated.
+                if app.response_section == ResponseSection::Body {
+                    let mut compact = app.response_compact;
+                    if ui
+                        .selectable_label(compact, lbl_compact)
+                        .on_hover_text(lbl_compact_hint)
+                        .clicked()
+                    {
+                        compact = !compact;
+                    }
+                    app.response_compact = compact;
+                }
             }
         });
     });
@@ -122,7 +140,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if body.is_empty() {
                     ui.colored_label(theme.dim, lbl_empty_body);
                 } else {
-                    let mut text = body.to_string();
+                    let mut text = if app.response_compact {
+                        crate::shared_utils::compact_long_strings(&body[..])
+                    } else {
+                        body.to_string()
+                    };
                     ui.add(
                         egui::TextEdit::multiline(&mut text)
                             .code_editor()

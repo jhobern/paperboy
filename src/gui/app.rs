@@ -95,6 +95,10 @@ pub struct GuiApp {
     pub focus: Focus,
     pub editor_section: EditorSection,
     pub response_section: ResponseSection,
+    /// When true, the Response Body view shortens long string literals to a
+    /// `"head...tail"` overview (see [`crate::shared_utils::compact_long_strings`]).
+    /// Display-only: the Copy button always yields the full body.
+    pub response_compact: bool,
     pub dialog: Option<Dialog>,
     /// Recomputed each frame from the active theme spec.
     pub theme: GuiTheme,
@@ -139,6 +143,7 @@ impl GuiApp {
             focus: Focus::List,
             editor_section: EditorSection::Params,
             response_section: ResponseSection::Body,
+            response_compact: false,
             dialog: None,
             theme,
             strings,

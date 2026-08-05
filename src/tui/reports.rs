@@ -3331,8 +3331,10 @@ pub(crate) fn draw_report_content(
         return;
     }
 
-    // Number of validation rows to reserve at the bottom (bounded so a long
-    // list of problems can't crowd out the source).
+    // Number of validation rows to reserve at the bottom. Grow with the number
+    // of problems so a long list is visible at once (mirrors the GUI's enlarged,
+    // drag-resizable validation panel), but always keep several rows of the
+    // source above — and the panel scrolls, so any overflow is still reachable.
     let diag_count = {
         let rt = &app.reports[idx];
         if rt.parse_error.is_some() {
@@ -3341,7 +3343,10 @@ pub(crate) fn draw_report_content(
             rt.diagnostics.len().max(1)
         }
     };
-    let diag_h = (diag_count as u16 + 2).min(10);
+    // Leave at least ~5 rows for the source plus the 4-row binding block; within
+    // that budget show up to 16 validation rows before falling back to scroll.
+    let diag_room = area.height.saturating_sub(4 + 5).max(4);
+    let diag_h = (diag_count as u16 + 2).min(diag_room).min(16);
 
     let rows = Layout::vertical([
         Constraint::Min(3),
