@@ -1515,6 +1515,14 @@ fn dragged_row_path(ctx: &egui::Context) -> Option<Vec<usize>> {
     })
 }
 
+/// Whether `row_path` is part of the subtree currently being dragged: the
+/// dragged path itself, or any descendant of it (a `FOR` loop's body rows and
+/// its synthetic `END`, all of which carry the loop's path as a prefix). A leaf
+/// therefore lifts only itself; a loop lifts its whole body in one piece.
+fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
+    row_path.starts_with(dragged)
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -1554,12 +1562,19 @@ fn block_row(
     // both its first-line rect (for the modifier drop zone) and its full rect
     // (for the insert strip) so a drop lands *after the whole block*.
     //
-    // When this block is the one being dragged for reordering, lift it out of
-    // its slot and paint it into a floating (Tooltip-order) layer that follows
-    // the pointer — so it reads as physically picked up, leaving an empty slot
-    // where it was. This mirrors egui's own `dnd_drag_source`, which we can't
+    // When this row belongs to the picked-up subtree, lift it out of its slot
+    // and paint it into a floating (Tooltip-order) layer that follows the
+    // pointer — so it reads as physically picked up, leaving an empty slot
+    // where it was. A leaf lifts just itself; a FOR loop lifts its head, its
+    // whole body and the matching `END` (every row whose path is prefixed by
+    // the dragged path), all into one shared layer so they float together as a
+    // single unit. This mirrors egui's own `dnd_drag_source`, which we can't
     // use directly here because the drag handle is an inner chip, not the row.
-    let dragging_this = dragged_row_path(ui.ctx()).as_deref() == Some(row.path.as_slice());
+    let drag_path = dragged_row_path(ui.ctx());
+    let lifted = drag_path
+        .as_deref()
+        .is_some_and(|d| row_is_lifted(d, &row.path));
+    let is_drag_head = drag_path.as_deref() == Some(row.path.as_slice());
     let block_body = |ui: &mut egui::Ui| -> egui::Rect {
         // Top-align the chip cluster (rather than the default centre alignment):
         // every chip is the same height, so top-alignment keeps them level while
@@ -1596,10 +1611,16 @@ fn block_row(
         }
         inner.response.rect
     };
-    let block = if dragging_this {
+    if lifted {
+        // All lifted rows share one layer (keyed by the dragged path) so a
+        // single transform moves the whole subtree together, keeping each row's
+        // relative offset. Their slots stay blank (the `scope_builder` still
+        // reserves the space), and we skip the drop targets below — you can't
+        // drop onto a row that's currently in your hand.
         let layer_id = egui::LayerId::new(
             egui::Order::Tooltip,
-            ui.id().with(("pt_drag_block", row_index)),
+            ui.id()
+                .with(("pt_drag_subtree", drag_path.as_ref().unwrap())),
         );
         let ir = ui.scope_builder(
             egui::UiBuilder::new()
@@ -1607,19 +1628,19 @@ fn block_row(
                 .layout(egui::Layout::top_down(egui::Align::Min)),
             block_body,
         );
-        // Move the floating layer's shapes so the block is centred on the
-        // pointer (the slot it was allocated in stays blank).
-        if let Some(p) = ui.ctx().pointer_interact_pos() {
+        // Only the head row sets the transform (the last writer would otherwise
+        // win): it centres the head on the pointer so the rest of the loop hangs
+        // below it, exactly as the single-block case centres its one row.
+        if is_drag_head && let Some(p) = ui.ctx().pointer_interact_pos() {
             let delta = p - ir.response.rect.center();
             ui.ctx().transform_layer_shapes(
                 layer_id,
                 egui::emath::TSTransform::from_translation(delta),
             );
         }
-        ir
-    } else {
-        ui.vertical(block_body)
-    };
+        return;
+    }
+    let block = ui.vertical(block_body);
     let cluster = block.inner;
     let block_rect = block.response.rect;
 
@@ -2822,6 +2843,30 @@ mod tests {
             dragged_row_path(&ctx),
             None,
             "a modifier-chip drag must not lift a row"
+        );
+    }
+
+    #[test]
+    fn lifted_subtree_covers_a_loop_body_but_not_siblings() {
+        // Dragging a leaf lifts only that leaf.
+        assert!(row_is_lifted(&[2], &[2]));
+        assert!(!row_is_lifted(&[2], &[1]));
+        assert!(!row_is_lifted(&[2], &[3]));
+
+        // Dragging a FOR loop at [2] lifts its head ([2]), every body row
+        // ([2,0], [2,1], …) and its synthetic END (path == [2]) — but never a
+        // sibling ([3]) or a cousin under a different loop ([1,0]).
+        assert!(row_is_lifted(&[2], &[2, 0]), "loop body row is lifted");
+        assert!(row_is_lifted(&[2], &[2, 1, 0]), "nested body row is lifted");
+        assert!(!row_is_lifted(&[2], &[3]), "the next sibling stays put");
+        assert!(
+            !row_is_lifted(&[2], &[1, 0]),
+            "another loop's body stays put"
+        );
+        // A path that merely shares a leading digit is not a descendant.
+        assert!(
+            !row_is_lifted(&[2], &[20]),
+            "prefix is index-wise, not textual"
         );
     }
 }

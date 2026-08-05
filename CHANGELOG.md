@@ -199,6 +199,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the target gap as before. (The whole line — including any nested `WITH` fields
   — floats together.)
 
+- **Dragging a `FOR` loop now lifts the whole loop.** Picking up a loop header
+  used to float only the header while its body and `END` stayed behind; a loop
+  now floats as a single unit — the header, every nested statement inside it and
+  the closing `END` all lift together under the pointer and leave one contiguous
+  blank gap where they were, so it reads as physically picking up the entire
+  loop (matching how a single block already behaved).
+
 - **GUI report editor: the end-of-list drop marker now matches a block's
   height.** When you drag a block (or a new palette block) past the last row,
   the highlighted "drop here" mark at the bottom of the report is now sized to a
