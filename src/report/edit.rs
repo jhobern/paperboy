@@ -473,6 +473,12 @@ pub(crate) enum DetachWhich {
     Parallel,
     As,
     With(usize),
+    /// The `RESPONSE RAW/PRETTY` override on a report request.
+    Response,
+    /// The `SHOW(…)` field selector on a report request.
+    Show,
+    /// The `HIDE(…)` field selector on a report request.
+    Hide,
 }
 
 /// Attach `m` to the node at `path` (see [`Modifier::applies_to`]). No-op when
@@ -593,7 +599,79 @@ pub(crate) fn detach_modifier(flow: &mut ReportFlow, path: &[usize], which: Deta
             }
             false
         }
+        DetachWhich::Response => {
+            if let FlowNode::Report(ReportStmt::Request { response_fmt, .. }) = node {
+                *response_fmt = None;
+            }
+            false
+        }
+        DetachWhich::Show => {
+            if let FlowNode::Report(ReportStmt::Request { show, .. }) = node {
+                show.clear();
+            }
+            false
+        }
+        DetachWhich::Hide => {
+            if let FlowNode::Report(ReportStmt::Request { hide, .. }) = node {
+                hide.clear();
+            }
+            false
+        }
     }
+}
+
+/// Take (remove and return) the node at `path`, or `None` when the path does
+/// not address a node. Used to relocate an existing node for drag-to-reorder.
+pub(crate) fn take_node(flow: &mut ReportFlow, path: &[usize]) -> Option<FlowNode> {
+    let (last, rest) = path.split_last()?;
+    let body = body_at_mut(flow, rest)?;
+    if *last < body.len() {
+        Some(body.remove(*last))
+    } else {
+        None
+    }
+}
+
+/// Move the existing node at `from` to the insert position `pos`, returning the
+/// moved node's new path. Used when an in-report block is dragged onto a drop
+/// strip to reorder it. A no-op (returns `None`) when `from` would move into its
+/// own subtree (a loop cannot contain itself), keeping the tree well-formed.
+///
+/// Because removing the source shifts later siblings down by one, the
+/// destination index is adjusted when both share a parent and the target sits
+/// after the removed slot.
+pub(crate) fn move_node_to(
+    flow: &mut ReportFlow,
+    from: &[usize],
+    pos: &InsertPos,
+) -> Option<Vec<usize>> {
+    // Refuse to drop a loop inside itself (its own body / a descendant body):
+    // `pos.parent` starting with `from` would orphan the subtree.
+    if pos.parent.len() >= from.len() && pos.parent[..from.len()] == *from {
+        return None;
+    }
+    let node = take_node(flow, from)?;
+    let (from_last, from_parent) = from.split_last()?;
+    // Removing the source shifts the later children of *its* body down by one.
+    // A destination that traverses that same body at a slot after the removed
+    // one must have that single index decremented — whether the slot is the
+    // insertion index itself (same body) or a component of the parent path (the
+    // destination nests through the body below the removed node).
+    let d = from_parent.len();
+    let mut parent = pos.parent.clone();
+    let mut index = pos.index;
+    if parent.len() > d && parent[..d] == *from_parent {
+        if parent[d] > *from_last {
+            parent[d] -= 1;
+        }
+    } else if parent == *from_parent && *from_last < index {
+        index -= 1;
+    }
+    let dest = InsertPos { parent, index };
+    insert_node(flow, &dest, node);
+    let mut new_path = dest.parent;
+    new_path.push(dest.index);
+    Some(new_path)
 }
 
 #[cfg(test)]
@@ -841,5 +919,84 @@ mod tests {
             }
             other => panic!("expected the report request kept its modifiers, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detaching_response_show_hide_clears_only_that_clause() {
+        let mut f =
+            flow("REPORT REQUEST analyze RESPONSE RAW SHOW(Time, HttpStatus) HIDE(Response)\n");
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::Response));
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::Show));
+        assert!(!detach_modifier(&mut f, &[0], DetachWhich::Hide));
+        match node_at(&f, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request {
+                name,
+                response_fmt,
+                show,
+                hide,
+                ..
+            })) => {
+                assert_eq!(name, "analyze");
+                assert!(response_fmt.is_none());
+                assert!(show.is_empty());
+                assert!(hide.is_empty());
+            }
+            other => panic!("expected the request kept only its name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_node_to_reorders_within_a_body_and_adjusts_the_index() {
+        // A, B, C at top level. Move A (index 0) to index 2 (after B, before C).
+        let mut f = flow("REQUEST A\nREQUEST B\nREQUEST C\n");
+        let pos = InsertPos {
+            parent: Vec::new(),
+            index: 2,
+        };
+        let new = move_node_to(&mut f, &[0], &pos).expect("move should succeed");
+        // The removal of index 0 shifts the target down by one → lands at 1.
+        assert_eq!(new, vec![1]);
+        let names: Vec<String> = f
+            .nodes
+            .iter()
+            .map(|n| match n {
+                FlowNode::Request { name } => name.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(names, vec!["B", "A", "C"]);
+    }
+
+    #[test]
+    fn move_node_to_can_nest_into_a_loop_body() {
+        let mut f = flow("REQUEST A\nFOR X IN FILES \"/d\"\n    REQUEST B\nEND\n");
+        // Move A (index 0) into the loop body (path [1]) at index 0.
+        let pos = InsertPos {
+            parent: vec![1],
+            index: 0,
+        };
+        let new = move_node_to(&mut f, &[0], &pos).expect("move should succeed");
+        assert_eq!(new, vec![0, 0]);
+        // Now the loop is the only top-level node, holding A then B.
+        match &f.nodes[0] {
+            FlowNode::ForEach { body, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(&body[0], FlowNode::Request { name } if name == "A"));
+            }
+            other => panic!("expected the loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_node_to_refuses_to_drop_a_loop_into_itself() {
+        let mut f = flow("FOR X IN FILES \"/d\"\n    REQUEST B\nEND\n");
+        // Try to move the loop (path [0]) into its own body (parent [0]).
+        let pos = InsertPos {
+            parent: vec![0],
+            index: 0,
+        };
+        assert!(move_node_to(&mut f, &[0], &pos).is_none());
+        // The tree is untouched.
+        assert!(matches!(&f.nodes[0], FlowNode::ForEach { .. }));
     }
 }

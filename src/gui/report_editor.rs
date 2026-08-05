@@ -76,6 +76,9 @@ pub struct ReportEditor {
     pub run: Option<RunHandle>,
     /// Whether the current `result` has been exported since it was produced.
     pub results_exported: bool,
+    /// When `Some`, a node-configure wizard (request / envs / files) is open as
+    /// a modal over the blocks view.
+    pub wizard: Option<super::report_wizard::Wizard>,
 }
 
 /// The insert-palette popup state: where a new node lands, and whether we're on
@@ -109,6 +112,7 @@ impl ReportEditor {
             progress: None,
             run: None,
             results_exported: false,
+            wizard: None,
         };
         ed.reparse();
         ed
@@ -163,6 +167,18 @@ impl ReportEditor {
             self.reparse();
             self.reseed_line = true;
         }
+    }
+
+    /// Replace the node at `path` with `node` (from a configure wizard),
+    /// re-select it, and mirror the result back into the session — the wizard
+    /// module's single commit path into the editor's private edit machinery.
+    pub(super) fn wizard_apply(&mut self, app: &mut GuiApp, path: &[usize], node: FlowNode) {
+        self.edit_flow(|flow| {
+            replace_node(flow, path, node);
+        });
+        self.selection = path.to_vec();
+        self.reseed_line = true;
+        sync_back(self, app);
     }
 
     /// Whether a run is currently in flight.
@@ -281,6 +297,21 @@ fn node_for_kind(kind: NodeKind, titles: &[String]) -> FlowNode {
     }
 }
 
+/// A drag payload for an *existing* in-report item (as opposed to the palette's
+/// `NodeKind` / `Modifier` payloads for adding new ones). Dragging a base chip
+/// carries its whole row (to reorder it onto a drop strip, or bin it); dragging
+/// a modifier chip carries the detach it represents (to bin it off its node).
+#[derive(Clone, PartialEq, Eq)]
+enum DragItem {
+    /// A whole block/row identified by its path — reorder or delete.
+    Row(Vec<usize>),
+    /// A modifier chip on the node at `path` — detach (bin) it.
+    Chip {
+        path: Vec<usize>,
+        which: DetachWhich,
+    },
+}
+
 /// One chip in a row's chip cluster (a compositional block is drawn as several
 /// chips side by side). Exactly one chip per node is the *base* (the editable
 /// subject: click it to select the row for inline editing); the rest are
@@ -348,22 +379,31 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                 th.subst,
                 DetachWhich::Report,
             )];
-            // Fold the clauses that have no palette block of their own (RESPONSE
-            // / SHOW / HIDE — edited in Source view) into the base request chip.
-            let mut base = format!("REQUEST {name}");
+            chips.push(Chip::base(format!("REQUEST {name}"), req_col(req_ok)));
+            // RESPONSE / SHOW / HIDE are their own detachable chips so a long
+            // reported request reads as a row of small, legible clauses rather
+            // than one dense line.
             if let Some(fmt) = response_fmt {
-                base.push_str(match fmt {
-                    crate::report::flow::ResponseFmt::Raw => " RESPONSE RAW",
-                    crate::report::flow::ResponseFmt::Pretty => " RESPONSE PRETTY",
-                });
+                let text = match fmt {
+                    crate::report::flow::ResponseFmt::Raw => "RESPONSE RAW",
+                    crate::report::flow::ResponseFmt::Pretty => "RESPONSE PRETTY",
+                };
+                chips.push(Chip::modifier(text.into(), th.subst, DetachWhich::Response));
             }
             if !show.is_empty() {
-                base.push_str(&format!(" SHOW({})", show.join(", ")));
+                chips.push(Chip::modifier(
+                    format!("SHOW({})", show.join(", ")),
+                    th.subst,
+                    DetachWhich::Show,
+                ));
             }
             if !hide.is_empty() {
-                base.push_str(&format!(" HIDE({})", hide.join(", ")));
+                chips.push(Chip::modifier(
+                    format!("HIDE({})", hide.join(", ")),
+                    th.subst,
+                    DetachWhich::Hide,
+                ));
             }
-            chips.push(Chip::base(base, req_col(req_ok)));
             if let Some(a) = alias {
                 chips.push(Chip::modifier(format!("AS {a}"), th.subst, DetachWhich::As));
             }
@@ -436,10 +476,54 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                 }
                 None => full,
             };
-            chips.push(Chip::base(head, th.accent));
+            // For an ENVS comparison loop, split the BASELINE/COMPARISON clause
+            // off the head into their own chips so a long compare line reads as
+            // legible parts. They are edited through the ENVS wizard, so the
+            // chips are fixed (no detach ×) — the base chip becomes just the
+            // `FOR … IN ENVS` opener.
+            if let FlowNode::ForEnvs {
+                clause:
+                    crate::report::flow::EnvClause::Roles {
+                        baseline,
+                        comparisons,
+                        ..
+                    },
+                var,
+                ..
+            } = node
+            {
+                chips.push(Chip::base(format!("FOR {var} IN ENVS"), th.accent));
+                if !baseline.is_empty() {
+                    chips.push(Chip::fixed(
+                        format!("BASELINE({})", role_refs_text(baseline)),
+                        th.pending,
+                    ));
+                }
+                if !comparisons.is_empty() {
+                    chips.push(Chip::fixed(
+                        format!("COMPARISON({})", role_refs_text(comparisons)),
+                        th.pending,
+                    ));
+                }
+            } else {
+                chips.push(Chip::base(head, th.accent));
+            }
             chips
         }
     }
+}
+
+/// Render a list of environment role refs for a BASELINE/COMPARISON chip: a
+/// bare env name, or `FILE("…")` for a saved-snapshot reference.
+fn role_refs_text(refs: &[crate::report::flow::RoleRef]) -> String {
+    use crate::report::flow::RoleRef;
+    refs.iter()
+        .map(|r| match r {
+            RoleRef::Env(n) => n.clone(),
+            RoleRef::File(p) => format!("FILE(\"{p}\")"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// An action collected while rendering the (borrow-frozen) blocks, applied to
@@ -485,6 +569,16 @@ enum Act {
         path: Vec<usize>,
         name: String,
     },
+    /// An existing block was dragged from `from` onto a drop strip, relocating
+    /// it to `pos` (see [`edit::move_node_to`]).
+    MoveNode {
+        from: Vec<usize>,
+        pos: InsertPos,
+    },
+    /// A block dragged onto the trash bin: delete the node at `path`.
+    DeletePath(Vec<usize>),
+    /// Open the configure wizard for the node at `path`.
+    OpenWizard(Vec<usize>),
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -604,6 +698,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
         EditorView::Results => results_view(&mut ed, app, ui),
     }
+
+    // The node-configure wizard modal (opened by double-clicking a block on the
+    // blocks view) floats above whichever view is showing.
+    super::report_wizard::show(&mut ed, app, ui.ctx());
 
     // Global keys: Ctrl+Z undo (both views); Delete on the blocks view is
     // handled inside `blocks_view` so it doesn't fire while typing.
@@ -950,7 +1048,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                     egui::ScrollArea::vertical()
                         .id_salt("pt_palette")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| palette_list(app, ui));
+                        .show(ui, |ui| palette_list(app, ui, &mut acts));
                 },
             );
             ui.separator();
@@ -999,8 +1097,9 @@ const BASE_KINDS: [NodeKind; 7] = [
 /// The always-visible palette, split into two groups: **Blocks** (base
 /// statements, dragged into the gaps between rows to insert a new line) and
 /// **Modifiers** (dragged *onto* a row to attach REPORT / PARALLEL / WITH / AS).
+/// A trash bin at the foot deletes a block or detaches a modifier dropped on it.
 /// Drag-only — the toolbar's "Add block" popup still covers click-based insert.
-fn palette_list(app: &GuiApp, ui: &mut egui::Ui) {
+fn palette_list(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
     let th = app.theme;
     ui.label(
         RichText::new(app.strings.gui_report_palette_blocks)
@@ -1033,6 +1132,57 @@ fn palette_list(app: &GuiApp, ui: &mut egui::Ui) {
             palette_chip(ui, &th, m.label(&app.strings), base);
         });
         ui.add_space(4.0);
+    }
+
+    ui.add_space(10.0);
+    trash_bin(app, ui, acts);
+}
+
+/// The trash bin drop target at the foot of the palette. It reacts only to an
+/// in-report [`DragItem`]: a dropped row is deleted, a dropped modifier chip is
+/// detached from its node. Highlights while such a drag hovers it.
+fn trash_bin(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    let th = app.theme;
+    let frame = egui::Frame::NONE
+        .fill(mix(th.panel, th.err, 0.14))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, th.err, 0.5)))
+        .inner_margin(egui::Margin::symmetric(8, 8))
+        .corner_radius(6);
+    let resp = frame
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} {}",
+                            super::icons::TRASH,
+                            app.strings.gui_report_trash
+                        ))
+                        .color(th.err),
+                    )
+                    .selectable(false),
+                );
+            });
+        })
+        .response;
+    let zone = ui.interact(resp.rect, ui.id().with("pt_trash"), egui::Sense::hover());
+    if zone.dnd_hover_payload::<DragItem>().is_some() {
+        ui.painter().rect_stroke(
+            resp.rect.expand(2.0),
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(2.0, th.err),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if let Some(item) = zone.dnd_release_payload::<DragItem>() {
+        match &*item {
+            DragItem::Row(path) => acts.push(Act::DeletePath(path.clone())),
+            DragItem::Chip { path, which } => acts.push(Act::DetachMod {
+                path: path.clone(),
+                which: *which,
+            }),
+        }
     }
 }
 
@@ -1150,7 +1300,15 @@ fn block_row(
         ui.id().with(("pt_drop", row_index)),
         egui::Sense::hover(),
     );
-    let hovering_base = strip_resp.dnd_hover_payload::<NodeKind>().is_some();
+    // The strip opens its gap for either a palette base block (`NodeKind`) or an
+    // existing block being dragged to a new home (`DragItem::Row`) — but not
+    // when a row is hovering its own insert point (dropping there is a no-op).
+    let hovering_new = strip_resp.dnd_hover_payload::<NodeKind>().is_some();
+    let hovering_move = strip_resp
+        .dnd_hover_payload::<DragItem>()
+        .map(|d| matches!(&*d, DragItem::Row(from) if *from != row.path))
+        .unwrap_or(false);
+    let hovering_base = hovering_new || hovering_move;
     let gap =
         ui.ctx()
             .animate_value_with_time(gap_id, if hovering_base { GAP_H } else { 0.0 }, 0.12);
@@ -1160,6 +1318,15 @@ fn block_row(
             pos: drop_pos.clone(),
             node: node_for_kind(*kind, titles),
         });
+    } else if let Some(item) = strip_resp.dnd_release_payload::<DragItem>() {
+        if let DragItem::Row(from) = &*item
+            && *from != row.path
+        {
+            acts.push(Act::MoveNode {
+                from: from.clone(),
+                pos: drop_pos.clone(),
+            });
+        }
     }
     if gap > 0.5 {
         let indent = row.depth as f32 * 16.0;
@@ -1199,8 +1366,10 @@ fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32) {
         });
 }
 
-/// Render one [`Chip`]. The base chip is click-to-select and shows the selection
-/// outline; a modifier chip shows a `×` that detaches it.
+/// Render one [`Chip`]. The base chip is click-to-select, double-click-to-open
+/// the wizard, and a drag source that relocates or bins its whole row; a
+/// modifier chip shows a `×` that detaches it and is itself a drag source that
+/// bins the modifier.
 fn render_chip(
     ui: &mut egui::Ui,
     th: &GuiTheme,
@@ -1243,8 +1412,29 @@ fn render_chip(
             }
         })
         .response;
-    if chip.is_base && resp.interact(egui::Sense::click()).clicked() {
-        acts.push(Act::Select(path.to_vec()));
+
+    // Every chip is a drag source (base → its whole row; a detachable modifier →
+    // itself), so it can be dragged onto a drop strip (reorder) or the trash bin.
+    let sensed = resp.interact(egui::Sense::click_and_drag());
+    if sensed.dragged() {
+        let payload = if chip.is_base {
+            DragItem::Row(path.to_vec())
+        } else if let Some(which) = chip.detach {
+            DragItem::Chip {
+                path: path.to_vec(),
+                which,
+            }
+        } else {
+            DragItem::Row(path.to_vec())
+        };
+        sensed.dnd_set_drag_payload(payload);
+    }
+    if chip.is_base {
+        if sensed.double_clicked() {
+            acts.push(Act::OpenWizard(path.to_vec()));
+        } else if sensed.clicked() {
+            acts.push(Act::Select(path.to_vec()));
+        }
     }
 }
 
@@ -1492,6 +1682,24 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 ed.selection = path;
                 ed.reseed_line = true;
             }
+            Act::MoveNode { from, pos } => {
+                let mut new_sel = None;
+                ed.edit_flow(|flow| {
+                    new_sel = edit::move_node_to(flow, &from, &pos);
+                });
+                if let Some(ns) = new_sel {
+                    ed.selection = ns;
+                }
+                ed.reseed_line = true;
+            }
+            Act::DeletePath(path) => {
+                ed.edit_flow(|flow| {
+                    remove_node(flow, &path);
+                });
+                ed.selection = Vec::new();
+                ed.reseed_line = true;
+            }
+            Act::OpenWizard(path) => super::report_wizard::open(ed, app, &path),
         }
     }
     sync_back(ed, app);

@@ -784,6 +784,17 @@ strings! {
     gui_report_move_up => "Move up", "Monter", "Flyt op";
     gui_report_move_down => "Move down", "Descendre", "Flyt ned";
     gui_report_delete_block => "Delete", "Supprimer", "Slet";
+    gui_report_trash => "Trash (drop to delete)", "Corbeille (déposer pour supprimer)", "Papirkurv (slip for at slette)";
+    node_request_title => "Configure request", "Configurer la requête", "Konfigurer forespørgsel";
+    node_form_name => "Name", "Nom", "Navn";
+    node_form_report => "Report", "Rapporter", "Rapportér";
+    node_form_report_hint => "Include this request as report columns", "Inclure cette requête comme colonnes de rapport", "Medtag denne forespørgsel som rapportkolonner";
+    node_form_response => "Response", "Réponse", "Svar";
+    node_form_response_default => "Default", "Défaut", "Standard";
+    node_form_alias => "Column name (AS)", "Nom de colonne (AS)", "Kolonnenavn (AS)";
+    node_form_show => "Show fields (all ticked = show all)", "Afficher les champs (tous cochés = tout afficher)", "Vis felter (alle markeret = vis alle)";
+    node_envs_environments => "Environments", "Environnements", "Miljøer";
+    node_envs_add => "Add environment", "Ajouter un environnement", "Tilføj miljø";
     gui_report_view_results => "Results", "Résultats", "Resultater";
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";

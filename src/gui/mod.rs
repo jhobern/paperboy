@@ -16,6 +16,7 @@ mod menu;
 mod remote;
 mod report_editor;
 mod report_run;
+mod report_wizard;
 mod reports;
 mod requests;
 mod response;

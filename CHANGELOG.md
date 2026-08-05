@@ -96,6 +96,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   compositional edit operations live in the shared flow-editing core, so they
   are available to both front-ends.
 
+- **Legible report chips, drag-to-reorder, a trash bin, and node wizards for
+  the GUI report editor.** A report line's clauses each render as their own
+  chip so a long line stays readable: a reported request now shows separate
+  `RESPONSE(…)`, `SHOW(…)` and `HIDE(…)` chips (each with a `×` to detach it),
+  and a `FOR … IN ENVS` role loop shows its `BASELINE(…)` and `COMPARISON(…)`
+  as distinct chips. Blocks and chips already in the report are now themselves
+  drag sources: drag a whole row to **reorder** it (the surrounding blocks slide
+  apart to show where it will land, just like dropping from the palette), or
+  drag a row or a modifier chip onto the new **trash bin** at the foot of the
+  palette to delete the block or detach the modifier. Double-clicking a block
+  (or a request/`ENVS`/files node) opens a **configuration wizard** — a modal
+  form ported from the terminal UI's node editors — so you tick fields, pick
+  requests and environments and set `RESPONSE`/`SHOW`/alias options through
+  checkboxes, combo boxes and radio buttons instead of hand-editing the grammar
+  line. The wizard, detach and move operations all run through the shared
+  flow-editing core, so the terminal UI and GUI stay in lock-step.
+
 
 ## [0.1.10] - 2026-08-03
 
