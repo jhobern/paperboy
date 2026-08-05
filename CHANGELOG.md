@@ -226,6 +226,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   any empty space in the block pane deselects** the current block (matching the
   usual editor gesture), so you're no longer stuck with a block selected.
 
+- **GUI report results: a cell inspector.** Clicking any cell in a report's
+  Results grid now opens a small floating window showing that cell's **full,
+  unflattened value** (JSON bodies are pretty-printed one field per line),
+  so a long string that's truncated in the grid can be read in full, selected,
+  and copied (a **Copy full value** button copies the whole cell). Esc or the
+  window's close button dismisses it. This mirrors the terminal UI's result-cell
+  popup.
+
 
 ## [0.1.10] - 2026-08-03
 

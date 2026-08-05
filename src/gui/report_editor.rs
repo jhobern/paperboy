@@ -82,6 +82,17 @@ pub struct ReportEditor {
     /// Width (px) of the palette column in the Blocks view. User-adjustable by
     /// dragging the divider between the palette and the block stack.
     pub palette_w: f32,
+    /// When `Some`, the results cell inspector window is open, showing one
+    /// cell's full (pretty-printed) value — the GUI stand-in for the TUI's
+    /// result-cell popup, so a long/truncated cell can be read in full.
+    pub inspector: Option<CellInspector>,
+}
+
+/// One results cell opened in the inspector window: the column header (title)
+/// and the cell's full, unflattened (JSON-pretty-printed when applicable) value.
+pub struct CellInspector {
+    pub title: String,
+    pub content: String,
 }
 
 /// The insert-palette popup state: where a new node lands, and whether we're on
@@ -116,6 +127,7 @@ impl ReportEditor {
             wizard: None,
             diag_h: 132.0,
             palette_w: 168.0,
+            inspector: None,
         };
         ed.reparse();
         ed
@@ -830,6 +842,50 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // blocks view) floats above whichever view is showing.
     super::report_wizard::show(&mut ed, app, ui.ctx());
 
+    // The results cell inspector: a floating window showing one cell's full
+    // (JSON-pretty-printed) value, so a long/truncated cell can be read and
+    // copied in full. The GUI stand-in for the TUI's result-cell popup.
+    if ed.inspector.is_some() {
+        let mut open = true;
+        let esc = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
+        let ins = ed.inspector.as_ref().unwrap();
+        egui::Window::new(RichText::new(&ins.title).strong().color(th.text))
+            .id(egui::Id::new("pt_cell_inspector"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([520.0, 340.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(app.strings.gui_report_cell_copy_full).clicked() {
+                        ui.ctx().copy_text(ins.content.clone());
+                        app.session.status = Some(crate::i18n::Status::Copied);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .fill(th.sunken())
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&ins.content).monospace().color(th.text),
+                                    )
+                                    .selectable(true)
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            });
+                    });
+            });
+        if !open || esc {
+            ed.inspector = None;
+        }
+    }
+
     // Global keys: Ctrl+Z undo (both views); Delete on the blocks view is
     // handled inside `blocks_view` so it doesn't fire while typing.
     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
@@ -938,7 +994,11 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     let states = ed.progress.as_ref().map(|p| p.states.as_slice());
-    results_grid(app, ui, result, &columns, states);
+    ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
+    ui.add_space(2.0);
+    if let Some(ins) = results_grid(app, ui, result, &columns, states) {
+        ed.inspector = Some(ins);
+    }
 }
 
 /// Render the results as a scrollable table: a header row, one row per data row
@@ -950,9 +1010,10 @@ fn results_grid(
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     states: Option<&[RowState]>,
-) {
+) -> Option<CellInspector> {
     let th = app.theme;
     let show_icons = states.is_some();
+    let mut opened: Option<CellInspector> = None;
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -986,9 +1047,10 @@ fn results_grid(
                             _ => th.text,
                         };
                         for col in columns {
-                            let cell = flatten_cell(&col.value(row, &result.no_match_marker));
-                            ui.label(RichText::new(truncate_cell(&cell)).color(text_col))
-                                .on_hover_text(cell);
+                            let full = col.value(row, &result.no_match_marker);
+                            if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
+                                opened = Some(ins);
+                            }
                         }
                         ui.end_row();
                     }
@@ -998,19 +1060,69 @@ fn results_grid(
                         if show_icons {
                             ui.label(" ");
                         }
-                        for (c, _col) in columns.iter().enumerate() {
-                            let cell = flatten_cell(&srow.text_cell(c));
-                            ui.label(
-                                RichText::new(truncate_cell(&cell))
-                                    .italics()
-                                    .color(th.accent),
-                            )
-                            .on_hover_text(cell);
+                        for (c, col) in columns.iter().enumerate() {
+                            let full = srow.text_cell(c);
+                            let cell = flatten_cell(&full);
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(truncate_cell(&cell))
+                                            .italics()
+                                            .color(th.accent),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(cell);
+                            if resp.clicked() {
+                                opened = Some(CellInspector {
+                                    title: col.header.clone(),
+                                    content: pretty_json_cell(&full),
+                                });
+                            }
                         }
                         ui.end_row();
                     }
                 });
         });
+    opened
+}
+
+/// A single clickable results cell: shows the truncated one-line value, the full
+/// value on hover, and — when clicked — returns a [`CellInspector`] carrying the
+/// cell's full (JSON-pretty-printed) value so a long cell can be read in full.
+fn result_cell(
+    ui: &mut egui::Ui,
+    text_col: Color32,
+    header: &str,
+    full: &str,
+) -> Option<CellInspector> {
+    let cell = flatten_cell(full);
+    let resp = ui
+        .add(
+            egui::Label::new(RichText::new(truncate_cell(&cell)).color(text_col))
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(cell);
+    resp.clicked().then(|| CellInspector {
+        title: header.to_string(),
+        content: pretty_json_cell(full),
+    })
+}
+
+/// Pretty-print a cell whose whole trimmed value is a single JSON object/array
+/// (e.g. a captured response body) so the inspector shows an indented,
+/// one-field-per-line view; anything else is returned unchanged. Mirrors the
+/// TUI's `pretty_print_json_cell`.
+fn pretty_json_cell(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return raw.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.to_string()),
+        Err(_) => raw.to_string(),
+    }
 }
 
 /// Collapse a cell's newlines to a single line (a response body can be huge).
@@ -2626,5 +2738,18 @@ mod tests {
             sel.height(),
             unsel.height()
         );
+    }
+
+    #[test]
+    fn pretty_json_cell_reflows_json_documents_only() {
+        // A JSON object/array is indented one-field-per-line.
+        let pretty = pretty_json_cell(r#"{"a":1,"b":[2,3]}"#);
+        assert!(pretty.contains('\n'), "object should be reflowed: {pretty}");
+        assert!(pretty.contains("\"a\": 1"));
+        // A bare scalar / plain string is left exactly as-is.
+        assert_eq!(pretty_json_cell("42"), "42");
+        assert_eq!(pretty_json_cell("just text"), "just text");
+        // Invalid JSON that merely starts like an object is returned unchanged.
+        assert_eq!(pretty_json_cell("{not json"), "{not json");
     }
 }

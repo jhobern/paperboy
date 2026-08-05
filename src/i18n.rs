@@ -823,6 +823,8 @@ strings! {
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
     gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
     gui_report_running => "Running…", "Exécution…", "Kører…";
+    gui_report_cell_hint => "Click a cell to inspect its full value", "Cliquez sur une cellule pour voir sa valeur complète", "Klik på en celle for at se dens fulde værdi";
+    gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
