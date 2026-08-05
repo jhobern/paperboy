@@ -61,3 +61,8 @@ egui_extras = "0.35"
 egui-phosphor = { version = "0.13", default-features = false, features = [
     "regular",
 ] }
+# PNG decoding for the application/window icon and the status-bar logo. Already
+# in the tree transitively (egui image support); declared directly so we can
+# decode `assets/paperboy_logo.png` into an `egui::IconData` / `ColorImage`.
+# Pure-Rust `png` backend only — no C toolchain, matching the rest of the build.
+image = { version = "0.25", default-features = false, features = ["png"] }

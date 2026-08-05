@@ -79,6 +79,9 @@ pub struct ReportEditor {
     /// (the GUI's stand-in for a fixed panel), so a report with many validation
     /// errors can be given as much room as needed.
     pub diag_h: f32,
+    /// Width (px) of the palette column in the Blocks view. User-adjustable by
+    /// dragging the divider between the palette and the block stack.
+    pub palette_w: f32,
 }
 
 /// The insert-palette popup state: where a new node lands, and whether we're on
@@ -112,6 +115,7 @@ impl ReportEditor {
             results_exported: false,
             wizard: None,
             diag_h: 132.0,
+            palette_w: 168.0,
         };
         ed.reparse();
         ed
@@ -473,24 +477,28 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                     crate::report::flow::ResponseFmt::Raw => "RESPONSE RAW",
                     crate::report::flow::ResponseFmt::Pretty => "RESPONSE PRETTY",
                 };
-                chips.push(Chip::modifier(text.into(), th.subst, DetachWhich::Response));
+                chips.push(Chip::modifier(
+                    text.into(),
+                    th.accent,
+                    DetachWhich::Response,
+                ));
             }
             if !show.is_empty() {
                 chips.push(Chip::modifier(
                     format!("SHOW({})", show.join(", ")),
-                    th.subst,
+                    th.ok,
                     DetachWhich::Show,
                 ));
             }
             if !hide.is_empty() {
                 chips.push(Chip::modifier(
                     format!("HIDE({})", hide.join(", ")),
-                    th.subst,
+                    th.dim,
                     DetachWhich::Hide,
                 ));
             }
             if let Some(a) = alias {
-                chips.push(Chip::alias(a, th.subst, Some(DetachWhich::As)));
+                chips.push(Chip::alias(a, th.pending, Some(DetachWhich::As)));
             }
             // The `WITH … END` fields are rendered as a *nested block* under the
             // request line (see `with_block` in `block_row`); the line itself
@@ -515,14 +523,14 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
         FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
             Chip::base(var.clone(), th.subst),
-            Chip::alias(name, th.subst, Some(DetachWhich::As)),
+            Chip::alias(name, th.pending, Some(DetachWhich::As)),
         ],
         FlowNode::Report(ReportStmt::Computed { template, name, .. }) => vec![
             Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
             Chip::base(format!("\"{template}\""), th.subst),
             // A computed column requires its AS name, so this chip is fixed
             // (inline-editable, but not detachable).
-            Chip::alias(name, th.subst, None),
+            Chip::alias(name, th.pending, None),
         ],
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
             let col = if matches!(node, FlowNode::Assign { .. }) {
@@ -1145,20 +1153,24 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let body_h = (avail - diag_h - 12.0).max(120.0);
     ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
         ui.horizontal_top(|ui| {
-            const PALETTE_W: f32 = 168.0;
+            // The palette column width is user-adjustable via the divider drawn
+            // just after it (mirrors the diagnostics splitter's drag model).
+            let palette_w = ed
+                .palette_w
+                .clamp(96.0, (ui.available_width() - 160.0).max(96.0));
             ui.allocate_ui_with_layout(
-                egui::vec2(PALETTE_W, body_h),
+                egui::vec2(palette_w, body_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.set_min_width(PALETTE_W);
-                    ui.set_max_width(PALETTE_W);
+                    ui.set_min_width(palette_w);
+                    ui.set_max_width(palette_w);
                     egui::ScrollArea::vertical()
                         .id_salt("pt_palette")
                         .auto_shrink([false, false])
                         .show(ui, |ui| palette_list(app, ui));
                 },
             );
-            ui.separator();
+            palette_splitter(ed, ui, body_h);
             ui.vertical(|ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("pt_blocks")
@@ -1318,10 +1330,12 @@ fn palette_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, base: Color32) {
     });
 }
 
-/// The palette colour for a modifier chip.
+/// The palette colour for a modifier chip. Kept in step with [`node_chips`] so
+/// a palette modifier reads the same colour as the chip it drops in.
 fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
     match m {
-        Modifier::Report | Modifier::With | Modifier::As => th.subst,
+        Modifier::Report | Modifier::With => th.subst,
+        Modifier::As => th.pending,
         Modifier::Parallel => th.accent,
     }
 }
@@ -2151,6 +2165,32 @@ fn diag_splitter(ed: &mut ReportEditor, ui: &mut egui::Ui) {
     let x0 = rect.center().x - w / 2.0;
     ui.painter()
         .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
+/// A thin draggable handle between the palette and the block stack. Dragging it
+/// left/right grows or shrinks the palette column (`ed.palette_w`), the GUI's
+/// click-and-drag replacement for the TUI's fixed panel widths.
+fn palette_splitter(ed: &mut ReportEditor, ui: &mut egui::Ui, body_h: f32) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(8.0, body_h), egui::Sense::drag());
+    if resp.dragged() {
+        ed.palette_w = (ed.palette_w + resp.drag_delta().x).clamp(96.0, 480.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    // A short grab bar centred in the strip, brightened while hovered/dragged so
+    // the resize affordance reads as interactive.
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let h = (rect.height() * 0.25).clamp(24.0, 120.0);
+    let y0 = rect.center().y - h / 2.0;
+    ui.painter()
+        .vline(rect.center().x, y0..=y0 + h, egui::Stroke::new(2.0, colour));
 }
 
 fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {

@@ -16,6 +16,7 @@ use super::{
 /// Which section of the request editor (centre-top) is shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EditorSection {
+    All,
     Params,
     Headers,
     Body,
@@ -115,6 +116,37 @@ pub struct GuiApp {
     pub report_editor: Option<report_editor::ReportEditor>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
+    /// The PaperBoy logo texture, lazily uploaded on the first frame and shown
+    /// in the status bar. `None` until loaded (or if decoding ever fails).
+    pub logo: Option<egui::TextureHandle>,
+}
+
+/// The raw PNG bytes of the application logo, embedded at compile time so the
+/// binary is self-contained (no runtime asset path to resolve). Used for both
+/// the window/taskbar icon and the status-bar badge.
+const LOGO_PNG: &[u8] = include_bytes!("../../assets/paperboy_logo.png");
+
+/// Decode the embedded logo into an `egui::IconData` for the window/taskbar
+/// icon. Returns `None` if decoding fails (we then fall back to the platform
+/// default rather than refusing to launch).
+pub fn load_app_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
+/// Decode the embedded logo into an egui image ready to upload as a texture.
+fn logo_color_image() -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        img.as_raw(),
+    ))
 }
 
 impl GuiApp {
@@ -141,7 +173,7 @@ impl GuiApp {
         Self {
             session,
             focus: Focus::List,
-            editor_section: EditorSection::Params,
+            editor_section: EditorSection::All,
             response_section: ResponseSection::Body,
             response_compact: false,
             dialog: None,
@@ -151,6 +183,7 @@ impl GuiApp {
             show_reports: false,
             report_editor: None,
             remote: super::remote::RemoteUi::default(),
+            logo: None,
         }
     }
 
@@ -353,6 +386,18 @@ impl GuiApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            // The PaperBoy logo badge, lazily uploaded on first use. Drawn at
+            // the text's own height so it sits inline with the status message.
+            let logo = self.logo.get_or_insert_with(|| {
+                let img = logo_color_image().unwrap_or_else(|| {
+                    egui::ColorImage::new([1, 1], vec![egui::Color32::TRANSPARENT])
+                });
+                ui.ctx()
+                    .load_texture("paperboy_logo", img, egui::TextureOptions::LINEAR)
+            });
+            let h = ui.text_style_height(&egui::TextStyle::Body);
+            ui.add(egui::Image::new((logo.id(), egui::vec2(h, h))));
+            ui.add_space(4.0);
             let msg = self
                 .session
                 .status

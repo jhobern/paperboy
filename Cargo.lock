@@ -3332,6 +3332,7 @@ dependencies = [
  "egui_extras",
  "hurl",
  "hurl_core",
+ "image",
  "nom",
  "ratatui",
  "ratatui-explorer",

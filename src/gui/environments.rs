@@ -211,9 +211,10 @@ fn var_editor(
     let mut changed = false;
     let mut remove: Option<usize> = None;
     egui::Grid::new("env_vars")
-        .num_columns(3)
+        .num_columns(2)
         .spacing([8.0, 4.0])
         .striped(true)
+        .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..vars.len() {
                 let source = vars[i].source;
@@ -227,44 +228,53 @@ fn var_editor(
                 {
                     changed = true;
                 }
-                match source_label(source) {
-                    None => {
-                        // Literal: editable value.
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut vars[i].value)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text(s.gui_hint_value),
-                            )
-                            .changed()
-                        {
-                            vars[i].raw = vars[i].value.clone();
-                            vars[i].modified = true;
-                            changed = true;
+                // The value cell is the grid's last column so it stretches to
+                // fill the panel; the remove ✕ is right-aligned inside it (see
+                // the note in `widgets::kv_editor`).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    match source_label(source) {
+                        None => {
+                            // Literal: editable value.
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut vars[i].value)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(s.gui_hint_value),
+                                )
+                                .changed()
+                            {
+                                vars[i].raw = vars[i].value.clone();
+                                vars[i].modified = true;
+                                changed = true;
+                            }
+                        }
+                        Some(provider) => {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{{{{ {provider} }}}}"))
+                                            .color(theme.subst),
+                                    );
+                                    if vars[i].loading {
+                                        ui.spinner();
+                                        ui.colored_label(theme.pending, s.gui_resolving);
+                                    } else if vars[i].resolved {
+                                        ui.colored_label(theme.dim, "••••••");
+                                    } else {
+                                        ui.colored_label(theme.err, s.gui_unresolved);
+                                    }
+                                },
+                            );
                         }
                     }
-                    Some(provider) => {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{{{{ {provider} }}}}")).color(theme.subst),
-                            );
-                            if vars[i].loading {
-                                ui.spinner();
-                                ui.colored_label(theme.pending, s.gui_resolving);
-                            } else if vars[i].resolved {
-                                ui.colored_label(theme.dim, "••••••");
-                            } else {
-                                ui.colored_label(theme.err, s.gui_unresolved);
-                            }
-                        });
-                    }
-                }
-                if ui
-                    .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
+                });
                 ui.end_row();
             }
         });

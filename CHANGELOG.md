@@ -161,6 +161,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   untruncated body**. The truncation itself lives in the shared core, so both
   front-ends stay in lock-step.
 
+- **GUI polish: app icon, resizable block palette, roomier edit fields, an "All"
+  request view, and clearer report chips.** The desktop GUI now shows the
+  PaperBoy logo as its window/taskbar icon and in the status bar (in place of
+  the generic gear). In the PaperTrail block editor the divider between the
+  block **palette** and the report is now **drag-resizable** (like the other
+  splitters). Every key/value table (request Headers, Params, Cookies, Options,
+  Captures and the environment variable editor) now **stretches its value field
+  to fill the panel** instead of leaving it stuck at a narrow fixed width. The
+  request editor gains an **"All"** tab — now the default — that stacks every
+  section (Params, Headers, Body, Auth, Cookies, Options, Asserts, Captures) in
+  one scrollable form, and a **Name** field, mirroring the terminal UI's
+  edit-request wizard. Finally, PaperTrail keywords/chips are now **coloured by
+  category** (`REPORT`/`WITH` in the substitution colour, `RESPONSE` in the
+  accent, `SHOW` green, `HIDE` dimmed, `AS`/`BASELINE`/`COMPARISON` amber) in
+  both the GUI chips and the terminal source highlighter, so a long report line
+  reads at a glance.
+
 
 ## [0.1.10] - 2026-08-03
 

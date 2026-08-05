@@ -29,12 +29,20 @@ use eframe::egui;
 
 /// Launch the GUI. Blocks until the window is closed.
 pub fn run() -> Result<(), String> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([760.0, 500.0])
+        .with_title("PaperBoy")
+        .with_app_id("paperboy");
+    // Use the PaperBoy logo as the window / taskbar icon instead of the
+    // platform's default. Decoding can't fail for our bundled asset, but if it
+    // ever did we simply fall back to the default icon rather than refusing to
+    // launch.
+    if let Some(icon) = app::load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([760.0, 500.0])
-            .with_title("PaperBoy")
-            .with_app_id("paperboy"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

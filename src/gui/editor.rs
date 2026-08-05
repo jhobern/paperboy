@@ -171,10 +171,25 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // selected entry ends (egui closures can't borrow `app` again mid-frame).
     let mut code_show_hurl = app.show_hurl;
 
-    // ── Method / URL / Send bar ───────────────────────────────────────────
+    // ── Name / Method / URL / Send bar ────────────────────────────────────
+    // Mirrors the TUI edit-request wizard, which shows the request Name above
+    // the Method/URL row. The Name is the display title in the request tree.
     let send_label = format!("{} {}", app.strings.gui_send, super::icons::PLAY);
     {
         let entry = &mut app.session.collections[ci].entries[sel];
+        let name_label = app.strings.gui_name;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(name_label).color(theme.dim));
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut entry.title)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(name_label),
+            );
+            if name.changed() {
+                changed = true;
+            }
+        });
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             if widgets::method_combo(ui, "method", &mut entry.method) {
                 changed = true;
@@ -217,6 +232,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let mut cur = app.editor_section;
         let st = &app.strings;
         let tabs = [
+            (EditorSection::All, st.tab_all.to_string()),
             (
                 EditorSection::Params,
                 format!("{}{}", st.gui_sec_params, widgets::count_suffix(params_n)),
@@ -294,145 +310,33 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             let entry = &mut app.session.collections[ci].entries[sel];
             let st = &app.strings;
             match section {
-                EditorSection::Params => {
-                    ui.label(RichText::new(st.gui_query_parameters).color(theme.dim));
-                    if widgets::kv_editor(
-                        ui,
-                        &theme,
-                        st,
-                        "params",
-                        &mut entry.queries,
-                        st.gui_hint_key,
-                        st.gui_hint_value,
-                    ) {
-                        changed = true;
-                    }
-                }
-                EditorSection::Headers => {
-                    if widgets::kv_editor(
-                        ui,
-                        &theme,
-                        st,
-                        "headers",
-                        &mut entry.headers,
-                        st.gui_hint_header,
-                        st.gui_hint_value,
-                    ) {
-                        changed = true;
-                    }
-                }
-                EditorSection::Body => {
-                    if !entry.form_fields.is_empty() {
-                        ui.colored_label(theme.pending, st.gui_form_mutually_exclusive);
-                    }
-                    let mut body = entry.body.take().unwrap_or_default();
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut body)
-                            .code_editor()
-                            .desired_rows(10)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(st.gui_raw_body_hint),
-                    );
-                    if resp.changed() {
-                        changed = true;
-                    }
-                    entry.body = if body.is_empty() { None } else { Some(body) };
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
-                    if form_editor(ui, &theme, st, &mut entry.form_fields) {
-                        changed = true;
-                    }
-                }
-                EditorSection::Auth => {
-                    let mut enabled = entry.basic_auth.is_some();
-                    if ui.checkbox(&mut enabled, st.gui_basic_auth).changed() {
-                        entry.basic_auth = if enabled {
-                            Some((String::new(), String::new()))
-                        } else {
-                            None
-                        };
-                        changed = true;
-                    }
-                    if let Some((user, pass)) = entry.basic_auth.as_mut() {
-                        egui::Grid::new("auth").num_columns(2).show(ui, |ui| {
-                            ui.label(st.gui_username);
-                            if ui.text_edit_singleline(user).changed() {
-                                changed = true;
-                            }
-                            ui.end_row();
-                            ui.label(st.gui_password);
-                            if ui
-                                .add(egui::TextEdit::singleline(pass).password(true))
-                                .changed()
-                            {
-                                changed = true;
-                            }
-                            ui.end_row();
-                        });
-                    }
-                }
-                EditorSection::Cookies => {
-                    if widgets::kv_editor(
-                        ui,
-                        &theme,
-                        st,
-                        "cookies",
-                        &mut entry.cookies,
-                        st.gui_hint_name,
-                        st.gui_hint_value,
-                    ) {
-                        changed = true;
-                    }
-                }
-                EditorSection::Options => {
-                    ui.label(RichText::new(st.gui_per_request_options).color(theme.dim));
-                    if widgets::kv_editor(
-                        ui,
-                        &theme,
-                        st,
-                        "options",
-                        &mut entry.options,
-                        st.gui_hint_option,
-                        st.gui_hint_value,
-                    ) {
-                        changed = true;
-                    }
-                }
-                EditorSection::Asserts => {
-                    ui.label(RichText::new(st.gui_response_assertions).color(theme.dim));
-                    if assert_editor(ui, &theme, st, &mut entry.asserts) {
-                        changed = true;
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(st.gui_expected_status);
-                        let mut s = entry
-                            .expected_status
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut s).desired_width(60.0))
-                            .changed()
-                        {
-                            entry.expected_status = s.trim().parse::<u16>().ok();
+                EditorSection::All => {
+                    // The combined view stacks every section, mirroring the TUI
+                    // wizard's default "All" tab so the whole request is visible
+                    // and editable without switching tabs.
+                    const STACK: [EditorSection; 8] = [
+                        EditorSection::Params,
+                        EditorSection::Headers,
+                        EditorSection::Body,
+                        EditorSection::Auth,
+                        EditorSection::Cookies,
+                        EditorSection::Options,
+                        EditorSection::Asserts,
+                        EditorSection::Captures,
+                    ];
+                    for (i, sec) in STACK.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(8.0);
+                            ui.separator();
+                        }
+                        ui.label(
+                            RichText::new(section_title(*sec, st))
+                                .strong()
+                                .color(theme.text),
+                        );
+                        if draw_section(*sec, ui, &theme, st, entry) {
                             changed = true;
                         }
-                    });
-                }
-                EditorSection::Captures => {
-                    ui.label(RichText::new(st.gui_captures_help).color(theme.dim));
-                    if widgets::pair_editor(
-                        ui,
-                        &theme,
-                        st,
-                        "captures",
-                        &mut entry.captures,
-                        st.gui_hint_name,
-                        st.gui_hint_query,
-                    ) {
-                        changed = true;
                     }
                 }
                 EditorSection::Code => {
@@ -468,6 +372,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                     subst_legend(ui, &seen, &theme, st);
                 }
+                other => {
+                    if draw_section(other, ui, &theme, st, entry) {
+                        changed = true;
+                    }
+                }
             }
         });
 
@@ -481,6 +390,182 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         app.session.collections[ci].selected_entry = sel;
         app.run_active();
     }
+}
+
+/// Human-readable heading for a section, used above each block in the "All"
+/// combined view. Reads the same i18n tab labels as the section tab bar.
+fn section_title(section: EditorSection, s: &Strings) -> &'static str {
+    match section {
+        EditorSection::All => s.tab_all,
+        EditorSection::Params => s.gui_sec_params,
+        EditorSection::Headers => s.gui_sec_headers,
+        EditorSection::Body => s.gui_sec_body,
+        EditorSection::Auth => s.gui_sec_auth,
+        EditorSection::Cookies => s.gui_sec_cookies,
+        EditorSection::Options => s.gui_sec_options,
+        EditorSection::Asserts => s.gui_sec_asserts,
+        EditorSection::Captures => s.gui_sec_captures,
+        EditorSection::Code => s.gui_sec_code,
+    }
+}
+
+/// Draw one editable request section into `ui`, returning whether the entry
+/// changed. Shared by the single-section tabs and the combined "All" view.
+/// `All` and `Code` are handled by the caller (they need extra state) and are
+/// no-ops here.
+fn draw_section(
+    section: EditorSection,
+    ui: &mut egui::Ui,
+    theme: &super::theme::GuiTheme,
+    st: &Strings,
+    entry: &mut HurlEntry,
+) -> bool {
+    let mut changed = false;
+    match section {
+        EditorSection::All | EditorSection::Code => {}
+        EditorSection::Params => {
+            ui.label(RichText::new(st.gui_query_parameters).color(theme.dim));
+            if widgets::kv_editor(
+                ui,
+                theme,
+                st,
+                "params",
+                &mut entry.queries,
+                st.gui_hint_key,
+                st.gui_hint_value,
+            ) {
+                changed = true;
+            }
+        }
+        EditorSection::Headers => {
+            if widgets::kv_editor(
+                ui,
+                theme,
+                st,
+                "headers",
+                &mut entry.headers,
+                st.gui_hint_header,
+                st.gui_hint_value,
+            ) {
+                changed = true;
+            }
+        }
+        EditorSection::Body => {
+            if !entry.form_fields.is_empty() {
+                ui.colored_label(theme.pending, st.gui_form_mutually_exclusive);
+            }
+            let mut body = entry.body.take().unwrap_or_default();
+            let resp = ui.add(
+                egui::TextEdit::multiline(&mut body)
+                    .code_editor()
+                    .desired_rows(10)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(st.gui_raw_body_hint),
+            );
+            if resp.changed() {
+                changed = true;
+            }
+            entry.body = if body.is_empty() { None } else { Some(body) };
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
+            if form_editor(ui, theme, st, &mut entry.form_fields) {
+                changed = true;
+            }
+        }
+        EditorSection::Auth => {
+            let mut enabled = entry.basic_auth.is_some();
+            if ui.checkbox(&mut enabled, st.gui_basic_auth).changed() {
+                entry.basic_auth = if enabled {
+                    Some((String::new(), String::new()))
+                } else {
+                    None
+                };
+                changed = true;
+            }
+            if let Some((user, pass)) = entry.basic_auth.as_mut() {
+                egui::Grid::new("auth").num_columns(2).show(ui, |ui| {
+                    ui.label(st.gui_username);
+                    if ui.text_edit_singleline(user).changed() {
+                        changed = true;
+                    }
+                    ui.end_row();
+                    ui.label(st.gui_password);
+                    if ui
+                        .add(egui::TextEdit::singleline(pass).password(true))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
+            }
+        }
+        EditorSection::Cookies => {
+            if widgets::kv_editor(
+                ui,
+                theme,
+                st,
+                "cookies",
+                &mut entry.cookies,
+                st.gui_hint_name,
+                st.gui_hint_value,
+            ) {
+                changed = true;
+            }
+        }
+        EditorSection::Options => {
+            ui.label(RichText::new(st.gui_per_request_options).color(theme.dim));
+            if widgets::kv_editor(
+                ui,
+                theme,
+                st,
+                "options",
+                &mut entry.options,
+                st.gui_hint_option,
+                st.gui_hint_value,
+            ) {
+                changed = true;
+            }
+        }
+        EditorSection::Asserts => {
+            ui.label(RichText::new(st.gui_response_assertions).color(theme.dim));
+            if assert_editor(ui, theme, st, &mut entry.asserts) {
+                changed = true;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(st.gui_expected_status);
+                let mut s = entry
+                    .expected_status
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut s).desired_width(60.0))
+                    .changed()
+                {
+                    entry.expected_status = s.trim().parse::<u16>().ok();
+                    changed = true;
+                }
+            });
+        }
+        EditorSection::Captures => {
+            ui.label(RichText::new(st.gui_captures_help).color(theme.dim));
+            if widgets::pair_editor(
+                ui,
+                theme,
+                st,
+                "captures",
+                &mut entry.captures,
+                st.gui_hint_name,
+                st.gui_hint_query,
+            ) {
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Editable list of `[Asserts]` expression strings.

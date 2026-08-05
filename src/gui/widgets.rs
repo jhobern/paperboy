@@ -147,10 +147,16 @@ pub fn kv_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
+    // The value must be the grid's *last* column for egui to stretch it to the
+    // full available width — otherwise a trailing "remove" column would be the
+    // one that fills and the value would stay content-sized (a narrow table).
+    // So the remove ✕ is tucked into the value cell via a right-to-left layout:
+    // ✕ pins to the right edge and the value fills everything to its left.
     egui::Grid::new(id)
-        .num_columns(4)
+        .num_columns(3)
         .spacing([8.0, 4.0])
         .striped(true)
+        .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..rows.len() {
                 if ui.checkbox(&mut rows[i].2, "").changed() {
@@ -161,21 +167,26 @@ pub fn kv_editor(
                         .hint_text(key_hint)
                         .desired_width(150.0),
                 );
-                let v = ui.add(
-                    egui::TextEdit::singleline(&mut rows[i].1)
-                        .hint_text(val_hint)
-                        .desired_width(f32::INFINITY),
-                );
-                if k.changed() || v.changed() {
+                if k.changed() {
                     changed = true;
                 }
-                if ui
-                    .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                    .on_hover_text(s.gui_remove)
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                        .on_hover_text(s.gui_remove)
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    let v = ui.add(
+                        egui::TextEdit::singleline(&mut rows[i].1)
+                            .hint_text(val_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if v.changed() {
+                        changed = true;
+                    }
+                });
                 ui.end_row();
             }
         });
@@ -203,10 +214,13 @@ pub fn pair_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
+    // See `kv_editor`: the value fills only as the last column, so the remove ✕
+    // shares the value cell (right-aligned) rather than being its own column.
     egui::Grid::new(id)
-        .num_columns(3)
+        .num_columns(2)
         .spacing([8.0, 4.0])
         .striped(true)
+        .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..rows.len() {
                 let k = ui.add(
@@ -214,20 +228,25 @@ pub fn pair_editor(
                         .hint_text(key_hint)
                         .desired_width(160.0),
                 );
-                let v = ui.add(
-                    egui::TextEdit::singleline(&mut rows[i].1)
-                        .hint_text(val_hint)
-                        .desired_width(f32::INFINITY),
-                );
-                if k.changed() || v.changed() {
+                if k.changed() {
                     changed = true;
                 }
-                if ui
-                    .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    let v = ui.add(
+                        egui::TextEdit::singleline(&mut rows[i].1)
+                            .hint_text(val_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if v.changed() {
+                        changed = true;
+                    }
+                });
                 ui.end_row();
             }
         });
