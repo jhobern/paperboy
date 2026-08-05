@@ -21157,8 +21157,8 @@ fn report_node_inserting_a_files_loop_opens_the_folder_picker_immediately() {
     // Selection starts on Begin (row 0); `a` opens the insert palette.
     press(&mut app, KeyCode::Char('a'));
     assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
-    // FILES is index 4 in NodeKind::ALL; Down four times, then commit the kind.
-    for _ in 0..4 {
+    // FILES is index 5 in NodeKind::ALL; Down five times, then commit the kind.
+    for _ in 0..5 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);
@@ -21191,8 +21191,8 @@ fn report_node_inserting_an_envs_loop_opens_the_configure_popup_immediately() {
     // Selection starts on Begin (row 0); `a` opens the insert palette.
     press(&mut app, KeyCode::Char('a'));
     assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
-    // ENVS is index 6 in NodeKind::ALL; Down six times, then commit the kind.
-    for _ in 0..6 {
+    // ENVS is index 7 in NodeKind::ALL; Down seven times, then commit the kind.
+    for _ in 0..7 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);

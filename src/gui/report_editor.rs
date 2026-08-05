@@ -302,7 +302,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 fn kind_color(kind: NodeKind, th: &GuiTheme) -> Color32 {
     match kind {
         NodeKind::Request | NodeKind::ReportRequest => th.ok,
-        NodeKind::ReportVar => th.subst,
+        NodeKind::ReportVar | NodeKind::ReportComputed => th.subst,
         NodeKind::Assign => th.accent,
         NodeKind::ForFiles | NodeKind::ForFolders | NodeKind::ForEnvs => th.accent,
         NodeKind::List => th.pending,
@@ -1347,9 +1347,12 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
 /// statement row. `ReportRequest` and `ReportVar` are intentionally absent — a
 /// reported request is composed by dropping the `REPORT` modifier onto a
 /// `REQUEST`, and a reported variable by dropping `REPORT` onto a `VARIABLE`
-/// (`Assign`) block, so there is a single `REPORT` in the palette.
-const BASE_KINDS: [NodeKind; 6] = [
+/// (`Assign`) block, so there is a single `REPORT` in the palette. A *computed*
+/// column (`REPORT "…" AS …`) has no such composition, so it is offered
+/// directly.
+const BASE_KINDS: [NodeKind; 7] = [
     NodeKind::Request,
+    NodeKind::ReportComputed,
     NodeKind::Assign,
     NodeKind::List,
     NodeKind::ForFiles,
@@ -1468,6 +1471,11 @@ fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
         Modifier::With => th.accent,
         Modifier::As => th.pending,
         Modifier::Parallel => th.err,
+        // RESPONSE / SHOW / HIDE reuse the same hues their attached chips carry
+        // (see `node_chips`) so the palette entry reads as the chip it creates.
+        Modifier::Response => th.accent,
+        Modifier::Show => th.ok,
+        Modifier::Hide => th.dim,
     }
 }
 

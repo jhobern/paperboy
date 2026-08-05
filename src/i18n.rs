@@ -579,6 +579,7 @@ strings! {
     node_kind_request => "REQUEST — send a request", "REQUEST — envoyer une requête", "REQUEST — send en forespørgsel";
     node_kind_report_request => "REPORT REQUEST — send and report its fields", "REPORT REQUEST — envoyer et rapporter ses champs", "REPORT REQUEST — send og rapportér dens felter";
     node_kind_report_var => "REPORT — report a variable", "REPORT — rapporter une variable", "REPORT — rapportér en variabel";
+    node_kind_report_computed => "REPORT \"…\" AS — a computed column", "REPORT \"…\" AS — une colonne calculée", "REPORT \"…\" AS — en beregnet kolonne";
     node_kind_assign => "VARIABLE — set VAR = VALUE", "VARIABLE — définir VAR = VALEUR", "VARIABLE — sæt VAR = VÆRDI";
     node_kind_for_files => "FOR … IN FILES — loop over files", "FOR … IN FILES — boucler sur des fichiers", "FOR … IN FILES — løkke over filer";
     node_kind_for_folders => "FOR … IN FOLDERS — loop over folders", "FOR … IN FOLDERS — boucler sur des dossiers", "FOR … IN FOLDERS — løkke over mapper";
@@ -588,6 +589,9 @@ strings! {
     node_mod_parallel => "PARALLEL — run a loop concurrently", "PARALLEL — exécuter une boucle en parallèle", "PARALLEL — kør en løkke samtidigt";
     node_mod_with => "WITH — add a field to a report request", "WITH — ajouter un champ à une requête de rapport", "WITH — tilføj et felt til en rapportforespørgsel";
     node_mod_as => "AS — name a report column", "AS — nommer une colonne du rapport", "AS — navngiv en rapportkolonne";
+    node_mod_response => "RESPONSE — capture the response body (RAW/PRETTY)", "RESPONSE — capturer le corps de la réponse (RAW/PRETTY)", "RESPONSE — indfang svarets krop (RAW/PRETTY)";
+    node_mod_show => "SHOW — pick which fields to show", "SHOW — choisir les champs à afficher", "SHOW — vælg hvilke felter der vises";
+    node_mod_hide => "HIDE — pick which fields to hide", "HIDE — choisir les champs à masquer", "HIDE — vælg hvilke felter der skjules";
     report_node_edit_title => "Edit Node Line", "Modifier la ligne du nœud", "Rediger nodelinje";
     report_node_edit_hint => "Enter apply · Esc cancel", "Entrée appliquer · Échap annuler", "Enter anvend · Esc annuller";
     report_node_line_invalid => "Not a valid statement", "Instruction non valide", "Ikke en gyldig sætning";

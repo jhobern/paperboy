@@ -12,7 +12,8 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, WithItem,
+    EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt,
+    RoleRef, WithItem,
 };
 use crate::report::parse_flow;
 
@@ -295,6 +296,7 @@ pub(crate) enum NodeKind {
     Request,
     ReportRequest,
     ReportVar,
+    ReportComputed,
     Assign,
     ForFiles,
     ForFolders,
@@ -303,10 +305,11 @@ pub(crate) enum NodeKind {
 }
 
 impl NodeKind {
-    pub(crate) const ALL: [NodeKind; 8] = [
+    pub(crate) const ALL: [NodeKind; 9] = [
         NodeKind::Request,
         NodeKind::ReportRequest,
         NodeKind::ReportVar,
+        NodeKind::ReportComputed,
         NodeKind::Assign,
         NodeKind::ForFiles,
         NodeKind::ForFolders,
@@ -320,6 +323,7 @@ impl NodeKind {
             NodeKind::Request => s.node_kind_request,
             NodeKind::ReportRequest => s.node_kind_report_request,
             NodeKind::ReportVar => s.node_kind_report_var,
+            NodeKind::ReportComputed => s.node_kind_report_computed,
             NodeKind::Assign => s.node_kind_assign,
             NodeKind::ForFiles => s.node_kind_for_files,
             NodeKind::ForFolders => s.node_kind_for_folders,
@@ -339,6 +343,15 @@ impl NodeKind {
         Some(match self {
             NodeKind::Request | NodeKind::ReportRequest => return None,
             NodeKind::ReportVar => FlowNode::Report(ReportStmt::Vars(vec!["VAR".into()])),
+            NodeKind::ReportComputed => FlowNode::Report(ReportStmt::Computed {
+                // A placeholder computed column the user edits via its wizard.
+                // The template must be a non-empty string and it must carry an
+                // AS name, or `REPORT "…"` won't re-parse (kicking the user out
+                // of the node editor).
+                template: "value".into(),
+                name: "column".into(),
+                stats: Vec::new(),
+            }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
                 value: String::new(),
@@ -418,14 +431,20 @@ pub(crate) enum Modifier {
     Parallel,
     With,
     As,
+    Response,
+    Show,
+    Hide,
 }
 
 impl Modifier {
-    pub(crate) const ALL: [Modifier; 4] = [
+    pub(crate) const ALL: [Modifier; 7] = [
         Modifier::Report,
         Modifier::Parallel,
         Modifier::With,
         Modifier::As,
+        Modifier::Response,
+        Modifier::Show,
+        Modifier::Hide,
     ];
 
     /// The palette label for this modifier.
@@ -435,6 +454,9 @@ impl Modifier {
             Modifier::Parallel => s.node_mod_parallel,
             Modifier::With => s.node_mod_with,
             Modifier::As => s.node_mod_as,
+            Modifier::Response => s.node_mod_response,
+            Modifier::Show => s.node_mod_show,
+            Modifier::Hide => s.node_mod_hide,
         }
     }
 
@@ -463,6 +485,22 @@ impl Modifier {
                 FlowNode::Report(ReportStmt::Vars(vars)) => vars.len() == 1,
                 _ => false,
             },
+            // RESPONSE / SHOW / HIDE all decorate a report request, and only
+            // when it doesn't already carry that clause (so the drop reads as
+            // "add it" and never silently overwrites an existing one).
+            Modifier::Response => matches!(
+                node,
+                FlowNode::Report(ReportStmt::Request {
+                    response_fmt: None,
+                    ..
+                })
+            ),
+            Modifier::Show => {
+                matches!(node, FlowNode::Report(ReportStmt::Request { show, .. }) if show.is_empty())
+            }
+            Modifier::Hide => {
+                matches!(node, FlowNode::Report(ReportStmt::Request { hide, .. }) if hide.is_empty())
+            }
         }
     }
 }
@@ -535,6 +573,27 @@ pub(crate) fn attach_modifier(flow: &mut ReportFlow, path: &[usize], m: Modifier
             }
             _ => {}
         },
+        // RESPONSE / SHOW / HIDE seed a sensible default (PRETTY, and the first
+        // intrinsic field) that the user then refines in the request wizard.
+        Modifier::Response => {
+            if let FlowNode::Report(ReportStmt::Request { response_fmt, .. }) = node {
+                *response_fmt = Some(ResponseFmt::Pretty);
+            }
+        }
+        Modifier::Show => {
+            if let FlowNode::Report(ReportStmt::Request { show, .. }) = node
+                && show.is_empty()
+            {
+                *show = vec!["HttpStatus".into()];
+            }
+        }
+        Modifier::Hide => {
+            if let FlowNode::Report(ReportStmt::Request { hide, .. }) = node
+                && hide.is_empty()
+            {
+                *hide = vec!["HttpStatus".into()];
+            }
+        }
     }
     true
 }
@@ -1079,6 +1138,64 @@ mod tests {
                 assert!(hide.is_empty());
             }
             other => panic!("expected the request kept only its name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_show_hide_modifiers_attach_defaults_and_round_trip() {
+        let mut f = flow("REPORT REQUEST analyze\n");
+        // Each applies to a bare report request…
+        assert!(Modifier::Response.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(Modifier::Show.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(Modifier::Hide.applies_to(node_at(&f, &[0]).unwrap()));
+        // …and drops a sensible default in place.
+        assert!(attach_modifier(&mut f, &[0], Modifier::Response));
+        assert!(attach_modifier(&mut f, &[0], Modifier::Show));
+        assert!(attach_modifier(&mut f, &[0], Modifier::Hide));
+        // Now attached, none applies a second time (no silent overwrite).
+        assert!(!Modifier::Response.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(!Modifier::Show.applies_to(node_at(&f, &[0]).unwrap()));
+        assert!(!Modifier::Hide.applies_to(node_at(&f, &[0]).unwrap()));
+        // The serialized text re-parses with the same clauses intact.
+        let reparsed = flow(&f.to_text());
+        match node_at(&reparsed, &[0]) {
+            Some(FlowNode::Report(ReportStmt::Request {
+                response_fmt,
+                show,
+                hide,
+                ..
+            })) => {
+                assert_eq!(*response_fmt, Some(ResponseFmt::Pretty));
+                assert_eq!(show, &vec!["HttpStatus".to_string()]);
+                assert_eq!(hide, &vec!["HttpStatus".to_string()]);
+            }
+            other => panic!("expected a decorated report request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_computed_kind_template_round_trips() {
+        // The palette's computed-column template must round-trip through the
+        // serializer/parser or dropping it would kick the user out of the editor.
+        let node = NodeKind::ReportComputed
+            .template()
+            .expect("computed kind has a template");
+        let mut f = flow("REQUEST A\n");
+        insert_node(
+            &mut f,
+            &InsertPos {
+                parent: Vec::new(),
+                index: 1,
+            },
+            node,
+        );
+        let reparsed = flow(&f.to_text());
+        match node_at(&reparsed, &[1]) {
+            Some(FlowNode::Report(ReportStmt::Computed { template, name, .. })) => {
+                assert!(!template.is_empty());
+                assert!(!name.is_empty());
+            }
+            other => panic!("expected a computed column, got {other:?}"),
         }
     }
 

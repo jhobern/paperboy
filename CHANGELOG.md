@@ -192,6 +192,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   substituted, so the buffer edits cleanly). This brings the GUI in line with the
   terminal UI's editable raw Hurl/JSON views.
 
+- **PaperTrail block palette adds SHOW, HIDE, RESPONSE and a computed-column
+  block.** Auditing the drag/drop report editor turned up constructs you could
+  render but not *create* from the palette. You can now drop **RESPONSE** (adds a
+  `RESPONSE PRETTY` clause), **SHOW** and **HIDE** modifiers onto a `REPORT
+  REQUEST` — seeding a sensible default field you then refine in the request
+  wizard — and drop a new **`REPORT "…" AS`** computed-column block for a value
+  computed from other columns. Each round-trips through the report text and can
+  be detached again (SHOW/HIDE/RESPONSE) like the other modifiers. Both
+  front-ends share the underlying model, so the terminal UI's node-insert menu
+  offers the computed-column block too.
+
 - **GUI report blocks now lift and float while you drag them.** Dragging a block
   in the PaperTrail block editor now picks it up: the block follows the pointer
   in a floating layer and its original slot goes blank, so it reads as physically
