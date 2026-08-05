@@ -178,6 +178,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   both the GUI chips and the terminal source highlighter, so a long report line
   reads at a glance.
 
+- **GUI follow-ups: roomier key fields, aligned form rows, distinct
+  `WITH`/`PARALLEL` chips, and a Linux taskbar launcher.** Key/value tables
+  (request Headers, Params, Cookies, Options, Captures, the environment variable
+  editor and the Body form/multipart fields) now **split their spare width ~35%
+  key / ~65% value** so the key grows with the panel too, instead of staying a
+  fixed sliver next to a filling value. The Body **form/multipart rows are now a
+  grid**, so the Text/File kind dropdowns and their values line up in shared
+  columns rather than drifting downwards row by row. PaperTrail chip colours are
+  further de-conflicted: **`WITH`** now reads in the accent (a block opener,
+  distinct from `REPORT`'s substitution colour) and **`PARALLEL`** in the error
+  hue, so it stands apart from the blue loop/`SET` chips it sits beside — mirrored
+  in the terminal highlighter. On Linux the GUI now installs a per-user
+  freedesktop launcher (`~/.local/share/applications/paperboy.desktop` plus a
+  logo copy under `~/.local/share/paperboy/`) so the **taskbar/dock shows the
+  PaperBoy logo** rather than a generic icon; it is written only if absent and
+  never blocks launch.
+
 
 ## [0.1.10] - 2026-08-03
 

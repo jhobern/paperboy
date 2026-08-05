@@ -10,6 +10,24 @@ pub const METHODS: [&str; 8] = [
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
 ];
 
+/// Width for the **key** cell of a two-column key/value row so the key grows
+/// with the panel instead of staying a fixed sliver next to a filling value.
+///
+/// A filling value column (the grid's last column, `desired_width(INFINITY)`)
+/// otherwise eats *all* free width, so a fixed-width key reads as "tiny key,
+/// huge value". Instead we reserve the row's fixed controls (`reserved`:
+/// checkbox, remove ✕, column spacing) and split the remaining free width
+/// ~35% key / ~65% value — the value still fills whatever is left. The result
+/// is clamped so the key never collapses to nothing and never starves the
+/// value of at least half the free space.
+///
+/// Call this **before** building the grid: inside a grid cell `available_width`
+/// reports the column width, not the panel width.
+pub fn split_key_width(ui: &egui::Ui, reserved: f32) -> f32 {
+    let usable = (ui.available_width() - reserved).max(120.0);
+    (usable * 0.35).clamp(90.0, usable * 0.5)
+}
+
 /// A selectable label whose footprint never changes between the
 /// unselected, hovered and selected states.
 ///
@@ -152,6 +170,11 @@ pub fn kv_editor(
     // one that fills and the value would stay content-sized (a narrow table).
     // So the remove ✕ is tucked into the value cell via a right-to-left layout:
     // ✕ pins to the right edge and the value fills everything to its left.
+    //
+    // The key must grow too (a fixed-width key next to a filling value reads as
+    // "tiny key, huge value"): after reserving the fixed controls (checkbox, ✕,
+    // column spacing) the free width is split ~35% key / ~65% value.
+    let key_w = split_key_width(ui, 72.0);
     egui::Grid::new(id)
         .num_columns(3)
         .spacing([8.0, 4.0])
@@ -165,7 +188,7 @@ pub fn kv_editor(
                 let k = ui.add(
                     egui::TextEdit::singleline(&mut rows[i].0)
                         .hint_text(key_hint)
-                        .desired_width(150.0),
+                        .desired_width(key_w),
                 );
                 if k.changed() {
                     changed = true;
@@ -215,7 +238,9 @@ pub fn pair_editor(
     let mut changed = false;
     let mut remove: Option<usize> = None;
     // See `kv_editor`: the value fills only as the last column, so the remove ✕
-    // shares the value cell (right-aligned) rather than being its own column.
+    // shares the value cell (right-aligned) rather than being its own column,
+    // and the key takes ~35% of the free width so it grows too.
+    let key_w = split_key_width(ui, 42.0);
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([8.0, 4.0])
@@ -226,7 +251,7 @@ pub fn pair_editor(
                 let k = ui.add(
                     egui::TextEdit::singleline(&mut rows[i].0)
                         .hint_text(key_hint)
-                        .desired_width(160.0),
+                        .desired_width(key_w),
                 );
                 if k.changed() {
                     changed = true;

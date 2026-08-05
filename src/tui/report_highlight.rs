@@ -88,17 +88,19 @@ fn is_keyword(word: &str) -> bool {
 
 /// The theme colour for a keyword, by category — kept in step with the GUI's
 /// PaperTrail chip colours (`gui/report_editor.rs::node_chips`) so a report
-/// reads with the same colour vocabulary in both front-ends: reporting
-/// (`REPORT`/`WITH`) in the substitution colour, response formatting in the
-/// accent, `SHOW` green, `HIDE` dimmed, `AS` and environment roles amber, and
-/// the structural loop/list keywords in the accent.
+/// reads with the same colour vocabulary in both front-ends: `REPORT` in the
+/// substitution colour, `WITH` in the accent (a block opener, distinct from
+/// `REPORT`), response formatting in the accent, `SHOW` green, `HIDE` dimmed,
+/// `AS` and environment roles amber, `PARALLEL` in the *error* hue so it stands
+/// apart from the blue loop keywords it sits beside, and the remaining
+/// structural loop/list keywords in the accent.
 fn keyword_color(upper: &str, th: &Theme) -> Color {
     match upper {
-        "REPORT" | "WITH" => th.subst,
-        "RESPONSE" | "RAW" | "PRETTY" => th.accent,
+        "REPORT" => th.subst,
         "SHOW" => th.ok,
         "HIDE" => th.dim,
         "AS" | "BASELINE" | "COMPARISON" => th.pending,
+        "PARALLEL" => th.err,
         _ => th.accent,
     }
 }
@@ -422,13 +424,18 @@ mod tests {
     #[test]
     fn keyword_colour_follows_category() {
         let th = th();
-        let line = "SHOW HIDE AS RESPONSE";
+        let line = "SHOW HIDE AS RESPONSE WITH PARALLEL";
         let spans = highlight_line(line, &ctx(), &th);
         let fg = |kw: &str| spans.iter().find(|s| s.content == kw).unwrap().style.fg;
         assert_eq!(fg("SHOW"), Some(th.ok));
         assert_eq!(fg("HIDE"), Some(th.dim));
         assert_eq!(fg("AS"), Some(th.pending));
         assert_eq!(fg("RESPONSE"), Some(th.accent));
+        // WITH is a block opener drawn in the accent (distinct from REPORT's
+        // substitution colour), and PARALLEL uses the error hue so it stands
+        // apart from the blue loop keywords.
+        assert_eq!(fg("WITH"), Some(th.accent));
+        assert_eq!(fg("PARALLEL"), Some(th.err));
     }
 
     #[test]

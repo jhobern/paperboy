@@ -578,7 +578,16 @@ fn assert_editor(
     let mut changed = false;
     let mut remove = None;
     for i in 0..asserts.len() {
-        ui.horizontal(|ui| {
+        // Pin the remove ✕ to the right and let the value fill everything to its
+        // left: an infinite-width field laid out left-to-right would instead
+        // claim the whole row and shove the ✕ off the edge (see `kv_editor`).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                .clicked()
+            {
+                remove = Some(i);
+            }
             let r = ui.add(
                 egui::TextEdit::singleline(&mut asserts[i])
                     .desired_width(f32::INFINITY)
@@ -587,12 +596,6 @@ fn assert_editor(
             );
             if r.changed() {
                 changed = true;
-            }
-            if ui
-                .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                .clicked()
-            {
-                remove = Some(i);
             }
         });
     }
@@ -616,83 +619,100 @@ fn form_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
-    for i in 0..fields.len() {
-        ui.horizontal(|ui| {
-            if ui.checkbox(&mut fields[i].enabled, "").changed() {
-                changed = true;
-            }
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut fields[i].key)
-                        .desired_width(120.0)
-                        .hint_text(s.gui_hint_field),
-                )
-                .changed()
-            {
-                changed = true;
-            }
-            // Kind picker.
-            let mut kind = fields[i].kind;
-            egui::ComboBox::from_id_salt(("formkind", i))
-                .selected_text(match kind {
-                    FormFieldKind::Text => s.gui_kind_text,
-                    FormFieldKind::File => s.gui_kind_file,
-                    FormFieldKind::Base64File => s.gui_kind_base64,
-                })
-                .width(80.0)
-                .show_ui(ui, |ui| {
-                    for (k, label) in [
-                        (FormFieldKind::Text, s.gui_kind_text),
-                        (FormFieldKind::File, s.gui_kind_file),
-                        (FormFieldKind::Base64File, s.gui_kind_base64),
-                    ] {
-                        if super::widgets::selectable(ui, kind == k, label).clicked() {
-                            kind = k;
-                            changed = true;
-                        }
-                    }
-                });
-            fields[i].kind = kind;
-            let hint = match kind {
-                FormFieldKind::Text => s.gui_hint_value,
-                _ => "/path/to/file",
-            };
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut fields[i].value)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(hint),
-                )
-                .changed()
-            {
-                changed = true;
-            }
-            if ui
-                .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                .clicked()
-            {
-                remove = Some(i);
-            }
-        });
-        if fields[i].kind == FormFieldKind::Base64File {
-            ui.horizontal(|ui| {
-                ui.add_space(24.0);
-                ui.label(RichText::new(s.gui_base64_prefix).color(theme.dim).small());
-                let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut prefix).desired_width(240.0))
-                    .changed()
-                {
-                    fields[i].base64_prefix = if prefix.is_empty() {
-                        None
-                    } else {
-                        Some(prefix)
-                    };
+    // A grid (not a per-row `ui.horizontal`) keeps every column vertically
+    // aligned across rows: the kind ComboBox is taller than the text cells, so
+    // laying each row out independently let the dropdowns and values drift down
+    // the further right they sat. The grid pins them to shared column edges and
+    // gives the key ~35% of the free width (the value fills the rest as the
+    // last column — see `widgets::split_key_width`).
+    let key_w = super::widgets::split_key_width(ui, 160.0);
+    egui::Grid::new("form_fields")
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for i in 0..fields.len() {
+                if ui.checkbox(&mut fields[i].enabled, "").changed() {
                     changed = true;
                 }
-            });
-        }
-    }
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut fields[i].key)
+                            .desired_width(key_w)
+                            .hint_text(s.gui_hint_field),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                // Kind picker.
+                let mut kind = fields[i].kind;
+                egui::ComboBox::from_id_salt(("formkind", i))
+                    .selected_text(match kind {
+                        FormFieldKind::Text => s.gui_kind_text,
+                        FormFieldKind::File => s.gui_kind_file,
+                        FormFieldKind::Base64File => s.gui_kind_base64,
+                    })
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for (k, label) in [
+                            (FormFieldKind::Text, s.gui_kind_text),
+                            (FormFieldKind::File, s.gui_kind_file),
+                            (FormFieldKind::Base64File, s.gui_kind_base64),
+                        ] {
+                            if super::widgets::selectable(ui, kind == k, label).clicked() {
+                                kind = k;
+                                changed = true;
+                            }
+                        }
+                    });
+                fields[i].kind = kind;
+                let hint = match kind {
+                    FormFieldKind::Text => s.gui_hint_value,
+                    _ => "/path/to/file",
+                };
+                // Value fills the last column; the remove ✕ is tucked to its
+                // right (see the note in `widgets::kv_editor`).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut fields[i].value)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(hint),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                ui.end_row();
+                if fields[i].kind == FormFieldKind::Base64File {
+                    ui.label(""); // checkbox column
+                    ui.label(RichText::new(s.gui_base64_prefix).color(theme.dim).small());
+                    ui.label(""); // kind column
+                    let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut prefix).desired_width(f32::INFINITY))
+                        .changed()
+                    {
+                        fields[i].base64_prefix = if prefix.is_empty() {
+                            None
+                        } else {
+                            Some(prefix)
+                        };
+                        changed = true;
+                    }
+                    ui.end_row();
+                }
+            }
+        });
     if let Some(i) = remove {
         fields.remove(i);
         changed = true;

@@ -124,7 +124,7 @@ pub struct GuiApp {
 /// The raw PNG bytes of the application logo, embedded at compile time so the
 /// binary is self-contained (no runtime asset path to resolve). Used for both
 /// the window/taskbar icon and the status-bar badge.
-const LOGO_PNG: &[u8] = include_bytes!("../../assets/paperboy_logo.png");
+pub(super) const LOGO_PNG: &[u8] = include_bytes!("../../assets/paperboy_logo.png");
 
 /// Decode the embedded logo into an `egui::IconData` for the window/taskbar
 /// icon. Returns `None` if decoding fails (we then fall back to the platform

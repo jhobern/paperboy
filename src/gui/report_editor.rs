@@ -505,7 +505,7 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
             // only carries the opening `WITH` keyword so it reads like the
             // textual form (`… SHOW(Time) WITH`).
             if !with.is_empty() {
-                chips.push(Chip::fixed("WITH".into(), th.subst));
+                chips.push(Chip::fixed("WITH".into(), th.accent));
             }
             chips
         }
@@ -548,8 +548,10 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                     Some(n) => format!("PARALLEL({n})"),
                 };
                 // The head label already embeds the PARALLEL prefix; strip it so
-                // it is not duplicated by the base chip below.
-                chips.push(Chip::modifier(text, th.accent, DetachWhich::Parallel));
+                // it is not duplicated by the base chip below. PARALLEL uses the
+                // theme's *error* hue so it stands apart from the blue loop/set
+                // chips it sits beside (`PARALLEL(8) FOR …`).
+                chips.push(Chip::modifier(text, th.err, DetachWhich::Parallel));
             }
             let full = node.label();
             let head = match parallel {
@@ -1334,9 +1336,10 @@ fn palette_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, base: Color32) {
 /// a palette modifier reads the same colour as the chip it drops in.
 fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
     match m {
-        Modifier::Report | Modifier::With => th.subst,
+        Modifier::Report => th.subst,
+        Modifier::With => th.accent,
         Modifier::As => th.pending,
-        Modifier::Parallel => th.accent,
+        Modifier::Parallel => th.err,
     }
 }
 
@@ -1619,7 +1622,7 @@ fn with_block(
     });
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 16.0);
-        static_chip(ui, th, "END", th.subst);
+        static_chip(ui, th, "END", th.accent);
     });
 }
 
