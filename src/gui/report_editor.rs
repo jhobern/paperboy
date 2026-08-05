@@ -1175,7 +1175,7 @@ fn trash_bin(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
             egui::StrokeKind::Outside,
         );
     }
-    if let Some(item) = zone.dnd_release_payload::<DragItem>() {
+    if let Some(item) = release_payload::<DragItem>(&zone) {
         match &*item {
             DragItem::Row(path) => acts.push(Act::DeletePath(path.clone())),
             DragItem::Chip { path, which } => acts.push(Act::DetachMod {
@@ -1213,6 +1213,26 @@ fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
 /// opens an animated gap when a base block is dragged over it. Leaf and loop
 /// heads carry an inline single-line editor when selected.
 #[allow(clippy::too_many_arguments)]
+/// Consume a drag-and-drop payload of type `T` on the release frame — but only
+/// when the payload in flight is *actually* a `T`.
+///
+/// egui's [`egui::Response::dnd_release_payload`] is destructive in a subtle
+/// way: it `take()`s the stored payload out of the DnD plugin *before* it checks
+/// its type, so asking it for a type that doesn't match still throws the payload
+/// away — silently starving any later reader on the same frame. Several drop
+/// zones overlap each report row (the modifier zone reads [`Modifier`], the
+/// insert strip reads [`NodeKind`] *and* [`DragItem`]), so an unguarded
+/// `dnd_release_payload::<NodeKind>()` would eat a [`DragItem::Row`] before the
+/// reorder branch ever ran (which is exactly why drops "opened a gap" but never
+/// moved anything). Peeking non-destructively with `dnd_hover_payload` first and
+/// only consuming a matching payload lets the zones coexist.
+fn release_payload<T: std::any::Any + Send + Sync>(
+    resp: &egui::Response,
+) -> Option<std::sync::Arc<T>> {
+    resp.dnd_hover_payload::<T>()?;
+    resp.dnd_release_payload::<T>()
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -1272,7 +1292,7 @@ fn block_row(
                 egui::StrokeKind::Outside,
             );
         }
-        if let Some(m) = zresp.dnd_release_payload::<Modifier>()
+        if let Some(m) = release_payload::<Modifier>(&zresp)
             && m.applies_to(n)
         {
             acts.push(Act::AttachMod {
@@ -1313,12 +1333,12 @@ fn block_row(
         ui.ctx()
             .animate_value_with_time(gap_id, if hovering_base { GAP_H } else { 0.0 }, 0.12);
     ui.ctx().data_mut(|d| d.insert_temp(gap_id, gap));
-    if let Some(kind) = strip_resp.dnd_release_payload::<NodeKind>() {
+    if let Some(kind) = release_payload::<NodeKind>(&strip_resp) {
         acts.push(Act::DropNode {
             pos: drop_pos.clone(),
             node: node_for_kind(*kind, titles),
         });
-    } else if let Some(item) = strip_resp.dnd_release_payload::<DragItem>() {
+    } else if let Some(item) = release_payload::<DragItem>(&strip_resp) {
         if let DragItem::Row(from) = &*item
             && *from != row.path
         {
