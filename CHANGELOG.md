@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.3.1] - 2026-08-06
+
+### Changed
+
+- **The GUI is now behind a `gui` Cargo feature, and is no longer built by
+  default.** `cargo install paperboy` builds only the terminal UI and the
+  headless runner; `cargo install paperboy --features gui` adds the graphical
+  one. eframe/winit/wgpu more than doubled the dependency tree (225 crates to
+  482) and dominated the build, which is a poor trade for anyone who only wants
+  PaperBoy in a terminal. Nothing else changes: the saved-state format is
+  identical, so a terminal-only build still round-trips a GUI user's window and
+  panel geometry, and `--gui` on a build without the feature prints the command
+  to install one that has it rather than failing to parse the flag.
+
+
 ## [0.3.0] - 2026-08-06
 
 ### Added

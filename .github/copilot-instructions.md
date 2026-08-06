@@ -10,7 +10,14 @@ terminal UI (default) and a headless CLI runner.
 - `cargo run -- -c collection.hurl [-e environment.vars] [--batch]` — headless
   CLI runner (runs a collection and exits).
 - `cargo build` / `cargo build --release`.
-- `cargo test` — run the whole suite. This is a **binary crate with no lib
+- `cargo run --features gui -- --gui` — launch the native GUI. The GUI is behind
+  the **`gui` Cargo feature** (it doubles the dependency tree, so `cargo install
+  paperboy` doesn't pay for it); everything it needs lives under `src/gui`, and
+  the rest of the tree never refers to it. Items that exist only for the GUI
+  carry `#[cfg_attr(not(feature = "gui"), allow(dead_code))]` so **both**
+  configurations stay warning-free — check both after touching shared code.
+- `cargo test` — run the whole suite; add `--features gui` to include the GUI's
+  own tests. This is a **binary crate with no lib
   target**, so `cargo test --lib` fails; always use plain `cargo test` (unit
   tests are compiled into `src/main.rs`).
 - `cargo test <name>` — run a single test (or a substring filter), e.g.

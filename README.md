@@ -12,7 +12,9 @@ It ships as a single binary with three front-ends:
   editing, running and organizing requests.
 - **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
   with the same features and layout as the terminal UI, using mouse gestures
-  (drag to resize panels, click to switch tabs) instead of shortcuts.
+  (drag to resize panels, click to switch tabs) instead of shortcuts. Opt-in at
+  build time via the `gui` Cargo feature, since it more than doubles the
+  dependency tree.
 - **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
   prints the results, for scripts and CI.
 
@@ -34,11 +36,23 @@ git-remote workflows behave identically across them.
 
 ## Installing & running
 
-From the `paperboy` directory:
+```sh
+cargo install paperboy                 # terminal UI + headless runner
+cargo install paperboy --features gui  # …and the graphical UI
+```
+
+The graphical UI is behind the `gui` feature because it pulls in
+eframe/winit/wgpu — roughly twice as many crates as everything else combined —
+and most of that build time is wasted on anyone who only wants PaperBoy in a
+terminal. A build without it still reads and writes the same state file, so
+switching between the two loses nothing. Running `--gui` on a build that lacks
+it prints the command to install one that has it.
+
+From a checkout:
 
 ```sh
-cargo run            # launch the terminal UI
-cargo run -- --gui   # launch the graphical UI
+cargo run                           # launch the terminal UI
+cargo run --features gui -- --gui   # launch the graphical UI
 cargo build --release
 ```
 
@@ -192,8 +206,10 @@ cargo build --release
 
 ## Graphical UI
 
-Run `paperboy -g` (or `cargo run -- --gui`) to open the native desktop
-front-end instead of the terminal UI. It is built on
+Run `paperboy -g` (or `cargo run --features gui -- --gui`) to open the native
+desktop front-end instead of the terminal UI. It needs a build made with the
+`gui` feature (see [Installing & running](#installing--running)). It is built
+on
 [eframe/egui](https://github.com/emilk/egui) and drives the exact same core as
 the terminal UI, so it is feature-for-feature equivalent — collection tabs, the
 folder tree, the request editor (Params, Headers, Body, Auth, Cookies, Options,

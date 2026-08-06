@@ -1,11 +1,17 @@
-//! PaperBoy — a Rust-native API client (Postman alternative). Two front-ends
-//! over one core: a terminal UI (default), and a headless CLI runner
-//! (`-c collection.hurl [-e environment.vars]`).
+//! PaperBoy — a Rust-native API client (Postman alternative). Front-ends over
+//! one core: a terminal UI (default), a headless CLI runner
+//! (`-c collection.hurl [-e environment.vars]`), and — behind the `gui` Cargo
+//! feature — a native graphical UI.
 
 mod cli;
 mod collection;
 mod environment;
 mod git_remote;
+// The GUI pulls in eframe/winit/wgpu, which dominate build time, so it is
+// opt-in (`--features gui`). Everything it needs lives under `src/gui`; the
+// rest of the tree never refers to it, so the gate is this one line plus the
+// `--gui` dispatch below.
+#[cfg(feature = "gui")]
 mod gui;
 mod http;
 mod hurl;
@@ -101,7 +107,8 @@ struct Cli {
     output: Option<String>,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
-    /// Ignored in the headless modes (`-c`/`-r`).
+    /// Ignored in the headless modes (`-c`/`-r`). Only available when built
+    /// with the `gui` feature (`cargo install paperboy --features gui`).
     #[arg(short = 'g', long)]
     gui: bool,
 }
@@ -135,11 +142,7 @@ fn main() {
 
     // Native GUI mode (`-g/--gui`): a graphical front-end over the same core.
     if cli.gui {
-        if let Err(e) = gui::run() {
-            eprintln!("gui error: {e}");
-            std::process::exit(1);
-        }
-        std::process::exit(0);
+        std::process::exit(run_gui());
     }
 
     // Terminal UI (the default).
@@ -148,4 +151,27 @@ fn main() {
         std::process::exit(1);
     }
     std::process::exit(0);
+}
+
+/// Launch the GUI, or explain why this build can't.
+///
+/// The flag is always accepted so that a user who copies a `--gui` command from
+/// the README gets told how to get it, rather than an unhelpful "unexpected
+/// argument" from the argument parser.
+#[cfg(feature = "gui")]
+fn run_gui() -> i32 {
+    if let Err(e) = gui::run() {
+        eprintln!("gui error: {e}");
+        return 1;
+    }
+    0
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> i32 {
+    eprintln!(
+        "This build of PaperBoy has no GUI. Reinstall it with the `gui` feature:\n\
+         \x20   cargo install paperboy --features gui"
+    );
+    1
 }

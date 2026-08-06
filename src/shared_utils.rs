@@ -28,6 +28,7 @@ const COMPACT_ELLIPSIS: &str = "...";
 /// text is harmless. Scanning is escape-aware so a `\"` inside a string doesn't
 /// end it early. Operates on `char`s (never byte offsets) so it can't panic on
 /// multi-byte UTF-8.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn compact_long_strings(text: &str) -> String {
     compact_long_strings_mapped(text).0
 }

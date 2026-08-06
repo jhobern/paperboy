@@ -1,11 +1,31 @@
 [package]
 name = "paperboy"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
 repository = "https://github.com/jhobern/paperboy"
 license = "MIT"
+
+[features]
+# The terminal UI and the headless runner are always built. The native GUI is
+# opt-in because it drags in eframe/winit/wgpu and the Phosphor font, which
+# together dominate build time — a cost a user who only wants `paperboy` in a
+# terminal should not pay:
+#
+#     cargo install paperboy --features gui
+#
+# Everything the GUI needs is optional and enabled only by this feature; the
+# saved-state format is unaffected, so a terminal-only build still round-trips
+# a GUI user's window/panel geometry rather than dropping it.
+default = []
+gui = [
+    "dep:eframe",
+    "dep:egui_extras",
+    "dep:egui-phosphor",
+    "dep:image",
+    "dep:rfd",
+]
 
 
 [dependencies]
@@ -50,22 +70,24 @@ nom = "7.0"
 # `theme`, …) as the terminal UI, so the two never duplicate logic. egui is
 # immediate-mode like ratatui, so the panel model and RGB theming map across
 # directly. `egui_extras` provides the table/grid builders the panels use.
-eframe = "0.35"
-egui_extras = "0.35"
+eframe = { version = "0.35", optional = true }
+egui_extras = { version = "0.35", optional = true }
 # Phosphor icon font for the GUI. egui's bundled emoji/symbol fonts don't
 # actually contain the folder/file/report/key/caret glyphs the tree needs (they
 # render as empty "tofu" boxes on many systems), so we register the Phosphor
 # icon set at startup and draw all GUI icons from it — guaranteed to render
 # regardless of the host's installed fonts. `default-features = false` +
 # `regular` bundles only the one weight we use.
-egui-phosphor = { version = "0.13", default-features = false, features = [
+egui-phosphor = { version = "0.13", default-features = false, optional = true, features = [
     "regular",
 ] }
 # PNG decoding for the application/window icon and the status-bar logo. Already
 # in the tree transitively (egui image support); declared directly so we can
 # decode `assets/paperboy_logo.png` into an `egui::IconData` / `ColorImage`.
 # Pure-Rust `png` backend only — no C toolchain, matching the rest of the build.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, optional = true, features = [
+    "png",
+] }
 # Native OS file/folder picker for the GUI's open/save flows and any path field
 # (collections/workspaces/environments, `FOR … IN FILES/FOLDERS` folders, and
 # Form/Multipart File/Base64 values). Default features use the XDG Desktop
@@ -73,7 +95,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # system GTK `-dev` libraries — matching the rest of this self-contained build.
 # The terminal UI keeps its own in-app browser overlay (the right UX for a
 # terminal); rfd is GUI-only.
-rfd = { version = "0.17", default-features = false, features = [
+rfd = { version = "0.17", default-features = false, optional = true, features = [
     "xdg-portal",
     "wayland",
 ] }

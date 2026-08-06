@@ -10,6 +10,13 @@
 //! re-serializes back to `report.text` via [`ReportFlow::to_text`], so the text
 //! and node views round-trip and both front-ends share this one implementation.
 
+// The modifier half of this API (attach / detach / carry / transfer) exists for
+// the GUI's block editor — the terminal UI reaches its node editor through its
+// own wizards and uses only the insert/move/replace half. It stays compiled in a
+// terminal-only build so this module remains one shared core with one test
+// suite, rather than splintering along a front-end boundary.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+
 use crate::i18n::Strings;
 use crate::report::flow::{
     EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
