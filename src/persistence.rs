@@ -143,6 +143,12 @@ pub struct PersistedTab {
     /// start collapsed — a safe, backwards-compatible default.
     #[serde(default)]
     pub workspace_expanded_paths: Vec<String>,
+    /// The workspace-tree node the user last selected, as a forward-slash path
+    /// relative to `workspace_root` (see [`Collection::workspace_selected`]).
+    /// Absent in older state files, which simply means the tab reopens on its
+    /// loaded collection file as it always did.
+    #[serde(default)]
+    pub workspace_selected_path: Option<String>,
 }
 
 /// Enough information to offer redownloading a Workspace whose entire
@@ -157,6 +163,15 @@ pub struct PendingWorkspaceReload {
     /// `workspace_root`, so it can be re-resolved against a freshly
     /// downloaded folder — which will have a different absolute temp path.
     pub relative_selected_path: Option<String>,
+}
+
+/// A path rendered as forward-slash-separated components, so relative paths in
+/// `state.json` round-trip between platforms.
+fn rel_slashes(rel: &std::path::Path) -> String {
+    rel.components()
+        .filter_map(|comp| comp.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl PersistedTab {
@@ -198,20 +213,17 @@ impl PersistedTab {
                     let mut paths: Vec<String> = c
                         .workspace_expanded
                         .iter()
-                        .filter_map(|abs| {
-                            abs.strip_prefix(root).ok().map(|rel| {
-                                rel.components()
-                                    .filter_map(|comp| comp.as_os_str().to_str())
-                                    .collect::<Vec<_>>()
-                                    .join("/")
-                            })
-                        })
+                        .filter_map(|abs| abs.strip_prefix(root).ok().map(rel_slashes))
                         .filter(|s| !s.is_empty())
                         .collect();
                     paths.sort(); // deterministic JSON
                     paths
                 })
                 .unwrap_or_default(),
+            workspace_selected_path: match (&c.workspace_root, &c.workspace_selected) {
+                (Some(root), Some(sel)) => sel.strip_prefix(root).ok().map(rel_slashes),
+                _ => None,
+            },
         }
     }
 
@@ -329,6 +341,16 @@ impl PersistedTab {
         // names from disk into the cache.
         c.rebuild_expanded_titles();
         c.sync_ws_cursor();
+        // Only remember a selection whose file is still there — a workspace is a
+        // live folder, so the node may well have been deleted or renamed since,
+        // and reopening on a path that no longer exists would just report an
+        // error the user didn't ask for.
+        c.workspace_selected = match (&c.workspace_root, &self.workspace_selected_path) {
+            (Some(root), Some(rel)) if !rel.is_empty() => {
+                Some(root.join(rel)).filter(|p| p.exists())
+            }
+            _ => None,
+        };
         (c, pending_reload)
     }
 }
@@ -337,7 +359,7 @@ impl PersistedTab {
 /// *source text* is snapshotted (like [`PersistedTab`] snapshots collection
 /// entries) so an unsaved scratch report survives a restart; `path`/`git_origin`
 /// keep "Save" targeting the right place after a restart.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct PersistedReport {
     pub name: String,
     #[serde(default)]
@@ -392,6 +414,64 @@ impl PersistedReport {
             dirty: false,
         }
     }
+}
+
+/// Which view the GUI's centre column was showing, so it reopens on the same
+/// thing rather than always dropping the user back on the request editor.
+///
+/// A report opened from a Workspace file has no stable identity to persist (it
+/// is addressed by an on-disk path that may have moved), so those record as
+/// [`GuiView::Reports`] — the list is still the right place to land.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GuiView {
+    /// The request editor (the default view).
+    #[default]
+    Requests,
+    /// The reports list.
+    Reports,
+    /// The block editor open on the session report at this index.
+    Report(usize),
+}
+
+/// Window and panel geometry for the graphical front-end.
+///
+/// The terminal UI's `list_width`/`response_pct` are measured in character
+/// cells and percentages of a text grid, so they cannot describe a pixel layout
+/// the user dragged with a mouse — rounding one into the other would creep the
+/// panels every time the two front-ends were used in turn. The GUI therefore
+/// records its own geometry here and the two leave each other's alone.
+///
+/// Every size is optional: `None` means "never adjusted", which is what lets
+/// the GUI fall back to a layout derived from the terminal defaults on a fresh
+/// profile.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+pub struct GuiLayout {
+    /// Inner size of the window in logical points.
+    #[serde(default)]
+    pub window: Option<(f32, f32)>,
+    /// Width of the left column (Requests + Global Environments).
+    #[serde(default)]
+    pub left_width: Option<f32>,
+    /// Height of the Global Environments panel inside the left column.
+    #[serde(default)]
+    pub env_height: Option<f32>,
+    /// Height of the Response panel under the request editor.
+    #[serde(default)]
+    pub response_height: Option<f32>,
+    /// Height of the report editor's diagnostics panel.
+    #[serde(default)]
+    pub report_diag_height: Option<f32>,
+    /// Width of the report editor's block palette column.
+    #[serde(default)]
+    pub report_palette_width: Option<f32>,
+    /// Which centre-column view was open.
+    #[serde(default)]
+    pub view: GuiView,
+    /// Whether the open report editor was showing Blocks or Source. Stored as
+    /// a flag rather than the full `EditorView` because the Results view has
+    /// nothing to show until the report is run again.
+    #[serde(default)]
+    pub report_source_view: bool,
 }
 
 /// The full application state saved between sessions. Environments are stored
@@ -470,6 +550,11 @@ pub struct PersistedState {
     /// Environment, if any.
     #[serde(default)]
     pub active_global_env: Option<usize>,
+    /// GUI-only window/panel geometry and last-open view (see [`GuiLayout`]).
+    /// Ignored by the terminal UI, which round-trips it untouched so using one
+    /// front-end never discards the other's layout.
+    #[serde(default)]
+    pub gui: GuiLayout,
 }
 
 fn yes() -> bool {
@@ -507,6 +592,7 @@ impl Default for PersistedState {
             active_theme: None,
             global_envs: Vec::new(),
             active_global_env: None,
+            gui: GuiLayout::default(),
         }
     }
 }
@@ -567,6 +653,53 @@ mod tests {
         assert_eq!(restored.text, r.text);
         assert_eq!(restored.path, r.path);
         assert!(!restored.dirty, "a restored report is not dirty");
+    }
+
+    /// A Workspace tab reopens on whatever node was last selected in its tree,
+    /// including the `.trail` reports and `.vars` environments that previously
+    /// left no trace at all.
+    #[test]
+    fn a_workspaces_selected_node_round_trips_and_drops_when_it_vanishes() {
+        let root =
+            std::env::temp_dir().join(format!("paperboy_ws_selected_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nightly")).unwrap();
+        let report = root.join("nightly/run.trail");
+        std::fs::write(&report, "REQUEST A\n").unwrap();
+
+        let mut c = Collection::new("ws".to_string(), Vec::new());
+        c.workspace_root = Some(root.clone());
+        c.workspace_selected = Some(report.clone());
+
+        let persisted = PersistedTab::from_collection(&c, None);
+        assert_eq!(
+            persisted.workspace_selected_path.as_deref(),
+            Some("nightly/run.trail"),
+            "stored relative to the root, with forward slashes"
+        );
+
+        let json = serde_json::to_string(&persisted).unwrap();
+        let back: PersistedTab = serde_json::from_str(&json).unwrap();
+        let (restored, _) = back.into_collection(None);
+        assert_eq!(restored.workspace_selected, Some(report.clone()));
+
+        // A workspace is a live folder: a node deleted since the last session
+        // must not come back as a selection that only produces an error.
+        std::fs::remove_file(&report).unwrap();
+        let json = serde_json::to_string(&PersistedTab::from_collection(&c, None)).unwrap();
+        let back: PersistedTab = serde_json::from_str(&json).unwrap();
+        let (restored, _) = back.into_collection(None);
+        assert_eq!(restored.workspace_selected, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An older `state.json` has no selection recorded; the tab must still open.
+    #[test]
+    fn a_state_file_without_a_workspace_selection_still_loads() {
+        let tab: PersistedTab = serde_json::from_str(r#"{"name":"ws","entries":[]}"#).unwrap();
+        assert_eq!(tab.workspace_selected_path, None);
+        let (c, _) = tab.into_collection(None);
+        assert_eq!(c.workspace_selected, None);
     }
 
     #[test]

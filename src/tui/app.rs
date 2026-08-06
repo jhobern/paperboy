@@ -49,6 +49,12 @@ pub(crate) enum FileAction {
     /// permanently (see [`TuiApp::pending_workspace_save`]) — confirms on
     /// `Space` exactly like `OpenWorkspace`, then a name prompt follows.
     SaveWorkspaceChooseFolder,
+    /// Picking the DESTINATION FOLDER for a workspace file or folder being
+    /// moved (see [`TuiApp::pending_workspace_move`]) — confirms on `Space`
+    /// like the other folder pickers, since there is no name to type. The
+    /// browser is seeded at the workspace root, and the move itself still
+    /// refuses anything outside it.
+    MoveWorkspaceItemChooseFolder,
     /// Picking a DESTINATION FOLDER for "Save Collection As" (including the
     /// Scratch Space, which has no file of its own). Confirms on `Space` like
     /// the Workspace folder pickers; a filename prompt (pre-filled with the
@@ -78,6 +84,14 @@ pub(crate) enum FileAction {
     /// other folder pickers; Enter writes `dir/<name>.report` (extension added
     /// when missing), seeded with the report's name.
     SaveReportChooseFolder,
+    /// Picking a DESTINATION FOLDER for "New Report" — creating a brand-new
+    /// empty report. Confirms like the other folder pickers (navigate to the
+    /// folder, Tab to the filename editor, Enter writes `dir/<name>.trail`);
+    /// the filename is seeded with `report.trail`. If the chosen folder lies
+    /// inside an open Workspace, the report is created embedded in that
+    /// workspace's tree; otherwise it opens as a standalone report tab. `Ctrl+N`
+    /// in this browser instead creates an unsaved scratch report tab (no file).
+    NewReportChooseFolder,
     /// Picking a SOURCE FOLDER for a `FOR … IN FILES/FOLDERS` node in the
     /// structured report editor. Confirms on `Space` (the current directory,
     /// like `OpenWorkspace`); the chosen path is written into the loop's
@@ -101,6 +115,7 @@ impl FileAction {
                 | FileAction::SaveReportCsvChooseFolder
                 | FileAction::SaveReportBaselineChooseFolder
                 | FileAction::SaveReportChooseFolder
+                | FileAction::NewReportChooseFolder
         )
     }
 }
@@ -134,12 +149,11 @@ pub(crate) enum PromptKind {
     /// `.hurl` extension is defaulted. Reached via `n` in the workspace
     /// destination picker.
     NewWorkspaceCollection(usize),
-    /// Naming a brand-new `.trail` file being created inside a Workspace tab
-    /// (the `usize` is the workspace collection index). Like
-    /// [`Self::NewWorkspaceCollection`] the typed text is a path relative to
-    /// the workspace root; subfolders are allowed and a `.trail` extension is
-    /// defaulted. Reached via `R` in the workspace destination picker.
-    NewWorkspaceReport(usize),
+    /// Naming a new workspace file of any kind, created in the folder the tree
+    /// cursor is in (see [`TuiApp::open_new_workspace_item_prompt`]). Which of
+    /// the three kinds it is comes from the extension typed, so one key and one
+    /// prompt cover all of them rather than a menu asking which first.
+    NewWorkspaceItem(usize, std::path::PathBuf),
     /// Editing one report-flow node "as a line" in the structured node editor:
     /// the prompt is seeded with the node's single-line source form and, on
     /// commit, that text is re-parsed and swapped back into the flow at `path`
@@ -160,7 +174,7 @@ impl PromptKind {
             PromptKind::FilePath(FileAction::SaveCollection) => ".hurl",
             PromptKind::FilePath(FileAction::SaveEnv) => ".vars",
             PromptKind::NewWorkspaceCollection(_) => ".hurl",
-            PromptKind::NewWorkspaceReport(_) => ".trail",
+            PromptKind::NewWorkspaceItem(..) => ".hurl",
             _ => "",
         }
     }
@@ -431,11 +445,6 @@ pub(crate) enum Overlay {
     RemoteGit(Box<RemoteWizard>),
     GitSave(Box<GitSaveWizard>),
     /// Dry-run preview for a report tab: the projected row count, a sample of
-    /// the first few iterations' resolved bindings, and any producer /
-    /// request-resolution problems — computed by expanding the flow with a
-    /// no-op runner (no HTTP). Opened with `d` in the Reports view; scrolls with
-    /// Up/Down, closes with Esc/`q` (see [`crate::tui::reports::DryRunReport`]).
-    ReportDryRun(Box<crate::tui::reports::DryRunReport>),
     /// Drill-down popup for a results grid cell: shows the selected cell's full
     /// (untruncated, unflattened) content in a scrollable, selectable panel.
     /// Opened with Enter (or a second click on the same cell) in the Results
@@ -478,6 +487,35 @@ pub(crate) enum Overlay {
     /// `Enter` on a `FOR … IN ENVS` node. See
     /// [`crate::tui::report_nodes::EnvsForm`].
     ReportNodeEnvs(Box<crate::tui::report_nodes::EnvsForm>),
+    /// The structured node editor's `FOR … IN FILES` configure form
+    /// ([`Overlay::ReportNodeFiles`]): picks the loop variable, the source
+    /// folder (via the file picker), an optional `MATCH` glob and the
+    /// `PARALLEL` toggle. Opened with `Enter` on a `FOR … IN FILES` node. See
+    /// [`crate::tui::report_nodes::FilesForm`].
+    ReportNodeFiles(Box<crate::tui::report_nodes::FilesForm>),
+    /// The structured node editor's `WITH name: query` field form
+    /// ([`Overlay::ReportNodeWithField`]): one ad-hoc column of a report
+    /// request's `WITH … END` block — its name, its Hurl query and its
+    /// `STATISTICS(…)` checklist. Opened from a `WITH` row of the request form.
+    /// See [`crate::tui::report_nodes::WithFieldForm`].
+    ReportNodeWithField(Box<crate::tui::report_nodes::WithFieldForm>),
+    /// The structured node editor's `VARIABLE = VALUE` form
+    /// ([`Overlay::ReportNodeAssign`]). See
+    /// [`crate::tui::report_nodes::AssignForm`].
+    ReportNodeAssign(Box<crate::tui::report_nodes::AssignForm>),
+    /// The structured node editor's `LIST NAME = [ … ]` form
+    /// ([`Overlay::ReportNodeList`]). See
+    /// [`crate::tui::report_nodes::ListForm`].
+    ReportNodeList(Box<crate::tui::report_nodes::ListForm>),
+    /// The structured node editor's `REPORT <var>` form
+    /// ([`Overlay::ReportNodeVars`]): which in-scope variables become columns,
+    /// and for a single one its `AS` name and `STATISTICS(…)`. See
+    /// [`crate::tui::report_nodes::VarsForm`].
+    ReportNodeVars(Box<crate::tui::report_nodes::VarsForm>),
+    /// The structured node editor's `REPORT "<template>" AS <name>` form
+    /// ([`Overlay::ReportNodeComputed`]). See
+    /// [`crate::tui::report_nodes::ComputedForm`].
+    ReportNodeComputed(Box<crate::tui::report_nodes::ComputedForm>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
     /// Linking/unlinking a Global Environment to a collection (see
@@ -580,6 +618,12 @@ pub(crate) enum ConfirmAction {
     /// values. Holds the env id. Raised by `Ctrl+R` in the entries popup only
     /// when the env has unsaved changes.
     RevertEnv(u64),
+    /// Rerun the active report when its current on-screen results haven't been
+    /// exported (CSV/JSON/HTML/XLSX or a `.baseline` snapshot) since the run
+    /// that produced them — confirming discards the unsaved results. Acts on the
+    /// active report tab. Raised only when [`ReportTab::results_exported`] is
+    /// false and no run is in flight (#2).
+    RerunReport,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -611,7 +655,6 @@ pub(crate) enum MouseScrollTarget {
     Response,
     ReportPane(crate::tui::reports::ReportPane),
     Help,
-    ReportDryRun,
     ReportCellPopup,
     WizardBody,
     WizardAllSections,
@@ -984,6 +1027,22 @@ pub struct TuiApp {
     /// which is what keeps dragging a selection or scrolling responsive even
     /// for an "obscenely large" body.
     pub(crate) resp_panel: MultiSelectPanel,
+    /// When true, the Response body view shortens long string literals to a
+    /// `"head...tail"` overview (see
+    /// [`crate::shared_utils::compact_long_strings`]). Toggled with `c` while
+    /// the Response pane is focused. Display-only: `resp_full_body` keeps the
+    /// untruncated text so a whole-panel `y`-copy still yields the full body.
+    pub(crate) response_compact: bool,
+    /// The full (untruncated) Response body cached each frame the normal body is
+    /// drawn, so the whole-panel copy fallback can return it even while the
+    /// panel is showing the compacted overview. Empty when the current frame
+    /// isn't showing a compactable body (loading / no-response / error).
+    pub(crate) resp_full_body: Arc<str>,
+    /// Per-line column map from the *compacted* Response body back to the full
+    /// body, rebuilt alongside `resp_full_body` each frame the compact overview
+    /// is drawn. Lets a drag-selection over compacted text copy the untruncated
+    /// value (see `resp_full_selected_parts`). Empty when not compacting.
+    pub(crate) resp_compact_line_maps: Vec<Vec<usize>>,
     /// The exact screen Rect the Request JSON panel's scrollbar thumb/track
     /// was last rendered into (one column, on the panel's right border),
     /// used to hit-test mouse clicks/drags for click-to-jump and
@@ -1035,11 +1094,13 @@ pub struct TuiApp {
     /// switched. Lets a Help body taller than the terminal be scrolled with
     /// Up/Down instead of those keys just closing the popup.
     pub(crate) help_scroll: u16,
-    /// Vertical scroll offset for the report dry-run preview overlay
-    /// ([`Overlay::ReportDryRun`]) — reset to 0 when the preview is opened.
-    /// Kept on the app (like [`Self::help_scroll`]) so the immutable overlay
-    /// draw pass can clamp overshoot against the real content height.
-    pub(crate) dry_run_scroll: u16,
+    /// Case-insensitive substring filter typed into the open Help popup, or
+    /// empty for "show everything". Applied to every tab's entries (matched
+    /// against both the key/label column and the description) so a user can
+    /// type part of a shortcut or word to narrow a long reference down to the
+    /// lines that mention it. Reset when Help is (re)opened; the first Esc
+    /// clears it and a second Esc then closes Help.
+    pub(crate) help_query: String,
     pub(crate) quit: bool,
 
     /// Receivers for in-flight background secret resolution (one per env load).
@@ -1071,6 +1132,13 @@ pub struct TuiApp {
     /// picker reopens here (falling back to `last_browse_dir`), so it isn't
     /// dragged around by loads of unrelated file types.
     pub(crate) last_env_dir: Option<PathBuf>,
+
+    /// One-shot start folder for the *new-report* folder browser
+    /// ([`FileAction::NewReportChooseFolder`]): the highlighted workspace folder
+    /// (or the workspace root) the "New Report" action was launched from.
+    /// Consumed and cleared by [`TuiApp::open_browser`]; falls back to
+    /// `last_browse_dir` when unset.
+    pub(crate) new_report_seed_dir: Option<PathBuf>,
 
     /// Directory the file browser started in the last time it was opened, so
     /// `^r` can snap it back there after wandering up/down the tree. Set by
@@ -1115,6 +1183,12 @@ pub struct TuiApp {
     /// preset. Set the moment the user picks any theme in the Theme editor;
     /// while `None`, changing language also changes the effective theme.
     pub(crate) active_theme: Option<String>,
+
+    /// The GUI's window/panel geometry, carried through untouched. The terminal
+    /// UI has no use for pixel sizes, but it shares one `state.json` with the
+    /// graphical front-end, so dropping the field here would silently reset the
+    /// GUI's layout every time the terminal UI saved.
+    pub(crate) gui_layout: crate::persistence::GuiLayout,
 
     /// `true` when the terminal supports the keyboard-enhancement protocol, so
     /// Ctrl+Enter is reported distinctly from a plain Enter. Advanced shortcuts
@@ -1179,6 +1253,12 @@ pub struct TuiApp {
     /// (`.hurl`/`.json`, `.vars`/`.env*`, `.trail`). On by default; `Tab`
     /// toggles it so an oddly-named file can still be picked. Runtime-only.
     pub(crate) browser_filter_on: bool,
+    /// Type-to-filter query for the local load browser (Open Collection / Load
+    /// Environment / Open Report): printable keys accumulate here and narrow the
+    /// file list to names containing this substring (case-insensitive), on top
+    /// of the extension filter. Backspace trims it, Esc clears it (then cancels
+    /// on a second press), and it resets whenever the browser opens. Runtime-only.
+    pub(crate) browser_query: String,
     /// Which pane focus returns to when the New/Edit Request wizard closes
     /// (whether saved or cancelled). Opening the wizard temporarily moves
     /// focus onto the Main panel so the request preview shows behind it, but
@@ -1210,6 +1290,11 @@ pub struct TuiApp {
     /// once the save completes, is cancelled, or falls back to keeping a
     /// fresh git download temporary.
     pub(crate) pending_workspace_save: Option<PendingWorkspaceSave>,
+    /// The workspace file or folder parked for a move, awaiting a destination
+    /// folder chosen through the browser (see
+    /// [`FileAction::MoveWorkspaceItemChooseFolder`]). Carries the tab it came
+    /// from so the tree can be re-focused on the item once it has moved.
+    pub(crate) pending_workspace_move: Option<(usize, std::path::PathBuf)>,
 
     /// Last row clicked by the mouse. Runtime-only: keyboard input, wheel
     /// input, or any non-row mouse-down breaks the consecutive-click pair.
@@ -1242,6 +1327,9 @@ impl Default for TuiApp {
             main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
             resp_panel: MultiSelectPanel::new(),
+            response_compact: false,
+            resp_full_body: Arc::from(""),
+            resp_compact_line_maps: Vec::new(),
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,
@@ -1256,7 +1344,7 @@ impl Default for TuiApp {
             status: None,
             overlay: None,
             help_scroll: 0,
-            dry_run_scroll: 0,
+            help_query: String::new(),
             quit: false,
             pending_env: Vec::new(),
             pending_captures: Vec::new(),
@@ -1265,6 +1353,7 @@ impl Default for TuiApp {
             running_reports: std::collections::HashMap::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            new_report_seed_dir: None,
             browser_origin_dir: None,
             browser_forward_path: None,
             confirm_on_exit: true,
@@ -1275,6 +1364,7 @@ impl Default for TuiApp {
             run_all_batch_mode: false,
             custom_themes: Vec::new(),
             active_theme: None,
+            gui_layout: crate::persistence::GuiLayout::default(),
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
@@ -1286,11 +1376,13 @@ impl Default for TuiApp {
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             browser_filter_on: true,
+            browser_query: String::new(),
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
             pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
             pending_workspace_save: None,
+            pending_workspace_move: None,
             last_mouse_row: None,
             mouse_hits: RefCell::new(Vec::new()),
             mouse_top_layer: Cell::new(MouseLayer::Base),
@@ -1416,6 +1508,14 @@ impl TuiApp {
         // one would be stale.
         self.clear_selections();
         self.begin_request();
+        // Mark just this entry as in-flight so the Response pane shows the
+        // spinner only while *this* selected entry is sending — selecting a
+        // different entry mid-send now shows that entry's own last response
+        // rather than a blanket "Sending…".
+        let selected = self.collections[col_idx].selected_entry;
+        if let Some(entry) = self.collections[col_idx].entries.get_mut(selected) {
+            entry.last_run = RunStatus::Running;
+        }
         if let Some(rx) = request::run_collection(
             &self.collections[col_idx],
             env.as_ref(),
@@ -1504,9 +1604,11 @@ impl TuiApp {
         let mut still = Vec::new();
         for rx in std::mem::take(&mut self.pending_batch_runs) {
             let mut disconnected = false;
+            let mut run_col_id: Option<u64> = None;
             loop {
                 match rx.try_recv() {
                     Ok(update) => {
+                        run_col_id = Some(update.col_id);
                         if let Some(col) =
                             self.collections.iter_mut().find(|c| c.id == update.col_id)
                         {
@@ -1525,9 +1627,13 @@ impl TuiApp {
                                 entry.last_run = match result {
                                     Some(true) => RunStatus::Passed,
                                     Some(false) => RunStatus::Failed,
-                                    // The runner never reached this entry (batch
-                                    // stopped early) — back to "hasn't run".
-                                    None => RunStatus::NotRun,
+                                    // The runner hasn't reached this entry *yet*
+                                    // in this streaming pass — it's still in
+                                    // flight, so keep it "Running" (the Response
+                                    // pane shows the spinner only for Running
+                                    // entries). Unreached-because-stopped-early
+                                    // is reset to NotRun once the run ends (below).
+                                    None => RunStatus::Running,
                                 };
                                 // Only overwrite when this pass actually reached
                                 // the entry — an unreached entry keeps whatever
@@ -1555,6 +1661,19 @@ impl TuiApp {
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         disconnected = true;
                         break;
+                    }
+                }
+            }
+            // The run has ended: any entry still marked "Running" was never
+            // reached (the run stopped early / the collection failed to parse),
+            // so drop it back to "hasn't run" rather than leaving it spinning.
+            if disconnected
+                && let Some(col_id) = run_col_id
+                && let Some(col) = self.collections.iter_mut().find(|c| c.id == col_id)
+            {
+                for entry in col.entries.iter_mut() {
+                    if entry.last_run == RunStatus::Running {
+                        entry.last_run = RunStatus::NotRun;
                     }
                 }
             }
@@ -1766,7 +1885,7 @@ impl TuiApp {
             }
             PromptKind::FilePath(action) => self.save_as_path(action, text.trim()),
             PromptKind::NewWorkspaceCollection(ci) => self.create_workspace_collection(ci, text),
-            PromptKind::NewWorkspaceReport(ci) => self.create_workspace_report(ci, text),
+            PromptKind::NewWorkspaceItem(ci, dir) => self.create_workspace_item(ci, &dir, text),
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
@@ -1823,6 +1942,16 @@ impl TuiApp {
     /// user has edited. Such edits are kept only in memory — writing them to
     /// the plaintext state file would leak the secret — so they are lost when
     /// the app closes.
+    /// How many requests across every tab have edits that only exist in memory.
+    /// Drives the exit warning: unlike a `.hurl` file the user explicitly saved,
+    /// these have nowhere to survive a quit.
+    pub(crate) fn unsaved_request_edits(&self) -> usize {
+        self.collections
+            .iter()
+            .map(|c| c.unsaved_edit_count())
+            .sum()
+    }
+
     pub(crate) fn has_unsaved_secret_changes(&self) -> bool {
         self.global_envs
             .iter()
@@ -1834,10 +1963,7 @@ impl TuiApp {
     /// whether by a local Save or a git push, so both paths agree on what
     /// "saved" means.
     fn mark_collection_saved(&mut self, ci: usize) {
-        for e in &mut self.collections[ci].entries {
-            e.user_added = false;
-            e.modified = false;
-        }
+        self.collections[ci].mark_saved();
     }
 
     /// Clear a Global Environment's "new"/"modified" var markers and reset
@@ -1950,6 +2076,12 @@ impl TuiApp {
             },
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
+                // Refuse to write a file PaperBoy couldn't read back: a file
+                // field with no path serializes to an invalid `file,;` line.
+                if let Some((req, field)) = self.collections[ci].first_empty_file_field() {
+                    self.status = Some(Status::SaveUnreadableEmptyFile { req, field });
+                    return;
+                }
                 let text = self.collections[ci].to_hurl();
                 if let Some(parent) = PathBuf::from(path).parent()
                     && !parent.as_os_str().is_empty()
@@ -2043,6 +2175,10 @@ impl TuiApp {
             // current directory (see `Overlay::Browser`'s Enter/Space
             // handling in `input.rs`), not on selecting a file with Enter,
             // so this action never flows through `do_file_action`.
+            // Folder-only like `OpenWorkspace`: `Space` confirms the current
+            // folder as the move destination (handled in `input.rs`), so no
+            // path ever arrives here.
+            FileAction::MoveWorkspaceItemChooseFolder => {}
             FileAction::OpenWorkspace => {}
             // Same as `OpenWorkspace` above: the destination folder is
             // confirmed with `Space`, handled directly in `input.rs` via
@@ -2084,6 +2220,11 @@ impl TuiApp {
             // real write through `FileAction::SaveReport`, so this never reaches
             // here.
             FileAction::SaveReportChooseFolder => {}
+            // Like the folder pickers above: the new-report destination is
+            // confirmed in `input.rs` (`browser_commit_save`), which routes
+            // creation through `create_report_at_path`, so this never reaches
+            // here.
+            FileAction::NewReportChooseFolder => {}
             // Like the folder pickers above: the loop's source folder is
             // confirmed with `Space` in `input.rs`
             // (`commit_report_node_folder`), so a file-Enter never reaches here.
@@ -2109,7 +2250,22 @@ impl TuiApp {
     ) -> bool {
         let entries = crate::postman::parse_collection(content);
         if entries.is_empty() {
-            self.status = Some(Status::NotCollection);
+            // Prefer the concrete Hurl parse reason (line + what's wrong) over
+            // the generic "no requests found": a single malformed line — e.g. a
+            // `[Multipart]` `file,;` with an empty filename — makes `hurl_core`
+            // reject the *entire* file, so pointing at the offending line is far
+            // more actionable. We only do this for Hurl source, not a failed
+            // Postman import, where a Hurl-parse reason would be nonsense.
+            let s = Strings::for_language(&self.language);
+            let reason = if crate::postman::looks_like_postman(content) {
+                None
+            } else {
+                crate::hurl::parse_hurl_error(content)
+            };
+            self.status = Some(match reason {
+                Some(why) => Status::Error(format!("{} {why}", s.file_not_collection_prefix)),
+                None => Status::NotCollection,
+            });
             return false;
         }
         let mut col = Collection::new(name, entries);
@@ -2307,31 +2463,14 @@ impl TuiApp {
     /// — only the Requests-list panel title does that, deriving its display
     /// name straight from `path` (see `draw::draw_collection_left`).
     pub(crate) fn load_workspace_file(&mut self, collection_idx: usize, path: PathBuf) {
-        let Some(col) = self.collections.get(collection_idx) else {
+        let Some(col) = self.collections.get_mut(collection_idx) else {
             return;
         };
-        let workspace_root = col.workspace_root.clone();
-        let filter = col.workspace_filter_hurl_json;
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let entries = crate::postman::parse_collection(&content);
-                if let Some(col) = self.collections.get_mut(collection_idx) {
-                    // Cache the outgoing file's request names first, so if it was
-                    // left expanded it keeps listing its requests from the cache
-                    // once it is no longer the loaded file.
-                    col.snapshot_loaded_titles();
-                    col.entries = entries;
-                    col.selected_entry = 0;
-                    col.path = Some(path);
-                    col.workspace_root = workspace_root;
-                    col.workspace_filter_hurl_json = filter;
-                    col.invalidate_request_json();
-                    col.sync_folder_to_selected();
-                    // Expand all ancestor folders of the newly-loaded file so
-                    // it is visible in the tree (and un-collapse its accordion).
-                    col.expand_ancestors_for_path();
-                    col.sync_ws_cursor();
-                }
+        // The read+parse+tree-sync is shared with the GUI (see
+        // `Collection::load_workspace_file`); the terminal UI only adds its own
+        // focus/status/persistence handling around it.
+        match col.load_workspace_file(path) {
+            Ok(()) => {
                 self.active_tab = collection_idx;
                 self.focus = Pane::List;
                 self.status = Some(Status::Loaded);
@@ -2427,6 +2566,15 @@ impl TuiApp {
             is_move,
         } = transfer;
         let method = entry.method.clone();
+        // Refuse to write a request PaperBoy couldn't read back: a file field
+        // with no path serializes to an invalid `file,;` line.
+        if let Some(field) = entry.first_empty_file_field() {
+            self.status = Some(Status::SaveUnreadableEmptyFile {
+                req: entry.title.clone(),
+                field: field.to_string(),
+            });
+            return;
+        }
         let dest_name = dest_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2552,6 +2700,232 @@ impl TuiApp {
         self.save_state();
     }
 
+    /// Park the highlighted workspace file or folder for a move and open the
+    /// destination-folder browser.
+    ///
+    /// Requests are not files, so they are left to the existing `m`/`c`
+    /// transfer, which moves a request *between* collections rather than moving
+    /// a file on disk.
+    pub(crate) fn start_workspace_item_move(&mut self) {
+        let ci = self.active_tab;
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        let Some(row) = col.ws_rows().into_iter().nth(col.list_cursor) else {
+            return;
+        };
+        if matches!(row, crate::collection::WsRow::Request { .. }) {
+            return;
+        }
+        self.pending_workspace_move = Some((ci, row.path().to_path_buf()));
+        self.open_browser(FileAction::MoveWorkspaceItemChooseFolder);
+        // Start at the workspace root: the destination has to be inside it, so
+        // wherever the browser was last is rarely the right place to begin.
+        if let Some(Overlay::Browser(_, ex)) = self.overlay.as_mut() {
+            let _ = ex.set_cwd(&root);
+        }
+    }
+
+    /// Move the parked workspace item into `dest_dir`, then re-point everything
+    /// that was holding it and put the tree cursor back on it.
+    ///
+    /// Shares [`crate::workspace::move_item`] with the graphical front-end, so
+    /// both refuse to leave the workspace, to overwrite, or to move a folder
+    /// inside itself in exactly the same way.
+    pub(crate) fn finish_workspace_item_move(&mut self, dest_dir: std::path::PathBuf) {
+        use crate::workspace::{MoveError, move_item, repoint};
+
+        let Some((ci, src)) = self.pending_workspace_move.take() else {
+            return;
+        };
+        let Some(root) = self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.clone())
+        else {
+            return;
+        };
+        let dest = match move_item(&root, &src, &dest_dir) {
+            Ok(dest) => dest,
+            Err(MoveError::Exists(what)) => {
+                self.status = Some(Status::WsItemMoveExists(what));
+                return;
+            }
+            Err(MoveError::IntoItself) => {
+                self.status = Some(Status::WsItemMoveIntoItself);
+                return;
+            }
+            Err(MoveError::Escapes(what)) => {
+                self.status = Some(Status::WsItemEscaped(what));
+                return;
+            }
+            Err(MoveError::Io(what)) => {
+                self.status = Some(Status::Error(what));
+                return;
+            }
+        };
+        if dest == src {
+            return;
+        }
+
+        for col in &mut self.collections {
+            if let Some(p) = col.path.clone().and_then(|p| repoint(&p, &src, &dest)) {
+                col.path = Some(p);
+            }
+            if let Some(p) = col
+                .workspace_selected
+                .clone()
+                .and_then(|p| repoint(&p, &src, &dest))
+            {
+                col.workspace_selected = Some(p);
+            }
+            col.workspace_expanded = col
+                .workspace_expanded
+                .iter()
+                .map(|p| repoint(p, &src, &dest).unwrap_or_else(|| p.clone()))
+                .collect();
+            col.workspace_titles = col
+                .workspace_titles
+                .drain()
+                .map(|(p, v)| (repoint(&p, &src, &dest).unwrap_or(p), v))
+                .collect();
+        }
+        // An embedded report showing the moved file must follow it too, or
+        // Ctrl+S would write it back to where it used to be.
+        for rt in &mut self.reports {
+            if let Some(p) = rt
+                .report
+                .path
+                .clone()
+                .and_then(|p| repoint(&p, &src, &dest))
+            {
+                rt.report.path = Some(p);
+            }
+        }
+
+        self.reveal_workspace_path(ci, &dest);
+        self.save_state();
+        self.status = Some(Status::WsItemMoved(crate::workspace::display_name(
+            &root, &dest,
+        )));
+    }
+
+    /// Open the "name a new workspace file" prompt for Workspace tab `ci`,
+    /// creating it in `dir` (the folder the tree cursor is sitting in).
+    ///
+    /// One prompt for all three kinds: what gets made is decided by the
+    /// extension typed, which is already how the tree tells a collection from a
+    /// report from an environment. That keeps this to a single keystroke
+    /// instead of a menu asking which kind before asking for a name.
+    pub(crate) fn open_new_workspace_item_prompt(&mut self, ci: usize) {
+        let Some(col) = self.collections.get(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        // New files land beside whatever is highlighted — in that folder for a
+        // folder row, next to it for a file — which is almost always where the
+        // user is looking.
+        let dir = match col.ws_rows().into_iter().nth(col.list_cursor) {
+            Some(crate::collection::WsRow::Folder { path, .. }) => path,
+            Some(row) => row.path().parent().unwrap_or(&root).to_path_buf(),
+            None => root.clone(),
+        };
+        let s = Strings::for_language(&self.language);
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::NewWorkspaceItem(ci, dir),
+            editor: Editor::blank(),
+            title: s.workspace_new_item_title.to_string(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Create the named collection / report / environment inside `dir` and show
+    /// it. Mirrors the graphical front-end's New menu, sharing the same
+    /// [`crate::workspace::create_item`] so both obey the same containment and
+    /// no-overwrite rules.
+    pub(crate) fn create_workspace_item(&mut self, ci: usize, dir: &std::path::Path, name: String) {
+        use crate::workspace::{NewItemError, NewItemKind};
+
+        let Some(root) = self
+            .collections
+            .get(ci)
+            .and_then(|c| c.workspace_root.clone())
+        else {
+            return;
+        };
+        let Some(kind) = NewItemKind::from_name(name.trim()) else {
+            self.status = Some(Status::WsItemUnknownKind(name));
+            return;
+        };
+        let path = match crate::workspace::create_item(&root, dir, &name, kind) {
+            Ok(path) => path,
+            Err(NewItemError::EmptyName) => return,
+            Err(NewItemError::Escapes(what)) => {
+                self.status = Some(Status::WsItemEscaped(what));
+                return;
+            }
+            Err(NewItemError::Exists(what)) => {
+                self.status = Some(Status::WsItemExists(what));
+                return;
+            }
+            Err(NewItemError::Io(what)) => {
+                self.status = Some(Status::Error(what));
+                return;
+            }
+        };
+
+        self.reveal_workspace_path(ci, &path);
+        // A new report opens in the tab's report pane, exactly as `R` does; the
+        // other two are files the tree now lists, and a collection additionally
+        // becomes the loaded one so requests can be added to it straight away.
+        match kind {
+            NewItemKind::Report => {
+                self.show_embedded_report(path.clone(), root.clone());
+            }
+            NewItemKind::Collection => {
+                self.load_workspace_file(ci, path.clone());
+            }
+            NewItemKind::Environment => {}
+        }
+        self.save_state();
+        self.status = Some(Status::WsItemCreated(crate::workspace::display_name(
+            &root, &path,
+        )));
+    }
+
+    /// Expand every folder between the workspace root and `path`, then put the
+    /// tree cursor on its row — so a file that was just created or moved is
+    /// both visible and selected rather than hidden in a collapsed folder.
+    pub(crate) fn reveal_workspace_path(&mut self, ci: usize, path: &std::path::Path) {
+        let Some(col) = self.collections.get_mut(ci) else {
+            return;
+        };
+        let Some(root) = col.workspace_root.clone() else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Ok(rel) = parent.strip_prefix(&root)
+        {
+            let mut cur = root.clone();
+            col.workspace_expanded.insert(cur.clone());
+            for component in rel.components() {
+                cur.push(component);
+                col.workspace_expanded.insert(cur.clone());
+            }
+        }
+        if let Some(i) = col.ws_rows().iter().position(|r| r.path() == path) {
+            col.list_cursor = i;
+        }
+    }
+
     /// Open the "name a new collection" prompt for Workspace tab `ci` (see
     /// [`PromptKind::NewWorkspaceCollection`]). The typed text is a path
     /// relative to the workspace root; `.hurl` is ghosted as the default
@@ -2570,31 +2944,6 @@ impl TuiApp {
             kind: PromptKind::NewWorkspaceCollection(ci),
             editor: Editor::blank(),
             title: s.workspace_new_collection_title.to_string(),
-            mask: false,
-            reset_to: None,
-            secret_intact: false,
-            secret_checkbox: None,
-        });
-    }
-
-    /// Open the "name a new report" prompt for Workspace tab `ci` (see
-    /// [`PromptKind::NewWorkspaceReport`]). The typed text is a path relative
-    /// to the workspace root; `.trail` is ghosted as the default extension.
-    /// Mirrors [`Self::open_new_workspace_collection_prompt`].
-    pub(crate) fn open_new_workspace_report_prompt(&mut self, ci: usize) {
-        if self
-            .collections
-            .get(ci)
-            .and_then(|c| c.workspace_root.as_ref())
-            .is_none()
-        {
-            return;
-        }
-        let s = Strings::for_language(&self.language);
-        self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::NewWorkspaceReport(ci),
-            editor: Editor::blank(),
-            title: s.workspace_new_report_title.to_string(),
             mask: false,
             reset_to: None,
             secret_intact: false,
@@ -2993,25 +3342,17 @@ impl TuiApp {
     /// Every theme offered in the Theme editor, in display order: the built-in
     /// presets first, then the user's own custom themes.
     pub(crate) fn all_themes(&self) -> Vec<crate::tui::theme::ThemeSpec> {
-        let mut themes = crate::tui::theme::builtin_presets();
-        themes.extend(self.custom_themes.iter().cloned());
-        themes
-    }
-
-    /// Look a theme up by name across presets and custom themes.
-    pub(crate) fn find_theme(&self, name: &str) -> Option<crate::tui::theme::ThemeSpec> {
-        self.all_themes().into_iter().find(|t| t.name == name)
+        crate::session::all_themes(&self.custom_themes)
     }
 
     /// The theme spec currently in effect: the manually-chosen theme if set
     /// (and still present), otherwise the current language's preset.
     pub(crate) fn active_theme_spec(&self) -> crate::tui::theme::ThemeSpec {
-        if let Some(name) = &self.active_theme
-            && let Some(spec) = self.find_theme(name)
-        {
-            return spec;
-        }
-        crate::tui::theme::preset_for_language(&self.language)
+        crate::session::active_theme_spec(
+            self.active_theme.as_deref(),
+            &self.custom_themes,
+            &self.language,
+        )
     }
 
     /// The runtime [`Theme`](crate::tui::theme::Theme) to draw with. While the
@@ -3040,30 +3381,7 @@ impl TuiApp {
     /// the collection's own Linked Environment's vars on any name collision
     /// (Linked wins). `None` when neither is set.
     pub(crate) fn effective_env(&self, ci: usize) -> Option<Environment> {
-        let linked = self
-            .collections
-            .get(ci)
-            .and_then(|c| c.linked_env_id)
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        let active = self
-            .active_env_id
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        match (linked, active) {
-            (None, None) => None,
-            (Some(env), None) | (None, Some(env)) => Some(env.clone()),
-            (Some(linked), Some(active)) => {
-                let mut merged = active.clone();
-                for lv in &linked.vars {
-                    match merged.vars.iter_mut().find(|v| v.key == lv.key) {
-                        Some(existing) => *existing = lv.clone(),
-                        None => merged.vars.push(lv.clone()),
-                    }
-                }
-                merged.id = linked.id;
-                merged.name = linked.name.clone();
-                Some(merged)
-            }
-        }
+        crate::session::effective_env(&self.collections, &self.global_envs, ci, self.active_env_id)
     }
 
     /// Keys defined in *both* the active collection's linked Environment and
@@ -3072,25 +3390,12 @@ impl TuiApp {
     /// silently shadowed. Used to flag such substitutions in the Request
     /// viewer with a warning icon so the collision isn't invisible.
     pub(crate) fn shadowed_env_keys(&self, ci: usize) -> std::collections::HashSet<String> {
-        let linked = self
-            .collections
-            .get(ci)
-            .and_then(|c| c.linked_env_id)
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        let active = self
-            .active_env_id
-            .and_then(|id| self.global_envs.iter().find(|e| e.id == id));
-        match (linked, active) {
-            // A collection linked to the very environment that's also active
-            // shadows nothing — the same value would be substituted either way.
-            (Some(linked), Some(active)) if linked.id != active.id => linked
-                .vars
-                .iter()
-                .filter(|lv| active.vars.iter().any(|av| av.key == lv.key))
-                .map(|lv| lv.key.clone())
-                .collect(),
-            _ => std::collections::HashSet::new(),
-        }
+        crate::session::shadowed_env_keys(
+            &self.collections,
+            &self.global_envs,
+            ci,
+            self.active_env_id,
+        )
     }
 
     /// Apply the user's choice on an [`Overlay::EnvCollision`] popup,
@@ -3254,6 +3559,12 @@ impl TuiApp {
         let Some(path) = self.collections[ci].path.clone() else {
             return false;
         };
+        // Refuse to write a file PaperBoy couldn't read back (see
+        // `SaveCollection`): an empty-path file field breaks reparsing.
+        if let Some((req, field)) = self.collections[ci].first_empty_file_field() {
+            self.status = Some(Status::SaveUnreadableEmptyFile { req, field });
+            return false;
+        }
         let text = self.collections[ci].to_hurl();
         match std::fs::write(&path, text) {
             Ok(()) => {
@@ -3796,6 +4107,19 @@ impl TuiApp {
                                 }
                             }
                             GitSaveSource::Collection => {
+                                // Refuse to push a file PaperBoy couldn't read
+                                // back (see `SaveCollection`): an empty-path
+                                // file field breaks reparsing.
+                                if let Some((req, field)) =
+                                    self.collections[ci].first_empty_file_field()
+                                {
+                                    let s = Strings::for_language(&self.language);
+                                    w.stage = GitSaveStage::Error(
+                                        Status::SaveUnreadableEmptyFile { req, field }.text(&s),
+                                    );
+                                    self.overlay = Some(Overlay::GitSave(w));
+                                    return;
+                                }
                                 let col = &self.collections[ci];
                                 let mut files = vec![(w.collection_path.text(), col.to_hurl())];
                                 if w.include_env

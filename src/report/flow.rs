@@ -9,6 +9,8 @@
 
 use std::fmt::Write as _;
 
+use super::model::StatKind;
+
 /// A whole report flow: a comment/directive header plus the ordered statements
 /// the interpreter executes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,22 +151,36 @@ pub enum ReportStmt {
     },
     /// `REPORT <var>` / `REPORT (<v1>, <v2>, …)` — one column per variable.
     Vars(Vec<String>),
-    /// `REPORT <var> AS <name>` — a single variable's value under a renamed
-    /// column. The bareword source is what distinguishes this from the
-    /// quoted-template `Computed` form.
-    VarAs { var: String, name: String },
-    /// `REPORT "<template>" AS <name>` — a computed column.
-    Computed { template: String, name: String },
+    /// `REPORT <var> AS <name> [STATISTICS(…)]` — a single variable's value
+    /// under a renamed column, with optional summary statistics. The bareword
+    /// source is what distinguishes this from the quoted-template `Computed`
+    /// form.
+    VarAs {
+        var: String,
+        name: String,
+        stats: Vec<StatKind>,
+    },
+    /// `REPORT "<template>" AS <name> [STATISTICS(…)]` — a computed column.
+    Computed {
+        template: String,
+        name: String,
+        stats: Vec<StatKind>,
+    },
 }
 
 /// An item inside a `REPORT REQUEST … WITH … END` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WithItem {
     ResponseFmt(ResponseFmt),
-    /// `name: <hurl query>` — an ad-hoc report field (same syntax as `[Reports]`).
+    /// `name: <hurl query> [STATISTICS(…)]` — an ad-hoc report field. The query
+    /// is the same syntax as `[Reports]`, and may also be an intrinsic name
+    /// (`HttpStatus`/`Time`/`Asserts`/`Error`/`Response`) to alias an intrinsic
+    /// under a friendlier column name. An optional trailing `STATISTICS(…)`
+    /// clause attaches summary statistics to the field's column.
     Field {
         name: String,
         query: String,
+        stats: Vec<StatKind>,
     },
 }
 
@@ -243,6 +259,36 @@ impl Pattern {
     }
 }
 
+/// One environment role argument: either a named environment run live each
+/// time, or a previously-exported snapshot loaded once and reused in place of a
+/// live run. `FILE(…)` only appears in argument position inside a role clause
+/// (`BASELINE(…)`/`COMPARISON(…)`), where a bare string would otherwise mean an
+/// environment *name* — so it disambiguates "load this saved snapshot" from
+/// "run this named environment". Every other path in the grammar (`FILES`,
+/// `FOLDERS`, `TUPLES FROM`, header directives) is already unambiguously a path
+/// by keyword/position and stays a bare string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleRef {
+    /// A named environment, run live for this role.
+    Env(String),
+    /// A saved baseline snapshot file (resolved like producer paths, relative to
+    /// `# root:`/the report dir). Its rows stand in for a live run of this role,
+    /// so no environment is executed for it.
+    File(String),
+}
+
+impl RoleRef {
+    /// The comparison *target* identity this ref contributes: a named env is
+    /// keyed by its name, a snapshot by its (relative) path. Used to align the
+    /// injected/produced rows against the role sets in [`super::compare`].
+    pub fn target(&self) -> &str {
+        match self {
+            RoleRef::Env(n) => n,
+            RoleRef::File(p) => p,
+        }
+    }
+}
+
 /// The environment clause of `FOR … IN ENVS …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvClause {
@@ -250,12 +296,15 @@ pub enum EnvClause {
     Plain(Vec<String>),
     /// `BASELINE("prod") SHOW(Time), COMPARISON("staging", …)`.
     ///
+    /// Each role argument is a [`RoleRef`]: a live environment name or a
+    /// `FILE("…")` snapshot to reuse in place of running it.
+    ///
     /// `baseline_show` names the baseline fields to copy into each candidate row
     /// under `baseline.<alias>.<field>` (only for aliases the candidate already
     /// emits that field).  Empty when no `SHOW(…)` clause is present.
     Roles {
-        baseline: Vec<String>,
-        comparisons: Vec<String>,
+        baseline: Vec<RoleRef>,
+        comparisons: Vec<RoleRef>,
         baseline_show: Vec<String>,
     },
 }
@@ -288,6 +337,57 @@ impl ReportFlow {
             write_node(&mut out, node, 0);
         }
         out
+    }
+
+    /// Collect the per-column summary statistics requested by
+    /// `REPORT … AS <header> STATISTICS(…)` statements anywhere in the flow
+    /// (including inside loops), keyed by output-column header. Later statements
+    /// for the same header win. Used to attach statistics to the resolved
+    /// columns at render time.
+    pub fn column_stats(&self) -> std::collections::HashMap<String, Vec<StatKind>> {
+        let mut out = std::collections::HashMap::new();
+        collect_column_stats(&self.nodes, &mut out);
+        out
+    }
+}
+
+fn collect_column_stats(
+    nodes: &[FlowNode],
+    out: &mut std::collections::HashMap<String, Vec<StatKind>>,
+) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, stats, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, stats, .. })
+                if !stats.is_empty() =>
+            {
+                out.insert(name.clone(), stats.clone());
+            }
+            // `WITH` fields carry their own optional `STATISTICS(…)`; their
+            // output column is `alias.field`, where `alias` defaults to the
+            // request's leaf name. Compute that key statically so the stats
+            // attach at render time just like a `REPORT … STATISTICS(…)`.
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname, stats, ..
+                    } = item
+                        && !stats.is_empty()
+                    {
+                        out.insert(format!("{a}.{fname}"), stats.clone());
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_stats(body, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -392,8 +492,9 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                         WithItem::ResponseFmt(fmt) => {
                             let _ = writeln!(out, "RESPONSE {}", fmt_text(*fmt));
                         }
-                        WithItem::Field { name, query } => {
-                            let _ = writeln!(out, "{name}: {query}");
+                        WithItem::Field { name, query, stats } => {
+                            let _ =
+                                writeln!(out, "{}: {query}{}", name_text(name), stats_text(stats));
                         }
                     }
                 }
@@ -408,13 +509,38 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 let _ = writeln!(out, "REPORT ({})", vars.join(", "));
             }
         }
-        ReportStmt::VarAs { var, name } => {
-            let _ = writeln!(out, "REPORT {var} AS {}", name_text(name));
+        ReportStmt::VarAs { var, name, stats } => {
+            let _ = writeln!(
+                out,
+                "REPORT {var} AS {}{}",
+                name_text(name),
+                stats_text(stats)
+            );
         }
-        ReportStmt::Computed { template, name } => {
-            let _ = writeln!(out, "REPORT {} AS {}", quote(template), name_text(name));
+        ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        } => {
+            let _ = writeln!(
+                out,
+                "REPORT {} AS {}{}",
+                quote(template),
+                name_text(name),
+                stats_text(stats)
+            );
         }
     }
+}
+
+/// Render a `STATISTICS(…)` clause (with a leading space) for a report
+/// statement, or the empty string when no statistics are requested.
+fn stats_text(stats: &[StatKind]) -> String {
+    if stats.is_empty() {
+        return String::new();
+    }
+    let list: Vec<&str> = stats.iter().map(|s| s.keyword()).collect();
+    format!(" STATISTICS({})", list.join(", "))
 }
 
 fn fmt_text(fmt: ResponseFmt) -> &'static str {
@@ -500,7 +626,7 @@ fn env_clause_text(c: &EnvClause) -> String {
         } => {
             let mut parts = Vec::new();
             if !baseline.is_empty() {
-                let names: Vec<String> = baseline.iter().map(|s| quote(s)).collect();
+                let names: Vec<String> = baseline.iter().map(role_ref_text).collect();
                 let mut token = format!("BASELINE({})", names.join(", "));
                 if !baseline_show.is_empty() {
                     token.push_str(&format!(" SHOW({})", baseline_show.join(", ")));
@@ -508,11 +634,20 @@ fn env_clause_text(c: &EnvClause) -> String {
                 parts.push(token);
             }
             if !comparisons.is_empty() {
-                let names: Vec<String> = comparisons.iter().map(|s| quote(s)).collect();
+                let names: Vec<String> = comparisons.iter().map(role_ref_text).collect();
                 parts.push(format!("COMPARISON({})", names.join(", ")));
             }
             parts.join(", ")
         }
+    }
+}
+
+/// Render a single role argument: a bare quoted env name, or `FILE("…")` for a
+/// snapshot reference.
+fn role_ref_text(r: &RoleRef) -> String {
+    match r {
+        RoleRef::Env(n) => quote(n),
+        RoleRef::File(p) => format!("FILE({})", quote(p)),
     }
 }
 
@@ -672,11 +807,15 @@ fn report_label(stmt: &ReportStmt) -> String {
                 format!("REPORT ({})", vars.join(", "))
             }
         }
-        ReportStmt::VarAs { var, name } => {
-            format!("REPORT {var} AS {name}")
+        ReportStmt::VarAs { var, name, stats } => {
+            format!("REPORT {var} AS {name}{}", stats_text(stats))
         }
-        ReportStmt::Computed { template, name } => {
-            format!("REPORT {} AS {name}", quote(template))
+        ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        } => {
+            format!("REPORT {} AS {name}{}", quote(template), stats_text(stats))
         }
     }
 }

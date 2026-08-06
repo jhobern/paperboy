@@ -13,8 +13,8 @@ use ratatui::crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
 use crate::hurl::{
-    EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, run_hurl,
-    run_hurl_streaming,
+    EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, parse_hurl_error,
+    run_hurl, run_hurl_streaming,
 };
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::shared_utils::stem;
@@ -40,7 +40,17 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     // Hurl text so the runner (which only speaks Hurl) can execute it.
     let entries = parse_collection(&col_content);
     if entries.is_empty() {
-        eprintln!("warning: no requests found in '{collection_path}'");
+        // Surface the concrete Hurl parse reason (line + what's wrong) when the
+        // source is Hurl: a single malformed line rejects the whole file, so
+        // "no requests found" alone is unhelpful. (Skip for Postman JSON, where
+        // a Hurl-parse reason would be meaningless.)
+        match (!looks_like_postman(&col_content))
+            .then(|| parse_hurl_error(&col_content))
+            .flatten()
+        {
+            Some(why) => eprintln!("warning: no requests found in '{collection_path}' — {why}"),
+            None => eprintln!("warning: no requests found in '{collection_path}'"),
+        }
         return 0;
     }
     // A Base64File field is a PaperBoy concept Hurl can't run directly: expand

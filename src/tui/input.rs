@@ -13,7 +13,7 @@ use ratatui_explorer::{
 
 use crate::collection::Collection;
 use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
-use crate::hurl::{FormField, FormFieldKind, HurlEntry, METHODS};
+use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, METHODS};
 use crate::i18n::{Language, Status, Strings};
 use crate::persistence::{
     self, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState, PersistedTab,
@@ -31,6 +31,7 @@ use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
 use tui_panel_select::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
+use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
 impl TuiApp {
@@ -405,18 +406,18 @@ impl TuiApp {
                 self.resp_panel.set_scroll(next);
             }
             MouseScrollTarget::ReportPane(pane) => {
-                if let Some(idx) = self.active_report_index() {
-                    if pane == ReportPane::Results
-                        && self.reports[idx].view == ReportView::Results
-                        && self.reports[idx].result.is_some()
-                    {
-                        self.result_cursor_move(dir, 0);
-                    } else if let Some(panel) = self.report_panel_mut(pane) {
-                        let next = (panel.scroll() as i32 + dir * 3)
-                            .max(0)
-                            .min(u16::MAX as i32);
-                        panel.set_scroll(next as u16);
-                    }
+                if self.active_report_index().is_some()
+                    && let Some(panel) = self.report_panel_mut(pane)
+                {
+                    // Scroll the panel directly (including the results grid):
+                    // the wheel moves the *viewport*, leaving the cell cursor
+                    // where it is even if that scrolls it off-screen. The draw
+                    // code only re-centres on the cursor after keyboard
+                    // navigation, so the wheel is no longer fought each frame.
+                    let next = (panel.scroll() as i32 + dir * 3)
+                        .max(0)
+                        .min(u16::MAX as i32);
+                    panel.set_scroll(next as u16);
                 }
             }
             MouseScrollTarget::Help => {
@@ -424,13 +425,6 @@ impl TuiApp {
                     self.help_scroll.saturating_sub(3)
                 } else {
                     self.help_scroll.saturating_add(3)
-                };
-            }
-            MouseScrollTarget::ReportDryRun => {
-                self.dry_run_scroll = if dir < 0 {
-                    self.dry_run_scroll.saturating_sub(3)
-                } else {
-                    self.dry_run_scroll.saturating_add(3)
                 };
             }
             MouseScrollTarget::ReportCellPopup => self.scroll_result_cell_popup(dir * 3),
@@ -488,6 +482,12 @@ impl TuiApp {
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
             Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
+            Some(Overlay::ReportNodeFiles(form)) => form.selected = row,
+            Some(Overlay::ReportNodeWithField(form)) => form.selected = row,
+            Some(Overlay::ReportNodeAssign(form)) => form.selected = row,
+            Some(Overlay::ReportNodeList(form)) => form.selected = row,
+            Some(Overlay::ReportNodeVars(form)) => form.selected = row,
+            Some(Overlay::ReportNodeComputed(form)) => form.selected = row,
             _ => return,
         }
         self.on_key(Self::mouse_key(KeyCode::Enter));
@@ -902,13 +902,13 @@ impl TuiApp {
     /// click should fall through to the text-selection handler.
     ///
     /// Geometry: `report_pane_areas[Results]` is set to `inner` (the rect
-    /// returned by `block.inner(area)` in `draw_report_panel`), meaning the
-    /// border has already been stripped.  The whole `lines` vec — header at
-    /// index 0, data rows at 1..n — is rendered into `inner` scrolled by
-    /// `results_panel.scroll()`.  Therefore:
-    ///   y_off = row − area.y   (0 == header row when scroll == 0)
-    ///   grid_row = y_off + scroll   (no −1 for border)
-    ///   data_row = grid_row − 1    (only valid when grid_row >= 1)
+    /// returned by `block.inner(area)`), meaning the border has already been
+    /// stripped. When a result is shown the header row (grid line 0) is *pinned*
+    /// at inner row 0 and only the data rows below it scroll, so
+    /// `results_panel.scroll()` is a DATA-ROW offset. Therefore:
+    ///   y_off = row − area.y
+    ///   y_off == 0            → the pinned header row (fall through to select)
+    ///   data_row = (y_off − 1) + scroll   (for y_off >= 1)
     fn on_mouse_results_cell_click(&mut self, col: u16, row: u16) -> bool {
         let Some(idx) = self.active_report_index() else {
             return false;
@@ -929,13 +929,12 @@ impl TuiApp {
         let Some(result) = &self.reports[idx].result else {
             return false;
         };
-        let scroll = self.reports[idx].results_panel.scroll() as usize;
-        let grid_row = y_off + scroll;
-        if grid_row == 0 {
-            // Header row — fall through to text selection.
+        if y_off == 0 {
+            // Pinned header row — fall through to text selection.
             return false;
         }
-        let data_row = grid_row - 1;
+        let scroll = self.reports[idx].results_panel.scroll() as usize;
+        let data_row = (y_off - 1) + scroll;
         if data_row >= result.rows.len() {
             return false;
         }
@@ -1156,6 +1155,14 @@ impl TuiApp {
     /// they're a purely visual annotation, so a copied/pasted request must
     /// never actually contain one.
     pub(crate) fn whole_panel_text(&self, pane: Pane) -> Option<String> {
+        // With the Response compact overview on, the panel holds the *shortened*
+        // text; the whole-panel copy fallback must still yield the untruncated
+        // body (the "hard mode" of the compact-view feature), so consult the
+        // cached full body first. `resp_full_body` is only non-empty on frames
+        // that actually drew a compactable body.
+        if pane == Pane::Response && self.response_compact && !self.resp_full_body.is_empty() {
+            return Some(self.resp_full_body.to_string());
+        }
         let text = self.panel(pane)?.whole_text()?;
         if text.is_empty() {
             return None;
@@ -1255,12 +1262,65 @@ impl TuiApp {
             self.main_panel
                 .selected_parts(Some(&self.main_shadow_icon_positions)),
         );
-        parts.extend(self.resp_panel.selected_parts(None));
+        // In the Response pane's compact overview, a drag selects *shortened*
+        // text — but a copy must still yield the untruncated values, so expand
+        // the selection back through the compaction map (see
+        // `resp_full_selected_parts`). Outside compact mode there's nothing to
+        // expand and we take the panel's own extracted text directly.
+        if self.response_compact {
+            parts.extend(self.resp_full_selected_parts());
+        } else {
+            parts.extend(self.resp_panel.selected_parts(None));
+        }
         if parts.is_empty() {
             None
         } else {
             Some(parts.join("\n\n"))
         }
+    }
+
+    /// The Response pane's selection, expanded so a drag over the *compacted*
+    /// overview copies the untruncated values (the "hard mode" of the compact
+    /// feature for a partial selection, complementing the whole-panel copy in
+    /// [`whole_panel_text`]). Each selected region's logical positions are in
+    /// compacted-text coordinates; they're translated through
+    /// `resp_compact_line_maps` into full-body coordinates and handed to a
+    /// throwaway panel loaded with the full body, so the crate's own
+    /// multi-region extraction produces the text. Falls back to the live
+    /// panel's `selected_parts` whenever there's no map to expand through
+    /// (e.g. a frame that didn't draw a compactable body).
+    fn resp_full_selected_parts(&self) -> Vec<String> {
+        let maps = &self.resp_compact_line_maps;
+        if maps.is_empty() || self.resp_full_body.is_empty() {
+            return self.resp_panel.selected_parts(None);
+        }
+        // Translate one compacted position to its full-body counterpart,
+        // clamping into the line map so an out-of-range column can't panic.
+        let translate = |pos: TextPos| -> TextPos {
+            let Some(line_map) = maps.get(pos.line) else {
+                return pos;
+            };
+            if line_map.is_empty() {
+                return pos;
+            }
+            let idx = pos.col.min(line_map.len() - 1);
+            TextPos::new(pos.line, line_map[idx])
+        };
+        let mut regions: Vec<(TextPos, TextPos)> = self.resp_panel.finalized_selections();
+        if let Some(active) = self.resp_panel.active_selection() {
+            regions.push(active);
+        }
+        if regions.is_empty() {
+            return Vec::new();
+        }
+        // Extraction reads logical lines, so the wrap width is irrelevant here;
+        // a wide width just avoids any wrapping while the cache is built.
+        let mut scratch = MultiSelectPanel::new();
+        scratch.set_content(self.resp_full_body.clone(), usize::from(u16::MAX));
+        for (anchor, cursor) in regions {
+            scratch.push_finalized(translate(anchor), translate(cursor));
+        }
+        scratch.selected_parts(None)
     }
 
     /// Copy every active text selection region to the clipboard via OSC 52
@@ -1349,7 +1409,6 @@ impl TuiApp {
             Overlay::EnvVarForm(form) => self.env_var_form_key_handler(key, form),
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
-            Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
             Overlay::ReportCellPopup {
                 title,
                 content,
@@ -1360,6 +1419,14 @@ impl TuiApp {
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
             Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
+            Overlay::ReportNodeFiles(form) => self.report_node_files_key_handler(key, form),
+            Overlay::ReportNodeWithField(form) => {
+                self.report_node_with_field_key_handler(key, form)
+            }
+            Overlay::ReportNodeAssign(form) => self.report_node_assign_key_handler(key, form),
+            Overlay::ReportNodeList(form) => self.report_node_list_key_handler(key, form),
+            Overlay::ReportNodeVars(form) => self.report_node_vars_key_handler(key, form),
+            Overlay::ReportNodeComputed(form) => self.report_node_computed_key_handler(key, form),
         }
     }
 
@@ -1400,6 +1467,15 @@ impl TuiApp {
             // single source of truth for "would `y` do anything right now",
             // shared with the footer hint so they can't drift apart.
             KeyCode::Char('y') if self.can_copy() => self.copy_selection_to_clipboard(),
+            // `c` (Response pane) toggles the compact overview: long string
+            // literals in the body are shortened to a `"head...tail"` form so a
+            // body full of long opaque values (tokens, hashes, base64) can be
+            // skimmed. Display-only — a whole-panel `y`-copy still yields the
+            // full body (see `whole_panel_text`). Scoped to the Response pane so
+            // it doesn't clash with `c`'s Requests-list "copy to workspace".
+            KeyCode::Char('c') if self.focus == Pane::Response => {
+                self.response_compact = !self.response_compact;
+            }
             // Shift+Arrow moves the *end* of an active selection, letting
             // the user fine-tune (or start extending, one line/char at a
             // time) a selection begun with the mouse, without redoing the
@@ -1452,10 +1528,37 @@ impl TuiApp {
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.overlay = Some(Overlay::Help(0));
                 self.help_scroll = 0;
+                self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
             // Shift+R opens a brand-new PaperTrail report tab (report tabs live
-            // after the collection tabs in the same strip).
+            // after the collection tabs in the same strip). In a Workspace tab
+            // it instead opens the new-report folder browser, seeded to the
+            // highlighted folder (or the workspace root), so the report is
+            // created inside the workspace and shown in the tree — regardless of
+            // which pane holds focus, since "new report while viewing a
+            // workspace" always means "put it in the workspace". (The browser's
+            // Ctrl+N is the escape hatch for an unattached scratch report tab.)
+            KeyCode::Char('R') if self.collections[self.active_tab].is_workspace() => {
+                self.open_new_report_browser_for_tree(self.active_tab);
+            }
+            // Shift+N in a Workspace tab creates a new collection, report or
+            // environment inside the highlighted folder (or the folder holding
+            // the highlighted file). One prompt handles all three: the KIND
+            // COMES FROM THE EXTENSION typed (`.hurl`/`.trail`/`.vars`), which
+            // suits a keyboard UI better than a menu overlay and matches how
+            // the browser's inline filename editor already works.
+            KeyCode::Char('N') if self.collections[self.active_tab].is_workspace() => {
+                self.open_new_workspace_item_prompt(self.active_tab);
+            }
+            // Shift+M moves the highlighted workspace FILE OR FOLDER into
+            // another folder of the same workspace — the keyboard equivalent of
+            // the graphical front-end's drag-and-drop in the tree. Requests
+            // aren't files, so they keep the existing `m`/`c` transfer between
+            // collections instead.
+            KeyCode::Char('M') if self.collections[self.active_tab].is_workspace() => {
+                self.start_workspace_item_move();
+            }
             KeyCode::Char('R') => self.new_report_tab(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.response_pct = self.response_pct.saturating_sub(5).max(15);
@@ -2152,6 +2255,55 @@ impl TuiApp {
         }
     }
 
+    /// Open the new-report folder browser for a Workspace tab's tree
+    /// (`Shift+R`). The browser starts in the highlighted folder (or the parent
+    /// folder of a highlighted file, or the workspace root), so confirming the
+    /// filename there creates the report inside the workspace — where it appears
+    /// in the tree. `Ctrl+N` inside the browser instead makes a scratch report.
+    fn open_new_report_browser_for_tree(&mut self, ci: usize) {
+        let col = &self.collections[ci];
+        let root = col.workspace_root.clone();
+        let seed = col
+            .ws_rows()
+            .into_iter()
+            .nth(col.list_cursor)
+            .and_then(|row| match row {
+                crate::collection::WsRow::Folder { path, .. } => Some(path),
+                crate::collection::WsRow::Collection { path, .. }
+                | crate::collection::WsRow::Report { path, .. }
+                | crate::collection::WsRow::Environment { path, .. } => {
+                    path.parent().map(|p| p.to_path_buf())
+                }
+                crate::collection::WsRow::Request { collection, .. } => {
+                    collection.parent().map(|p| p.to_path_buf())
+                }
+            })
+            .or(root);
+        self.new_report_seed_dir = seed;
+        self.open_browser(FileAction::NewReportChooseFolder);
+    }
+
+    /// The deepest open Workspace root that (lexically) contains `path`, if any.
+    /// "Deepest" so a report dropped inside a workspace nested within another
+    /// binds to the innermost one — the same rule
+    /// [`Self::create_report_at_path`] uses to choose the embed target.
+    fn deepest_ws_root_containing(&self, path: &Path) -> Option<PathBuf> {
+        self.collections
+            .iter()
+            .filter_map(|c| c.workspace_root.as_ref())
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+    }
+
+    /// Whether the browser is the workspace-scoped new-report chooser sitting at
+    /// its enclosing workspace root — the point past which it must not ascend,
+    /// so the report can only ever land inside the workspace.
+    fn browser_confined_at_root(&self, action: FileAction, ex: &FileExplorer) -> bool {
+        action == FileAction::NewReportChooseFolder
+            && self.deepest_ws_root_containing(ex.cwd()).as_deref() == Some(ex.cwd().as_path())
+    }
+
     /// Load a workspace `.vars` file as a global environment (reusing the
     /// File → Load → Environment code path). Reports a read error via the status
     /// line if the file can't be read.
@@ -2566,16 +2718,19 @@ impl TuiApp {
     /// <code>` status expectation *is* exposed, as a `status == <code>` assert
     /// row that folds back into `expected_status` here.
     pub(crate) fn submit_new_request(&mut self, form: NewReq) {
-        fn header_rows_to_triples(rows: &[HeaderRow]) -> Vec<(String, String, bool)> {
+        /// The wizard's editable rows as model rows. The Description cell is
+        /// carried through like any other: it round-trips to the `.hurl` file
+        /// as a `# @desc` line above the row (see [`crate::hurl::KvRow`]), so a
+        /// note written here survives a save and reload.
+        fn header_rows_to_rows(rows: &[HeaderRow]) -> Vec<KvRow> {
             rows.iter()
-                .map(|r| {
-                    (
-                        r.key.text().trim().to_string(),
-                        r.value.text().trim().to_string(),
-                        r.enabled,
-                    )
+                .map(|r| KvRow {
+                    key: r.key.text().trim().to_string(),
+                    value: r.value.text().trim().to_string(),
+                    enabled: r.enabled,
+                    desc: r.desc.text().trim().to_string(),
                 })
-                .filter(|(k, _, _)| !k.is_empty())
+                .filter(|r| !r.key.is_empty())
                 .collect()
         }
 
@@ -2591,10 +2746,10 @@ impl TuiApp {
         // siblings. The list already shows the URL for every row, so an empty
         // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let headers: Vec<(String, String, bool)> = header_rows_to_triples(&form.headers);
-        let cookies: Vec<(String, String, bool)> = header_rows_to_triples(&form.cookies);
-        let queries: Vec<(String, String, bool)> = header_rows_to_triples(&form.queries);
-        let options: Vec<(String, String, bool)> = header_rows_to_triples(&form.options);
+        let headers: Vec<KvRow> = header_rows_to_rows(&form.headers);
+        let cookies: Vec<KvRow> = header_rows_to_rows(&form.cookies);
+        let queries: Vec<KvRow> = header_rows_to_rows(&form.queries);
+        let options: Vec<KvRow> = header_rows_to_rows(&form.options);
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
@@ -2602,8 +2757,6 @@ impl TuiApp {
             .map(|r| {
                 // For File-kind rows the Content-Type cell is the optional
                 // Hurl content-type override; for Text rows it's ignored.
-                // Desc is always UI-only and not persisted, matching Header
-                // rows.
                 let kind = r.kind;
                 let content_type = if kind == FormFieldKind::File {
                     let ct = r.ctype.text().trim().to_string();
@@ -2622,6 +2775,7 @@ impl TuiApp {
                     content_type,
                     base64_prefix,
                     enabled: r.enabled,
+                    desc: r.desc.text().trim().to_string(),
                 }
             })
             .collect();
@@ -2906,6 +3060,7 @@ impl TuiApp {
         self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
         self.active_theme = state.active_theme;
+        self.gui_layout = state.gui;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
@@ -2975,6 +3130,7 @@ impl TuiApp {
                 .iter()
                 .map(PersistedEnv::from_environment)
                 .collect(),
+            gui: self.gui_layout,
             active_global_env: self
                 .active_env_id
                 .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
@@ -3039,6 +3195,8 @@ impl TuiApp {
                 Some(name) => self.status = Some(Status::EnvReverted(name)),
                 None => self.status = Some(Status::NothingToRevert),
             },
+            // Confirmed discarding unexported report results: start the rerun.
+            ConfirmAction::RerunReport => self.start_active_report_run(),
         }
     }
 
@@ -3322,6 +3480,14 @@ impl TuiApp {
                 let path = dir.join(file).to_string_lossy().into_owned();
                 self.save_as_path(FileAction::SaveReport, &path);
             }
+            FileAction::NewReportChooseFolder => {
+                let mut file = std::path::PathBuf::from(&name);
+                if file.extension().is_none() {
+                    file.set_extension("trail");
+                }
+                let path = dir.join(file);
+                self.create_report_at_path(&path);
+            }
             _ => {}
         }
     }
@@ -3345,10 +3511,13 @@ impl TuiApp {
     }
 
     /// Quit, first asking for confirmation when the setting is enabled — or when
-    /// there are unsaved secret edits that would be lost (even if the setting is
-    /// off), so the user is never silently robbed of secret changes.
+    /// there are unsaved secret or request edits that would be lost (even if the
+    /// setting is off), so the user is never silently robbed of changes.
     pub(crate) fn request_quit(&mut self) {
-        if self.confirm_on_exit || self.has_unsaved_secret_changes() {
+        if self.confirm_on_exit
+            || self.has_unsaved_secret_changes()
+            || self.unsaved_request_edits() > 0
+        {
             self.overlay = Some(Overlay::Confirm {
                 action: ConfirmAction::Exit,
                 sel: 1,
@@ -3575,9 +3744,27 @@ impl TuiApp {
             }
             // Create a brand-new report in this workspace. Only in Browse mode
             // (a report can't be a move/copy/add-request target), mirroring the
-            // `n` new-collection action — see `open_new_workspace_report_prompt`.
+            // `n` new-collection action. Opens the new-report folder browser
+            // (seeded to the highlighted folder / workspace root) rather than a
+            // bare name prompt, so the user can choose where it lands — or press
+            // Ctrl+N there to keep it as an unattached scratch tab instead.
             KeyCode::Char('R') if picker.mode == WsPickerMode::Browse => {
-                self.open_new_workspace_report_prompt(picker.collection_idx);
+                let seed = picker
+                    .entries
+                    .get(picker.selected)
+                    .map(|e| {
+                        if e.is_dir {
+                            e.path.clone()
+                        } else {
+                            e.path
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| picker.root.clone())
+                        }
+                    })
+                    .unwrap_or_else(|| picker.root.clone());
+                self.new_report_seed_dir = Some(seed);
+                self.open_browser(FileAction::NewReportChooseFolder);
             }
             KeyCode::Enter => match picker.entries.get(picker.selected) {
                 Some(entry) if !entry.is_dir => {
@@ -3771,11 +3958,13 @@ impl TuiApp {
             FileAction::LoadEnv => s.load_environment,
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
+            FileAction::MoveWorkspaceItemChooseFolder => s.move_workspace_item,
             FileAction::SaveCollectionChooseFolder => s.save_collection_folder,
             FileAction::SaveReportCsvChooseFolder => s.report_export_csv_folder,
             FileAction::SaveReportBaselineChooseFolder => s.report_save_baseline_folder,
             FileAction::OpenReport => s.open_report,
             FileAction::SaveReportChooseFolder => s.save_report_folder,
+            FileAction::NewReportChooseFolder => s.new_report_folder,
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
             _ => s.browser_select_file,
         }
@@ -3784,10 +3973,13 @@ impl TuiApp {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::PickReportNodeFolder => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
+            FileAction::MoveWorkspaceItemChooseFolder => s.browser_hint_workspace_move,
             FileAction::SaveCollectionChooseFolder
             | FileAction::SaveReportCsvChooseFolder
             | FileAction::SaveReportBaselineChooseFolder
             | FileAction::SaveReportChooseFolder => s.browser_hint_collection_save,
+            // The new-report picker adds the `^n scratch tab` note.
+            FileAction::NewReportChooseFolder => s.browser_hint_new_report,
             // The load pickers get the `Tab all/matching` filter note.
             _ if browser_filters_by_ext(action) => s.browser_hint_filter,
             _ => s.browser_hint,
@@ -3839,6 +4031,13 @@ impl TuiApp {
                     | FileAction::SaveReportBaselineChooseFolder => {
                         report_dir.as_ref().or(self.last_browse_dir.as_ref())
                     }
+                    // New report: start in the workspace folder the action was
+                    // launched from (highlighted folder / workspace root), else
+                    // the shared last-browsed folder.
+                    FileAction::NewReportChooseFolder => self
+                        .new_report_seed_dir
+                        .as_ref()
+                        .or(self.last_browse_dir.as_ref()),
                     _ => self.last_browse_dir.as_ref(),
                 };
                 if let Some(dir) = reopen
@@ -3846,6 +4045,9 @@ impl TuiApp {
                 {
                     let _ = ex.set_cwd(dir);
                 }
+                // The seed dir is one-shot — clear it so a later browser opened
+                // for a different action doesn't inherit it.
+                self.new_report_seed_dir = None;
                 // Remember where the browser actually started so `^r` can jump
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
@@ -3866,6 +4068,9 @@ impl TuiApp {
                             self.default_report_baseline_filename()
                         }
                         FileAction::SaveReportChooseFolder => self.default_save_report_filename(),
+                        // A brand-new report always starts from a fresh default
+                        // name (never the active report's file name).
+                        FileAction::NewReportChooseFolder => "report.trail".to_string(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
@@ -3874,9 +4079,30 @@ impl TuiApp {
                 // (a collection can't be a `.trail`, etc.); `Tab` toggles it via
                 // `browser_key_handler`. On by default each time the picker opens.
                 self.browser_filter_on = true;
+                // Start with an empty type-to-filter query each time the picker
+                // opens (see `browser_key_handler`).
+                self.browser_query.clear();
                 if browser_filters_by_ext(action) {
                     let _ = ex.set_filter_map(move |file| {
                         browser_keep_file(action, &file).then_some(file)
+                    });
+                }
+                // The new-report picker is a workspace-scoped *folder* chooser:
+                // only folders are selectable (the report name — and an optional
+                // `sub/name` path that creates a new subfolder — is typed in the
+                // inline field). We still *show* the workspace's own files
+                // (collections, environments, reports) greyed alongside the
+                // folders, so it's visually obvious the picker is scoped inside
+                // the workspace rather than browsing the wider filesystem;
+                // non-workspace files (e.g. a stray `notes.txt`) stay hidden.
+                // This filter is permanent for the action; unlike the ext
+                // filters it isn't Tab-toggleable, because Tab focuses the
+                // filename field. Enter on a shown file is inert (see
+                // `browser_key_handler`), so files remain non-selectable.
+                if action == FileAction::NewReportChooseFolder {
+                    let _ = ex.set_filter_map(|file| {
+                        (file.is_dir || crate::workspace::is_workspace_file(&file.path))
+                            .then_some(file)
                     });
                 }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
@@ -3889,11 +4115,15 @@ impl TuiApp {
         // Three tabs: 0 = Shortcuts, 1 = Glossary, 2 = Reports.
         const HELP_TABS: usize = 3;
         match key.code {
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            // Tab switching keeps the active filter (so a search can be checked
+            // against each tab in turn). Arrow Left/Right switch tabs too; the
+            // `h`/`l` letter aliases were dropped so those letters can be typed
+            // into the filter instead.
+            KeyCode::Tab | KeyCode::Right => {
                 self.overlay = Some(Overlay::Help((tab + 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::BackTab | KeyCode::Left => {
                 self.overlay = Some(Overlay::Help((tab + HELP_TABS - 1) % HELP_TABS));
                 self.help_scroll = 0;
             }
@@ -3926,6 +4156,32 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Help(tab));
                 self.help_scroll = u16::MAX;
             }
+            // Type-to-filter: printable characters extend the query and jump
+            // back to the top so the first match is visible. A leading space
+            // would just be noise, so it's ignored when the query is empty.
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !(c == ' ' && self.help_query.is_empty()) =>
+            {
+                self.help_query.push(c);
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            KeyCode::Backspace => {
+                self.help_query.pop();
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            // First Esc clears an active filter; a second Esc (empty query)
+            // falls through to the catch-all and closes Help. Mirrors the
+            // load-browser filter's clear-then-close behaviour.
+            KeyCode::Esc if !self.help_query.is_empty() => {
+                self.help_query.clear();
+                self.help_scroll = 0;
+                self.overlay = Some(Overlay::Help(tab));
+            }
+            // Any other key (Esc with no filter, Enter, q, …) leaves the overlay
+            // taken (see `on_key_overlay`) and so closes Help.
             _ => {}
         }
     }
@@ -4732,6 +4988,48 @@ impl TuiApp {
         }
     }
 
+    /// Reapply the load browser's file filter from the current extension-filter
+    /// toggle and the type-to-filter query.
+    ///
+    /// The *extension* filter never hides a directory — it selects what kind of
+    /// thing is being opened, and hiding folders by it would make whole subtrees
+    /// unreachable. The *type-to-filter query* does apply to folders, though: in
+    /// a directory holding hundreds of entries, narrowing only the files still
+    /// leaves the matches buried among unrelated folders, which is exactly what
+    /// the query is meant to cut through. Clearing the query brings them all
+    /// back, and `../` is always exempt so there is never a filter you can't
+    /// navigate out of.
+    ///
+    /// When neither constraint is active the filter is removed entirely.
+    fn apply_browser_filter(&self, action: FileAction, ex: &mut FileExplorer) {
+        let filter_on = self.browser_filter_on && browser_filters_by_ext(action);
+        let query = self.browser_query.to_ascii_lowercase();
+        if !filter_on && query.is_empty() {
+            let _ = ex.remove_filter_map();
+            return;
+        }
+        let _ = ex.set_filter_map(move |file| {
+            if file.is_dir && file.name == "../" {
+                return Some(file);
+            }
+            if !file.is_dir && filter_on && !browser_keep_file(action, &file) {
+                return None;
+            }
+            if !query.is_empty() {
+                let name = file
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if !name.contains(&query) {
+                    return None;
+                }
+            }
+            Some(file)
+        });
+    }
+
     fn browser_key_handler(
         &mut self,
         key: KeyEvent,
@@ -4743,23 +5041,64 @@ impl TuiApp {
         // bottom. Tab swaps focus between the folder list and that editor; a
         // focused editor swallows editing keys and saves on Enter.
         let save_folder = action.is_save_to_folder();
+        // Ctrl+N in the new-report browser abandons the folder choice and opens
+        // an unsaved scratch report tab instead — the "don't attach to a
+        // workspace" escape hatch. Handled first so it works even while the
+        // inline filename field has focus. Not re-showing the overlay closes it.
+        if action == FileAction::NewReportChooseFolder
+            && ctrl
+            && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+        {
+            self.browser_name_focused = false;
+            self.new_report_tab();
+            return;
+        }
         if save_folder && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.browser_name_focused = !self.browser_name_focused;
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
         }
         // On a load picker, Tab toggles the extension filter (show all ↔ only
-        // matching files) so an oddly-named file can still be picked.
+        // matching files) so an oddly-named file can still be picked. Routed
+        // through `apply_browser_filter` so any active type-to-filter query is
+        // preserved across the toggle.
         if browser_filters_by_ext(action) && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.browser_filter_on = !self.browser_filter_on;
-            if self.browser_filter_on {
-                let _ =
-                    ex.set_filter_map(move |file| browser_keep_file(action, &file).then_some(file));
-            } else {
-                let _ = ex.remove_filter_map();
-            }
+            self.apply_browser_filter(action, &mut ex);
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
+        }
+        // Type-to-filter for the load pickers: printable keys narrow the file
+        // list by name (case-insensitive substring) on top of the extension
+        // filter, so a crowded folder can be sifted by just typing. Handled
+        // before the generic key match below so letters that double as vim
+        // motions here (h/j/k/l/q) filter instead of navigating. Backspace
+        // trims the query; the first Esc clears it (a second Esc, with an empty
+        // query, then cancels via the generic handler).
+        if browser_filters_by_ext(action) && !save_folder {
+            match key.code {
+                KeyCode::Char(c)
+                    if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+                {
+                    self.browser_query.push(c);
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                KeyCode::Backspace if !self.browser_query.is_empty() => {
+                    self.browser_query.pop();
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                KeyCode::Esc if !self.browser_query.is_empty() => {
+                    self.browser_query.clear();
+                    self.apply_browser_filter(action, &mut ex);
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
+                _ => {}
+            }
         }
         if save_folder && self.browser_name_focused {
             match key.code {
@@ -4821,7 +5160,7 @@ impl TuiApp {
                     // only ever go deeper, so a run of Rights can't bounce
                     // back up once a retrace lands on "../". Use Left (or
                     // Enter) to ascend.
-                    if key.code == KeyCode::Enter {
+                    if key.code == KeyCode::Enter && !self.browser_confined_at_root(action, &ex) {
                         self.browser_ascend(&mut ex);
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
@@ -4851,6 +5190,8 @@ impl TuiApp {
                     FileAction::OpenWorkspace
                         | FileAction::SaveWorkspaceChooseFolder
                         | FileAction::SaveCollectionChooseFolder
+                        | FileAction::MoveWorkspaceItemChooseFolder
+                        | FileAction::NewReportChooseFolder
                 ) {
                     // A Workspace root/destination (or a collection save
                     // destination) must be a folder, not a file — Enter on a
@@ -4858,6 +5199,10 @@ impl TuiApp {
                     // Tab to the filename field at the bottom and press Enter
                     // there to save into the current folder; `Space` picks the
                     // current folder as a Workspace root (OpenWorkspace).
+                    // `NewReportChooseFolder` shows the workspace's own files
+                    // for context but only folders are selectable, so Enter on
+                    // one of those files is likewise inert (the browser stays
+                    // open).
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else {
                     // A file is selected — remember its folder so the browser
@@ -4880,6 +5225,14 @@ impl TuiApp {
                 self.last_browse_dir = Some(root.clone());
                 self.confirm_workspace_root(root);
                 self.save_state();
+            }
+            KeyCode::Char(' ') if action == FileAction::MoveWorkspaceItemChooseFolder => {
+                // Confirm the CURRENT folder as the move destination, as with
+                // `OpenWorkspace` above — the highlighted child may well be the
+                // file being moved, so Enter stays "descend into folder".
+                let dir = ex.cwd().clone();
+                self.overlay = None;
+                self.finish_workspace_item_move(dir);
             }
             KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
                 // Confirm the current directory as the loop's source folder,
@@ -4904,8 +5257,12 @@ impl TuiApp {
                 // Going up a level highlights the folder we just left
                 // (rather than "../"), so an accidental Left is undone by
                 // Right — instead of descending back into "../" and
-                // climbing another level.
-                self.browser_ascend(&mut ex);
+                // climbing another level. The workspace-scoped new-report
+                // chooser stops at the workspace root: the report must land
+                // inside the workspace, so there's nowhere higher to go.
+                if !self.browser_confined_at_root(action, &ex) {
+                    self.browser_ascend(&mut ex);
+                }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
             _ => {
@@ -4917,9 +5274,29 @@ impl TuiApp {
     }
 
     fn new_request_key_handler(&mut self, key: KeyEvent, mut form: Box<NewReq>) {
+        // Terminals without the keyboard-enhancement protocol deliver Backspace
+        // (and Ctrl+Backspace) as Ctrl+H — `Char('h')`+CONTROL. Left as-is, a
+        // text-entry cell's generic `Char(c) => insert(c)` arm types a literal
+        // `h` when the user presses Backspace (the reported bug). Normalise it to
+        // a plain Backspace up front so every field deletes instead, mirroring
+        // the multiline editor's own Ctrl+H handling.
+        let key = if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+        {
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+        } else {
+            key
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
         let prev_focus = form.focus;
+        // Remember the last table cell (Headers/Cookies/Queries/Options row or
+        // Form-field cell) the user was on, so leaving the multiline Body
+        // upward can return to that exact column/row instead of dropping onto
+        // the section's "+ Add" row (which loses the column being edited).
+        if matches!(form.focus, NewField::Kvd(..) | NewField::FormField(..)) {
+            form.last_table_cell = Some(form.focus);
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let submit = key.code == KeyCode::F(2) || (ctrl && key.code == KeyCode::Enter);
@@ -5534,7 +5911,19 @@ impl TuiApp {
                             _ => true, // single-line fields always move sections
                         };
                         if leave {
-                            form.focus_next(down, true);
+                            // Arrowing up out of the multiline Body returns to
+                            // the last table cell the user was editing (its
+                            // exact column/row) rather than the section's
+                            // "+ Add" row; other cases fall back to normal
+                            // section navigation.
+                            if !down
+                                && form.focus == NewField::Body
+                                && let Some(cell) = form.valid_last_table_cell()
+                            {
+                                form.focus = cell;
+                            } else {
+                                form.focus_next(down, true);
+                            }
                         }
                     } else if let Some(ed) = form.active_editor() {
                         let single = !ed.multiline;

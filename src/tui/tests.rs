@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use crate::collection::Collection;
 use crate::git_remote::{RefKind, RemoteRefs};
 use crate::hurl::HurlEntry;
+use crate::hurl::KvRow;
 use crate::i18n::Language;
 use crate::persistence::PersistedState;
 
@@ -982,6 +983,73 @@ fn tab_skips_empty_headers_cookies_and_form_between_url_and_body() {
     assert_eq!(new_focus(&app), NewField::Url);
 }
 
+#[test]
+fn up_from_body_returns_to_last_table_cell_not_add_row() {
+    // Query section has a data row; user is editing its Value cell, then
+    // moves down into the multiline Body. Arrowing back up must return to
+    // that exact Query Value cell rather than dropping onto a "+ Add" row.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Enter); // creates Query(0, Key)
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Right); // -> Query(0, Value)
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Query, 0, HdrCol::Value)
+    );
+
+    // Jump down through the empty Options and Form sections into the Body.
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(new_focus(&app), NewField::Body);
+
+    // Up out of the Body returns to the remembered Query Value cell.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Kvd(KvdKind::Query, 0, HdrCol::Value)
+    );
+}
+
+#[test]
+fn up_from_body_returns_to_last_form_field_column() {
+    // Same behaviour for the Form section directly above the Body: leaving
+    // the Body upward returns to the last-focused Form cell's column/row.
+    let mut app = TuiApp::default();
+    open_form_on_form_field_kind(&mut app); // FormField(0, Kind)
+    press(&mut app, KeyCode::Right); // -> FormField(0, Value)
+    let cell = new_focus(&app);
+    assert!(matches!(cell, NewField::FormField(0, _)));
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)); // -> Body
+    assert_eq!(new_focus(&app), NewField::Body);
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(new_focus(&app), cell);
+}
+
+#[test]
+fn up_from_body_without_table_history_falls_back_to_add_row() {
+    // With no table cell ever focused (empty sections), Up from the Body
+    // keeps the original behaviour of stepping to the section above.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..9 {
+        press(&mut app, KeyCode::Tab); // walk to Body through empty sections
+    }
+    assert_eq!(new_focus(&app), NewField::Body);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(new_focus(&app), NewField::AddFormField);
+}
+
 fn header_enabled(app: &TuiApp, i: usize) -> bool {
     match app.overlay.as_ref().unwrap() {
         Overlay::NewRequest(f) => f.headers[i].enabled,
@@ -1284,10 +1352,10 @@ fn arrow_up_from_the_first_cookie_stops_at_the_populated_headers_add_row() {
     // the last header row on the following Up.
     let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
     entry.headers = vec![
-        ("H0".to_string(), "v0".to_string(), true),
-        ("H1".to_string(), "v1".to_string(), true),
+        KvRow::toggled("H0", "v0", true),
+        KvRow::toggled("H1", "v1", true),
     ];
-    entry.cookies = vec![("C0".to_string(), "cv0".to_string(), true)];
+    entry.cookies = vec![KvRow::toggled("C0", "cv0", true)];
 
     let mut app = TuiApp::default();
     app.collections[0].entries.push(entry);
@@ -1607,6 +1675,64 @@ fn ctrl_e_toggles_enabled_without_moving_focus() {
     );
 }
 
+/// Scan the whole terminal buffer for the first cell whose glyph is `ch` and
+/// return its foreground colour — a small helper for asserting on the colour a
+/// particular character was drawn in.
+fn find_cell_fg(buf: &ratatui::buffer::Buffer, ch: char) -> Option<ratatui::style::Color> {
+    let target = ch.to_string();
+    let area = *buf.area();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buf.cell((x, y))
+                && cell.symbol() == target
+            {
+                return Some(cell.fg);
+            }
+        }
+    }
+    None
+}
+
+/// A disabled request row (checkbox unticked) renders its key in the dim
+/// colour so it reads as inactive — the terminal-side mirror of the GUI's
+/// greyed-out disabled key/value editors.
+#[test]
+fn a_disabled_header_row_renders_its_key_dimmed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app); // focus Header(0, Key)
+    for ch in "Zydeco".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    // Move focus off the key so it renders via the non-focused (coloured)
+    // path rather than as the live editor.
+    press(&mut app, KeyCode::Tab); // -> Header(0, Value)
+
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+    // Enabled: the key text is drawn in the normal text colour.
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let enabled_fg = find_cell_fg(term.backend().buffer(), 'Z')
+        .expect("the header key's first char should be on screen");
+    assert_eq!(
+        enabled_fg, th.text,
+        "an enabled row's key uses the normal text colour"
+    );
+
+    // Ctrl+E disables the row (from any of its columns); the key greys out.
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert!(!header_enabled(&app, 0), "Ctrl+E disabled the row");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let disabled_fg = find_cell_fg(term.backend().buffer(), 'Z')
+        .expect("the header key's first char should still be on screen");
+    assert_eq!(
+        disabled_fg, th.dim,
+        "a disabled row's key is greyed out to read as inactive"
+    );
+}
+
 #[test]
 fn arrows_can_reach_the_enabled_checkbox_in_a_form_row() {
     // The checkbox is the leftmost visual column of the Form table too,
@@ -1756,17 +1882,17 @@ fn default_request_view_setting_round_trips() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
-        RequestView::Json,
-        "defaults to JSON"
+        RequestView::Hurl,
+        "defaults to Hurl"
     );
-    app.default_request_view = RequestView::Hurl;
+    app.default_request_view = RequestView::Json;
 
     let snapshot = app.to_persisted();
     let mut restored = TuiApp::default();
     restored.apply_persisted(snapshot);
     assert_eq!(
         restored.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "the view preference survives a round trip"
     );
 
@@ -1776,7 +1902,7 @@ fn default_request_view_setting_round_trips() {
     restored2.apply_persisted(back);
     assert_eq!(
         restored2.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "the view preference survives JSON (de)serialization"
     );
 }
@@ -1797,7 +1923,7 @@ fn persisted_state_round_trips_requests_and_settings() {
         "post",
         "POST",
         "http://h/x",
-        vec![("X-A".into(), "1".into(), true)],
+        vec![KvRow::toggled("X-A", "1", true)],
         "{}",
     ));
 
@@ -2070,8 +2196,8 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     let mut app = TuiApp::default();
     assert_eq!(
         app.default_request_view,
-        RequestView::Json,
-        "defaults to JSON"
+        RequestView::Hurl,
+        "defaults to Hurl"
     );
 
     press(&mut app, KeyCode::Char('s')); // Options (sel 0)
@@ -2090,26 +2216,26 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     press(&mut app, KeyCode::Enter); // open the Default Request View submenu
     assert!(
-        matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
-        "opens a submenu preselecting the current view (JSON = 0)"
+        matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
+        "opens a submenu preselecting the current view (Hurl = 1)"
     );
-    assert_eq!(
-        app.default_request_view,
-        RequestView::Json,
-        "opening the submenu doesn't change anything yet"
-    );
-
-    press(&mut app, KeyCode::Down); // -> Hurl (hovering already applies it live)
     assert_eq!(
         app.default_request_view,
         RequestView::Hurl,
-        "hovering over Hurl previews it immediately"
+        "opening the submenu doesn't change anything yet"
+    );
+
+    press(&mut app, KeyCode::Up); // -> JSON (hovering already applies it live)
+    assert_eq!(
+        app.default_request_view,
+        RequestView::Json,
+        "hovering over JSON previews it immediately"
     );
     press(&mut app, KeyCode::Enter); // just returns to Preferences now; nothing left to confirm
     assert_eq!(
         app.default_request_view,
-        RequestView::Hurl,
-        "selecting Hurl in the submenu sets the view"
+        RequestView::Json,
+        "selecting JSON in the submenu sets the view"
     );
     assert!(
         matches!(app.overlay, Some(Overlay::Preferences(5))),
@@ -2118,12 +2244,12 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
     assert!(app.confirm_on_clear, "unrelated settings are untouched");
 
-    // Re-opening the submenu preselects Hurl (index 1) this time, and Esc
+    // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
     press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(5)
     assert!(
-        matches!(app.overlay, Some(Overlay::RequestViewMenu(1))),
-        "preselects Hurl (index 1)"
+        matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
+        "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
@@ -2132,7 +2258,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     );
     assert_eq!(
         app.default_request_view,
-        RequestView::Hurl,
+        RequestView::Json,
         "Esc doesn't change the setting"
     );
 }
@@ -2152,27 +2278,27 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
     press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
-    press(&mut app, KeyCode::Enter); // open the submenu, preselects JSON (0)
-    assert_eq!(app.default_request_view, RequestView::Json);
+    press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
+    assert_eq!(app.default_request_view, RequestView::Hurl);
 
-    press(&mut app, KeyCode::Down); // hover onto Hurl
-    assert_eq!(
-        app.default_request_view,
-        RequestView::Hurl,
-        "hovering onto Hurl previews it immediately"
-    );
-    press(&mut app, KeyCode::Up); // hover back onto JSON
+    press(&mut app, KeyCode::Up); // hover onto JSON
     assert_eq!(
         app.default_request_view,
         RequestView::Json,
-        "hovering back onto JSON restores it immediately"
+        "hovering onto JSON previews it immediately"
+    );
+    press(&mut app, KeyCode::Down); // hover back onto Hurl
+    assert_eq!(
+        app.default_request_view,
+        RequestView::Hurl,
+        "hovering back onto Hurl restores it immediately"
     );
 
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
     assert!(matches!(app.overlay, Some(Overlay::Preferences(5))));
-    assert_eq!(app.default_request_view, RequestView::Json);
+    assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
 #[test]
@@ -3841,14 +3967,14 @@ fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
     let th = super::theme::theme(&Language::English);
     let s = Strings::for_language(&Language::English);
 
-    // The workspace "New report" prompt has a long title; on the fixed-width
-    // single-line box it used to be clipped by the panel border, hiding the
-    // trailing "Esc cancel" (and the box's own right edge).
+    // The workspace "New collection" prompt has a long title; on the
+    // fixed-width single-line box it used to be clipped by the panel border,
+    // hiding the trailing "Esc cancel" (and the box's own right edge).
     let mut app = TuiApp::default();
     app.overlay = Some(Overlay::Prompt {
-        kind: PromptKind::NewWorkspaceReport(0),
+        kind: PromptKind::NewWorkspaceCollection(0),
         editor: super::editor::Editor::blank(),
-        title: s.workspace_new_report_title.to_string(),
+        title: s.workspace_new_collection_title.to_string(),
         mask: false,
         reset_to: None,
         secret_intact: false,
@@ -3861,7 +3987,7 @@ fn a_long_prompt_title_is_not_clipped_by_the_box_border() {
 
     let full = format!(
         "{}  ({})",
-        s.workspace_new_report_title, s.prompt_save_hint_sl
+        s.workspace_new_collection_title, s.prompt_save_hint_sl
     );
     assert!(
         out.contains(&full),
@@ -4112,8 +4238,11 @@ fn help_popup_any_other_key_closes_it_from_either_tab() {
         overlay: Some(Overlay::Help(1)),
         ..Default::default()
     };
-    press(&mut app, KeyCode::Char('q'));
-    assert!(app.overlay.is_none(), "q closes Help from the Glossary tab");
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.overlay.is_none(),
+        "Enter closes Help from the Glossary tab"
+    );
 }
 
 #[test]
@@ -4330,7 +4459,10 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         overlay: Some(Overlay::Help(0)),
         ..Default::default()
     };
-    let mut term = Terminal::new(TestBackend::new(120, 80)).unwrap();
+    // Tall enough that nothing scrolls out of the buffer, with room to spare:
+    // the list grows every time a key is added, and a height that just fits
+    // today would turn the next new shortcut into a mystery failure here.
+    let mut term = Terminal::new(TestBackend::new(120, 200)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
     let text = buffer_text(term.backend().buffer());
@@ -4400,6 +4532,131 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
     );
 }
 
+/// Typing in the Help popup filters its entries to those matching the query
+/// (against both the key column and the description), keeping the enclosing
+/// section heading and dropping sections with no matches. The active filter is
+/// echoed under the tab strip. (#4)
+#[test]
+fn help_type_to_filter_narrows_entries_to_the_query() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?')); // open Help on the Shortcuts tab
+    for c in "grow".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.help_query, "grow", "typing builds the filter query");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help(0))),
+        "typing keeps Help open on its current tab"
+    );
+
+    let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains(&format!("{}grow", s.help_filter_label)),
+        "the active filter is echoed under the tab strip"
+    );
+    assert!(
+        text.contains(s.help_resize),
+        "a matching entry ('shrink / grow response pane') is kept"
+    );
+    assert!(
+        text.contains(s.help_group_panels),
+        "the matching entry's section heading is kept"
+    );
+    assert!(
+        !text.contains(s.help_focus),
+        "a non-matching entry is filtered out"
+    );
+    assert!(
+        !text.contains(s.help_group_navigation),
+        "a section with no matches is dropped entirely"
+    );
+}
+
+/// The filter query survives switching tabs (so a search can be checked against
+/// each view), Backspace trims it, the first Esc clears it and a second Esc then
+/// closes Help. (#4)
+#[test]
+fn help_filter_persists_across_tabs_and_esc_clears_then_closes() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    for c in "zip".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    // "zip" only appears in the Reports tab's grammar, so switch there.
+    press(&mut app, KeyCode::Tab); // Glossary
+    press(&mut app, KeyCode::Tab); // Reports
+    assert!(matches!(app.overlay, Some(Overlay::Help(2))));
+    assert_eq!(app.help_query, "zip", "the filter survives tab switches");
+
+    let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains(s.help_grammar_zip),
+        "the matching grammar entry is kept"
+    );
+    assert!(
+        !text.contains(s.help_grammar_collection),
+        "a non-matching grammar entry is filtered out"
+    );
+
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.help_query, "zi", "Backspace trims the query");
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.help_query, "", "the first Esc clears the filter");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Help(2))),
+        "clearing the filter leaves Help open"
+    );
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.overlay.is_none(),
+        "a second Esc (empty filter) closes Help"
+    );
+}
+
+/// A filter that matches nothing on the current tab shows an explanatory line
+/// rather than a blank void. (#4)
+#[test]
+fn help_filter_with_no_matches_shows_a_message() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    for c in "zzqx".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("No entries match"),
+        "an empty result set explains itself"
+    );
+}
+
 #[test]
 fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
     // The third Help tab documents the Reports feature: a "what is a
@@ -4425,6 +4682,9 @@ fn help_reports_tab_explains_reports_shortcuts_and_grammar() {
         s.help_grammar_collection,
         s.help_grammar_for_tuple,
         s.help_grammar_zip,
+        s.help_grammar_statistics,
+        s.help_grammar_with,
+        s.help_grammar_baseline_file,
     ] {
         assert!(
             text.contains(expected),
@@ -4554,12 +4814,14 @@ fn help_popup_shows_a_scrollbar_and_clamps_scroll_when_the_body_is_taller_than_t
         "help_scroll is clamped to the body's actual max scroll, not left at u16::MAX"
     );
 
-    // A tall terminal fits everything, so no scrollbar is needed.
+    // A tall terminal fits everything, so no scrollbar is needed. Generously
+    // taller than the body needs: the shortcut list grows as keys are added,
+    // and a height picked to fit it exactly would fail on the next new key.
     let mut app2 = TuiApp {
         overlay: Some(Overlay::Help(0)),
         ..Default::default()
     };
-    let mut term2 = Terminal::new(TestBackend::new(120, 80)).unwrap();
+    let mut term2 = Terminal::new(TestBackend::new(120, 200)).unwrap();
     term2
         .draw(|f| super::draw::draw_overlay(f, &mut app2, &s, &th))
         .unwrap();
@@ -6127,6 +6389,96 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     );
 }
 
+/// #3: the Response pane shows the request's duration when the runner reported
+/// one (the same figure reports surface as the per-request "Time" column).
+#[test]
+fn response_panel_shows_response_time() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{}".into(),
+            duration_ms: Some(123),
+            ..Default::default()
+        });
+    }
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    let ci = app.active_tab;
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("123 ms"),
+        "the response time should be shown:\n{out}"
+    );
+}
+
+/// #2: while one entry is in flight, selecting a *different* entry shows that
+/// entry's own last response — not a blanket "Sending…". Only the in-flight
+/// entry (its `last_run` is `Running`) shows the spinner.
+#[test]
+fn response_panel_shows_other_entrys_response_while_one_is_sending() {
+    use crate::hurl::RunStatus;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    {
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default()); // entry 0 — in flight
+        col.entries.push(HurlEntry::default()); // entry 1 — already finished
+        // Entry 0 is mid-send.
+        col.entries[0].last_run = RunStatus::Running;
+        // Entry 1 has a finished response.
+        col.entries[1].last_run = RunStatus::Passed;
+        col.entries[1].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "{}".into(),
+            ..Default::default()
+        });
+    }
+
+    // Select the *finished* entry 1: it must show its response, not "Sending…".
+    app.collections[ci].selected_entry = 1;
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("200 OK"),
+        "the finished entry's response should be shown while another sends:\n{out}"
+    );
+    assert!(
+        !out.contains(s.sending),
+        "the finished entry must not show the sending spinner:\n{out}"
+    );
+
+    // Select the in-flight entry 0: now the spinner is shown.
+    app.collections[ci].selected_entry = 0;
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains(s.sending),
+        "the in-flight entry should show the sending spinner:\n{out}"
+    );
+}
+
 /// A failed status assertion (e.g. `HTTP 200` but the server returned 500)
 /// still shows the full response — status line, the failing assert marked ✗,
 /// and the response body — instead of replacing everything with the error text.
@@ -6793,6 +7145,7 @@ fn request_json_panel_wraps_long_lines_instead_of_truncating() {
 
     let token: String = (0..100).map(|i| format!("{i:03}")).collect();
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     app.collections[ci].entries =
         vec![HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "")];
@@ -6837,6 +7190,7 @@ fn request_json_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selec
 
     let token: String = (0..100).map(|i| format!("{i:03}")).collect();
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     app.collections[ci].entries =
         vec![HurlEntry::from_fields("t", "GET", "http://h/x", vec![], "")];
@@ -7067,11 +7421,130 @@ fn whole_panel_text_returns_the_full_response_body_when_the_response_panel_has_f
     );
 }
 
+/// Toggling the Response compact view (`c`) shortens long string values in
+/// the *displayed* panel, but a whole-panel `y`-copy still returns the full,
+/// untruncated body — the "hard mode" of the feature.
+#[test]
+fn response_compact_view_shortens_the_display_but_copy_still_yields_the_full_body() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let full = "{\n  \"tok\": \"abcdefghijklmnopqrstuvwxyz0123456789\"\n}";
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: full.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+    // Compact off: the panel shows the full body verbatim.
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+
+    // `c` toggles the compact overview.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.response_compact, "c should turn compact view on");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    // The displayed text is now shortened ("head...tail") and no longer holds
+    // the full value, while short keys are untouched.
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(
+        shown.contains("abcd...6789"),
+        "compact display should show head...tail, got: {shown}"
+    );
+    assert!(!shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(shown.contains("\"tok\""), "short keys stay intact");
+
+    // Hard mode: copying the whole panel still yields the untruncated body.
+    let copied = app
+        .whole_panel_text(Pane::Response)
+        .expect("response panel has content");
+    assert_eq!(copied, full);
+
+    // Toggling back restores the full display.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(!app.response_compact);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let shown = app.resp_panel.whole_text().expect("body shown");
+    assert!(shown.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+}
+
+/// Hard mode for a *partial* selection: drag-selecting a compacted value in the
+/// Response overview and copying it yields the untruncated string, not the
+/// shortened "head...tail" shown on screen. The selection's logical positions
+/// (in compacted-text coordinates) are translated back through the compaction
+/// map before extraction (see `resp_full_selected_parts`).
+#[test]
+fn dragging_a_compacted_value_copies_the_full_untruncated_string() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let full = "{\n  \"tok\": \"abcdefghijklmnopqrstuvwxyz0123456789\"\n}";
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: full.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    // Turn the compact overview on, then lay the panel out (which builds the
+    // compaction map used to translate the selection).
+    press(&mut app, KeyCode::Char('c'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    assert!(area.width > 12 && area.height > 1, "body must render");
+
+    // The value literal is on the second logical line: `  "tok": "abcd...6789"`.
+    // Its opening quote is at column 9 (2 spaces + `"tok"` + `: `). Drag from
+    // there out to the right edge so the whole compacted literal is selected.
+    let open_col = 9u16;
+    let end_col = area.width - 1;
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), open_col));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), end_col));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end_col));
+
+    // On screen the selection is the shortened literal...
+    let shown = app.resp_panel.selected_parts(None).join("");
+    assert!(
+        shown.contains("abcd...6789"),
+        "the on-screen selection is compacted: {shown}"
+    );
+    // ...but the copied text is the full, untruncated value.
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert_eq!(copied, "\"abcdefghijklmnopqrstuvwxyz0123456789\"");
+}
+
 #[test]
 fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
@@ -7094,7 +7567,6 @@ fn whole_panel_text_returns_the_full_request_json_when_the_main_panel_has_focus(
         "y should copy the whole request JSON since the Main panel has focus"
     );
 }
-
 /// Copying the Main panel's JSON body must return the *substituted*
 /// value the user actually sees on screen (e.g. a resolved `{{ TOKEN }}`
 /// environment variable shown in a header value), not the raw
@@ -7112,7 +7584,7 @@ fn main_panel_copy_uses_the_substituted_value_not_the_raw_template() {
     let entry = HurlEntry {
         method: "GET".into(),
         url: "http://example.com/path".into(),
-        headers: vec![("X-Token".into(), "{{ TOKEN }}".into(), true)],
+        headers: vec![KvRow::toggled("X-Token", "{{ TOKEN }}", true)],
         ..Default::default()
     };
     app.collections[ci].entries = vec![entry];
@@ -7215,7 +7687,7 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
     let entry = HurlEntry {
         method: "GET".into(),
         url: "http://example.com/path!important".into(),
-        headers: vec![("X-Token".into(), "{{ TOKEN }}".into(), true)],
+        headers: vec![KvRow::toggled("X-Token", "{{ TOKEN }}", true)],
         ..Default::default()
     };
     app.collections[ci].entries = vec![entry];
@@ -7360,8 +7832,8 @@ fn hurl_view_shows_disabled_rows_as_comments() {
         ..Default::default()
     };
     entry.headers = vec![
-        ("Accept".into(), "application/json".into(), true),
-        ("X-Debug".into(), "1".into(), false),
+        KvRow::toggled("Accept", "application/json", true),
+        KvRow::toggled("X-Debug", "1", false),
     ];
     app.collections[ci].entries = vec![entry];
     app.focus = Pane::Main;
@@ -7431,6 +7903,7 @@ fn main_panel_drag_extracts_the_expected_text() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
+    app.default_request_view = RequestView::Json;
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
@@ -7732,8 +8205,8 @@ fn dragging_from_main_panel_past_its_bottom_edge_into_the_response_panel_does_no
     // than the viewport once wrapped — so autoscroll must cross
     // several *wrapped* rows within a single raw JSON line, not just
     // advance line by line.
-    let headers: Vec<(String, String, bool)> = (0..40)
-        .map(|i| (format!("X-Header-{i}"), "v".repeat(300), true))
+    let headers: Vec<KvRow> = (0..40)
+        .map(|i| KvRow::new(format!("X-Header-{i}"), "v".repeat(300)))
         .collect();
     app.collections[ci].entries = vec![HurlEntry {
         title: "tall-request".into(),
@@ -8366,6 +8839,89 @@ fn saving_a_collection_clears_the_user_added_markers() {
 }
 
 #[test]
+fn saving_a_collection_with_an_empty_multipart_file_field_is_refused() {
+    use crate::i18n::Status;
+    // PaperBoy created these files, so it must be able to read back anything it
+    // writes. A `[Multipart]` file field with no path serializes to an invalid
+    // `file,;` line that its own parser rejects — so the save is refused with a
+    // clear message rather than writing an unreadable file.
+    let dir = temp_dir("savecol_emptyfile");
+    let path = dir.join("out.hurl");
+
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".into(),
+        method: "POST".into(),
+        url: "http://h/upload".into(),
+        form_fields: vec![crate::hurl::FormField {
+            key: "photo".into(),
+            value: String::new(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+            desc: String::new(),
+        }],
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".into(), vec![entry]));
+    app.active_tab = 1;
+
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    assert!(
+        !path.exists(),
+        "PaperBoy refuses to write a file it couldn't reload"
+    );
+    match &app.status {
+        Some(Status::SaveUnreadableEmptyFile { req, field }) => {
+            assert_eq!(req, "upload");
+            assert_eq!(field, "photo");
+        }
+        other => panic!("expected SaveUnreadableEmptyFile, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn saving_a_collection_with_a_filled_multipart_file_field_round_trips() {
+    use crate::i18n::Status;
+    // The guard only blocks an *empty* path: a real file path saves and reloads
+    // cleanly (so we haven't over-blocked valid multipart requests).
+    let dir = temp_dir("savecol_filledfile");
+    let path = dir.join("out.hurl");
+
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".into(),
+        method: "POST".into(),
+        url: "http://h/upload".into(),
+        form_fields: vec![crate::hurl::FormField {
+            key: "photo".into(),
+            value: "photo.jpg".into(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+            desc: String::new(),
+        }],
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".into(), vec![entry]));
+    app.active_tab = 1;
+
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    assert!(path.exists(), "a valid multipart request writes normally");
+    assert!(matches!(app.status, Some(Status::Saved)));
+    let reloaded = crate::hurl::parse_hurl(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(reloaded.len(), 1, "the saved file reloads cleanly");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn saving_an_environment_clears_new_and_modified_markers() {
     let dir = temp_dir("saveenv");
     let path = dir.join("out.vars");
@@ -8459,6 +9015,123 @@ fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
     press(&mut app, KeyCode::Tab);
     assert!(app.browser_filter_on);
     assert!(!names(&app).iter().any(|n| n == "notes.txt"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The terminal UI shares one `state.json` with the graphical front-end but has
+/// no use for pixel geometry, so it must carry the GUI's layout through
+/// untouched — a `to_persisted` that rebuilt the field from nothing would reset
+/// the GUI's window and panel sizes every time the terminal UI saved.
+#[test]
+fn the_tui_preserves_the_guis_saved_layout() {
+    use crate::persistence::{GuiLayout, GuiView, PersistedState};
+
+    let layout = GuiLayout {
+        window: Some((1440.0, 900.0)),
+        left_width: Some(312.0),
+        env_height: Some(240.0),
+        response_height: Some(360.0),
+        report_diag_height: Some(96.0),
+        report_palette_width: Some(200.0),
+        view: GuiView::Report(2),
+        report_source_view: true,
+    };
+
+    let mut app = TuiApp::default();
+    app.apply_persisted(PersistedState {
+        gui: layout,
+        ..Default::default()
+    });
+    assert_eq!(
+        app.to_persisted().gui,
+        layout,
+        "the GUI's layout survives a terminal-UI save"
+    );
+}
+
+/// Typing in a load browser filters the list by name (case-insensitive
+/// substring) on top of the extension filter; Backspace trims the query and the
+/// first Esc clears it (leaving the picker open). Folders are narrowed by the
+/// query as well as files — only `../` is exempt, so there is always a way out.
+#[test]
+fn load_browser_type_to_filter_narrows_by_name() {
+    let dir = temp_dir("typefilter");
+    for f in ["api.hurl", "auth.hurl", "data.json"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+
+    let mut app = TuiApp {
+        last_browse_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    app.open_browser(FileAction::OpenCollection);
+    assert!(app.browser_query.is_empty(), "query starts empty");
+
+    // Type "au": only auth.hurl contains it; api.hurl and data.json don't.
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.browser_query, "au");
+    let shown = names(&app);
+    assert!(
+        shown.iter().any(|n| n == "auth.hurl"),
+        "matching file shown"
+    );
+    assert!(
+        !shown.iter().any(|n| n == "api.hurl") && !shown.iter().any(|n| n == "data.json"),
+        "non-matching files hidden: {shown:?}"
+    );
+    // Folders are filtered by the query too, so a big tree narrows to just the
+    // relevant branches instead of leaving every unrelated folder in the way.
+    assert!(
+        shown.iter().any(|n| n == "auth-fixtures/"),
+        "matching folder shown: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|n| n == "sub/"),
+        "non-matching folder hidden: {shown:?}"
+    );
+    // …but never the way back out.
+    assert!(
+        shown.iter().any(|n| n == "../"),
+        "the parent entry is always reachable: {shown:?}"
+    );
+
+    // Backspace widens the query back to "a": now all three files match.
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.browser_query, "a");
+    let shown = names(&app);
+    assert!(
+        ["api.hurl", "auth.hurl", "data.json"]
+            .iter()
+            .all(|f| shown.iter().any(|n| n == f)),
+        "all files containing 'a' shown: {shown:?}"
+    );
+
+    // Clearing the query brings every folder back.
+    press(&mut app, KeyCode::Backspace);
+    assert!(
+        names(&app).iter().any(|n| n == "sub/"),
+        "clearing the query restores hidden folders"
+    );
+    press(&mut app, KeyCode::Char('a'));
+
+    // First Esc clears the filter but keeps the picker open.
+    press(&mut app, KeyCode::Esc);
+    assert!(app.browser_query.is_empty(), "Esc cleared the query");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Browser(..))),
+        "the picker stays open after clearing the filter"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -9134,7 +9807,7 @@ fn request_preview_substitutes_env_values_and_masks_secrets() {
         "r",
         "GET",
         "{{ BASE_URL }}/x",
-        vec![("Authorization".into(), "Bearer {{ TOKEN }}".into(), true)],
+        vec![KvRow::toggled("Authorization", "Bearer {{ TOKEN }}", true)],
         "",
     ));
     app.collections[0].selected_entry = app.collections[0].entries.len() - 1;
@@ -9368,7 +10041,7 @@ fn editing_request_json_via_f2_persists_and_marks_modified() {
         "r",
         "GET",
         "http://h/x",
-        vec![("X-A".into(), "1".into(), true)],
+        vec![KvRow::toggled("X-A", "1", true)],
         "",
     );
     app.collections
@@ -9753,7 +10426,7 @@ fn creating_a_request_returns_focus_to_the_requests_list() {
 fn editing_a_request_preserves_fields_the_wizard_does_not_expose() {
     let mut app = TuiApp::default();
     let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
-    entry.queries = vec![("q".into(), "1".into(), true)];
+    entry.queries = vec![KvRow::toggled("q", "1", true)];
     entry.basic_auth = Some(("user".into(), "pass".into()));
     entry.expected_status = Some(200);
     app.collections[0].entries.push(entry);
@@ -10091,8 +10764,8 @@ fn editing_a_request_populates_and_preserves_the_options_section() {
     // editable table on open and survive a commit that changes nothing else.
     let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
     entry.options = vec![
-        ("retry".to_string(), "3".to_string(), true),
-        ("insecure".to_string(), "true".to_string(), true),
+        KvRow::toggled("retry", "3", true),
+        KvRow::toggled("insecure", "true", true),
     ];
 
     let mut app = TuiApp::default();
@@ -10345,6 +11018,41 @@ fn pressing_enter_to_confirm_the_kind_dropdown_stays_on_the_kind_cell() {
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
 }
 
+#[test]
+fn ctrl_h_deletes_in_an_assert_cell_instead_of_typing_a_literal_h() {
+    // On terminals without the keyboard-enhancement protocol, Backspace arrives
+    // as Ctrl+H (`Char('h')`+CONTROL). It must delete the previous character in
+    // a wizard text cell — not insert a stray `h` (the reported bug).
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::PageDown); // -> Headers
+    press(&mut app, KeyCode::PageDown); // -> Cookies
+    press(&mut app, KeyCode::PageDown); // -> Queries
+    press(&mut app, KeyCode::PageDown); // -> Options
+    press(&mut app, KeyCode::PageDown); // -> Form
+    press(&mut app, KeyCode::PageDown); // -> Body
+    press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Enter); // add a blank assert row
+    assert_eq!(new_focus(&app), NewField::Assert(0));
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(form_ref(&app).asserts[0].expr.text(), "ab");
+
+    // Ctrl+H (how Backspace can arrive) deletes rather than inserting.
+    app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        form_ref(&app).asserts[0].expr.text(),
+        "a",
+        "Ctrl+H deletes the last char and never types a literal 'h'"
+    );
+    assert_eq!(
+        new_focus(&app),
+        NewField::Assert(0),
+        "focus stays on the cell"
+    );
+}
+
 // ── Content-type dropdown (File-kind Form rows) ─────────────────────────
 
 /// Move focus onto the first Form row's Value cell with its kind flipped
@@ -10409,10 +11117,15 @@ fn content_type_and_description_are_independent_form_columns() {
 
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
     let e = &app.collections[0].entries;
-    // Description never persists, only the content-type override does.
+    // Both the content-type override and the note the user typed survive the
+    // submit — the description used to be UI-only scratch.
     assert_eq!(
         e[0].form_fields[0].content_type.as_deref(),
         Some("text/csv")
+    );
+    assert_eq!(
+        e[0].form_fields[0].desc, "a note",
+        "the Description column should be saved with the form field"
     );
 }
 
@@ -10864,6 +11577,7 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
         content_type: None,
         base64_prefix: None,
         enabled: true,
+        desc: String::new(),
     });
 
     let mut app = TuiApp::default();
@@ -13517,7 +14231,7 @@ fn create_workspace_report_rejects_paths_escaping_the_root() {
 }
 
 #[test]
-fn capital_r_in_the_workspace_picker_opens_the_new_report_prompt() {
+fn capital_r_in_the_workspace_picker_opens_the_new_report_browser() {
     let dir = workspace_temp_dir("ws_picker_new_report");
     let mut col = Collection::new("ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -13526,17 +14240,391 @@ fn capital_r_in_the_workspace_picker_opens_the_new_report_prompt() {
     let ci = app.collections.len() - 1;
     app.active_tab = ci;
 
-    // A Browse-mode picker (the `w` flow) → `R` opens the new-report prompt.
+    // A Browse-mode picker (the `w` flow) → `R` opens the new-report *folder
+    // browser* (not a bare name prompt), seeded inside the workspace (to the
+    // highlighted folder), so the user chooses where the report lands.
     app.open_workspace_picker_for_active_tab();
     press(&mut app, KeyCode::Char('R'));
 
     match &app.overlay {
-        Some(Overlay::Prompt { kind, .. }) => {
-            assert!(matches!(kind, PromptKind::NewWorkspaceReport(idx) if *idx == ci));
+        Some(Overlay::Browser(action, ex)) => {
+            assert!(matches!(action, FileAction::NewReportChooseFolder));
+            assert!(
+                ex.cwd().starts_with(&dir),
+                "the browser starts inside the workspace (seed folder), got {:?}",
+                ex.cwd()
+            );
         }
-        _ => panic!("expected the new-report name prompt"),
+        _ => panic!("expected the new-report folder browser"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_standalone_writes_and_opens_a_plain_report_tab() {
+    let dir = temp_dir("new_report_standalone");
+    let mut app = TuiApp::default();
+    // No open Workspace encloses `dir`, so the report is written and opened as
+    // its own standalone strip tab bound to the file.
+    let path = dir.join("adhoc.trail");
+    app.create_report_at_path(&path);
+
+    assert!(path.is_file(), "the report is written to disk immediately");
+    assert_eq!(app.reports.len(), 1, "one report tab was opened");
+    let rt = &app.reports[0];
+    assert_eq!(
+        rt.report.path.as_deref(),
+        Some(path.as_path()),
+        "the tab is bound to the chosen path"
+    );
+    assert!(
+        rt.workspace_root.is_none(),
+        "a standalone report has no workspace root"
+    );
+    // Standalone reports occupy a strip slot after the collection tabs.
+    assert_eq!(app.tab_count(), 2, "a new strip tab was created");
+    assert!(app.active_is_report(), "the new report tab is active");
+    assert_eq!(app.active_report_index(), Some(0));
+    assert!(matches!(app.status, Some(crate::i18n::Status::Loaded)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_inside_a_workspace_creates_it_embedded() {
+    let dir = workspace_temp_dir("new_report_embedded");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // The chosen path lies inside the open Workspace root, so the report joins
+    // that tree (embedded) rather than opening as a separate strip tab.
+    let path = dir.join("reports").join("nightly.trail");
+    app.create_report_at_path(&path);
+
+    assert!(path.is_file(), "the report is written under the workspace");
+    assert_eq!(app.reports.len(), 1, "a report was opened");
+    let rt = &app.reports[0];
+    assert_eq!(rt.report.path.as_deref(), Some(path.as_path()));
+    assert!(
+        rt.workspace_root.is_some(),
+        "opened embedded in the workspace tab, not as a plain report tab"
+    );
+    assert_eq!(
+        app.active_tab, ci,
+        "the Workspace collection tab stays active"
+    );
+    assert_eq!(app.tab_count(), 2, "no new strip tab is created");
+    assert!(app.active_is_report(), "the Workspace tab shows the report");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceReportCreated(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn create_report_at_path_defaults_the_trail_extension() {
+    let dir = temp_dir("new_report_default_ext");
+    let mut app = TuiApp::default();
+    // A path with no extension gets `.trail` appended before it's written.
+    app.create_report_at_path(&dir.join("noext"));
+
+    let expected = dir.join("noext.trail");
+    assert!(expected.is_file(), "a missing extension defaults to .trail");
+    assert_eq!(
+        app.reports[0].report.path.as_deref(),
+        Some(expected.as_path())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctrl_n_in_the_new_report_browser_opens_a_scratch_report_tab() {
+    let dir = temp_dir("new_report_scratch");
+    // Start from a guaranteed-empty folder so the "nothing was written" check
+    // below can't trip over leftovers from an earlier aborted run.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    // Stand in the new-report folder browser, then Ctrl+N — the escape hatch
+    // that abandons the folder choice and makes an unsaved scratch report tab.
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "the browser overlay is closed");
+    assert_eq!(app.reports.len(), 1, "a scratch report tab was opened");
+    assert!(
+        app.reports[0].report.path.is_none(),
+        "a scratch report is unsaved (no file bound)"
+    );
+    assert!(
+        app.reports[0].workspace_root.is_none(),
+        "a scratch report isn't attached to any workspace"
+    );
+    assert!(app.active_is_report(), "the scratch report tab is active");
+    // Nothing was written to disk for the folder that was browsed.
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "no file was created in the browsed folder"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enter_in_the_new_report_browser_writes_and_opens_the_report() {
+    let dir = temp_dir("new_report_browser_commit");
+    let mut app = TuiApp::default();
+    // Drive the full browser flow: Tab to the filename field, type a name, Enter
+    // writes `dir/<name>.trail` and opens it (standalone, since `dir` is not a
+    // workspace).
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_name_focused, "Tab focuses the filename field");
+    app.browser_name = super::editor::Editor::new("smoke", false);
+    press(&mut app, KeyCode::Enter);
+
+    let expected = dir.join("smoke.trail");
+    assert!(expected.is_file(), "Enter writes the report to the folder");
+    assert_eq!(app.reports.len(), 1);
+    assert_eq!(
+        app.reports[0].report.path.as_deref(),
+        Some(expected.as_path())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn shift_r_in_a_workspace_opens_the_folder_browser_even_when_focus_is_not_the_tree() {
+    let dir = workspace_temp_dir("shift_r_ws_focus");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    // Focus is on the Main pane (e.g. the user is viewing a report body or the
+    // request/response), not the file tree. Shift+R must still open the
+    // workspace new-report browser so the report lands *in the workspace* —
+    // rather than falling through to a standalone scratch tab.
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
+        ),
+        "Shift+R in a workspace opens the folder browser regardless of focus"
+    );
+    assert_eq!(app.reports.len(), 0, "no standalone report tab was opened");
+
+    // Completing the browser creates the report embedded in the workspace.
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("smoke", false);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.reports.len(), 1);
+    assert!(
+        app.reports[0].workspace_root.is_some(),
+        "the report is embedded in the workspace, not a standalone tab"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_picker_shows_folders_and_workspace_files_but_hides_others() {
+    let dir = workspace_temp_dir("new_report_show_files");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    // Open the new-report chooser seeded at the workspace root. It shows the
+    // destination *folders* plus the workspace's own files (collections,
+    // environments, reports) for context — so it's visually obvious the
+    // picker is scoped inside the workspace — while non-workspace files
+    // (a stray `notes.txt`) stay hidden. Only folders are selectable.
+    app.new_report_seed_dir = Some(dir.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+    match &app.overlay {
+        Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) => {
+            let names: Vec<&String> = ex.files().iter().map(|f| &f.name).collect();
+            assert!(
+                ex.files().iter().any(|f| f.is_dir && f.name == "sub/"),
+                "the `sub/` folder is shown as a destination, got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.as_str() == "alpha.hurl"),
+                "the workspace's collection file is shown for context, got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.as_str() == "report.trail"),
+                "the workspace's report file is shown for context, got: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n.as_str() == "notes.txt"),
+                "non-workspace files are hidden, got: {names:?}"
+            );
+        }
+        _ => panic!("expected the new-report folder browser"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
+    let dir = workspace_temp_dir("new_report_enter_file");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    app.new_report_seed_dir = Some(dir.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+
+    // Move the selection onto a shown file (a collection) and press Enter:
+    // files are non-selectable here, so Enter is inert and the folder
+    // browser stays open (rather than closing or opening anything).
+    if let Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) = &mut app.overlay {
+        let idx = ex
+            .files()
+            .iter()
+            .position(|f| f.name == "alpha.hurl")
+            .expect("the collection file is listed");
+        ex.set_selected_idx(idx);
+    } else {
+        panic!("expected the new-report folder browser");
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
+        ),
+        "Enter on a non-selectable file leaves the new-report browser open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_browser_cannot_ascend_above_the_workspace_root() {
+    let dir = workspace_temp_dir("new_report_confine");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    // Start the browser one level down, inside the workspace's `sub/` folder.
+    let sub = dir.join("sub");
+    app.new_report_seed_dir = Some(sub.clone());
+    app.open_browser(FileAction::NewReportChooseFolder);
+
+    // Left ascends within the workspace: `sub/` → the workspace root.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "ascended from sub/ back to the root")
+        }
+        _ => panic!("browser should stay open"),
+    }
+    // Left again at the root is inert — the report must stay inside the
+    // workspace, so there's nowhere higher to go.
+    press(&mut app, KeyCode::Left);
+    match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => {
+            assert_eq!(ex.cwd(), &dir, "stayed put at the workspace root")
+        }
+        _ => panic!("browser should stay open"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_report_name_with_a_subfolder_path_creates_the_folder_embedded() {
+    let dir = workspace_temp_dir("new_report_subfolder");
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+
+    // A `sub/name` filename creates the (new) subfolder and lands the report in
+    // it, embedded in the workspace — the "＋ new subfolder" affordance.
+    app.overlay = Some(Overlay::Browser(FileAction::NewReportChooseFolder, {
+        let mut ex = ratatui_explorer::FileExplorer::new().unwrap();
+        let _ = ex.set_cwd(&dir);
+        Box::new(ex)
+    }));
+    press(&mut app, KeyCode::Tab);
+    app.browser_name = super::editor::Editor::new("nightly/run", false);
+    press(&mut app, KeyCode::Enter);
+
+    let expected = dir.join("nightly").join("run.trail");
+    assert!(
+        expected.is_file(),
+        "the new subfolder and report were created"
+    );
+    assert_eq!(app.reports.len(), 1);
+    assert!(
+        app.reports[0].workspace_root.is_some(),
+        "the report is embedded in the workspace, not standalone"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::WorkspaceReportCreated(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn new_report_into_a_symlink_that_escapes_the_workspace_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = workspace_temp_dir("new_report_symlink_escape");
+    let outside = temp_dir("new_report_symlink_outside");
+    // A folder inside the workspace that is really a symlink pointing OUT of it.
+    // Lexically `escape/r.trail` looks contained; physically it resolves under
+    // `outside`, so the containment guard must refuse to write it.
+    let link = dir.join("escape");
+    let _ = std::fs::remove_file(&link);
+    symlink(&outside, &link).unwrap();
+
+    let mut col = Collection::new("ws".to_string(), Vec::new());
+    col.workspace_root = Some(dir.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    app.create_report_at_path(&link.join("r.trail"));
+
+    assert!(
+        app.reports.is_empty(),
+        "no report is opened for an escaping destination"
+    );
+    assert!(
+        !outside.join("r.trail").exists(),
+        "nothing is written outside the workspace"
+    );
+    assert!(
+        matches!(
+            app.status,
+            Some(crate::i18n::Status::WorkspaceReportEscaped(_))
+        ),
+        "the escape is reported to the user"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// Load `alpha.hurl` into a fresh Workspace tab so a request row is
@@ -18164,6 +19252,52 @@ fn report_export_writes_a_csv_next_to_the_report() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The report export key is `Ctrl+S`, not a bare `x` (which deletes an
+/// environment/request one pane away in the collection view). `Ctrl+S` opens
+/// the export folder picker; a plain `x` in a report view does nothing.
+#[test]
+fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+
+    // A bare `x` must not open the export picker (nor do anything else).
+    app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(
+        app.overlay.is_none(),
+        "a plain `x` should be inert in a report view, not export"
+    );
+
+    // Ctrl+S opens the report-CSV export folder picker.
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::SaveReportCsvChooseFolder, _))
+        ),
+        "Ctrl+S should open the report-CSV export picker"
+    );
+}
+
 /// The export filename's extension selects the output format: typing an
 /// `.xlsx`/`.json`/`.html` name writes that format, not CSV.
 #[test]
@@ -18224,6 +19358,155 @@ fn report_export_format_follows_the_typed_extension() {
     );
     let html = std::fs::read_to_string(dir.join("smoke.html")).unwrap();
     assert!(html.starts_with("<!DOCTYPE html>"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A completed run leaves its results *unexported*, so rerunning first asks to
+/// confirm (the on-screen results would otherwise vanish) rather than starting
+/// straight away (#2). The warning is a [`ConfirmAction::RerunReport`] popup and
+/// no run is spawned until it's confirmed.
+#[test]
+fn rerunning_a_report_warns_when_results_are_unexported() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(
+        !app.reports[idx].results_exported,
+        "a fresh run's results start unexported"
+    );
+    assert!(app.rerun_would_discard_unexported());
+
+    app.run_active_report();
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::RerunReport,
+                ..
+            })
+        ),
+        "rerun over unexported results should ask to confirm first"
+    );
+    assert!(
+        app.running_reports.is_empty(),
+        "no run should start until the warning is confirmed"
+    );
+}
+
+/// Exporting the results (here as CSV) marks them saved, so a later rerun no
+/// longer warns (#2).
+#[test]
+fn exporting_report_results_clears_the_rerun_warning() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-rerun-export-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.trail");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(app.rerun_would_discard_unexported());
+
+    app.browser_commit_save(
+        FileAction::SaveReportCsvChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
+    assert!(
+        app.reports[idx].results_exported,
+        "a successful export marks the results saved"
+    );
+    assert!(
+        !app.rerun_would_discard_unexported(),
+        "exported results need no rerun warning"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Saving a `.baseline` snapshot also persists the results, so it clears the
+/// rerun warning too (#2).
+#[test]
+fn saving_a_report_baseline_clears_the_rerun_warning() {
+    let dir = std::env::temp_dir().join(format!(
+        "pb-report-rerun-baseline-{}",
+        crate::report::report::next_report_id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let report_path = dir.join("smoke.trail");
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Oauth".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/oauth".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.path = Some(report_path.clone());
+    app.reports[idx].report.set_text(
+        "# collection: api\n# columns: Oauth.HttpStatus as Status\nREPORT REQUEST Oauth\n",
+    );
+    app.revalidate_report(idx);
+    let runner = FakeReportRunner {
+        body: "{}".to_string(),
+    };
+    app.apply_report_run(idx, &runner);
+    assert!(app.rerun_would_discard_unexported());
+
+    app.browser_commit_save(
+        FileAction::SaveReportBaselineChooseFolder,
+        dir.clone(),
+        "smoke".to_string(),
+    );
+    assert!(
+        app.reports[idx].results_exported,
+        "saving a baseline snapshot marks the results saved"
+    );
+    assert!(!app.rerun_would_discard_unexported());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -18547,10 +19830,10 @@ fn dry_run_previews_row_count_and_file_bindings() {
     let result = app.dry_run_report_flow(idx).expect("expandable");
     assert_eq!(result.rows.len(), 3);
 
-    // Opening the overlay (via the `d` key) builds a preview from that.
+    // Pressing `d` builds a preview from that and parks it in the results pane.
     press(&mut app, KeyCode::Char('d'));
-    match app.overlay.as_ref() {
-        Some(Overlay::ReportDryRun(p)) => {
+    match app.reports[idx].dry_run.as_ref() {
+        Some(p) => {
             assert_eq!(p.rows, 3, "three files → three rows");
             assert_eq!(
                 p.result.rows.len(),
@@ -18564,8 +19847,12 @@ fn dry_run_previews_row_count_and_file_bindings() {
             );
             assert!(p.errors.is_empty(), "a valid loop should have no problems");
         }
-        _ => panic!("the `d` key should open the dry-run preview overlay"),
+        None => panic!("the `d` key should show the dry-run preview"),
     }
+    assert!(
+        app.reports[idx].view == crate::tui::reports::ReportView::Results,
+        "and the preview is shown where results are, not in a popup"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -18592,15 +19879,15 @@ fn dry_run_surfaces_producer_errors_without_running() {
     app.revalidate_report(idx);
 
     app.open_report_dry_run();
-    match app.overlay.as_ref() {
-        Some(Overlay::ReportDryRun(p)) => {
+    match app.reports[idx].dry_run.as_ref() {
+        Some(p) => {
             assert_eq!(p.rows, 0, "a missing directory yields no rows");
             assert!(
                 !p.errors.is_empty(),
                 "the missing directory should surface a producer error"
             );
         }
-        _ => panic!("expected the dry-run overlay"),
+        None => panic!("expected a dry-run preview"),
     }
 }
 
@@ -18616,8 +19903,8 @@ fn dry_run_is_blocked_when_unbound() {
 
     app.open_report_dry_run();
     assert!(
-        app.overlay.is_none(),
-        "an unbound report can't be dry-run, so no overlay opens"
+        app.reports[idx].dry_run.is_none(),
+        "an unbound report can't be dry-run, so no preview appears"
     );
     assert!(matches!(
         app.status,
@@ -18648,17 +19935,25 @@ fn dry_run_overlay_scrolls_and_closes() {
     app.revalidate_report(idx);
 
     press(&mut app, KeyCode::Char('d'));
-    assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
+    assert!(app.reports[idx].dry_run.is_some());
+    assert!(app.reports[idx].view == crate::tui::reports::ReportView::Results);
 
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
 
-    // Down scrolls the preview but keeps it open; Esc closes it.
+    // The preview lives in the results pane, so it scrolls with that pane's
+    // own panel rather than a popup-specific offset; Esc dismisses it.
     press(&mut app, KeyCode::Down);
-    assert_eq!(app.dry_run_scroll, 1);
-    assert!(matches!(app.overlay, Some(Overlay::ReportDryRun(_))));
+    assert!(
+        app.reports[idx].dry_run.is_some(),
+        "scrolling doesn't dismiss the preview"
+    );
     press(&mut app, KeyCode::Esc);
-    assert!(app.overlay.is_none(), "Esc closes the dry-run overlay");
+    assert!(
+        app.reports[idx].dry_run.is_none(),
+        "Esc dismisses the dry-run preview"
+    );
+    assert!(app.overlay.is_none(), "and nothing was ever a popup");
 }
 
 /// The dry-run preview overlay renders the same output grid as the Results
@@ -18686,10 +19981,10 @@ fn dry_run_overlay_renders_grid_not_bindings_list() {
     app.revalidate_report(idx);
 
     press(&mut app, KeyCode::Char('d'));
-    let p = match app.overlay.as_ref() {
-        Some(Overlay::ReportDryRun(p)) => p,
-        _ => panic!("expected ReportDryRun overlay"),
-    };
+    let p = app.reports[idx]
+        .dry_run
+        .as_ref()
+        .expect("expected a dry-run preview");
 
     assert_eq!(p.rows, 2, "two iterations → two rows");
     assert_eq!(p.result.rows.len(), 2, "result carries both rows");
@@ -18756,12 +20051,12 @@ fn dry_run_overlay_shows_var_availability_warnings() {
         app.reports[idx].diagnostics
     );
 
-    // The dry-run overlay should also surface the warning.
+    // The dry-run preview should also surface the warning.
     press(&mut app, KeyCode::Char('d'));
-    let p = match app.overlay.as_ref() {
-        Some(Overlay::ReportDryRun(p)) => p,
-        _ => panic!("expected ReportDryRun overlay"),
-    };
+    let p = app.reports[idx]
+        .dry_run
+        .as_ref()
+        .expect("expected a dry-run preview");
     assert!(
         p.var_warnings.iter().any(|w| w.contains("API_KEY")),
         "dry-run overlay should list the API_KEY warning: {:?}",
@@ -18870,6 +20165,7 @@ fn report_with_result(text: &str, column_order: &[&str]) -> (TuiApp, usize) {
         column_order: column_order.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     (app, idx)
 }
@@ -19840,9 +21136,286 @@ fn report_node_editor_moves_a_node_down() {
     );
 }
 
-/// Editing a non-request node "as a line" (Enter on an assignment) opens the
-/// prompt seeded with the node's source; committing edited text re-parses it
-/// back into the flow.
+/// Enter on an assignment opens the structured `VARIABLE = VALUE` form (the
+/// raw line editor is now the fallback, not the first thing you meet), and
+/// applying it writes the typed value back into the flow.
+#[test]
+fn report_node_editor_configures_an_assignment() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nURL=old\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the assignment row
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeAssign(_))),
+        "Enter on an assignment opens the assignment form"
+    );
+    press(&mut app, KeyCode::Down); // to the Value row
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Backspace); // clear "old"
+    }
+    for c in "new".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter); // apply
+    let flow = app.reports[idx].report.flow().unwrap();
+    assert!(
+        matches!(&flow.nodes[0], crate::report::flow::FlowNode::Assign { key, value } if key == "URL" && value == "new"),
+        "the form's value is written back: {:?}",
+        flow.nodes
+    );
+}
+
+/// Enter on a `REPORT <var>` statement opens the variable form, whose checklist
+/// is seeded from the assignments in scope. Ticking a single one and naming it
+/// produces `REPORT <var> AS <name>`.
+#[test]
+fn report_node_editor_reports_a_variable_in_scope() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nTIER=gold\nREPORT TIER\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down); // select the REPORT row
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeVars(form)) = &app.overlay else {
+        panic!("Enter on a reported variable opens the variable form");
+    };
+    assert!(
+        form.vars.iter().any(|r| r.name == "TIER" && r.included),
+        "the assignment above is offered and already ticked: {:?}",
+        form.vars.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+    // With exactly one variable ticked the alias row is reachable.
+    press(&mut app, KeyCode::Down); // past the TIER row
+    press(&mut app, KeyCode::Down); // past the "other variable" row, onto Alias
+    for c in "Plan".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("REPORT TIER AS Plan"),
+        "the alias is written back: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Enter on a computed column opens its own form rather than the raw line
+/// prompt, and both the template and the statistics round-trip.
+#[test]
+fn report_node_editor_configures_a_computed_column() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT \"value\" AS column\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeComputed(_))),
+        "Enter on a computed column opens the computed form"
+    );
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Backspace); // clear "value"
+    }
+    for c in "{{ n }}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Down); // Column name
+    press(&mut app, KeyCode::Down); // first statistic
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("REPORT \"{{ n }}\" AS column") && text.contains("STATISTICS("),
+        "template and statistics both round-trip: {text}"
+    );
+}
+
+/// Enter on a `LIST` of scalars opens the list form; Space on the add row
+/// appends an element that can be typed into straight away.
+#[test]
+fn report_node_editor_adds_a_list_value() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nLIST TIERS = [ gold ]\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeList(_))),
+        "Enter on a LIST opens the list form"
+    );
+    press(&mut app, KeyCode::Down); // the existing "gold" row
+    press(&mut app, KeyCode::Down); // the add row
+    press(&mut app, KeyCode::Char(' ')); // append
+    for c in "silver".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    let flow = app.reports[idx].report.flow().unwrap();
+    assert!(
+        app.reports[idx].report.text.contains("silver"),
+        "the appended value reaches the source: {:?}",
+        flow.nodes
+    );
+}
+
+/// `PARALLEL(n)` is editable from the ENVS form: ticking PARALLEL reveals a
+/// digits-only max-concurrency row, and the number reaches the source.
+#[test]
+fn report_node_editor_sets_a_parallel_degree() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nFOR E IN ENVS \"prod\", \"stage\"\n    REQUEST Oauth\nEND\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the loop head
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeEnvs(_))),
+        "Enter on an ENVS loop opens the envs form"
+    );
+    press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Parallel
+    press(&mut app, KeyCode::Char(' ')); // tick it — reveals the degree row
+    press(&mut app, KeyCode::Down); // the degree row
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("PARALLEL(4)"),
+        "the typed degree is written as PARALLEL(n): {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A `SHOW` on the baseline is editable from the ENVS form rather than being a
+/// separate block: the checklist only appears in Compare mode, and ticking a
+/// field writes `BASELINE(…) SHOW(…)`.
+#[test]
+fn report_node_editor_shows_baseline_fields_from_the_envs_form() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR E IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REPORT REQUEST Oauth\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeEnvs(form)) = app.overlay.as_ref() else {
+        panic!("Enter on an ENVS loop opens the envs form");
+    };
+    // The checklist offers what the body reports; nothing is ticked, because an
+    // empty baseline SHOW means "carry nothing across".
+    let rows = form.visible_rows();
+    let show_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r, super::report_nodes::EnvsRow::BaselineShow(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !show_rows.is_empty(),
+        "a compare loop with a baseline offers a SHOW checklist"
+    );
+    let first = show_rows[0];
+    if let Some(Overlay::ReportNodeEnvs(form)) = app.overlay.as_mut() {
+        form.selected = first;
+    }
+    press(&mut app, KeyCode::Char(' ')); // tick the first field
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("SHOW("),
+        "ticking a field writes a baseline SHOW clause: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A `WITH` field is added from the request form's own "add" row, through a
+/// sub-form that also carries its `STATISTICS(…)` checklist — the GUI has a
+/// WITH chip for this; the terminal UI folds it into the form.
+#[test]
+fn report_node_editor_adds_a_with_field_to_a_reported_request() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_ref() else {
+        panic!("Enter on a report request opens the request form");
+    };
+    let add = form
+        .visible_rows()
+        .iter()
+        .position(|r| matches!(r, super::report_nodes::FormRow::AddWith))
+        .expect("the request form offers an add-WITH row");
+    if let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_mut() {
+        form.selected = add;
+    }
+    press(&mut app, KeyCode::Char(' ')); // open the WITH sub-form
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeWithField(_))),
+        "the add row opens the WITH field form"
+    );
+    for c in "latency".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Down); // the query row
+    for c in "Time".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter); // apply, returning to the request form
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeRequest(_))),
+        "applying the sub-form returns to the request form"
+    );
+    assert!(
+        app.reports[idx].report.text.contains("latency: Time"),
+        "the WITH field reaches the source: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A `HIDE(…)` clause is editable from the request form's second checklist —
+/// SHOW and HIDE are separate clauses, so they get separate lists.
+#[test]
+fn report_node_editor_hides_a_field_from_the_request_form() {
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nREPORT REQUEST Oauth\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_ref() else {
+        panic!("Enter on a report request opens the request form");
+    };
+    let hide = form
+        .visible_rows()
+        .iter()
+        .position(|r| matches!(r, super::report_nodes::FormRow::Hidden(_)))
+        .expect("the request form offers a HIDE checklist");
+    if let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_mut() {
+        form.selected = hide;
+    }
+    press(&mut app, KeyCode::Char(' ')); // tick the first HIDE row
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("HIDE("),
+        "ticking a HIDE row writes a HIDE clause: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Editing a node "as a line" (`e` on an assignment) opens the prompt seeded
+/// with the node's source; committing edited text re-parses it back into the
+/// flow. `e` is the raw escape hatch — Enter opens the structured form instead
+/// (see `report_node_editor_configures_an_assignment`).
 #[test]
 fn report_node_editor_edits_a_line_and_roundtrips() {
     let (mut app, idx) = node_editor_app(&["Oauth"]);
@@ -19851,7 +21424,7 @@ fn report_node_editor_edits_a_line_and_roundtrips() {
         .set_text("# collection: api\nURL=old\n");
     app.revalidate_report(idx);
     press(&mut app, KeyCode::Down); // select the assignment row
-    press(&mut app, KeyCode::Enter); // open the "edit as line" prompt
+    press(&mut app, KeyCode::Char('e')); // open the "edit as line" prompt
     assert!(
         matches!(
             &app.overlay,
@@ -19886,7 +21459,7 @@ fn report_node_editor_rejects_an_invalid_edited_line() {
         .set_text("# collection: api\nURL=keep\n");
     app.revalidate_report(idx);
     press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('e'));
     if let Some(Overlay::Prompt { editor, .. }) = app.overlay.as_mut() {
         // A dangling FOR with no END never yields a single statement.
         *editor = super::editor::Editor::new("FOR", false);
@@ -19911,17 +21484,82 @@ fn report_node_folder_key_opens_the_browser_for_a_for_loop() {
     press(&mut app, KeyCode::Down); // select the FOR head (row 1)
     press(&mut app, KeyCode::Enter);
     assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))),
+        "Enter opens the FILES configure wizard"
+    );
+    // The Folder row opens the browser with Space.
+    if let Some(Overlay::ReportNodeFiles(form)) = &mut app.overlay {
+        form.selected = 1; // Folder row
+    }
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
         matches!(
             app.overlay,
             Some(Overlay::Browser(FileAction::PickReportNodeFolder, _))
         ),
-        "Enter opens the node folder picker"
+        "the Folder row opens the node folder picker"
     );
     assert!(app.pending_node_folder.is_some(), "the node is parked");
 }
 
-/// Confirming a folder pick writes the chosen directory into the loop's
-/// producer and re-serializes the flow.
+/// Inserting a `FILES` loop from the palette jumps straight into the configure
+/// wizard (folder pre-selected) rather than the raw line prompt — mirroring the
+/// ENVS loop, so every freshly-inserted node lands in its most helpful editor.
+#[test]
+fn report_node_inserting_a_files_loop_opens_the_folder_picker_immediately() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    // Selection starts on Begin (row 0); `a` opens the insert palette.
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
+    // FILES is index 5 in NodeKind::ALL; Down five times, then commit the kind.
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))),
+        "inserting a FILES loop opens the configure wizard straight away"
+    );
+    // A dir-less fresh loop pre-selects the Folder row so the picker is one
+    // keystroke away.
+    if let Some(Overlay::ReportNodeFiles(form)) = &app.overlay {
+        assert_eq!(
+            form.selected, 1,
+            "Folder row is pre-selected for a fresh loop"
+        );
+    }
+    assert!(
+        app.reports[idx].report.text.contains("IN FILES"),
+        "the FILES loop template was inserted: {:?}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Inserting a `FOR … IN ENVS` loop from the palette opens the ENVS configure
+/// popup (baseline / comparison / mode) straight away — the same view Enter
+/// opens on an existing ENVS node — rather than the raw line prompt, so every
+/// freshly-inserted node lands in its most helpful editor.
+#[test]
+fn report_node_inserting_an_envs_loop_opens_the_configure_popup_immediately() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    // Selection starts on Begin (row 0); `a` opens the insert palette.
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeMenu(_))));
+    // ENVS is index 7 in NodeKind::ALL; Down seven times, then commit the kind.
+    for _ in 0..7 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::ReportNodeEnvs(_))),
+        "inserting a FOR … IN ENVS loop opens the baseline/comparison popup straight away"
+    );
+    assert!(
+        app.reports[idx].report.text.contains("IN ENVS"),
+        "the ENVS loop template was inserted: {:?}",
+        app.reports[idx].report.text
+    );
+}
 #[test]
 fn report_node_folder_commit_writes_into_the_loop_producer() {
     let (mut app, idx) = node_editor_app(&["upload"]);
@@ -20247,8 +21885,9 @@ fn report_node_envs_form_cycles_loaded_environments() {
         );
     }
 
-    // Rows: 0 Var, 1 Mode, 2 Env(0) baseline, 3 Env(1) comparison.
+    // Rows: 0 Var, 1 Mode, 2 Parallel, 3 Env(0) baseline, 4 Env(1) comparison.
     press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Parallel
     press(&mut app, KeyCode::Down); // Env(0)
     press(&mut app, KeyCode::Down); // Env(1) — the comparison
     press(&mut app, KeyCode::Right); // staging -> candidate
@@ -20301,8 +21940,88 @@ fn report_node_envs_form_mode_toggle_rewrites_the_clause() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Workspace-aware reports: opening a `.trail` from a Workspace tab's tree
+/// Toggling the ENVS form's PARALLEL row marks (and unmarks) the loop as
+/// `PARALLEL`, preserving the clause and body.
+#[test]
+fn report_node_envs_form_toggles_parallel() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "prod");
+    add_empty_global_env(&mut app, "staging");
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    press(&mut app, KeyCode::Down); // select the FOR … IN ENVS node
+    press(&mut app, KeyCode::Enter); // open the form
+    press(&mut app, KeyCode::Down); // Mode
+    press(&mut app, KeyCode::Down); // Parallel row
+    press(&mut app, KeyCode::Char(' ')); // toggle PARALLEL on
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("PARALLEL FOR TARGET IN ENVS"),
+        "the loop is now PARALLEL: {text:?}"
+    );
+    assert!(
+        text.contains("BASELINE(\"prod\")") && text.contains("REQUEST upload"),
+        "the clause and body are preserved: {text:?}"
+    );
+}
+
+/// The FILES configure wizard edits the loop variable, `MATCH` glob and
+/// PARALLEL toggle, writing them all back on apply.
+#[test]
+fn report_node_files_form_edits_var_match_and_parallel() {
+    let (mut app, idx) = node_editor_app(&["upload"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR FILE IN FILES \"docs\"\n    REPORT REQUEST upload\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down); // select the FOR head
+    press(&mut app, KeyCode::Enter); // open the FILES wizard
+    assert!(matches!(app.overlay, Some(Overlay::ReportNodeFiles(_))));
+
+    // Var row (selected first for a loop with a dir): append to the variable.
+    if let Some(Overlay::ReportNodeFiles(form)) = &app.overlay {
+        assert_eq!(form.selected, 0, "an existing loop selects the Var row");
+    }
+    press(&mut app, KeyCode::Backspace); // FILE -> FIL
+    press(&mut app, KeyCode::Backspace); // FIL -> FI
+    press(&mut app, KeyCode::Backspace); // FI -> F
+    press(&mut app, KeyCode::Backspace); // F -> (empty)
+    press(&mut app, KeyCode::Char('D'));
+    press(&mut app, KeyCode::Char('O'));
+    press(&mut app, KeyCode::Char('C')); // var = "DOC"
+
+    // Down to Match row, type a glob.
+    press(&mut app, KeyCode::Down); // Folder
+    press(&mut app, KeyCode::Down); // Match
+    press(&mut app, KeyCode::Char('*'));
+    press(&mut app, KeyCode::Char('.'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Char('g'));
+
+    // Down to Parallel, toggle it on.
+    press(&mut app, KeyCode::Down); // Parallel
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter); // apply
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("PARALLEL FOR DOC IN FILES \"docs\" MATCH \"*.jpg\""),
+        "var, MATCH and PARALLEL all applied: {text:?}"
+    );
+    assert!(
+        text.contains("REPORT REQUEST upload"),
+        "the body is preserved: {text:?}"
+    );
+}
+
 // embeds it in that tab's *right pane* while the single collection-side tree
 // stays on the left driving navigation. No duplicate tree, no separate report
 // tab — the report just replaces the request/response view in place.
@@ -20931,6 +22650,7 @@ fn report_with_multi_row_result() -> (TuiApp, usize) {
         column_order: cols.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
@@ -21022,6 +22742,160 @@ fn result_cell_cursor_end_jumps_to_last_row() {
     assert_eq!(row, 2, "End must jump to the last row");
 }
 
+/// Build a report whose results grid has `n` data rows (single column) so the
+/// grid is taller than any test terminal and can actually scroll.
+fn report_with_n_rows(n: usize) -> (TuiApp, usize) {
+    use crate::report::model::{ReportResult, ReportRow};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut rows = Vec::new();
+    for r in 0..n {
+        let mut row = ReportRow::default();
+        row.cells.insert("Col1".to_string(), format!("r{r}"));
+        rows.push(row);
+    }
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: vec!["Col1".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats: Default::default(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    (app, idx)
+}
+
+/// #4: the mouse wheel scrolls the results *viewport* without dragging the cell
+/// cursor along, and — crucially — a subsequent draw does NOT yank the scroll
+/// back to keep the (unmoved) cursor visible. Before the fix the draw
+/// re-centred on the cursor every frame, so the wheel appeared frozen.
+#[test]
+fn mouse_wheel_scrolls_results_without_recentering_on_cursor() {
+    use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 3 {
+        return; // pane not visible at this size — skip
+    }
+
+    // Keyboard-navigate to the last row so the panel auto-scrolls down.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::End);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let scroll_after_kbd = app.reports[idx].results_panel.scroll();
+    assert!(
+        scroll_after_kbd > 0,
+        "navigating to the last row should have scrolled the grid down"
+    );
+    let cursor_before = app.reports[idx].cell_cursor;
+
+    // Wheel up several notches over the grid.
+    let mid = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    };
+    for _ in 0..3 {
+        app.on_mouse(mid);
+    }
+    let scroll_after_wheel = app.reports[idx].results_panel.scroll();
+    assert!(
+        scroll_after_wheel < scroll_after_kbd,
+        "the wheel should scroll the viewport up"
+    );
+    assert_eq!(
+        app.reports[idx].cell_cursor, cursor_before,
+        "the wheel must not move the cell cursor"
+    );
+
+    // Re-draw: the scroll must stay where the wheel left it (not snap back to
+    // the still-off-screen cursor).
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.reports[idx].results_panel.scroll(),
+        scroll_after_wheel,
+        "a redraw must not re-centre the viewport on the unmoved cursor"
+    );
+}
+
+/// #4: Ctrl+Down / Ctrl+Up move the cell cursor a whole page at a time.
+#[test]
+fn ctrl_arrows_page_the_result_cursor() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 4 {
+        return;
+    }
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    let (row, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert!(
+        row > 1,
+        "Ctrl+Down should page down more than a single row (got {row})"
+    );
+    let paged_down = row;
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    let (row_up, _) = app.reports[idx].cell_cursor.expect("cursor set");
+    assert!(
+        row_up < paged_down,
+        "Ctrl+Up should page back up (from {paged_down} to {row_up})"
+    );
+}
+
+/// #10: the drill-down popup sizes its height to the *wrapped* row count, so a
+/// long single-line value gets a tall box rather than a two-line one. Compares
+/// the inner height returned for a long value against a short value.
+#[test]
+fn drill_down_popup_grows_for_long_wrapped_values() {
+    use ratatui::{Terminal, backend::TestBackend};
+    use tui_panel_select::MultiSelectPanel;
+
+    let s = crate::i18n::Strings::for_language(&Language::English);
+    let th = crate::tui::theme::preset_for_language(&Language::English).to_theme();
+
+    let measure = |content: &str| -> u16 {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut panel = MultiSelectPanel::new();
+        let mut h = 0u16;
+        term.draw(|f| {
+            let inner = super::reports::draw_result_cell_popup_overlay(
+                f, "Body", content, &mut panel, &s, &th,
+            );
+            h = inner.height;
+        })
+        .unwrap();
+        h
+    };
+
+    let short = measure("small");
+    // A single logical line long enough to wrap across many rows in an ~80-col
+    // popup.
+    let long = measure(&"x".repeat(600));
+    assert!(
+        long > short,
+        "a long wrapped value should get a taller popup (long={long}, short={short})"
+    );
+}
+
 #[test]
 fn enter_on_cursor_opens_cell_popup() {
     let (mut app, idx) = report_with_multi_row_result();
@@ -21044,6 +22918,48 @@ fn enter_on_cursor_opens_cell_popup() {
         _ => panic!("expected Overlay::ReportCellPopup, got a different overlay"),
     }
     let _ = idx;
+}
+
+/// A cell whose whole value is a compact JSON document is pretty-printed in the
+/// drill-down popup (indented, one field per line) so it's readable; other
+/// cells are left untouched.
+#[test]
+fn cell_popup_pretty_prints_a_json_cell() {
+    use crate::report::model::{ReportResult, ReportRow};
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let mut row = ReportRow::default();
+    row.cells
+        .insert("Body".to_string(), r#"{"a":1,"b":[2,3]}"#.to_string());
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: vec!["Body".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats: Default::default(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+    press(&mut app, KeyCode::Enter); // initialise cursor at (0,0)
+    press(&mut app, KeyCode::Enter); // open the popup
+    match &app.overlay {
+        Some(Overlay::ReportCellPopup { content, .. }) => {
+            assert!(
+                content.contains('\n') && content.contains("\"a\": 1"),
+                "JSON cell should be pretty-printed; got: {content:?}"
+            );
+        }
+        _ => panic!("expected Overlay::ReportCellPopup"),
+    }
 }
 
 #[test]
@@ -21225,6 +23141,117 @@ fn mouse_click_on_header_row_does_not_select_a_cell() {
     let _ = term;
 }
 
+/// #9: the grid's column-header row stays pinned at the top of the pane while
+/// the data rows scroll underneath it. After navigating far enough down that
+/// the panel scrolls, the header text (column names) must still be rendered on
+/// the first inner row.
+#[test]
+fn report_header_stays_pinned_while_body_scrolls() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_n_rows(60);
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    if area.width == 0 || area.height < 3 {
+        return; // pane not visible at this size — skip
+    }
+
+    // Navigate to the last row so the body scrolls well past the top.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::End);
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(
+        app.reports[idx].results_panel.scroll() > 0,
+        "navigating to the last row should have scrolled the body down"
+    );
+
+    // The pinned header row (inner row 0 == area.y) must still show "Col1".
+    let buf = term.backend().buffer();
+    let header: String = (area.x..area.x + area.width)
+        .map(|x| buf[(x, area.y)].symbol().to_string())
+        .collect();
+    assert!(
+        header.contains("Col1"),
+        "the column header must stay pinned at the top after scrolling (got {header:?})"
+    );
+}
+
+/// A `STATISTICS(…)` request appends summary rows below the data: the grid must
+/// render the stat's label (in the first column) and its computed value, styled
+/// distinctly (accent + italic) so it reads as a footer rather than data.
+#[test]
+fn report_statistics_render_a_summary_footer_row() {
+    use crate::report::model::{ReportResult, ReportRow, StatKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ep".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ep".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Two columns so the stat label lands in the (non-value) first column: a
+    // non-numeric Name and a numeric Time carrying STATISTICS(MEAN).
+    let mut rows = Vec::new();
+    for (name, time) in [("a", "100"), ("b", "200"), ("c", "300")] {
+        let mut row = ReportRow::default();
+        row.cells.insert("Name".to_string(), name.to_string());
+        row.cells.insert("Time".to_string(), time.to_string());
+        rows.push(row);
+    }
+    let mut column_stats = std::collections::HashMap::new();
+    column_stats.insert("Time".to_string(), vec![StatKind::Mean]);
+    app.reports[idx].result = Some(ReportResult {
+        rows,
+        column_order: vec!["Name".to_string(), "Time".to_string()],
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats,
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+
+    let accent = app.theme().accent;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+
+    // The whole rendered buffer should contain the "Mean" label and its value
+    // "200" ((100+200+300)/3), and at least one italic accent cell (the footer
+    // style, distinct from the bold-only header).
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert!(
+        text.contains("Mean"),
+        "the summary footer must show the 'Mean' stat label"
+    );
+    assert!(
+        text.contains("200"),
+        "the summary footer must show the computed mean value 200"
+    );
+    let mut italic_accent = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            if cell.fg == accent && cell.modifier.contains(ratatui::style::Modifier::ITALIC) {
+                italic_accent = true;
+            }
+        }
+    }
+    assert!(
+        italic_accent,
+        "the summary footer rows should be styled in italic accent"
+    );
+}
+
 /// With scroll > 0, the row mapping must account for the scroll offset so
 /// the click lands on the correct logical data row.
 #[test]
@@ -21258,6 +23285,7 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         column_order: vec!["A".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
+        column_stats: Default::default(),
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
@@ -21270,16 +23298,14 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         return;
     }
 
-    // Manually set scroll to 3 so the inner header (y_off 0) now shows grid
-    // line 3 (which is data row 2, since grid_row = y_off + scroll = 0 + 3;
-    // but grid_row 0 is header, 1 = data0, 2 = data1, 3 = data2).
-    // The first visible data row is at y_off 1: grid_row = 1 + 3 = 4 → data row 3.
+    // Manually set the panel's DATA-ROW scroll to 3 so the first data row shown
+    // just under the pinned header (y_off 1) is data row 3.
     app.reports[idx].results_panel.set_scroll(3);
 
     app.on_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: area.x + 1,
-        row: area.y + 1, // y_off = 1, grid_row = 1 + 3 = 4, data_row = 3
+        row: area.y + 1, // y_off = 1 → data_row = (1 - 1) + scroll(3) = 3
         modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
     });
     let (data_row, _) = app.reports[idx]
@@ -21307,13 +23333,13 @@ mod all_view_layout {
         let s = Strings::for_language(&Language::English);
         let mut entry = HurlEntry::from_fields("Get token", "POST", "{{ URL }}/oauth2", vec![], "");
         entry.headers = vec![
-            ("Content-Length".into(), "0".into(), true),
-            ("User-Agent".into(), "crabman/0.1.0".into(), true),
-            ("Accept".into(), "*/*".into(), true),
-            ("Accept-Encoding".into(), "gzip, deflate, br".into(), true),
-            ("client_id".into(), "{{ CLIENT_ID }}".into(), true),
-            ("client_secret".into(), "{{ CLIENT_SECRET }}".into(), true),
-            ("grant_type".into(), "client_credentials".into(), true),
+            KvRow::toggled("Content-Length", "0", true),
+            KvRow::toggled("User-Agent", "crabman/0.1.0", true),
+            KvRow::toggled("Accept", "*/*", true),
+            KvRow::toggled("Accept-Encoding", "gzip, deflate, br", true),
+            KvRow::new("client_id", "{{ CLIENT_ID }}"),
+            KvRow::new("client_secret", "{{ CLIENT_SECRET }}"),
+            KvRow::new("grant_type", "client_credentials"),
         ];
         // The default the wizard opens in (view_tab = All).
         let mut form =
@@ -21362,7 +23388,7 @@ mod all_view_layout {
 
         let mut entry = HurlEntry::from_fields("orig", "GET", "http://h/x", vec![], "");
         entry.headers = (0..6)
-            .map(|i| (format!("SecretHeader{i}"), format!("v{i}"), true))
+            .map(|i| KvRow::new(format!("SecretHeader{i}"), format!("v{i}")))
             .collect();
         entry.captures = (0..3)
             .map(|i| (format!("cap{i}"), format!("jsonpath \"$.c{i}\"")))
@@ -21416,7 +23442,7 @@ mod all_view_layout {
         let th = super::super::theme::theme(&Language::English);
         let s = Strings::for_language(&Language::English);
         let mut entry = HurlEntry::from_fields("t", "POST", "http://h/x", vec![], "");
-        entry.headers = vec![("A".into(), "1".into(), true)];
+        entry.headers = vec![KvRow::toggled("A", "1", true)];
         entry.captures = vec![("tok".into(), "jsonpath \"$.tok\"".into())];
         let mut form =
             NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
@@ -21492,4 +23518,255 @@ mod all_view_layout {
             "the '(＋ Add …)' actions should all start at the same column, got {cols:?}:\n{out}"
         );
     }
+
+    #[test]
+    fn loading_an_invalid_hurl_collection_reports_the_parse_reason() {
+        // A `[Multipart]` `file,;` with an empty filename makes `hurl_core`
+        // reject the whole file. Loading it should surface the concrete line +
+        // reason, not just the generic "no requests found" message.
+        let mut app = TuiApp::default();
+        let content = "# upload\nPOST http://h/upload\n[Multipart]\nphoto: file,;\n";
+        let ok = app.load_collection_text("bad".to_string(), content, None);
+        assert!(!ok, "an invalid collection does not load");
+        let s = crate::i18n::Strings::for_language(&Language::English);
+        let text = app.status.as_ref().expect("a status is set").text(&s);
+        assert!(
+            text.contains(s.file_not_collection_prefix),
+            "the message uses the collection-invalid prefix: {text}"
+        );
+        assert!(
+            text.contains("line 4") && text.to_lowercase().contains("filename"),
+            "the message names the offending line and reason: {text}"
+        );
+    }
+}
+
+/// Build a Workspace tab over a scratch folder holding `apis/billing.hurl`,
+/// with `apis` expanded so the tree lists it.
+fn workspace_tab_for_gestures(tag: &str) -> (TuiApp, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("paperboy_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("apis")).unwrap();
+    std::fs::create_dir_all(root.join("archive")).unwrap();
+    std::fs::write(root.join("apis/billing.hurl"), "GET https://example.com\n").unwrap();
+
+    let mut col = Collection::new("workspace".into(), Vec::new());
+    col.workspace_root = Some(root.clone());
+    col.workspace_expanded.insert(root.clone());
+    col.workspace_expanded.insert(root.join("apis"));
+
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    app.active_tab = app.collections.len() - 1;
+    app.focus = Pane::List;
+    (app, root)
+}
+
+/// Put the workspace tree's cursor on the row for `path`.
+fn cursor_on_ws_row(app: &mut TuiApp, path: &std::path::Path) {
+    let ci = app.active_tab;
+    let i = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| r.path() == path)
+        .unwrap_or_else(|| panic!("{} should have a row in the tree", path.display()));
+    app.collections[ci].list_cursor = i;
+}
+
+#[test]
+fn shift_n_in_a_workspace_names_a_new_file_and_its_extension_picks_the_kind() {
+    let (mut app, root) = workspace_tab_for_gestures("ws_new_item");
+    cursor_on_ws_row(&mut app, &root.join("apis"));
+
+    press(&mut app, KeyCode::Char('N'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::NewWorkspaceItem(_, ref dir),
+                ..
+            }) if dir == &root.join("apis")
+        ),
+        "the prompt targets the highlighted folder, so the file lands where the user is looking"
+    );
+
+    // `.trail` asks for a report, not a collection — one prompt covers all
+    // three kinds because the extension chooses between them.
+    for ch in "monthly.trail".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let made = root.join("apis/monthly.trail");
+    assert!(
+        made.is_file(),
+        "the report should have been written to disk"
+    );
+    assert!(
+        !std::fs::read_to_string(&made).unwrap().is_empty(),
+        "a new report starts from a template, never an empty file"
+    );
+    let ci = app.active_tab;
+    assert_eq!(
+        app.collections[ci].ws_rows()[app.collections[ci].list_cursor].path(),
+        made,
+        "the tree cursor lands on what was just created"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_new_workspace_file_with_no_extension_is_a_collection_like_the_ghost_suggests() {
+    let (mut app, root) = workspace_tab_for_gestures("ws_new_default");
+    cursor_on_ws_row(&mut app, &root.join("apis"));
+
+    press(&mut app, KeyCode::Char('N'));
+    for ch in "orders".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        root.join("apis/orders.hurl").is_file(),
+        "with no extension typed the prompt honours its own `.hurl` ghost"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shift_m_moves_the_highlighted_workspace_file_into_the_folder_confirmed_with_space() {
+    let (mut app, root) = workspace_tab_for_gestures("ws_move_item");
+    let src = root.join("apis/billing.hurl");
+    cursor_on_ws_row(&mut app, &src);
+    // A tab pointing at the file must follow it, or saving would write the
+    // file back to where it no longer is.
+    app.collections[app.active_tab].path = Some(src.clone());
+
+    press(&mut app, KeyCode::Char('M'));
+    let Some(Overlay::Browser(action, ex)) = app.overlay.as_ref() else {
+        panic!("Shift+M should open the destination-folder browser")
+    };
+    assert!(
+        *action == FileAction::MoveWorkspaceItemChooseFolder,
+        "and it is the move picker, not one of the save pickers"
+    );
+    assert_eq!(
+        ex.cwd(),
+        &root,
+        "seeded at the workspace root, since the destination has to be inside it"
+    );
+
+    // Enter descends; Space confirms the folder we are standing in.
+    let dest = root.join("archive");
+    if let Some(Overlay::Browser(_, ex)) = app.overlay.as_mut() {
+        ex.set_cwd(&dest).unwrap();
+    }
+    press(&mut app, KeyCode::Char(' '));
+
+    assert!(app.overlay.is_none(), "confirming closes the browser");
+    assert!(!src.exists(), "the file has left its old folder");
+    assert!(
+        dest.join("billing.hurl").is_file(),
+        "and arrived in the chosen one"
+    );
+    assert_eq!(
+        app.collections[app.active_tab].path,
+        Some(dest.join("billing.hurl")),
+        "the tab that held the file now points at its new home"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_workspace_move_refuses_to_put_a_folder_inside_itself() {
+    let (mut app, root) = workspace_tab_for_gestures("ws_move_nested");
+    cursor_on_ws_row(&mut app, &root.join("apis"));
+
+    press(&mut app, KeyCode::Char('M'));
+    if let Some(Overlay::Browser(_, ex)) = app.overlay.as_mut() {
+        ex.set_cwd(&root.join("apis")).unwrap();
+    }
+    press(&mut app, KeyCode::Char(' '));
+
+    assert!(
+        root.join("apis/billing.hurl").is_file(),
+        "the folder and its contents are left exactly where they were"
+    );
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::WsItemMoveIntoItself)),
+        "and the refusal is explained rather than silent"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_workspace_gestures_only_apply_to_workspace_tabs() {
+    // A plain collection tab has no tree to create in or move within, so both
+    // keys must fall through to their existing meanings rather than half-fire.
+    let mut app = TuiApp::default();
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('N'));
+    assert!(
+        !matches!(
+            app.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::NewWorkspaceItem(..),
+                ..
+            })
+        ),
+        "no new-workspace-file prompt outside a workspace"
+    );
+    app.overlay = None;
+    press(&mut app, KeyCode::Char('M'));
+    assert!(
+        !matches!(
+            app.overlay,
+            Some(Overlay::Browser(
+                FileAction::MoveWorkspaceItemChooseFolder,
+                _
+            ))
+        ),
+        "and no move picker either"
+    );
+}
+
+/// Quitting with request edits that were never written to a file warns even
+/// when confirm-on-exit is off — the same reasoning as the secret-edit warning:
+/// a setting about *convenience* must not silently cost the user work.
+#[test]
+fn quitting_warns_about_unsaved_request_edits_even_with_confirmation_off() {
+    let mut app = TuiApp::default();
+    app.confirm_on_exit = false;
+
+    app.request_quit();
+    assert!(app.quit, "a clean session quits without a word");
+
+    app.quit = false;
+    let ci = app.active_tab;
+    let mut e = crate::hurl::HurlEntry::default();
+    e.title = "req".into();
+    e.method = "GET".into();
+    e.url = "https://example.com".into();
+    e.modified = true;
+    app.collections[ci].entries.push(e);
+    assert_eq!(
+        app.unsaved_request_edits(),
+        1,
+        "the edited request is what's at stake"
+    );
+    app.request_quit();
+    assert!(!app.quit, "the quit must wait for an answer");
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::Exit,
+                ..
+            })
+        ),
+        "and the answer is asked for in the exit confirmation"
+    );
 }

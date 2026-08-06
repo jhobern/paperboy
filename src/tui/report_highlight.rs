@@ -7,9 +7,15 @@
 //! (`render_editor_highlighted`), so the source looks identical whether or not
 //! it currently has edit focus.
 //!
+//! The GUI's Source view uses it too, converting the spans to egui text
+//! sections (`gui::report_editor::highlight_job`). Every theme colour is an
+//! `Color::Rgb` triple from the same `ThemeSpec`, so the translation is exact
+//! and the two front-ends can't drift apart.
+//!
 //! The highlighting is deliberately simple — enough to tell a well-formed flow
 //! from a malformed one at a glance:
-//! - PaperTrail keywords are drawn in the theme accent (bold);
+//! - PaperTrail keywords are drawn (bold) in a theme colour chosen by category,
+//!   matching the GUI's chip colours (see `keyword_color`);
 //! - `{{ … }}` substitution placeholders reuse the app's substitution colour,
 //!   matching how they read everywhere else;
 //! - whole-line `#` comments/directives are dimmed;
@@ -17,7 +23,7 @@
 //!   recoloured to the error colour and underlined, so a broken script is
 //!   obvious without reading the validation panel.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 
@@ -83,6 +89,25 @@ fn is_word_char(c: char) -> bool {
 fn is_keyword(word: &str) -> bool {
     let upper = word.to_ascii_uppercase();
     KEYWORDS.contains(&upper.as_str())
+}
+
+/// The theme colour for a keyword, by category — kept in step with the GUI's
+/// PaperTrail chip colours (`gui/report_editor.rs::node_chips`) so a report
+/// reads with the same colour vocabulary in both front-ends: `REPORT` in the
+/// substitution colour, `WITH` in the accent (a block opener, distinct from
+/// `REPORT`), response formatting in the accent, `SHOW` green, `HIDE` dimmed,
+/// `AS` and environment roles amber, `PARALLEL` in the *error* hue so it stands
+/// apart from the blue loop keywords it sits beside, and the remaining
+/// structural loop/list keywords in the accent.
+fn keyword_color(upper: &str, th: &Theme) -> Color {
+    match upper {
+        "REPORT" => th.subst,
+        "SHOW" => th.ok,
+        "HIDE" => th.dim,
+        "AS" | "BASELINE" | "COMPARISON" => th.pending,
+        "PARALLEL" => th.err,
+        _ => th.accent,
+    }
 }
 
 /// Tokenise one source line into styled spans that tile the whole line (their
@@ -186,7 +211,9 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
                 // The token after a `REQUEST` keyword is a request name; any
                 // other keyword ends that expectation.
                 expect_request_name = upper == "REQUEST";
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(keyword_color(&upper, th))
+                    .add_modifier(Modifier::BOLD)
             } else if expect_request_name {
                 expect_request_name = false;
                 let colour = if ctx.request_names.contains(&word) {
@@ -378,14 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn keywords_are_accented_and_bold() {
+    fn keywords_are_coloured_by_category_and_bold() {
         let th = th();
         let line = "REPORT REQUEST upload";
         let spans = highlight_line(line, &ctx(), &th);
         assert_tiles(line, &spans);
+        // Keywords are bold and coloured by category: REPORT reads in the
+        // reporting (substitution) colour, matching the GUI's REPORT chip, …
         let report = spans.iter().find(|s| s.content == "REPORT").unwrap();
-        assert_eq!(report.style.fg, Some(th.accent));
+        assert_eq!(report.style.fg, Some(th.subst));
         assert!(report.style.add_modifier.contains(Modifier::BOLD));
+        // … while a structural keyword like REQUEST stays in the accent.
+        let request = spans.iter().find(|s| s.content == "REQUEST").unwrap();
+        assert_eq!(request.style.fg, Some(th.accent));
+        assert!(request.style.add_modifier.contains(Modifier::BOLD));
         // A non-keyword identifier is not keyword-accented (here it's a
         // request name, coloured by resolution — never bold like a keyword).
         let ident = spans.iter().find(|s| s.content == "upload").unwrap();
@@ -394,11 +427,28 @@ mod tests {
     }
 
     #[test]
+    fn keyword_colour_follows_category() {
+        let th = th();
+        let line = "SHOW HIDE AS RESPONSE WITH PARALLEL";
+        let spans = highlight_line(line, &ctx(), &th);
+        let fg = |kw: &str| spans.iter().find(|s| s.content == kw).unwrap().style.fg;
+        assert_eq!(fg("SHOW"), Some(th.ok));
+        assert_eq!(fg("HIDE"), Some(th.dim));
+        assert_eq!(fg("AS"), Some(th.pending));
+        assert_eq!(fg("RESPONSE"), Some(th.accent));
+        // WITH is a block opener drawn in the accent (distinct from REPORT's
+        // substitution colour), and PARALLEL uses the error hue so it stands
+        // apart from the blue loop keywords.
+        assert_eq!(fg("WITH"), Some(th.accent));
+        assert_eq!(fg("PARALLEL"), Some(th.err));
+    }
+
+    #[test]
     fn keywords_match_case_insensitively() {
         let th = th();
         let spans = highlight_line("report request x", &ctx(), &th);
         let report = spans.iter().find(|s| s.content == "report").unwrap();
-        assert_eq!(report.style.fg, Some(th.accent));
+        assert_eq!(report.style.fg, Some(th.subst));
     }
 
     #[test]

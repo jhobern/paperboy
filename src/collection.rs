@@ -100,6 +100,24 @@ pub enum WsRow {
     },
 }
 
+impl WsRow {
+    /// The filesystem path a row stands for — the file itself for a file row,
+    /// the owning collection for a request (which has no file of its own).
+    ///
+    /// Lets callers that only care *where* a row is (revealing a just-created
+    /// file, deciding which folder a new one goes in) avoid re-matching all
+    /// five variants each time.
+    pub fn path(&self) -> &Path {
+        match self {
+            WsRow::Folder { path, .. }
+            | WsRow::Collection { path, .. }
+            | WsRow::Report { path, .. }
+            | WsRow::Environment { path, .. } => path,
+            WsRow::Request { collection, .. } => collection,
+        }
+    }
+}
+
 /// A loaded Hurl collection (one .hurl file).
 #[derive(Clone)]
 pub struct Collection {
@@ -183,6 +201,19 @@ pub struct Collection {
     /// survives restarts. Absolute paths in memory; serialised relative to
     /// `workspace_root` in [`crate::persistence`].
     pub workspace_expanded: HashSet<PathBuf>,
+    /// For a Workspace tab, the node in the tree the user last selected
+    /// (absolute path): a collection file, a `.trail` report or a `.vars`
+    /// environment. Persisted (relative to `workspace_root`) so the tab reopens
+    /// on whatever was being worked on rather than an empty right-hand pane.
+    ///
+    /// A selected *request* is already fully described by `path` +
+    /// `selected_entry`; this records the collection file in that case, which
+    /// is all the restore needs on top of those two.
+    ///
+    /// Written by the graphical front-end only — the terminal UI drives the
+    /// tree from its own cursor and simply carries this through a save/load,
+    /// exactly as it does the GUI's panel geometry.
+    pub workspace_selected: Option<PathBuf>,
     /// For a Workspace tab, cached request *names* (leaf titles) of expanded
     /// collection files that are **not** the currently-loaded one — the loaded
     /// file renders its rows straight from `entries`, so it needs no cache.
@@ -192,6 +223,21 @@ pub struct Collection {
     /// expanded collection from disk (see [`Self::rebuild_expanded_titles`]).
     /// Derived state — not persisted.
     pub workspace_titles: HashMap<PathBuf, Vec<String>>,
+    /// Unsaved edits belonging to workspace collection files that are **not**
+    /// the currently-loaded one.
+    ///
+    /// A Workspace tab holds exactly one file's requests in `entries` at a
+    /// time, so opening a second collection from the tree used to overwrite —
+    /// and silently discard — whatever the user had just typed into the first.
+    /// The outgoing file's entries are parked here instead and handed straight
+    /// back when it is opened again, which is what makes "edit a request, go
+    /// look at another collection, come back" behave the way anyone would
+    /// expect. Cleared for a file when it is written to disk
+    /// ([`Self::mark_saved`]).
+    ///
+    /// Runtime-only. A workspace tab's entries are never a trusted snapshot
+    /// across a restart (see [`crate::persistence`]), so neither are these.
+    pub workspace_pending: HashMap<PathBuf, Vec<HurlEntry>>,
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -223,7 +269,9 @@ impl Collection {
             workspace_downloaded_from_git: false,
             workspace_git_origin: None,
             workspace_expanded: HashSet::new(),
+            workspace_selected: None,
             workspace_titles: HashMap::new(),
+            workspace_pending: HashMap::new(),
         };
         c.sync_folder_to_selected();
         c
@@ -232,6 +280,17 @@ impl Collection {
     /// Serialize this collection's entries to Hurl text.
     pub fn to_hurl(&self) -> String {
         collection_to_hurl(&self.entries)
+    }
+
+    /// The first enabled `[Form]`/`[Multipart]` file field with an empty path,
+    /// as `(request title, field key)`. Such a field serializes to an invalid
+    /// `file,;` line that PaperBoy's own Hurl parser rejects, so a file written
+    /// with one couldn't be reloaded. Saves are refused until it's filled in.
+    pub fn first_empty_file_field(&self) -> Option<(String, String)> {
+        self.entries.iter().find_map(|e| {
+            e.first_empty_file_field()
+                .map(|k| (e.title.clone(), k.to_string()))
+        })
     }
 
     /// Discard the cached request-JSON preview so it is rebuilt from the current
@@ -386,6 +445,131 @@ impl Collection {
         if let Some(path) = self.path.clone() {
             let names = self.entries.iter().map(ws_request_label).collect();
             self.workspace_titles.insert(path, names);
+        }
+    }
+
+    /// Load a workspace collection file (Hurl or Postman JSON) at `path` into
+    /// this tab, replacing its currently-loaded requests. Front-end agnostic —
+    /// it only mutates this `Collection` (both the terminal UI and the GUI call
+    /// it, then add their own focus/status handling). The tab's
+    /// `workspace_root`/`workspace_filter_hurl_json` are left untouched. Caches
+    /// the outgoing file's request names first so a still-expanded previous file
+    /// keeps listing its requests, then re-syncs the tree cursor/selection and
+    /// expands the new file's ancestors so it's visible.
+    pub fn load_workspace_file(&mut self, path: PathBuf) -> std::io::Result<()> {
+        // Prefer edits parked when we switched away from this file — they are
+        // by definition newer than what is still on disk. Read (and fail) before
+        // touching any state, so a vanished file leaves the tab as it was.
+        let entries = match self.workspace_pending.get(&path) {
+            Some(parked) => parked.clone(),
+            None => crate::postman::parse_collection(&std::fs::read_to_string(&path)?),
+        };
+        self.workspace_pending.remove(&path);
+        self.park_pending_edits();
+        self.snapshot_loaded_titles();
+        self.entries = entries;
+        self.selected_entry = 0;
+        self.path = Some(path);
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        self.expand_ancestors_for_path();
+        self.sync_ws_cursor();
+        Ok(())
+    }
+
+    /// Park the loaded file's unsaved edits in `workspace_pending` so they
+    /// survive a switch to another file in the same Workspace tab. A file with
+    /// no edits is not parked — re-reading it from disk is both cheaper and
+    /// more correct, since it picks up any change made outside PaperBoy.
+    fn park_pending_edits(&mut self) {
+        if self.workspace_root.is_none() || !self.has_unsaved_edits() {
+            return;
+        }
+        if let Some(path) = self.path.clone() {
+            self.workspace_pending.insert(path, self.entries.clone());
+        }
+    }
+
+    /// `true` when this collection holds requests that have been added or
+    /// edited since it was last read from / written to disk.
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.entries.iter().any(|e| e.user_added || e.modified)
+    }
+
+    /// `true` when this tab is holding *any* request edit that exists only in
+    /// memory — the loaded file's, or a Workspace file's parked while the user
+    /// looks at another one. This is the question to ask before doing something
+    /// that discards them (closing the tab, quitting); [`Self::has_unsaved_edits`]
+    /// alone would miss a Workspace tab's parked files.
+    pub fn has_any_unsaved_edits(&self) -> bool {
+        self.has_unsaved_edits() || !self.workspace_pending.is_empty()
+    }
+
+    /// How many requests in this tab are added-but-unsaved or edited, counting
+    /// a Workspace tab's parked files as well as the one it is showing.
+    pub fn unsaved_edit_count(&self) -> usize {
+        let loaded = self
+            .entries
+            .iter()
+            .filter(|e| e.user_added || e.modified)
+            .count();
+        let parked: usize = self
+            .workspace_pending
+            .iter()
+            // The loaded file is parked *and* live while it is being shown, so
+            // counting both would double it.
+            .filter(|(path, _)| self.path.as_deref() != Some(path.as_path()))
+            .map(|(_, entries)| {
+                entries
+                    .iter()
+                    .filter(|e| e.user_added || e.modified)
+                    .count()
+            })
+            .sum();
+        loaded + parked
+    }
+
+    /// `true` when the workspace collection file at `path` has unsaved edits —
+    /// either it is the loaded file and that has been edited, or it was edited
+    /// and then switched away from (so it lives in `workspace_pending`). Drives
+    /// the "edited" pencil in the workspace tree.
+    pub fn workspace_file_edited(&self, path: &std::path::Path) -> bool {
+        if self.workspace_pending.contains_key(path) {
+            return true;
+        }
+        self.path.as_deref() == Some(path) && self.has_unsaved_edits()
+    }
+
+    /// Whether request `idx` of the workspace collection file at `path` has
+    /// unsaved edits. Answers for a file that isn't the loaded one too, by
+    /// reading the entries parked in `workspace_pending` — the tree lists a
+    /// non-loaded collection's requests from the `workspace_titles` cache, which
+    /// was snapshotted from those same (edited) entries, so the indices line up.
+    /// Without this, opening a second collection made the first one's pencils
+    /// disappear from its rows even though the edits were still pending.
+    pub fn workspace_request_edited(&self, path: &std::path::Path, idx: usize) -> bool {
+        let entries = if self.path.as_deref() == Some(path) {
+            &self.entries
+        } else {
+            match self.workspace_pending.get(path) {
+                Some(parked) => parked,
+                None => return false,
+            }
+        };
+        entries.get(idx).is_some_and(|e| e.user_added || e.modified)
+    }
+
+    /// Clear this collection's "new"/"edited" request markers, and drop any
+    /// parked edits for its file — called whenever its `.hurl` is written to
+    /// disk (local Save or git push) so every save path agrees on what "saved"
+    /// means.
+    pub fn mark_saved(&mut self) {
+        for e in &mut self.entries {
+            e.user_added = false;
+            e.modified = false;
+        }
+        if let Some(path) = &self.path {
+            self.workspace_pending.remove(path);
         }
     }
 

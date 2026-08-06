@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.1.9"
+version = "0.3.0"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -45,3 +45,35 @@ chrono = { version = "0.4", default-features = false, features = [
 # integrations we don't use, keeping the dependency tree small.
 rust_xlsxwriter = { version = "0.96.0", default-features = false }
 nom = "7.0"
+# Native GUI front-end (eframe = egui + winit + wgpu). Shares the same
+# front-end-agnostic core (`session`, `request`, `collection`, `environment`,
+# `theme`, …) as the terminal UI, so the two never duplicate logic. egui is
+# immediate-mode like ratatui, so the panel model and RGB theming map across
+# directly. `egui_extras` provides the table/grid builders the panels use.
+eframe = "0.35"
+egui_extras = "0.35"
+# Phosphor icon font for the GUI. egui's bundled emoji/symbol fonts don't
+# actually contain the folder/file/report/key/caret glyphs the tree needs (they
+# render as empty "tofu" boxes on many systems), so we register the Phosphor
+# icon set at startup and draw all GUI icons from it — guaranteed to render
+# regardless of the host's installed fonts. `default-features = false` +
+# `regular` bundles only the one weight we use.
+egui-phosphor = { version = "0.13", default-features = false, features = [
+    "regular",
+] }
+# PNG decoding for the application/window icon and the status-bar logo. Already
+# in the tree transitively (egui image support); declared directly so we can
+# decode `assets/paperboy_logo.png` into an `egui::IconData` / `ColorImage`.
+# Pure-Rust `png` backend only — no C toolchain, matching the rest of the build.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Native OS file/folder picker for the GUI's open/save flows and any path field
+# (collections/workspaces/environments, `FOR … IN FILES/FOLDERS` folders, and
+# Form/Multipart File/Base64 values). Default features use the XDG Desktop
+# Portal backend via `pollster` (a synchronous `FileDialog`), so it needs no
+# system GTK `-dev` libraries — matching the rest of this self-contained build.
+# The terminal UI keeps its own in-app browser overlay (the right UX for a
+# terminal); rfd is GUI-only.
+rfd = { version = "0.17", default-features = false, features = [
+    "xdg-portal",
+    "wayland",
+] }

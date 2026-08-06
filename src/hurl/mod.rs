@@ -11,7 +11,7 @@ pub mod run;
 mod stage;
 
 pub use entry::{
-    FormField, FormFieldKind, HurlEntry, METHODS, RunStatus, collection_to_hurl, method_rgb,
+    FormField, FormFieldKind, HurlEntry, KvRow, METHODS, RunStatus, collection_to_hurl, method_rgb,
     status_eq_code,
 };
 pub use parser::{parse_hurl, parse_hurl_error};

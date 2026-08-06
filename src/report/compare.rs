@@ -102,12 +102,16 @@ fn collect_roles(
                     baseline_show: s,
                 } = clause
                 {
-                    for name in b {
-                        baseline.insert(name.clone());
+                    // A role's comparison *target* is its name (a live env) or
+                    // its snapshot path (a `FILE(…)`); either way the produced /
+                    // injected rows carry that string as their target.
+                    for r in b {
+                        baseline.insert(r.target().to_string());
                     }
-                    for name in c {
-                        if !comparisons.contains(name) {
-                            comparisons.push(name.clone());
+                    for r in c {
+                        let name = r.target().to_string();
+                        if !comparisons.contains(&name) {
+                            comparisons.push(name);
                         }
                     }
                     for field in s {

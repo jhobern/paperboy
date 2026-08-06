@@ -17,7 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt};
+use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef};
+use crate::i18n::{Strings, fill};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -49,7 +50,6 @@ impl Diagnostic {
 /// What's known about the environment a flow will run in. Both fields are
 /// optional: `None` means "not bound yet", so name-resolution checks are
 /// skipped (with a single reminder diagnostic) rather than producing noise.
-#[derive(Default)]
 pub struct Context<'a> {
     /// Full entry titles (incl. virtual-folder paths) of the bound collection.
     pub request_titles: Option<&'a [String]>,
@@ -80,18 +80,48 @@ pub struct Context<'a> {
     /// it runs. `None` (unbound collection) skips the variable-availability
     /// check entirely.
     pub request_entries: Option<&'a [crate::hurl::HurlEntry]>,
+    /// The language to phrase diagnostics in. They are user-facing text like
+    /// any other, so they live in the `i18n` table rather than as literals
+    /// here — a validation message is often the only thing standing between a
+    /// user and a report that runs, which is exactly when it must be readable.
+    pub strings: &'a Strings,
+}
+
+impl Default for Context<'_> {
+    /// An empty context in English — every optional check skipped. Hand-written
+    /// only because a `&Strings` has no `Default` of its own.
+    fn default() -> Self {
+        Self {
+            request_titles: None,
+            env_names: None,
+            request_fields: None,
+            root: None,
+            base_var_names: None,
+            all_env_var_names: None,
+            request_entries: None,
+            strings: Strings::english(),
+        }
+    }
+}
+
+/// Whether any step anywhere in the flow (loop bodies included) emits a column.
+fn emits_a_column(nodes: &[FlowNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        FlowNode::Report(_) => true,
+        FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => emits_a_column(body),
+        _ => false,
+    })
 }
 
 /// Validate `flow` against `ctx`, returning all diagnostics (errors + warnings).
 pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    let s = ctx.strings;
 
     // Header: collection binding + output format.
     match flow.header.collection() {
-        None => diags.push(Diagnostic::error(
-            "missing '# collection:' header — the report isn't bound to a collection",
-        )),
-        Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error("'# collection:' is empty")),
+        None => diags.push(Diagnostic::error(s.diag_collection_unset)),
+        Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error(s.diag_collection_unset)),
         Some(_) => {}
     }
     if let Some(out) = flow.header.output() {
@@ -101,9 +131,9 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
                 .iter()
                 .any(|e| out.eq_ignore_ascii_case(e))
         {
-            diags.push(Diagnostic::error(format!(
-                "unsupported output format '{out}' (supported: {})",
-                super::writer::OUTPUT_EXTENSIONS.join(", ")
+            diags.push(Diagnostic::error(fill(
+                s.diag_output_unsupported,
+                &[out, &super::writer::OUTPUT_EXTENSIONS.join(", ")],
             )));
         }
     }
@@ -119,10 +149,7 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         for header in cols.iter().map(|c| c.header.as_str()) {
             if seen.contains(&header) {
                 if !reported.contains(&header) {
-                    diags.push(Diagnostic::error(format!(
-                        "duplicate column header '{header}' in '# columns:' — give each \
-                         column a distinct name with AS"
-                    )));
+                    diags.push(Diagnostic::error(fill(s.diag_duplicate_column, &[&header])));
                     reported.push(header);
                 }
             } else {
@@ -137,12 +164,13 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     if let Some(env) = flow.header.environment() {
         let env = env.trim();
         if env.is_empty() {
-            diags.push(Diagnostic::error("'# environment:' is empty"));
+            diags.push(Diagnostic::error(s.diag_environment_unset));
         } else if let Some(loaded) = ctx.env_names
             && !loaded.iter().any(|e| e == env)
         {
-            diags.push(Diagnostic::error(format!(
-                "environment '{env}' is not loaded"
+            diags.push(Diagnostic::error(fill(
+                s.diag_environment_not_loaded,
+                &[env],
             )));
         }
     }
@@ -154,9 +182,7 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     if flow.header.baseline().is_some_and(|b| !b.trim().is_empty())
         && super::compare::comparison_roles(flow).is_some()
     {
-        diags.push(Diagnostic::warning(
-            "'# baseline:' is ignored because the flow already has an ENVS BASELINE/COMPARISON comparison",
-        ));
+        diags.push(Diagnostic::warning(s.diag_baseline_ignored));
     } else if let Some(rel) = flow
         .header
         .baseline()
@@ -169,17 +195,23 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         // report is anchored) that the referenced snapshot can't be found.
         let path = super::producers::resolve_path(Some(root), rel);
         if !path.exists() {
-            diags.push(Diagnostic::warning(format!(
-                "baseline snapshot '{rel}' was not found ({})",
-                path.display()
+            diags.push(Diagnostic::warning(fill(
+                s.diag_baseline_missing,
+                &[rel, &path.display().to_string()],
             )));
         }
     }
 
+    // A report whose steps never emit a column runs perfectly and produces an
+    // empty table. That is almost always a `REQUEST` that should have been a
+    // `REPORT` — the distinction is the first thing a newcomer to the block
+    // editor trips over, and nothing else in the UI mentions it.
+    if !flow.nodes.is_empty() && !emits_a_column(&flow.nodes) {
+        diags.push(Diagnostic::warning(s.diag_no_columns));
+    }
+
     if ctx.request_titles.is_none() {
-        diags.push(Diagnostic::warning(
-            "collection not loaded — request names can't be validated until it's bound",
-        ));
+        diags.push(Diagnostic::warning(s.diag_collection_not_loaded));
     }
 
     // Walk the tree with a scope stack of declared LIST producers.
@@ -212,8 +244,9 @@ fn walk(
             FlowNode::ListDecl { name, producer } => {
                 check_producer(producer, ctx, scopes, diags);
                 if scopes.iter().any(|s| s.contains_key(name)) {
-                    diags.push(Diagnostic::warning(format!(
-                        "LIST '{name}' shadows an earlier declaration of the same name"
+                    diags.push(Diagnostic::warning(fill(
+                        ctx.strings.diag_list_shadowed,
+                        &[name],
                     )));
                 }
                 scopes
@@ -230,7 +263,7 @@ fn walk(
                 ..
             } => {
                 check_producer(producer, ctx, scopes, diags);
-                check_arity(pattern, producer, scopes, diags);
+                check_arity(pattern, producer, scopes, ctx.strings, diags);
                 scopes.push(HashMap::new());
                 walk(body, ctx, scopes, diags);
                 scopes.pop();
@@ -255,7 +288,7 @@ fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     } = stmt
     {
         check_request_name(name, ctx, diags);
-        check_show_hide_overlap(show, hide, diags);
+        check_show_hide_overlap(show, hide, ctx.strings, diags);
         check_show_fields(name, show, with, ctx, diags);
         check_hide_fields(name, hide, with, ctx, diags);
     }
@@ -310,8 +343,9 @@ fn check_show_fields(
             || with_fields.contains(&field.as_str())
             || report_fields.iter().any(|f| f == field);
         if !known {
-            diags.push(Diagnostic::warning(format!(
-                "SHOW field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — it will be ignored"
+            diags.push(Diagnostic::warning(fill(
+                ctx.strings.diag_show_unknown,
+                &[field, name],
             )));
         }
     }
@@ -320,12 +354,15 @@ fn check_show_fields(
 /// Error when the same field suffix appears in both SHOW and HIDE — the two
 /// clauses are contradictory (SHOW keeps, HIDE removes) and no ordering of
 /// evaluation resolves the conflict sensibly.
-fn check_show_hide_overlap(show: &[String], hide: &[String], diags: &mut Vec<Diagnostic>) {
+fn check_show_hide_overlap(
+    show: &[String],
+    hide: &[String],
+    s: &Strings,
+    diags: &mut Vec<Diagnostic>,
+) {
     for field in show {
         if hide.iter().any(|h| h == field) {
-            diags.push(Diagnostic::error(format!(
-                "field '{field}' appears in both SHOW and HIDE — these clauses conflict"
-            )));
+            diags.push(Diagnostic::error(fill(s.diag_show_hide_conflict, &[field])));
         }
     }
 }
@@ -372,8 +409,9 @@ fn check_hide_fields(
             || with_fields.contains(&field.as_str())
             || report_fields.iter().any(|f| f == field);
         if !known {
-            diags.push(Diagnostic::warning(format!(
-                "HIDE field '{field}' on request '{name}' isn't an intrinsic, a WITH field, or one of its [Reports] fields — that field isn't produced by this request"
+            diags.push(Diagnostic::warning(fill(
+                ctx.strings.diag_hide_unknown,
+                &[field, name],
             )));
         }
     }
@@ -390,8 +428,9 @@ fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
         return;
     }
     if exact > 1 {
-        diags.push(Diagnostic::error(format!(
-            "request '{name}' is ambiguous ({exact} entries share that title)"
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_request_ambiguous_title,
+            &[name, &exact.to_string()],
         )));
         return;
     }
@@ -402,11 +441,13 @@ fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
         .collect();
     match leaves.len() {
         1 => {}
-        0 => diags.push(Diagnostic::error(format!(
-            "request '{name}' not found in the bound collection"
+        0 => diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_request_not_found,
+            &[name],
         ))),
-        n => diags.push(Diagnostic::error(format!(
-            "request '{name}' is ambiguous ({n} entries end with that name — qualify it with its folder path)"
+        n => diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_request_ambiguous_leaf,
+            &[name, &n.to_string()],
         ))),
     }
 }
@@ -415,7 +456,7 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
     let names: Vec<&String> = match clause {
         EnvClause::Plain(names) => {
             if names.is_empty() {
-                diags.push(Diagnostic::error("ENVS loop has no environments"));
+                diags.push(Diagnostic::error(ctx.strings.diag_envs_empty));
             }
             names.iter().collect()
         }
@@ -425,23 +466,30 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
             ..
         } => {
             if baseline.len() > 1 {
-                diags.push(Diagnostic::error(
-                    "at most one BASELINE environment is allowed",
-                ));
+                diags.push(Diagnostic::error(ctx.strings.diag_baseline_multiple));
             }
             if comparisons.is_empty() {
-                diags.push(Diagnostic::error(
-                    "a role clause needs at least one COMPARISON environment",
-                ));
+                diags.push(Diagnostic::error(ctx.strings.diag_comparison_missing));
             }
-            baseline.iter().chain(comparisons.iter()).collect()
+            // Only live env-name refs are checked against the loaded set; a
+            // `FILE(…)` snapshot is a path resolved (and reported non-fatally if
+            // missing) at run time, not an environment.
+            baseline
+                .iter()
+                .chain(comparisons.iter())
+                .filter_map(|r| match r {
+                    RoleRef::Env(n) => Some(n),
+                    RoleRef::File(_) => None,
+                })
+                .collect()
         }
     };
     if let Some(loaded) = ctx.env_names {
         for n in names {
             if !loaded.iter().any(|e| e == n) {
-                diags.push(Diagnostic::error(format!(
-                    "environment '{n}' is not loaded"
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_environment_not_loaded,
+                    &[n],
                 )));
             }
         }
@@ -499,6 +547,7 @@ fn check_arity(
     pattern: &Pattern,
     producer: &Producer,
     scopes: &[HashMap<String, Producer>],
+    s: &Strings,
     diags: &mut Vec<Diagnostic>,
 ) {
     let Some(arity) = producer_arity(producer, scopes) else {
@@ -507,29 +556,31 @@ fn check_arity(
     let binders = pattern.binders.len();
     if pattern.rest {
         if binders > arity {
-            diags.push(Diagnostic::error(format!(
-                "pattern binds {binders} names before '...' but the producer yields only {arity}"
+            diags.push(Diagnostic::error(fill(
+                s.diag_pattern_before_rest,
+                &[&binders.to_string(), &arity.to_string()],
             )));
         }
     } else if binders != arity {
-        diags.push(Diagnostic::error(format!(
-            "pattern binds {binders} name(s) but the producer yields {arity} per item \
-             (use '_' to discard or '...' to absorb extras)"
+        diags.push(Diagnostic::error(fill(
+            s.diag_pattern_arity,
+            &[&binders.to_string(), &arity.to_string()],
         )));
     }
 }
 
 fn check_producer(
     producer: &Producer,
-    _ctx: &Context,
+    ctx: &Context,
     scopes: &[HashMap<String, Producer>],
     diags: &mut Vec<Diagnostic>,
 ) {
     if let Producer::Named(name) = producer
         && !scopes.iter().rev().any(|s| s.contains_key(name))
     {
-        diags.push(Diagnostic::error(format!(
-            "unknown list '{name}' (declare it with 'LIST {name} = …' before use)"
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_unknown_list,
+            &[name, name],
         )));
     }
     // Inconsistent list-literal arity (a mix of scalars/tuples of different
@@ -546,19 +597,17 @@ fn check_producer(
         if let Some(&first) = arities.first()
             && !arities.iter().all(|&a| a == first)
         {
-            diags.push(Diagnostic::error(
-                "list elements have inconsistent arity (mix of scalars/tuples of different sizes)",
-            ));
+            diags.push(Diagnostic::error(ctx.strings.diag_list_arity));
         }
     }
     if let Producer::Zip(ps) = producer {
         for p in ps {
-            check_producer(p, _ctx, scopes, diags);
+            check_producer(p, ctx, scopes, diags);
         }
     }
     if let Producer::Concat(ps) = producer {
         for p in ps {
-            check_producer(p, _ctx, scopes, diags);
+            check_producer(p, ctx, scopes, diags);
         }
         // All inputs must yield items of the same arity, else the loop pattern
         // can't destructure them uniformly. Only flag when statically knowable.
@@ -570,10 +619,7 @@ fn check_producer(
             && arities.len() == ps.len()
             && !arities.iter().all(|&a| a == first)
         {
-            diags.push(Diagnostic::error(
-                "CONCAT inputs have inconsistent arity (every input must yield the \
-                 same number of values per item)",
-            ));
+            diags.push(Diagnostic::error(ctx.strings.diag_concat_arity));
         }
     }
 }
@@ -662,10 +708,9 @@ fn warn_if_vars_undefined(
     let refs = crate::request::entry_referenced_keys(entry);
     for var in &refs {
         if !defined.contains(var.as_str()) {
-            diags.push(Diagnostic::warning(format!(
-                "request '{name}' references {{{{{}}}}} which may not be defined at this point \
-                 in the flow — add it to the environment or assign it before this request",
-                var
+            diags.push(Diagnostic::warning(fill(
+                ctx.strings.diag_var_maybe_undefined,
+                &[name, &format!("{{{{{var}}}}}")],
             )));
         }
     }
@@ -840,10 +885,7 @@ mod tests {
             Some(&titles),
             None,
         );
-        let dup: Vec<_> = errs
-            .iter()
-            .filter(|m| m.contains("duplicate column"))
-            .collect();
+        let dup: Vec<_> = errs.iter().filter(|m| m.contains("Two columns")).collect();
         assert_eq!(dup.len(), 1, "one duplicate-header error: {errs:?}");
         assert!(dup[0].contains('X'));
 
@@ -852,7 +894,7 @@ mod tests {
             "# collection: c\n# columns: FILE AS Name, Oauth.status AS Status\nREPORT REQUEST Oauth\n",
             Some(&titles),
             None,
-            "duplicate column",
+            "Two columns",
         ));
     }
 
@@ -901,7 +943,7 @@ mod tests {
             "REQUEST Oauth\n",
             None,
             None,
-            "missing '# collection:'"
+            "No collection chosen"
         ));
     }
 
@@ -911,7 +953,7 @@ mod tests {
             "# collection:\nREQUEST Oauth\n",
             None,
             None,
-            "empty"
+            "No collection chosen"
         ));
     }
 
@@ -991,7 +1033,7 @@ mod tests {
             "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n",
             Some(&t),
             None,
-            "'# environment:' is empty"
+            "environment setting is empty"
         ));
     }
 
@@ -1011,9 +1053,10 @@ mod tests {
     #[test]
     fn unbound_collection_warns_but_does_not_error_on_names() {
         let diags = diags_for("# collection: ./c.hurl\nREQUEST Whatever\n", None, None);
-        assert!(diags.iter().any(
-            |d| d.severity == Severity::Warning && d.message.contains("collection not loaded")
-        ));
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.message.contains("collection isn't loaded"))
+        );
         // No name-resolution error while unbound.
         assert!(!diags.iter().any(|d| d.message.contains("not found")));
     }
@@ -1103,7 +1146,9 @@ mod tests {
         .map(|d| d.message)
         .collect();
         assert!(
-            warns.iter().any(|m| m.contains("'# baseline:' is ignored")),
+            warns
+                .iter()
+                .any(|m| m.contains("baseline setting is ignored")),
             "expected the ignored-baseline warning: {warns:?}"
         );
     }
@@ -1383,7 +1428,7 @@ mod tests {
         };
         validate(&flow, &ctx)
             .into_iter()
-            .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be defined"))
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be set"))
             .map(|d| d.message)
             .collect()
     }

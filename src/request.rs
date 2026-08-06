@@ -15,8 +15,8 @@ use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
 use crate::http::ApiResponse;
 use crate::hurl::{
-    EntryOutcome, FormField, HurlEntry, RunOutput, collection_to_hurl, expand_base64_form_fields,
-    run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
+    EntryOutcome, FormField, HurlEntry, KvRow, RunOutput, RunStatus, collection_to_hurl,
+    expand_base64_form_fields, run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -177,20 +177,28 @@ pub fn subst_display(text: &str, map: &HashMap<String, SubstInfo>) -> String {
 /// a **disabled** entry serializes as a `[value, false]` pair so the flag
 /// survives a round trip through the editor. On parse it tolerates either
 /// shape: any bare scalar (string, number, bool, null) is treated as enabled,
-/// while a `[value, enabled?]` array carries an explicit flag (defaulting to
-/// enabled when the flag is omitted).
+/// while a `[value, enabled?, desc?]` array carries an explicit flag
+/// (defaulting to enabled when omitted) and an optional description.
 #[derive(Clone)]
 struct KvValue {
     value: String,
     enabled: bool,
+    /// The row's description. Carried through so the Code view round-trips a
+    /// note rather than silently dropping it on the way back.
+    desc: String,
 }
 
 impl serde::Serialize for KvValue {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if self.enabled {
+        // The plain-string form is kept for the overwhelmingly common
+        // "enabled, no note" row, so the Code view stays readable; the array
+        // grows a third element only when there is actually a note to carry.
+        if self.enabled && self.desc.is_empty() {
             s.serialize_str(&self.value)
-        } else {
+        } else if self.desc.is_empty() {
             (&self.value, self.enabled).serialize(s)
+        } else {
+            (&self.value, self.enabled, &self.desc).serialize(s)
         }
     }
 }
@@ -201,10 +209,12 @@ impl<'de> serde::Deserialize<'de> for KvValue {
             Value::Array(arr) => KvValue {
                 value: arr.first().map(value_as_text).unwrap_or_default(),
                 enabled: arr.get(1).and_then(Value::as_bool).unwrap_or(true),
+                desc: arr.get(2).map(value_as_text).unwrap_or_default(),
             },
             other => KvValue {
                 value: value_as_text(&other),
                 enabled: true,
+                desc: String::new(),
             },
         })
     }
@@ -275,6 +285,10 @@ struct FormFieldJson {
     value: TextValue,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     enabled: bool,
+    /// The field's note. Omitted from the JSON entirely when empty, which is
+    /// almost always, so the Code view isn't cluttered by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    desc: String,
 }
 
 fn default_true() -> bool {
@@ -298,6 +312,7 @@ impl From<&FormField> for FormFieldJson {
             },
             value: TextValue(f.value.clone()),
             enabled: f.enabled,
+            desc: f.desc.clone(),
         }
     }
 }
@@ -315,6 +330,7 @@ impl From<FormFieldJson> for FormField {
             content_type: f.content_type,
             base64_prefix: f.base64_prefix,
             enabled: f.enabled,
+            desc: f.desc,
         }
     }
 }
@@ -351,24 +367,29 @@ struct RequestJson {
     url: String,
 }
 
-fn triples_to_map(triples: &[(String, String, bool)]) -> BTreeMap<String, KvValue> {
-    triples
-        .iter()
-        .map(|(k, v, e)| {
+fn rows_to_map(rows: &[KvRow]) -> BTreeMap<String, KvValue> {
+    rows.iter()
+        .map(|r| {
             (
-                k.clone(),
+                r.key.clone(),
                 KvValue {
-                    value: v.clone(),
-                    enabled: *e,
+                    value: r.value.clone(),
+                    enabled: r.enabled,
+                    desc: r.desc.clone(),
                 },
             )
         })
         .collect()
 }
 
-fn map_to_triples(map: BTreeMap<String, KvValue>) -> Vec<(String, String, bool)> {
+fn map_to_rows(map: BTreeMap<String, KvValue>) -> Vec<KvRow> {
     map.into_iter()
-        .map(|(k, kv)| (k, kv.value, kv.enabled))
+        .map(|(key, kv)| KvRow {
+            key,
+            value: kv.value,
+            enabled: kv.enabled,
+            desc: kv.desc,
+        })
         .collect()
 }
 
@@ -385,11 +406,11 @@ pub fn build_request_json(entry: &HurlEntry) -> String {
         body: entry.body.as_deref().map(|raw| {
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
         }),
-        cookies: triples_to_map(&entry.cookies),
+        cookies: rows_to_map(&entry.cookies),
         form_fields: entry.form_fields.iter().map(FormFieldJson::from).collect(),
-        headers: triples_to_map(&entry.headers),
+        headers: rows_to_map(&entry.headers),
         method: entry.method.clone(),
-        query_params: triples_to_map(&entry.queries),
+        query_params: rows_to_map(&entry.queries),
         url: entry.url.clone(),
     };
     serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".into())
@@ -412,9 +433,9 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
     entry.method = dto.method;
     entry.url = dto.url;
     entry.basic_auth = dto.basic_auth.map(|ba| (ba.user.0, ba.pass.0));
-    entry.headers = map_to_triples(dto.headers);
-    entry.cookies = map_to_triples(dto.cookies);
-    entry.queries = map_to_triples(dto.query_params);
+    entry.headers = map_to_rows(dto.headers);
+    entry.cookies = map_to_rows(dto.cookies);
+    entry.queries = map_to_rows(dto.query_params);
     entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
     entry.body = body;
     Ok(entry)
@@ -427,8 +448,8 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
 /// applies to every request, not just the one currently selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RequestView {
-    #[default]
     Json,
+    #[default]
     Hurl,
 }
 
@@ -454,8 +475,8 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
     let mut headers: Vec<(String, String)> = entry
         .headers
         .iter()
-        .filter(|(_, _, e)| *e)
-        .map(|(k, v, _)| (k.clone(), substitute(v, vars)))
+        .filter(|r| r.enabled)
+        .map(|r| (r.key.clone(), substitute(&r.value, vars)))
         .collect();
     if let Some((user, pass)) = &entry.basic_auth {
         let cred = STANDARD.encode(format!(
@@ -468,8 +489,8 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
     let cookies: Vec<(String, String)> = entry
         .cookies
         .iter()
-        .filter(|(_, _, e)| *e)
-        .map(|(k, v, _)| (substitute(k, vars), substitute(v, vars)))
+        .filter(|r| r.enabled)
+        .map(|r| (substitute(&r.key, vars), substitute(&r.value, vars)))
         .collect();
     let form_fields: Vec<FormField> = entry
         .form_fields
@@ -482,6 +503,7 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
             content_type: f.content_type.as_deref().map(|ct| substitute(ct, vars)),
             base64_prefix: f.base64_prefix.as_deref().map(|p| substitute(p, vars)),
             enabled: f.enabled,
+            desc: String::new(),
         })
         .collect();
 
@@ -503,6 +525,11 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
 pub struct CaptureUpdate {
     pub col_id: u64,
     pub entry_idx: usize,
+    /// Whether the runner considered this entry a pass (status expectation,
+    /// asserts and transport all satisfied) — mirrors `EntryOutcome::ok`, so
+    /// the front-end can stamp the entry's pass/fail marker without re-deriving
+    /// it from the response.
+    pub ok: bool,
     pub values: HashMap<String, String>,
     pub response: ApiResponse,
 }
@@ -550,7 +577,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         headers: resolved
             .headers
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone(), true))
+            .map(|(k, v)| KvRow::new(k.clone(), v.clone()))
             .collect(),
         basic_auth: None, // already encoded into `headers` by resolve_entry
         form_fields: resolved.form_fields,
@@ -559,7 +586,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         cookies: resolved
             .cookies
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone(), true))
+            .map(|(k, v)| KvRow::new(k.clone(), v.clone()))
             .collect(),
         // Per-request `[Options]` (retry, insecure, delay, …) genuinely affect
         // the run, so carry them through to the executed entry.
@@ -682,12 +709,14 @@ pub fn run_collection(
                 r.body = Arc::from(eo.body);
                 r.headers = eo.headers;
                 r.assert_results = eo.asserts;
+                r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
                 let values: HashMap<String, String> = eo.captures.into_iter().collect();
                 let _ = tx.send(CaptureUpdate {
                     col_id,
                     entry_idx,
+                    ok: eo.ok,
                     values,
                     response: r.clone(),
                 });
@@ -712,6 +741,7 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         error: eo.error.clone().unwrap_or_default(),
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
+        duration_ms: Some(eo.duration_ms),
     }
 }
 
@@ -886,6 +916,15 @@ pub fn drain_capture_updates(
                             col.invalidate_request_json();
                             if let Some(entry) = col.entries.get_mut(update.entry_idx) {
                                 entry.last_response = Some(update.response.clone());
+                                // The send finished — stamp the pass/fail marker
+                                // and clear the "sending" (Running) state so the
+                                // Response pane stops showing the spinner for
+                                // this entry (only the still-in-flight entry does).
+                                entry.last_run = if update.ok {
+                                    RunStatus::Passed
+                                } else {
+                                    RunStatus::Failed
+                                };
                             }
                         }
                     }
@@ -911,21 +950,17 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
     let mut add = |text: &str| keys.extend(crate::environment::referenced_keys(text));
 
     add(&entry.url);
-    for (k, v, _) in &entry.headers {
-        add(k);
-        add(v);
-    }
-    for (k, v, _) in &entry.queries {
-        add(k);
-        add(v);
+    for r in entry.headers.iter().chain(&entry.queries) {
+        add(&r.key);
+        add(&r.value);
     }
     for f in &entry.form_fields {
         add(&f.key);
         add(&f.value);
     }
-    for (k, v, _) in &entry.cookies {
-        add(k);
-        add(v);
+    for r in &entry.cookies {
+        add(&r.key);
+        add(&r.value);
     }
     if let Some((u, p)) = &entry.basic_auth {
         add(u);
@@ -1034,11 +1069,11 @@ mod tests {
             url: "http://example.com/api".into(),
             // Deliberately out of order to prove keys come out sorted.
             headers: vec![
-                ("X-Zed".into(), "z".into(), true),
-                ("Authorization".into(), "Bearer t".into(), true),
+                KvRow::toggled("X-Zed", "z", true),
+                KvRow::toggled("Authorization", "Bearer t", true),
             ],
-            cookies: vec![("session".into(), "abc".into(), true)],
-            queries: vec![("page".into(), "2".into(), true)],
+            cookies: vec![KvRow::toggled("session", "abc", true)],
+            queries: vec![KvRow::toggled("page", "2", true)],
             basic_auth: Some(("alice".into(), "secret".into())),
             form_fields: vec![
                 FormField {
@@ -1048,6 +1083,7 @@ mod tests {
                     content_type: None,
                     base64_prefix: None,
                     enabled: true,
+                    desc: String::new(),
                 },
                 FormField {
                     key: "file".into(),
@@ -1056,6 +1092,7 @@ mod tests {
                     content_type: Some("application/octet-stream".into()),
                     base64_prefix: None,
                     enabled: true,
+                    desc: String::new(),
                 },
             ],
             body: Some(r#"{"a":1}"#.into()),
@@ -1145,11 +1182,7 @@ mod tests {
         HurlEntry {
             method: "GET".into(),
             url: "{{ BASE_URL }}/me".into(),
-            headers: vec![(
-                "Authorization".into(),
-                "Bearer {{ API_TOKEN }}".into(),
-                true,
-            )],
+            headers: vec![KvRow::new("Authorization", "Bearer {{ API_TOKEN }}")],
             ..Default::default()
         }
     }
@@ -1372,6 +1405,7 @@ mod tests {
         tx.send(CaptureUpdate {
             col_id: target,
             entry_idx: 0,
+            ok: true,
             values,
             response,
         })

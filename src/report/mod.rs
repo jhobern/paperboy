@@ -15,6 +15,9 @@
 
 pub mod baseline;
 pub mod compare;
+pub mod context;
+pub mod dry_run;
+pub mod edit;
 pub mod flow;
 pub mod model;
 pub mod parser;

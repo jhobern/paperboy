@@ -426,8 +426,54 @@ fn draw_report_node_request_overlay(
                 } else {
                     Style::default().fg(th.dim)
                 };
-                Line::from(Span::styled(format!("{mark} {}", fr.name), style))
+                // `SHOW` and `HIDE` are two independent clauses over the same
+                // field names, so each row names the clause it writes — without
+                // it the two blocks of checkboxes are indistinguishable.
+                Line::from(Span::styled(format!("{mark} SHOW {}", fr.name), style))
             }
+            FormRow::Hidden(fi) => {
+                let fr = &form.hide_fields[fi];
+                let mark = if fr.included { "[x]" } else { "[ ]" };
+                let style = if is_sel {
+                    base
+                } else if fr.included {
+                    Style::default().fg(th.text)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                Line::from(Span::styled(format!("{mark} HIDE {}", fr.name), style))
+            }
+            FormRow::With(wi) => {
+                let text = match form.with.get(wi) {
+                    Some(crate::report::flow::WithItem::Field { name, query, stats }) => {
+                        let stats = if stats.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "  {}({})",
+                                s.report_node_with_stats_label,
+                                stats
+                                    .iter()
+                                    .map(|k| k.keyword())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
+                        format!("WITH {name}: {query}{stats}")
+                    }
+                    // A bare `WITH RESPONSE` carries no name/query.
+                    _ => "WITH RESPONSE".to_string(),
+                };
+                Line::from(Span::styled(text, base))
+            }
+            FormRow::AddWith => Line::from(Span::styled(
+                s.report_node_with_add.to_string(),
+                if is_sel {
+                    base
+                } else {
+                    Style::default().fg(th.dim)
+                },
+            )),
         };
         lines.push(line);
     }
@@ -436,6 +482,443 @@ fn draw_report_node_request_overlay(
     let block = panel(s.report_node_config_title.to_string(), true, th).title_bottom(
         Line::from(Span::styled(
             format!(" {} ", s.report_node_request_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// The `PARALLEL(n)` max-concurrency row's text, shared by the ENVS and FILES
+/// overlays. A blank box is shown as "no limit" rather than as an empty field,
+/// since blank is a meaningful value here (fall back to `MAX_PARALLEL`) and not
+/// an unfinished one.
+fn degree_row_text(degree: &str, s: &Strings, is_sel: bool) -> String {
+    let shown = if degree.trim().is_empty() {
+        s.report_node_parallel_degree_none.to_string()
+    } else {
+        degree.to_string()
+    };
+    let mut text = format!("  {}: {shown}", s.report_node_parallel_degree_label);
+    if is_sel {
+        text.push('▏');
+    }
+    text
+}
+
+/// Draw the `REPORT <var>` overlay ([`Overlay::ReportNodeVars`]): a checklist of
+/// the variables in scope, a free-text row for the ones the static scan can't
+/// see, and — for a single picked variable — its `AS` name and statistics.
+fn draw_report_node_vars_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::VarsForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::VarsRow;
+    let lines: Vec<(usize, String)> = form
+        .visible_rows()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let text = match row {
+                VarsRow::Var(vi) => {
+                    let r = &form.vars[*vi];
+                    let mark = if r.included {
+                        s.checkbox_checked
+                    } else {
+                        s.checkbox_unchecked
+                    };
+                    format!("{mark} {}", r.name)
+                }
+                // The two typed rows carry a cursor bar when selected.
+                VarsRow::Other => caretted(
+                    format!("{}: {}", s.report_node_vars_other_label, form.other),
+                    i == form.selected,
+                ),
+                VarsRow::Alias => caretted(
+                    format!("{}: {}", s.report_node_alias_label, form.alias),
+                    i == form.selected,
+                ),
+                VarsRow::Stat(si) => {
+                    let (kind, on) = form.stats[*si];
+                    let mark = if on {
+                        s.checkbox_checked
+                    } else {
+                        s.checkbox_unchecked
+                    };
+                    format!(
+                        "  {mark} {}({})",
+                        s.report_node_with_stats_label,
+                        kind.keyword()
+                    )
+                }
+            };
+            (i, text)
+        })
+        .collect();
+    // With nothing in scope the checklist is empty, which would read as a bug
+    // rather than as "type one below".
+    let note = form.vars.is_empty().then_some(s.report_node_vars_none);
+    draw_simple_form_overlay(
+        f,
+        s.report_node_vars_title,
+        s.report_node_vars_hint,
+        &lines,
+        form.selected,
+        note,
+        th,
+        app,
+    );
+}
+
+/// Draw the `REPORT "<template>" AS <name>` overlay
+/// ([`Overlay::ReportNodeComputed`]): the template, the column name and the
+/// statistics checklist.
+fn draw_report_node_computed_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::ComputedForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::ComputedRow;
+    let lines: Vec<(usize, String)> = form
+        .visible_rows()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let text = match row {
+                ComputedRow::Template => caretted(
+                    format!(
+                        "{}: {}",
+                        s.report_node_computed_template_label, form.template
+                    ),
+                    i == form.selected,
+                ),
+                ComputedRow::Alias => caretted(
+                    format!("{}: {}", s.report_node_computed_name_label, form.alias),
+                    i == form.selected,
+                ),
+                ComputedRow::Stat(si) => {
+                    let (kind, on) = form.stats[*si];
+                    let mark = if on {
+                        s.checkbox_checked
+                    } else {
+                        s.checkbox_unchecked
+                    };
+                    format!(
+                        "  {mark} {}({})",
+                        s.report_node_with_stats_label,
+                        kind.keyword()
+                    )
+                }
+            };
+            (i, text)
+        })
+        .collect();
+    draw_simple_form_overlay(
+        f,
+        s.report_node_computed_title,
+        s.report_node_computed_hint,
+        &lines,
+        form.selected,
+        None,
+        th,
+        app,
+    );
+}
+
+/// Draw the `VARIABLE = VALUE` overlay ([`Overlay::ReportNodeAssign`]): two
+/// free-text rows, so a `SET` line's value can be changed without dropping into
+/// the raw line editor.
+fn draw_report_node_assign_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::AssignForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::AssignRow;
+    let rows = form.visible_rows();
+    let lines: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let text = match row {
+                AssignRow::Key => format!("{}: {}", s.node_form_var, form.key),
+                AssignRow::Value => format!("{}: {}", s.node_form_value, form.value),
+            };
+            // Both rows are typed into.
+            (i, caretted(text, i == form.selected))
+        })
+        .collect();
+    draw_simple_form_overlay(
+        f,
+        s.node_assign_title,
+        s.report_node_assign_hint,
+        &lines,
+        form.selected,
+        None,
+        th,
+        app,
+    );
+}
+
+/// Draw the `LIST NAME = [ … ]` overlay ([`Overlay::ReportNodeList`]): the list
+/// name and one row per scalar element, plus an "add" row.
+fn draw_report_node_list_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::ListForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::ListRow;
+    let rows = form.visible_rows();
+    let lines: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let sel = i == form.selected;
+            let text = match row {
+                ListRow::Name => caretted(format!("{}: {}", s.node_form_list_name, form.name), sel),
+                ListRow::Value(vi) => caretted(format!("  {}", form.values[*vi]), sel),
+                // The add row is a button, not a field.
+                ListRow::Add => s.report_node_list_add.to_string(),
+            };
+            (i, text)
+        })
+        .collect();
+    draw_simple_form_overlay(
+        f,
+        s.node_list_title,
+        s.report_node_list_hint,
+        &lines,
+        form.selected,
+        None,
+        th,
+        app,
+    );
+}
+
+/// Append a cursor bar to `text` when the row is selected, marking it as a
+/// field being typed into rather than one toggled with Space.
+fn caretted(mut text: String, selected: bool) -> String {
+    if selected {
+        text.push('▏');
+    }
+    text
+}
+
+/// Draw a plain list-of-rows overlay: a centred, scrolling box with one text
+/// line per row, the selected row highlighted, and the shortcut hint on the
+/// bottom border. The `WITH`/`ENVS`/`FILES` overlays each style their rows
+/// individually, but the simple text forms have no such needs and would
+/// otherwise be three copies of this scaffolding.
+///
+/// `note` is an optional dim, unselectable line above the rows, for saying why
+/// a list is empty. Callers append their own cursor bar to text-entry rows —
+/// only they know which rows are typed into rather than ticked.
+#[allow(clippy::too_many_arguments)]
+fn draw_simple_form_overlay(
+    f: &mut Frame,
+    title: &str,
+    hint: &str,
+    lines: &[(usize, String)],
+    selected: usize,
+    note: Option<&str>,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    // The note occupies a line but no row index, so the scroll window and the
+    // box height must both count it while selection ignores it.
+    let note_h = usize::from(note.is_some());
+    let n = lines.len() + note_h;
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = selected.min(lines.len().saturating_sub(1));
+    // Scroll is measured in drawn lines, so the selected row's line is its row
+    // index plus the note above it.
+    let sel_line = selected + note_h;
+    let scroll = if sel_line >= inner_h {
+        sel_line + 1 - inner_h
+    } else {
+        0
+    };
+    let mut all: Vec<Line> = Vec::with_capacity(n);
+    if let Some(note) = note {
+        all.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::default().fg(th.dim),
+        )));
+    }
+    all.extend(lines.iter().map(|(i, text)| {
+        let style = if *i == selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        Line::from(Span::styled(text.clone(), style))
+    }));
+    let rendered: Vec<Line> = all.into_iter().skip(scroll).take(inner_h).collect();
+    let block = panel(title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {hint} "),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(rendered).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for line in scroll..n.min(scroll + inner_h) {
+            // The note line is not a row, so it gets no hit target.
+            let Some(row) = line.checked_sub(note_h) else {
+                continue;
+            };
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (line - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
+/// Draw the `WITH` field overlay ([`Overlay::ReportNodeWithField`]): the column
+/// name, the Hurl query behind it and the `STATISTICS(…)` checklist. Opened
+/// from a `WITH` row of the request form and returns there on Enter or Esc.
+fn draw_report_node_with_field_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::WithFieldForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::WithFieldRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            WithFieldRow::Name => {
+                let mut text = format!("{}: {}", s.report_node_with_name_label, form.name);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            WithFieldRow::Query => {
+                // An empty query is legal — it reports the whole response — so
+                // it is labelled rather than left as a blank field.
+                let shown = if form.query.trim().is_empty() && !is_sel {
+                    s.report_node_with_query_none.to_string()
+                } else {
+                    form.query.clone()
+                };
+                let mut text = format!("{}: {shown}", s.report_node_with_query_label);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            WithFieldRow::Stat(si) => {
+                let (kind, on) = form.stats[si];
+                let mark = if on {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                let style = if is_sel {
+                    base
+                } else if on {
+                    Style::default().fg(th.text)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                Line::from(Span::styled(
+                    format!(
+                        "  {mark} {}({})",
+                        s.report_node_with_stats_label,
+                        kind.keyword()
+                    ),
+                    style,
+                ))
+            }
+        };
+        lines.push(line);
+    }
+    let block = panel(s.report_node_with_title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_with_hint),
             Style::default().fg(th.dim),
         ))
         .centered(),
@@ -521,6 +1004,38 @@ fn draw_report_node_envs_overlay(
                 format!("{}: ‹{}›", s.report_node_envs_mode_label, mode_label),
                 base,
             )),
+            EnvsRow::Parallel => {
+                let mark = if form.parallel {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{} {}", mark, s.report_node_parallel_label),
+                    base,
+                ))
+            }
+            EnvsRow::Degree => {
+                Line::from(Span::styled(degree_row_text(&form.degree, s, is_sel), base))
+            }
+            EnvsRow::BaselineShow(fi) => {
+                let row = &form.baseline_show[fi];
+                let mark = if row.included {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                // Indented under the env rows and prefixed with the clause it
+                // writes, so it reads as "SHOW, on the baseline" rather than as
+                // another field list belonging to the loop as a whole.
+                Line::from(Span::styled(
+                    format!(
+                        "  {} {} {}",
+                        mark, s.report_node_baseline_show_label, row.name
+                    ),
+                    base,
+                ))
+            }
             EnvsRow::Env(ei) => {
                 let entry = &form.entries[ei];
                 let shown = if entry.name.is_empty() {
@@ -528,15 +1043,22 @@ fn draw_report_node_envs_overlay(
                 } else {
                     entry.name.as_str()
                 };
+                // A snapshot reference reads as `FILE(‹…›)` so it mirrors the
+                // grammar it serializes to; a live env is just `‹name›`.
+                let value = if entry.file {
+                    format!("{}(‹{shown}›)", s.report_node_envs_file)
+                } else {
+                    format!("‹{shown}›")
+                };
                 let text = if form.compare {
                     let role = if entry.baseline {
                         s.report_node_envs_baseline
                     } else {
                         s.report_node_envs_comparison
                     };
-                    format!("  [{role}] ‹{shown}›")
+                    format!("  [{role}] {value}")
                 } else {
-                    format!("  ‹{shown}›")
+                    format!("  {value}")
                 };
                 Line::from(Span::styled(text, base))
             }
@@ -578,10 +1100,126 @@ fn draw_report_node_envs_overlay(
     }
 }
 
-/// Draw the collection-binding picker overlay ([`Overlay::ReportBind`]): a
-/// simple selectable list of the open collections, each showing its display
-/// name and (dimmed) file path — or "(unsaved)" when it has none. Choosing one
-/// re-points the active report's `# collection:` header at it.
+/// Draw the FILES-loop configure overlay ([`Overlay::ReportNodeFiles`]): the
+/// loop variable, the source folder (opened via the file picker), an optional
+/// `MATCH` glob and the `PARALLEL` toggle — the file analogue of the ENVS
+/// overlay above.
+fn draw_report_node_files_overlay(
+    f: &mut Frame,
+    form: &super::report_nodes::FilesForm,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::report_nodes::FilesRow;
+    let rows = form.visible_rows();
+    let n = rows.len();
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let selected = form.selected.min(n.saturating_sub(1));
+    let scroll = if selected >= inner_h {
+        selected + 1 - inner_h
+    } else {
+        0
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(scroll).take(inner_h) {
+        let is_sel = i == selected;
+        let base = if is_sel {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        let line = match *row {
+            FilesRow::Var => {
+                let mut text = format!("{}: {}", s.report_node_files_var_label, form.var);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            FilesRow::Folder => {
+                let shown = if form.dir.trim().is_empty() {
+                    s.report_node_files_none
+                } else {
+                    form.dir.as_str()
+                };
+                Line::from(Span::styled(
+                    format!("{}: ‹{shown}›", s.report_node_files_folder_label),
+                    base,
+                ))
+            }
+            FilesRow::Match => {
+                let mut text = format!("{}: {}", s.report_node_files_match_label, form.glob);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
+            FilesRow::Parallel => {
+                let mark = if form.parallel {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{} {}", mark, s.report_node_parallel_label),
+                    base,
+                ))
+            }
+            FilesRow::Degree => {
+                Line::from(Span::styled(degree_row_text(&form.degree, s, is_sel), base))
+            }
+        };
+        lines.push(line);
+    }
+    // One form serves both producers, so the title says which one is open.
+    let title = if form.folders {
+        s.report_node_folders_title
+    } else {
+        s.report_node_files_title
+    };
+    let block = panel(title.to_string(), true, th).title_bottom(
+        Line::from(Span::styled(
+            format!(" {} ", s.report_node_files_hint),
+            Style::default().fg(th.dim),
+        ))
+        .centered(),
+    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..rows.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+    if n > inner_h {
+        let bar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: inner_h as u16,
+        };
+        draw_scrollbar(f, bar_area, n, inner_h, scroll, th);
+    }
+}
+
 fn draw_report_bind_overlay(
     f: &mut Frame,
     picker: &super::reports::ReportBindPicker,
@@ -746,7 +1384,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     draw_topbar(f, rows[1], app, &s, &th);
     draw_tabs(f, rows[2], app, &s, &th);
     draw_body(f, rows[3], app, &s, &th);
-    draw_footer(f, rows[4], &s, &th, app.can_copy());
+    draw_footer(
+        f,
+        rows[4],
+        &s,
+        &th,
+        app.can_copy(),
+        app.focus == Pane::Response,
+    );
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
@@ -962,13 +1607,15 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         spans.push(Span::raw("│"));
         pos += 1;
         // Unsaved edits get a trailing dot (with a leading space so it never
-        // crowds the name); the report icon leads.
+        // crowds the name); the report icon leads — the same 📊 icon the
+        // Workspace tree uses for report files (`REPORT_ICON`), so a report
+        // reads the same whether it's a standalone tab or a workspace row.
         let marker = if rt.report.dirty {
             format!(" {}", s.report_dirty_marker)
         } else {
             String::new()
         };
-        let name = format!("{}{}{}", s.report_tab_icon, rt.report.name, marker);
+        let name = format!("{REPORT_ICON} {}{}", rt.report.name, marker);
         let idx = report_base + slot;
         let w = name.chars().count() + 2;
         if app.active_tab == idx {
@@ -1095,10 +1742,12 @@ pub(crate) fn draw_collection_left(
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
     let smap = crate::request::subst_map(col, env.as_ref());
-    // Columns available for the URL text (after the border, highlight symbol,
-    // user-added marker and the fixed method column). Recorded so h-scrolling
-    // can be clamped to stop once the URL's end is visible (no blank overscroll).
-    let url_w = panes[0].width.saturating_sub(2 + 2 + 2 + 5);
+    // Columns available for the URL text (after the border, user-added marker
+    // and the fixed method column). The selected row is shown highlighted
+    // rather than with a leftmost caret, so no column is reserved for one.
+    // Recorded so h-scrolling can be clamped to stop once the URL's end is
+    // visible (no blank overscroll).
+    let url_w = panes[0].width.saturating_sub(2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -1380,15 +2029,12 @@ pub(crate) fn draw_collection_left(
         .title(Line::from(title_spans))
         .style(Style::default().bg(th.panel))
         .title_bottom(Line::styled(run_hint, Style::default().fg(th.dim)));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(th.accent)
-                .fg(th.bg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(th.accent)
+            .fg(th.bg)
+            .add_modifier(Modifier::BOLD),
+    );
     let mut st = ListState::default();
     if !view_rows.is_empty() {
         st.select(Some(sel));
@@ -1478,10 +2124,11 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     let sel = app
         .global_env_idx
         .min(app.global_envs.len().saturating_sub(1));
-    // Columns available for the name text (after the border, highlight
-    // symbol, the leftmost pencil column and the active-marker column); used
-    // to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2 + 2);
+    // Columns available for the name text (after the border, the leftmost
+    // pencil column and the active-marker column). The selected row is shown
+    // highlighted rather than with a leftmost caret, so no column is reserved
+    // for one. Used to clamp scrolling.
+    let text_w = area.width.saturating_sub(2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
     let sel_len = app
         .global_envs
@@ -1555,8 +2202,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .collect();
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD))
-        .highlight_symbol("› ");
+        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
     let mut st = ListState::default();
     st.select(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
@@ -2368,18 +3014,19 @@ pub(crate) fn draw_response(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // The in-flight spinner is still driven by the single shared "live"
-    // response slot (no per-entry concept of "currently sending"), but once
-    // a request has finished, the actual status/body/asserts shown always
-    // come from the *selected entry's own* last response — not whichever
-    // entry happened to finish last — so switching entries after a batch
-    // "Run All" shows the right result for each one.
-    let loading = app.response.lock().unwrap().loading;
+    // The in-flight spinner now tracks the *selected entry* rather than a single
+    // shared "loading" flag: an entry is "sending" while its `last_run` is
+    // `Running`. So a request that's still in flight shows the spinner, while
+    // selecting a *different* entry (whether idle or already finished) shows
+    // that entry's own last response — even if some other request is mid-send.
     let entry = app
         .collections
         .get(ci)
         .and_then(|col| col.entries.get(col.selected_entry));
-    let (status, status_text, body, error, asserts) =
+    let loading = entry
+        .map(|e| e.last_run == RunStatus::Running)
+        .unwrap_or(false);
+    let (status, status_text, body, error, asserts, duration) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
                 r.status,
@@ -2387,9 +3034,24 @@ pub(crate) fn draw_response(
                 r.body.clone(),
                 r.error.clone(),
                 r.assert_results.clone(),
+                r.duration_ms,
             ),
-            None => (0, String::new(), Arc::from(""), String::new(), Vec::new()),
+            None => (
+                0,
+                String::new(),
+                Arc::from(""),
+                String::new(),
+                Vec::new(),
+                None,
+            ),
         };
+
+    // Cleared here so every early-return path (loading / no-response / error)
+    // leaves it empty; only the compact body branch below sets it. This is what
+    // the whole-panel `y`-copy consults to return the untruncated body while the
+    // panel shows the compacted overview.
+    app.resp_full_body = Arc::from("");
+    app.resp_compact_line_maps = Vec::new();
 
     if loading {
         app.resp_max_scroll = 0;
@@ -2479,6 +3141,15 @@ pub(crate) fn draw_response(
             Style::default().fg(badge).add_modifier(Modifier::BOLD),
         ));
     }
+    // Response time, when the runner reported one — the same figure reports
+    // show as the per-request "Time" column, surfaced here for a single run.
+    if let Some(ms) = duration {
+        status_spans.push(Span::raw("   "));
+        status_spans.push(Span::styled(
+            format!("{} {ms} ms", s.response_time_label),
+            Style::default().fg(th.dim),
+        ));
+    }
 
     // One line per assert (✓/✗ with the expression and, on failure, the actual).
     let assert_lines: Vec<Line> = asserts
@@ -2547,7 +3218,17 @@ pub(crate) fn draw_response(
     let body_area = rows[3];
     let width = body_area.width as usize;
     app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
-    app.resp_panel.set_content(body.clone(), width);
+    // Compact view (toggled with `c`) shortens long string literals for
+    // skimming. It's display-only: cache the full body so a whole-panel
+    // `y`-copy still returns the untruncated text (see `whole_panel_text`).
+    if app.response_compact {
+        app.resp_full_body = body.clone();
+        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&body);
+        app.resp_compact_line_maps = line_maps;
+        app.resp_panel.set_content(Arc::from(compacted), width);
+    } else {
+        app.resp_panel.set_content(body.clone(), width);
+    }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
@@ -2604,7 +3285,14 @@ pub(crate) fn draw_response(
     );
 }
 
-pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, can_copy: bool) {
+pub(crate) fn draw_footer(
+    f: &mut Frame,
+    area: Rect,
+    s: &Strings,
+    th: &Theme,
+    can_copy: bool,
+    can_compact: bool,
+) {
     // Run/Run All (F5 / Alt+F5) now live on the Collections panel's bottom
     // border (see draw_collection_left), and the base-URL row above already
     // shows its own "b" hint — kept out of here to leave room for the rest.
@@ -2613,10 +3301,6 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, ca
         format!("↑↓ {}", s.foot_move),
         format!("Enter {}", s.foot_edit),
         format!("n {}", s.foot_new),
-        format!("r {}", s.foot_reload_var),
-        format!("f {}", s.foot_file),
-        format!("s {}", s.foot_options),
-        format!("[ / ], ^←/→ {}", s.help_prev_next_tab),
         format!("F2 {}", s.foot_rename),
         format!("x {}", s.foot_close),
     ];
@@ -2626,6 +3310,11 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, s: &Strings, th: &Theme, ca
     // Response panel that currently has focus (see `TuiApp::can_copy`).
     if can_copy {
         hint.push(format!("y {}", s.foot_copy_selection));
+    }
+    // `c` toggles the Response body's compact overview — only meaningful (and
+    // only shown) while the Response pane holds focus.
+    if can_compact {
+        hint.push(format!("c {}", s.foot_compact));
     }
     hint.push(format!("? {}", s.foot_help));
     hint.push(format!("q {}", s.foot_quit));
@@ -2774,6 +3463,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         q.push(' ');
                         q.push_str(s.confirm_exit_secrets);
                     }
+                    // Same treatment for in-memory request edits: they have no
+                    // file behind them, so quitting is the moment they vanish.
+                    let edits = app.unsaved_request_edits();
+                    if edits > 0 {
+                        q.push(' ');
+                        q.push_str(&s.confirm_exit_edits.replace("{n}", &edits.to_string()));
+                    }
                     q
                 }
                 ConfirmAction::Clear => s.confirm_clear_q.to_string(),
@@ -2832,6 +3528,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         .replace("{e}", &name)
                         .replace("{n}", &n.to_string())
                 }
+                ConfirmAction::RerunReport => s.confirm_rerun_report_q.to_string(),
             };
             draw_confirm_popup(
                 f,
@@ -2860,6 +3557,18 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // to whatever's actually available on narrow terminals).
             let box_w = f.area().width.saturating_sub(6).clamp(64, 100);
             let inner_w = (box_w as usize).saturating_sub(2); // minus the left/right border
+
+            // Active type-to-filter query (see `TuiApp::help_query`). A row is
+            // kept when any of its text columns contains the query (case-
+            // insensitively); an empty query keeps everything.
+            let query = app.help_query.to_ascii_lowercase();
+            let filtering = !query.is_empty();
+            let matches = |texts: &[&str]| -> bool {
+                query.is_empty()
+                    || texts
+                        .iter()
+                        .any(|t| t.to_ascii_lowercase().contains(query.as_str()))
+            };
 
             let tab_bar = |active: usize| {
                 Line::from(vec![
@@ -2957,6 +3666,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("\u{2190} / \u{2192} (File menu)", s.help_menu_submenu_nav),
                             ("w", s.help_workspace_browse),
                             ("\u{2192} / Enter (Workspace)", s.help_workspace_open),
+                            ("Shift+N (Workspace)", s.help_workspace_new_item),
+                            ("Shift+M (Workspace)", s.help_workspace_move_item),
                             ("^r (File browser)", s.help_browser_reset),
                         ],
                     ),
@@ -2978,6 +3689,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("", s.help_row_toggle_delete),
                             ("y", s.help_copy_selection),
+                            ("c (Response pane)", s.help_compact),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],
@@ -2992,9 +3704,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("d (report)", s.help_report_dry_run),
                             ("v (report)", s.help_report_view),
                             ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
+                            ("Enter (nodes)", s.help_report_nodes_forms),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
-                            ("x (report)", s.help_report_export),
+                            ("Ctrl+S (report)", s.help_report_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
                             ("b (report)", s.help_report_bind),
@@ -3014,12 +3727,19 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     ),
                 ];
                 let mut body = Vec::new();
-                for (i, (heading, entries)) in groups.iter().enumerate() {
-                    if i > 0 {
+                for (heading, entries) in groups.iter() {
+                    let kept: Vec<&(&str, &str)> = entries
+                        .iter()
+                        .filter(|(k, d)| matches(&[k, d, heading]))
+                        .collect();
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    if !body.is_empty() {
                         body.push(Line::raw(""));
                     }
                     body.push(help_section_divider(heading, inner_w, th));
-                    for &(shortcut, desc) in entries.iter() {
+                    for &(shortcut, desc) in kept {
                         body.extend(help_entry_lines(shortcut, desc, inner_w));
                     }
                 }
@@ -3027,7 +3747,27 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             };
 
             let glossary_body = || {
-                let mut body = vec![help_section_divider(s.glossary_heading, inner_w, th)];
+                let render_group =
+                    |body: &mut Vec<Line<'static>>,
+                     heading: &str,
+                     entries: &[(&str, Color, &str, &str)]| {
+                        let kept: Vec<&(&str, Color, &str, &str)> = entries
+                            .iter()
+                            .filter(|(_, _, label, desc)| matches(&[label, desc, heading]))
+                            .collect();
+                        if kept.is_empty() {
+                            return;
+                        }
+                        if !body.is_empty() {
+                            body.push(Line::raw(""));
+                        }
+                        body.push(help_section_divider(heading, inner_w, th));
+                        for &&(icon, color, label, desc) in kept.iter() {
+                            body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
+                        }
+                    };
+
+                let mut body: Vec<Line<'static>> = Vec::new();
                 let entries: [(&str, Color, &str, &str); 5] = [
                     (
                         "\u{25cf}",
@@ -3060,14 +3800,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_desc_shadowed,
                     ),
                 ];
-                for (icon, color, label, desc) in entries {
-                    body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
-                }
+                render_group(&mut body, s.glossary_heading, &entries);
                 // A second group covers every other icon shown around the
                 // app (list rows, tab bar, form editor) so this one tab is
                 // a complete legend rather than just the substitution dots.
-                body.push(Line::raw(""));
-                body.push(help_section_divider(s.glossary_heading_icons, inner_w, th));
                 let icon_entries: [(&str, Color, &str, &str); 9] = [
                     (
                         "\u{270e}",
@@ -3119,9 +3855,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_desc_scroll_hint,
                     ),
                 ];
-                for (icon, color, label, desc) in icon_entries {
-                    body.extend(glossary_entry_lines(icon, color, label, desc, inner_w));
-                }
+                render_group(&mut body, s.glossary_heading_icons, &icon_entries);
                 body
             };
 
@@ -3129,29 +3863,49 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // Render one titled group whose descriptions all align to that
                 // group's own widest key (so long grammar left-hand sides don't
                 // shove their descriptions out of line with the short ones).
+                // Under an active filter, only matching rows are kept and a
+                // group with no matches is dropped entirely.
                 let group = |body: &mut Vec<Line<'static>>,
                              heading: &'static str,
                              entries: &[(&'static str, &'static str)]| {
+                    let kept: Vec<&(&'static str, &'static str)> = entries
+                        .iter()
+                        .filter(|(k, d)| matches(&[k, d, heading]))
+                        .collect();
+                    if kept.is_empty() {
+                        return;
+                    }
+                    if !body.is_empty() {
+                        body.push(Line::raw(""));
+                    }
                     body.push(help_section_divider(heading, inner_w, th));
-                    let key_col = entries
+                    let key_col = kept
                         .iter()
                         .map(|(k, _)| k.chars().count())
                         .max()
                         .unwrap_or(0)
                         .clamp(6, 34);
-                    for &(code, desc) in entries {
+                    for &&(code, desc) in kept.iter() {
                         body.extend(help_entry_lines_col(code, desc, key_col, inner_w));
                     }
                 };
 
-                let mut body = vec![help_section_divider(
-                    s.help_reports_about_heading,
-                    inner_w,
-                    th,
-                )];
-                for para in [s.help_reports_about_1, s.help_reports_about_2] {
-                    body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
-                    body.push(Line::raw(""));
+                let mut body: Vec<Line<'static>> = Vec::new();
+                // The prose intro is orientation, not a searchable entry, so it's
+                // hidden while filtering to keep the results tight.
+                if !filtering {
+                    body.push(help_section_divider(
+                        s.help_reports_about_heading,
+                        inner_w,
+                        th,
+                    ));
+                    for para in [s.help_reports_about_1, s.help_reports_about_2] {
+                        body.push(Line::from(Span::styled(para, Style::default().fg(th.text))));
+                        body.push(Line::raw(""));
+                    }
+                    // Drop the trailing blank so the first group's own leading
+                    // blank isn't doubled up.
+                    body.pop();
                 }
 
                 group(
@@ -3165,9 +3919,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("d", s.help_report_dry_run),
                         ("v", s.help_report_view),
                         ("a / Del / Shift+↑↓ (nodes)", s.help_report_nodes_edit),
+                        ("Enter (nodes)", s.help_report_nodes_forms),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
-                        ("x", s.help_report_export),
+                        ("Ctrl+S", s.help_report_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),
@@ -3175,7 +3930,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("→", s.help_report_complete),
                     ],
                 );
-                body.push(Line::raw(""));
                 group(
                     &mut body,
                     s.help_reports_grammar_heading,
@@ -3187,11 +3941,16 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("REQUEST NAME", s.help_grammar_request),
                         ("REPORT REQUEST NAME [AS COL]", s.help_grammar_report),
                         ("REPORT REQUEST NAME SHOW(a, b)", s.help_grammar_show),
+                        ("REPORT REQUEST NAME HIDE(a, b)", s.help_grammar_hide),
+                        (
+                            "REPORT COL AS N STATISTICS(MEAN)",
+                            s.help_grammar_statistics,
+                        ),
+                        ("WITH Name: query [STATISTICS]", s.help_grammar_with),
                         ("Result", s.help_grammar_result),
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
                     ],
                 );
-                body.push(Line::raw(""));
                 group(
                     &mut body,
                     s.help_reports_loops_heading,
@@ -3207,6 +3966,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("ZIP(a, b, …)", s.help_grammar_zip),
                         ("CONCAT(a, b, …)", s.help_grammar_concat),
                         ("ENVS \"au\", \"eu\"", s.help_grammar_envs),
+                        (
+                            "BASELINE(FILE(\"snap.baseline\"))",
+                            s.help_grammar_baseline_file,
+                        ),
                     ],
                 );
                 body
@@ -3219,25 +3982,53 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 ),
                 tab_bar(*tab),
             ];
-            lines.extend(match *tab {
+            // Show the active filter (and let the user see what they've typed)
+            // on its own line just under the tab strip.
+            if filtering {
+                lines.push(Line::from(vec![
+                    Span::styled(s.help_filter_label, Style::default().fg(th.dim)),
+                    Span::styled(
+                        app.help_query.clone(),
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            let body = match *tab {
                 0 => shortcuts_body(),
                 1 => glossary_body(),
                 _ => reports_body(),
-            });
+            };
+            // A filter that matches nothing on this tab would otherwise leave a
+            // blank void — say so, and point out the filter spans every tab.
+            if filtering && body.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    s.help_filter_no_matches,
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                lines.extend(body);
+            }
 
-            // All three tabs share one fixed height (the tallest body) so
-            // switching tabs doesn't resize the popup out from under the user
-            // — a stable box makes the tab strip read as one steady window
-            // rather than a jarring resize on every switch. `centered_rect`
+            // With no filter, all three tabs share one fixed height (the
+            // tallest body) so switching tabs doesn't resize the popup out
+            // from under the user — a stable box makes the tab strip read as
+            // one steady window rather than a jarring resize on every switch.
+            // Under a filter the bodies shrink to the matches, so the popup is
+            // sized to the current (filtered) content instead. `centered_rect`
             // further caps this to the terminal's own height on small
             // terminals, in which case the body is scrolled (Up/Down) with a
             // scrollbar on the right border rather than clipping off the
             // bottom silently.
-            let content_len = lines
-                .len()
-                .max(2 + shortcuts_body().len())
-                .max(2 + glossary_body().len())
-                .max(2 + reports_body().len());
+            let content_len = if filtering {
+                lines.len()
+            } else {
+                lines
+                    .len()
+                    .max(2 + shortcuts_body().len())
+                    .max(2 + glossary_body().len())
+                    .max(2 + reports_body().len())
+            };
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
@@ -3300,47 +4091,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 MouseHitTarget::Scroll(MouseScrollTarget::Help),
             );
         }
-        Overlay::ReportDryRun(preview) => {
-            let box_w = f.area().width.saturating_sub(6).clamp(48, 96);
-            // Pre-wrap to the inner width with an explicit end-of-line marker
-            // (rather than ratatui's markerless `Wrap`) so long binding/error
-            // lines read unambiguously as single logical lines.
-            let inner_w = box_w.saturating_sub(2);
-            let lines = wrap_lines_with_marker(preview.lines(s, th), inner_w, th);
-            let content_len = lines.len();
-            // Leave room for the border (2) and cap the height to the terminal;
-            // long previews scroll rather than overflowing.
-            let box_h = (content_len as u16 + 2).min(f.area().height.saturating_sub(2));
-            let area = centered_rect(box_w, box_h, f.area());
-            f.render_widget(Clear, area);
-            let title = format!("{}  ({})", s.report_dry_run_title, s.report_dry_run_hint);
-            let visible_rows = area.height.saturating_sub(2) as usize;
-            let max_scroll = content_len.saturating_sub(visible_rows) as u16;
-            if app.dry_run_scroll > max_scroll {
-                app.dry_run_scroll = max_scroll;
-            }
-            let scroll = app.dry_run_scroll;
-            f.render_widget(
-                Paragraph::new(lines)
-                    .block(panel(title, true, th))
-                    .scroll((scroll, 0)),
-                area,
-            );
-            if max_scroll > 0 {
-                let bar_area = Rect {
-                    x: area.x + area.width - 1,
-                    y: area.y + 1,
-                    width: 1,
-                    height: visible_rows as u16,
-                };
-                draw_scrollbar(f, bar_area, content_len, visible_rows, scroll as usize, th);
-            }
-            app.push_mouse_hit(
-                MouseLayer::Overlay,
-                area,
-                MouseHitTarget::Scroll(MouseScrollTarget::ReportDryRun),
-            );
-        }
         Overlay::ReportColumns(picker) => {
             draw_report_columns_overlay(f, picker, s, th, Some(app));
         }
@@ -3355,6 +4105,24 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeEnvs(form) => {
             draw_report_node_envs_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeWithField(form) => {
+            draw_report_node_with_field_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeAssign(form) => {
+            draw_report_node_assign_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeList(form) => {
+            draw_report_node_list_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeVars(form) => {
+            draw_report_node_vars_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeComputed(form) => {
+            draw_report_node_computed_overlay(f, form, s, th, Some(app));
+        }
+        Overlay::ReportNodeFiles(form) => {
+            draw_report_node_files_overlay(f, form, s, th, Some(app));
         }
         Overlay::Prompt {
             kind,
@@ -3545,6 +4313,29 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 }
                 app.push_mouse_hit(MouseLayer::Overlay, inner, MouseHitTarget::BrowserNameField);
                 register_browser_hits(app, ex, rows[0]);
+            } else if !app.browser_query.is_empty() {
+                // An active type-to-filter query gets a one-line strip beneath
+                // the list so it's obvious the list is being filtered (and by
+                // what) rather than mysteriously short.
+                let rows =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+                ex.widget().render_ref(rows[0], f.buffer_mut());
+                register_browser_hits(app, ex, rows[0]);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
+                        Span::styled(
+                            app.browser_query.clone(),
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                    // Fill the theme panel background (like the export-format
+                    // strip and the Help filter) so the strip blends with the
+                    // explorer's own `th.panel` block instead of showing the
+                    // terminal's default background.
+                    .style(Style::default().bg(th.panel)),
+                    rows[1],
+                );
             } else {
                 ex.widget().render_ref(area, f.buffer_mut());
                 register_browser_hits(app, ex, area);

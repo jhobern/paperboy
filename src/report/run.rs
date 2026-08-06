@@ -46,7 +46,7 @@ use crate::hurl::{EntryOutcome, RunOutput};
 
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, WithItem,
+    ResponseFmt, RoleRef, WithItem,
 };
 use super::model::{ReportResult, ReportRow};
 use super::producers::{self, ProducerItem};
@@ -222,6 +222,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+        column_stats: flow.column_stats(),
     }
 }
 
@@ -594,10 +595,10 @@ impl<'a> Exec<'a> {
                 .iter()
                 .map(|v| (v.clone(), self.lookup(v).unwrap_or_default()))
                 .collect(),
-            ReportStmt::VarAs { var, name } => {
+            ReportStmt::VarAs { var, name, .. } => {
                 vec![(name.clone(), self.lookup(var).unwrap_or_default())]
             }
-            ReportStmt::Computed { template, name } => {
+            ReportStmt::Computed { template, name, .. } => {
                 let value = substitute(template, &self.vars_for());
                 vec![(name.clone(), value)]
             }
@@ -712,20 +713,32 @@ impl<'a> Exec<'a> {
             format!("{alias}.Error"),
             eo.error.clone().unwrap_or_default(),
         ));
-        cells.push((format!("{alias}.Response"), response));
+        cells.push((format!("{alias}.Response"), response.clone()));
 
         // Report fields: the request's own `[Reports]` block, then `WITH` fields
         // (report-level overrides on name clash). Fields are stored raw (empty
         // for a non-match); the no-match marker is applied once, at render time.
         let mut fields: Vec<(String, String)> = base.reports.clone();
         for w in with {
-            if let WithItem::Field { name, query } = w {
+            if let WithItem::Field { name, query, .. } = w {
                 fields.retain(|(n, _)| n != name);
                 fields.push((name.clone(), query.clone()));
             }
         }
         for (fname, query) in fields {
-            let value = eval_field(&query, &eo).unwrap_or_default();
+            // A field query may name an intrinsic (`HttpStatus`/`Time`/…), which
+            // aliases that intrinsic value under the field's column — the inline
+            // counterpart to renaming an intrinsic in the `columns:` directive.
+            // `Response` uses the format-resolved body so it honours RESPONSE
+            // RAW/PRETTY. Anything else is a Hurl query evaluated by `eval_field`.
+            let value = match query.trim() {
+                "HttpStatus" => eo.status.to_string(),
+                "Time" => eo.duration_ms.to_string(),
+                "Asserts" => asserts_summary(&eo),
+                "Error" => eo.error.clone().unwrap_or_default(),
+                "Response" => response.clone(),
+                q => eval_field(q, &eo).unwrap_or_default(),
+            };
             cells.push((format!("{alias}.{fname}"), value));
         }
 
@@ -832,21 +845,34 @@ impl<'a> Exec<'a> {
         parallel: Option<&ParallelSpec>,
         inherited: &HashMap<String, String>,
     ) -> Vec<ReportRow> {
-        let names: Vec<String> = match clause {
-            EnvClause::Plain(names) => names.clone(),
+        // Split the clause's roles into environments to run live and snapshot
+        // files to load in place of a live run. `FILE(…)` only appears in a role
+        // clause (never in a plain `ENVS "a","b"` list), so a plain clause is
+        // all-live.
+        let mut live: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        match clause {
+            EnvClause::Plain(names) => live = names.clone(),
             EnvClause::Roles {
                 baseline,
                 comparisons,
                 ..
-            } => baseline.iter().chain(comparisons).cloned().collect(),
-        };
+            } => {
+                for r in baseline.iter().chain(comparisons) {
+                    match r {
+                        RoleRef::Env(n) => live.push(n.clone()),
+                        RoleRef::File(p) => files.push(p.clone()),
+                    }
+                }
+            }
+        }
         let mut seed = self.to_state();
         for (k, v) in inherited {
             seed.broadcast.insert(k.clone(), v.clone());
         }
         let ctx = self.ctx;
         let run_one = |i: usize| -> IterOut {
-            let name = &names[i];
+            let name = &live[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
             sub.path.push((node_index, i));
             sub.target = Some(name.clone());
@@ -864,7 +890,43 @@ impl<'a> Exec<'a> {
                 errors: sub.errors,
             }
         };
-        self.run_iterations(names.len(), parallel, run_one)
+        let mut rows = self.run_iterations(live.len(), parallel, run_one);
+
+        // Inject each `FILE(…)` role's saved snapshot: it is loaded once (no
+        // environment is run) and its rows stand in for a live run of that role.
+        // They carry the snapshot's (relative) path as their `target` — the same
+        // identity `compare::comparison_roles` records for the role — and their
+        // own stored row keys, so they align with the live candidates by key.
+        for (fi, rel) in files.iter().enumerate() {
+            let path = super::producers::resolve_path(self.ctx.root.as_deref(), rel);
+            match super::baseline::Baseline::load(&path) {
+                Ok(snapshot) => {
+                    for (ri, br) in snapshot.rows.iter().enumerate() {
+                        let mut row = br.to_row();
+                        row.target = Some(rel.clone());
+                        // A deterministic structural path (identical between the
+                        // dry skeleton pass and the live run) so a streaming
+                        // front-end slots the row; file roles come after the live
+                        // ones, and each snapshot row gets its own ordinal.
+                        let mut p = self.path.clone();
+                        p.push((node_index, live.len() + fi));
+                        p.push((node_index, ri));
+                        row.path = p;
+                        for k in row.cells.keys().cloned().collect::<Vec<_>>() {
+                            self.note_column(&k);
+                        }
+                        if let Some(sink) = self.ctx.sink {
+                            sink(RowEvent::Completed(&row));
+                        }
+                        rows.push(row);
+                    }
+                }
+                Err(e) => self
+                    .errors
+                    .push(format!("baseline {}: {e}", path.display())),
+            }
+        }
+        rows
     }
 
     /// Execute `count` independent loop iterations — sequentially, or across a
@@ -1163,6 +1225,7 @@ fn json_value_to_string(v: serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::hurl::AssertOutcome;
+    use crate::report::model::StatKind;
     use crate::report::parse_flow;
     use std::sync::Mutex;
 
@@ -1535,6 +1598,7 @@ mod tests {
         let col = crate::report::model::OutputColumn {
             header: "m".into(),
             sources: vec!["process.missing".into()],
+            stats: Vec::new(),
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }
@@ -2293,6 +2357,135 @@ mod tests {
     }
 
     #[test]
+    fn envs_baseline_file_diffs_live_comparison_against_a_snapshot() {
+        use crate::report::baseline::Baseline;
+        use crate::report::compare::RESULT_COLUMN;
+
+        // A per-run runner whose reported `overall` field comes from a variable,
+        // so a snapshot saved with one value diffs against a live env carrying
+        // another.
+        struct Echo;
+        impl EntryRunner for Echo {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let v = vars.get("VERDICT").cloned().unwrap_or_default();
+                let body = format!("{{\"overall\":\"{v}\"}}");
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: body.clone(),
+                        raw_body: body,
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+
+        let dir = tmpdir("envs_baseline_file");
+        let entries = [entry("proc", &[])];
+        let body_src = "FOR FILE IN [\"a\", \"b\"]\n    REPORT REQUEST proc WITH\n        overall: jsonpath \"$.overall\"\n    END\nEND\n";
+
+        // Produce the baseline snapshot from a plain (no-ENVS) run with
+        // VERDICT=CLEAR — its row keys (["a"], ["b"]) match the comparison run.
+        let base_flow = parse_flow(body_src).unwrap();
+        let base_ctx = RunContext {
+            entries: &entries,
+            base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
+                .into_iter()
+                .collect(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &Echo,
+            sink: None,
+        };
+        let first = run_flow(&base_flow, &base_ctx);
+        let snap_path = dir.join("prod.baseline");
+        Baseline::from_result(&first).save(&snap_path).unwrap();
+
+        // Now compare a live `staging` env (VERDICT=REVIEW) against the snapshot
+        // reused as the baseline role — no baseline env is run.
+        let cmp_src = format!(
+            "FOR TARGET IN ENVS BASELINE(FILE(\"prod.baseline\")), COMPARISON(\"staging\")\n{body_src}END\n"
+        );
+        let cmp_flow = parse_flow(&cmp_src).unwrap();
+        let cmp_ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: [(
+                "staging".to_string(),
+                [("VERDICT".to_string(), "REVIEW".to_string())]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            root: Some(dir.clone()),
+            runner: &Echo,
+            sink: None,
+        };
+        let cmp = run_flow(&cmp_flow, &cmp_ctx);
+
+        assert!(
+            cmp.errors.is_empty(),
+            "snapshot loaded cleanly: {:?}",
+            cmp.errors
+        );
+        assert_eq!(
+            cmp.column_order.first(),
+            Some(&RESULT_COLUMN.to_string()),
+            "Result column surfaced"
+        );
+        // One candidate row per key (a, b); each diffs staging against the file.
+        assert_eq!(cmp.rows.len(), 2);
+        for r in &cmp.rows {
+            let cell = r.cells.get(RESULT_COLUMN).expect("Result column");
+            let parsed: serde_json::Value = serde_json::from_str(cell).expect("valid JSON");
+            let obj = parsed.as_object().expect("object");
+            // The baseline entry is keyed by the snapshot path, not an env name.
+            assert!(obj.contains_key("prod.baseline (baseline)"));
+            assert!(obj.contains_key("staging"));
+            assert_eq!(obj["prod.baseline (baseline)"]["overall"], "CLEAR");
+            assert_eq!(obj["staging"]["overall"], "REVIEW");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn envs_baseline_file_reports_a_missing_snapshot() {
+        // A `FILE(…)` role pointing at a missing snapshot is a non-fatal run
+        // error (the live comparison rows are still produced).
+        let fake = Fake::new(&[(
+            "proc",
+            Canned {
+                status: 200,
+                raw_body: "{\"overall\":\"REVIEW\"}".into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("proc", &[])];
+        let res = run(
+            "FOR TARGET IN ENVS BASELINE(FILE(\"nope.baseline\")), COMPARISON(\"staging\")\n    REPORT REQUEST proc WITH\n        overall: jsonpath \"$.overall\"\n    END\nEND\n",
+            &entries,
+            &[],
+            &[("staging", &[])],
+            &fake,
+        );
+        assert!(
+            res.errors.iter().any(|e| e.contains("nope.baseline")),
+            "missing snapshot surfaced as an error: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
     fn baseline_directive_matches_when_unchanged() {
         use crate::report::baseline::Baseline;
         use crate::report::compare::{MATCH, RESULT_COLUMN};
@@ -2644,6 +2837,71 @@ mod tests {
         assert_eq!(cells.get("svc.Response"), None);
         // Intrinsics (in SHOW) precede WITH fields in the column order.
         assert_eq!(res.column_order, vec!["svc.HttpStatus", "svc.extra"]);
+    }
+
+    #[test]
+    fn with_field_query_can_alias_an_intrinsic() {
+        // An intrinsic name used as a WITH-field query aliases that intrinsic
+        // under the field's (possibly multi-word) column name; the original
+        // intrinsic column stays suppressed.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 201,
+                duration_ms: 137,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[])];
+        let res = run(
+            "REPORT REQUEST svc WITH\n    Status: HttpStatus\n    \"Response Time\": Time\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("svc.Status"), Some(&"201".to_string()));
+        assert_eq!(cells.get("svc.Response Time"), Some(&"137".to_string()));
+        // The raw intrinsics were aliased away, not duplicated.
+        assert_eq!(cells.get("svc.HttpStatus"), None);
+        assert_eq!(cells.get("svc.Time"), None);
+    }
+
+    #[test]
+    fn with_field_statistics_flow_into_summary_rows() {
+        // STATISTICS on a WITH field attaches to that field's column and yields
+        // a summary footer, exactly as a `columns:` STATISTICS clause would.
+        let fake = Fake::new(&[(
+            "svc",
+            Canned {
+                status: 200,
+                duration_ms: 100,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("svc", &[])];
+        let res = run(
+            "FOR X IN [1, 2, 3]\n    REPORT REQUEST svc WITH\n        Elapsed: Time STATISTICS(MEAN)\n    END\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        // The stat is registered against the field's output column.
+        assert_eq!(
+            res.column_stats.get("svc.Elapsed"),
+            Some(&vec![StatKind::Mean])
+        );
+        let cols = res.resolved_columns(&crate::report::flow::Header::default());
+        let summary = res.summary_rows(&cols);
+        // One Mean row; the mean of three identical 100ms values is 100.
+        assert_eq!(summary.len(), 1);
+        let idx = cols
+            .iter()
+            .position(|c| c.header == "svc.Elapsed")
+            .expect("Elapsed column present");
+        assert_eq!(summary[0].text_cell(idx), "100");
     }
 
     #[test]

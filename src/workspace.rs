@@ -8,7 +8,7 @@
 //! collection — this module instead walks the real filesystem under a
 //! chosen root directory.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Filesystem entries recurse at most this many levels deep below the
 /// workspace root, as a defensive guard against pathological symlink loops.
@@ -24,6 +24,225 @@ pub struct WsEntry {
     /// Nesting depth below the root (root's direct children are depth 0).
     pub depth: usize,
     pub is_dir: bool,
+}
+
+/// The three kinds of file a workspace is made of, as something the user can
+/// ask for a *new* one of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NewItemKind {
+    Collection,
+    Report,
+    Environment,
+}
+
+impl NewItemKind {
+    /// The extension given to a name typed without one.
+    pub fn extension(self) -> &'static str {
+        match self {
+            NewItemKind::Collection => "hurl",
+            NewItemKind::Report => "trail",
+            NewItemKind::Environment => "vars",
+        }
+    }
+
+    /// Which kind of file a name describes, by its extension.
+    ///
+    /// The three kinds are already told apart by extension everywhere else in
+    /// the app (that is how the tree decides what each row is), so a keyboard
+    /// front-end can ask for one name rather than first asking which of three
+    /// things is being made. `None` for anything that isn't a workspace file
+    /// type; a name with no extension at all is a collection, which is both the
+    /// commonest case and the existing default.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match Path::new(name).extension().and_then(|e| e.to_str()) {
+            None => Some(NewItemKind::Collection),
+            Some(e) => match e.to_ascii_lowercase().as_str() {
+                "hurl" | "json" => Some(NewItemKind::Collection),
+                "trail" => Some(NewItemKind::Report),
+                "vars" => Some(NewItemKind::Environment),
+                _ => None,
+            },
+        }
+    }
+
+    /// What a brand-new file of this kind contains.
+    ///
+    /// Never empty: an empty file is indistinguishable from a broken one, and
+    /// every one of these formats treats `#` as a comment, so a one-line note
+    /// naming the file is both valid and a hint about what goes in it.
+    fn starter(self, stem: &str) -> String {
+        match self {
+            NewItemKind::Collection => format!("# {stem}\n"),
+            // A report has real structure, so it gets the same template a
+            // scratch report in a tab does rather than a bare comment.
+            NewItemKind::Report => crate::report::Report::scratch(stem).text,
+            NewItemKind::Environment => format!("# {stem}\n"),
+        }
+    }
+}
+
+/// Create a new, empty collection / report / environment inside a workspace.
+///
+/// `dir` is the folder it should land in (the workspace root itself, or a
+/// folder the user right-clicked); `name` is what they typed, which may include
+/// subfolders and may omit the extension.
+///
+/// Refuses anything that would leave `root` — both lexically (an absolute path
+/// or a `..` segment) and physically (a symlinked component that *resolves*
+/// outside, which the lexical check can't see). A workspace is a self-contained
+/// thing that gets copied and shared as a unit, so a file that appears to be in
+/// the tree but actually lives elsewhere on disk would silently not travel with
+/// it. Refuses to overwrite an existing file for the same reason it's easy to
+/// do by accident: the names in a workspace are short and repetitive.
+pub fn create_item(
+    root: &Path,
+    dir: &Path,
+    name: &str,
+    kind: NewItemKind,
+) -> Result<PathBuf, NewItemError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(NewItemError::EmptyName);
+    }
+    let mut rel = PathBuf::from(name);
+    if rel.extension().is_none() {
+        rel.set_extension(kind.extension());
+    }
+    let lexically_safe = rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if !lexically_safe {
+        return Err(NewItemError::Escapes(rel.display().to_string()));
+    }
+
+    let full = dir.join(&rel);
+    if escapes_root(root, &full) {
+        return Err(NewItemError::Escapes(full.display().to_string()));
+    }
+    if full.exists() {
+        return Err(NewItemError::Exists(display_name(root, &full)));
+    }
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| NewItemError::Io(format!("{}: {e}", parent.display())))?;
+    }
+    let stem = full
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    std::fs::write(&full, kind.starter(&stem))
+        .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+    Ok(full)
+}
+
+/// Move a workspace file or folder into `dest_dir`, keeping its name.
+///
+/// Refuses anything that would take the item out of `root` (in either
+/// direction) for the same reason [`create_item`] does: a workspace travels as
+/// a unit, and an item that appears in the tree but lives elsewhere on disk
+/// would silently not travel with it. Also refuses to move a folder into itself
+/// or its own descendant — `fs::rename` would either fail obscurely or, worse,
+/// succeed and lose the subtree.
+///
+/// Returns the item's new path. Moving something to where it already is is not
+/// an error; it just does nothing, which is what dropping a file back on its
+/// own folder should do.
+pub fn move_item(root: &Path, src: &Path, dest_dir: &Path) -> Result<PathBuf, MoveError> {
+    if !src.starts_with(root) || escapes_root(root, src) {
+        return Err(MoveError::Escapes(src.display().to_string()));
+    }
+    if !dest_dir.starts_with(root) || escapes_root(root, dest_dir) {
+        return Err(MoveError::Escapes(dest_dir.display().to_string()));
+    }
+    let Some(name) = src.file_name() else {
+        return Err(MoveError::Escapes(src.display().to_string()));
+    };
+    // Dropping an item on the folder it is already in.
+    if src.parent() == Some(dest_dir) {
+        return Ok(src.to_path_buf());
+    }
+    if dest_dir.starts_with(src) {
+        return Err(MoveError::IntoItself);
+    }
+    let dest = dest_dir.join(name);
+    if dest.exists() {
+        return Err(MoveError::Exists(display_name(root, &dest)));
+    }
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| MoveError::Io(format!("{}: {e}", dest_dir.display())))?;
+    std::fs::rename(src, &dest).map_err(|e| MoveError::Io(format!("{}: {e}", dest.display())))?;
+    Ok(dest)
+}
+
+/// Why an item couldn't be moved. Separate variants for the same reason as
+/// [`NewItemError`]: "there's already one of those there" and "that would leave
+/// the workspace" need different words.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MoveError {
+    Escapes(String),
+    Exists(String),
+    IntoItself,
+    Io(String),
+}
+
+/// Rewrite `path` for an item that has just moved from `from` to `to`.
+///
+/// Used to keep everything the app is *holding* — the loaded collection, the
+/// open report, the set of expanded folders — pointing at the file it was
+/// pointing at before, rather than at a path that no longer exists. Matches the
+/// moved item itself and anything that was inside it.
+pub fn repoint(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    path.strip_prefix(from).ok().map(|rest| to.join(rest))
+}
+
+/// Why a new workspace file couldn't be created. Kept apart from a plain string
+/// so each front-end can phrase them itself — "already exists" and "resolves
+/// outside the workspace" are very different things to tell someone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NewItemError {
+    /// Nothing was typed (or the dialog was dismissed): not worth reporting.
+    EmptyName,
+    Escapes(String),
+    Exists(String),
+    Io(String),
+}
+
+/// A path named the way the user thinks of it: relative to the workspace root,
+/// since that is the tree they are looking at.
+pub fn display_name(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether writing to `target` would physically escape workspace `root` once
+/// symlinks are resolved. `target` (a not-yet-created file) is checked via its
+/// **deepest existing ancestor**: the closest parent that exists on disk is
+/// canonicalised and compared against the canonicalised `root`. A symlinked
+/// directory component therefore fails the check even though a lexical `..`
+/// scan would pass it, and any subfolders still to be created underneath a
+/// real, in-root ancestor are inherently contained. Returns `false` (don't
+/// block) when `root` can't be canonicalised — an open workspace root always
+/// exists, so that only happens in degenerate cases where the later write will
+/// surface the real error.
+pub fn escapes_root(root: &Path, target: &Path) -> bool {
+    let Ok(canon_root) = root.canonicalize() else {
+        return false;
+    };
+    let mut ancestor = target;
+    loop {
+        if ancestor.exists() {
+            return match ancestor.canonicalize() {
+                Ok(real) => !real.starts_with(&canon_root),
+                Err(_) => true,
+            };
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return true,
+        }
+    }
 }
 
 /// Recursively scans `root`, returning a flattened, depth-first list of
@@ -153,6 +372,16 @@ pub fn is_env_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("vars"))
 }
 
+/// Whether `path` is any file the Workspace tree surfaces — a collection
+/// (`.hurl`/`.json`), an environment (`.vars`) or a report (`.trail`). Exposed
+/// so the new-report folder chooser can *show* the same files (alongside
+/// folders) even though only folders are selectable there: seeing the
+/// workspace's own files makes it obvious the picker is scoped inside the
+/// workspace rather than browsing the wider filesystem.
+pub fn is_workspace_file(path: &Path) -> bool {
+    is_matching_file(path, true)
+}
+
 /// Recursively copies `src`'s contents into `dst` (creating `dst` and any
 /// needed subdirectories), skipping hidden (dot-prefixed) entries exactly
 /// like [`scan_workspace`] — used by "Save Workspace" to copy a Workspace's
@@ -247,6 +476,189 @@ fn collect_files_inner(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Each kind of new file lands where it was asked for, gets its extension
+    /// filled in, and starts out as something the format can actually read.
+    #[test]
+    fn a_new_workspace_file_is_created_with_its_extension_and_valid_starting_content() {
+        let root = tmp_dir("new_item");
+        fs::create_dir_all(root.join("apis")).expect("subfolder");
+
+        // Named without an extension, and into a subfolder of the root.
+        let c = create_item(
+            &root,
+            &root.join("apis"),
+            "billing",
+            NewItemKind::Collection,
+        )
+        .expect("the collection is created");
+        assert_eq!(c, root.join("apis/billing.hurl"), "extension filled in");
+
+        let r = create_item(&root, &root, "nightly.trail", NewItemKind::Report)
+            .expect("the report is created");
+        let text = fs::read_to_string(&r).expect("readable");
+        assert!(
+            crate::report::parser::parse_flow(&text).is_ok(),
+            "a new report parses, rather than starting life broken: {text:?}"
+        );
+
+        let e = create_item(&root, &root, "dev", NewItemKind::Environment)
+            .expect("the environment is created");
+        assert_eq!(e, root.join("dev.vars"));
+        assert!(
+            fs::read_to_string(&e).expect("readable").starts_with('#'),
+            "a new environment is a comment, not an empty file"
+        );
+
+        // Subfolders named in passing are created rather than failing.
+        let nested = create_item(&root, &root, "team/smoke", NewItemKind::Collection)
+            .expect("the nested collection is created");
+        assert!(nested.exists(), "the missing folder was created for it");
+
+        // All of them show up in the tree they were added to.
+        let names: Vec<String> = scan_workspace(&root, true)
+            .into_iter()
+            .map(|e| e.display_name)
+            .collect();
+        for want in ["billing.hurl", "nightly.trail", "dev.vars", "smoke.hurl"] {
+            assert!(names.contains(&want.to_string()), "{want} is in the tree");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A workspace is shared as a unit, so nothing may be created outside it —
+    /// and nothing may quietly replace what's already there.
+    #[test]
+    fn creating_a_workspace_file_refuses_to_escape_the_root_or_overwrite() {
+        let root = tmp_dir("new_item_guard");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("taken.hurl"), "GET https://x\n").expect("existing file");
+
+        assert!(
+            matches!(
+                create_item(&root, &root, "../outside.hurl", NewItemKind::Collection),
+                Err(NewItemError::Escapes(_))
+            ),
+            "a `..` segment is refused"
+        );
+        assert!(
+            matches!(
+                create_item(&root, &root, "/tmp/outside.hurl", NewItemKind::Collection),
+                Err(NewItemError::Escapes(_))
+            ),
+            "an absolute path is refused"
+        );
+        assert!(
+            matches!(
+                create_item(&root, &root, "taken.hurl", NewItemKind::Collection),
+                Err(NewItemError::Exists(_))
+            ),
+            "an existing file is never overwritten"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("taken.hurl")).expect("still there"),
+            "GET https://x\n",
+            "and it is left exactly as it was"
+        );
+        assert!(
+            matches!(
+                create_item(&root, &root, "   ", NewItemKind::Collection),
+                Err(NewItemError::EmptyName)
+            ),
+            "an empty name is nothing to report, just nothing to do"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Dropping a file on a folder moves it there, and everything the app was
+    /// holding it by moves with it.
+    #[test]
+    fn moving_a_workspace_item_relocates_it_and_repoints_what_referred_to_it() {
+        let root = tmp_dir("move_item");
+        fs::create_dir_all(root.join("apis")).expect("subfolder");
+        fs::write(root.join("billing.hurl"), "GET https://x\n").expect("collection");
+
+        let src = root.join("billing.hurl");
+        let moved = move_item(&root, &src, &root.join("apis")).expect("it moves");
+        assert_eq!(moved, root.join("apis/billing.hurl"));
+        assert!(!src.exists(), "it is no longer where it was");
+        assert!(moved.exists(), "and it is where it was put");
+
+        // Anything pointing at it (or into it) follows.
+        assert_eq!(
+            repoint(&src, &src, &moved),
+            Some(moved.clone()),
+            "the item itself is repointed"
+        );
+        assert_eq!(
+            repoint(
+                &root.join("team/a.hurl"),
+                &root.join("team"),
+                &root.join("apis/team")
+            ),
+            Some(root.join("apis/team/a.hurl")),
+            "and so is anything that was inside a moved folder"
+        );
+        assert_eq!(
+            repoint(&root.join("other.hurl"), &src, &moved),
+            None,
+            "anything unrelated is left alone"
+        );
+
+        // Dropping it back on the folder it is already in does nothing.
+        assert_eq!(
+            move_item(&root, &moved, &root.join("apis")).expect("no-op"),
+            moved,
+            "a move to where it already is is not an error"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same containment rules as creating: nothing leaves the workspace,
+    /// nothing is silently replaced, and a folder can't swallow itself.
+    #[test]
+    fn moving_a_workspace_item_refuses_to_escape_overwrite_or_nest_inside_itself() {
+        let root = tmp_dir("move_guard");
+        fs::create_dir_all(root.join("apis/deep")).expect("subfolders");
+        fs::write(root.join("a.hurl"), "GET https://x\n").expect("collection");
+        fs::write(root.join("apis/a.hurl"), "GET https://y\n").expect("clash");
+
+        assert!(
+            matches!(
+                move_item(&root, &root.join("a.hurl"), &root.join("apis")),
+                Err(MoveError::Exists(_))
+            ),
+            "it will not replace the file already called that"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("apis/a.hurl")).expect("still there"),
+            "GET https://y\n",
+            "and the file it would have replaced is untouched"
+        );
+        assert!(
+            matches!(
+                move_item(&root, &root.join("apis"), &root.join("apis/deep")),
+                Err(MoveError::IntoItself)
+            ),
+            "a folder cannot be moved inside itself"
+        );
+        assert!(
+            matches!(
+                move_item(&root, &root.join("a.hurl"), Path::new("/tmp")),
+                Err(MoveError::Escapes(_))
+            ),
+            "nothing may be moved out of the workspace"
+        );
+        assert!(
+            root.join("a.hurl").exists(),
+            "and every refusal leaves the original exactly where it was"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

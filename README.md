@@ -6,18 +6,25 @@ for requests, `.vars` files for environments — so everything can be committed,
 diffed, and shared through a normal git repository. There is no hosted
 service and nothing runs outside your machine.
 
-It ships as a single binary with two front-ends:
+It ships as a single binary with three front-ends:
 
 - **Terminal UI** (default) — a full interactive client for building,
   editing, running and organizing requests.
+- **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
+  with the same features and layout as the terminal UI, using mouse gestures
+  (drag to resize panels, click to switch tabs) instead of shortcuts.
 - **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
   prints the results, for scripts and CI.
+
+All three drive the same shared core, so collections, environments, themes and
+git-remote workflows behave identically across them.
 
 ## Contents
 
 - [Installing & running](#installing--running)
 - [Core concepts](#core-concepts)
 - [Features](#features)
+- [Graphical UI](#graphical-ui)
 - [Working with collections & environments](#working-with-collections--environments)
 - [Loading & saving via git](#loading--saving-via-git)
 - [Secrets & environment variables](#secrets--environment-variables)
@@ -31,6 +38,7 @@ From the `paperboy` directory:
 
 ```sh
 cargo run            # launch the terminal UI
+cargo run -- --gui   # launch the graphical UI
 cargo build --release
 ```
 
@@ -181,6 +189,117 @@ cargo build --release
   way automatically; native Hurl collections get the same behavior for free
   simply by naming requests with `/` in them. Creating a new request while
   browsing a folder prefills the Name field with that folder's path.
+
+## Graphical UI
+
+Run `paperboy -g` (or `cargo run -- --gui`) to open the native desktop
+front-end instead of the terminal UI. It is built on
+[eframe/egui](https://github.com/emilk/egui) and drives the exact same core as
+the terminal UI, so it is feature-for-feature equivalent — collection tabs, the
+folder tree, the request editor (Params, Headers, Body, Auth, Cookies, Options,
+Asserts, Captures, and a resolved-request Code view), the response viewer
+(Body / Headers / Asserts), the Global Environments panel (activate, link, edit
+variables, resolve `env:` / `ssm:` / `op://` secrets), report tabs, the theme
+editor, and loading/saving collections and environments to a git remote with no
+local clone.
+
+What changes is how you interact with it:
+
+- **Tab** cycles the focused panel in the same order as the terminal UI
+  (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
+  backwards — so the muscle memory carries over.
+- **Panels are resized by dragging** their splitters, rather than with keyboard
+  shortcuts.
+- **Selection, scrolling and the clipboard** use the platform's native
+  handling; **collection tabs switch by clicking**; folders collapse/expand by
+  clicking their header.
+- **The File menu is grouped by verb** (New / Open / Save / Import-Export)
+  rather than one flat list. There is no separate "Import Postman": **Open ▸
+  Collection** takes a Hurl `.hurl` file or a Postman `.json` export and works
+  out which it is. Every file dialog reopens in the folder you last used it in.
+- **Workspaces can be grown from inside the app.** The workspace panel's **New**
+  menu adds a collection, report or environment at the top of the tree, and
+  right-clicking any row offers the same three inside *that* folder. Files (and
+  folders) can be **dragged onto another folder to move them**, or dropped on
+  the empty space below the tree to move them back out to the root; whatever the
+  app was holding — the loaded collection, the open report, which folders were
+  expanded — follows the file. Nothing can be created or moved outside the
+  workspace root, and nothing is ever silently overwritten.
+- **Workspaces stay portable.** A report binds to its collection by a path
+  *relative to the report* — including `../apis/billing.hurl` for a collection
+  in a sibling folder — so a workspace still works when it is zipped up, checked
+  in, or handed to someone whose folders are laid out differently. The
+  `collection` dropdown lists collections **by name**, offers the ones in the
+  report's own workspace first, and keeps anything from outside it behind a
+  "Show collections outside this workspace" toggle, since binding to one of
+  those is what makes a workspace stop travelling.
+- **Git remotes load whole workspaces**, not just single files — the same
+  no-local-clone loading and saving the terminal UI offers, for collections,
+  environments and entire workspace trees.
+- **The window remembers itself** — its size, the widths and heights of every
+  panel you dragged (including the block editor's palette and diagnostics
+  panel), which view was open, which report or request you were on, and which
+  node a Workspace tab was showing are all restored on the next launch. A
+  Workspace selection is dropped if that file has since gone, since a workspace
+  is a live folder rather than a snapshot.
+- **The active environment is unmissable** — it is ticked, coloured and banded
+  in the Global Environments list rather than marked with a dot.
+- **Every theme applies unchanged** — built-in language presets and custom
+  themes are read from the same `ThemeSpec` and mapped onto egui's visual
+  style, and the whole GUI is translated (English / French / Danish) through
+  the same `i18n` table as the terminal UI.
+
+### The PaperTrail block editor
+
+Reports open in a drag-and-drop block editor (a **Blocks** view alongside the
+**Source** and **Results** views). Blocks are dragged from a palette into the
+flow, reordered, nested inside `FOR` loops — whole loops move as one, with
+their body — and dropped on the trash bar to delete. Both the dashed outline
+left behind by a picked-up block and the marker showing where it will land are
+drawn as that block's own silhouette — one outline per row, at its own width
+and indent — so what you see really is what will land there.
+
+Editable directly on the blocks:
+
+- the request a step runs, its alias, response format, and its `SHOW(…)` /
+  `HIDE(…)` / `STATISTICS(…)` column lists;
+- a `FOR` loop's binder, source and roles, and the maximum concurrency of a
+  `PARALLEL(n)` loop;
+- the report's own settings — `collection`, `output`, `environment`, `root`,
+  `baseline` and `columns` — stacked in a boxed panel above `BEGIN`. These
+  apply to the report as a whole rather than running as a step, so they are
+  deliberately not draggable blocks; the box is what says so, and it keeps a
+  fixed width so the view doesn't twitch as you edit. `collection` and `output`
+  are always shown (a missing `collection` is flagged as an error; `output`
+  simply defaults to CSV); the rest are appended from the **Add a report
+  setting** button below them, and any setting that is set can be cleared with
+  its `×`. Settings with a
+  closed set of values are dropdowns — including `output`, which names a
+  *format* (`csv`, `json`, `html`, `xlsx`), not a filename: the file is named
+  after the report, and only the command-line runner's `-o` takes a path.
+
+Every block and setting has hover help explaining what it is and what its
+editable parts do. The **Source** view is syntax-highlighted with exactly the
+same colours as the terminal UI, and the line the parser rejected is
+underlined.
+
+### Desktop icon on Linux
+
+Wayland has no per-window icon protocol, so shells such as GNOME resolve the
+dock/taskbar icon by matching the window's app id (`paperboy`) against an
+installed `.desktop` file. The first GUI launch therefore writes, if they are
+not already there:
+
+- `$XDG_DATA_HOME/paperboy/paperboy_logo.png` — a copy of the bundled logo, and
+- `$XDG_DATA_HOME/applications/paperboy.desktop` — a launcher entry pointing at
+  it, with `StartupWMClass=paperboy` so X11 sessions match too.
+
+Both are left alone if they already exist, so you can customise them. Because
+the entry only appears *during* the first launch, the shell may not pick it up
+until it next rescans — log out and back in (or restart the shell) if the
+generic icon is still showing. Deleting the two files and relaunching
+regenerates them, which is also how you refresh the `Exec=` line after moving
+the binary.
 
 ## Working with collections & environments
 
@@ -429,6 +548,8 @@ up-to-date list. Highlights:
 | `Enter` | Open the Edit Request wizard for the selected request (or, on a folder row in the Requests list, descend into that folder; on the "‹ .." row, go back up) |
 | `→` / `l` (Workspace list) | Open the highlighted workspace folder or collection (same as `Enter`); `Enter` on an already-open collection collapses it |
 | `w` (Workspace tab) | Pop up the full workspace file-tree picker to jump to any collection |
+| `Shift+N` (Workspace tab) | New collection / report / environment in the highlighted folder — the extension you type (`.hurl`, `.trail`, `.vars`) chooses which |
+| `Shift+M` (Workspace tab) | Move the highlighted workspace file or folder — `Space` confirms the destination folder |
 | `Backspace` (Requests list) | Go up a folder, from anywhere in the current folder |
 | `Shift+R` | Edit the selected request in Raw Mode (Hurl text) |
 | `F5`, `Ctrl+Enter` | Run the current request |

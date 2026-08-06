@@ -12,7 +12,7 @@ use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
 
 use super::entry::{
-    BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry,
+    BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
     RunStatus,
 };
 
@@ -157,7 +157,7 @@ fn map_entry(
         if !resp.headers.is_empty()
             || scan_kv_rows(lines, status_line + 1, first_response_anchor(resp))
                 .iter()
-                .any(|(_, _, enabled)| !enabled)
+                .any(|r| !r.enabled)
         {
             landmarks.push((status_line + 1, CommentAnchor::ResponseHeaders));
         }
@@ -413,9 +413,10 @@ fn scan_comments(
             .any(|&(s, e)| line_no >= s && line_no < e)
     };
 
-    // A comment line that scan_kv_rows / scan_disabled_form_rows already recover
-    // as a disabled row (so it round-trips via `headers`/`queries`/etc., not as
-    // prose). Only meaningful for `#`-comment lines.
+    // A comment line that the row scans already recover — either as a disabled
+    // row (round-tripping via `headers`/`queries`/etc.) or as a row's `# @desc`
+    // description — and so must not *also* be captured as prose, which would
+    // duplicate it on the next save. Only meaningful for `#`-comment lines.
     let is_disabled_row = |line_no: usize| {
         let Some(&line) = lines.get(line_no.wrapping_sub(1)) else {
             return false;
@@ -423,10 +424,11 @@ fn scan_comments(
         regions.iter().any(|&(s, e, kind)| {
             line_no >= s
                 && line_no < e
-                && match kind {
-                    RowKind::Kv => parse_kv_row(line).is_some(),
-                    RowKind::Form => parse_form_field_line(uncomment(line).1, true).is_some(),
-                }
+                && (desc_line(line).is_some()
+                    || match kind {
+                        RowKind::Kv => parse_kv_row(line).is_some(),
+                        RowKind::Form => parse_form_field_line(uncomment(line).1, true).is_some(),
+                    })
         })
     };
 
@@ -560,6 +562,10 @@ fn scan_comments(
 /// Cookies and Query rows, which `hurl_core` drops as comments before they ever
 /// reach the AST.
 ///
+/// A `# @desc …` line immediately above a row becomes that row's
+/// [`KvRow::desc`] rather than a row of its own; consecutive marker lines are
+/// the successive lines of one note.
+///
 /// `end` is the block's exclusive upper bound — the next structural anchor
 /// below it (body / section / response), from [`first_anchor_after`]. It drives
 /// two scan modes that together match `hurl_core` without ever reading rows
@@ -578,18 +584,34 @@ fn scan_comments(
 ///   non-row line — including a leading blank line — so it halts at the blank
 ///   that separates this entry from the next rather than skipping across it and
 ///   absorbing that entry's leading comments/title as stray rows.
-fn scan_kv_rows(lines: &[&str], start: usize, end: Option<usize>) -> Vec<(String, String, bool)> {
-    let mut rows = Vec::new();
+fn scan_kv_rows(lines: &[&str], start: usize, end: Option<usize>) -> Vec<KvRow> {
+    let mut rows: Vec<KvRow> = Vec::new();
+    // Description lines accumulated since the last row: a `# @desc …` block
+    // belongs to the row *below* it, and several of them are the successive
+    // lines of one multi-line note.
+    let mut pending_desc: Vec<String> = Vec::new();
     let mut i = start.saturating_sub(1);
     let limit = end.map(|e| e.saturating_sub(1)).unwrap_or(lines.len());
     while i < limit {
         let Some(&line) = lines.get(i) else { break };
+        if let Some(text) = desc_line(line) {
+            pending_desc.push(text.to_string());
+            i += 1;
+            continue;
+        }
         match parse_kv_row(line) {
-            Some(row) => rows.push(row),
+            Some(mut row) => {
+                row.desc = std::mem::take(&mut pending_desc).join("\n");
+                rows.push(row);
+            }
             // Bounded: skip a blank/prose line (leading or interior) and keep
             // scanning — the anchor keeps us inside this entry. Open: stop, so
             // we never cross into the next request's leading comments.
-            None if end.is_some() => {}
+            None if end.is_some() => {
+                // A note followed by prose rather than a row describes nothing;
+                // drop it so it can't leap onto an unrelated later row.
+                pending_desc.clear();
+            }
             None => break,
         }
         i += 1;
@@ -597,16 +619,31 @@ fn scan_kv_rows(lines: &[&str], start: usize, end: Option<usize>) -> Vec<(String
     rows
 }
 
-/// Parse a single Header/Cookies/Query row into `(key, value, enabled)`.
+/// The text of a `# @desc …` description line, or `None` for anything else.
+/// Whitespace before the `#` is tolerated so an indented note still reads.
+pub(crate) fn desc_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix(crate::hurl::entry::DESC_MARKER.trim_end())?;
+    // Require the marker to be followed by a separator (or nothing), so a
+    // comment like `# @description of the API` isn't mistaken for one.
+    match rest.strip_prefix(' ') {
+        Some(text) => Some(text.trim_end()),
+        None if rest.is_empty() => Some(""),
+        None => None,
+    }
+}
+
+/// Parse a single Header/Cookies/Query row into a [`KvRow`] (without its
+/// description, which the caller attaches from the `# @desc` lines above it).
 /// `enabled` is `false` when the line is commented out (`# key: value`). The
 /// key must start with an alphanumeric and contain only token characters, so a
 /// JSON body line, a `[Section]` header, an `HTTP` status line or a prose
 /// comment all fail to parse (ending a scan) instead of being mistaken for a
 /// row.
-fn parse_kv_row(line: &str) -> Option<(String, String, bool)> {
+fn parse_kv_row(line: &str) -> Option<KvRow> {
     let (enabled, rest) = uncomment(line);
     let (key, value) = split_kv(rest)?;
-    Some((key.to_string(), value.to_string(), enabled))
+    Some(KvRow::toggled(key, value, enabled))
 }
 
 /// Strip a leading `#` (marking a disabled/commented request row) and the
@@ -665,13 +702,51 @@ fn form_fields_from_section(
                     content_type: None,
                     base64_prefix: None,
                     enabled: true,
+                    desc: String::new(),
                 },
             ));
         }
     }
     rows.extend(scan_disabled_form_rows(lines, rows_start, rows_end));
     rows.sort_by_key(|(line, _)| *line);
-    rows.into_iter().map(|(_, f)| f).collect()
+    // Descriptions are matched to rows by line: unlike the kv sections, form
+    // rows come from two sources (the AST for enabled rows, a source scan for
+    // disabled ones), so a single scan of the `# @desc` lines and the line each
+    // one sits above is what joins them back up.
+    let descs = scan_row_descriptions(lines, rows_start, rows_end);
+    rows.into_iter()
+        .map(|(line, mut f)| {
+            if let Some(desc) = descs.get(&line) {
+                f.desc = desc.clone();
+            }
+            f
+        })
+        .collect()
+}
+
+/// Map each row line in `[start, end)` to the description written on the
+/// `# @desc …` line(s) directly above it. Lines with no note aren't in the map.
+fn scan_row_descriptions(
+    lines: &[&str],
+    start: usize,
+    end: Option<usize>,
+) -> std::collections::HashMap<usize, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut i = start.saturating_sub(1);
+    let limit = end.map(|e| e.saturating_sub(1)).unwrap_or(lines.len());
+    while i < limit {
+        let Some(&line) = lines.get(i) else { break };
+        match desc_line(line) {
+            Some(text) => pending.push(text.to_string()),
+            None if !pending.is_empty() => {
+                out.insert(i + 1, std::mem::take(&mut pending).join("\n"));
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The 1-based source line a `[Multipart]` row starts on.
@@ -706,6 +781,12 @@ fn scan_disabled_form_rows(
     let limit = end.map(|e| e.saturating_sub(1)).unwrap_or(lines.len());
     while i < limit {
         let Some(&line) = lines.get(i) else { break };
+        // A description line is an annotation on the row below, not a row (and
+        // not prose that should stop an open-mode scan).
+        if desc_line(line).is_some() {
+            i += 1;
+            continue;
+        }
         let (enabled, rest) = uncomment(line);
         match parse_form_field_line(rest, true) {
             Some(mut field) if !enabled => {
@@ -741,6 +822,7 @@ fn parse_form_field_line(body: &str, multipart: bool) -> Option<FormField> {
         content_type: None,
         base64_prefix: None,
         enabled: true,
+        desc: String::new(),
     })
 }
 
@@ -763,6 +845,7 @@ fn parse_file_form_value(key: &str, spec: &str) -> FormField {
             content_type: None,
             base64_prefix: Some(prefix),
             enabled: true,
+            desc: String::new(),
         };
     }
     FormField {
@@ -772,6 +855,7 @@ fn parse_file_form_value(key: &str, spec: &str) -> FormField {
         content_type: (!ct.is_empty()).then(|| ct.to_string()),
         base64_prefix: None,
         enabled: true,
+        desc: String::new(),
     }
 }
 
@@ -824,6 +908,7 @@ fn multipart_field(p: &MultipartParam) -> FormField {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         },
         MultipartParam::FilenameParam(fp) => {
             let content_type = fp
@@ -851,6 +936,7 @@ fn multipart_field(p: &MultipartParam) -> FormField {
                     content_type: None,
                     base64_prefix: Some(prefix),
                     enabled: true,
+                    desc: String::new(),
                 };
             }
             FormField {
@@ -864,6 +950,7 @@ fn multipart_field(p: &MultipartParam) -> FormField {
                 content_type,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             }
         }
     }
@@ -1235,14 +1322,14 @@ mod tests {
                 "Create post",
                 "POST",
                 "{{ BASE_URL }}/posts",
-                vec![("Content-Type".into(), "application/json".into(), true)],
+                vec![KvRow::toggled("Content-Type", "application/json", true)],
                 "{\n  \"title\": \"hi\"\n}",
             ),
             HurlEntry::from_fields(
                 "Health",
                 "GET",
                 "{{ BASE_URL }}/health",
-                vec![("Accept".into(), "application/json".into(), true)],
+                vec![KvRow::toggled("Accept", "application/json", true)],
                 "",
             ),
         ];
@@ -1317,8 +1404,8 @@ mod tests {
     fn cookies_round_trip() {
         let mut entry = HurlEntry::from_fields("Login", "GET", "{{ BASE_URL }}/me", vec![], "");
         entry.cookies = vec![
-            ("session".to_string(), "abc123".to_string(), true),
-            ("theme".to_string(), "dark".to_string(), true),
+            KvRow::toggled("session", "abc123", true),
+            KvRow::toggled("theme", "dark", true),
         ];
 
         let text = entry.to_hurl();
@@ -1400,6 +1487,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "pass".to_string(),
@@ -1408,6 +1496,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
         ];
 
@@ -1436,6 +1525,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "field2".to_string(),
@@ -1444,6 +1534,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "field3".to_string(),
@@ -1452,6 +1543,7 @@ mod tests {
                 content_type: Some("application/zip".to_string()),
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
         ];
 
@@ -1479,6 +1571,7 @@ mod tests {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         }];
 
         let text = entry.to_hurl();
@@ -1519,6 +1612,7 @@ mod tests {
             content_type: None,
             base64_prefix: Some("data:image/png;base64,".to_string()),
             enabled: true,
+            desc: String::new(),
         }];
 
         let text = entry.to_hurl();
@@ -1549,6 +1643,7 @@ mod tests {
             content_type: None,
             base64_prefix: Some(String::new()),
             enabled: true,
+            desc: String::new(),
         }];
 
         let reparsed = parse_hurl(&entry.to_hurl());
@@ -1559,8 +1654,8 @@ mod tests {
     fn disabled_header_round_trips_as_a_comment() {
         let mut entry = HurlEntry::from_fields("Get", "GET", "http://x/y", vec![], "");
         entry.headers = vec![
-            ("Accept".to_string(), "application/json".to_string(), true),
-            ("X-Off".to_string(), "no".to_string(), false),
+            KvRow::toggled("Accept", "application/json", true),
+            KvRow::toggled("X-Off", "no", false),
         ];
 
         let text = entry.to_hurl();
@@ -1577,12 +1672,12 @@ mod tests {
     fn disabled_cookie_and_query_rows_round_trip() {
         let mut entry = HurlEntry::from_fields("Get", "GET", "http://x/y", vec![], "");
         entry.cookies = vec![
-            ("session".to_string(), "abc".to_string(), true),
-            ("stale".to_string(), "1".to_string(), false),
+            KvRow::toggled("session", "abc", true),
+            KvRow::toggled("stale", "1", false),
         ];
         entry.queries = vec![
-            ("page".to_string(), "2".to_string(), false),
-            ("q".to_string(), "hi".to_string(), true),
+            KvRow::toggled("page", "2", false),
+            KvRow::toggled("q", "hi", true),
         ];
 
         let text = entry.to_hurl();
@@ -1627,9 +1722,9 @@ mod tests {
     fn disabled_rows_keep_their_position_relative_to_enabled_ones() {
         let mut entry = HurlEntry::from_fields("Get", "GET", "http://x/y", vec![], "");
         entry.headers = vec![
-            ("A".to_string(), "1".to_string(), false),
-            ("B".to_string(), "2".to_string(), true),
-            ("C".to_string(), "3".to_string(), false),
+            KvRow::toggled("A", "1", false),
+            KvRow::toggled("B", "2", true),
+            KvRow::toggled("C", "3", false),
         ];
         let reparsed = parse_hurl(&entry.to_hurl());
         assert_eq!(reparsed[0].headers, entry.headers, "order is preserved");
@@ -1646,6 +1741,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "off".to_string(),
@@ -1654,6 +1750,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: false,
+                desc: String::new(),
             },
         ];
 
@@ -1681,6 +1778,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "doc".to_string(),
@@ -1689,6 +1787,7 @@ mod tests {
                 content_type: Some("application/pdf".to_string()),
                 base64_prefix: None,
                 enabled: false,
+                desc: String::new(),
             },
         ];
 
@@ -1710,6 +1809,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: String::new(),
             },
             FormField {
                 key: "avatar".to_string(),
@@ -1718,6 +1818,7 @@ mod tests {
                 content_type: None,
                 base64_prefix: Some("data:image/png;base64,".to_string()),
                 enabled: false,
+                desc: String::new(),
             },
         ];
 
@@ -2198,5 +2299,122 @@ mod tests {
         assert_eq!(e[1].response_body.as_deref(), Some("```\n{\"b\":2}\n```"));
 
         assert_sections_round_trip(src);
+    }
+
+    /// A per-row note has nowhere to live in the Hurl grammar, so it is
+    /// smuggled through as a `# @desc ` comment on the line *above* the row
+    /// (a trailing comment would be ambiguous — a header value may contain
+    /// `#`). Both halves of that convention have to agree.
+    #[test]
+    fn a_header_description_survives_a_round_trip_through_the_hurl_text() {
+        let mut e = HurlEntry::from_fields("Get", "GET", "http://h/x", vec![], "");
+        e.headers = vec![KvRow {
+            key: "X-Trace".into(),
+            value: "on".into(),
+            enabled: true,
+            desc: "only for staging".into(),
+        }];
+        let text = collection_to_hurl(&[e]);
+        assert!(
+            text.contains("# @desc only for staging"),
+            "the note should be written above its row: {text}"
+        );
+        let back = parse_hurl(&text);
+        assert_eq!(
+            back[0].headers[0].desc, "only for staging",
+            "and it should come back attached to the same row"
+        );
+        assert_eq!(back[0].headers[0].key, "X-Trace");
+    }
+
+    #[test]
+    fn a_multi_line_description_round_trips_as_several_marker_lines() {
+        let mut e = HurlEntry::from_fields("Get", "GET", "http://h/x", vec![], "");
+        e.headers = vec![KvRow {
+            key: "X-Trace".into(),
+            value: "on".into(),
+            enabled: true,
+            desc: "first line\nsecond line".into(),
+        }];
+        let text = collection_to_hurl(&[e]);
+        assert_eq!(
+            text.matches("# @desc ").count(),
+            2,
+            "one marker per line of the note: {text}"
+        );
+        let back = parse_hurl(&text);
+        assert_eq!(back[0].headers[0].desc, "first line\nsecond line");
+    }
+
+    /// The marker lines are also plain comments, so the prose-comment scanner
+    /// has to know to leave them alone — otherwise every save would keep a
+    /// copy as free text *and* re-emit the row's own marker.
+    #[test]
+    fn a_description_is_not_also_captured_as_a_prose_comment() {
+        let mut e = HurlEntry::from_fields("Get", "GET", "http://h/x", vec![], "");
+        e.headers = vec![KvRow {
+            key: "X-Trace".into(),
+            value: "on".into(),
+            enabled: true,
+            desc: "only for staging".into(),
+        }];
+        let once = collection_to_hurl(&[e]);
+        let twice = collection_to_hurl(&parse_hurl(&once));
+        assert_eq!(once, twice, "a save/load cycle must be a fixed point");
+        assert_eq!(
+            twice.matches("only for staging").count(),
+            1,
+            "the note must not be duplicated as prose: {twice}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_row_keeps_both_its_note_and_its_disabled_state() {
+        let mut e = HurlEntry::from_fields("Get", "GET", "http://h/x", vec![], "");
+        e.headers = vec![KvRow {
+            key: "X-Trace".into(),
+            value: "on".into(),
+            enabled: false,
+            desc: "off until the rollout".into(),
+        }];
+        let back = parse_hurl(&collection_to_hurl(&[e]));
+        let row = &back[0].headers[0];
+        assert!(!row.enabled, "the row should still be off");
+        assert_eq!(row.desc, "off until the rollout");
+    }
+
+    #[test]
+    fn a_form_field_description_survives_a_round_trip() {
+        let mut e = HurlEntry::from_fields("Post", "POST", "http://h/x", vec![], "");
+        e.form_fields = vec![crate::hurl::FormField {
+            key: "region".into(),
+            value: "eu-west-1".into(),
+            enabled: true,
+            desc: "which cluster to hit".into(),
+            ..Default::default()
+        }];
+        let back = parse_hurl(&collection_to_hurl(&[e]));
+        assert_eq!(back[0].form_fields[0].desc, "which cluster to hit");
+    }
+
+    /// `# @description` is ordinary prose that happens to start with the same
+    /// letters; only the exact marker followed by a space (or end of line)
+    /// counts, or a user's comment would silently become a row note.
+    #[test]
+    fn prose_that_merely_starts_like_the_marker_is_left_as_a_comment() {
+        let text = "POST http://h/x\n# @description of the endpoint\nX-Trace: on\nHTTP 200\n";
+        let back = parse_hurl(text);
+        assert_eq!(
+            back[0].headers[0].desc, "",
+            "the row should not have adopted the comment as its note"
+        );
+        assert!(
+            back[0]
+                .comments
+                .iter()
+                .any(|c| c.text.contains("@description")),
+            "and the line should survive as a comment: {:?}",
+            back[0].comments
+        );
     }
 }

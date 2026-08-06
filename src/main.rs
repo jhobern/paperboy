@@ -6,6 +6,7 @@ mod cli;
 mod collection;
 mod environment;
 mod git_remote;
+mod gui;
 mod http;
 mod hurl;
 mod i18n;
@@ -14,7 +15,9 @@ mod postman;
 mod report;
 mod report_cli;
 mod request;
+mod session;
 mod shared_utils;
+mod theme;
 mod tree;
 mod tui;
 mod workspace;
@@ -96,6 +99,11 @@ struct Cli {
     /// `{time}` token).
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<String>,
+
+    /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
+    /// Ignored in the headless modes (`-c`/`-r`).
+    #[arg(short = 'g', long)]
+    gui: bool,
 }
 
 fn main() {
@@ -123,6 +131,15 @@ fn main() {
             );
         }
         std::process::exit(cli::run(collection, cli.env.into_iter().next(), cli.batch));
+    }
+
+    // Native GUI mode (`-g/--gui`): a graphical front-end over the same core.
+    if cli.gui {
+        if let Err(e) = gui::run() {
+            eprintln!("gui error: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
     }
 
     // Terminal UI (the default).
