@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.3.2] - 2026-08-07
+
+### Changed
+
+- **A clause that qualifies another chip is now drawn as one pill with it.** In
+  the report editor's drag-and-drop view, `SHOW(…)` belongs to the `BASELINE`
+  before it, and `STATISTICS(…)` to the column before it, but the thin bracket
+  that said so was drawn beside the chips and read as decoration — it never made
+  clear which of the two owned the other. The pair now sits flush inside a single
+  outline with the meeting corners squared off, the way a segmented control does,
+  and the qualifying half takes a desaturated tint of its anchor's colour so the
+  hue says the same thing as the shape. Hovering either half outlines both.
+
+### Fixed
+
+- **A tethered clause now really does sit flush against the chip it qualifies.**
+  The reduced spacing was applied while laying out the clause itself, but egui
+  fixes the gap between two widgets when the *first* of them is added, so it had
+  no effect and the pair was always drawn a full gap apart.
+
+
 ## [0.3.1] - 2026-08-06
 
 ### Changed

@@ -450,6 +450,14 @@ struct Chip {
     /// reads as three peers in a row and the SHOW looks like it governs all of
     /// them.
     tethered: bool,
+    /// Whether this chip is drawn merged with its neighbour into one segmented
+    /// pill: the joined edge is squared off so the pair shares a single
+    /// outline. Derived from [`Chip::tethered`] by [`link_tethers`] rather than
+    /// set at construction, because it depends on the neighbours — and it is
+    /// cleared again wherever the pair is being pulled apart, so a chip is
+    /// never drawn joined to something that has left its slot.
+    join_prev: bool,
+    join_next: bool,
 }
 
 impl Chip {
@@ -534,6 +542,8 @@ impl Chip {
             edit: ChipEdit::None,
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
     fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
@@ -545,6 +555,8 @@ impl Chip {
             edit: ChipEdit::None,
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
     /// The request base chip, whose name is picked from an inline dropdown.
@@ -559,6 +571,8 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
     /// A `BASELINE`/`COMPARISON` chip carrying a single-environment dropdown.
@@ -578,6 +592,8 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
     /// An `AS <alias>` chip whose alias is edited inline. `detach` is `Some(As)`
@@ -594,6 +610,8 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
     /// A `PARALLEL` chip whose concurrency limit is edited inline.
@@ -606,6 +624,8 @@ impl Chip {
             edit: ChipEdit::Parallel { degree },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
         }
     }
 }
@@ -832,11 +852,11 @@ fn build_node_chips(
                 }
                 // The SHOW belongs to the BASELINE, so it follows it directly —
                 // before the COMPARISON, mirroring the source order — and is
-                // *tethered* to it, which tucks it against the baseline chip and
-                // draws a bracket joining the two. It keeps SHOW's own colour
-                // rather than borrowing the baseline's: three identically
-                // coloured chips in a row read as three peers, and it should be
-                // the bracket, not the hue, that says which one it qualifies.
+                // *tethered* to it, which merges the two into one segmented pill
+                // and restates the ownership in the colour (see `link_tethers`).
+                // The colour given here is only what an untethered SHOW would
+                // use; `link_tethers` replaces it with a desaturated tint of
+                // whichever chip it ends up qualifying.
                 if !baseline_show.is_empty() {
                     chips.push(
                         Chip::modifier(
@@ -882,7 +902,8 @@ fn build_node_chips(
 /// The `STATISTICS(…)` chip for a named report column, or nothing when the
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
-/// whole.
+/// whole — so the two are drawn as one segmented pill, and this colour is
+/// replaced by a tint of the column's (see [`link_tethers`]).
 fn stats_chip(
     stats: &[crate::report::model::StatKind],
     th: &GuiTheme,
@@ -1688,36 +1709,105 @@ fn results_grid(
     opened
 }
 
-/// The gap left between a tethered chip and the chip it qualifies. Narrower
-/// than the normal inter-chip spacing, so the pair reads as one thing before
-/// the bracket is even noticed.
-const TETHER_GAP: f32 = 2.0;
-
-/// Draw the bracket joining a tethered chip to the chip it qualifies.
+/// The gap left between a tethered chip and the chip it qualifies: none, so the
+/// two sit flush and their touching borders form the divider of a single
+/// segmented pill (see [`link_tethers`]).
 ///
-/// A shallow staple above *and* below the pair: each starts over the anchor,
-/// steps out past the chips and runs along to the far edge of the hanger. The
-/// mirrored pair reads as a single bracket enclosing the two chips, which is
-/// much easier to spot in a long row than one lone line underneath. Drawn
-/// *outside* the chips rather than as a box around them so it can't be confused
-/// with the border that marks a request and its `WITH` fields as one droppable
-/// unit — this is an annotation, not a block boundary.
-fn paint_tether(painter: &egui::Painter, th: &GuiTheme, anchor: egui::Rect, hanger: egui::Rect) {
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.text, 0.55));
-    let drop = 3.0;
-    let left = anchor.center().x;
-    let right = hanger.right() - 2.0;
-    // `dir` is which way the staple steps away from the chips: +1 below, -1
-    // above. The union covers both chips even when they differ in height.
-    for (dir, edge) in [
-        (1.0, anchor.bottom().max(hanger.bottom()) + 2.0),
-        (-1.0, anchor.top().min(hanger.top()) - 2.0),
-    ] {
-        let near = edge - drop * dir;
-        painter.line_segment([egui::pos2(left, near), egui::pos2(left, edge)], stroke);
-        painter.line_segment([egui::pos2(left, edge), egui::pos2(right, edge)], stroke);
-        painter.line_segment([egui::pos2(right, edge), egui::pos2(right, near)], stroke);
+/// Applied while laying out the *anchor*, not the tethered chip. egui advances
+/// the cursor — spacing included — as each widget is allocated, so the gap
+/// between two chips is the one in effect when the **first** of them was added;
+/// narrowing it just before the second has no effect on the space already left
+/// behind it.
+const TETHER_GAP: f32 = 0.0;
+
+/// The corner radius of a chip.
+const CHIP_RADIUS: u8 = 6;
+
+/// Fully rounded corners, for a chip that never joins a neighbour.
+const ROUND_CHIP: egui::CornerRadius = egui::CornerRadius::same(CHIP_RADIUS);
+
+/// The corner radii for a chip, squaring off whichever edge it shares with a
+/// tethered neighbour so the pair is drawn as one pill split into segments
+/// rather than as two separate chips that happen to be adjacent.
+fn chip_corners(chip: &Chip) -> egui::CornerRadius {
+    let joined = |yes: bool| if yes { 0 } else { CHIP_RADIUS };
+    egui::CornerRadius {
+        nw: joined(chip.join_prev),
+        sw: joined(chip.join_prev),
+        ne: joined(chip.join_next),
+        se: joined(chip.join_next),
     }
+}
+
+/// A subordinate version of a chip colour: the same hue, desaturated.
+///
+/// Desaturating in HSV rather than mixing towards a theme colour keeps the
+/// value, so the tint stays legible against the panel in light and dark themes
+/// alike — a mix towards the background would fade to unreadable in one of
+/// them.
+fn tint_of(anchor: Color32) -> Color32 {
+    let mut hsva = egui::ecolor::Hsva::from(anchor);
+    hsva.s *= 0.45;
+    hsva.into()
+}
+
+/// Work out how each tethered chip joins the chip it qualifies, and tint it to
+/// match.
+///
+/// A tethered chip is drawn as the right-hand segment of a single pill: the
+/// pair sits flush, the anchor keeps its rounded left corners and squares off
+/// its right, and the hanger mirrors it, so one outline encloses both and their
+/// touching borders read as a divider. Segmented controls and breadcrumbs
+/// already teach that shape as "one control in two parts". The bracket this
+/// replaces was drawn *beside* the chips, and a thin line in a muted grey read
+/// as decoration — it never said which of the two owned the other.
+///
+/// The hanger also takes the anchor's hue, desaturated. Sharing the colour
+/// outright would blur `BASELINE(prod) SHOW(Time) COMPARISON(stage)` into three
+/// identical-looking peers, which is why the SHOW used to keep a colour of its
+/// own; a desaturated tint keeps the two distinguishable while saying the SHOW
+/// is subordinate to the baseline rather than a third peer beside it.
+fn link_tethers(chips: &mut [Chip]) {
+    for i in 1..chips.len() {
+        if !chips[i].tethered {
+            continue;
+        }
+        chips[i - 1].join_next = true;
+        chips[i].join_prev = true;
+        chips[i].color = tint_of(chips[i - 1].color);
+    }
+}
+
+/// Undo the join between `chips[i - 1]` and `chips[i]`, restoring both the
+/// rounded corners and the normal inter-chip gap.
+///
+/// Used where the pair is about to stop being adjacent: either half is in hand,
+/// or a hovering clause is about to be dropped between them. Merging across
+/// that gap would say "these two are one thing" at exactly the moment the user
+/// is separating them, and would leave a squared-off edge facing an empty slot.
+fn split_tether(chips: &mut [Chip], i: usize) {
+    chips[i - 1].join_next = false;
+    chips[i].join_prev = false;
+    chips[i].tethered = false;
+}
+
+/// Highlight both halves of a tethered pair while the pointer is over either of
+/// them: a single outline around the two, which answers "what does this SHOW
+/// belong to?" the moment the user goes looking, without adding anything to the
+/// resting state of an already-busy line.
+fn paint_tether_hover(ui: &egui::Ui, th: &GuiTheme, anchor: egui::Rect, hanger: egui::Rect) {
+    let pair = anchor.union(hanger);
+    // Suppressed mid-drag: the pointer is then carrying something, and an
+    // outline under it reads as a drop target rather than as an explanation.
+    if ui.ctx().dragged_id().is_some() || !ui.rect_contains_pointer(pair) {
+        return;
+    }
+    ui.painter().rect_stroke(
+        pair.expand(2.0),
+        egui::CornerRadius::same(CHIP_RADIUS + 2),
+        egui::Stroke::new(1.0, mix(th.panel, th.text, 0.75)),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Horizontal spacing between the grid's columns.
@@ -2812,14 +2902,30 @@ fn block_row(
                 ),
                 RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent, s.chip_help_end),
                 RowKind::Leaf | RowKind::LoopHead => {
-                    let chips = node
+                    let mut chips = node
                         .as_ref()
                         .map(|n| node_chips(n, row.req_ok, &th, s))
                         .unwrap_or_default();
-                    // A tethered chip is pulled up against the chip it
-                    // qualifies and the pair is bracketed together afterwards
-                    // (see `paint_tether`); everything else keeps the normal
-                    // inter-chip gap.
+                    // Merge each tethered chip into one pill with the chip it
+                    // qualifies (see `link_tethers`) — except where the two are
+                    // about to stop being neighbours, because either half is in
+                    // hand or a hovering clause is about to be dropped between
+                    // them.
+                    link_tethers(&mut chips);
+                    for i in (1..chips.len()).rev() {
+                        let parted = [i - 1, i]
+                            .iter()
+                            .any(|&j| chips[j].detach.is_some_and(&chip_in_this_row))
+                            || mod_ghost.as_ref().is_some_and(|(gi, _, _)| *gi == i);
+                        if chips[i].join_prev && parted {
+                            split_tether(&mut chips, i);
+                        }
+                    }
+                    // A tethered chip is pulled flush against the chip it
+                    // qualifies (see `TETHER_GAP`, which is why this keys off
+                    // the anchor's `join_next` rather than the tethered chip's
+                    // own flag); everything else keeps the normal inter-chip
+                    // gap.
                     let gap = ui.spacing().item_spacing.x;
                     let mut prev: Option<egui::Rect> = None;
                     let mut tethers: Vec<(egui::Rect, egui::Rect)> = Vec::new();
@@ -2832,7 +2938,7 @@ fn block_row(
                         {
                             ghost_chip(ui, &th, text, *extra);
                         }
-                        if chip.tethered {
+                        if chip.join_next {
                             ui.spacing_mut().item_spacing.x = TETHER_GAP;
                         }
                         let in_hand = chip.detach.is_some_and(&chip_in_this_row);
@@ -2865,12 +2971,11 @@ fn block_row(
                             )
                         };
                         ui.spacing_mut().item_spacing.x = gap;
-                        // No bracket to a chip that is currently in hand: it would
-                        // join the baseline to an empty ghost, which reads as
-                        // "these two are one thing" at exactly the moment the
-                        // user is pulling them apart.
-                        if chip.tethered
-                            && !in_hand
+                        // Remember the pair so it can be highlighted together
+                        // on hover. `split_tether` has already cleared the flag
+                        // for a pair that is being pulled apart, so there is no
+                        // in-hand case left to exclude here.
+                        if chip.join_prev
                             && let Some(anchor) = prev
                         {
                             tethers.push((anchor, rect));
@@ -2885,7 +2990,7 @@ fn block_row(
                         ghost_chip(ui, &th, text, *extra);
                     }
                     for (anchor, hanger) in tethers {
-                        paint_tether(ui.painter(), &th, anchor, hanger);
+                        paint_tether_hover(ui, &th, anchor, hanger);
                     }
                 }
             }
@@ -3201,7 +3306,7 @@ fn with_block(
                         }
                     ),
                 };
-                let lbl = chip_shell(ui, fill, stroke, true, |ui| {
+                let lbl = chip_shell(ui, fill, stroke, true, ROUND_CHIP, |ui| {
                     let lbl = ui.add(
                         egui::Label::new(RichText::new(&text).color(th.subst))
                             .selectable(false)
@@ -3800,7 +3905,7 @@ fn header_chip(
     let scope = ui.scope(|ui| {
         // A combo box sets its own (tallest) height; everything else has to be
         // grown to match, exactly as in the flow's chips.
-        chip_shell(ui, fill, stroke, !combo, |ui| {
+        chip_shell(ui, fill, stroke, !combo, ROUND_CHIP, |ui| {
             // The key label goes on the left, but a combo box is taller than a
             // label and only sets the row height once it has been added — a
             // label placed first would be "centred" in a still-short row and end
@@ -4127,6 +4232,7 @@ fn chip_shell<R>(
     fill: Color32,
     stroke: egui::Stroke,
     grow: bool,
+    corners: egui::CornerRadius,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let h = chip_h(ui);
@@ -4134,7 +4240,7 @@ fn chip_shell<R>(
         .fill(fill)
         .stroke(stroke)
         .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
+        .corner_radius(corners)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if grow {
@@ -4222,7 +4328,7 @@ fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32, hel
     let fill = mix(th.panel, color, 0.22);
     let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.5));
     let scope = ui.scope(|ui| {
-        chip_shell(ui, fill, stroke, true, |ui| {
+        chip_shell(ui, fill, stroke, true, ROUND_CHIP, |ui| {
             ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
         });
     });
@@ -4405,7 +4511,7 @@ fn render_chip_body(
     }
 
     let (fill, stroke, text_col) = chip_colors(th, chip, selected);
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
         // The label is the drag/select handle, kept separate from the `×`
         // button so the button's click is never stolen by the drag sense.
         let handle = ui.add(
@@ -4480,7 +4586,7 @@ fn alias_chip(
     acts: &mut Vec<Act>,
 ) {
     let (fill, stroke, text_col) = chip_colors(th, chip, false);
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("AS").color(text_col))
                 .selectable(false)
@@ -4529,7 +4635,7 @@ fn parallel_chip(
 ) {
     let (fill, stroke, text_col) = chip_colors(th, chip, false);
     let shown = current.map(|n| n.to_string()).unwrap_or_default();
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("PARALLEL").color(text_col))
                 .selectable(false)
@@ -4596,7 +4702,7 @@ fn combo_chip(
     let mut detached: Option<DetachWhich> = None;
     // A combo box already renders at the tallest chip height, so this chip does
     // not grow its row (which would only inflate the combo box further).
-    let handle = chip_shell(ui, fill, stroke, false, |ui| {
+    let handle = chip_shell(ui, fill, stroke, false, chip_corners(chip), |ui| {
         // The keyword prefix is the interactive handle (drag to reorder, click
         // to select, double-click to open the wizard). It must be added *before*
         // the combo (so it sits on the left), but the combo is taller and only
@@ -5229,6 +5335,81 @@ mod tests {
             });
         }
         h
+    }
+
+    /// Lay two chips out the way `block_row` lays out a line — closing the gap
+    /// in front of a tethered one — and return the rect each rendered into.
+    fn pair_rects(chips: &[Chip]) -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::for_language(&Language::English);
+        let mut rects = Vec::new();
+        // A few frames, so egui's sizing settles before the rects are read.
+        for _ in 0..3 {
+            rects.clear();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal_top(|ui| {
+                    let gap = ui.spacing().item_spacing.x;
+                    let mut acts = Vec::new();
+                    for chip in chips {
+                        if chip.join_next {
+                            ui.spacing_mut().item_spacing.x = TETHER_GAP;
+                        }
+                        rects.push(render_chip(
+                            ui,
+                            &th,
+                            &s,
+                            chip,
+                            false,
+                            &[0],
+                            &[],
+                            &[],
+                            &mut acts,
+                        ));
+                        ui.spacing_mut().item_spacing.x = gap;
+                    }
+                });
+            });
+        }
+        rects
+    }
+
+    /// The pill only reads as one control if the two halves actually meet: a
+    /// gap between them would leave the squared-off corners looking like a
+    /// rendering fault rather than a divider.
+    #[test]
+    fn the_halves_of_a_tethered_pill_are_rendered_touching() {
+        let pair = |tether: bool| {
+            let show = Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            );
+            let mut chips = vec![
+                Chip::modifier(
+                    "BASELINE(prod)".into(),
+                    Color32::RED,
+                    DetachWhich::Statistics,
+                ),
+                if tether { show.tether() } else { show },
+            ];
+            link_tethers(&mut chips);
+            let r = pair_rects(&chips);
+            r[1].left() - r[0].right()
+        };
+
+        assert_eq!(
+            pair(true),
+            0.0,
+            "the tethered half sits flush against the chip it qualifies, so their \
+             borders meet as the pill's divider"
+        );
+        assert!(
+            pair(false) > 0.0,
+            "while an untethered neighbour keeps the normal gap — otherwise every \
+             chip on the line would look joined"
+        );
     }
 
     #[test]
@@ -6881,7 +7062,10 @@ mod tests {
 
 #[cfg(test)]
 mod baseline_show_chip_tests {
-    use super::node_chips;
+    use super::{
+        CHIP_RADIUS, Chip, Color32, DetachWhich, ROUND_CHIP, chip_corners, link_tethers,
+        node_chips, split_tether, tint_of,
+    };
     use crate::gui::theme::GuiTheme;
     use crate::i18n::{Language, Strings};
 
@@ -6918,35 +7102,111 @@ mod baseline_show_chip_tests {
     }
 
     #[test]
-    fn the_baselines_show_is_tethered_to_it_and_keeps_its_own_colour() {
+    fn the_baselines_show_is_tethered_to_it_and_takes_a_tint_of_its_colour() {
         let flow = crate::report::parser::parse_flow(
             "FOR TARGET IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
         )
         .expect("the fixture flow parses");
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let s = Strings::for_language(&Language::English);
-        let chips = node_chips(&flow.nodes[0], None, &th, &s);
+        let mut chips = node_chips(&flow.nodes[0], None, &th, &s);
 
-        let show = chips
+        let show_at = chips
             .iter()
-            .find(|c| c.text.starts_with("SHOW("))
+            .position(|c| c.text.starts_with("SHOW("))
             .expect("the SHOW is chipped");
         assert!(
-            show.tethered,
+            chips[show_at].tethered,
             "it is tied to the chip before it, not left floating between three peers"
         );
-        assert_eq!(
-            show.color, th.ok,
-            "and it keeps SHOW's own colour — the tie is drawn, not implied by hue"
+        assert!(
+            chips[show_at - 1].text.contains("prod"),
+            "and the chip it is tied to is the BASELINE, so the tie says who owns it"
         );
 
-        let baseline = chips
-            .iter()
-            .find(|c| c.text.contains("prod"))
-            .expect("the BASELINE is chipped");
+        link_tethers(&mut chips);
+        let (baseline, show) = (&chips[show_at - 1], &chips[show_at]);
+        assert!(
+            baseline.join_next && show.join_prev,
+            "the pair is drawn as one segmented pill rather than two loose chips"
+        );
+        assert!(
+            !chips
+                .iter()
+                .any(|c| c.text.starts_with("COMPARISON(") && (c.join_prev || c.join_next)),
+            "but the COMPARISON stays a peer — it qualifies the loop, not the baseline"
+        );
+        assert_eq!(
+            show.color,
+            tint_of(baseline.color),
+            "and the SHOW borrows the baseline's hue, so the colour says the same thing as the shape"
+        );
         assert_ne!(
             show.color, baseline.color,
-            "so the two are still told apart at a glance"
+            "desaturated rather than identical, so the two are still told apart at a glance"
+        );
+    }
+
+    #[test]
+    fn a_tethered_chip_squares_off_only_the_edge_it_shares() {
+        let mut chips = vec![
+            Chip::modifier(
+                "BASELINE(prod)".into(),
+                Color32::RED,
+                DetachWhich::Statistics,
+            ),
+            Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            )
+            .tether(),
+        ];
+        link_tethers(&mut chips);
+
+        let (left, right) = (chip_corners(&chips[0]), chip_corners(&chips[1]));
+        assert_eq!(
+            (left.nw, left.sw, right.ne, right.se),
+            (CHIP_RADIUS, CHIP_RADIUS, CHIP_RADIUS, CHIP_RADIUS),
+            "the outside of the pair stays rounded, so it reads as a single pill"
+        );
+        assert_eq!(
+            (left.ne, left.se, right.nw, right.sw),
+            (0, 0, 0, 0),
+            "and the meeting edges are square, so no gap or bulge shows between the halves"
+        );
+    }
+
+    #[test]
+    fn a_pair_being_pulled_apart_is_no_longer_drawn_joined() {
+        let mut chips = vec![
+            Chip::modifier(
+                "BASELINE(prod)".into(),
+                Color32::RED,
+                DetachWhich::Statistics,
+            ),
+            Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            )
+            .tether(),
+        ];
+        link_tethers(&mut chips);
+        split_tether(&mut chips, 1);
+
+        assert!(
+            !chips[0].join_next && !chips[1].join_prev,
+            "a squared-off edge facing an empty slot would look like damage, not a join"
+        );
+        assert!(
+            !chips[1].tethered,
+            "and the pair falls back to the normal gap, so the row does not close up around the hole"
+        );
+        assert_eq!(
+            chip_corners(&chips[0]),
+            ROUND_CHIP,
+            "the chip left behind is a whole chip again"
         );
     }
 
