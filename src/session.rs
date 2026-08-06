@@ -129,6 +129,7 @@ pub fn active_theme_spec(
 /// from collections (a shared secrets folder vs. a project tree), so a single
 /// shared directory would send one picker to the other's folder every time.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub enum PickerKind {
     Environment,
     Other,
@@ -138,6 +139,7 @@ pub enum PickerKind {
 
 /// The whole front-end-agnostic application state. The GUI holds one of these;
 /// the terminal UI keeps its own view state but shares this module's logic.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct Session {
     pub language: Language,
     pub vars: AppVars,
@@ -236,6 +238,7 @@ impl Default for Session {
     }
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 impl Session {
     /// A session restored from the persisted `state.json`, or a fresh one when
     /// there is nothing to restore.

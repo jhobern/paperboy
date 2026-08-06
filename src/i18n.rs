@@ -20,6 +20,10 @@ pub enum Language {
 /// drift out of sync.
 macro_rules! strings {
     ($($field:ident => $en:expr, $fr:expr, $da:expr;)*) => {
+        // A terminal-only build still carries every string: the table is the
+        // single place translations live, and splitting it by front-end is
+        // exactly how the three languages would start to drift.
+        #[cfg_attr(not(feature = "gui"), allow(dead_code))]
         pub struct Strings {
             $(pub $field: &'static str,)*
         }
