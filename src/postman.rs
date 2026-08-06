@@ -12,7 +12,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use crate::hurl::{FormField, FormFieldKind, HurlEntry, parse_hurl};
+use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -128,6 +128,10 @@ struct Param {
     src: String,
     #[serde(rename = "contentType")]
     content_type: Option<String>,
+    /// Postman's own per-row note. Imported into [`KvRow::desc`] so the
+    /// documentation an exported collection carries isn't thrown away.
+    #[serde(default, deserialize_with = "de_str")]
+    description: String,
 }
 
 /// Deserialize a string field tolerantly: an explicit JSON `null` (which
@@ -137,9 +141,14 @@ fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 }
 
 impl Param {
-    /// A `{key, value}` pair, unless the entry is  keyless.
-    fn enabled_kve(&self) -> Option<(String, String, bool)> {
-        (!self.key.is_empty()).then(|| (self.key.clone(), self.value.clone(), !self.disabled))
+    /// The row this parameter becomes, unless it is keyless.
+    fn enabled_kve(&self) -> Option<KvRow> {
+        (!self.key.is_empty()).then(|| KvRow {
+            key: self.key.clone(),
+            value: self.value.clone(),
+            enabled: !self.disabled,
+            desc: self.description.clone(),
+        })
     }
 
     /// A form field — text, or a `File` using `src` as its path — unless the
@@ -156,6 +165,7 @@ impl Param {
                 content_type: self.content_type.clone(),
                 base64_prefix: None,
                 enabled: true,
+                desc: self.description.clone(),
             }
         } else {
             FormField {
@@ -165,6 +175,7 @@ impl Param {
                 content_type: None,
                 base64_prefix: None,
                 enabled: true,
+                desc: self.description.clone(),
             }
         })
     }
@@ -224,8 +235,7 @@ fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) 
 }
 
 fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
-    let mut headers: Vec<(String, String, bool)> =
-        req.header.iter().filter_map(Param::enabled_kve).collect();
+    let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
 
     // Auth → basic_auth, or a `Bearer` Authorization header for bearer tokens.
     let mut basic_auth = None;
@@ -241,7 +251,7 @@ fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
             "bearer" => {
                 let t = Auth::field(&auth.bearer, "token");
                 if !t.is_empty() {
-                    headers.push(("Authorization".to_string(), format!("Bearer {t}"), true));
+                    headers.push(KvRow::new("Authorization", format!("Bearer {t}")));
                 }
             }
             _ => {}
@@ -450,7 +460,8 @@ mod tests {
                     kind: FormFieldKind::Text,
                     content_type: None,
                     base64_prefix: None,
-                    enabled: true
+                    enabled: true,
+                    desc: String::new(),
                 },
                 FormField {
                     key: "f".into(),
@@ -458,7 +469,8 @@ mod tests {
                     kind: FormFieldKind::File,
                     content_type: None,
                     base64_prefix: None,
-                    enabled: true
+                    enabled: true,
+                    desc: String::new(),
                 },
             ],
             "text and file form-data fields are both imported"
@@ -473,7 +485,7 @@ mod tests {
         }}]}"#;
         let e = import_postman(json);
         assert_eq!(e.len(), 1);
-        assert!(e[0].headers.contains(&(
+        assert!(e[0].headers.contains(&KvRow::toggled(
             "Authorization".to_string(),
             "Bearer {{tok}}".to_string(),
             true
@@ -608,6 +620,46 @@ mod tests {
         assert!(
             !e[0].to_hurl().contains("HTTP"),
             "a capture-less import has no response line"
+        );
+    }
+
+    /// Postman lets you document each header and body parameter. Those notes
+    /// used to be dropped on import; they now land in the row's description.
+    /// (Query parameters stay in the raw URL, so they have no row to carry.)
+    #[test]
+    fn postman_parameter_documentation_becomes_a_row_description() {
+        let json = r#"{
+          "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [
+            { "name": "search", "request": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{url}}/search?q=cats",
+                  "host": ["{{url}}"],
+                  "path": ["search"],
+                  "query": [ { "key": "q", "value": "cats" } ]
+                },
+                "header": [
+                  { "key": "X-Trace", "value": "on", "description": "staging only" }
+                ],
+                "body": {
+                  "mode": "urlencoded",
+                  "urlencoded": [
+                    { "key": "region", "value": "eu", "description": "which cluster" }
+                  ]
+                }
+            }}
+          ]
+        }"#;
+        let entries = import_postman(json);
+        let e = &entries[0];
+        assert_eq!(
+            e.headers[0].desc, "staging only",
+            "the header's Postman documentation should survive the import"
+        );
+        assert_eq!(
+            e.form_fields[0].desc, "which cluster",
+            "and so should a form field's"
         );
     }
 }

@@ -8,6 +8,343 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.3.0] - 2026-08-06
+
+### Added
+
+- **A warning before unsaved request edits are thrown away.** Quitting, or
+  closing a tab, while requests hold edits that were never written to a file now
+  asks first and says how many are at stake. A Workspace tab's requests are
+  deliberately not carried across restarts, and edits parked for a file you have
+  switched away from live only in memory, so this was the point at which work
+  disappeared without a word. The terminal UI folds the same warning into its
+  exit confirmation, which now appears even with confirm-on-exit switched off
+  (matching how unsaved *secret* edits already behaved).
+
+- **Drag a clause from one line onto another.** A `SHOW`, `PARALLEL`,
+  `STATISTICS`, `WITH` field, `BASELINE`/`COMPARISON` role — anything you can
+  pull off a block — can now be dropped on another block instead of only in the
+  bin, and it arrives with the value it was carrying (`SHOW(Time, Status)` keeps
+  its columns). Hold **Shift** as you drop to leave the original in place and
+  drop a copy, so one loop's `PARALLEL(4)` can be cloned onto its neighbours.
+
+- **The line opens up to show where a modifier will land.** Dragging a modifier
+  over a block now slides its chips aside and draws a dashed placeholder, the
+  size of the block that will fill it and labelled with what it will say, so you
+  can see how the drop changes the statement before letting go.
+
+- **`REPORT <var>` is a palette block.** Previously the only way to report a
+  variable was to drop `REPORT` on a `VARIABLE` block, which left no way to
+  report a captured value or a loop variable.
+
+- **A pencil marks anything edited but not yet saved.** It shows next to a
+  request in the Requests list and the Workspace tree, next to a Workspace
+  collection file that still has unsaved edits, and on the tab of any
+  collection holding them — so it is obvious what a Save would write.
+
+- **`STATISTICS` is now a block you can drag.** It joins the modifier palette
+  and drops onto a `REPORT <var> AS <name>` or a computed column.
+
+- The `BASELINE`/`SHOW` bracket in the block editor is now drawn above the pair
+  as well as below it, so the two chips read as enclosed rather than merely
+  underlined — much easier to pick out in a long compare line.
+
+- Every chip that can be pulled out of a line now says so on hover, spelling out
+  the plain-drag / Ctrl-drag distinction that was otherwise invisible.
+
+- Reported variables and computed columns now have wizards of their own in both
+  front-ends, closing the last two palette blocks that could only be edited as
+  raw text. `REPORT <var>` offers a checklist of the variables actually in scope
+  at that point in the flow — assignments, loop binders, `FOLDERS` role names and
+  the `[Captures]` of requests earlier in the flow — plus a free-text row for
+  names bound only at run time, and an `AS` name with `STATISTICS(…)` when a
+  single variable is picked. `REPORT "…" AS <name>` gets a template field, a
+  column name and the statistics checklist. The scope scan (`vars_in_scope`)
+  lives in the shared core, so the terminal UI and the GUI offer the same list.
+
+- **The PaperTrail block editor is now a complete way to write a report.**
+  Reports open in a drag-and-drop **Blocks** view in the GUI, and it no longer
+  makes you drop into Source to finish the job:
+
+  - **Collections are chosen by name, not by path.** The `collection` dropdown
+    lists the collections in the report's own workspace first, by name with
+    their location underneath, and hides ones from outside that workspace
+    behind a toggle. What it *writes* is still a path — a relative one, now
+    including `../` for a collection in a sibling folder, so a workspace stays
+    portable between machines instead of baking in paths that only exist on the
+    one it was built on.
+  - **Report settings are editable.** A fixed-width panel above `BEGIN` exposes
+    the header directives — `collection`, `output`, `environment`, `root`,
+    `baseline` and `columns` — stacked one per line, boxed so they read as
+    settings for the report rather than the first steps of it, and lined up
+    with the flow below. `collection` and `output` are always shown (only a
+    missing `collection` is highlighted as an error — `output` defaults to
+    CSV); the others are appended from the **Add a report setting** button
+    beneath them. Any setting that is set can be cleared with its `×`.
+    Anything with a closed set of valid values is a dropdown (`collection`,
+    `environment`, and `output`, which names a format — `csv`, `json`, `html`
+    or `xlsx` — rather than a filename); `root` and `baseline` are paths with a
+    Browse button, stored relative to the report when they live beside it.
+    These apply to the report as a whole rather than running as a step, so they
+    are deliberately a fixed strip and not draggable blocks.
+  - **A matching `END`** now closes the flow under the last block, mirroring
+    the `BEGIN` at the top.
+  - **`PARALLEL(n)`** loops expose their maximum concurrency as an editable
+    number, and report-request blocks expose their `STATISTICS(…)` and
+    `HIDE(…)` column lists alongside `SHOW(…)`.
+  - **Every block and setting has hover help** explaining what it is and what
+    each editable part of it does.
+  - **The Source view is syntax-highlighted** with exactly the same colours as
+    the terminal UI (the two share one highlighter), and the line the parser
+    rejected is underlined.
+
+- **Whole workspaces load from a git remote in the GUI**, matching the terminal
+  UI: collections, environments and entire workspace trees, all without a local
+  clone.
+
+- **The GUI remembers your layout.** Window size, every panel width and height
+  you dragged, which view was open, and which request or report you were on are
+  saved to `state.json` and restored on the next launch. The terminal UI carries
+  this geometry through untouched rather than rounding it into its own
+  character-cell layout.
+
+- **Every GUI file dialog reopens where you left it**, per kind of file.
+
+- **A Workspace tab reopens on whatever you last selected in its tree.** A
+  `.trail` report or `.vars` environment opened from the tree previously left no
+  trace at all, so the tab came back with an empty right-hand pane. The
+  selection is saved relative to the workspace root, and dropped on load if that
+  file has since been deleted or renamed — a workspace is a live folder.
+
+- **Workspaces can be grown and rearranged in the GUI.** A **New** menu on the
+  workspace panel adds a collection, report or environment at the root, and a
+  right-click on any row offers the same inside that row's folder. Items can be
+  dragged onto a folder to move them there, or dropped below the tree to move
+  them back to the root; open tabs, the open report and the expanded-folder set
+  are all repointed at the file's new home. Creating and moving are both held
+  inside the workspace root — symlinks included — and neither will overwrite an
+  existing file. The terminal UI has the same two gestures: **Shift+N** names a
+  new file in the highlighted folder (its extension — `.hurl`, `.trail` or
+  `.vars` — chooses whether it is a collection, report or environment), and
+  **Shift+M** moves the highlighted file or folder into a destination picked
+  with `Space`, refusing to escape the workspace, overwrite, or nest a folder
+  inside itself exactly as the GUI does.
+- **A dry run in the GUI.** **Dry run**, beside Run in the report editor,
+  previews what the report would produce — every loop expanded, every variable
+  resolved, the projected row count and the output grid itself — without
+  sending a single request. Producer and resolution problems, and any
+  variable-availability warnings, are listed above the grid. This is the
+  terminal UI's `d` preview, and both now share one implementation.
+- **`BASELINE(…) SHOW(…)` is editable.** A `SHOW` on a comparison's
+  baseline used to be invisible in the GUI: preserved if you had written it by
+  hand, but with nothing to view or change it. It now appears as its own chip,
+  placed immediately after the `BASELINE` it belongs to and joined to it by a
+  bracket (it keeps `SHOW`'s own colour: three same-coloured chips in a row read
+  as three peers, so it is the bracket, not the hue, that says which one it
+  qualifies), and the ENVS form offers its fields as a checklist boxed and
+  indented beneath that baseline's row — so there is no mistaking it for something governing the
+  comparisons.
+- **Row descriptions are saved.** Headers, cookies, query parameters, options
+  and form fields have always had a Description column in the terminal UI's
+  request wizard, but whatever you typed there was thrown away on submit — it
+  had nowhere to live in the Hurl format and no field in PaperBoy's model. Each
+  row now carries its note through save, reload, request export/import and the
+  session state, written as a `# @desc …` comment line directly above the row
+  (a trailing comment would be ambiguous, since a header value may legitimately
+  contain `#`). The GUI's key/value tables gained the matching Description
+  column, and a section that already carries notes opens with that column
+  showing. Postman's per-parameter documentation is imported into it instead of
+  being discarded.
+
+- **Double-clicking an environment in a workspace opens it.** It now reveals and
+  scrolls to that environment in the Global Environments panel, expanding it if
+  it was collapsed — the same gesture the collection and report rows already
+  had.
+- **The block editor helps with the first report.** An empty flow says what to
+  drag in rather than showing a bare `BEGIN`/`END`; the `collection` dropdown
+  always offers **Browse…** (and explains itself when no collection is loaded,
+  where it used to be simply an empty menu); a flow that sends requests but
+  reports none warns that the report will have no columns, which is the single
+  most common reason a first report comes back blank; and a modifier chip
+  dropped on a block that won't take it now says why — distinguishing "wrong
+  kind of block" from "that clause is already there" — instead of springing
+  back in silence.
+
+- **The terminal UI's node editor reaches the GUI block editor's feature set.**
+  Following the GUI's chips block by block, but presented as forms rather than
+  as things to drag onto each other:
+
+  - The request form gained the `HIDE(…)` checklist beside its `SHOW(…)` one
+    (they are separate clauses in the language, so they are separate lists —
+    each row names the clause it writes), and a `WITH … END` field list with an
+    add row. A `WITH` field opens its own small form for the column name, the
+    Hurl query behind it and the `STATISTICS(…)` checklist; Enter returns to
+    the request form it came from, Esc likewise.
+  - `PARALLEL` is no longer only on/off. Ticking it reveals a digits-only
+    max-concurrency row that writes `PARALLEL(n)`; blank still means "use the
+    prelude's `MAX_PARALLEL`", and is labelled as such rather than shown as an
+    empty box.
+  - **A comparison's `BASELINE(…) SHOW(…)` is edited in the `FOR … IN ENVS`
+    form** — where the baseline it qualifies already lives — rather than as a
+    block of its own. The checklist lists what the loop's *body* reports, and
+    appears only once there is a baseline for it to apply to. Nothing is ticked
+    by default, because an empty baseline `SHOW` means "carry nothing across".
+  - `FOR … IN FOLDERS` now opens the loop form (variable, folder picker,
+    `PARALLEL`) instead of only a bare folder browser; its `WITH role="glob"`
+    clauses are preserved.
+  - `VARIABLE = VALUE` and `LIST NAME = [ … ]` gained forms, so the two most
+    common non-request blocks no longer route straight to the raw line editor.
+    A tuple list or a computed producer still does — a flat form would flatten
+    structure those carry.
+
+  The raw "edit as a line" escape hatch is unchanged and still reaches anything
+  the forms don't, but it has moved off `Enter` (which now opens the block's
+  form) onto `e`, where it already was for every other block.
+
+### Fixed
+
+- **Request rows now carry stable widget ids.** A row's decorations (method
+  badge, run marker, edit pencil) come and go with which collection is loaded,
+  and `egui` numbers widgets by how many came before them, so switching
+  collections renumbered every row after them. Each row is now keyed to the
+  request it draws. (This also silenced a red id-clash outline that flashed
+  around the edit pencil in debug builds; `egui` only runs that check when
+  `debug_assertions` are on, so release builds were never affected.)
+
+- **A drop placeholder was drawn at the wrong indent.** A block dropped just
+  after `BEGIN` (or just after a `FOR` header) lands one level in, but its
+  silhouette was drawn flush against the margin. The preview now uses the depth
+  the block will actually land at.
+
+- **Refusing a duplicate `REPORT` explained the wrong thing.** Dragging `REPORT`
+  onto an already-reported request answered "REPORT can only be added to a
+  request or a SET assignment" instead of saying it is already there.
+
+- **Edits were thrown away when you opened another collection from a
+  Workspace.** A Workspace tab shows one file's requests at a time, and loading
+  the next file overwrote them without saving. The outgoing file's unsaved
+  edits are now parked and handed back when you reopen it. Saving a collection
+  (locally or to git) now also clears its edit markers in the GUI, which it
+  previously never did.
+
+- **A `STATISTICS(…)` clause was invisible in the block editor.** It was in the
+  source and in the wizards, but nothing drew it — on a named report column it
+  now gets its own chip (tethered to the column it summarises), and on a `WITH`
+  field it is shown on that field's row.
+
+- **A chip only snaps off a line if the statement survives without it.** Pulling
+  `REPORT` off a reported *column* would have taken the whole statement with it,
+  so grabbing that chip now moves the line instead — the same rule, applied
+  centrally, for every chip present and future.
+
+- **Dragging the `WITH` chip now carries its fields with it.** Detaching `WITH`
+  removes the whole block, but only the keyword chip used to move; the fields
+  now float with it and their space is ghosted, so what moves is what goes.
+
+- **A chip dragged out of a line now looks like it has been picked up.** It
+  floats under the pointer and leaves the same dashed grey ghost in its slot
+  that a dragged block does, so the gesture is visible (and obviously
+  reversible) instead of appearing to do nothing until the drop.
+
+- **Dragging one block out of a long line works again.** The `BASELINE`,
+  `COMPARISON`, baseline `SHOW` and `WITH` chips had no detach action, so a
+  plain drag on any of them fell through to "move the whole line" — which, on a
+  compare loop, is every chip there is. They are now detachable (and carry a `×`
+  like every other modifier), so a plain drag pulls just that clause out and
+  Ctrl/Cmd+drag still moves the line. Dropping either half of a comparison
+  degrades the loop to a plain pass over the environments that remain, rather
+  than writing a `BASELINE(…)` with no `COMPARISON(…)`.
+
+- **`columns:` could not be added from the report settings panel.** It was
+  seeded with an empty value, and an empty value means "remove this directive",
+  so choosing it from the add menu did nothing at all.
+
+- Optional report settings keep their `×` while still unset, so one added by
+  mistake can be taken off again instead of being stuck showing its prompt.
+
+- **The GUI dry-run button appeared to do nothing.** It built the preview
+  correctly but, unlike a real run, never switched to the Results view — and
+  the toolbar it lives on spans every view, so from the Blocks view (where you
+  press it) the button looked dead. Both paths now go through one place.
+- **The run marker no longer hides under the scrollbar.** The pass/fail tick
+  next to a request sits at the right edge of the list, where egui draws its
+  scrollbar over the content rather than reserving a gutter for it, so a
+  scrolling collection put the bar straight through the marker. Both the
+  request tree and the workspace tree now leave it room.
+- **The GUI's Response panel follows the selection.** It showed whatever came
+  back most recently, so clicking through a collection left one request's body
+  and status sitting under a different request's name. It now shows the
+  selected request's own last response — and its own "sending" state, so a
+  request still on the wire spins while selecting a settled one shows what that
+  one actually got back. This is what the terminal UI has always done; both
+  read the same per-entry record.
+
+- **Report validation speaks the reader's language.** The diagnostics under the
+  block editor were the last hardcoded English strings in the UI; they are now
+  rows in the shared string table like everything else, and were reworded away
+  from source syntax at the same time — a report with no collection says "No
+  collection chosen" rather than "missing '# collection:' header", which is not
+  a header the user of the block editor ever sees.
+
+### Changed
+
+- **The dry run is no longer a popup.** In both front-ends the preview now
+  appears in the report's own results pane, in the place — and with the same
+  scrolling — the real results occupy, and is dismissed with Esc or superseded
+  by a real run. As a modal it stacked above the cell viewer it could spawn,
+  which left no way back to the cell.
+- **The GUI results table fills the window and keeps its columns in it.**
+  Columns are measured and then fitted to the available width: a narrow table
+  is stretched to fill the window instead of huddling at the left edge, and a
+  wide one is squeezed — taking the room from the widest columns first, so a
+  three-character `Status` column isn't punished for a sprawling response
+  column beside it. Only when even the minimum widths can't fit does the table
+  overflow into a horizontal scroll bar. Truncated cells are, as before, one
+  click away from the cell viewer.
+- **The GUI File menu is grouped by verb** (New / Open / Save / Import-Export)
+  instead of one flat list.
+- **The active environment is unmissable in the GUI** — ticked, coloured and
+  banded in the Global Environments list, rather than marked with a small dot.
+- **Terminal UI file browsers filter folders as well as files.** Typing a filter
+  now hides non-matching folders too, which is what makes it usable in a large
+  tree. The `../` parent entry is always exempt so you can never filter yourself
+  into a dead end.
+
+### Removed
+
+- **"Import Postman" from the GUI File menu.** **Open ▸ Collection** accepts a
+  Hurl `.hurl` file or a Postman `.json` export and works out which it is, so
+  the separate entry was a trap for anyone who didn't find it.
+
+### Fixed
+
+- **The drop marker in the block editor is the *shape* of the block being
+  dragged.** It used to be a fixed one-row gap running the full width of the
+  editor. It is now drawn as the block's own silhouette — one rounded outline
+  per row it will occupy, at that row's own width and indent — so a dragged
+  `FOR` loop shows its short head, its indented body and its short `END` rather
+  than a solid slab nothing like the block in hand. As the gap animates open
+  the marker is revealed rather than stretched, so the block never appears to
+  change size on the way in.
+- **The dashed outline left behind by a picked-up block traces the block.** It
+  started at the editor's far-left margin regardless of how deeply the block was
+  nested (the indent is laid out *inside* the row, so it was included in the
+  measured rect), and its corners were square inside a rounded fill. It now
+  starts at the block's own indent and is dashed around a rounded path with the
+  same corner radius the blocks have.
+- **Dragging a `FOR` loop no longer comes apart.** The lifted rows were being
+  transformed from inside the loop's head row, so egui only moved the shapes it
+  had already painted and the body appeared to lag behind the head. The whole
+  lifted subtree is now transformed once, after all of it is painted.
+- **The block editor's palette and diagnostics panel widths now persist.** They
+  were only reapplied on the one startup path that restored a session report, so
+  opening a report any other way — from the reports list, freshly created, or
+  from a Workspace tree — silently reset them to the defaults, which read as the
+  setting not being saved at all. Every report now opens through one place.
+- **The desktop icon on Linux** is documented and works: the first GUI launch
+  installs a `.desktop` entry matching the window's Wayland app id (see the
+  README for the rescan caveat).
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

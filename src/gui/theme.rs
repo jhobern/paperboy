@@ -27,6 +27,22 @@ fn c([r, g, b]: [u8; 3]) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Convert a `ratatui` colour to an egui one, so the shared PaperTrail
+/// highlighter (`tui::report_highlight`, which speaks in ratatui spans) can
+/// paint the GUI's Source view.
+///
+/// Every colour a theme produces is an RGB triple — `ThemeSpec::to_theme` only
+/// ever builds `Color::Rgb` — so that arm is the whole story in practice. The
+/// terminal's indexed/named colours have no fixed RGB value (they're whatever
+/// the terminal's own palette says), so rather than invent one they fall back
+/// to the caller's default foreground.
+pub fn from_ratatui(color: ratatui::style::Color, fallback: Color32) -> Color32 {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+        _ => fallback,
+    }
+}
+
 /// Blend `a` toward `b` by `t` (0..1) — used to derive hover/active shades from
 /// the panel colour so widgets sit naturally on any theme.
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {

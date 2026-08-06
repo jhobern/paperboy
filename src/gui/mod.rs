@@ -28,14 +28,35 @@ pub use app::GuiApp;
 
 use eframe::egui;
 
+/// Inner size the window opens at on a profile that has never been resized.
+pub const DEFAULT_WINDOW: (f32, f32) = (1280.0, 820.0);
+
+/// Smallest inner size the window can be shrunk to. Also the floor a restored
+/// size must clear before it is trusted.
+pub const MIN_WINDOW: (f32, f32) = (760.0, 500.0);
+
 /// Launch the GUI. Blocks until the window is closed.
 pub fn run() -> Result<(), String> {
     // Best-effort: register a freedesktop launcher so Linux taskbars/docks show
     // the PaperBoy logo instead of a generic icon (see the function's docs).
     install_desktop_integration();
+    // The window has to be sized before `GuiApp::new` runs (that's when the
+    // session is loaded), so peek at the saved layout here. Reading the state
+    // file twice is cheap next to opening a window, and keeps the size in the
+    // one `state.json` both front-ends share rather than a second eframe store.
+    let saved = crate::persistence::load_state()
+        .map(|s| s.gui)
+        .unwrap_or_default();
+    let (w, h) = saved
+        .window
+        // A window saved as degenerate (a crash mid-resize, or a monitor that
+        // has since gone away) would reopen unusable, so anything smaller than
+        // the minimum falls back to the default size.
+        .filter(|(w, h)| *w >= MIN_WINDOW.0 && *h >= MIN_WINDOW.1)
+        .unwrap_or(DEFAULT_WINDOW);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 820.0])
-        .with_min_inner_size([760.0, 500.0])
+        .with_inner_size([w, h])
+        .with_min_inner_size([MIN_WINDOW.0, MIN_WINDOW.1])
         .with_title("PaperBoy")
         .with_app_id("paperboy");
     // Use the PaperBoy logo as the window / taskbar icon instead of the

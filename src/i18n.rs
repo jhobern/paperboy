@@ -94,6 +94,12 @@ strings! {
     copied_to_clipboard => "Copied to clipboard", "Copié dans le presse-papiers", "Kopieret til udklipsholder";
     preferences_menu => "Preferences", "Préférences", "Præferencer";
     confirm_exit_secrets => "There are environment secrets with unsaved changes, exiting will cause these changes to be lost.", "Il y a des secrets d'environnement avec des modifications non enregistrées, quitter entraînera la perte de ces modifications.", "Der er miljøhemmeligheder med ikke-gemte ændringer. Hvis du afslutter, vil disse ændringer gå tabt.";
+    confirm_exit_edits => "{n} request(s) have edits that have not been saved; exiting will cause these changes to be lost.", "{n} requête(s) ont des modifications non enregistrées\u{a0}; quitter entraînera la perte de ces modifications.", "{n} anmodning(er) har ændringer, der ikke er gemt; hvis du afslutter, vil disse ændringer gå tabt.";
+    gui_unsaved_quit_title => "Unsaved changes", "Modifications non enregistrées", "Ikke-gemte ændringer";
+    gui_unsaved_quit_q => "{n} request(s) in {t} have edits that have not been saved. Quitting now will lose them.", "{n} requête(s) dans {t} ont des modifications non enregistrées. Quitter maintenant les perdra.", "{n} anmodning(er) i {t} har ændringer, der ikke er gemt. Hvis du afslutter nu, går de tabt.";
+    gui_unsaved_close_tab_q => "{n} request(s) in \"{t}\" have edits that have not been saved. Closing this tab will lose them.", "{n} requête(s) dans «\u{a0}{t}\u{a0}» ont des modifications non enregistrées. Fermer cet onglet les perdra.", "{n} anmodning(er) i \"{t}\" har ændringer, der ikke er gemt. Hvis du lukker denne fane, går de tabt.";
+    gui_quit_anyway => "Quit anyway", "Quitter quand même", "Afslut alligevel";
+    gui_close_anyway => "Close anyway", "Fermer quand même", "Luk alligevel";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
     view_json_label => "JSON", "JSON", "JSON";
     view_hurl_label => "Hurl", "Hurl", "Hurl";
@@ -168,6 +174,14 @@ strings! {
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
+    ws_item_moved => "Moved '{name}'.", "« {name} » déplacé.", "'{name}' flyttet.";
+    ws_item_move_exists => "There is already a '{name}' there — nothing moved.", "Il y a déjà un « {name } » à cet endroit — rien n'a été déplacé.", "Der er allerede en '{name}' der — intet flyttet.";
+    ws_item_move_into_itself => "A folder can't be moved inside itself.", "Un dossier ne peut pas être déplacé dans lui-même.", "En mappe kan ikke flyttes ind i sig selv.";
+    workspace_new_item_title => "New file (.hurl, .trail or .vars)", "Nouveau fichier (.hurl, .trail ou .vars)", "Ny fil (.hurl, .trail eller .vars)";
+    ws_item_unknown_kind => "'{name}' isn't a collection, report or environment — use .hurl, .trail or .vars.", "« {name} » n'est ni une collection, ni un rapport, ni un environnement — utilisez .hurl, .trail ou .vars.", "'{name}' er hverken en samling, rapport eller et miljø — brug .hurl, .trail eller .vars.";
+    ws_item_created => "Created '{name}'.", "« {name} » créé.", "'{name}' oprettet.";
+    ws_item_escaped => "Destination '{name}' resolves outside the workspace — nothing created.", "La destination « {name} » pointe hors de l'espace de travail — rien n'a été créé.", "Destinationen '{name}' peger uden for arbejdsområdet — intet oprettet.";
+    ws_item_exists => "'{name}' already exists — nothing created.", "« {name} » existe déjà — rien n'a été créé.", "'{name}' findes allerede — intet oprettet.";
     workspace_report_escaped => "Destination '{name}' resolves outside the workspace — report not created.", "La destination « {name} » pointe hors du workspace — rapport non créé.", "Destinationen '{name}' peger uden for workspacet — rapport ikke oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
     workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
@@ -207,6 +221,9 @@ strings! {
     hdr_key => "Key", "Clé", "Nøgle";
     hdr_value => "Value", "Valeur", "Værdi";
     hdr_description => "Description", "Description", "Beskrivelse";
+    hdr_name => "Name", "Nom", "Navn";
+    hdr_option => "Option", "Option", "Indstilling";
+    hdr_query => "Query", "Requête", "Forespørgsel";
     hdr_type => "Type", "Type", "Type";
     form_type_text => "Text", "Texte", "Tekst";
     form_type_file => "File", "Fichier", "Fil";
@@ -295,6 +312,8 @@ strings! {
     workspace_reload_failed => "Could not redownload the workspace — the remote no longer seems to have that commit or tag ({e}).", "Impossible de retélécharger l'espace de travail — le dépôt distant ne semble plus avoir ce commit ou ce tag ({e}).", "Kunne ikke downloade workspace igen — det fjerne repo synes ikke længere at have denne commit eller tag ({e}).";
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
+    move_workspace_item => "Move — Choose Destination Folder", "Déplacer — Choisir le dossier de destination", "Flyt — Vælg destinationsmappe";
+    browser_hint_workspace_move => "Enter open folder · Space move here · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace déplacer ici · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum flyt hertil · ← overordnet · ^r nulstil · Esc annuller";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
     save_collection_folder => "Save Collection — Choose Destination Folder", "Enregistrer la collection — Choisir le dossier de destination", "Gem samling — Vælg destinationsmappe";
     browser_hint_collection_save => "Enter open folder · Tab file name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du fichier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab filnavn · ← overordnet · ^r nulstil · Esc annuller";
@@ -405,6 +424,8 @@ strings! {
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
+    help_workspace_new_item => "new collection / report / environment in the workspace (name it .hurl, .trail or .vars)", "nouvelle collection / rapport / environnement dans l'espace de travail (nommez-le .hurl, .trail ou .vars)", "ny samling / rapport / miljø i arbejdsområdet (navngiv den .hurl, .trail eller .vars)";
+    help_workspace_move_item => "move the highlighted workspace file or folder to another folder", "déplacer le fichier ou dossier d'espace de travail en surbrillance vers un autre dossier", "flyt den fremhævede workspace-fil eller -mappe til en anden mappe";
     help_workspace_open => "open the highlighted workspace folder / collection (→ or Enter)", "ouvrir le dossier / la collection du workspace en surbrillance (→ ou Entrée)", "åbn den fremhævede workspace-mappe / -samling (→ eller Enter)";
     help_menu_submenu_nav => "enter / leave a File-menu submenu", "entrer / quitter un sous-menu du menu Fichier", "gå ind i / ud af en Fil-menu-undermenu";
     help_browser_reset => "reset the file browser to the folder it opened in", "réinitialiser l'explorateur de fichiers au dossier d'ouverture", "nulstil filvælgeren til den mappe, den åbnede i";
@@ -451,6 +472,7 @@ strings! {
     help_report_view => "toggle between the source and the results grid", "basculer entre la source et la grille de résultats", "skift mellem kilden og resultatgitteret";
     help_report_nodes => "open the structured node editor (Esc returns to the source)", "ouvrir l'éditeur de nœuds structuré (Échap revient à la source)", "åbn den strukturerede node-editor (Esc vender tilbage til kilden)";
     help_report_nodes_edit => "in the node editor: a add · Enter configure · e edit line · f File menu · Del remove · Shift+↑/↓ move · Ctrl+Z undo", "dans l'éditeur de nœuds : a ajouter · Entrée configurer · e modifier la ligne · f menu Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler", "i node-editoren: a tilføj · Enter konfigurer · e rediger linje · f Fil-menu · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd";
+    help_report_nodes_forms => "every block has a form: requests carry SHOW / HIDE / WITH (with STATISTICS), loops carry PARALLEL(n), and a compare loop carries the baseline's SHOW", "chaque bloc a un formulaire : les requêtes portent SHOW / HIDE / WITH (avec STATISTICS), les boucles portent PARALLEL(n), et une boucle de comparaison porte le SHOW de la référence", "hver blok har en formular: forespørgsler bærer SHOW / HIDE / WITH (med STATISTICS), løkker bærer PARALLEL(n), og en sammenligningsløkke bærer referencens SHOW";
     help_report_focus_cycle => "cycle focus: editor → results → editor (tree included for workspace reports)", "faire défiler le focus : éditeur → résultats → éditeur (arbre inclus pour les rapports d'espace de travail)", "skift fokus: editor → resultater → editor (træ inkluderet for workspace-rapporter)";
     help_report_workspace_tree => "in a workspace report: ↑↓ move the pinned tree · Enter open a report/collection · ←/→ up/into a folder", "dans un rapport d'espace de travail : ↑↓ déplacer l'arbre épinglé · Entrée ouvrir un rapport/une collection · ←/→ monter/entrer dans un dossier", "i en arbejdsområderapport: ↑↓ flyt det fastgjorte træ · Enter åbn en rapport/samling · ←/→ op/ind i en mappe";
     help_report_export => "export the last run (CSV / JSON / HTML / xlsx by extension)", "exporter la dernière exécution (CSV / JSON / HTML / xlsx selon l'extension)", "eksportér den seneste kørsel (CSV / JSON / HTML / xlsx efter filtype)";
@@ -542,6 +564,10 @@ strings! {
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "Enter nodes", "Entrée nœuds", "Enter noder";
     report_hint_view => "v output", "v sortie", "v output";
+    gui_report_dry_run => "Dry run", "Simulation", "Prøvekørsel";
+    gui_report_dry_run_tooltip => "Preview the rows this report would produce — loops expanded and variables resolved, but no requests sent.", "Prévisualiser les lignes que ce rapport produirait — boucles développées et variables résolues, mais aucune requête envoyée.", "Forhåndsvis de rækker denne rapport ville producere — løkker udvidet og variabler løst, men ingen anmodninger sendt.";
+    gui_report_dry_run_close => "Close preview", "Fermer l'aperçu", "Luk forhåndsvisning";
+    gui_report_dry_run_close_tooltip => "Go back to the results of the last real run.", "Revenir aux résultats de la dernière exécution réelle.", "Gå tilbage til resultaterne af den seneste rigtige kørsel.";
     report_dry_run_title => "Dry run — expansion preview", "Simulation — aperçu de l'expansion", "Prøvekørsel — udvidelsesforhåndsvisning";
     report_dry_run_rows => "Projected rows:", "Lignes prévues :", "Forventede rækker:";
     report_dry_run_no_rows => "No rows would be produced.", "Aucune ligne ne serait produite.", "Ingen rækker ville blive produceret.";
@@ -571,6 +597,7 @@ strings! {
     report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · Esc source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · Échap source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · Esc kilde";
     report_nodes_parse_error => "Fix the source before editing as nodes", "Corrigez la source avant de modifier en nœuds", "Ret kilden før redigering som noder";
     report_node_begin => "Begin", "Début", "Start";
+    report_node_end => "End", "Fin", "Slut";
     node_menu_title => "Add Node", "Ajouter un nœud", "Tilføj node";
     node_menu_hint => "↑/↓ select · Enter add · Esc cancel", "↑/↓ sélectionner · Entrée ajouter · Échap annuler", "↑/↓ vælg · Enter tilføj · Esc annuller";
     node_pick_request_title => "Choose Request", "Choisir une requête", "Vælg forespørgsel";
@@ -591,7 +618,18 @@ strings! {
     node_mod_as => "AS — name a report column", "AS — nommer une colonne du rapport", "AS — navngiv en rapportkolonne";
     node_mod_response => "RESPONSE — capture the response body (RAW/PRETTY)", "RESPONSE — capturer le corps de la réponse (RAW/PRETTY)", "RESPONSE — indfang svarets krop (RAW/PRETTY)";
     node_mod_show => "SHOW — pick which fields to show", "SHOW — choisir les champs à afficher", "SHOW — vælg hvilke felter der vises";
+    node_mod_statistics => "STATISTICS", "STATISTICS", "STATISTICS";
     node_mod_hide => "HIDE — pick which fields to hide", "HIDE — choisir les champs à masquer", "HIDE — vælg hvilke felter der skjules";
+    // Why a modifier chip refuses to attach to the block under the pointer.
+    // Shown as a tooltip during the drag, so the drop never fails in silence.
+    mod_reject_present => "This block already has that.", "Ce bloc l'a déjà.", "Denne blok har allerede det.";
+    mod_reject_report => "REPORT can only be added to a request or a SET assignment.", "REPORT ne peut être ajouté qu'à une requête ou à une affectation SET.", "REPORT kan kun tilføjes til en forespørgsel eller en SET-tildeling.";
+    mod_reject_parallel => "PARALLEL can only be added to a FOR loop.", "PARALLEL ne peut être ajouté qu'à une boucle FOR.", "PARALLEL kan kun tilføjes til en FOR-løkke.";
+    mod_reject_with => "WITH can only be added to a reported request (add REPORT first).", "WITH ne peut être ajouté qu'à une requête rapportée (ajoutez d'abord REPORT).", "WITH kan kun tilføjes til en rapporteret forespørgsel (tilføj REPORT først).";
+    mod_reject_as => "AS can only name a reported request or a single reported variable.", "AS ne peut nommer qu'une requête rapportée ou une seule variable rapportée.", "AS kan kun navngive en rapporteret forespørgsel eller én rapporteret variabel.";
+    mod_reject_statistics => "STATISTICS summarises a named column — drop it on a REPORT … AS … or a computed column", "STATISTICS résume une colonne nommée — déposez-le sur un REPORT … AS … ou une colonne calculée", "STATISTICS opsummerer en navngivet kolonne — slip den på et REPORT … AS … eller en beregnet kolonne";
+    mod_reject_request_only => "This can only be added to a reported request (add REPORT first).", "Ceci ne peut être ajouté qu'à une requête rapportée (ajoutez d'abord REPORT).", "Dette kan kun tilføjes til en rapporteret forespørgsel (tilføj REPORT først).";
+    mod_reject_compare_only => "This can only be added to a FOR … IN ENVS comparison loop.", "Ceci ne peut être ajouté qu'à une boucle de comparaison FOR … IN ENVS.", "Dette kan kun tilføjes til en FOR … IN ENVS-sammenligningsløkke.";
     report_node_edit_title => "Edit Node Line", "Modifier la ligne du nœud", "Rediger nodelinje";
     report_node_edit_hint => "Enter apply · Esc cancel", "Entrée appliquer · Échap annuler", "Enter anvend · Esc annuller";
     report_node_line_invalid => "Not a valid statement", "Instruction non valide", "Ikke en gyldig sætning";
@@ -608,7 +646,7 @@ strings! {
     report_node_alias_label => "Alias", "Alias", "Alias";
     report_node_alias_none => "(request name)", "(nom de la requête)", "(forespørgselsnavn)";
     report_node_envs_title => "Configure ENVS loop", "Configurer la boucle ENVS", "Konfigurer ENVS-løkke";
-    report_node_envs_hint => "↑↓ move · ←/→ pick env · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
+    report_node_envs_hint => "↑↓ move · ←/→ pick · Space toggle · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
     report_node_envs_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
     report_node_envs_mode_label => "Mode", "Mode", "Tilstand";
     report_node_envs_mode_plain => "Iterate", "Itérer", "Iterér";
@@ -617,11 +655,34 @@ strings! {
     report_node_envs_comparison => "Comparison", "Comparaison", "Sammenligning";
     report_node_envs_file => "FILE", "FILE", "FILE";
     report_node_envs_none => "no environments loaded — load one to pick", "aucun environnement chargé — en charger un pour choisir", "ingen miljøer indlæst — indlæs et for at vælge";
+    report_node_vars_title => "Report a variable", "Rapporter une variable", "Rapportér en variabel";
+    report_node_vars_hint => "↑↓ move · Space tick · type a name/alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace cocher · saisir un nom/alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum markér · skriv et navn/alias · Enter anvend · Esc annuller";
+    report_node_vars_other_label => "Other variable", "Autre variable", "Anden variabel";
+    report_node_vars_none => "no variables in scope here — type one below", "aucune variable disponible ici — saisissez-en une ci-dessous", "ingen variabler i omfang her — skriv en nedenfor";
+    report_node_computed_title => "Computed column", "Colonne calculée", "Beregnet kolonne";
+    report_node_computed_hint => "↑↓ move · type template/name · Space toggle stat · Enter apply · Esc cancel", "↑↓ déplacer · saisir modèle/nom · Espace bascule stat · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv skabelon/navn · Mellemrum skift statistik · Enter anvend · Esc annuller";
+    report_node_computed_template_label => "Template", "Modèle", "Skabelon";
+    report_node_computed_template_hint => "text with {{ vars }}", "texte avec {{ vars }}", "tekst med {{ vars }}";
+    report_node_computed_name_label => "Column name", "Nom de la colonne", "Kolonnenavn";
+    report_node_assign_hint => "↑↓ move · type name/value · Enter apply · Esc cancel", "↑↓ déplacer · saisir nom/valeur · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv navn/værdi · Enter anvend · Esc annuller";
+    report_node_list_hint => "↑↓ move · type value · Space add · Del remove · Enter apply · Esc cancel", "↑↓ déplacer · saisir la valeur · Espace ajouter · Suppr retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv værdi · Mellemrum tilføj · Del fjern · Enter anvend · Esc annuller";
+    report_node_list_add => "+ Add a value", "+ Ajouter une valeur", "+ Tilføj en værdi";
+    report_node_with_add => "+ Add a WITH field", "+ Ajouter un champ WITH", "+ Tilføj et WITH-felt";
+    report_node_with_title => "Configure WITH field", "Configurer le champ WITH", "Konfigurer WITH-felt";
+    report_node_with_hint => "↑↓ move · type name/query · Space toggle stat · Enter apply · Esc back", "↑↓ déplacer · saisir nom/requête · Espace bascule stat · Entrée appliquer · Échap retour", "↑↓ flyt · skriv navn/forespørgsel · Mellemrum skift statistik · Enter anvend · Esc tilbage";
+    report_node_with_name_label => "Column name", "Nom de la colonne", "Kolonnenavn";
+    report_node_with_query_label => "Query", "Requête", "Forespørgsel";
+    report_node_with_stats_label => "STATISTICS", "STATISTICS", "STATISTICS";
+    report_node_with_query_none => "whole response", "réponse entière", "hele svaret";
+    report_node_parallel_degree_label => "Max at once", "Maximum simultané", "Maks. samtidige";
+    report_node_parallel_degree_none => "no limit", "sans limite", "ingen grænse";
+    report_node_baseline_show_label => "SHOW from baseline", "SHOW depuis la référence", "SHOW fra reference";
     report_node_parallel_label => "Run PARALLEL", "Exécuter en PARALLÈLE", "Kør PARALLELT";
     checkbox_checked => "[x]", "[x]", "[x]";
     checkbox_unchecked => "[ ]", "[ ]", "[ ]";
     report_node_files_title => "Configure FILES loop", "Configurer la boucle FILES", "Konfigurer FILES-løkke";
-    report_node_files_hint => "↑↓ move · Space folder/parallel · type var/match · Enter apply · Esc cancel", "↑↓ déplacer · Espace dossier/parallèle · saisir var/match · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum mappe/parallel · skriv var/match · Enter anvend · Esc annuller";
+    report_node_folders_title => "Configure FOLDERS loop", "Configurer la boucle FOLDERS", "Konfigurer FOLDERS-løkke";
+    report_node_files_hint => "↑↓ move · Space folder/parallel · type var/match/limit · Enter apply · Esc cancel", "↑↓ déplacer · Espace dossier/parallèle · saisir var/match · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum mappe/parallel · skriv var/match · Enter anvend · Esc annuller";
     report_node_files_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
     report_node_files_folder_label => "Folder", "Dossier", "Mappe";
     report_node_files_match_label => "Match (glob)", "Filtre (glob)", "Match (glob)";
@@ -674,6 +735,7 @@ strings! {
     gui_hint_header => "Header", "En-tête", "Header";
     gui_hint_name => "name", "nom", "navn";
     gui_hint_query => "query", "requête", "forespørgsel";
+    gui_hint_description => "note", "note", "note";
     gui_hint_option => "option", "option", "indstilling";
     gui_hint_field => "field", "champ", "felt";
     gui_hint_key_upper => "KEY", "CLÉ", "NØGLE";
@@ -710,6 +772,8 @@ strings! {
     gui_untitled_request => "(untitled)", "(sans titre)", "(uden titel)";
     gui_run => "Run", "Exécuter", "Kør";
     gui_rename_ellipsis => "Rename…", "Renommer…", "Omdøb…";
+    gui_edited_request => "Edited — not saved yet", "Modifiée — pas encore enregistrée", "Ændret — endnu ikke gemt";
+    gui_edited_collection => "Has unsaved edits", "Contient des modifications non enregistrées", "Har ugemte ændringer";
     // Shared widgets.
     gui_add => "+ Add", "+ Ajouter", "+ Tilføj";
     gui_remove => "Remove", "Supprimer", "Fjern";
@@ -718,14 +782,15 @@ strings! {
     gui_menu_view => "View", "Affichage", "Vis";
     gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
     gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";
-    gui_open_collection_ellipsis => "Open collection…", "Ouvrir une collection…", "Åbn samling…";
-    gui_import_postman => "Import Postman…", "Importer Postman…", "Importér Postman…";
-    gui_open_environment_ellipsis => "Open environment…", "Ouvrir un environnement…", "Åbn miljø…";
-    gui_open_workspace_ellipsis => "Open workspace…", "Ouvrir un espace de travail…", "Åbn workspace…";
-    gui_save_collection_ellipsis => "Save collection…", "Enregistrer la collection…", "Gem samling…";
-    gui_save_response_ellipsis => "Save response…", "Enregistrer la réponse…", "Gem svar…";
-    gui_load_from_git => "Load from Git…", "Charger depuis Git…", "Indlæs fra Git…";
-    gui_save_collection_git => "Save collection to Git…", "Enregistrer la collection sur Git…", "Gem samling til Git…";
+    gui_menu_open => "Open", "Ouvrir", "Åbn";
+    gui_menu_open_git => "Open from Git", "Ouvrir depuis Git", "Åbn fra Git";
+    gui_menu_save => "Save", "Enregistrer", "Gem";
+    gui_menu_save_git => "Save to Git", "Enregistrer sur Git", "Gem til Git";
+    gui_menu_item_collection => "Collection…", "Collection…", "Samling…";
+    gui_menu_item_environment => "Environment…", "Environnement…", "Miljø…";
+    gui_menu_item_workspace => "Workspace…", "Espace de travail…", "Workspace…";
+    gui_menu_item_response => "Response…", "Réponse…", "Svar…";
+    gui_menu_item_collection_or_env => "Collection or environment…", "Collection ou environnement…", "Samling eller miljø…";
     gui_set_base_url => "Set base URL…", "Définir l'URL de base…", "Angiv basis-URL…";
     gui_close_tab => "Close tab", "Fermer l'onglet", "Luk fane";
     gui_quit => "Quit", "Quitter", "Afslut";
@@ -755,6 +820,16 @@ strings! {
     gui_open_workspace_title => "Open workspace folder", "Ouvrir un dossier d'espace de travail", "Åbn workspace-mappe";
     gui_not_a_folder => "That path is not a folder.", "Ce chemin n'est pas un dossier.", "Den sti er ikke en mappe.";
     gui_workspace_filter => "Filter", "Filtre", "Filter";
+    gui_ws_new => "New", "Nouveau", "Ny";
+    gui_ws_new_tooltip => "Add a collection, report or environment to this workspace", "Ajouter une collection, un rapport ou un environnement à cet espace de travail", "Tilføj en samling, rapport eller et miljø til dette arbejdsområde";
+    gui_ws_new_collection => "New collection…", "Nouvelle collection…", "Ny samling…";
+    gui_ws_new_report => "New report…", "Nouveau rapport…", "Ny rapport…";
+    gui_ws_new_environment => "New environment…", "Nouvel environnement…", "Nyt miljø…";
+    gui_ws_new_in_folder => "New in this folder", "Nouveau dans ce dossier", "Ny i denne mappe";
+    gui_ws_new_in_root => "New in this workspace", "Nouveau dans cet espace de travail", "Ny i dette arbejdsområde";
+    gui_ws_new_collection_title => "Name the new collection", "Nommez la nouvelle collection", "Navngiv den nye samling";
+    gui_ws_new_report_title => "Name the new report", "Nommez le nouveau rapport", "Navngiv den nye rapport";
+    gui_ws_new_environment_title => "Name the new environment", "Nommez le nouvel environnement", "Navngiv det nye miljø";
     gui_workspace_filter_tooltip => "Toggle showing only .hurl/.json/.vars/.trail files", "Basculer l'affichage des seuls fichiers .hurl/.json/.vars/.trail", "Skift visning af kun .hurl/.json/.vars/.trail-filer";
     gui_close => "Close", "Fermer", "Luk";
     gui_cancel => "Cancel", "Annuler", "Annuller";
@@ -802,6 +877,9 @@ strings! {
     node_form_alias => "Column name (AS)", "Nom de colonne (AS)", "Kolonnenavn (AS)";
     node_form_show => "Show fields (all ticked = show all)", "Afficher les champs (tous cochés = tout afficher)", "Vis felter (alle markeret = vis alle)";
     node_envs_environments => "Environments", "Environnements", "Miljøer";
+    node_envs_baseline_show => "SHOW — baseline fields to carry onto every comparison row", "SHOW — champs de référence à reporter sur chaque ligne de comparaison", "SHOW — referencefelter der føres over på hver sammenligningsrække";
+    node_envs_baseline_show_hint => "Ticked fields appear beside each comparison as baseline.<field>. Tick nothing for no SHOW clause.", "Les champs cochés apparaissent à côté de chaque comparaison sous la forme baseline.<champ>. Ne rien cocher = aucune clause SHOW.", "Afkrydsede felter vises ved siden af hver sammenligning som baseline.<felt>. Kryds intet af for ingen SHOW-klausul.";
+    node_envs_baseline_show_applies => "applies to this baseline only", "s'applique uniquement à cette référence", "gælder kun for denne reference";
     node_envs_add => "Add environment", "Ajouter un environnement", "Tilføj miljø";
     // VARIABLE / LIST / FOLDERS / raw-line node wizards (GUI).
     node_assign_title => "Set variable", "Définir une variable", "Sæt variabel";
@@ -813,6 +891,52 @@ strings! {
     node_folders_title => "Configure FOLDERS loop", "Configurer la boucle FOLDERS", "Konfigurer FOLDERS-løkke";
     node_raw_title => "Edit line", "Modifier la ligne", "Redigér linje";
     node_form_raw => "Statement text", "Texte de l'instruction", "Sætningstekst";
+    chip_help_begin => "BEGIN — where the report starts. Blocks above it set things up; blocks below it run in order.", "BEGIN — début du rapport. Les blocs au-dessus préparent le terrain ; ceux en dessous s'exécutent dans l'ordre.", "BEGIN — hvor rapporten starter. Blokke over den gør klar; blokke under den køres i rækkefølge.";
+    chip_help_hdr_collection => "COLLECTION — the requests this report runs against (its `# collection:` line). Pick one of the open collections; nothing can run until it is set.", "COLLECTION — la collection de requêtes utilisée par ce rapport (ligne `# collection:`). Choisissez une collection ouverte ; rien ne peut s'exécuter sans elle.", "COLLECTION — de forespørgsler rapporten køres mod (linjen `# collection:`). Vælg en åben samling; intet kan køre, før den er sat.";
+    chip_help_hdr_output => "OUTPUT — the format the results grid is written in when the report runs: csv, json, html or xlsx. The file itself is named after the report; only the command-line runner's -o flag takes a path.", "OUTPUT — le format dans lequel la grille de résultats est écrite à l'exécution : csv, json, html ou xlsx. Le fichier porte le nom du rapport ; seule l'option -o en ligne de commande accepte un chemin.", "OUTPUT — formatet resultatgitteret skrives i, når rapporten kører: csv, json, html eller xlsx. Selve filen opkaldes efter rapporten; kun kommandolinjens -o-flag tager en sti.";
+    chip_help_hdr_environment => "ENVIRONMENT — one loaded Global Environment to run with, instead of whichever is active. For comparing several, use a FOR … IN ENVS loop instead.", "ENVIRONMENT — un environnement global chargé à utiliser, au lieu de celui qui est actif. Pour en comparer plusieurs, utilisez plutôt une boucle FOR … IN ENVS.", "ENVIRONMENT — ét indlæst globalt miljø at køre med i stedet for det aktive. Skal flere sammenlignes, så brug en FOR … IN ENVS-løkke.";
+    chip_help_hdr_root => "ROOT — the folder that relative file paths in this report are resolved against. Defaults to the report's own folder.", "ROOT — le dossier auquel les chemins relatifs de ce rapport se rapportent. Par défaut, le dossier du rapport.", "ROOT — mappen som relative filstier i denne rapport slås op i forhold til. Som standard rapportens egen mappe.";
+    chip_help_hdr_baseline => "BASELINE — a saved run (`.baseline`) to diff this run against, filling the Result column. Ignored when the flow already compares environments.", "BASELINE — une exécution enregistrée (`.baseline`) à comparer à celle-ci, pour remplir la colonne Résultat. Ignoré si le flux compare déjà des environnements.", "BASELINE — en gemt kørsel (`.baseline`) at sammenligne denne med, som udfylder Resultat-kolonnen. Ignoreres, hvis flowet allerede sammenligner miljøer.";
+    chip_help_hdr_columns => "COLUMNS — the column order of the results grid, as a comma-separated list of names. Unnamed columns follow in the order they are reported.", "COLUMNS — l'ordre des colonnes de la grille de résultats, sous forme de liste de noms séparés par des virgules. Les colonnes non citées suivent dans leur ordre d'apparition.", "COLUMNS — kolonnerækkefølgen i resultatgitteret, som en kommasepareret liste af navne. Unævnte kolonner følger i den rækkefølge, de rapporteres.";
+    gui_report_settings_help => "Report settings — these apply to the whole report rather than running as a step, so they sit above BEGIN and can't be reordered or dragged.", "Réglages du rapport — ils s'appliquent à l'ensemble du rapport au lieu de s'exécuter comme une étape ; ils se placent donc au-dessus de BEGIN et ne peuvent être ni réordonnés ni déplacés.", "Rapportindstillinger — de gælder hele rapporten i stedet for at køre som et trin, så de ligger over BEGIN og kan ikke omarrangeres eller trækkes.";
+    gui_report_empty_flow => "No steps yet — drag a block here from the palette.", "Aucune étape pour l'instant — glissez un bloc ici depuis la palette.", "Ingen trin endnu — træk en blok herind fra paletten.";
+    gui_report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
+    gui_report_setting_unset => "not set", "non défini", "ikke sat";
+    gui_report_ws_collections => "In this workspace", "Dans cet espace de travail", "I dette arbejdsområde";
+    gui_report_other_collections => "Open elsewhere", "Ouvertes ailleurs", "Åbne andre steder";
+    gui_report_show_all_collections => "Show collections outside this workspace", "Afficher les collections hors de cet espace de travail", "Vis samlinger uden for dette arbejdsområde";
+    gui_report_collection_unsaved => "unsaved", "non enregistrée", "ikke gemt";
+    gui_report_no_collections => "No collections here yet — open one, or Browse\u{2026}", "Aucune collection ici pour l'instant — ouvrez-en une, ou Parcourir\u{2026}", "Ingen samlinger her endnu — åbn en, eller Gennemse\u{2026}";
+    gui_report_browse => "Browse…", "Parcourir…", "Gennemse…";
+    chip_help_flow_end => "END — where the report finishes. Everything between BEGIN and here runs, top to bottom.", "END — fin du rapport. Tout ce qui se trouve entre BEGIN et ici s'exécute, de haut en bas.", "END — hvor rapporten slutter. Alt mellem BEGIN og her køres oppefra og ned.";
+    chip_help_end => "END — closes the FOR loop above it. Drop blocks between the loop and its END to repeat them.", "END — ferme la boucle FOR au-dessus. Déposez des blocs entre la boucle et son END pour les répéter.", "END — afslutter FOR-løkken ovenfor. Slip blokke mellem løkken og dens END for at gentage dem.";
+    chip_help_request => "REQUEST — runs this request from the bound collection. Pick which one from the dropdown.", "REQUEST — exécute cette requête de la collection liée. Choisissez laquelle dans la liste déroulante.", "REQUEST — kører denne forespørgsel fra den tilknyttede samling. Vælg hvilken i rullelisten.";
+    chip_help_report => "REPORT — turns the line into report output. Detach it with × to run the request without reporting on it.", "REPORT — transforme la ligne en sortie de rapport. Détachez-le avec × pour exécuter la requête sans la rapporter.", "REPORT — gør linjen til rapportoutput. Fjern det med × for at køre forespørgslen uden at rapportere den.";
+    chip_help_response => "RESPONSE — includes the response body as a column. RAW keeps it verbatim, PRETTY re-formats JSON. Click to change.", "RESPONSE — inclut le corps de la réponse comme colonne. RAW le garde tel quel, PRETTY reformate le JSON. Cliquez pour changer.", "RESPONSE — medtager svarets indhold som en kolonne. RAW bevarer det ordret, PRETTY omformaterer JSON. Klik for at ændre.";
+    chip_help_show => "SHOW(…) — limits the report to just these fields. Without it every field is reported. Click to choose them.", "SHOW(…) — limite le rapport à ces seuls champs. Sans lui, tous les champs sont rapportés. Cliquez pour les choisir.", "SHOW(…) — begrænser rapporten til netop disse felter. Uden den rapporteres alle felter. Klik for at vælge dem.";
+    chip_help_hide => "HIDE(…) — removes these fields from the report, even ones SHOW selected. Click to choose them.", "HIDE(…) — retire ces champs du rapport, même ceux sélectionnés par SHOW. Cliquez pour les choisir.", "HIDE(…) — fjerner disse felter fra rapporten, også dem SHOW valgte. Klik for at vælge dem.";
+    chip_help_with => "WITH — the block below adds extra report columns from response queries. Use + to add one.", "WITH — le bloc ci-dessous ajoute des colonnes de rapport issues de requêtes sur la réponse. Utilisez + pour en ajouter une.", "WITH — blokken nedenfor tilføjer ekstra rapportkolonner fra svarforespørgsler. Brug + for at tilføje en.";
+    chip_help_alias => "AS — the column heading this appears under in the report. Type a new name to rename it.", "AS — l'en-tête de colonne sous lequel ceci apparaît dans le rapport. Saisissez un nouveau nom pour le renommer.", "AS — kolonneoverskriften dette vises under i rapporten. Skriv et nyt navn for at omdøbe den.";
+    chip_help_alias_required => "AS — the column heading for this computed value. It is required, so it can't be detached.", "AS — l'en-tête de colonne de cette valeur calculée. Il est obligatoire et ne peut pas être détaché.", "AS — kolonneoverskriften for denne beregnede værdi. Den er påkrævet og kan ikke fjernes.";
+    chip_help_var => "The value reported into the column — a variable set earlier in the flow, or a loop's variable.", "La valeur rapportée dans la colonne — une variable définie plus haut dans le flux, ou la variable d'une boucle.", "Værdien der rapporteres i kolonnen — en variabel sat tidligere i flowet eller en løkkes variabel.";
+    chip_help_computed => "A computed column: the quoted template is expanded with {{variables}} and reported under its AS name.", "Une colonne calculée : le modèle entre guillemets est développé avec {{variables}} et rapporté sous son nom AS.", "En beregnet kolonne: den citerede skabelon udvides med {{variabler}} og rapporteres under sit AS-navn.";
+    chip_help_assign => "Sets a variable for the rest of the flow. Open it to edit the name and value.", "Définit une variable pour la suite du flux. Ouvrez-le pour modifier le nom et la valeur.", "Sætter en variabel for resten af flowet. Åbn den for at redigere navn og værdi.";
+    chip_help_list => "Declares a named list of values that a FOR loop can iterate over. Open it to edit the entries.", "Déclare une liste nommée de valeurs qu'une boucle FOR peut parcourir. Ouvrez-la pour modifier les entrées.", "Erklærer en navngiven liste af værdier, som en FOR-løkke kan gennemløbe. Åbn den for at redigere posterne.";
+    chip_help_for => "FOR — repeats everything up to its END once per item. Open it to change the loop variable and its source.", "FOR — répète tout jusqu'à son END une fois par élément. Ouvrez-le pour changer la variable de boucle et sa source.", "FOR — gentager alt frem til sit END én gang pr. element. Åbn den for at ændre løkkevariablen og dens kilde.";
+    chip_help_parallel => "PARALLEL — runs the loop's iterations at the same time. Type a number to cap how many run at once; leave it blank to use the default.", "PARALLEL — exécute les itérations de la boucle en même temps. Saisissez un nombre pour limiter combien s'exécutent à la fois ; laissez vide pour la valeur par défaut.", "PARALLEL — kører løkkens gennemløb samtidigt. Skriv et tal for at begrænse hvor mange der kører ad gangen; lad det stå tomt for standarden.";
+    chip_help_for_envs => "FOR … IN ENVS — runs everything up to its END once per environment listed, with that environment's variables active. The name after FOR is what each run is labelled with in the report, not a value you set. Open it to choose the environments.", "FOR … IN ENVS — exécute tout jusqu'à son END une fois par environnement listé, avec les variables de cet environnement actives. Le nom après FOR sert d'étiquette à chaque exécution dans le rapport, ce n'est pas une valeur que vous définissez. Ouvrez-le pour choisir les environnements.", "FOR … IN ENVS — kører alt frem til sit END én gang pr. angivet miljø, med det miljøs variabler aktive. Navnet efter FOR er det, hver kørsel navngives med i rapporten, ikke en værdi du sætter. Åbn den for at vælge miljøerne.";
+    chip_help_baseline_show => "SHOW — the BASELINE's fields carried onto every comparison row. Belongs to the BASELINE beside it; edit it in the ENVS form.", "SHOW — les champs de la BASELINE reportés sur chaque ligne de comparaison. Appartient à la BASELINE voisine ; modifiable dans le formulaire ENVS.", "SHOW — BASELINE-felterne der føres over på hver sammenligningsrække. Hører til den BASELINE ved siden af; redigér den i ENVS-formularen.";
+    chip_help_baseline => "BASELINE — the environment the others are compared against. Pick it from the dropdown.", "BASELINE — l'environnement auquel les autres sont comparés. Choisissez-le dans la liste déroulante.", "BASELINE — det miljø de andre sammenlignes med. Vælg det i rullelisten.";
+    chip_help_comparison => "COMPARISON — an environment compared against the baseline. Pick it from the dropdown.", "COMPARISON — un environnement comparé à la référence. Choisissez-le dans la liste déroulante.", "COMPARISON — et miljø der sammenlignes med referencen. Vælg det i rullelisten.";
+    chip_help_statistics => "STATISTICS — summary rows (count, mean, …) for this column. Open the block to choose which.", "STATISTICS — lignes de synthèse (comptage, moyenne, …) pour cette colonne. Ouvrez le bloc pour les choisir.", "STATISTICS — opsummeringsrækker (antal, gennemsnit, …) for denne kolonne. Åbn blokken for at vælge hvilke.";
+    chip_help_drag_gesture => "Drag this chip out (or click ×) to remove just it · drop it on another line to move it there (Shift to copy) · Ctrl+drag to move the whole line", "Faites glisser cette puce (ou cliquez sur ×) pour ne retirer qu'elle · déposez-la sur une autre ligne pour l'y déplacer (Maj pour copier) · Ctrl+glisser pour déplacer toute la ligne", "Træk denne chip ud (eller klik på ×) for kun at fjerne den · slip den på en anden linje for at flytte den dertil (Shift for at kopiere) · Ctrl+træk for at flytte hele linjen";
+    chip_help_roles_fixed => "Environments for the comparison. This form (several environments, or a saved FILE snapshot) is edited in the loop's form — open the block to change it.", "Environnements de la comparaison. Cette forme (plusieurs environnements, ou un instantané FILE enregistré) se modifie dans le formulaire de la boucle — ouvrez le bloc pour la changer.", "Miljøer til sammenligningen. Denne form (flere miljøer eller et gemt FILE-øjebliksbillede) redigeres i løkkens formular — åbn blokken for at ændre den.";
+    node_form_hide => "Hide fields", "Masquer des champs", "Skjul felter";
+    node_form_hide_hint => "Ticked fields are removed from the report, even if shown above", "Les champs cochés sont retirés du rapport, même s'ils sont affichés ci-dessus", "Markerede felter fjernes fra rapporten, også selvom de vises ovenfor";
+    node_form_statistics => "Statistics", "Statistiques", "Statistik";
+    node_form_statistics_hint => "Summary rows added under this column", "Lignes de synthèse ajoutées sous cette colonne", "Opsummeringsrækker tilføjet under denne kolonne";
+    node_form_parallel_degree => "max", "max", "maks";
+    node_form_parallel_degree_label => "Max parallel steps (blank = use the default)", "Étapes parallèles max. (vide = valeur par défaut)", "Maks. parallelle trin (tomt = brug standarden)";
     // WITH-field wizard + inline block-editor helpers (GUI).
     node_with_title => "Report field (WITH)", "Champ de rapport (WITH)", "Rapportfelt (WITH)";
     node_with_name => "Column name", "Nom de colonne", "Kolonnenavn";
@@ -871,6 +995,85 @@ strings! {
     gui_git_err_branch_required => "Branch is required.", "La branche est requise.", "Gren er påkrævet.";
     gui_git_err_path_required => "Path in repository is required.", "Le chemin dans le dépôt est requis.", "Sti i lageret er påkrævet.";
     gui_git_err_path_relative => "Path must be relative and must not contain “..”.", "Le chemin doit être relatif et ne doit pas contenir « .. ».", "Stien skal være relativ og må ikke indeholde “..”.";
+    gui_git_load_workspace_title => "Load workspace from Git", "Charger un espace de travail depuis Git", "Indlæs workspace fra Git";
+    gui_git_ws_pick_filter => "Choose which files to download. Nothing else in the repository is ever fetched.", "Choisissez les fichiers à télécharger. Rien d'autre dans le dépôt n'est jamais récupéré.", "Vælg hvilke filer der skal hentes. Intet andet i lageret bliver nogensinde hentet.";
+    gui_git_ws_match_count => "{n} of {total} files match", "{n} fichiers sur {total} correspondent", "{n} af {total} filer matcher";
+    gui_git_ws_download => "Download", "Télécharger", "Hent";
+    gui_git_ws_storage_title => "Keep this workspace?", "Conserver cet espace de travail ?", "Behold dette workspace?";
+    gui_git_ws_folder_name => "Folder name", "Nom du dossier", "Mappenavn";
+    gui_git_err_ws_no_matches => "No files in this repository matched that filter.", "Aucun fichier de ce dépôt ne correspond à ce filtre.", "Ingen filer i dette lager matchede det filter.";
+    gui_git_err_ws_name_required => "A folder name is required.", "Un nom de dossier est requis.", "Et mappenavn er påkrævet.";
+    gui_git_err_ws_exists => "That folder already exists — choose another name.", "Ce dossier existe déjà — choisissez un autre nom.", "Den mappe findes allerede — vælg et andet navn.";
+    gui_close_git_workspace_title => "Close downloaded workspace", "Fermer l'espace de travail téléchargé", "Luk downloadet workspace";
+    gui_workspace_reload_title => "Workspace files are missing", "Les fichiers de l'espace de travail sont introuvables", "Workspace-filer mangler";
+    gui_workspace_reload_yes => "Redownload", "Retélécharger", "Hent igen";
+    gui_workspace_reload_no => "Leave it empty", "Le laisser vide", "Lad den være tom";
+
+    // ── Report validation ────────────────────────────────────────────────
+    // These read in the terms of whatever front-end is showing them (a
+    // "collection setting", not a `# collection:` header), because the block
+    // editor never shows the source syntax the directive is written in.
+    // `{}` placeholders are filled in order by `fill`.
+    diag_collection_unset => "No collection chosen — a report has nothing to run against until one is set.", "Aucune collection choisie — un rapport n'a rien à exécuter tant qu'aucune n'est définie.", "Ingen samling valgt — en rapport har intet at køre mod, før en er sat.";
+    diag_output_unsupported => "Unsupported output format '{}' — supported formats are {}.", "Format de sortie '{}' non pris en charge — les formats acceptés sont {}.", "Outputformatet '{}' understøttes ikke — de understøttede formater er {}.";
+    diag_duplicate_column => "Two columns are both headed '{}' — give each one a distinct name with AS.", "Deux colonnes portent le même titre '{}' — donnez à chacune un nom distinct avec AS.", "To kolonner har begge overskriften '{}' — giv hver af dem et særskilt navn med AS.";
+    diag_environment_unset => "The environment setting is empty — either name an environment or remove the setting.", "Le réglage d'environnement est vide — nommez un environnement ou supprimez le réglage.", "Miljøindstillingen er tom — navngiv et miljø, eller fjern indstillingen.";
+    diag_environment_not_loaded => "Environment '{}' is not loaded.", "L'environnement '{}' n'est pas chargé.", "Miljøet '{}' er ikke indlæst.";
+    diag_baseline_ignored => "The baseline setting is ignored, because this report already compares a BASELINE environment with COMPARISON environments.", "Le réglage baseline est ignoré, car ce rapport compare déjà un environnement BASELINE à des environnements COMPARISON.", "Baseline-indstillingen ignoreres, fordi denne rapport allerede sammenligner et BASELINE-miljø med COMPARISON-miljøer.";
+    diag_baseline_missing => "The baseline snapshot '{}' was not found at {}.", "L'instantané baseline '{}' est introuvable à {}.", "Baseline-øjebliksbilledet '{}' blev ikke fundet på {}.";
+    diag_no_columns => "This report emits no columns, so it will produce an empty table — attach REPORT to a request to make it one.", "Ce rapport ne produit aucune colonne, il donnera donc un tableau vide — attachez REPORT à une requête pour en créer une.", "Denne rapport udsender ingen kolonner, så den giver en tom tabel — sæt REPORT på en forespørgsel for at lave en.";
+    diag_collection_not_loaded => "The collection isn't loaded, so request names can't be checked yet.", "La collection n'est pas chargée, les noms de requêtes ne peuvent donc pas encore être vérifiés.", "Samlingen er ikke indlæst, så forespørgselsnavne kan ikke tjekkes endnu.";
+    diag_list_shadowed => "LIST '{}' hides an earlier list of the same name.", "LIST '{}' masque une liste antérieure du même nom.", "LIST '{}' skjuler en tidligere liste med samme navn.";
+    diag_show_unknown => "SHOW field '{}' on request '{}' isn't a field that request produces, so it will be ignored.", "Le champ SHOW '{}' de la requête '{}' n'est pas un champ produit par cette requête, il sera donc ignoré.", "SHOW-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer, så det ignoreres.";
+    diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
+    diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
+    diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
+    diag_request_not_found => "Request '{}' was not found in the bound collection.", "La requête '{}' est introuvable dans la collection liée.", "Forespørgslen '{}' blev ikke fundet i den bundne samling.";
+    diag_request_ambiguous_leaf => "Request '{}' is ambiguous — {} requests end with that name; qualify it with its folder path.", "La requête '{}' est ambiguë — {} requêtes se terminent par ce nom\u{a0}; qualifiez-la avec son chemin de dossier.", "Forespørgslen '{}' er tvetydig — {} forespørgsler slutter med det navn; kvalificér den med dens mappesti.";
+    diag_envs_empty => "This ENVS loop has no environments to run over.", "Cette boucle ENVS n'a aucun environnement à parcourir.", "Denne ENVS-løkke har ingen miljøer at køre over.";
+    diag_baseline_multiple => "At most one BASELINE environment is allowed.", "Un seul environnement BASELINE est autorisé.", "Højst ét BASELINE-miljø er tilladt.";
+    diag_comparison_missing => "A BASELINE needs at least one COMPARISON environment to be compared against.", "Une BASELINE a besoin d'au moins un environnement COMPARISON auquel se comparer.", "En BASELINE har brug for mindst ét COMPARISON-miljø at blive sammenlignet med.";
+    diag_pattern_before_rest => "The pattern binds {} names before '...' but the producer yields only {}.", "Le motif lie {} noms avant '...' alors que le producteur n'en fournit que {}.", "Mønstret binder {} navne før '...', men produceren giver kun {}.";
+    diag_pattern_arity => "The pattern binds {} name(s) but the producer yields {} per item — use '_' to discard one or '...' to absorb the extras.", "Le motif lie {} nom(s) alors que le producteur en fournit {} par élément — utilisez '_' pour en ignorer un ou '...' pour absorber le reste.", "Mønstret binder {} navn(e), men produceren giver {} pr. element — brug '_' til at kassere et eller '...' til at opsamle resten.";
+    diag_unknown_list => "Unknown list '{}' — declare it with LIST {} = … before using it.", "Liste '{}' inconnue — déclarez-la avec LIST {} = … avant de l'utiliser.", "Ukendt liste '{}' — erklær den med LIST {} = … før du bruger den.";
+    diag_list_arity => "The list elements have inconsistent arity — a mix of scalars and tuples of different sizes.", "Les éléments de la liste ont une arité incohérente — un mélange de scalaires et de tuples de tailles différentes.", "Listens elementer har inkonsistent aritet — en blanding af skalarer og tupler af forskellig størrelse.";
+    diag_concat_arity => "The CONCAT inputs have inconsistent arity — every input must yield the same number of values per item.", "Les entrées de CONCAT ont une arité incohérente — chaque entrée doit fournir le même nombre de valeurs par élément.", "CONCAT-inputtene har inkonsistent aritet — hvert input skal give det samme antal værdier pr. element.";
+    diag_var_maybe_undefined => "Request '{}' uses {} which may not be set at this point in the flow — add it to the environment, or assign it before this request.", "La requête '{}' utilise {} qui pourrait ne pas être défini à ce stade du flux — ajoutez-le à l'environnement ou affectez-le avant cette requête.", "Forespørgslen '{}' bruger {}, som måske ikke er sat på dette punkt i forløbet — føj den til miljøet, eller tildel den før denne forespørgsel.";
+}
+
+impl Strings {
+    /// The English strings as a shared static.
+    ///
+    /// For the places that have no language of their own to consult — the
+    /// headless runner, and test fixtures that care about *which* diagnostic
+    /// fired rather than how it reads.
+    pub fn english() -> &'static Strings {
+        static EN: std::sync::OnceLock<Strings> = std::sync::OnceLock::new();
+        EN.get_or_init(|| Strings::for_language(&Language::English))
+    }
+}
+
+/// Fill the `{}` placeholders of a translated template, in order.
+///
+/// `format!` needs a literal, so a translated string with runtime values in it
+/// can't go through it. Extra placeholders are left as-is and extra arguments
+/// are ignored, so a mistranslation that drops or adds a `{}` degrades to odd
+/// text rather than a panic — a validation message is not worth crashing over.
+pub fn fill(template: &str, args: &[&str]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    for arg in args {
+        match rest.split_once("{}") {
+            Some((before, after)) => {
+                out.push_str(before);
+                out.push_str(arg);
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A language-independent status / notification message. It stores *what*
@@ -953,6 +1156,20 @@ pub enum Status {
     /// resolved, it lands outside the workspace root (holds the relative path
     /// that was attempted). See [`crate::tui::reports`]'s containment guard.
     WorkspaceReportEscaped(String),
+    /// A new workspace file was created (graphical front-end).
+    WsItemCreated(String),
+    /// The destination for a new workspace file resolved outside the root.
+    WsItemEscaped(String),
+    /// A file of that name is already there.
+    WsItemExists(String),
+    /// The name typed doesn't say which of the three kinds it should be.
+    WsItemUnknownKind(String),
+    /// A workspace file or folder was dragged into another folder.
+    WsItemMoved(String),
+    /// The destination folder already holds something of that name.
+    WsItemMoveExists(String),
+    /// A folder was dropped on itself or one of its own descendants.
+    WsItemMoveIntoItself,
     /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
     /// URL, which is the one field a request can't be saved without — the
     /// wizard is kept open (focused on the URL field) instead of silently
@@ -1136,6 +1353,13 @@ impl Status {
             Status::WorkspaceReportEscaped(name) => {
                 s.workspace_report_escaped.replace("{name}", name)
             }
+            Status::WsItemCreated(name) => s.ws_item_created.replace("{name}", name),
+            Status::WsItemEscaped(name) => s.ws_item_escaped.replace("{name}", name),
+            Status::WsItemExists(name) => s.ws_item_exists.replace("{name}", name),
+            Status::WsItemUnknownKind(name) => s.ws_item_unknown_kind.replace("{name}", name),
+            Status::WsItemMoved(name) => s.ws_item_moved.replace("{name}", name),
+            Status::WsItemMoveExists(name) => s.ws_item_move_exists.replace("{name}", name),
+            Status::WsItemMoveIntoItself => s.ws_item_move_into_itself.to_string(),
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),

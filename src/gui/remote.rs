@@ -3,10 +3,15 @@
 //! read/written are fetched), driven by the shared [`crate::git_remote`]
 //! module (the same core the terminal UI uses).
 //!
+//! A whole **Workspace** can be loaded this way too: instead of picking one
+//! file, you pick a file-*type* filter and every matching file in the chosen
+//! ref is checked out into a throwaway folder that becomes the new tab's
+//! workspace root (see [`LoadTarget::Workspace`]).
+//!
 //! All git state lives here so the rest of the GUI only needs a single
 //! [`RemoteUi`] field on [`GuiApp`] plus one [`show`] call per frame; menu
 //! entries kick a flow off with [`RemoteUi::open_load`] /
-//! [`RemoteUi::open_save_collection`] / [`RemoteUi::open_save_environment`].
+//! [`RemoteUi::open_load_workspace`] / [`RemoteUi::open_save_collection`].
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -17,6 +22,7 @@ use eframe::egui;
 
 use crate::git_remote::{self, GitOrigin, RefKind, RemoteRefs};
 use crate::i18n::{Status, Strings};
+use crate::tui::remote::{WorkspaceGitFilter, WorkspaceGitOrigin};
 
 use super::app::GuiApp;
 
@@ -40,11 +46,28 @@ enum SaveTarget {
     Collection(usize),
 }
 
+/// What a load flow is fetching: one file (a collection or an environment,
+/// told apart by its extension once picked), or every file matching a
+/// [`WorkspaceGitFilter`] as a whole Workspace tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadTarget {
+    File,
+    Workspace,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadStep {
     Connect,
     PickRef,
     PickFile,
+    /// Workspace load only: choose which file types to actually download,
+    /// before anything is checked out. A repo may hold plenty of large,
+    /// unrelated files that have no business being pulled down just to browse
+    /// its collections, so nothing is fetched until this is answered.
+    PickWorkspaceFilter,
+    /// Workspace load only: the files are downloaded and sitting in a temp
+    /// folder — keep it there, or copy it somewhere permanent right now?
+    WorkspaceStorage,
 }
 
 /// A temp repo returned by `git_remote::list_files`.
@@ -53,28 +76,47 @@ enum LoadStep {
 /// worker result can be abandoned in a channel, or the user can cancel at many
 /// points in the wizard. Keeping the cleanup tied to ownership is the most
 /// reliable way to avoid token-bearing git remotes lingering on disk.
+///
+/// A Workspace load is the one case that *keeps* the folder — the checkout
+/// becomes the tab's live workspace root — so it takes ownership away with
+/// [`RepoHandle::keep`], which disarms the drop.
 struct RepoHandle {
-    path: PathBuf,
+    /// `None` only after [`Self::keep`] has handed the folder to a caller who
+    /// now owns it; `Drop` then has nothing to clean up.
+    path: Option<PathBuf>,
 }
 
 impl RepoHandle {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path: Some(path) }
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.path
+            .as_deref()
+            .expect("RepoHandle used after its folder was given away")
+    }
+
+    /// Take the folder out of the handle: the caller owns it from here and it
+    /// will **not** be scrubbed or deleted on drop.
+    fn keep(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("RepoHandle used after its folder was given away")
     }
 }
 
 impl Drop for RepoHandle {
     fn drop(&mut self) {
-        git_remote::scrub_remote(&self.path);
-        git_remote::cleanup(&self.path);
+        if let Some(path) = &self.path {
+            git_remote::scrub_remote(path);
+            git_remote::cleanup(path);
+        }
     }
 }
 
 struct LoadFlow {
+    target: LoadTarget,
     step: LoadStep,
     url: String,
     token: String,
@@ -89,14 +131,23 @@ struct LoadFlow {
     filter: String,
     show_all_files: bool,
     selected_path: Option<String>,
+    /// Workspace load only: which file types to download.
+    ws_filter: WorkspaceGitFilter,
+    /// Workspace load only: the downloaded folder, held between the
+    /// `WorkspaceStorage` question and the answer that consumes it.
+    ws_root: Option<PathBuf>,
+    /// Workspace load only: the name proposed for the tab (and for a
+    /// permanent folder), derived from the repo URL.
+    ws_name: String,
     error: Option<String>,
     rx: Option<Receiver<WorkerMsg>>,
     busy_label: Option<&'static str>,
 }
 
 impl LoadFlow {
-    fn new() -> Self {
+    fn new(target: LoadTarget) -> Self {
         Self {
+            target,
             step: LoadStep::Connect,
             url: String::new(),
             token: String::new(),
@@ -111,6 +162,9 @@ impl LoadFlow {
             filter: String::new(),
             show_all_files: false,
             selected_path: None,
+            ws_filter: WorkspaceGitFilter::HurlAndJson,
+            ws_root: None,
+            ws_name: String::new(),
             error: None,
             rx: None,
             busy_label: None,
@@ -150,6 +204,31 @@ impl LoadFlow {
             .collect()
     }
 
+    /// The repo files the current [`WorkspaceGitFilter`] would download.
+    fn workspace_matches(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|p| self.ws_filter.matches(p))
+            .cloned()
+            .collect()
+    }
+
+    /// The provenance recorded on the new Workspace tab, pinned to the exact
+    /// commit the listing was fetched at (not just the branch name) so a later
+    /// redownload restores precisely these files. `None` if the ref or sha is
+    /// somehow missing — both are always set before a download is spawned.
+    fn workspace_origin(&self) -> Option<WorkspaceGitOrigin> {
+        let gitref = self.chosen_gitref.as_deref()?;
+        let (ref_kind, ref_name) = git_remote::parse_ref_kind(gitref);
+        Some(WorkspaceGitOrigin {
+            repo_url: self.url.trim().to_string(),
+            commit_sha: self.commit_sha.clone()?,
+            ref_kind,
+            ref_name,
+            filter: self.ws_filter,
+        })
+    }
+
     fn poll(&mut self, app: &mut GuiApp) -> bool {
         let Some(msg) = poll_worker(
             &mut self.rx,
@@ -187,9 +266,16 @@ impl LoadFlow {
                     self.files = files;
                     self.filter.clear();
                     self.show_all_files = false;
-                    self.selected_path = self.visible_files().first().cloned();
-                    self.step = LoadStep::PickFile;
                     self.error = None;
+                    match self.target {
+                        // A Workspace load never picks a single file — it
+                        // chooses which *types* to download instead.
+                        LoadTarget::Workspace => self.step = LoadStep::PickWorkspaceFilter,
+                        LoadTarget::File => {
+                            self.selected_path = self.visible_files().first().cloned();
+                            self.step = LoadStep::PickFile;
+                        }
+                    }
                 }
                 Err(e) => {
                     self.step = LoadStep::PickRef;
@@ -208,11 +294,45 @@ impl LoadFlow {
                     }
                 }
             }
+            WorkerMsg::Workspace(result) => match result {
+                Ok(()) => {
+                    // The checkout succeeded, so the temp folder is now the
+                    // Workspace's live content rather than a scratch clone —
+                    // take it away from the handle so it survives.
+                    let Some(repo) = self.repo.take() else {
+                        self.error = Some(app.strings.gui_git_err_browse_again.to_string());
+                        return false;
+                    };
+                    self.ws_root = Some(repo.keep());
+                    self.ws_name = file_stem_from_url(&self.url);
+                    self.error = None;
+                    self.step = LoadStep::WorkspaceStorage;
+                }
+                Err(e) => {
+                    self.step = LoadStep::PickWorkspaceFilter;
+                    self.error = Some(e);
+                }
+            },
             WorkerMsg::Save(_) => {
                 self.error = Some(app.strings.gui_git_err_unexpected_save.to_string());
             }
         }
         false
+    }
+
+    /// Create the Workspace tab from the downloaded folder now sitting at
+    /// `ws_root`, and close the wizard. Returns `false` (leaving the dialog
+    /// open on its error) if the download was somehow lost.
+    fn finish_workspace(&mut self, app: &mut GuiApp) -> bool {
+        let Some(root) = self.ws_root.take() else {
+            self.error = Some(app.strings.gui_git_err_browse_again.to_string());
+            return false;
+        };
+        let name = nonblank(&self.ws_name).unwrap_or_else(|| file_stem_from_url(&self.url));
+        remember_git_url(&mut app.session, &self.url);
+        app.session
+            .open_workspace_from_git(root, name, self.workspace_origin());
+        true
     }
 
     fn finish_loaded_content(&mut self, app: &mut GuiApp, content: String) -> bool {
@@ -346,7 +466,10 @@ impl SaveFlow {
                     false
                 }
             },
-            WorkerMsg::Refs(_) | WorkerMsg::Files(_) | WorkerMsg::Content(_) => {
+            WorkerMsg::Refs(_)
+            | WorkerMsg::Files(_)
+            | WorkerMsg::Content(_)
+            | WorkerMsg::Workspace(_) => {
                 self.error = Some(app.strings.gui_git_err_unexpected_load.to_string());
                 false
             }
@@ -368,6 +491,9 @@ impl SaveFlow {
                     return false;
                 };
                 col.git_origin = Some(origin);
+                // The push is the collection's save — clear its edit markers
+                // exactly as a local Save does.
+                col.mark_saved();
             }
         }
 
@@ -382,6 +508,10 @@ enum WorkerMsg {
     Refs(Result<RemoteRefs, String>),
     Files(Result<(Vec<String>, RepoHandle, String), String>),
     Content(Result<String, String>),
+    /// A Workspace's filtered batch of files finished checking out into the
+    /// temp repo the flow already holds (so the folder itself isn't sent
+    /// across the channel, and a cancelled flow still cleans it up on drop).
+    Workspace(Result<(), String>),
     Save(Result<String, String>),
 }
 
@@ -395,6 +525,12 @@ enum UiAction {
     BrowseFiles,
     BackToRefs,
     LoadFile,
+    /// Download the Workspace files matching the chosen filter.
+    DownloadWorkspace,
+    /// Keep the downloaded Workspace in its temp folder and open it.
+    KeepWorkspaceTemp,
+    /// Copy the downloaded Workspace somewhere permanent, then open that.
+    SaveWorkspacePermanently,
     Save,
 }
 
@@ -408,7 +544,13 @@ struct UiColors {
 impl RemoteUi {
     /// Begin loading a collection/environment from a git remote.
     pub fn open_load(&mut self) {
-        self.flow = Some(Flow::Load(LoadFlow::new()));
+        self.flow = Some(Flow::Load(LoadFlow::new(LoadTarget::File)));
+    }
+
+    /// Begin loading a whole Workspace (every file matching a chosen type
+    /// filter) from a git remote.
+    pub fn open_load_workspace(&mut self) {
+        self.flow = Some(Flow::Load(LoadFlow::new(LoadTarget::Workspace)));
     }
 
     /// Begin saving collection `ci` to a git remote.
@@ -460,7 +602,17 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     let mut close = false;
     match action {
         UiAction::None => {}
-        UiAction::Cancel => close = true,
+        UiAction::Cancel => {
+            // A cancel after the download has landed (only reachable if a
+            // future step adds a cancel button past `WorkspaceStorage`) must
+            // not strand the checkout on disk with nothing referencing it.
+            if let Flow::Load(load) = &mut flow
+                && let Some(root) = load.ws_root.take()
+            {
+                git_remote::cleanup(&root);
+            }
+            close = true;
+        }
         UiAction::Connect => {
             if let Flow::Load(load) = &mut flow {
                 start_list_refs(load, &app.strings);
@@ -489,6 +641,26 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
                 start_checkout(load, &app.strings);
             }
         }
+        UiAction::DownloadWorkspace => {
+            if let Flow::Load(load) = &mut flow {
+                start_workspace_checkout(load, &app.strings);
+            }
+        }
+        UiAction::KeepWorkspaceTemp => {
+            if let Flow::Load(load) = &mut flow
+                && load.finish_workspace(app)
+            {
+                return;
+            }
+        }
+        UiAction::SaveWorkspacePermanently => {
+            if let Flow::Load(load) = &mut flow
+                && save_workspace_permanently(load, app)
+                && load.finish_workspace(app)
+            {
+                return;
+            }
+        }
         UiAction::Save => {
             if let Flow::Save(save) = &mut flow {
                 start_save(save, app);
@@ -509,7 +681,10 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
 impl Flow {
     fn title(&self, s: &Strings) -> &'static str {
         match self {
-            Flow::Load(_) => s.gui_git_load_title,
+            Flow::Load(load) => match load.target {
+                LoadTarget::File => s.gui_git_load_title,
+                LoadTarget::Workspace => s.gui_git_load_workspace_title,
+            },
             Flow::Save(_) => s.gui_git_save_collection_title,
         }
     }
@@ -563,7 +738,116 @@ fn draw_load(ui: &mut egui::Ui, load: &mut LoadFlow, colors: UiColors, s: &Strin
         LoadStep::Connect => draw_load_connect(ui, load, busy, colors, s),
         LoadStep::PickRef => draw_load_pick_ref(ui, load, busy, colors, s),
         LoadStep::PickFile => draw_load_pick_file(ui, load, busy, colors, s),
+        LoadStep::PickWorkspaceFilter => draw_load_workspace_filter(ui, load, busy, colors, s),
+        LoadStep::WorkspaceStorage => draw_load_workspace_storage(ui, load, busy, colors, s),
     }
+}
+
+/// Workspace load, step 3: pick which file types to download. Nothing has been
+/// fetched from the repo yet beyond its *listing*, so this is the last chance
+/// to keep a repo full of large, unrelated files off the user's disk.
+fn draw_load_workspace_filter(
+    ui: &mut egui::Ui,
+    load: &mut LoadFlow,
+    busy: bool,
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
+    let mut action = UiAction::None;
+
+    if let Some(sha) = &load.commit_sha {
+        ui.colored_label(
+            colors.dim,
+            format!("{} {}", s.gui_git_fetched_at, short_sha(sha)),
+        );
+    }
+    ui.colored_label(colors.dim, s.gui_git_ws_pick_filter);
+    ui.add_space(4.0);
+    ui.add_enabled_ui(!busy, |ui| {
+        for choice in WorkspaceGitFilter::ALL {
+            ui.radio_value(&mut load.ws_filter, choice, choice.label(s));
+        }
+    });
+
+    let matched = load.workspace_matches().len();
+    ui.add_space(4.0);
+    ui.colored_label(
+        colors.dim,
+        s.gui_git_ws_match_count
+            .replace("{n}", &matched.to_string())
+            .replace("{total}", &load.files.len().to_string()),
+    );
+    if matched == 0 {
+        ui.colored_label(colors.err, s.gui_git_err_ws_no_matches);
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !busy && load.repo.is_some() && matched > 0,
+                egui::Button::new(s.gui_git_ws_download),
+            )
+            .clicked()
+        {
+            action = UiAction::DownloadWorkspace;
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new(s.gui_git_back))
+            .clicked()
+        {
+            action = UiAction::BackToRefs;
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new(s.gui_cancel))
+            .clicked()
+        {
+            action = UiAction::Cancel;
+        }
+    });
+
+    action
+}
+
+/// Workspace load, step 4: the files are on disk in a throwaway folder. Keep
+/// them there (nothing is ever cleaned up automatically, so the folder lives as
+/// long as the tab does), or copy them somewhere permanent right now.
+fn draw_load_workspace_storage(
+    ui: &mut egui::Ui,
+    load: &mut LoadFlow,
+    busy: bool,
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
+    let mut action = UiAction::None;
+
+    ui.colored_label(colors.accent, s.gui_git_ws_storage_title);
+    ui.add_space(4.0);
+    ui.colored_label(colors.dim, s.git_workspace_storage_q);
+    ui.add_space(6.0);
+    ui.colored_label(colors.accent, s.gui_git_ws_folder_name);
+    ui.add_enabled(
+        !busy,
+        egui::TextEdit::singleline(&mut load.ws_name).desired_width(f32::INFINITY),
+    );
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, egui::Button::new(s.git_workspace_storage_choose))
+            .clicked()
+        {
+            action = UiAction::SaveWorkspacePermanently;
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new(s.git_workspace_storage_temp))
+            .clicked()
+        {
+            action = UiAction::KeepWorkspaceTemp;
+        }
+    });
+
+    action
 }
 
 fn draw_load_connect(
@@ -930,6 +1214,63 @@ fn start_save(save: &mut SaveFlow, app: &mut GuiApp) {
     save.busy_label = Some(app.strings.gui_git_saving);
 }
 
+fn start_workspace_checkout(load: &mut LoadFlow, s: &Strings) {
+    let Some(repo) = &load.repo else {
+        load.error = Some(s.gui_git_err_browse_again.to_string());
+        return;
+    };
+    let matched = load.workspace_matches();
+    if matched.is_empty() {
+        load.error = Some(s.gui_git_err_ws_no_matches.to_string());
+        return;
+    }
+    load.error = None;
+    load.rx = Some(spawn_workspace_checkout(repo.path().to_path_buf(), matched));
+    load.busy_label = Some(s.git_loading_workspace_files);
+}
+
+/// Copy the just-downloaded Workspace out of its temp folder into a permanent
+/// location the user picks, and repoint the flow at the copy. Returns `false`
+/// (leaving the storage step open, with an error where it's the user's to fix)
+/// if the user cancelled the picker or the copy failed — the temp folder is
+/// kept in that case rather than losing the download outright.
+fn save_workspace_permanently(load: &mut LoadFlow, app: &mut GuiApp) -> bool {
+    let Some(source) = load.ws_root.clone() else {
+        load.error = Some(app.strings.gui_git_err_browse_again.to_string());
+        return false;
+    };
+    let Some(name) = nonblank(&load.ws_name) else {
+        load.error = Some(app.strings.gui_git_err_ws_name_required.to_string());
+        return false;
+    };
+    let Some(parent) = super::filepick::pick_folder(
+        app.strings.git_workspace_storage_choose,
+        app.session.last_browse_dir.as_deref(),
+    ) else {
+        return false; // cancelled — stay on the question, keep it temporary
+    };
+
+    // Copy into `<chosen folder>/<name>` rather than straight into the chosen
+    // folder, so picking an existing folder full of unrelated files can never
+    // mix the workspace into it.
+    let dest = parent.join(&name);
+    if dest.exists() {
+        load.error = Some(app.strings.gui_git_err_ws_exists.to_string());
+        return false;
+    }
+    if let Err(e) = crate::workspace::copy_dir_all(&source, &dest) {
+        load.error = Some(e.to_string());
+        return false;
+    }
+
+    // The copy is the workspace now; the temp download has served its purpose.
+    git_remote::cleanup(&source);
+    app.session.last_browse_dir = Some(parent);
+    app.session.status = Some(Status::WorkspaceSaved);
+    load.ws_root = Some(dest);
+    true
+}
+
 fn spawn_list_refs(url: String, token: Option<String>) -> Receiver<WorkerMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -955,6 +1296,22 @@ fn spawn_checkout(repo: PathBuf, path: String) -> Receiver<WorkerMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let _ = tx.send(WorkerMsg::Content(git_remote::checkout_file(&repo, &path)));
+    });
+    rx
+}
+
+/// Check out a Workspace's filtered batch of `paths` into `repo`, which the
+/// flow keeps as the new tab's workspace root. The folder outlives the wizard
+/// on success, so its `origin` remote is dropped first — otherwise the access
+/// token used to fetch it would sit in the kept folder's `.git/config`.
+fn spawn_workspace_checkout(repo: PathBuf, paths: Vec<String>) -> Receiver<WorkerMsg> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = git_remote::checkout_files(&repo, &paths);
+        if result.is_ok() {
+            git_remote::scrub_remote(&repo);
+        }
+        let _ = tx.send(WorkerMsg::Workspace(result));
     });
     rx
 }
@@ -1024,6 +1381,23 @@ fn name_from_repo_path(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string()
+}
+
+/// A tab name for a Workspace loaded from `url`: the repository's own name
+/// (`…/team/api-tests.git` → `api-tests`). The folder it was downloaded into is
+/// a meaningless temp path, so the URL is the only human-readable source.
+fn file_stem_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let last = trimmed
+        .rsplit(['/', ':'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(trimmed);
+    let stem = last.strip_suffix(".git").unwrap_or(last).trim();
+    if stem.is_empty() {
+        "workspace".to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 fn default_save_path(name: &str, local_path: Option<&Path>, ext: &str) -> String {

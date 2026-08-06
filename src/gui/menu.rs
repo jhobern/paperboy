@@ -8,6 +8,7 @@ use eframe::egui::{self, Align2, RichText};
 
 use crate::i18n::{Language, Strings};
 use crate::request::RequestView;
+use crate::session::PickerKind;
 use crate::theme::{THEME_COLOR_COUNT, ThemeSpec, is_builtin};
 
 use super::app::{Dialog, GuiApp, OpenKind, PromptKind, RenameTarget, SaveKind};
@@ -41,6 +42,13 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
 }
 
+/// The File menu. Grouped into submenus by *verb* (New / Open / Save) rather
+/// than one flat list, because the local and Git variants of each had grown to
+/// a dozen sibling entries where "open" and "save" items were interleaved.
+///
+/// There is deliberately no separate "Import Postman" entry: Open ▸ Collection
+/// sniffs Postman JSON and Hurl alike, so a second command pointing at exactly
+/// the same loader only made the menu longer.
 fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
     ui.menu_button(app.strings.gui_menu_file, |ui| {
         if ui.button(app.strings.gui_new_collection_ellipsis).clicked() {
@@ -50,51 +58,64 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             });
             ui.close();
         }
-        if ui
-            .button(app.strings.gui_open_collection_ellipsis)
-            .clicked()
-        {
-            open_via_picker(app, OpenKind::Collection);
-            ui.close();
-        }
-        if ui.button(app.strings.gui_import_postman).clicked() {
-            // Same loader — it auto-detects Postman JSON vs. Hurl.
-            open_via_picker(app, OpenKind::Collection);
-            ui.close();
-        }
-        if ui
-            .button(app.strings.gui_open_environment_ellipsis)
-            .clicked()
-        {
-            open_via_picker(app, OpenKind::Environment);
-            ui.close();
-        }
-        if ui.button(app.strings.gui_open_workspace_ellipsis).clicked() {
-            open_via_picker(app, OpenKind::Workspace);
-            ui.close();
-        }
         ui.separator();
-        if ui
-            .button(app.strings.gui_save_collection_ellipsis)
-            .clicked()
-        {
-            save_via_picker(app, SaveKind::Collection);
-            ui.close();
-        }
-        if ui.button(app.strings.gui_save_response_ellipsis).clicked() {
-            save_via_picker(app, SaveKind::Response);
-            ui.close();
-        }
+
+        let mut close_menu = false;
+        ui.menu_button(app.strings.gui_menu_open, |ui| {
+            if ui.button(app.strings.gui_menu_item_collection).clicked() {
+                open_via_picker(app, OpenKind::Collection);
+                close_menu = true;
+                ui.close();
+            }
+            if ui.button(app.strings.gui_menu_item_environment).clicked() {
+                open_via_picker(app, OpenKind::Environment);
+                close_menu = true;
+                ui.close();
+            }
+            if ui.button(app.strings.gui_menu_item_workspace).clicked() {
+                open_via_picker(app, OpenKind::Workspace);
+                close_menu = true;
+                ui.close();
+            }
+        });
+        ui.menu_button(app.strings.gui_menu_open_git, |ui| {
+            if ui
+                .button(app.strings.gui_menu_item_collection_or_env)
+                .clicked()
+            {
+                app.remote.open_load();
+                close_menu = true;
+                ui.close();
+            }
+            if ui.button(app.strings.gui_menu_item_workspace).clicked() {
+                app.remote.open_load_workspace();
+                close_menu = true;
+                ui.close();
+            }
+        });
         ui.separator();
-        if ui.button(app.strings.gui_load_from_git).clicked() {
-            app.remote.open_load();
-            ui.close();
-        }
-        if ui.button(app.strings.gui_save_collection_git).clicked() {
-            app.remote.open_save_collection(app.active_ci());
-            ui.close();
-        }
+
+        ui.menu_button(app.strings.gui_menu_save, |ui| {
+            if ui.button(app.strings.gui_menu_item_collection).clicked() {
+                save_via_picker(app, SaveKind::Collection);
+                close_menu = true;
+                ui.close();
+            }
+            if ui.button(app.strings.gui_menu_item_response).clicked() {
+                save_via_picker(app, SaveKind::Response);
+                close_menu = true;
+                ui.close();
+            }
+        });
+        ui.menu_button(app.strings.gui_menu_save_git, |ui| {
+            if ui.button(app.strings.gui_menu_item_collection).clicked() {
+                app.remote.open_save_collection(app.active_ci());
+                close_menu = true;
+                ui.close();
+            }
+        });
         ui.separator();
+
         if ui.button(app.strings.gui_set_base_url).clicked() {
             app.dialog = Some(Dialog::Prompt {
                 kind: PromptKind::BaseUrl,
@@ -103,12 +124,19 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             ui.close();
         }
         ui.separator();
+
         if ui.button(app.strings.gui_close_tab).clicked() {
-            app.session.close_tab(app.active_ci());
+            app.request_close_tab(app.active_ci());
             ui.close();
         }
         if ui.button(app.strings.gui_quit).clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Closing a submenu leaves the parent File menu open; dismiss it too so
+        // picking an item doesn't strand a half-open menu over the app.
+        if close_menu {
+            ui.close();
         }
     });
 }
@@ -269,6 +297,188 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         Dialog::Rename { target, text } => rename_dialog(app, ctx, target, text),
         Dialog::Prompt { kind, text } => prompt_dialog(app, ctx, kind, text),
         Dialog::Theme(state) => theme_dialog(app, ctx, *state),
+        Dialog::CloseGitWorkspace { ci, root } => close_git_workspace_dialog(app, ctx, ci, root),
+        Dialog::UnsavedQuit { count, tabs } => unsaved_quit_dialog(app, ctx, count, tabs),
+        Dialog::UnsavedCloseTab { ci, name, count } => {
+            unsaved_close_tab_dialog(app, ctx, ci, name, count)
+        }
+        Dialog::WorkspaceReload { ci, reload } => workspace_reload_dialog(app, ctx, ci, *reload),
+    }
+}
+
+/// Last chance before quitting throws away request edits that were never
+/// written to a file.
+///
+/// A Workspace tab's requests are deliberately not persisted between runs (see
+/// `persistence`), and edits parked for a file the user has switched away from
+/// live only in memory, so "quit" really is the moment they disappear — hence a
+/// modal rather than a status line. Cancelling re-arms nothing: the close was
+/// already refused, so there is simply nothing left to do.
+fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs: String) {
+    let title = app.strings.gui_unsaved_quit_title;
+    let (quit, cancel, question) = (
+        app.strings.gui_quit_anyway,
+        app.strings.gui_cancel,
+        app.strings
+            .gui_unsaved_quit_q
+            .replace("{n}", &count.to_string())
+            .replace("{t}", &tabs),
+    );
+    let mut decided = false;
+    modal(ctx, title, |ui| {
+        ui.label(question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(quit).clicked() {
+                app.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    });
+    if !decided {
+        app.dialog = Some(Dialog::UnsavedQuit { count, tabs });
+    }
+}
+
+/// The same warning for one tab. Confirming hands over to the ordinary close
+/// path, so a downloaded git Workspace still gets its keep-or-delete question.
+fn unsaved_close_tab_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    name: String,
+    count: usize,
+) {
+    let title = app.strings.gui_unsaved_quit_title;
+    let (close, cancel, question) = (
+        app.strings.gui_close_anyway,
+        app.strings.gui_cancel,
+        app.strings
+            .gui_unsaved_close_tab_q
+            .replace("{n}", &count.to_string())
+            .replace("{t}", &name),
+    );
+    let mut decided = false;
+    modal(ctx, title, |ui| {
+        ui.label(question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(close).clicked() {
+                app.close_tab_now(ci);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    });
+    if !decided {
+        app.dialog = Some(Dialog::UnsavedCloseTab { ci, name, count });
+    } else {
+        app.session.save();
+    }
+}
+
+/// Keep-or-delete prompt for a Workspace folder PaperBoy downloaded itself.
+/// Cancel re-arms the dialog so an accidental click outside can't close the tab.
+fn close_git_workspace_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    root: std::path::PathBuf,
+) {
+    let title = app.strings.gui_close_git_workspace_title;
+    let (keep, delete, cancel, question) = (
+        app.strings.close_git_workspace_keep,
+        app.strings.close_git_workspace_delete,
+        app.strings.close_git_workspace_cancel,
+        app.strings
+            .close_git_workspace_q
+            .replace("{p}", &root.display().to_string()),
+    );
+    let mut decided = false;
+    modal(ctx, title, |ui| {
+        ui.label(question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(keep).clicked() {
+                app.session.close_tab(ci);
+                decided = true;
+            }
+            if ui.button(delete).clicked() {
+                app.session.close_tab_deleting_workspace(ci);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    });
+    if !decided {
+        app.dialog = Some(Dialog::CloseGitWorkspace { ci, root });
+    } else {
+        app.session.save();
+    }
+}
+
+/// Offer to redownload a restored Workspace whose folder has vanished. Declining
+/// leaves the tab in place but empty — the recorded origin stays on it, so the
+/// same offer comes back next launch.
+fn workspace_reload_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    reload: crate::persistence::PendingWorkspaceReload,
+) {
+    let title = app.strings.gui_workspace_reload_title;
+    let ref_label = if reload.origin.ref_kind == crate::git_remote::RefKind::Branch {
+        app.strings.git_branches
+    } else {
+        app.strings.git_tags
+    };
+    let question = app
+        .strings
+        .workspace_reload_confirm_q
+        .replace("{name}", &reload.tab_name)
+        .replace(
+            "{ref}",
+            &format!("[{ref_label}] {}", reload.origin.ref_name),
+        )
+        .replace("{url}", &reload.origin.repo_url);
+    let (yes, no, hint) = (
+        app.strings.gui_workspace_reload_yes,
+        app.strings.gui_workspace_reload_no,
+        app.strings.workspace_reload_save_hint,
+    );
+    let mut answer: Option<bool> = None;
+    modal(ctx, title, |ui| {
+        ui.label(question);
+        ui.add_space(4.0);
+        ui.label(hint);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(yes).clicked() {
+                answer = Some(true);
+            }
+            if ui.button(no).clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    match answer {
+        Some(true) => app.start_workspace_redownload(ci, reload),
+        Some(false) => {}
+        // Re-arm until the user answers; the reload can't be silently skipped.
+        None => {
+            app.dialog = Some(Dialog::WorkspaceReload {
+                ci,
+                reload: Box::new(reload),
+            });
+        }
     }
 }
 
@@ -293,11 +503,16 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
         OpenKind::Environment => app.strings.gui_open_environment_title,
         OpenKind::Workspace => app.strings.gui_open_workspace_title,
     };
+    let picker_kind = match kind {
+        OpenKind::Environment => PickerKind::Environment,
+        _ => PickerKind::Other,
+    };
+    let dir = app.session.picker_dir(picker_kind).map(|p| p.to_path_buf());
     let picked = match kind {
-        OpenKind::Workspace => super::filepick::pick_folder(title, None),
+        OpenKind::Workspace => super::filepick::pick_folder(title, dir.as_deref()),
         OpenKind::Collection => super::filepick::pick_file(
             title,
-            None,
+            dir.as_deref(),
             &[
                 (app.strings.gui_filter_collections, &["hurl", "json"]),
                 (app.strings.gui_filter_all, &["*"]),
@@ -305,7 +520,7 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
         ),
         OpenKind::Environment => super::filepick::pick_file(
             title,
-            None,
+            dir.as_deref(),
             &[
                 (app.strings.gui_filter_environments, &["vars", "env"]),
                 (app.strings.gui_filter_all, &["*"]),
@@ -315,9 +530,13 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
     let Some(path) = picked else {
         return; // cancelled
     };
+    // Remembered even when the load fails: the user still browsed there, and
+    // sending the next picker back to square one would be the bigger annoyance.
+    app.session.remember_picker_dir(picker_kind, &path);
     if let Err(msg) = apply_open(app, kind, &path) {
         super::filepick::error_alert(title, &msg);
     }
+    app.session.save();
 }
 
 /// Load the chosen path as the given kind, returning a user-facing error string
@@ -390,7 +609,14 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             .unwrap_or_default(),
         SaveKind::Response => String::new(),
     };
-    let dir = super::filepick::seed_dir(&current);
+    let picker_kind = match kind {
+        SaveKind::Environment(_) => PickerKind::Environment,
+        _ => PickerKind::Other,
+    };
+    // The file's own folder wins (a re-save belongs where it already lives);
+    // an unsaved item falls back to wherever the user last browsed.
+    let dir = super::filepick::seed_dir(&current)
+        .or_else(|| app.session.picker_dir(picker_kind).map(|p| p.to_path_buf()));
     let default_name = std::path::Path::new(&current)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -415,9 +641,11 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
     else {
         return; // cancelled
     };
+    app.session.remember_picker_dir(picker_kind, &path);
     if let Err(msg) = apply_save(app, kind, &path) {
         super::filepick::error_alert(title, &msg);
     }
+    app.session.save();
 }
 
 /// Write the given kind to `path`, returning a user-facing error on failure.
@@ -445,6 +673,9 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
         SaveKind::Collection => {
             let ci = app.active_ci();
             app.session.collections[ci].path = Some(path.to_path_buf());
+            // The file on disk now matches what is in memory, so the "new" and
+            // "edited" pencils must go — including any parked edits for it.
+            app.session.collections[ci].mark_saved();
         }
         SaveKind::Environment(id) => {
             if let Some(e) = app.session.global_envs.iter_mut().find(|e| e.id == id) {

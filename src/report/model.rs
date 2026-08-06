@@ -217,6 +217,22 @@ impl StatKind {
         StatKind::StdDev,
     ];
 
+    /// Every statistic a user can pick from, in the order a chooser should
+    /// list them: the summary-row order, then `Distribution` (which isn't a
+    /// summary row — it expands to one row per distinct value — so it is kept
+    /// last rather than being interleaved with the others).
+    pub const CHOOSABLE: [StatKind; 9] = [
+        StatKind::Count,
+        StatKind::Sum,
+        StatKind::Mean,
+        StatKind::Median,
+        StatKind::Mode,
+        StatKind::Min,
+        StatKind::Max,
+        StatKind::StdDev,
+        StatKind::Distribution,
+    ];
+
     /// Parse a `STATISTICS(…)` keyword (case-insensitive), accepting a few
     /// common aliases (`AVG`, `STDEV`, `DIST`).
     pub fn parse(s: &str) -> Option<StatKind> {

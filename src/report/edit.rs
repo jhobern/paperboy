@@ -12,9 +12,10 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt,
-    RoleRef, WithItem,
+    EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
+    ResponseFmt, RoleRef, WithItem,
 };
+use crate::report::model::StatKind;
 use crate::report::parse_flow;
 
 // ---------------------------------------------------------------------------
@@ -434,10 +435,12 @@ pub(crate) enum Modifier {
     Response,
     Show,
     Hide,
+    /// `STATISTICS(…)` — summary rows for a named report column.
+    Statistics,
 }
 
 impl Modifier {
-    pub(crate) const ALL: [Modifier; 7] = [
+    pub(crate) const ALL: [Modifier; 8] = [
         Modifier::Report,
         Modifier::Parallel,
         Modifier::With,
@@ -445,6 +448,7 @@ impl Modifier {
         Modifier::Response,
         Modifier::Show,
         Modifier::Hide,
+        Modifier::Statistics,
     ];
 
     /// The palette label for this modifier.
@@ -457,6 +461,7 @@ impl Modifier {
             Modifier::Response => s.node_mod_response,
             Modifier::Show => s.node_mod_show,
             Modifier::Hide => s.node_mod_hide,
+            Modifier::Statistics => s.node_mod_statistics,
         }
     }
 
@@ -501,7 +506,78 @@ impl Modifier {
             Modifier::Hide => {
                 matches!(node, FlowNode::Report(ReportStmt::Request { hide, .. }) if hide.is_empty())
             }
+            // STATISTICS summarises a *named* report column, so it needs an
+            // already-named one: `REPORT <var> AS <name>` or a computed column.
+            // A bare `REPORT (A, B)` has no single column to summarise (attach
+            // AS first), and a request's own columns are named by its WITH
+            // fields, which carry their own STATISTICS.
+            Modifier::Statistics => match node {
+                FlowNode::Report(ReportStmt::VarAs { stats, .. })
+                | FlowNode::Report(ReportStmt::Computed { stats, .. }) => stats.is_empty(),
+                _ => false,
+            },
         }
+    }
+
+    /// Why this modifier refuses to attach to `node`, or `None` when it does
+    /// attach. A rejected drop used to be silent — the chip simply sprang back
+    /// with no hint that the *block*, not the aim, was the problem. The two
+    /// answers a user needs are "wrong kind of block" and "it's already there",
+    /// so the reasons split along that line rather than restating `applies_to`.
+    pub(crate) fn reject_reason(self, node: &FlowNode, s: &Strings) -> Option<&'static str> {
+        if self.applies_to(node) {
+            return None;
+        }
+        // A reported request is the target of most modifiers; when the block is
+        // one, the only remaining reason is that the clause is already present.
+        let reported = matches!(node, FlowNode::Report(ReportStmt::Request { .. }));
+        Some(match self {
+            // Any `REPORT …` statement — a reported request, a reported
+            // variable, a computed column — already *is* the thing REPORT
+            // adds, so the honest answer is "already there" rather than a
+            // lecture about where REPORT goes.
+            Modifier::Report => {
+                if matches!(node, FlowNode::Report(_)) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_report
+                }
+            }
+            Modifier::Parallel => {
+                if matches!(node, FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. }) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_parallel
+                }
+            }
+            Modifier::With => s.mod_reject_with,
+            Modifier::As => {
+                if reported || matches!(node, FlowNode::Report(ReportStmt::Vars(v)) if v.len() == 1)
+                {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_as
+                }
+            }
+            Modifier::Response | Modifier::Show | Modifier::Hide => {
+                if reported {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_request_only
+                }
+            }
+            Modifier::Statistics => {
+                if matches!(
+                    node,
+                    FlowNode::Report(ReportStmt::VarAs { .. })
+                        | FlowNode::Report(ReportStmt::Computed { .. })
+                ) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_statistics
+                }
+            }
+        })
     }
 }
 
@@ -519,14 +595,167 @@ pub(crate) enum DetachWhich {
     Show,
     /// The `HIDE(…)` field selector on a report request.
     Hide,
+    /// The `SHOW(…)` clause hanging off an ENVS loop's `BASELINE`.
+    BaselineShow,
+    /// One `BASELINE`/`COMPARISON` role of an ENVS compare loop.
+    Role {
+        baseline: bool,
+        index: usize,
+    },
+    /// The whole `WITH … END` block of a report request (its individual fields
+    /// detach one at a time as [`DetachWhich::With`]).
+    WithBlock,
+    /// The `STATISTICS(…)` clause of a named report column.
+    Statistics,
+}
+
+/// Every variable name in scope at `path` — the candidates a `REPORT <var>`
+/// column can name.
+///
+/// Walks the flow down `path`, collecting what is bound *before* the node at
+/// each level: assignments and the captures of requests already sent, plus the
+/// binders of every enclosing loop (its pattern, and a `FOLDERS` loop's role
+/// names). `entries` is the bound collection, used to resolve each request's
+/// `[Captures]`; pass an empty slice when the collection is unknown and the
+/// list simply won't include captures.
+///
+/// This is deliberately the *statically knowable* set: a `TUPLES FROM` or
+/// `ZIP` loop can bind names that only exist at run time, and an environment
+/// contributes its own keys, so the list is a helpful shortlist rather than an
+/// exhaustive one. Both front-ends offer it alongside a free-text row for
+/// exactly that reason.
+pub(crate) fn vars_in_scope(
+    flow: &ReportFlow,
+    path: &[usize],
+    entries: &[crate::hurl::HurlEntry],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !name.trim().is_empty() && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    let mut nodes: &[FlowNode] = &flow.nodes;
+    for index in path {
+        for node in nodes.iter().take(*index) {
+            match node {
+                FlowNode::Assign { key, .. } => push(key, &mut out),
+                FlowNode::Request { name } | FlowNode::Report(ReportStmt::Request { name, .. }) => {
+                    if let Some(entry) = crate::report::run::resolve_title(entries, name) {
+                        for (cap, _) in &entry.captures {
+                            push(cap, &mut out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Stepping *into* the loop at `index` brings its binders into scope for
+        // everything below, including the node we're heading towards.
+        let Some(parent) = nodes.get(*index) else {
+            break;
+        };
+        match parent {
+            FlowNode::ForEach {
+                pattern,
+                producer,
+                body,
+                ..
+            } => {
+                for name in pattern.named() {
+                    push(name, &mut out);
+                }
+                if let Producer::Folders { roles, .. } = producer {
+                    for (role, _) in roles {
+                        push(role, &mut out);
+                    }
+                }
+                nodes = body;
+            }
+            FlowNode::ForEnvs { var, body, .. } => {
+                push(var, &mut out);
+                nodes = body;
+            }
+            // The path claims to step into a loop but the node isn't one, so
+            // there is nothing further to walk.
+            _ => break,
+        }
+    }
+    out
+}
+
+/// The fields a `BASELINE(…) SHOW(…)` can name, ticked where the clause already
+/// names them.
+///
+/// A `SHOW` on a baseline selects from what the loop's *body* reports, so the
+/// candidates are gathered by walking the body for reported requests and asking
+/// the bound collection what each one emits — the same canonical order the
+/// request form uses (intrinsics first, then the request's own `[Reports]`
+/// fields). Anything already named by the clause is appended even if no request
+/// claims it, so opening and applying the form can never silently drop a field
+/// the user wrote by hand.
+pub(crate) fn baseline_show_choices(
+    entries: &[crate::hurl::HurlEntry],
+    body: &[FlowNode],
+    selected: &[String],
+) -> Vec<(String, bool)> {
+    let mut names: Vec<String> = Vec::new();
+    let push = |n: &str, names: &mut Vec<String>| {
+        if !n.trim().is_empty() && !names.iter().any(|x| x == n) {
+            names.push(n.to_string());
+        }
+    };
+    for f in crate::report::run::INTRINSIC_FIELDS {
+        push(f, &mut names);
+    }
+    for req in reported_requests(body) {
+        if let Some(entry) = crate::report::run::resolve_title(entries, &req) {
+            for (f, _) in &entry.reports {
+                push(f, &mut names);
+            }
+        }
+    }
+    for f in selected {
+        push(f, &mut names);
+    }
+    names
+        .iter()
+        .map(|n| (n.clone(), selected.iter().any(|sel| sel == n)))
+        .collect()
+}
+
+/// Every request name reported anywhere beneath `body`, nested loops included.
+pub(crate) fn reported_requests(body: &[FlowNode]) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(nodes: &[FlowNode], out: &mut Vec<String>) {
+        for n in nodes {
+            match n {
+                // A bare `REQUEST x` sends but emits nothing, so it has no
+                // fields to offer; only `REPORT REQUEST x` does.
+                FlowNode::Report(ReportStmt::Request { name, .. }) => out.push(name.clone()),
+                FlowNode::ForEnvs { body, .. } | FlowNode::ForEach { body, .. } => walk(body, out),
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
 }
 
 /// Attach `m` to the node at `path` (see [`Modifier::applies_to`]). No-op when
 /// the modifier does not apply. Returns whether anything changed.
 pub(crate) fn attach_modifier(flow: &mut ReportFlow, path: &[usize], m: Modifier) -> bool {
-    let Some(node) = node_at_mut(flow, path) else {
-        return false;
-    };
+    match node_at_mut(flow, path) {
+        Some(node) => attach_to_node(node, m),
+        None => false,
+    }
+}
+
+/// The body of [`attach_modifier`], on an already-resolved node. Split out so a
+/// caller can *rehearse* a drop on a throwaway clone — which is how the block
+/// editor previews where a dragged modifier will land without the preview ever
+/// being able to disagree with the real thing.
+pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
     if !m.applies_to(node) {
         return false;
     }
@@ -594,6 +823,15 @@ pub(crate) fn attach_modifier(flow: &mut ReportFlow, path: &[usize], m: Modifier
                 *hide = vec!["HttpStatus".into()];
             }
         }
+        // COUNT is the one statistic that means something for every column
+        // (text included), so it is the safe seed; the wizard refines it.
+        Modifier::Statistics => match node {
+            FlowNode::Report(ReportStmt::VarAs { stats, .. })
+            | FlowNode::Report(ReportStmt::Computed { stats, .. }) => {
+                *stats = vec![StatKind::Count];
+            }
+            _ => {}
+        },
     }
     true
 }
@@ -701,6 +939,86 @@ pub(crate) fn set_report_alias(flow: &mut ReportFlow, path: &[usize], text: &str
     }
 }
 
+/// Set (or clear) the maximum concurrency of the `PARALLEL` modifier on the
+/// loop at `path`. `degree: None` means "no explicit limit", which the runner
+/// resolves to the prelude's `MAX_PARALLEL` (or the built-in default) — that is
+/// the plain `PARALLEL` form. `Some(0)` is rejected, matching the parser, which
+/// refuses `PARALLEL(0)` because a zero-wide pool could never run anything.
+/// Returns `false` when the node isn't a loop, isn't marked parallel, or the
+/// degree is invalid.
+pub(crate) fn set_parallel_degree(
+    flow: &mut ReportFlow,
+    path: &[usize],
+    degree: Option<u32>,
+) -> bool {
+    if degree == Some(0) {
+        return false;
+    }
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach { parallel, .. }) | Some(FlowNode::ForEnvs { parallel, .. }) => {
+            match parallel {
+                Some(spec) => {
+                    spec.degree = degree;
+                    true
+                }
+                // Setting a degree on a serial loop would silently make it
+                // concurrent — the PARALLEL modifier has to be attached first.
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Set the `# key: value` header directive, or remove it entirely when `value`
+/// is `None` (or blank).
+///
+/// A directive that already exists is edited in place so the user's own
+/// ordering and any interleaved comments survive; a new one is inserted after
+/// the last existing directive rather than appended, which keeps the directives
+/// together above any trailing comment block.
+///
+/// Returns `true` when the header actually changed.
+pub(crate) fn set_header(flow: &mut ReportFlow, key: &str, value: Option<&str>) -> bool {
+    let value = value.map(str::trim).filter(|v| !v.is_empty());
+    let existing = flow.header.lines.iter().position(
+        |l| matches!(l, HeaderLine::Directive { key: k, .. } if k.eq_ignore_ascii_case(key)),
+    );
+    match (existing, value) {
+        (Some(i), Some(v)) => {
+            let HeaderLine::Directive { value: old, .. } = &mut flow.header.lines[i] else {
+                return false;
+            };
+            if old == v {
+                return false;
+            }
+            *old = v.to_string();
+            true
+        }
+        (Some(i), None) => {
+            flow.header.lines.remove(i);
+            true
+        }
+        (None, Some(v)) => {
+            let at = flow
+                .header
+                .lines
+                .iter()
+                .rposition(|l| matches!(l, HeaderLine::Directive { .. }))
+                .map_or(0, |i| i + 1);
+            flow.header.lines.insert(
+                at,
+                HeaderLine::Directive {
+                    key: key.to_string(),
+                    value: v.to_string(),
+                },
+            );
+            true
+        }
+        (None, None) => false,
+    }
+}
+
 /// Append a new `WITH` field (a `name: query` column) to the report-request at
 /// `path`, returning its index. A no-op (`None`) when the node is not a report
 /// request.
@@ -709,12 +1027,13 @@ pub(crate) fn add_with_field(
     path: &[usize],
     name: &str,
     query: &str,
+    stats: Vec<StatKind>,
 ) -> Option<usize> {
     if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path) {
         with.push(WithItem::Field {
             name: name.to_string(),
             query: query.to_string(),
-            stats: Vec::new(),
+            stats,
         });
         Some(with.len() - 1)
     } else {
@@ -731,14 +1050,18 @@ pub(crate) fn set_with_field(
     index: usize,
     name: &str,
     query: &str,
+    stats: Vec<StatKind>,
 ) -> bool {
     if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path)
         && let Some(WithItem::Field {
-            name: n, query: q, ..
+            name: n,
+            query: q,
+            stats: st,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
         *q = query.to_string();
+        *st = stats;
         true
     } else {
         false
@@ -751,6 +1074,338 @@ pub(crate) fn detach_modifier(flow: &mut ReportFlow, path: &[usize], which: Deta
     let Some(node) = node_at_mut(flow, path) else {
         return false;
     };
+    detach_from_node(node, which)
+}
+
+/// Whether detaching `which` from `node` would leave a statement that still
+/// stands on its own.
+///
+/// This is the rule the block editor uses to decide whether a chip can be
+/// pulled out of a line by itself: a clause whose removal would take the whole
+/// row with it (`REPORT` on a reported *column*, say — there is no statement
+/// left without it) is load-bearing, so grabbing that chip moves the line
+/// instead. Answered by probing the real detach on a throwaway clone, so the
+/// two can never drift apart.
+pub(crate) fn detach_leaves_statement(node: &FlowNode, which: DetachWhich) -> bool {
+    !detach_from_node(&mut node.clone(), which)
+}
+
+/// A modifier lifted **off a node with the value it was carrying**, so that
+/// dropping it somewhere else re-creates it as it was rather than as a fresh
+/// default.
+///
+/// [`Modifier`] describes a modifier in the abstract — it is what the palette
+/// hands out, and attaching it seeds a placeholder the user then fills in. That
+/// is exactly wrong for a clause pulled off an existing line: dragging
+/// `SHOW(Time, Status)` from one reported request to another has to bring
+/// `Time, Status` along, or the gesture silently rewrites the user's work.
+/// A `CarriedMod` is therefore the modifier *and its contents*.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum CarriedMod {
+    Report,
+    Parallel(Option<ParallelSpec>),
+    As(String),
+    /// One `WITH` field. A report request may hold several, so unlike the rest
+    /// this one always has room at the destination.
+    With(WithItem),
+    Response(ResponseFmt),
+    Show(Vec<String>),
+    Hide(Vec<String>),
+    BaselineShow(Vec<String>),
+    Role {
+        baseline: bool,
+        role: RoleRef,
+    },
+    /// A whole `WITH … END` block.
+    WithBlock(Vec<WithItem>),
+    Statistics(Vec<StatKind>),
+}
+
+/// Read the value the modifier `which` holds on `node`, ready to be grafted
+/// onto another node. `None` when `node` doesn't actually carry it.
+pub(crate) fn carry_modifier(node: &FlowNode, which: DetachWhich) -> Option<CarriedMod> {
+    Some(match (which, node) {
+        (DetachWhich::Report, FlowNode::Report(_)) => CarriedMod::Report,
+        (
+            DetachWhich::Parallel,
+            FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. },
+        ) => CarriedMod::Parallel(parallel.clone()),
+        (DetachWhich::As, FlowNode::Report(ReportStmt::Request { alias, .. })) => {
+            CarriedMod::As(alias.clone()?)
+        }
+        (DetachWhich::As, FlowNode::Report(ReportStmt::VarAs { name, .. })) => {
+            CarriedMod::As(name.clone())
+        }
+        (DetachWhich::With(i), FlowNode::Report(ReportStmt::Request { with, .. })) => {
+            CarriedMod::With(with.get(i)?.clone())
+        }
+        (DetachWhich::Response, FlowNode::Report(ReportStmt::Request { response_fmt, .. })) => {
+            CarriedMod::Response(*response_fmt.as_ref()?)
+        }
+        (DetachWhich::Show, FlowNode::Report(ReportStmt::Request { show, .. })) => {
+            CarriedMod::Show(non_empty(show)?)
+        }
+        (DetachWhich::Hide, FlowNode::Report(ReportStmt::Request { hide, .. })) => {
+            CarriedMod::Hide(non_empty(hide)?)
+        }
+        (
+            DetachWhich::BaselineShow,
+            FlowNode::ForEnvs {
+                clause: EnvClause::Roles { baseline_show, .. },
+                ..
+            },
+        ) => CarriedMod::BaselineShow(non_empty(baseline_show)?),
+        (
+            DetachWhich::Role { baseline, index },
+            FlowNode::ForEnvs {
+                clause:
+                    EnvClause::Roles {
+                        baseline: b,
+                        comparisons,
+                        ..
+                    },
+                ..
+            },
+        ) => CarriedMod::Role {
+            baseline,
+            role: if baseline { b } else { comparisons }.get(index)?.clone(),
+        },
+        (DetachWhich::WithBlock, FlowNode::Report(ReportStmt::Request { with, .. })) => {
+            CarriedMod::WithBlock(non_empty(with)?)
+        }
+        (
+            DetachWhich::Statistics,
+            FlowNode::Report(ReportStmt::VarAs { stats, .. } | ReportStmt::Computed { stats, .. }),
+        ) => CarriedMod::Statistics(non_empty(stats)?),
+        _ => return None,
+    })
+}
+
+/// `Some(clone)` for a non-empty list — the "is this clause actually present?"
+/// test every list-shaped modifier shares.
+fn non_empty<T: Clone>(v: &[T]) -> Option<Vec<T>> {
+    (!v.is_empty()).then(|| v.to_vec())
+}
+
+impl CarriedMod {
+    /// The abstract modifier this is an instance of, when there is one. The
+    /// role clauses of an `ENVS` loop (and a whole `WITH` block) have no
+    /// palette counterpart, so they answer `None` and carry their own rules.
+    fn kind(&self) -> Option<Modifier> {
+        Some(match self {
+            CarriedMod::Report => Modifier::Report,
+            CarriedMod::Parallel(_) => Modifier::Parallel,
+            CarriedMod::As(_) => Modifier::As,
+            CarriedMod::With(_) => Modifier::With,
+            CarriedMod::Response(_) => Modifier::Response,
+            CarriedMod::Show(_) => Modifier::Show,
+            CarriedMod::Hide(_) => Modifier::Hide,
+            CarriedMod::Statistics(_) => Modifier::Statistics,
+            CarriedMod::BaselineShow(_) | CarriedMod::Role { .. } | CarriedMod::WithBlock(_) => {
+                return None;
+            }
+        })
+    }
+
+    /// Whether this clause can be grafted onto `node`.
+    pub(crate) fn applies_to(&self, node: &FlowNode) -> bool {
+        match self {
+            // A carried REPORT only ever re-wraps a plain request. Dropping it
+            // on an assignment *inserts a line* rather than changing this one
+            // (see `report_assignment`), which is not a move of the clause in
+            // hand, so that stays the palette's job.
+            CarriedMod::Report => matches!(node, FlowNode::Request { .. }),
+            CarriedMod::BaselineShow(_) => matches!(
+                node,
+                FlowNode::ForEnvs {
+                    clause: EnvClause::Roles { baseline_show, .. },
+                    ..
+                } if baseline_show.is_empty()
+            ),
+            // A role joins any comparison loop that doesn't already list it —
+            // the point of dragging `COMPARISON(stage)` to another loop.
+            CarriedMod::Role { baseline, role } => matches!(
+                node,
+                FlowNode::ForEnvs {
+                    clause: EnvClause::Roles { baseline: b, comparisons, .. },
+                    ..
+                } if !if *baseline { b } else { comparisons }.contains(role)
+            ),
+            CarriedMod::WithBlock(_) => matches!(
+                node,
+                FlowNode::Report(ReportStmt::Request { with, .. }) if with.is_empty()
+            ),
+            other => other.kind().is_some_and(|m: Modifier| m.applies_to(node)),
+        }
+    }
+
+    /// Why this clause refuses to graft onto `node`, or `None` when it does.
+    pub(crate) fn reject_reason(&self, node: &FlowNode, s: &Strings) -> Option<&'static str> {
+        if self.applies_to(node) {
+            return None;
+        }
+        Some(match self {
+            CarriedMod::Report => {
+                if matches!(node, FlowNode::Report(_)) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_report
+                }
+            }
+            CarriedMod::BaselineShow(_) | CarriedMod::Role { .. } => {
+                if matches!(
+                    node,
+                    FlowNode::ForEnvs {
+                        clause: EnvClause::Roles { .. },
+                        ..
+                    }
+                ) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_compare_only
+                }
+            }
+            CarriedMod::WithBlock(_) => {
+                if matches!(node, FlowNode::Report(ReportStmt::Request { .. })) {
+                    s.mod_reject_present
+                } else {
+                    s.mod_reject_with
+                }
+            }
+            other => other.kind()?.reject_reason(node, s)?,
+        })
+    }
+
+    /// Graft this clause onto `node`, keeping the value it was carrying.
+    /// Returns whether anything changed.
+    pub(crate) fn attach_to(&self, node: &mut FlowNode) -> bool {
+        if !self.applies_to(node) {
+            return false;
+        }
+        match self {
+            CarriedMod::Report => {
+                if let FlowNode::Request { name } = node {
+                    let name = std::mem::take(name);
+                    *node = FlowNode::Report(ReportStmt::Request {
+                        name,
+                        alias: None,
+                        response_fmt: None,
+                        show: Vec::new(),
+                        hide: Vec::new(),
+                        with: Vec::new(),
+                    });
+                }
+            }
+            CarriedMod::Parallel(spec) => match node {
+                FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
+                    *parallel = Some(spec.clone().unwrap_or_default());
+                }
+                _ => {}
+            },
+            CarriedMod::As(name) => match node {
+                FlowNode::Report(ReportStmt::Request { alias, .. }) => *alias = Some(name.clone()),
+                FlowNode::Report(ReportStmt::Vars(vars)) if vars.len() == 1 => {
+                    let var = vars.remove(0);
+                    *node = FlowNode::Report(ReportStmt::VarAs {
+                        var,
+                        name: name.clone(),
+                        stats: Vec::new(),
+                    });
+                }
+                _ => {}
+            },
+            CarriedMod::With(item) => {
+                if let FlowNode::Report(ReportStmt::Request { with, .. }) = node {
+                    with.push(item.clone());
+                }
+            }
+            CarriedMod::Response(fmt) => {
+                if let FlowNode::Report(ReportStmt::Request { response_fmt, .. }) = node {
+                    *response_fmt = Some(*fmt);
+                }
+            }
+            CarriedMod::Show(cols) => {
+                if let FlowNode::Report(ReportStmt::Request { show, .. }) = node {
+                    *show = cols.clone();
+                }
+            }
+            CarriedMod::Hide(cols) => {
+                if let FlowNode::Report(ReportStmt::Request { hide, .. }) = node {
+                    *hide = cols.clone();
+                }
+            }
+            CarriedMod::BaselineShow(cols) => {
+                if let FlowNode::ForEnvs {
+                    clause: EnvClause::Roles { baseline_show, .. },
+                    ..
+                } = node
+                {
+                    *baseline_show = cols.clone();
+                }
+            }
+            CarriedMod::Role { baseline, role } => {
+                if let FlowNode::ForEnvs {
+                    clause:
+                        EnvClause::Roles {
+                            baseline: b,
+                            comparisons,
+                            ..
+                        },
+                    ..
+                } = node
+                {
+                    if *baseline { b } else { comparisons }.push(role.clone());
+                }
+            }
+            CarriedMod::WithBlock(items) => {
+                if let FlowNode::Report(ReportStmt::Request { with, .. }) = node {
+                    *with = items.clone();
+                }
+            }
+            CarriedMod::Statistics(stats) => match node {
+                FlowNode::Report(ReportStmt::VarAs { stats: s, .. })
+                | FlowNode::Report(ReportStmt::Computed { stats: s, .. }) => *s = stats.clone(),
+                _ => {}
+            },
+        }
+        true
+    }
+}
+
+/// Move (or, with `copy`, clone) the modifier `which` from the node at `from`
+/// onto the node at `to`. This is what dropping a clause pulled off one line
+/// onto another line does. A no-op returning `false` unless the clause is
+/// really there *and* the destination will take it — and the two are never
+/// half-applied, so a refused drop leaves the source untouched.
+///
+/// Detaching first is safe because only clauses whose removal leaves a valid
+/// statement can be picked up in the first place (see
+/// [`detach_leaves_statement`]), so no row disappears and no path shifts.
+pub(crate) fn transfer_modifier(
+    flow: &mut ReportFlow,
+    from: &[usize],
+    which: DetachWhich,
+    to: &[usize],
+    copy: bool,
+) -> bool {
+    if from == to {
+        return false;
+    }
+    let Some(carried) = node_at(flow, from).and_then(|n| carry_modifier(n, which)) else {
+        return false;
+    };
+    if !node_at(flow, to).is_some_and(|n| carried.applies_to(n)) {
+        return false;
+    }
+    if !copy {
+        detach_modifier(flow, from, which);
+    }
+    node_at_mut(flow, to).is_some_and(|n| carried.attach_to(n))
+}
+
+/// The body of [`detach_modifier`], on an already-resolved node. Returns `true`
+/// when nothing coherent is left and the caller should remove the row.
+fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
     match which {
         DetachWhich::Report => match node {
             // A reported request keeps sending: downgrade to a plain REQUEST.
@@ -807,6 +1462,62 @@ pub(crate) fn detach_modifier(flow: &mut ReportFlow, path: &[usize], which: Deta
         DetachWhich::Hide => {
             if let FlowNode::Report(ReportStmt::Request { hide, .. }) = node {
                 hide.clear();
+            }
+            false
+        }
+        DetachWhich::BaselineShow => {
+            if let FlowNode::ForEnvs {
+                clause: EnvClause::Roles { baseline_show, .. },
+                ..
+            } = node
+            {
+                baseline_show.clear();
+            }
+            false
+        }
+        DetachWhich::Role { baseline, index } => {
+            if let FlowNode::ForEnvs { clause, .. } = node
+                && let EnvClause::Roles {
+                    baseline: b,
+                    comparisons,
+                    ..
+                } = clause
+            {
+                let side = if baseline { &mut *b } else { &mut *comparisons };
+                if index < side.len() {
+                    side.remove(index);
+                }
+                // A comparison needs both halves. Emptying either one leaves
+                // nothing to compare against, so the loop degrades to a plain
+                // pass over whichever environments are left rather than
+                // serializing a half-written `BASELINE(…)` with no
+                // `COMPARISON(…)` (which would not re-parse). Snapshot refs
+                // have no plain form and so drop out.
+                if b.is_empty() || comparisons.is_empty() {
+                    let names: Vec<String> = b
+                        .iter()
+                        .chain(comparisons.iter())
+                        .filter_map(|r| match r {
+                            RoleRef::Env(n) => Some(n.clone()),
+                            RoleRef::File(_) => None,
+                        })
+                        .collect();
+                    *clause = EnvClause::Plain(names);
+                }
+            }
+            false
+        }
+        DetachWhich::WithBlock => {
+            if let FlowNode::Report(ReportStmt::Request { with, .. }) = node {
+                with.clear();
+            }
+            false
+        }
+        DetachWhich::Statistics => {
+            match node {
+                FlowNode::Report(ReportStmt::VarAs { stats, .. })
+                | FlowNode::Report(ReportStmt::Computed { stats, .. }) => stats.clear(),
+                _ => {}
             }
             false
         }
@@ -1022,6 +1733,95 @@ mod tests {
     }
 
     #[test]
+    fn set_parallel_degree_edits_the_concurrency_limit_and_rejects_zero() {
+        let mut f = flow("PARALLEL FOR X IN FILES \"/d\"\n    REQUEST A\nEND\n");
+
+        assert!(set_parallel_degree(&mut f, &[0], Some(4)));
+        assert!(f.to_text().contains("PARALLEL(4) FOR"));
+
+        // Clearing the degree goes back to the plain PARALLEL form, where the
+        // limit comes from the prelude rather than the loop.
+        assert!(set_parallel_degree(&mut f, &[0], None));
+        assert!(f.to_text().contains("PARALLEL FOR"));
+
+        // The parser refuses PARALLEL(0), so the editor must too — otherwise a
+        // saved flow wouldn't load back.
+        assert!(set_parallel_degree(&mut f, &[0], Some(4)));
+        assert!(!set_parallel_degree(&mut f, &[0], Some(0)));
+        assert!(f.to_text().contains("PARALLEL(4) FOR"));
+    }
+
+    #[test]
+    fn set_header_adds_edits_and_removes_directives() {
+        let mut f = flow(
+            "# collection: api.hurl
+REQUEST A
+",
+        );
+
+        // Editing in place keeps the directive where the user put it.
+        assert!(set_header(&mut f, "collection", Some("other.hurl")));
+        assert!(f.to_text().contains("# collection: other.hurl"));
+        assert_eq!(f.header.collection(), Some("other.hurl"));
+
+        // A new directive lands with the others, not at the top of the file.
+        assert!(set_header(&mut f, "output", Some("out.csv")));
+        assert_eq!(f.header.output(), Some("out.csv"));
+        let text = f.to_text();
+        assert!(
+            text.find("# collection:") < text.find("# output:"),
+            "new directives are appended after the existing ones: {text:?}"
+        );
+
+        // Setting the same value again is not a change, so it can't push a
+        // pointless undo entry or mark the report dirty.
+        assert!(!set_header(&mut f, "output", Some("out.csv")));
+
+        // Clearing removes the line rather than leaving `# output:` empty,
+        // which the parser would read as a directive set to the empty string.
+        assert!(set_header(&mut f, "output", None));
+        assert_eq!(f.header.output(), None);
+        assert!(!f.to_text().contains("# output"));
+        assert!(!set_header(&mut f, "output", None));
+
+        // Blank input means "unset", not "set to nothing".
+        assert!(!set_header(&mut f, "root", Some("   ")));
+        assert_eq!(f.header.root(), None);
+    }
+
+    /// Free-form `#` comments are the user's own notes; editing a directive must
+    /// never reorder or drop them.
+    #[test]
+    fn set_header_leaves_free_form_comments_alone() {
+        let mut f = flow(
+            "# collection: api.hurl
+# a note to self
+REQUEST A
+",
+        );
+        assert!(set_header(&mut f, "environment", Some("dev")));
+        let text = f.to_text();
+        assert!(text.contains("# a note to self"), "{text:?}");
+        assert!(
+            text.find("# environment:") < text.find("# a note"),
+            "the new directive joins the directive block, above the notes: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_degree_cannot_be_set_on_a_loop_that_is_not_parallel() {
+        // Accepting this would silently turn a serial loop concurrent; the
+        // PARALLEL modifier has to be attached first.
+        let mut f = flow("FOR X IN FILES \"/d\"\n    REQUEST A\nEND\n");
+        assert!(!set_parallel_degree(&mut f, &[0], Some(2)));
+        assert!(!f.to_text().contains("PARALLEL"));
+
+        // Nor on a node that has no PARALLEL concept at all.
+        let mut g = flow("REQUEST A\n");
+        assert!(!set_parallel_degree(&mut g, &[0], Some(2)));
+    }
+
+    #[test]
     fn parallel_modifier_toggles_a_loop() {
         let mut f = flow("FOR X IN FILES \"/d\"\n    REQUEST A\nEND\n");
         assert!(Modifier::Parallel.applies_to(node_at(&f, &[0]).unwrap()));
@@ -1099,6 +1899,255 @@ mod tests {
         assert!(!Modifier::Parallel.applies_to(n));
         assert!(!Modifier::With.applies_to(n));
         assert!(!Modifier::As.applies_to(n));
+    }
+
+    /// A clause is only pullable-out if the statement survives without it.
+    /// `REPORT` is load-bearing on a reported column (there is no statement left
+    /// at all) but not on a reported request, which falls back to a plain send.
+    #[test]
+    fn report_is_load_bearing_on_a_column_but_not_on_a_request() {
+        let flow =
+            parse_flow("REPORT REQUEST A\nREPORT TIER AS Plan\nREPORT \"x\" AS c\nREPORT (A, B)\n")
+                .expect("fixture parses");
+        assert!(
+            detach_leaves_statement(&flow.nodes[0], DetachWhich::Report),
+            "a reported request downgrades to a plain REQUEST, so REPORT snaps off"
+        );
+        for (i, what) in [
+            (1, "REPORT … AS"),
+            (2, "a computed column"),
+            (3, "REPORT (…)"),
+        ] {
+            assert!(
+                !detach_leaves_statement(&flow.nodes[i], DetachWhich::Report),
+                "nothing is left of {what} without REPORT, so it must move the whole row"
+            );
+        }
+    }
+
+    /// STATISTICS needs a named column to summarise; a bare `REPORT (A, B)` has
+    /// no single column to attach it to, and it is refused with a reason.
+    #[test]
+    fn statistics_attaches_to_a_named_column_and_only_once() {
+        let mut flow = parse_flow("REPORT TIER AS Plan\nREPORT (A, B)\n").expect("fixture parses");
+        assert!(
+            attach_modifier(&mut flow, &[0], Modifier::Statistics),
+            "a named column accepts STATISTICS"
+        );
+        assert!(
+            flow.to_text().contains("STATISTICS("),
+            "the clause is written out: {}",
+            flow.to_text()
+        );
+        assert!(
+            !attach_modifier(&mut flow, &[0], Modifier::Statistics),
+            "a column that already has STATISTICS refuses a second one"
+        );
+        assert!(
+            !attach_modifier(&mut flow, &[1], Modifier::Statistics),
+            "REPORT (A, B) names no single column"
+        );
+        detach_modifier(&mut flow, &[0], DetachWhich::Statistics);
+        assert!(
+            !flow.to_text().contains("STATISTICS(") && flow.to_text().contains("AS Plan"),
+            "detaching leaves the column itself alone: {}",
+            flow.to_text()
+        );
+    }
+
+    /// Every refusal has to distinguish "wrong kind of block" from "it's
+    /// already there" — telling someone REPORT only goes on a request while
+    /// they hover a reported request is worse than saying nothing.
+    #[test]
+    fn a_duplicate_modifier_is_refused_as_a_duplicate_not_as_a_wrong_block() {
+        let flow = parse_flow("REPORT REQUEST A\nREQUEST B\nREPORT TIER AS Plan\n")
+            .expect("fixture parses");
+        let s = Strings::english();
+
+        assert_eq!(
+            Modifier::Report.reject_reason(&flow.nodes[0], s),
+            Some(s.mod_reject_present),
+            "an already-reported request has REPORT, it isn't the wrong shape for it"
+        );
+        assert_eq!(
+            Modifier::Report.reject_reason(&flow.nodes[2], s),
+            Some(s.mod_reject_present),
+            "a reported column is a REPORT statement too"
+        );
+        assert_eq!(
+            Modifier::Report.reject_reason(&flow.nodes[1], s),
+            None,
+            "a plain request still takes REPORT"
+        );
+
+        // The same clause carried off another line answers the same way.
+        let carried = carry_modifier(&flow.nodes[0], DetachWhich::Report).expect("carries REPORT");
+        assert_eq!(
+            carried.reject_reason(&flow.nodes[0], s),
+            Some(s.mod_reject_present)
+        );
+    }
+
+    /// The whole point of dragging a clause between lines: it has to arrive
+    /// with the value it left with, not as a fresh placeholder.
+    #[test]
+    fn a_show_dragged_to_another_request_brings_its_columns_with_it() {
+        let mut flow = parse_flow("REPORT REQUEST A SHOW(Time, HttpStatus)\nREPORT REQUEST B\n")
+            .expect("fixture parses");
+
+        assert!(
+            transfer_modifier(&mut flow, &[0], DetachWhich::Show, &[1], false),
+            "an as-yet SHOW-less reported request accepts the clause"
+        );
+        let text = flow.to_text();
+        assert!(
+            text.contains("REQUEST B SHOW(Time, HttpStatus)"),
+            "the columns travel with the clause: {text}"
+        );
+        assert!(
+            !text.contains("REQUEST A SHOW"),
+            "a move leaves nothing behind on the source line: {text}"
+        );
+
+        // The destination already has one now, so dragging it back is refused
+        // outright rather than half-applied (the source must survive intact).
+        assert!(
+            !transfer_modifier(&mut flow, &[1], DetachWhich::Show, &[1], false),
+            "a line never transfers a clause to itself"
+        );
+    }
+
+    /// Shift-dropping copies instead of moving, which is how one loop's
+    /// `PARALLEL(4)` gets cloned onto its neighbours.
+    #[test]
+    fn a_copied_parallel_clones_its_degree_and_leaves_the_original_alone() {
+        let mut flow = parse_flow(
+            "PARALLEL(4) FOR X IN FILES \"/a\"\n    REQUEST A\nEND\nFOR Y IN FILES \"/b\"\n    REQUEST B\nEND\n",
+        )
+        .expect("fixture parses");
+
+        assert!(
+            transfer_modifier(&mut flow, &[0], DetachWhich::Parallel, &[1], true),
+            "a plain loop accepts a copied PARALLEL"
+        );
+        let text = flow.to_text();
+        assert_eq!(
+            text.matches("PARALLEL(4)").count(),
+            2,
+            "a copy keeps the original and reproduces its degree: {text}"
+        );
+
+        // Moving it onto a loop that now has one is refused, so the source keeps
+        // its own clause rather than losing it to a drop that did nothing.
+        assert!(
+            !transfer_modifier(&mut flow, &[0], DetachWhich::Parallel, &[1], false),
+            "a loop that is already parallel takes no second PARALLEL"
+        );
+        assert!(
+            flow.to_text().matches("PARALLEL(4)").count() == 2,
+            "a refused transfer is not half-applied: {}",
+            flow.to_text()
+        );
+    }
+
+    /// A clause is only offered where it makes sense, and the refusal says why.
+    #[test]
+    fn a_carried_clause_is_refused_by_a_block_that_cannot_hold_it() {
+        let flow = parse_flow("REPORT REQUEST A SHOW(Time)\nK = \"v\"\n").expect("parses");
+        let carried =
+            carry_modifier(&flow.nodes[0], DetachWhich::Show).expect("the SHOW is really there");
+        let s = Strings::english();
+
+        assert!(!carried.applies_to(&flow.nodes[1]), "SET has no columns");
+        assert_eq!(
+            carried.reject_reason(&flow.nodes[1], s),
+            Some(s.mod_reject_request_only),
+            "the refusal names the kind of block that would take it"
+        );
+
+        // Nothing to carry when the clause isn't on the node at all.
+        assert!(
+            carry_modifier(&flow.nodes[1], DetachWhich::Show).is_none(),
+            "a node without the clause carries nothing"
+        );
+    }
+
+    /// The baseline's `SHOW(…)` is a chip of its own, so dragging it out has to
+    /// clear only that clause and leave the comparison intact.
+    #[test]
+    fn detaching_the_baseline_show_leaves_the_rest_of_the_compare_loop() {
+        let mut flow = parse_flow(
+            "FOR E IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        )
+        .expect("fixture parses");
+        assert!(
+            !detach_modifier(&mut flow, &[0], DetachWhich::BaselineShow),
+            "clearing SHOW never removes the loop itself"
+        );
+        let text = flow.to_text();
+        assert!(
+            !text.contains("SHOW(") && text.contains("BASELINE(") && text.contains("COMPARISON("),
+            "only the SHOW clause goes: {text}"
+        );
+    }
+
+    /// Dropping either half of a comparison leaves nothing to compare against,
+    /// so the loop has to degrade to a plain pass rather than serialize a
+    /// `BASELINE(…)` with no `COMPARISON(…)` (which would not re-parse).
+    #[test]
+    fn detaching_a_comparison_role_degrades_the_loop_to_a_plain_pass() {
+        let mut flow = parse_flow(
+            "FOR E IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        )
+        .expect("fixture parses");
+        detach_modifier(
+            &mut flow,
+            &[0],
+            DetachWhich::Role {
+                baseline: false,
+                index: 0,
+            },
+        );
+        let text = flow.to_text();
+        assert!(
+            !text.contains("COMPARISON(") && !text.contains("BASELINE(") && text.contains("prod"),
+            "the surviving environment is still iterated: {text}"
+        );
+        assert!(
+            parse_flow(&text).is_ok(),
+            "the degraded loop re-parses: {text}"
+        );
+    }
+
+    #[test]
+    fn a_refused_modifier_says_whether_the_block_is_wrong_or_the_clause_is_already_there() {
+        let s = crate::i18n::Strings::english();
+        // Wrong kind of block: PARALLEL on an assignment names what it *does*
+        // take, so the user can aim somewhere useful.
+        let assign = flow("k = v\n");
+        assert_eq!(
+            Modifier::Parallel.reject_reason(node_at(&assign, &[0]).unwrap(), s),
+            Some(s.mod_reject_parallel),
+            "PARALLEL on an assignment should point at FOR loops"
+        );
+        // Right kind of block, clause already present: the reason must not
+        // claim the block is wrong, or the user will move the chip elsewhere.
+        let looped = flow(
+            "PARALLEL FOR E IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        );
+        assert_eq!(
+            Modifier::Parallel.reject_reason(node_at(&looped, &[0]).unwrap(), s),
+            Some(s.mod_reject_present),
+            "an already-parallel loop should say the clause is already there"
+        );
+        // And an accepted drop has no reason at all.
+        let plain =
+            flow("FOR E IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REQUEST A\nEND\n");
+        assert_eq!(
+            Modifier::Parallel.reject_reason(node_at(&plain, &[0]).unwrap(), s),
+            None,
+            "a modifier that applies should give no refusal reason"
+        );
     }
 
     #[test]
@@ -1361,31 +2410,54 @@ mod tests {
         let mut f = flow("REPORT REQUEST analyze RESPONSE PRETTY\n");
         // Append two fields; indices come back in order.
         assert_eq!(
-            add_with_field(&mut f, &[0], "Status", "HttpStatus"),
+            add_with_field(&mut f, &[0], "Status", "HttpStatus", Vec::new()),
             Some(0)
         );
         assert_eq!(
-            add_with_field(&mut f, &[0], "Body", "jsonpath \"$.x\""),
+            add_with_field(&mut f, &[0], "Body", "jsonpath \"$.x\"", Vec::new()),
             Some(1)
         );
         match node_at(&f, &[0]) {
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => assert_eq!(with.len(), 2),
             other => panic!("expected a report request, got {other:?}"),
         }
-        // Rewrite the first field's name/query in place.
-        assert!(set_with_field(&mut f, &[0], 0, "Code", "HttpStatus"));
+        // Rewrite the first field's name/query/statistics in place.
+        assert!(set_with_field(
+            &mut f,
+            &[0],
+            0,
+            "Code",
+            "HttpStatus",
+            vec![StatKind::Count, StatKind::Mean],
+        ));
         match node_at(&f, &[0]) {
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
                 assert!(matches!(
                     &with[0],
-                    WithItem::Field { name, query, .. } if name == "Code" && query == "HttpStatus"
+                    WithItem::Field { name, query, stats }
+                        if name == "Code"
+                            && query == "HttpStatus"
+                            && stats == &[StatKind::Count, StatKind::Mean]
                 ));
             }
             other => panic!("expected a report request, got {other:?}"),
         }
+        assert!(f.to_text().contains("STATISTICS(COUNT, MEAN)"));
+
+        // Clearing the checklist drops the clause entirely.
+        assert!(set_with_field(
+            &mut f,
+            &[0],
+            0,
+            "Code",
+            "HttpStatus",
+            Vec::new()
+        ));
+        assert!(!f.to_text().contains("STATISTICS"));
+
         // A non-request node has no WITH block to add to.
         let mut g = flow("REPORT userId\n");
-        assert_eq!(add_with_field(&mut g, &[0], "X", "Y"), None);
-        assert!(!set_with_field(&mut g, &[0], 0, "X", "Y"));
+        assert_eq!(add_with_field(&mut g, &[0], "X", "Y", Vec::new()), None);
+        assert!(!set_with_field(&mut g, &[0], 0, "X", "Y", Vec::new()));
     }
 }

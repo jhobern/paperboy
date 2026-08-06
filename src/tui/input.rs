@@ -13,7 +13,7 @@ use ratatui_explorer::{
 
 use crate::collection::Collection;
 use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
-use crate::hurl::{FormField, FormFieldKind, HurlEntry, METHODS};
+use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, METHODS};
 use crate::i18n::{Language, Status, Strings};
 use crate::persistence::{
     self, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState, PersistedTab,
@@ -427,13 +427,6 @@ impl TuiApp {
                     self.help_scroll.saturating_add(3)
                 };
             }
-            MouseScrollTarget::ReportDryRun => {
-                self.dry_run_scroll = if dir < 0 {
-                    self.dry_run_scroll.saturating_sub(3)
-                } else {
-                    self.dry_run_scroll.saturating_add(3)
-                };
-            }
             MouseScrollTarget::ReportCellPopup => self.scroll_result_cell_popup(dir * 3),
             MouseScrollTarget::WizardBody
             | MouseScrollTarget::WizardAllSections
@@ -490,6 +483,11 @@ impl TuiApp {
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
             Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
             Some(Overlay::ReportNodeFiles(form)) => form.selected = row,
+            Some(Overlay::ReportNodeWithField(form)) => form.selected = row,
+            Some(Overlay::ReportNodeAssign(form)) => form.selected = row,
+            Some(Overlay::ReportNodeList(form)) => form.selected = row,
+            Some(Overlay::ReportNodeVars(form)) => form.selected = row,
+            Some(Overlay::ReportNodeComputed(form)) => form.selected = row,
             _ => return,
         }
         self.on_key(Self::mouse_key(KeyCode::Enter));
@@ -1411,7 +1409,6 @@ impl TuiApp {
             Overlay::EnvVarForm(form) => self.env_var_form_key_handler(key, form),
             Overlay::Browser(action, ex) => self.browser_key_handler(key, action, ex),
             Overlay::NewRequest(form) => self.new_request_key_handler(key, form),
-            Overlay::ReportDryRun(preview) => self.report_dry_run_key_handler(key, preview),
             Overlay::ReportCellPopup {
                 title,
                 content,
@@ -1423,6 +1420,13 @@ impl TuiApp {
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
             Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
             Overlay::ReportNodeFiles(form) => self.report_node_files_key_handler(key, form),
+            Overlay::ReportNodeWithField(form) => {
+                self.report_node_with_field_key_handler(key, form)
+            }
+            Overlay::ReportNodeAssign(form) => self.report_node_assign_key_handler(key, form),
+            Overlay::ReportNodeList(form) => self.report_node_list_key_handler(key, form),
+            Overlay::ReportNodeVars(form) => self.report_node_vars_key_handler(key, form),
+            Overlay::ReportNodeComputed(form) => self.report_node_computed_key_handler(key, form),
         }
     }
 
@@ -1537,6 +1541,23 @@ impl TuiApp {
             // Ctrl+N is the escape hatch for an unattached scratch report tab.)
             KeyCode::Char('R') if self.collections[self.active_tab].is_workspace() => {
                 self.open_new_report_browser_for_tree(self.active_tab);
+            }
+            // Shift+N in a Workspace tab creates a new collection, report or
+            // environment inside the highlighted folder (or the folder holding
+            // the highlighted file). One prompt handles all three: the KIND
+            // COMES FROM THE EXTENSION typed (`.hurl`/`.trail`/`.vars`), which
+            // suits a keyboard UI better than a menu overlay and matches how
+            // the browser's inline filename editor already works.
+            KeyCode::Char('N') if self.collections[self.active_tab].is_workspace() => {
+                self.open_new_workspace_item_prompt(self.active_tab);
+            }
+            // Shift+M moves the highlighted workspace FILE OR FOLDER into
+            // another folder of the same workspace — the keyboard equivalent of
+            // the graphical front-end's drag-and-drop in the tree. Requests
+            // aren't files, so they keep the existing `m`/`c` transfer between
+            // collections instead.
+            KeyCode::Char('M') if self.collections[self.active_tab].is_workspace() => {
+                self.start_workspace_item_move();
             }
             KeyCode::Char('R') => self.new_report_tab(),
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -2697,16 +2718,19 @@ impl TuiApp {
     /// <code>` status expectation *is* exposed, as a `status == <code>` assert
     /// row that folds back into `expected_status` here.
     pub(crate) fn submit_new_request(&mut self, form: NewReq) {
-        fn header_rows_to_triples(rows: &[HeaderRow]) -> Vec<(String, String, bool)> {
+        /// The wizard's editable rows as model rows. The Description cell is
+        /// carried through like any other: it round-trips to the `.hurl` file
+        /// as a `# @desc` line above the row (see [`crate::hurl::KvRow`]), so a
+        /// note written here survives a save and reload.
+        fn header_rows_to_rows(rows: &[HeaderRow]) -> Vec<KvRow> {
             rows.iter()
-                .map(|r| {
-                    (
-                        r.key.text().trim().to_string(),
-                        r.value.text().trim().to_string(),
-                        r.enabled,
-                    )
+                .map(|r| KvRow {
+                    key: r.key.text().trim().to_string(),
+                    value: r.value.text().trim().to_string(),
+                    enabled: r.enabled,
+                    desc: r.desc.text().trim().to_string(),
                 })
-                .filter(|(k, _, _)| !k.is_empty())
+                .filter(|r| !r.key.is_empty())
                 .collect()
         }
 
@@ -2722,10 +2746,10 @@ impl TuiApp {
         // siblings. The list already shows the URL for every row, so an empty
         // title loses nothing visually.
         let name = form.name.text().trim().to_string();
-        let headers: Vec<(String, String, bool)> = header_rows_to_triples(&form.headers);
-        let cookies: Vec<(String, String, bool)> = header_rows_to_triples(&form.cookies);
-        let queries: Vec<(String, String, bool)> = header_rows_to_triples(&form.queries);
-        let options: Vec<(String, String, bool)> = header_rows_to_triples(&form.options);
+        let headers: Vec<KvRow> = header_rows_to_rows(&form.headers);
+        let cookies: Vec<KvRow> = header_rows_to_rows(&form.cookies);
+        let queries: Vec<KvRow> = header_rows_to_rows(&form.queries);
+        let options: Vec<KvRow> = header_rows_to_rows(&form.options);
         let form_fields: Vec<FormField> = form
             .form_fields
             .iter()
@@ -2733,8 +2757,6 @@ impl TuiApp {
             .map(|r| {
                 // For File-kind rows the Content-Type cell is the optional
                 // Hurl content-type override; for Text rows it's ignored.
-                // Desc is always UI-only and not persisted, matching Header
-                // rows.
                 let kind = r.kind;
                 let content_type = if kind == FormFieldKind::File {
                     let ct = r.ctype.text().trim().to_string();
@@ -2753,6 +2775,7 @@ impl TuiApp {
                     content_type,
                     base64_prefix,
                     enabled: r.enabled,
+                    desc: r.desc.text().trim().to_string(),
                 }
             })
             .collect();
@@ -3037,6 +3060,7 @@ impl TuiApp {
         self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
         self.active_theme = state.active_theme;
+        self.gui_layout = state.gui;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
@@ -3106,6 +3130,7 @@ impl TuiApp {
                 .iter()
                 .map(PersistedEnv::from_environment)
                 .collect(),
+            gui: self.gui_layout,
             active_global_env: self
                 .active_env_id
                 .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
@@ -3486,10 +3511,13 @@ impl TuiApp {
     }
 
     /// Quit, first asking for confirmation when the setting is enabled — or when
-    /// there are unsaved secret edits that would be lost (even if the setting is
-    /// off), so the user is never silently robbed of secret changes.
+    /// there are unsaved secret or request edits that would be lost (even if the
+    /// setting is off), so the user is never silently robbed of changes.
     pub(crate) fn request_quit(&mut self) {
-        if self.confirm_on_exit || self.has_unsaved_secret_changes() {
+        if self.confirm_on_exit
+            || self.has_unsaved_secret_changes()
+            || self.unsaved_request_edits() > 0
+        {
             self.overlay = Some(Overlay::Confirm {
                 action: ConfirmAction::Exit,
                 sel: 1,
@@ -3930,6 +3958,7 @@ impl TuiApp {
             FileAction::LoadEnv => s.load_environment,
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
+            FileAction::MoveWorkspaceItemChooseFolder => s.move_workspace_item,
             FileAction::SaveCollectionChooseFolder => s.save_collection_folder,
             FileAction::SaveReportCsvChooseFolder => s.report_export_csv_folder,
             FileAction::SaveReportBaselineChooseFolder => s.report_save_baseline_folder,
@@ -3944,6 +3973,7 @@ impl TuiApp {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::PickReportNodeFolder => s.browser_hint_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
+            FileAction::MoveWorkspaceItemChooseFolder => s.browser_hint_workspace_move,
             FileAction::SaveCollectionChooseFolder
             | FileAction::SaveReportCsvChooseFolder
             | FileAction::SaveReportBaselineChooseFolder
@@ -4959,10 +4989,18 @@ impl TuiApp {
     }
 
     /// Reapply the load browser's file filter from the current extension-filter
-    /// toggle and the type-to-filter query. Directories always pass so the tree
-    /// stays navigable; files must satisfy the extension set (when the toggle is
-    /// on) and contain the query as a case-insensitive substring. When neither
-    /// constraint is active the filter is removed entirely so every file shows.
+    /// toggle and the type-to-filter query.
+    ///
+    /// The *extension* filter never hides a directory — it selects what kind of
+    /// thing is being opened, and hiding folders by it would make whole subtrees
+    /// unreachable. The *type-to-filter query* does apply to folders, though: in
+    /// a directory holding hundreds of entries, narrowing only the files still
+    /// leaves the matches buried among unrelated folders, which is exactly what
+    /// the query is meant to cut through. Clearing the query brings them all
+    /// back, and `../` is always exempt so there is never a filter you can't
+    /// navigate out of.
+    ///
+    /// When neither constraint is active the filter is removed entirely.
     fn apply_browser_filter(&self, action: FileAction, ex: &mut FileExplorer) {
         let filter_on = self.browser_filter_on && browser_filters_by_ext(action);
         let query = self.browser_query.to_ascii_lowercase();
@@ -4971,10 +5009,10 @@ impl TuiApp {
             return;
         }
         let _ = ex.set_filter_map(move |file| {
-            if file.is_dir {
+            if file.is_dir && file.name == "../" {
                 return Some(file);
             }
-            if filter_on && !browser_keep_file(action, &file) {
+            if !file.is_dir && filter_on && !browser_keep_file(action, &file) {
                 return None;
             }
             if !query.is_empty() {
@@ -5152,6 +5190,7 @@ impl TuiApp {
                     FileAction::OpenWorkspace
                         | FileAction::SaveWorkspaceChooseFolder
                         | FileAction::SaveCollectionChooseFolder
+                        | FileAction::MoveWorkspaceItemChooseFolder
                         | FileAction::NewReportChooseFolder
                 ) {
                     // A Workspace root/destination (or a collection save
@@ -5186,6 +5225,14 @@ impl TuiApp {
                 self.last_browse_dir = Some(root.clone());
                 self.confirm_workspace_root(root);
                 self.save_state();
+            }
+            KeyCode::Char(' ') if action == FileAction::MoveWorkspaceItemChooseFolder => {
+                // Confirm the CURRENT folder as the move destination, as with
+                // `OpenWorkspace` above — the highlighted child may well be the
+                // file being moved, so Enter stays "descend into folder".
+                let dir = ex.cwd().clone();
+                self.overlay = None;
+                self.finish_workspace_item_move(dir);
             }
             KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
                 // Confirm the current directory as the loop's source folder,

@@ -28,8 +28,10 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef, WithItem,
+    Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt,
+    RoleRef, WithItem,
 };
+use crate::report::model::StatKind;
 
 // The pure structural-editing core (flatten/insert/remove/move/replace/parse
 // of the flow AST, plus the node-kind palette templates) lives in the
@@ -101,6 +103,13 @@ pub(crate) enum FormRow {
     Alias,
     /// A `SHOW(…)` field checkbox (index into [`RequestForm::fields`]).
     Field(usize),
+    /// A `HIDE(…)` field checkbox (index into [`RequestForm::hide_fields`]).
+    Hidden(usize),
+    /// One `WITH name: query` field (index into [`RequestForm::with`]).
+    /// Activating it opens the [`WithFieldForm`].
+    With(usize),
+    /// The "add a `WITH` field" row, which opens an empty [`WithFieldForm`].
+    AddWith,
 }
 
 /// The request configure form ([`Overlay::ReportNodeRequest`]), reached with
@@ -130,10 +139,11 @@ pub(crate) struct RequestForm {
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
-    /// The node's `HIDE(…)` clause, preserved verbatim across an edit (the
-    /// form doesn't expose a HIDE editor, but must not drop the clause when
-    /// re-serializing).
-    pub(crate) hide: Vec<String>,
+    /// The `HIDE(…)` checklist, over the same field names as [`Self::fields`].
+    /// A ticked row is *hidden*; nothing ticked ⇒ no `HIDE` clause. `SHOW` and
+    /// `HIDE` are separate clauses in the grammar, so they get separate lists
+    /// rather than one tri-state per field.
+    pub(crate) hide_fields: Vec<ShowRow>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -185,12 +195,27 @@ impl RequestForm {
         for f in current_show {
             push(f, &mut names);
         }
+        // A `HIDE` entry naming something no request offers is kept too, for
+        // the same reason: applying must not drop what the user wrote.
+        for f in &hide {
+            push(f, &mut names);
+        }
         let all = current_show.is_empty();
-        let fields = names
-            .into_iter()
+        let fields: Vec<ShowRow> = names
+            .iter()
             .map(|name| {
-                let included = all || current_show.iter().any(|s| s == &name);
-                ShowRow { name, included }
+                let included = all || current_show.iter().any(|s| s == name);
+                ShowRow {
+                    name: name.clone(),
+                    included,
+                }
+            })
+            .collect();
+        let hide_fields = names
+            .iter()
+            .map(|name| ShowRow {
+                name: name.clone(),
+                included: hide.iter().any(|h| h == name),
             })
             .collect();
         RequestForm {
@@ -203,7 +228,7 @@ impl RequestForm {
             alias: alias.unwrap_or_default(),
             fields,
             with,
-            hide,
+            hide_fields,
             selected: 0,
         }
     }
@@ -216,8 +241,22 @@ impl RequestForm {
             rows.push(FormRow::Response);
             rows.push(FormRow::Alias);
             rows.extend((0..self.fields.len()).map(FormRow::Field));
+            rows.extend((0..self.hide_fields.len()).map(FormRow::Hidden));
+            rows.extend((0..self.with.len()).map(FormRow::With));
+            rows.push(FormRow::AddWith);
         }
         rows
+    }
+
+    /// The `HIDE(…)` list for the ticked rows, in row order. Nothing ticked ⇒
+    /// no clause (unlike `SHOW`, where *everything* ticked is the no-clause
+    /// case — `HIDE` hides only what it names).
+    fn hide(&self) -> Vec<String> {
+        self.hide_fields
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect()
     }
 
     /// The last selectable row index.
@@ -284,6 +323,392 @@ impl RequestForm {
     }
 }
 
+/// One row of the [`VarsForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarsRow {
+    /// One in-scope variable checkbox (index into [`VarsForm::vars`]).
+    Var(usize),
+    /// The free-text row for a variable the static scan can't see (a value
+    /// that only exists at run time, or one supplied by the environment).
+    Other,
+    /// The `AS <name>` column name — only offered when exactly one variable is
+    /// picked, since `REPORT (A, B)` has no single column to name.
+    Alias,
+    /// One `STATISTICS(…)` checkbox — likewise single-variable only.
+    Stat(usize),
+}
+
+/// The `REPORT <var>` configure form ([`Overlay::ReportNodeVars`]): which
+/// variables become columns, and — for a single variable — the `AS <name>`
+/// column name and its `STATISTICS(…)`.
+///
+/// The two grammar forms it writes are `REPORT (A, B)` for several variables
+/// and `REPORT A AS name STATISTICS(…)` for one, so the alias and stat rows
+/// appear and disappear with the number ticked rather than being written into
+/// a shape that can't hold them.
+pub(crate) struct VarsForm {
+    pub(crate) report_id: u64,
+    pub(crate) path: Vec<usize>,
+    /// `(name, ticked)` over the variables in scope at this point in the flow,
+    /// plus anything the statement already names.
+    pub(crate) vars: Vec<ShowRow>,
+    /// A variable typed by hand, for the run-time-only names the static scan
+    /// can't enumerate (see [`crate::report::edit::vars_in_scope`]).
+    pub(crate) other: String,
+    pub(crate) alias: String,
+    pub(crate) stats: Vec<(StatKind, bool)>,
+    pub(crate) selected: usize,
+}
+
+impl VarsForm {
+    /// Build the form from the statement's current variables and the names in
+    /// scope. Anything the statement already names is ticked and kept, even if
+    /// it isn't in scope — applying must never drop what the user wrote.
+    fn build(
+        report_id: u64,
+        path: Vec<usize>,
+        chosen: &[String],
+        alias: Option<String>,
+        stats: &[StatKind],
+        in_scope: Vec<String>,
+    ) -> Self {
+        let mut names = in_scope;
+        for c in chosen {
+            if !names.iter().any(|n| n == c) {
+                names.push(c.clone());
+            }
+        }
+        VarsForm {
+            report_id,
+            path,
+            vars: names
+                .into_iter()
+                .map(|name| {
+                    let included = chosen.iter().any(|c| c == &name);
+                    ShowRow { name, included }
+                })
+                .collect(),
+            other: String::new(),
+            alias: alias.unwrap_or_default(),
+            stats: StatKind::CHOOSABLE
+                .iter()
+                .map(|k| (*k, stats.contains(k)))
+                .collect(),
+            selected: 0,
+        }
+    }
+
+    /// The ticked variables, in row order.
+    fn chosen(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .vars
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect();
+        let other = self.other.trim();
+        if !other.is_empty() && !out.iter().any(|n| n == other) {
+            out.push(other.to_string());
+        }
+        out
+    }
+
+    pub(crate) fn visible_rows(&self) -> Vec<VarsRow> {
+        let mut rows: Vec<VarsRow> = (0..self.vars.len()).map(VarsRow::Var).collect();
+        rows.push(VarsRow::Other);
+        // `AS` and `STATISTICS` belong to `REPORT <var> AS <name>`, which holds
+        // exactly one variable.
+        if self.chosen().len() == 1 {
+            rows.push(VarsRow::Alias);
+            rows.extend((0..self.stats.len()).map(VarsRow::Stat));
+        }
+        rows
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// The node the rows describe, or `None` when nothing is picked (a
+    /// `REPORT` with no variables can't be serialized).
+    fn node(&self) -> Option<FlowNode> {
+        let chosen = self.chosen();
+        let (first, rest) = chosen.split_first()?;
+        let alias = self.alias.trim();
+        let stats: Vec<StatKind> = self
+            .stats
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(k, _)| *k)
+            .collect();
+        // A single variable with a name or statistics is the `VarAs` form;
+        // anything else is the plain variable list.
+        if rest.is_empty() && (!alias.is_empty() || !stats.is_empty()) {
+            return Some(FlowNode::Report(ReportStmt::VarAs {
+                var: first.clone(),
+                // `STATISTICS` needs a column to attach to, so an unnamed one
+                // falls back to the variable's own name.
+                name: if alias.is_empty() {
+                    first.clone()
+                } else {
+                    alias.to_string()
+                },
+                stats,
+            }));
+        }
+        Some(FlowNode::Report(ReportStmt::Vars(chosen)))
+    }
+}
+
+/// One row of the [`ComputedForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComputedRow {
+    /// The quoted template the column's value is built from.
+    Template,
+    /// The `AS <name>` column name.
+    Alias,
+    /// One `STATISTICS(…)` checkbox.
+    Stat(usize),
+}
+
+/// The `REPORT "<template>" AS <name>` configure form
+/// ([`Overlay::ReportNodeComputed`]): a computed column's template, its name
+/// and its `STATISTICS(…)`.
+///
+/// The template is free text because it interpolates `{{ … }}` references —
+/// there is nothing to pick from a list — but the name and the statistics are
+/// structured, and both are required for the statement to re-parse, which is
+/// exactly why typing the whole line by hand was easy to get wrong.
+pub(crate) struct ComputedForm {
+    pub(crate) report_id: u64,
+    pub(crate) path: Vec<usize>,
+    pub(crate) template: String,
+    pub(crate) alias: String,
+    pub(crate) stats: Vec<(StatKind, bool)>,
+    pub(crate) selected: usize,
+}
+
+impl ComputedForm {
+    pub(crate) fn visible_rows(&self) -> Vec<ComputedRow> {
+        let mut rows = vec![ComputedRow::Template, ComputedRow::Alias];
+        rows.extend((0..self.stats.len()).map(ComputedRow::Stat));
+        rows
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// The node the rows describe. `None` when either half is blank: an empty
+    /// template or a missing `AS` name won't re-parse, which would kick the
+    /// user out of the node editor entirely.
+    fn node(&self) -> Option<FlowNode> {
+        let template = self.template.trim();
+        let alias = self.alias.trim();
+        if template.is_empty() || alias.is_empty() {
+            return None;
+        }
+        Some(FlowNode::Report(ReportStmt::Computed {
+            template: template.to_string(),
+            name: alias.to_string(),
+            stats: self
+                .stats
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(k, _)| *k)
+                .collect(),
+        }))
+    }
+}
+
+/// One row of the [`AssignForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignRow {
+    /// The variable name (`VAR = …`).
+    Key,
+    /// The value it is set to.
+    Value,
+}
+
+/// The `VARIABLE = VALUE` configure form ([`Overlay::ReportNodeAssign`]): two
+/// free-text rows. It exists so a `SET` line doesn't have to be typed as raw
+/// source just to change the value it assigns.
+pub(crate) struct AssignForm {
+    pub(crate) report_id: u64,
+    pub(crate) path: Vec<usize>,
+    pub(crate) key: String,
+    pub(crate) value: String,
+    pub(crate) selected: usize,
+}
+
+impl AssignForm {
+    pub(crate) fn visible_rows(&self) -> Vec<AssignRow> {
+        vec![AssignRow::Key, AssignRow::Value]
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// The node the rows describe, or `None` when the variable is unnamed (an
+    /// assignment with no left-hand side can't be serialized).
+    fn node(&self) -> Option<FlowNode> {
+        let key = self.key.trim();
+        (!key.is_empty()).then(|| FlowNode::Assign {
+            key: key.to_string(),
+            value: self.value.trim().to_string(),
+        })
+    }
+}
+
+/// One row of the [`ListForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListRow {
+    /// The list's name (`LIST NAME = [ … ]`).
+    Name,
+    /// One scalar element (index into [`ListForm::values`]).
+    Value(usize),
+    /// The "add an element" row.
+    Add,
+}
+
+/// The `LIST NAME = [ … ]` configure form ([`Overlay::ReportNodeList`]): the
+/// list's name and one row per element.
+///
+/// Only a *literal* list of scalars is edited here — a tuple list or a computed
+/// producer (`ZIP`, `CONCAT`, `TUPLES FROM`) has structure this flat form would
+/// flatten away, so those fall through to the raw line editor instead.
+pub(crate) struct ListForm {
+    pub(crate) report_id: u64,
+    pub(crate) path: Vec<usize>,
+    pub(crate) name: String,
+    pub(crate) values: Vec<String>,
+    pub(crate) selected: usize,
+}
+
+impl ListForm {
+    pub(crate) fn visible_rows(&self) -> Vec<ListRow> {
+        let mut rows = vec![ListRow::Name];
+        rows.extend((0..self.values.len()).map(ListRow::Value));
+        rows.push(ListRow::Add);
+        rows
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// The node the rows describe, or `None` when the list is unnamed. Blank
+    /// element rows are dropped, so deleting an element is just clearing it.
+    fn node(&self) -> Option<FlowNode> {
+        let name = self.name.trim();
+        (!name.is_empty()).then(|| FlowNode::ListDecl {
+            name: name.to_string(),
+            producer: Producer::List(
+                self.values
+                    .iter()
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| Element::Scalar(v.to_string()))
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// One row of the [`WithFieldForm`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithFieldRow {
+    /// The column name (`WITH name: …`), editable inline.
+    Name,
+    /// The Hurl query the column's value comes from, editable inline.
+    Query,
+    /// One `STATISTICS(…)` checkbox (index into [`StatKind::CHOOSABLE`]).
+    Stat(usize),
+}
+
+/// The `WITH name: query` field form ([`Overlay::ReportNodeWithField`]): one
+/// ad-hoc column of a report request's `WITH … END` block.
+///
+/// It edits a single field rather than the whole block because a `WITH` item is
+/// two free-text values plus a checklist — far more than a row of the request
+/// form can carry — and because adding one field at a time is how the block is
+/// actually built up.
+pub(crate) struct WithFieldForm {
+    /// The report being edited (looked up by id, resilient to tab reorder).
+    pub(crate) report_id: u64,
+    /// Path of the report-request node whose `WITH` block this edits.
+    pub(crate) path: Vec<usize>,
+    /// The index being edited, or `None` to append a new field.
+    pub(crate) index: Option<usize>,
+    pub(crate) name: String,
+    pub(crate) query: String,
+    /// `(stat, ticked)` over [`StatKind::CHOOSABLE`], in that order. None
+    /// ticked ⇒ no `STATISTICS(…)` clause.
+    pub(crate) stats: Vec<(StatKind, bool)>,
+    /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
+    pub(crate) selected: usize,
+}
+
+impl WithFieldForm {
+    fn build(
+        report_id: u64,
+        path: Vec<usize>,
+        index: Option<usize>,
+        existing: Option<&WithItem>,
+    ) -> Self {
+        let (name, query, stats) = match existing {
+            Some(WithItem::Field { name, query, stats }) => {
+                (name.clone(), query.clone(), stats.clone())
+            }
+            // A bare `WITH RESPONSE` isn't a named field, so editing it falls
+            // through to a fresh one rather than silently rewriting it.
+            _ => (String::new(), String::new(), Vec::new()),
+        };
+        WithFieldForm {
+            report_id,
+            path,
+            index,
+            name,
+            query,
+            stats: StatKind::CHOOSABLE
+                .iter()
+                .map(|k| (*k, stats.contains(k)))
+                .collect(),
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn visible_rows(&self) -> Vec<WithFieldRow> {
+        let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query];
+        rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
+        rows
+    }
+
+    fn last_row(&self) -> usize {
+        self.visible_rows().len().saturating_sub(1)
+    }
+
+    /// The field the rows describe, or `None` when it has no name (an unnamed
+    /// column can't be written, so the caller leaves the block unchanged).
+    fn item(&self) -> Option<WithItem> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some(WithItem::Field {
+            name: name.to_string(),
+            query: self.query.trim().to_string(),
+            stats: self
+                .stats
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(k, _)| *k)
+                .collect(),
+        })
+    }
+}
+
 /// One row of the [`EnvsForm`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnvsRow {
@@ -293,8 +718,14 @@ pub(crate) enum EnvsRow {
     Mode,
     /// The `PARALLEL` on/off toggle (run iterations concurrently).
     Parallel,
+    /// `PARALLEL(n)`'s max-concurrency, typed as digits. Only shown while
+    /// `PARALLEL` is on, since a degree without the marker means nothing.
+    Degree,
     /// One environment entry (index into [`EnvsForm::entries`]).
     Env(usize),
+    /// One `BASELINE(…) SHOW(…)` field checkbox (index into
+    /// [`EnvsForm::baseline_show`]). Compare mode only.
+    BaselineShow(usize),
 }
 
 /// One chosen environment in the [`EnvsForm`]. `baseline` is only meaningful in
@@ -334,26 +765,34 @@ pub(crate) struct EnvsForm {
     pub(crate) snapshots: Vec<String>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
-    /// Field suffixes from `BASELINE(…) SHOW(…)`.  The form has no editing UI
-    /// for this — it is preserved verbatim so a round-trip doesn't silently drop
-    /// a `SHOW(…)` clause the user wrote in source.
-    pub(crate) baseline_show: Vec<String>,
+    /// `PARALLEL(n)`'s max-concurrency as typed text, so the row can be left
+    /// blank (meaning "use the prelude's `MAX_PARALLEL`") and half-typed input
+    /// isn't clamped under the cursor.
+    pub(crate) degree: String,
+    /// `BASELINE(…) SHOW(…)` as a checklist over every field the loop body's
+    /// reported requests can emit. Nothing ticked means *no* `SHOW` clause,
+    /// which for a baseline is "carry nothing across" — the opposite of a
+    /// request's `SHOW`, where empty means "emit everything". So nothing is
+    /// ticked by default.
+    pub(crate) baseline_show: Vec<ShowRow>,
 }
 
 impl EnvsForm {
     /// Build the form from a node's current variable and [`EnvClause`].
     /// `choices` are the loaded environment names an env entry cycles through;
     /// `snapshots` are the discovered `.baseline` paths a `FILE(…)` entry cycles.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         report_id: u64,
         path: Vec<usize>,
         var: String,
         clause: &EnvClause,
-        parallel: bool,
+        parallel: Option<ParallelSpec>,
         choices: Vec<String>,
         mut snapshots: Vec<String>,
+        show_choices: Vec<(String, bool)>,
     ) -> Self {
-        let (compare, mut entries, baseline_show) = match clause {
+        let (compare, mut entries, baseline_show_names) = match clause {
             EnvClause::Plain(names) => (
                 false,
                 names
@@ -398,12 +837,32 @@ impl EnvsForm {
                 file: false,
             });
         }
+        // The checklist is built by the caller (it needs the loop body and the
+        // bound collection); anything the clause already names but the body no
+        // longer offers is appended there, so applying can't silently drop a
+        // field the user wrote by hand.
+        let mut baseline_show: Vec<ShowRow> = show_choices
+            .into_iter()
+            .map(|(name, included)| ShowRow { name, included })
+            .collect();
+        for name in &baseline_show_names {
+            if !baseline_show.iter().any(|r| &r.name == name) {
+                baseline_show.push(ShowRow {
+                    name: name.clone(),
+                    included: true,
+                });
+            }
+        }
         EnvsForm {
             report_id,
             path,
             var,
             compare,
-            parallel,
+            parallel: parallel.is_some(),
+            degree: parallel
+                .and_then(|p| p.degree)
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
             entries,
             choices,
             snapshots,
@@ -414,8 +873,35 @@ impl EnvsForm {
 
     pub(crate) fn visible_rows(&self) -> Vec<EnvsRow> {
         let mut rows = vec![EnvsRow::Var, EnvsRow::Mode, EnvsRow::Parallel];
+        if self.parallel {
+            rows.push(EnvsRow::Degree);
+        }
         rows.extend((0..self.entries.len()).map(EnvsRow::Env));
+        // `SHOW` selects what the baseline carries across into the comparison,
+        // so it only exists in Compare mode — and only once there is a baseline
+        // for it to qualify.
+        if self.compare && self.entries.iter().any(|e| e.baseline) {
+            rows.extend((0..self.baseline_show.len()).map(EnvsRow::BaselineShow));
+        }
         rows
+    }
+
+    /// The `PARALLEL` spec the rows describe: `None` when the toggle is off,
+    /// else the typed degree (a blank or unparseable box means "no explicit
+    /// limit", i.e. fall back to the prelude's `MAX_PARALLEL`).
+    fn parallel_spec(&self) -> Option<ParallelSpec> {
+        self.parallel.then(|| ParallelSpec {
+            degree: self.degree.trim().parse::<u32>().ok().filter(|d| *d > 0),
+        })
+    }
+
+    /// The ticked `BASELINE(…) SHOW(…)` fields, in checklist order.
+    fn selected_baseline_show(&self) -> Vec<String> {
+        self.baseline_show
+            .iter()
+            .filter(|r| r.included)
+            .map(|r| r.name.clone())
+            .collect()
     }
 
     fn last_row(&self) -> usize {
@@ -546,7 +1032,7 @@ impl EnvsForm {
             Some(EnvClause::Roles {
                 baseline,
                 comparisons,
-                baseline_show: self.baseline_show.clone(),
+                baseline_show: self.selected_baseline_show(),
             })
         } else {
             let names: Vec<String> = self
@@ -574,12 +1060,20 @@ pub(crate) enum FilesRow {
     Match,
     /// The `PARALLEL` on/off toggle (run iterations concurrently).
     Parallel,
+    /// `PARALLEL(n)`'s max-concurrency, typed as digits. Only shown while
+    /// `PARALLEL` is on.
+    Degree,
 }
 
-/// The `FOR … IN FILES` configure form ([`Overlay::ReportNodeFiles`]), reached
-/// with Enter on a `FILES` loop node — the file analogue of [`EnvsForm`]. It
-/// picks the loop variable, the source folder (via the file picker), an
-/// optional `MATCH` glob, and whether the loop runs `PARALLEL`.
+/// The `FOR … IN FILES` / `FOR … IN FOLDERS` configure form
+/// ([`Overlay::ReportNodeFiles`]), reached with Enter on either loop — the file
+/// analogue of [`EnvsForm`]. It picks the loop variable, the source folder (via
+/// the file picker), an optional `MATCH` glob (`FILES` only) and whether the
+/// loop runs `PARALLEL`, with an optional max-concurrency.
+///
+/// The two producers share one form because they differ only in that `FOLDERS`
+/// has no `MATCH` and instead carries `WITH role="glob"` clauses, which the
+/// form preserves verbatim rather than editing.
 pub(crate) struct FilesForm {
     /// The report being edited (looked up by id, resilient to tab reorder).
     pub(crate) report_id: u64,
@@ -594,6 +1088,13 @@ pub(crate) struct FilesForm {
     pub(crate) glob: String,
     /// `true` when the loop is marked `PARALLEL` (iterations run concurrently).
     pub(crate) parallel: bool,
+    /// `PARALLEL(n)`'s max-concurrency as typed text; blank ⇒ no explicit limit.
+    pub(crate) degree: String,
+    /// `true` when this edits a `FOLDERS` loop rather than a `FILES` one.
+    pub(crate) folders: bool,
+    /// A `FOLDERS` loop's `WITH role="glob"` clauses, preserved verbatim across
+    /// an edit (the form doesn't expose them, but must not drop them).
+    pub(crate) roles: Vec<(String, String)>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -603,13 +1104,16 @@ impl FilesForm {
     /// and parallel marker. A freshly-inserted loop (empty `dir`) starts with
     /// the Folder row selected so the picker is one keystroke away — the source
     /// directory is the whole point of the loop.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         report_id: u64,
         path: Vec<usize>,
         var: String,
         dir: String,
         glob: Option<String>,
-        parallel: bool,
+        parallel: Option<ParallelSpec>,
+        folders: bool,
+        roles: Vec<(String, String)>,
     ) -> Self {
         let selected = if dir.trim().is_empty() { 1 } else { 0 };
         FilesForm {
@@ -618,18 +1122,51 @@ impl FilesForm {
             var,
             dir,
             glob: glob.unwrap_or_default(),
-            parallel,
+            parallel: parallel.is_some(),
+            degree: parallel
+                .and_then(|p| p.degree)
+                .map(|d| d.to_string())
+                .unwrap_or_default(),
+            folders,
+            roles,
             selected,
         }
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<FilesRow> {
-        vec![
-            FilesRow::Var,
-            FilesRow::Folder,
-            FilesRow::Match,
-            FilesRow::Parallel,
-        ]
+        let mut rows = vec![FilesRow::Var, FilesRow::Folder];
+        // `FOLDERS` has no `MATCH` clause in the grammar, so the row would be
+        // a field that can't be written.
+        if !self.folders {
+            rows.push(FilesRow::Match);
+        }
+        rows.push(FilesRow::Parallel);
+        if self.parallel {
+            rows.push(FilesRow::Degree);
+        }
+        rows
+    }
+
+    /// The `PARALLEL` spec the rows describe (see [`EnvsForm::parallel_spec`]).
+    fn parallel_spec(&self) -> Option<ParallelSpec> {
+        self.parallel.then(|| ParallelSpec {
+            degree: self.degree.trim().parse::<u32>().ok().filter(|d| *d > 0),
+        })
+    }
+
+    /// The producer the rows describe.
+    fn producer(&self) -> Producer {
+        if self.folders {
+            Producer::Folders {
+                dir: self.dir.clone(),
+                roles: self.roles.clone(),
+            }
+        } else {
+            Producer::Files {
+                dir: self.dir.clone(),
+                glob: self.glob_opt(),
+            }
+        }
     }
 
     fn last_row(&self) -> usize {
@@ -857,9 +1394,10 @@ impl TuiApp {
     /// the selected node. The form depends on the node kind: `Begin` opens the
     /// insert palette; a request node opens the request form (name, `REPORT`
     /// toggle, and — when reported — response/alias/`SHOW`); a `FOR FILES/
-    /// FOLDERS` loop opens the folder browser; anything else falls back to the
-    /// raw line editor (until it grows its own form). Never touches the File
-    /// menu (that's `f`).
+    /// FOLDERS` loop opens the folder browser; reported variables and computed
+    /// columns open their own forms. Only the kinds with no palette entry
+    /// (tuple-pattern loops, tuple list literals, exotic producers) fall back to
+    /// the raw line editor. Never touches the File menu (that's `f`).
     fn configure_selected_node(&mut self, idx: usize) {
         let Ok(rows) = self.report_node_rows(idx) else {
             return;
@@ -884,6 +1422,18 @@ impl TuiApp {
         if self.open_report_node_files(idx) {
             return;
         }
+        if self.open_report_node_vars(idx) {
+            return;
+        }
+        if self.open_report_node_computed(idx) {
+            return;
+        }
+        if self.open_report_node_assign(idx) {
+            return;
+        }
+        if self.open_report_node_list(idx) {
+            return;
+        }
         if self.open_report_node_folder(idx) {
             return;
         }
@@ -894,54 +1444,48 @@ impl TuiApp {
     /// or a `REPORT REQUEST`. Returns `true` when the selection is a request
     /// node, `false` otherwise so the caller can try another form. The `REPORT`
     /// toggle lets a plain request become reported (and back) from here.
-    fn open_report_node_request(&mut self, idx: usize) -> bool {
-        let Ok(rows) = self.report_node_rows(idx) else {
-            return false;
-        };
-        let sel = self.reports[idx]
-            .node_selected
-            .min(rows.len().saturating_sub(1));
-        let Some(row) = rows.get(sel) else {
-            return false;
-        };
-        let path = row.path.clone();
+    /// Build a [`RequestForm`] for `node` at `path` in report `idx`, or `None`
+    /// when the node isn't a request. Shared by the "open it" gesture and by
+    /// the `WITH` sub-form's return path, so both land on an identically
+    /// populated form.
+    fn build_report_node_request_form(
+        &self,
+        idx: usize,
+        path: Vec<usize>,
+        node: &FlowNode,
+    ) -> Option<RequestForm> {
         let report_id = self.reports[idx].report.id;
-        let (name, report, alias, response, current_show, current_hide, with) = {
-            let Ok(flow) = self.reports[idx].report.flow() else {
-                return false;
-            };
-            match node_at(&flow, &path) {
-                Some(FlowNode::Request { name }) => (
-                    name.clone(),
-                    false,
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
-                Some(FlowNode::Report(ReportStmt::Request {
-                    name,
-                    alias,
-                    response_fmt,
-                    show,
-                    hide,
-                    with,
-                })) => (
-                    name.clone(),
-                    true,
-                    alias.clone(),
-                    *response_fmt,
-                    show.clone(),
-                    hide.clone(),
-                    with.clone(),
-                ),
-                _ => return false, // not a request node
-            }
+        let (name, report, alias, response, current_show, current_hide, with) = match node {
+            FlowNode::Request { name } => (
+                name.clone(),
+                false,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            FlowNode::Report(ReportStmt::Request {
+                name,
+                alias,
+                response_fmt,
+                show,
+                hide,
+                with,
+            }) => (
+                name.clone(),
+                true,
+                alias.clone(),
+                *response_fmt,
+                show.clone(),
+                hide.clone(),
+                with.clone(),
+            ),
+            _ => return None,
         };
         let report_fields = self.request_report_fields(report_id, &name);
         let titles = self.bound_request_titles(report_id);
-        let form = RequestForm::build(
+        Some(RequestForm::build(
             report_id,
             path,
             name,
@@ -953,7 +1497,29 @@ impl TuiApp {
             &report_fields,
             with,
             current_hide,
-        );
+        ))
+    }
+
+    fn open_report_node_request(&mut self, idx: usize) -> bool {
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return false;
+        };
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(sel) else {
+            return false;
+        };
+        let path = row.path.clone();
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return false;
+        };
+        let Some(node) = node_at(&flow, &path).cloned() else {
+            return false;
+        };
+        let Some(form) = self.build_report_node_request_form(idx, path, &node) else {
+            return false; // not a request node
+        };
         self.overlay = Some(Overlay::ReportNodeRequest(Box::new(form)));
         true
     }
@@ -989,7 +1555,7 @@ impl TuiApp {
                 alias: form.alias_opt(),
                 response_fmt: form.response,
                 show: form.show(),
-                hide: form.hide.clone(),
+                hide: form.hide(),
                 with: form.with.clone(),
             })
         } else {
@@ -998,6 +1564,545 @@ impl TuiApp {
             }
         };
         self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Open the `REPORT <var>` form for the selected node. Returns `true` when
+    /// the selection is a reported-variable statement.
+    fn open_report_node_vars(&mut self, idx: usize) -> bool {
+        let Some((report_id, path, node)) = self.selected_node(idx) else {
+            return false;
+        };
+        let (chosen, alias, stats) = match &node {
+            FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), None, Vec::new()),
+            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
+                (vec![var.clone()], Some(name.clone()), stats.clone())
+            }
+            _ => return false,
+        };
+        // The candidate list needs the bound collection to include the captures
+        // of requests already sent; without one it is just the flow's own
+        // assignments and loop binders.
+        let entries = self
+            .resolve_bound_collection(&self.reports[idx].report)
+            .map(|ci| self.collections[ci].entries.clone())
+            .unwrap_or_default();
+        let in_scope = match self.reports[idx].report.flow() {
+            Ok(flow) => crate::report::edit::vars_in_scope(&flow, &path, &entries),
+            Err(_) => Vec::new(),
+        };
+        self.overlay = Some(Overlay::ReportNodeVars(Box::new(VarsForm::build(
+            report_id, path, &chosen, alias, &stats, in_scope,
+        ))));
+        true
+    }
+
+    /// Write a [`VarsForm`] back. Picking nothing is a no-op.
+    pub(crate) fn apply_report_node_vars(&mut self, form: VarsForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(node) = form.node() else { return };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the `REPORT <var>` form. Variable and stat rows toggle
+    /// with Space/`x`; the free-text and alias rows take typed characters.
+    pub(crate) fn report_node_vars_key_handler(&mut self, key: KeyEvent, mut form: Box<VarsForm>) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeVars(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => self.apply_report_node_vars(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    Some(VarsRow::Var(vi)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some(row) = form.vars.get_mut(vi)
+                        {
+                            row.included = !row.included;
+                            // Ticking a second variable hides the alias/stat
+                            // rows, which can leave the selection past the end.
+                            form.selected = form.selected.min(form.last_row());
+                        }
+                        keep(self, form);
+                    }
+                    Some(VarsRow::Other) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
+                                form.other.push(c)
+                            }
+                            KeyCode::Backspace => {
+                                form.other.pop();
+                            }
+                            _ => {}
+                        }
+                        form.selected = form.selected.min(form.last_row());
+                        keep(self, form);
+                    }
+                    Some(VarsRow::Alias) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
+                                form.alias.push(c)
+                            }
+                            KeyCode::Backspace => {
+                                form.alias.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(VarsRow::Stat(si)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some((_, on)) = form.stats.get_mut(si)
+                        {
+                            *on = !*on;
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
+
+    /// Open the `REPORT "<template>" AS <name>` form for the selected node.
+    /// Returns `true` when the selection is a computed column.
+    fn open_report_node_computed(&mut self, idx: usize) -> bool {
+        let Some((report_id, path, node)) = self.selected_node(idx) else {
+            return false;
+        };
+        let FlowNode::Report(ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        }) = node
+        else {
+            return false;
+        };
+        self.overlay = Some(Overlay::ReportNodeComputed(Box::new(ComputedForm {
+            report_id,
+            path,
+            template,
+            alias: name,
+            stats: StatKind::CHOOSABLE
+                .iter()
+                .map(|k| (*k, stats.contains(k)))
+                .collect(),
+            selected: 0,
+        })));
+        true
+    }
+
+    /// Write a [`ComputedForm`] back. A blank template or name is a no-op.
+    pub(crate) fn apply_report_node_computed(&mut self, form: ComputedForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(node) = form.node() else { return };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the computed-column form. The template takes any
+    /// printable character (it interpolates `{{ … }}`); the name is an
+    /// identifier; stat rows toggle with Space/`x`.
+    pub(crate) fn report_node_computed_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut form: Box<ComputedForm>,
+    ) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeComputed(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => self.apply_report_node_computed(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    Some(ComputedRow::Template) => {
+                        match key.code {
+                            KeyCode::Char(c) => form.template.push(c),
+                            KeyCode::Backspace => {
+                                form.template.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(ComputedRow::Alias) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
+                                form.alias.push(c)
+                            }
+                            KeyCode::Backspace => {
+                                form.alias.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(ComputedRow::Stat(si)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some((_, on)) = form.stats.get_mut(si)
+                        {
+                            *on = !*on;
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
+
+    /// Open the `VARIABLE = VALUE` form for the selected node. Returns `true`
+    /// when the selection is an assignment (so the caller stops trying other
+    /// forms).
+    fn open_report_node_assign(&mut self, idx: usize) -> bool {
+        let Some((report_id, path, node)) = self.selected_node(idx) else {
+            return false;
+        };
+        let FlowNode::Assign { key, value } = node else {
+            return false;
+        };
+        self.overlay = Some(Overlay::ReportNodeAssign(Box::new(AssignForm {
+            report_id,
+            path,
+            key,
+            value,
+            selected: 0,
+        })));
+        true
+    }
+
+    /// Write an [`AssignForm`] back. A blank variable name is a no-op.
+    pub(crate) fn apply_report_node_assign(&mut self, form: AssignForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(node) = form.node() else { return };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the `VARIABLE = VALUE` form. Both rows are free text
+    /// (a value may be a `{{ … }}` reference or anything else), so they take
+    /// any printable character.
+    pub(crate) fn report_node_assign_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut form: Box<AssignForm>,
+    ) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeAssign(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => self.apply_report_node_assign(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                let target = match rows.get(sel).copied() {
+                    Some(AssignRow::Key) => &mut form.key,
+                    Some(AssignRow::Value) => &mut form.value,
+                    None => {
+                        keep(self, form);
+                        return;
+                    }
+                };
+                match key.code {
+                    KeyCode::Char(c) => target.push(c),
+                    KeyCode::Backspace => {
+                        target.pop();
+                    }
+                    _ => {}
+                }
+                keep(self, form);
+            }
+        }
+    }
+
+    /// Open the `LIST NAME = [ … ]` form for the selected node. Returns `true`
+    /// only for a *literal* list of scalars — a tuple list or a computed
+    /// producer falls through to the raw editor, which can express it.
+    fn open_report_node_list(&mut self, idx: usize) -> bool {
+        let Some((report_id, path, node)) = self.selected_node(idx) else {
+            return false;
+        };
+        let FlowNode::ListDecl {
+            name,
+            producer: Producer::List(elems),
+        } = node
+        else {
+            return false;
+        };
+        let mut values = Vec::with_capacity(elems.len());
+        for e in &elems {
+            match e {
+                Element::Scalar(v) => values.push(v.clone()),
+                Element::Tuple(_) => return false, // structure this form would flatten
+            }
+        }
+        self.overlay = Some(Overlay::ReportNodeList(Box::new(ListForm {
+            report_id,
+            path,
+            name,
+            values,
+            selected: 0,
+        })));
+        true
+    }
+
+    /// Write a [`ListForm`] back. A blank list name is a no-op.
+    pub(crate) fn apply_report_node_list(&mut self, form: ListForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(node) = form.node() else { return };
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Key handling for the `LIST` form. Name and element rows take any
+    /// printable character; the Add row appends an element with Space, and
+    /// `x`/Del removes the selected element.
+    pub(crate) fn report_node_list_key_handler(&mut self, key: KeyEvent, mut form: Box<ListForm>) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeList(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => self.apply_report_node_list(*form),
+            KeyCode::Esc => {} // cancel (overlay stays taken)
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    Some(ListRow::Name) => {
+                        match key.code {
+                            KeyCode::Char(c) => form.name.push(c),
+                            KeyCode::Backspace => {
+                                form.name.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(ListRow::Value(vi)) => {
+                        match key.code {
+                            // Del removes the whole element; Backspace edits it,
+                            // so a half-typed value isn't lost to a stray key.
+                            KeyCode::Delete => {
+                                if vi < form.values.len() {
+                                    form.values.remove(vi);
+                                }
+                                form.selected = form.selected.min(form.last_row());
+                            }
+                            KeyCode::Char(c) => form.values[vi].push(c),
+                            KeyCode::Backspace => {
+                                form.values[vi].pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(ListRow::Add) => {
+                        if matches!(key.code, KeyCode::Char(' ')) {
+                            form.values.push(String::new());
+                            // Land on the new (empty) row so it can be typed
+                            // into straight away.
+                            form.selected = form.values.len();
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
+
+    /// The report id, path and a clone of the node the node editor's selection
+    /// points at — the common preamble of every `open_report_node_*`.
+    fn selected_node(&self, idx: usize) -> Option<(u64, Vec<usize>, FlowNode)> {
+        let rows = self.report_node_rows(idx).ok()?;
+        let sel = self.reports[idx]
+            .node_selected
+            .min(rows.len().saturating_sub(1));
+        let path = rows.get(sel)?.path.clone();
+        let flow = self.reports[idx].report.flow().ok()?;
+        let node = node_at(&flow, &path)?.clone();
+        Some((self.reports[idx].report.id, path, node))
+    }
+
+    /// Key handling for the `WITH` field form ([`Overlay::ReportNodeWithField`]).
+    /// ↑/↓ (or Tab) move; the Name/Query rows take typed text; stat rows toggle
+    /// with Space/`x`; Enter applies and reopens the request form; Esc cancels
+    /// back to it, so the sub-form always returns where it came from.
+    pub(crate) fn report_node_with_field_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut form: Box<WithFieldForm>,
+    ) {
+        let keep = |app: &mut TuiApp, form| {
+            app.overlay = Some(Overlay::ReportNodeWithField(form));
+        };
+        let last = form.last_row();
+        match key.code {
+            KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                keep(self, form);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.selected = (form.selected + 1).min(last);
+                keep(self, form);
+            }
+            KeyCode::Enter => {
+                let (report_id, path) = (form.report_id, form.path.clone());
+                self.apply_report_node_with_field(*form);
+                self.reopen_report_node_request(report_id, &path);
+            }
+            KeyCode::Esc => {
+                let (report_id, path) = (form.report_id, form.path.clone());
+                self.reopen_report_node_request(report_id, &path);
+            }
+            _ => {
+                let rows = form.visible_rows();
+                let sel = form.selected.min(rows.len().saturating_sub(1));
+                match rows.get(sel).copied() {
+                    // The column name is an identifier-ish label; the query is
+                    // arbitrary Hurl (JSONPath, headers, …), so it takes any
+                    // printable character.
+                    Some(WithFieldRow::Name) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' => {
+                                form.name.push(c)
+                            }
+                            KeyCode::Backspace => {
+                                form.name.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(WithFieldRow::Query) => {
+                        match key.code {
+                            KeyCode::Char(c) => form.query.push(c),
+                            KeyCode::Backspace => {
+                                form.query.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(WithFieldRow::Stat(si)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some((_, on)) = form.stats.get_mut(si)
+                        {
+                            *on = !*on;
+                        }
+                        keep(self, form);
+                    }
+                    None => keep(self, form),
+                }
+            }
+        }
+    }
+
+    /// Write a [`WithFieldForm`] back into its request node's `WITH … END`
+    /// block — replacing the field at `index`, or appending when it is `None`.
+    /// A blank name is a no-op (an unnamed column can't be serialized), which
+    /// is also how "cancel by clearing the name" behaves.
+    pub(crate) fn apply_report_node_with_field(&mut self, form: WithFieldForm) {
+        let Some(idx) = self.report_index_by_id(form.report_id) else {
+            return;
+        };
+        let Some(item) = form.item() else {
+            return;
+        };
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let Some(FlowNode::Report(ReportStmt::Request {
+            name,
+            alias,
+            response_fmt,
+            show,
+            hide,
+            with,
+        })) = node_at(&flow, &form.path)
+        else {
+            return;
+        };
+        let mut with = with.clone();
+        match form.index {
+            Some(i) if i < with.len() => with[i] = item,
+            _ => with.push(item),
+        }
+        let node = FlowNode::Report(ReportStmt::Request {
+            name: name.clone(),
+            alias: alias.clone(),
+            response_fmt: *response_fmt,
+            show: show.clone(),
+            hide: hide.clone(),
+            with,
+        });
+        self.apply_node_replace(idx, &form.path, node);
+    }
+
+    /// Reopen the request form for the node at `path` after a `WITH` sub-form
+    /// closes, so the user lands back where they were rather than in the node
+    /// list. Silently does nothing when the node has gone (the report was
+    /// closed or edited underneath).
+    fn reopen_report_node_request(&mut self, report_id: u64, path: &[usize]) {
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let Some(node) = node_at(&flow, path).cloned() else {
+            return;
+        };
+        if let Some(form) = self.build_report_node_request_form(idx, path.to_vec(), &node) {
+            self.overlay = Some(Overlay::ReportNodeRequest(Box::new(form)));
+        }
     }
 
     /// Open the configure form for the selected `FOR … IN ENVS` node (#11) so
@@ -1016,7 +2121,7 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (var, clause, parallel) = {
+        let (var, clause, parallel, body) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
@@ -1025,14 +2130,37 @@ impl TuiApp {
                     var,
                     clause,
                     parallel,
-                    ..
-                }) => (var.clone(), clause.clone(), parallel.is_some()),
+                    body,
+                }) => (var.clone(), clause.clone(), *parallel, body.clone()),
                 _ => return false, // not an ENVS loop
             }
         };
         let choices: Vec<String> = self.global_envs.iter().map(|e| e.name.clone()).collect();
         let snapshots = self.discover_report_snapshots(idx);
-        let form = EnvsForm::build(report_id, path, var, &clause, parallel, choices, snapshots);
+        // The `SHOW` checklist offers what the loop *body* reports, so it needs
+        // the bound collection to ask each reported request what it emits.
+        let selected_show = match &clause {
+            crate::report::flow::EnvClause::Roles { baseline_show, .. } => baseline_show.clone(),
+            crate::report::flow::EnvClause::Plain(_) => Vec::new(),
+        };
+        let show_choices = match self.resolve_bound_collection(&self.reports[idx].report) {
+            Some(ci) => crate::report::edit::baseline_show_choices(
+                &self.collections[ci].entries,
+                &body,
+                &selected_show,
+            ),
+            None => crate::report::edit::baseline_show_choices(&[], &body, &selected_show),
+        };
+        let form = EnvsForm::build(
+            report_id,
+            path,
+            var,
+            &clause,
+            parallel,
+            choices,
+            snapshots,
+            show_choices,
+        );
         self.overlay = Some(Overlay::ReportNodeEnvs(Box::new(form)));
         true
     }
@@ -1072,27 +2200,22 @@ impl TuiApp {
         let Some(clause) = form.clause() else {
             return;
         };
-        // Preserve the existing node's body and any explicit PARALLEL degree;
-        // only var/clause and the parallel on/off state change here.
-        let (body, existing_parallel) = {
+        // Preserve the existing node's body; var, clause, the SHOW checklist and
+        // the PARALLEL marker (including its degree) all come from the form.
+        let body = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return;
             };
             match node_at(&flow, &form.path) {
-                Some(FlowNode::ForEnvs { body, parallel, .. }) => (body.clone(), *parallel),
+                Some(FlowNode::ForEnvs { body, .. }) => body.clone(),
                 _ => return,
             }
-        };
-        let parallel = if form.parallel {
-            Some(existing_parallel.unwrap_or_default())
-        } else {
-            None
         };
         let node = FlowNode::ForEnvs {
             var: form.var_or_default(),
             clause,
             body,
-            parallel,
+            parallel: form.parallel_spec(),
         };
         self.apply_node_replace(idx, &form.path, node);
     }
@@ -1113,7 +2236,7 @@ impl TuiApp {
         };
         let path = row.path.clone();
         let report_id = self.reports[idx].report.id;
-        let (var, dir, glob, parallel) = {
+        let (var, dir, glob, parallel, folders, roles) = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return false;
             };
@@ -1127,12 +2250,29 @@ impl TuiApp {
                     pattern.named().next().unwrap_or("FILE").to_string(),
                     dir.clone(),
                     glob.clone(),
-                    parallel.is_some(),
+                    *parallel,
+                    false,
+                    Vec::new(),
                 ),
-                _ => return false, // not a single-var FILES loop
+                // `FOLDERS` shares the form: same variable, same folder picker,
+                // same PARALLEL rows — it just has no `MATCH` glob.
+                Some(FlowNode::ForEach {
+                    pattern,
+                    producer: Producer::Folders { dir, roles },
+                    parallel,
+                    ..
+                }) if pattern.is_single() => (
+                    pattern.named().next().unwrap_or("FOLDER").to_string(),
+                    dir.clone(),
+                    None,
+                    *parallel,
+                    true,
+                    roles.clone(),
+                ),
+                _ => return false, // not a single-var FILES/FOLDERS loop
             }
         };
-        let form = FilesForm::build(report_id, path, var, dir, glob, parallel);
+        let form = FilesForm::build(report_id, path, var, dir, glob, parallel, folders, roles);
         self.overlay = Some(Overlay::ReportNodeFiles(Box::new(form)));
         true
     }
@@ -1143,28 +2283,20 @@ impl TuiApp {
         let Some(idx) = self.report_index_by_id(form.report_id) else {
             return;
         };
-        let (body, existing_parallel) = {
+        let body = {
             let Ok(flow) = self.reports[idx].report.flow() else {
                 return;
             };
             match node_at(&flow, &form.path) {
-                Some(FlowNode::ForEach { body, parallel, .. }) => (body.clone(), *parallel),
+                Some(FlowNode::ForEach { body, .. }) => body.clone(),
                 _ => return,
             }
         };
-        let parallel = if form.parallel {
-            Some(existing_parallel.unwrap_or_default())
-        } else {
-            None
-        };
         let node = FlowNode::ForEach {
             pattern: Pattern::single(form.var_or_default()),
-            producer: Producer::Files {
-                dir: form.dir.clone(),
-                glob: form.glob_opt(),
-            },
+            producer: form.producer(),
             body,
-            parallel,
+            parallel: form.parallel_spec(),
         };
         self.apply_node_replace(idx, &form.path, node);
     }
@@ -1243,6 +2375,19 @@ impl TuiApp {
                             KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
                         ) {
                             form.toggle_parallel();
+                            // Turning PARALLEL off hides the degree row below.
+                            form.selected = form.selected.min(form.last_row());
+                        }
+                        keep(self, form);
+                    }
+                    // The max-concurrency box: digits only.
+                    Some(FilesRow::Degree) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() => form.degree.push(c),
+                            KeyCode::Backspace => {
+                                form.degree.pop();
+                            }
+                            _ => {}
                         }
                         keep(self, form);
                     }
@@ -1329,6 +2474,29 @@ impl TuiApp {
                             KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
                         ) {
                             form.toggle_parallel();
+                            // Turning PARALLEL off hides the degree row, which
+                            // can leave the selection past the end.
+                            form.selected = form.selected.min(form.last_row());
+                        }
+                        keep(self, form);
+                    }
+                    // The max-concurrency box: digits only, so it can never
+                    // hold something that won't serialize as `PARALLEL(n)`.
+                    Some(EnvsRow::Degree) => {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() => form.degree.push(c),
+                            KeyCode::Backspace => {
+                                form.degree.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(EnvsRow::BaselineShow(fi)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some(row) = form.baseline_show.get_mut(fi)
+                        {
+                            row.included = !row.included;
                         }
                         keep(self, form);
                     }
@@ -1433,7 +2601,7 @@ impl TuiApp {
                         }
                         keep(self, form);
                     }
-                    // A field checkbox.
+                    // A SHOW field checkbox.
                     Some(FormRow::Field(fi)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some(row) = form.fields.get_mut(fi)
@@ -1441,6 +2609,52 @@ impl TuiApp {
                             row.included = !row.included;
                         }
                         keep(self, form);
+                    }
+                    // A HIDE field checkbox.
+                    Some(FormRow::Hidden(fi)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some(row) = form.hide_fields.get_mut(fi)
+                        {
+                            row.included = !row.included;
+                        }
+                        keep(self, form);
+                    }
+                    // A WITH field: Space/Enter would both mean "open", but
+                    // Enter is already "apply the whole form", so Space opens
+                    // the field editor and `x`/Del removes the field outright.
+                    Some(FormRow::With(wi)) => match key.code {
+                        KeyCode::Char(' ') => {
+                            let existing = form.with.get(wi).cloned();
+                            let sub = WithFieldForm::build(
+                                form.report_id,
+                                form.path.clone(),
+                                Some(wi),
+                                existing.as_ref(),
+                            );
+                            // The parent form is applied first so the rows the
+                            // user already changed aren't lost behind the
+                            // sub-form.
+                            self.apply_report_node_request(*form);
+                            self.overlay = Some(Overlay::ReportNodeWithField(Box::new(sub)));
+                        }
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if wi < form.with.len() {
+                                form.with.remove(wi);
+                            }
+                            form.selected = form.selected.min(form.last_row());
+                            keep(self, form);
+                        }
+                        _ => keep(self, form),
+                    },
+                    Some(FormRow::AddWith) => {
+                        if matches!(key.code, KeyCode::Char(' ')) {
+                            let sub =
+                                WithFieldForm::build(form.report_id, form.path.clone(), None, None);
+                            self.apply_report_node_request(*form);
+                            self.overlay = Some(Overlay::ReportNodeWithField(Box::new(sub)));
+                        } else {
+                            keep(self, form);
+                        }
                     }
                     None => keep(self, form),
                 }
@@ -1868,8 +3082,12 @@ mod tests {
             comparisons: vec![RoleRef::Env("staging".into())],
             baseline_show: vec!["Time".into()],
         };
-        let form = EnvsForm::build(1, vec![], "T".into(), &clause, false, vec![], vec![]);
-        assert_eq!(form.baseline_show, vec!["Time".to_string()]);
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, None, vec![], vec![], vec![]);
+        assert_eq!(
+            form.selected_baseline_show(),
+            vec!["Time".to_string()],
+            "a SHOW field the clause names must come back ticked"
+        );
 
         // clause() must hand it back intact — no silent drop.
         let rebuilt = form.clause().expect("clause must be Some");
@@ -1892,7 +3110,7 @@ mod tests {
             comparisons: vec![RoleRef::Env("staging".into())],
             baseline_show: vec![],
         };
-        let form = EnvsForm::build(1, vec![], "T".into(), &clause, false, vec![], vec![]);
+        let form = EnvsForm::build(1, vec![], "T".into(), &clause, None, vec![], vec![], vec![]);
         assert!(
             form.snapshots.iter().any(|s| s == "prod.baseline"),
             "existing FILE path must be seeded into the cycle"
@@ -1915,9 +3133,10 @@ mod tests {
             vec![],
             "T".into(),
             &clause,
-            false,
+            None,
             vec!["prod".into(), "staging".into()],
             vec!["snap.baseline".into()],
+            vec![],
         );
         form.toggle_file(0);
         assert!(form.entries[0].file);

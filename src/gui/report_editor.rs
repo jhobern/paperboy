@@ -14,13 +14,16 @@ use crate::i18n::Status;
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
-    self, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier, detach_modifier,
-    flatten, insert_node, insert_pos_after, move_node, node_at, remove_node, replace_node,
-    report_assignment, request_node, set_request_name,
+    self, CarriedMod, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier,
+    attach_to_node, carry_modifier, detach_modifier, flatten, insert_node, insert_pos_after,
+    move_node, node_at, remove_node, replace_node, report_assignment, request_node,
+    set_request_name, transfer_modifier,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
+
+use crate::tui::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
 use super::report_run::{self, RowState, RunHandle, RunProgress};
@@ -54,6 +57,9 @@ pub struct ReportEditor {
     /// Parsed AST cache, recomputed from `report.text` after every edit.
     pub flow: Option<ReportFlow>,
     pub parse_error: Option<String>,
+    /// 1-based line the parser rejected, so the Source view can mark exactly
+    /// that line the way the terminal UI does.
+    pub parse_error_line: Option<usize>,
     pub diagnostics: Vec<Diagnostic>,
     /// The selected node's path (a sequence of indices into nested loop
     /// bodies). Empty = the synthetic `Begin` root.
@@ -86,6 +92,15 @@ pub struct ReportEditor {
     /// cell's full (pretty-printed) value — the GUI stand-in for the TUI's
     /// result-cell popup, so a long/truncated cell can be read in full.
     pub inspector: Option<CellInspector>,
+    /// When `Some`, the Results view is showing a dry run — what the flow
+    /// *would* emit, worked out without sending a request — instead of the last
+    /// real result.
+    ///
+    /// Held apart from [`Self::result`] rather than written into it, so a
+    /// preview never destroys the results you actually ran for (and can't be
+    /// exported as though it were them). Dismissing the preview brings them
+    /// straight back.
+    pub dry_run: Option<Box<crate::report::dry_run::DryRunReport>>,
 }
 
 /// One results cell opened in the inspector window: the column header (title)
@@ -116,6 +131,7 @@ impl ReportEditor {
             view: EditorView::Blocks,
             flow: None,
             parse_error: None,
+            parse_error_line: None,
             diagnostics: Vec::new(),
             selection: Vec::new(),
             palette: None,
@@ -128,6 +144,7 @@ impl ReportEditor {
             diag_h: 132.0,
             palette_w: 168.0,
             inspector: None,
+            dry_run: None,
         };
         ed.reparse();
         ed
@@ -150,10 +167,12 @@ impl ReportEditor {
             Ok(flow) => {
                 self.flow = Some(flow);
                 self.parse_error = None;
+                self.parse_error_line = None;
             }
             Err(e) => {
                 self.flow = None;
                 self.parse_error = Some(e.to_string());
+                self.parse_error_line = Some(e.line);
             }
         }
     }
@@ -242,9 +261,76 @@ impl ReportEditor {
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
+                // A real run supersedes any preview of it.
+                self.dry_run = None;
                 self.view = EditorView::Results;
                 self.run = Some(report_run::spawn(inputs));
                 app.session.status = Some(Status::ReportRunning);
+            }
+            Err(context::RunInputError::Unbound) => {
+                app.session.status = Some(Status::ReportRunBlocked(
+                    app.strings.report_run_unbound.to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Hand a finished preview to the Results view and switch to it.
+    ///
+    /// The Dry run button sits on the toolbar above *every* view, but the
+    /// preview is rendered by the Results view — so without this the button
+    /// does nothing visible when pressed from Blocks or Source, which is
+    /// exactly where it is pressed from.
+    fn show_preview(&mut self, preview: Box<crate::report::dry_run::DryRunReport>) {
+        self.dry_run = Some(preview);
+        self.view = EditorView::Results;
+    }
+
+    /// Expand the flow with no HTTP and show the preview in the Results view.
+    ///
+    /// Runs on the calling thread rather than through
+    /// [`report_run::spawn`]'s worker: a dry run sends nothing, so it finishes
+    /// in the time it takes to walk the flow, and making the user wait on a
+    /// background thread for that would only add a frame of latency and a
+    /// second run-state to reason about.
+    fn start_dry_run(&mut self, app: &mut GuiApp) {
+        use crate::report::run::{DryRunner, RunContext, run_flow_raw};
+
+        let Some(flow) = self.flow.clone() else {
+            return;
+        };
+        match context::report_run_inputs(
+            &app.session.collections,
+            &app.session.global_envs,
+            app.session.active_env_id,
+            &flow,
+            self.report.path.as_deref(),
+        ) {
+            Ok(inputs) => {
+                let ctx = RunContext {
+                    entries: &inputs.entries,
+                    base_vars: inputs.base_vars.clone(),
+                    named_envs: inputs.named_envs.clone(),
+                    root: inputs.root.clone(),
+                    runner: &DryRunner,
+                    sink: None,
+                };
+                let result = run_flow_raw(&inputs.flow, &ctx);
+                // The non-blocking variable-availability warnings are worth
+                // showing here even though they never stop a run: a preview is
+                // exactly when you want to hear about a `{{VAR}}` that might
+                // not be set by the time its request goes out.
+                let var_warnings: Vec<String> = self
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == Severity::Warning)
+                    .map(|d| d.message.clone())
+                    .collect();
+                self.show_preview(Box::new(crate::report::dry_run::DryRunReport::from_result(
+                    result,
+                    flow.header.clone(),
+                    var_warnings,
+                )));
             }
             Err(context::RunInputError::Unbound) => {
                 app.session.status = Some(Status::ReportRunBlocked(
@@ -355,6 +441,33 @@ struct Chip {
     /// An optional inline dropdown replacing part of the chip label with a
     /// picker (e.g. the request name, or a BASELINE/COMPARISON environment).
     edit: ChipEdit,
+    /// Hover help: what this chip is, and what its editable parts do. Empty for
+    /// a chip whose meaning is already spelled out by its own label.
+    help: &'static str,
+    /// This chip qualifies the one immediately before it rather than the node
+    /// as a whole, so it is drawn tucked against it and joined to it by a
+    /// bracket. Without that, `BASELINE(prod) SHOW(Time) COMPARISON(stage)`
+    /// reads as three peers in a row and the SHOW looks like it governs all of
+    /// them.
+    tethered: bool,
+}
+
+impl Chip {
+    /// Mark this chip as belonging to the one before it (see
+    /// [`Chip::tethered`]).
+    fn tether(mut self) -> Chip {
+        self.tethered = true;
+        self
+    }
+}
+
+impl Chip {
+    /// Attach hover help, so the chip constructors stay short at their call
+    /// sites (`Chip::modifier(…).with_help(s.chip_help_report)`).
+    fn with_help(mut self, help: &'static str) -> Chip {
+        self.help = help;
+        self
+    }
 }
 
 /// The inline picker a chip hosts, if any. The chip still shows a keyword prefix
@@ -380,9 +493,38 @@ enum ChipEdit {
     Alias {
         text: String,
     },
+    /// The `PARALLEL` modifier's optional max-concurrency: the prefix is
+    /// `PARALLEL`, followed by a small numeric box. Empty means "no explicit
+    /// limit" (plain `PARALLEL`), which the runner resolves from the prelude's
+    /// `MAX_PARALLEL`; `degree` carries the current value.
+    Parallel {
+        degree: Option<u32>,
+    },
 }
 
 impl Chip {
+    /// The chip's label and the extra width its inline editor occupies, for
+    /// drawing a same-sized placeholder of it.
+    ///
+    /// Several chips keep their keyword in [`ChipEdit`] rather than in `text`
+    /// (a `PARALLEL` chip's `text` is empty — its label and numeric box are both
+    /// drawn by `parallel_chip`), so a ghost built from `text` alone came out a
+    /// thin sliver rather than the size of the block that will land there.
+    fn ghost_shape(&self) -> (String, f32) {
+        match &self.edit {
+            ChipEdit::None => (self.text.clone(), 0.0),
+            ChipEdit::Request { name } => (format!("{} {name}", self.text), COMBO_CHIP_WIDTH),
+            ChipEdit::EnvRole { name, .. } => (format!("{} {name}", self.text), COMBO_CHIP_WIDTH),
+            ChipEdit::Alias { text } => (format!("AS {text}"), ALIAS_FIELD_WIDTH),
+            ChipEdit::Parallel { degree } => (
+                degree
+                    .map(|n| format!("PARALLEL({n})"))
+                    .unwrap_or_else(|| "PARALLEL".to_string()),
+                PARALLEL_FIELD_WIDTH,
+            ),
+        }
+    }
+
     fn base(text: String, color: Color32) -> Chip {
         Chip {
             text,
@@ -390,6 +532,8 @@ impl Chip {
             is_base: true,
             detach: None,
             edit: ChipEdit::None,
+            help: "",
+            tethered: false,
         }
     }
     fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
@@ -399,17 +543,8 @@ impl Chip {
             is_base: false,
             detach: Some(which),
             edit: ChipEdit::None,
-        }
-    }
-    /// A modifier chip that cannot be detached (removing it would break the
-    /// node, e.g. the required `AS` name of a computed column).
-    fn fixed(text: String, color: Color32) -> Chip {
-        Chip {
-            text,
-            color,
-            is_base: false,
-            detach: None,
-            edit: ChipEdit::None,
+            help: "",
+            tethered: false,
         }
     }
     /// The request base chip, whose name is picked from an inline dropdown.
@@ -422,21 +557,27 @@ impl Chip {
             edit: ChipEdit::Request {
                 name: name.to_string(),
             },
+            help: "",
+            tethered: false,
         }
     }
     /// A `BASELINE`/`COMPARISON` chip carrying a single-environment dropdown.
+    /// Detachable: dragging it out (or clicking its `×`) drops that role, which
+    /// leaves the loop iterating whatever environments remain.
     fn env_role(baseline: bool, index: usize, name: &str, color: Color32) -> Chip {
         let kw = if baseline { "BASELINE" } else { "COMPARISON" };
         Chip {
             text: format!("{kw}({name})"),
             color,
             is_base: false,
-            detach: None,
+            detach: Some(DetachWhich::Role { baseline, index }),
             edit: ChipEdit::EnvRole {
                 baseline,
                 index,
                 name: name.to_string(),
             },
+            help: "",
+            tethered: false,
         }
     }
     /// An `AS <alias>` chip whose alias is edited inline. `detach` is `Some(As)`
@@ -451,21 +592,66 @@ impl Chip {
             edit: ChipEdit::Alias {
                 text: text.to_string(),
             },
+            help: "",
+            tethered: false,
+        }
+    }
+    /// A `PARALLEL` chip whose concurrency limit is edited inline.
+    fn parallel(degree: Option<u32>, color: Color32) -> Chip {
+        Chip {
+            text: String::new(),
+            color,
+            is_base: false,
+            detach: Some(DetachWhich::Parallel),
+            edit: ChipEdit::Parallel { degree },
+            help: "",
+            tethered: false,
         }
     }
 }
 
 /// Decompose a node into its chip cluster: the leading modifier chips, the
 /// editable base chip, and any trailing modifier chips (`AS`, `WITH …`).
-fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip> {
+fn node_chips(
+    node: &FlowNode,
+    req_ok: Option<bool>,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Vec<Chip> {
     let req_col = |ok: Option<bool>| match ok {
         Some(true) => th.ok,
         Some(false) => th.pending,
         None => th.ok,
     };
+    let mut chips = build_node_chips(node, req_col(req_ok), th, s);
+    // The rule for whether a chip can be pulled out of a line on its own: only
+    // if the statement still stands without it. `REPORT` on a reported *column*
+    // is the case that matters — take it away and there is no statement left at
+    // all — so grabbing that chip has to move the whole row instead of
+    // half-deleting it. Applied centrally rather than at each construction site
+    // so it can't be forgotten for a chip added later.
+    for chip in &mut chips {
+        if let Some(which) = chip.detach
+            && !crate::report::edit::detach_leaves_statement(node, which)
+        {
+            chip.detach = None;
+        }
+    }
+    chips
+}
+
+/// The chips a node is drawn as, before the load-bearing rule in [`node_chips`]
+/// is applied. `req_col` is the colour a request chip takes (its last run's
+/// outcome), already resolved by the caller.
+fn build_node_chips(
+    node: &FlowNode,
+    req_col: Color32,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Vec<Chip> {
     match node {
         FlowNode::Request { name } => {
-            vec![Chip::request(name, req_col(req_ok))]
+            vec![Chip::request(name, req_col).with_help(s.chip_help_request)]
         }
         FlowNode::Report(ReportStmt::Request {
             name,
@@ -475,12 +661,11 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
             hide,
             with,
         }) => {
-            let mut chips = vec![Chip::modifier(
-                "REPORT".into(),
-                th.subst,
-                DetachWhich::Report,
-            )];
-            chips.push(Chip::request(name, req_col(req_ok)));
+            let mut chips = vec![
+                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
+                    .with_help(s.chip_help_report),
+            ];
+            chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
             // RESPONSE / SHOW / HIDE are their own detachable chips so a long
             // reported request reads as a row of small, legible clauses rather
             // than one dense line.
@@ -489,35 +674,45 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                     crate::report::flow::ResponseFmt::Raw => "RESPONSE RAW",
                     crate::report::flow::ResponseFmt::Pretty => "RESPONSE PRETTY",
                 };
-                chips.push(Chip::modifier(
-                    text.into(),
-                    th.accent,
-                    DetachWhich::Response,
-                ));
+                chips.push(
+                    Chip::modifier(text.into(), th.accent, DetachWhich::Response)
+                        .with_help(s.chip_help_response),
+                );
             }
             if !show.is_empty() {
-                chips.push(Chip::modifier(
-                    format!("SHOW({})", show.join(", ")),
-                    th.ok,
-                    DetachWhich::Show,
-                ));
+                chips.push(
+                    Chip::modifier(
+                        format!("SHOW({})", show.join(", ")),
+                        th.ok,
+                        DetachWhich::Show,
+                    )
+                    .with_help(s.chip_help_show),
+                );
             }
             if !hide.is_empty() {
-                chips.push(Chip::modifier(
-                    format!("HIDE({})", hide.join(", ")),
-                    th.dim,
-                    DetachWhich::Hide,
-                ));
+                chips.push(
+                    Chip::modifier(
+                        format!("HIDE({})", hide.join(", ")),
+                        th.dim,
+                        DetachWhich::Hide,
+                    )
+                    .with_help(s.chip_help_hide),
+                );
             }
             if let Some(a) = alias {
-                chips.push(Chip::alias(a, th.pending, Some(DetachWhich::As)));
+                chips.push(
+                    Chip::alias(a, th.pending, Some(DetachWhich::As)).with_help(s.chip_help_alias),
+                );
             }
             // The `WITH … END` fields are rendered as a *nested block* under the
             // request line (see `with_block` in `block_row`); the line itself
             // only carries the opening `WITH` keyword so it reads like the
             // textual form (`… SHOW(Time) WITH`).
             if !with.is_empty() {
-                chips.push(Chip::fixed("WITH".into(), th.accent));
+                chips.push(
+                    Chip::modifier("WITH".into(), th.accent, DetachWhich::WithBlock)
+                        .with_help(s.chip_help_with),
+                );
             }
             chips
         }
@@ -531,42 +726,55 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
             // so it reads in the neutral text colour — matching the terminal UI
             // and keeping it distinct from the `REPORT` keyword's own colour.
             vec![
-                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-                Chip::base(text, th.text),
+                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
+                    .with_help(s.chip_help_report),
+                Chip::base(text, th.text).with_help(s.chip_help_var),
             ]
         }
-        FlowNode::Report(ReportStmt::VarAs { var, name, .. }) => vec![
-            Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-            Chip::base(var.clone(), th.text),
-            Chip::alias(name, th.pending, Some(DetachWhich::As)),
-        ],
-        FlowNode::Report(ReportStmt::Computed { template, name, .. }) => vec![
-            Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report),
-            Chip::base(format!("\"{template}\""), th.text),
-            // A computed column requires its AS name, so this chip is fixed
-            // (inline-editable, but not detachable).
-            Chip::alias(name, th.pending, None),
-        ],
+        FlowNode::Report(ReportStmt::VarAs {
+            var, name, stats, ..
+        }) => {
+            let mut chips = vec![
+                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
+                    .with_help(s.chip_help_report),
+                Chip::base(var.clone(), th.text).with_help(s.chip_help_var),
+                Chip::alias(name, th.pending, Some(DetachWhich::As)).with_help(s.chip_help_alias),
+            ];
+            chips.extend(stats_chip(stats, th, s));
+            chips
+        }
+        FlowNode::Report(ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        }) => {
+            let mut chips = vec![
+                Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
+                    .with_help(s.chip_help_report),
+                Chip::base(format!("\"{template}\""), th.text).with_help(s.chip_help_computed),
+                // A computed column requires its AS name, so this chip is
+                // inline-editable but never detachable.
+                Chip::alias(name, th.pending, None).with_help(s.chip_help_alias_required),
+            ];
+            chips.extend(stats_chip(stats, th, s));
+            chips
+        }
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
-            let col = if matches!(node, FlowNode::Assign { .. }) {
-                th.accent
+            let (col, help) = if matches!(node, FlowNode::Assign { .. }) {
+                (th.accent, s.chip_help_assign)
             } else {
-                th.pending
+                (th.pending, s.chip_help_list)
             };
-            vec![Chip::base(node.label(), col)]
+            vec![Chip::base(node.label(), col).with_help(help)]
         }
         FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
             let mut chips = Vec::new();
             if let Some(spec) = parallel {
-                let text = match spec.degree {
-                    None => "PARALLEL".to_string(),
-                    Some(n) => format!("PARALLEL({n})"),
-                };
                 // The head label already embeds the PARALLEL prefix; strip it so
                 // it is not duplicated by the base chip below. PARALLEL uses the
                 // theme's *error* hue so it stands apart from the blue loop/set
                 // chips it sits beside (`PARALLEL(8) FOR …`).
-                chips.push(Chip::modifier(text, th.err, DetachWhich::Parallel));
+                chips.push(Chip::parallel(spec.degree, th.err).with_help(s.chip_help_parallel));
             }
             let full = node.label();
             let head = match parallel {
@@ -591,39 +799,112 @@ fn node_chips(node: &FlowNode, req_ok: Option<bool>, th: &GuiTheme) -> Vec<Chip>
                     crate::report::flow::EnvClause::Roles {
                         baseline,
                         comparisons,
-                        ..
+                        baseline_show,
                     },
                 var,
                 ..
             } = node
             {
-                chips.push(Chip::base(format!("FOR {var} IN ENVS"), th.accent));
+                chips.push(
+                    Chip::base(format!("FOR {var} IN ENVS"), th.accent)
+                        .with_help(s.chip_help_for_envs),
+                );
                 // A single live-environment role becomes an inline dropdown; any
                 // other shape (multiple refs, or a FILE snapshot) stays a fixed
                 // chip edited through the ENVS wizard.
                 use crate::report::flow::RoleRef;
                 if let [RoleRef::Env(name)] = baseline.as_slice() {
-                    chips.push(Chip::env_role(true, 0, name, th.pending));
+                    chips.push(
+                        Chip::env_role(true, 0, name, th.pending).with_help(s.chip_help_baseline),
+                    );
                 } else if !baseline.is_empty() {
-                    chips.push(Chip::fixed(
-                        format!("BASELINE({})", role_refs_text(baseline)),
-                        th.pending,
-                    ));
+                    chips.push(
+                        Chip::modifier(
+                            format!("BASELINE({})", role_refs_text(baseline)),
+                            th.pending,
+                            DetachWhich::Role {
+                                baseline: true,
+                                index: 0,
+                            },
+                        )
+                        .with_help(s.chip_help_roles_fixed),
+                    );
+                }
+                // The SHOW belongs to the BASELINE, so it follows it directly —
+                // before the COMPARISON, mirroring the source order — and is
+                // *tethered* to it, which tucks it against the baseline chip and
+                // draws a bracket joining the two. It keeps SHOW's own colour
+                // rather than borrowing the baseline's: three identically
+                // coloured chips in a row read as three peers, and it should be
+                // the bracket, not the hue, that says which one it qualifies.
+                if !baseline_show.is_empty() {
+                    chips.push(
+                        Chip::modifier(
+                            format!("SHOW({})", baseline_show.join(", ")),
+                            th.ok,
+                            DetachWhich::BaselineShow,
+                        )
+                        .with_help(s.chip_help_baseline_show)
+                        .tether(),
+                    );
                 }
                 if let [RoleRef::Env(name)] = comparisons.as_slice() {
-                    chips.push(Chip::env_role(false, 0, name, th.pending));
+                    chips.push(
+                        Chip::env_role(false, 0, name, th.pending)
+                            .with_help(s.chip_help_comparison),
+                    );
                 } else if !comparisons.is_empty() {
-                    chips.push(Chip::fixed(
-                        format!("COMPARISON({})", role_refs_text(comparisons)),
-                        th.pending,
-                    ));
+                    chips.push(
+                        Chip::modifier(
+                            format!("COMPARISON({})", role_refs_text(comparisons)),
+                            th.pending,
+                            DetachWhich::Role {
+                                baseline: false,
+                                index: 0,
+                            },
+                        )
+                        .with_help(s.chip_help_roles_fixed),
+                    );
                 }
             } else {
-                chips.push(Chip::base(head, th.accent));
+                let help = if matches!(node, FlowNode::ForEnvs { .. }) {
+                    s.chip_help_for_envs
+                } else {
+                    s.chip_help_for
+                };
+                chips.push(Chip::base(head, th.accent).with_help(help));
             }
             chips
         }
     }
+}
+
+/// The `STATISTICS(…)` chip for a named report column, or nothing when the
+/// column has no statistics. Tethered, because the statistics belong to the
+/// column named immediately before them rather than to the statement as a
+/// whole.
+fn stats_chip(
+    stats: &[crate::report::model::StatKind],
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Option<Chip> {
+    if stats.is_empty() {
+        return None;
+    }
+    let list = stats
+        .iter()
+        .map(|k| k.keyword())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        Chip::modifier(
+            format!("STATISTICS({list})"),
+            th.subst,
+            DetachWhich::Statistics,
+        )
+        .with_help(s.chip_help_statistics)
+        .tether(),
+    )
 }
 
 /// Render a list of environment role refs for a BASELINE/COMPARISON chip: a
@@ -666,6 +947,15 @@ enum Act {
         path: Vec<usize>,
         modifier: Modifier,
     },
+    /// A clause pulled off one line was dropped on another: move it there, or
+    /// with `copy` (Shift held at the drop) leave the original in place and
+    /// graft a duplicate (see [`transfer_modifier`]).
+    MoveMod {
+        from: Vec<usize>,
+        which: DetachWhich,
+        to: Vec<usize>,
+        copy: bool,
+    },
     /// A modifier chip's `×` was clicked, detaching it from the node at `path`
     /// (see [`detach_modifier`]).
     DetachMod {
@@ -702,6 +992,12 @@ enum Act {
         path: Vec<usize>,
         text: String,
     },
+    /// The inline `PARALLEL` box committed a new max-concurrency for the loop at
+    /// `path`; `None` clears it back to the prelude-driven default.
+    SetParallelDegree {
+        path: Vec<usize>,
+        degree: Option<u32>,
+    },
     /// The nested `WITH` block's "add field" affordance: open the WITH-field
     /// wizard for a new field on the report request at `path`.
     AddWith {
@@ -717,6 +1013,16 @@ enum Act {
     RemoveWith {
         path: Vec<usize>,
         index: usize,
+    },
+    /// A header-strip chip committed a `# key: value` directive; `None` removes
+    /// the directive (see [`edit::set_header`]).
+    SetHeader {
+        key: &'static str,
+        value: Option<String>,
+    },
+    /// Browse for the file a path-valued header directive should point at.
+    PickHeaderFile {
+        key: &'static str,
     },
 }
 
@@ -744,6 +1050,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             app.session.active_env_id,
             flow,
             ed.report.path.as_deref(),
+            &app.strings,
         ),
         None => Vec::new(),
     };
@@ -795,6 +1102,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 );
                 if run.clicked() {
                     ed.start_run(app);
+                }
+                // Dry run sits beside Run, disabled on the same terms: it
+                // expands the flow for real, so a flow with errors can't be
+                // previewed any more than it can be run.
+                let dry = ui
+                    .add_enabled(
+                        ed.can_run(),
+                        egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::PREVIEW,
+                            app.strings.gui_report_dry_run
+                        )),
+                    )
+                    .on_hover_text(app.strings.gui_report_dry_run_tooltip);
+                if dry.clicked() {
+                    ed.start_dry_run(app);
                 }
             }
         });
@@ -898,6 +1221,162 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // (A dropped `ed` cancels any in-flight run via `RunHandle`'s `Drop`.)
 }
 
+/// The dry-run preview's contents: a notice that nothing was sent, the
+/// projected row count, the grid the run would produce, and the problems the
+/// expansion turned up.
+///
+/// Reuses [`results_grid`], so the preview looks exactly like the result it is
+/// predicting — including the clickable cells, since a projected value can be
+/// just as long as a real one.
+fn dry_run_body(
+    app: &GuiApp,
+    ui: &mut egui::Ui,
+    preview: &crate::report::dry_run::DryRunReport,
+) -> Option<CellInspector> {
+    let th = app.theme;
+    let s = &app.strings;
+    let mut opened = None;
+
+    ui.colored_label(th.dim, s.report_dry_run_preview_notice);
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!("{} {}", s.report_dry_run_rows, preview.rows))
+            .strong()
+            .color(th.accent),
+    );
+    ui.add_space(4.0);
+
+    // Problems first here, unlike the terminal UI's bottom-of-the-scroll
+    // placement: a window this size can hide them below the fold, and an
+    // unresolved request is the whole reason to have asked for a preview.
+    if preview.var_warnings.is_empty() && preview.errors.is_empty() {
+        ui.colored_label(th.accent, s.report_dry_run_no_problems);
+    } else {
+        if !preview.var_warnings.is_empty() {
+            ui.label(
+                RichText::new(s.report_dry_run_warnings_heading)
+                    .strong()
+                    .color(th.pending),
+            );
+            for w in &preview.var_warnings {
+                ui.colored_label(th.pending, format!("! {w}"));
+            }
+        }
+        if !preview.errors.is_empty() {
+            ui.label(
+                RichText::new(s.report_dry_run_problems_heading)
+                    .strong()
+                    .color(th.err),
+            );
+            for e in &preview.errors {
+                ui.colored_label(th.err, format!("• {e}"));
+            }
+        }
+    }
+    ui.separator();
+
+    if preview.rows == 0 {
+        ui.colored_label(th.dim, s.report_dry_run_no_rows);
+        return None;
+    }
+    let columns = preview.result.resolved_columns(&preview.header);
+    if columns.is_empty() {
+        ui.colored_label(th.dim, app.strings.gui_report_no_results);
+        return None;
+    }
+    // `None` states: a dry run has no streaming progress, so the grid draws
+    // without status icons, exactly like a finished run.
+    if let Some(ins) = results_grid(&th, ui, &preview.result, &columns, None) {
+        opened = Some(ins);
+    }
+    opened
+}
+
+/// Build the highlighter context for `ed`: which line the parser rejected, and
+/// which of the report's references currently resolve.
+///
+/// The colours only *mean* something with this context — a `# collection:` or
+/// `ENVS` name reads green when it binds to something loaded and amber when it
+/// doesn't — so the Source view answers "is this report wired up?" at a glance,
+/// exactly as the terminal UI's does.
+fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
+    let bound = ed.flow.as_ref().and_then(|flow| {
+        context::resolve_bound_collection(&app.session.collections, flow, ed.report.path.as_deref())
+    });
+    HlCtx {
+        error_line: ed.parse_error_line,
+        collection_resolves: bound.is_some(),
+        loaded_envs: app
+            .session
+            .global_envs
+            .iter()
+            .map(|e| e.name.clone())
+            .collect(),
+        request_names: bound
+            .map(|ci| {
+                app.session.collections[ci]
+                    .entries
+                    .iter()
+                    .map(|e| e.title.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Lay `text` out as a syntax-highlighted [`egui::text::LayoutJob`], reusing the
+/// terminal UI's PaperTrail highlighter so both front-ends colour a script
+/// identically (see [`crate::tui::report_highlight`]).
+///
+/// The highlighter works a line at a time and drops the line breaks, so the
+/// newlines are re-inserted here as their own sections — otherwise the whole
+/// script would lay out as one run-on line.
+fn highlight_job(
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    th: &GuiTheme,
+    font: egui::FontId,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let theme = spec.to_theme();
+    let mut job = LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width: wrap_width,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, TextFormat::simple(font.clone(), th.text));
+        }
+        // `highlight_row` is 0-based over the visible rows; it maps that onto
+        // the highlighter's 1-based `error_line` itself.
+        for span in report_highlight::highlight_row(i, line, ctx, &theme) {
+            let style = span.style;
+            let mut fmt = TextFormat::simple(
+                font.clone(),
+                style
+                    .fg
+                    .map_or(th.text, |c| super::theme::from_ratatui(c, th.text)),
+            );
+            fmt.underline = if style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+            {
+                egui::Stroke::new(1.0, fmt.color)
+            } else {
+                egui::Stroke::NONE
+            };
+            job.append(&span.content, 0.0, fmt);
+        }
+    }
+    job
+}
+
 /// The raw `.trail` source editor + validation panel.
 fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // Reserve room for the diagnostics panel at the bottom, then let the editor
@@ -906,6 +1385,17 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let avail = ui.available_height();
     let diag_h = ed.diag_h.clamp(48.0, (avail - 100.0).max(48.0));
     let edit_h = (avail - diag_h - 8.0).max(80.0);
+    let hl = highlight_ctx(ed, app);
+    let spec = app.session.active_theme_spec();
+    let th = app.theme;
+    // The layout job is rebuilt on every keystroke, so egui's galley cache is
+    // what keeps this cheap: an unchanged job hashes to the same key and the
+    // laid-out text is reused.
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let job = highlight_job(buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        ui.ctx().fonts_mut(|f| f.layout_job(job))
+    };
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .max_height(edit_h)
@@ -915,7 +1405,8 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
                 egui::TextEdit::multiline(&mut text)
                     .code_editor()
                     .desired_width(f32::INFINITY)
-                    .desired_rows(20),
+                    .desired_rows(20)
+                    .layouter(&mut layouter),
             );
             if resp.changed() {
                 // Snapshot for undo only when transitioning from a saved
@@ -933,6 +1424,37 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
 /// The results grid from the last (or in-flight) run, plus an Export button.
 fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
+
+    // A dry run is a result like any other, so it is shown in this view rather
+    // than in a window of its own — same table, same cell viewer, nothing
+    // floating over the top of anything. Its banner is what says it isn't real.
+    if let Some(preview) = ed.dry_run.take() {
+        let mut keep = true;
+        ui.horizontal(|ui| {
+            ui.colored_label(th.pending, app.strings.report_dry_run_preview_notice);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(format!(
+                        "{} {}",
+                        super::icons::CLOSE,
+                        app.strings.gui_report_dry_run_close
+                    ))
+                    .on_hover_text(app.strings.gui_report_dry_run_close_tooltip)
+                    .clicked()
+                {
+                    keep = false;
+                }
+            });
+        });
+        ui.separator();
+        if let Some(ins) = dry_run_body(app, ui, &preview) {
+            ed.inspector = Some(ins);
+        }
+        if keep {
+            ed.dry_run = Some(preview);
+        }
+        return;
+    }
 
     ui.horizontal(|ui| {
         if ed.is_running() {
@@ -996,37 +1518,109 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let states = ed.progress.as_ref().map(|p| p.states.as_slice());
     ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
     ui.add_space(2.0);
-    if let Some(ins) = results_grid(app, ui, result, &columns, states) {
+    if let Some(ins) = results_grid(&th, ui, result, &columns, states) {
         ed.inspector = Some(ins);
     }
+}
+
+/// The narrowest a column is allowed to get when the table is squeezed, in
+/// pixels — roughly four characters plus the ellipsis. Below this a column
+/// shows nothing useful, so it is better to stop shrinking and let the table
+/// scroll sideways instead.
+const MIN_COL_W: f32 = 46.0;
+
+/// Share `avail` pixels out between columns that would naturally like
+/// `natural` pixels each.
+///
+/// Two jobs in one, because they are the same sum from opposite sides:
+///
+/// * **Too much room** — the widths are grown in proportion so the table fills
+///   the window rather than huddling at the left edge.
+/// * **Not enough room** — the widths are *water-filled*: a level is found such
+///   that every column wider than it is cut down to it and every column
+///   narrower than it is left alone. Shrinking proportionally instead would
+///   punish a 3-character `Status` column just as hard as a sprawling body
+///   column, which is exactly backwards; capping the greedy columns first is
+///   what keeps everything on screen and still legible.
+///
+/// Columns are never squeezed below [`MIN_COL_W`]. If even that doesn't fit,
+/// the returned widths deliberately overflow `avail` — the caller's horizontal
+/// scroll bar is the honest answer at that point, and the cell viewer is there
+/// for whatever still gets clipped.
+fn fit_column_widths(natural: &[f32], avail: f32, spacing: f32) -> Vec<f32> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    let gaps = spacing * (natural.len() as f32 - 1.0);
+    let budget = (avail - gaps).max(0.0);
+    let total: f32 = natural.iter().sum();
+
+    if total <= 0.0 {
+        return vec![(budget / natural.len() as f32).max(MIN_COL_W); natural.len()];
+    }
+    if total <= budget {
+        // Grow in proportion to what each column asked for, so the extra room
+        // goes to the columns most likely to be truncating.
+        let scale = budget / total;
+        return natural.iter().map(|w| w * scale).collect();
+    }
+
+    // Water-fill: walk the columns narrowest-first, handing each the smaller of
+    // what it wants and an even share of what is left.
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by(|&a, &b| natural[a].total_cmp(&natural[b]));
+    let mut out = vec![0.0f32; natural.len()];
+    let mut left = budget;
+    for (i, &c) in order.iter().enumerate() {
+        let share = left / (order.len() - i) as f32;
+        if natural[c] <= share {
+            out[c] = natural[c];
+            left -= natural[c];
+        } else {
+            out[c] = share;
+            left -= share;
+        }
+    }
+    out.iter().map(|w| w.max(MIN_COL_W)).collect()
 }
 
 /// Render the results as a scrollable table: a header row, one row per data row
 /// (greyed/marked by its streaming [`RowState`]), then any STATISTICS summary
 /// rows. Mirrors the TUI's `report_grid_lines` semantics.
 fn results_grid(
-    app: &GuiApp,
+    th: &GuiTheme,
     ui: &mut egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     states: Option<&[RowState]>,
 ) -> Option<CellInspector> {
-    let th = app.theme;
     let show_icons = states.is_some();
     let mut opened: Option<CellInspector> = None;
+    let widths = fitted_column_widths(ui, result, columns, show_icons);
+    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Grid::new("report_results_grid")
                 .striped(true)
-                .spacing(egui::vec2(14.0, 3.0))
+                .spacing(egui::vec2(SPACING_X, 3.0))
                 .show(ui, |ui| {
                     // Header row.
                     if show_icons {
                         ui.label(" ");
                     }
-                    for col in columns {
-                        ui.label(RichText::new(&col.header).strong().color(th.accent));
+                    for (c, col) in columns.iter().enumerate() {
+                        let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
+                        cell_slot(ui, w, row_h, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&col.header).strong().color(th.accent),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&col.header);
+                        });
                     }
                     ui.end_row();
 
@@ -1046,11 +1640,14 @@ fn results_grid(
                             Some(RowState::Scheduled) => th.dim,
                             _ => th.text,
                         };
-                        for col in columns {
+                        for (c, col) in columns.iter().enumerate() {
                             let full = col.value(row, &result.no_match_marker);
-                            if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
-                                opened = Some(ins);
-                            }
+                            let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
+                            cell_slot(ui, w, row_h, |ui| {
+                                if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
+                                    opened = Some(ins);
+                                }
+                            });
                         }
                         ui.end_row();
                     }
@@ -1063,28 +1660,153 @@ fn results_grid(
                         for (c, col) in columns.iter().enumerate() {
                             let full = srow.text_cell(c);
                             let cell = flatten_cell(&full);
-                            let resp = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new(truncate_cell(&cell))
-                                            .italics()
-                                            .color(th.accent),
+                            let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
+                            cell_slot(ui, w, row_h, |ui| {
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(truncate_cell(&cell))
+                                                .italics()
+                                                .color(th.accent),
+                                        )
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
                                     )
-                                    .sense(egui::Sense::click()),
-                                )
-                                .on_hover_text(cell);
-                            if resp.clicked() {
-                                opened = Some(CellInspector {
-                                    title: col.header.clone(),
-                                    content: pretty_json_cell(&full),
-                                });
-                            }
+                                    .on_hover_text(&cell);
+                                if resp.clicked() {
+                                    opened = Some(CellInspector {
+                                        title: col.header.clone(),
+                                        content: pretty_json_cell(&full),
+                                    });
+                                }
+                            });
                         }
                         ui.end_row();
                     }
                 });
         });
     opened
+}
+
+/// The gap left between a tethered chip and the chip it qualifies. Narrower
+/// than the normal inter-chip spacing, so the pair reads as one thing before
+/// the bracket is even noticed.
+const TETHER_GAP: f32 = 2.0;
+
+/// Draw the bracket joining a tethered chip to the chip it qualifies.
+///
+/// A shallow staple above *and* below the pair: each starts over the anchor,
+/// steps out past the chips and runs along to the far edge of the hanger. The
+/// mirrored pair reads as a single bracket enclosing the two chips, which is
+/// much easier to spot in a long row than one lone line underneath. Drawn
+/// *outside* the chips rather than as a box around them so it can't be confused
+/// with the border that marks a request and its `WITH` fields as one droppable
+/// unit — this is an annotation, not a block boundary.
+fn paint_tether(painter: &egui::Painter, th: &GuiTheme, anchor: egui::Rect, hanger: egui::Rect) {
+    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.text, 0.55));
+    let drop = 3.0;
+    let left = anchor.center().x;
+    let right = hanger.right() - 2.0;
+    // `dir` is which way the staple steps away from the chips: +1 below, -1
+    // above. The union covers both chips even when they differ in height.
+    for (dir, edge) in [
+        (1.0, anchor.bottom().max(hanger.bottom()) + 2.0),
+        (-1.0, anchor.top().min(hanger.top()) - 2.0),
+    ] {
+        let near = edge - drop * dir;
+        painter.line_segment([egui::pos2(left, near), egui::pos2(left, edge)], stroke);
+        painter.line_segment([egui::pos2(left, edge), egui::pos2(right, edge)], stroke);
+        painter.line_segment([egui::pos2(right, edge), egui::pos2(right, near)], stroke);
+    }
+}
+
+/// Horizontal spacing between the grid's columns.
+const SPACING_X: f32 = 14.0;
+
+/// The width to give each data column of `result` in the space `ui` has left:
+/// what the column would like, fitted to the window by [`fit_column_widths`].
+fn fitted_column_widths(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+    show_icons: bool,
+) -> Vec<f32> {
+    // The status-glyph column is a fixed narrow gutter, not a data column, so
+    // it is taken off the top of the budget rather than shared in it.
+    let icon_w = if show_icons { 18.0 + SPACING_X } else { 0.0 };
+    let natural = natural_column_widths(ui, result, columns);
+    let avail = (ui.available_width() - icon_w).max(0.0);
+    fit_column_widths(&natural, avail, SPACING_X)
+}
+
+/// Lay a cell's content out in a slot exactly `w` wide.
+///
+/// `egui::Grid` sizes a column to its widest cell, so pinning every cell in a
+/// column to the same width is what makes the column that width — and it keeps
+/// the grid's striping and row alignment, which hand-rolling the rows would
+/// throw away. `set_min_size` is the part that matters: without it a short
+/// label would allocate only its own width and the column would collapse.
+fn cell_slot(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(w, h));
+            add(ui);
+        },
+    );
+}
+
+/// How wide each column would like to be: the width of its header or of its
+/// longest value, whichever is greater.
+///
+/// Only the *longest-by-character-count* value in each column is actually
+/// measured. Laying out every cell of a thousand-row report each frame to find
+/// the widest pixel width would be far more work than the answer is worth, and
+/// in a proportional font the longest string is almost always the widest one.
+/// Where it isn't, the loser is truncated by a character or two — which the
+/// cell viewer already covers.
+fn natural_column_widths(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> Vec<f32> {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    // Leave room for the cell's own padding so text isn't flush against the
+    // next column.
+    let pad = 6.0;
+    let measure = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+            + pad
+    };
+
+    columns
+        .iter()
+        .enumerate()
+        .map(|(c, col)| {
+            let mut longest = String::new();
+            let mut longest_len = 0usize;
+            let mut consider = |text: String| {
+                let n = text.chars().count();
+                if n > longest_len {
+                    longest_len = n;
+                    longest = text;
+                }
+            };
+            for row in &result.rows {
+                consider(truncate_cell(&flatten_cell(
+                    &col.value(row, &result.no_match_marker),
+                )));
+            }
+            for srow in result.summary_rows(columns) {
+                consider(truncate_cell(&flatten_cell(&srow.text_cell(c))));
+            }
+            measure(&col.header).max(measure(&longest))
+        })
+        .collect()
 }
 
 /// A single clickable results cell: shows the truncated one-line value, the full
@@ -1100,6 +1822,7 @@ fn result_cell(
     let resp = ui
         .add(
             egui::Label::new(RichText::new(truncate_cell(&cell)).color(text_col))
+                .truncate()
                 .sense(egui::Sense::click()),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1294,12 +2017,41 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                             ui.id().with("pt_bg_deselect"),
                             egui::Sense::click(),
                         );
+                        // Whole-report settings, pinned above BEGIN (see
+                        // `header_strip`) — deliberately outside the row loop so
+                        // no drop target, drag lift or selection ever reaches
+                        // them.
+                        header_strip(ed, app, ui, &mut acts);
+                        ui.add_space(4.0);
+                        let mut lift = DragLift::default();
                         for (i, row) in rows.iter().enumerate() {
                             let selected = row.path == ed.selection
                                 && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
                             let drop_pos = insert_pos_after(&rows, i);
-                            block_row(ed, app, ui, row, i, selected, &drop_pos, &titles, &mut acts);
+                            block_row(
+                                ed, app, ui, row, i, selected, &drop_pos, &titles, &mut lift,
+                                &mut acts,
+                            );
                         }
+                        // A report with no steps is where every new report
+                        // starts, and an empty gap between BEGIN and END says
+                        // nothing about what to do next — the palette's own
+                        // hint is over in the other column, easy to skim past.
+                        if rows.is_empty() {
+                            empty_flow_hint(ui, &th, &app.strings);
+                        }
+                        // Every lifted row is now in the drag layer, so the
+                        // whole picked-up subtree can be moved under the pointer
+                        // in one go (see `DragLift`).
+                        lift.follow_pointer(ui.ctx());
+                        // Close the flow with an `END` matching the `BEGIN` at
+                        // the top, so the whole report reads as one bracketed
+                        // block the way each FOR loop does. It is drawn here
+                        // rather than emitted by the shared `flatten` because it
+                        // is pure punctuation: there is no node to select, move
+                        // or drop onto, and adding a row would shift every index
+                        // the terminal UI's node editor navigates by.
+                        flow_end_row(ui, &th, &app.strings);
                         // The empty space under the last row is itself a drop
                         // target: dropping a base block (or an existing row)
                         // anywhere below the report appends it as the last
@@ -1335,14 +2087,17 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 /// The base blocks the palette offers, in display order. Each drops in as a new
-/// statement row. `ReportRequest` and `ReportVar` are intentionally absent — a
-/// reported request is composed by dropping the `REPORT` modifier onto a
-/// `REQUEST`, and a reported variable by dropping `REPORT` onto a `VARIABLE`
-/// (`Assign`) block, so there is a single `REPORT` in the palette. A *computed*
-/// column (`REPORT "…" AS …`) has no such composition, so it is offered
-/// directly.
-const BASE_KINDS: [NodeKind; 7] = [
+/// statement row.
+///
+/// `ReportRequest` is the one kind deliberately absent: a reported request is
+/// composed by dropping the `REPORT` modifier onto a `REQUEST`, so offering both
+/// would be two routes to the same block. `ReportVar` is *not* such a case —
+/// dropping `REPORT` on a `VARIABLE` only reports a variable this flow sets
+/// right there, which leaves no way at all to report a captured value or a loop
+/// variable — so it is offered as a block of its own.
+const BASE_KINDS: [NodeKind; 8] = [
     NodeKind::Request,
+    NodeKind::ReportVar,
     NodeKind::ReportComputed,
     NodeKind::Assign,
     NodeKind::List,
@@ -1369,9 +2124,17 @@ fn palette_list(app: &GuiApp, ui: &mut egui::Ui) {
     for (i, kind) in BASE_KINDS.into_iter().enumerate() {
         let base = kind_color(kind, &th);
         let id = ui.id().with(("pt_base_chip", i));
-        ui.dnd_drag_source(id, kind, |ui| {
+        let src = ui.dnd_drag_source(id, kind, |ui| {
             palette_chip(ui, &th, kind.label(&app.strings), base);
         });
+        // Remember how big the chip in hand is, so the drop markers down in the
+        // flow can be drawn at that size rather than a full-width bar (see
+        // `dragged_block_size`).
+        if ui.ctx().is_being_dragged(id) {
+            let size = src.response.rect.size();
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(palette_drag_size_id(), size));
+        }
         ui.add_space(4.0);
     }
 
@@ -1467,6 +2230,7 @@ fn modifier_color(m: Modifier, th: &GuiTheme) -> Color32 {
         Modifier::Response => th.accent,
         Modifier::Show => th.ok,
         Modifier::Hide => th.dim,
+        Modifier::Statistics => th.subst,
     }
 }
 
@@ -1497,6 +2261,15 @@ fn release_payload<T: std::any::Any + Send + Sync>(
     resp.dnd_release_payload::<T>()
 }
 
+/// Widths of the inline editors embedded in a chip. Shared by the real chip and
+/// by the same-sized placeholder a pending drop draws (see [`Chip::ghost_shape`])
+/// so the two can't drift apart.
+const ALIAS_FIELD_WIDTH: f32 = 96.0;
+const PARALLEL_FIELD_WIDTH: f32 = 44.0;
+/// A combo chip's dropdown grows to fit its text, which the ghost already spells
+/// out; this is just the arrow and its padding.
+const COMBO_CHIP_WIDTH: f32 = 24.0;
+
 /// Horizontal indent applied per nesting level in the block editor, so a
 /// statement inside a `FOR`/`PARALLEL`/`WITH` block sits clearly further right
 /// than its parent. Used for both the chip clusters and the drop-placeholder /
@@ -1514,6 +2287,17 @@ fn dragged_row_path(ctx: &egui::Context) -> Option<Vec<usize>> {
     })
 }
 
+/// The chip currently picked up on its own (an active [`DragItem::Chip`]
+/// payload), if any. Read at the start of a row's render from the payload set
+/// last frame — exactly like [`dragged_row_path`] — so the chip can be lifted
+/// out of its slot and floated under the cursor.
+fn dragged_chip(ctx: &egui::Context) -> Option<(Vec<usize>, DetachWhich)> {
+    egui::DragAndDrop::payload::<DragItem>(ctx).and_then(|d| match &*d {
+        DragItem::Chip { path, which } => Some((path.clone(), *which)),
+        _ => None,
+    })
+}
+
 /// Whether `row_path` is part of the subtree currently being dragged: the
 /// dragged path itself, or any descendant of it (a `FOR` loop's body rows and
 /// its synthetic `END`, all of which carry the loop's path as a prefix). A leaf
@@ -1522,31 +2306,410 @@ fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
     row_path.starts_with(dragged)
 }
 
+/// `rect` with the row's indent trimmed off its left edge: the block's own
+/// bounds. Never collapses the rect, however deeply nested the row is.
+fn indented_content(rect: egui::Rect, depth: usize) -> egui::Rect {
+    let indent = (depth as f32 * INDENT_STEP).min((rect.width() - 1.0).max(0.0));
+    egui::Rect::from_min_max(
+        egui::pos2(rect.left() + indent, rect.top()),
+        rect.right_bottom(),
+    )
+}
+
+/// Where the measured *silhouette* of the picked-up subtree is stashed between
+/// frames, so the drop markers can take its shape (see [`DragLift`] and
+/// [`dragged_block_shape`]). One drag is in flight at a time, so a single
+/// global id is enough.
+///
+/// A subtree is not a rectangle: a `FOR` loop is a short head, an indented body
+/// of varying widths and a short `END`. Storing one rect per row — each
+/// positioned relative to the subtree's own top-left corner — lets the marker
+/// show that outline instead of the bounding box, which for a loop over three
+/// requests promised a large solid slab nothing like the block in hand.
+fn lifted_shape_id() -> egui::Id {
+    egui::Id::new("pt_lifted_block_shape")
+}
+
+/// Where the size of the palette chip currently being dragged is stashed.
+///
+/// A palette block has no laid-out block to measure — it doesn't exist in the
+/// flow yet — but the thing physically in the user's hand *is* the palette
+/// chip's floating preview, so matching the drop ghost to that is both the
+/// honest answer and the one that looks right.
+fn palette_drag_size_id() -> egui::Id {
+    egui::Id::new("pt_palette_drag_size")
+}
+
+/// The floating ("picked up") subtree, accumulated as the block list renders.
+///
+/// Every lifted row paints into one shared layer so the whole block moves as a
+/// single unit, but the translation that puts it under the pointer can only be
+/// applied **after the last of those rows has been painted**:
+/// [`egui::Context::transform_layer_shapes`] moves the shapes *already in* the
+/// layer, so applying it from inside the head row — which always renders before
+/// its body — moved the head alone and left a `FOR` loop's body and its `END`
+/// sitting at their layout positions. That is what made the parts of a dragged
+/// loop appear to move at different speeds.
+#[derive(Default)]
+struct DragLift {
+    /// The shared layer every lifted row painted into.
+    layer: Option<egui::LayerId>,
+    /// The head row's laid-out rect — the anchor centred on the pointer, so the
+    /// rest of the subtree hangs off it at its natural offsets.
+    head: Option<egui::Rect>,
+    /// Union of every lifted row's rect: the true size of the block in hand.
+    bounds: Option<egui::Rect>,
+    /// Every lifted row's rect, in layout order — the block's silhouette.
+    rows: Vec<egui::Rect>,
+}
+
+impl DragLift {
+    fn add(&mut self, layer: egui::LayerId, rect: egui::Rect, is_head: bool) {
+        self.layer = Some(layer);
+        if is_head {
+            self.head = Some(rect);
+        }
+        self.bounds = Some(match self.bounds {
+            Some(bounds) => bounds.union(rect),
+            None => rect,
+        });
+        self.rows.push(rect);
+    }
+
+    /// Move the whole picked-up subtree under the pointer in one transform, and
+    /// remember its measured height for the drop ghosts. Call once per frame,
+    /// after every row has been rendered.
+    fn follow_pointer(self, ctx: &egui::Context) {
+        let (Some(layer), Some(head), Some(bounds)) = (self.layer, self.head, self.bounds) else {
+            // Nothing in hand this frame — forget the last drag's measurement so
+            // the next drag's first frame doesn't briefly shape its marker like
+            // the previous (possibly much bigger) block.
+            ctx.data_mut(|d| d.remove::<Vec<egui::Rect>>(lifted_shape_id()));
+            return;
+        };
+        // Normalised to the subtree's own top-left so the marker can simply be
+        // translated to wherever the block would land.
+        let shape: Vec<egui::Rect> = self
+            .rows
+            .iter()
+            .map(|r| egui::Rect::from_min_size(r.min - bounds.min.to_vec2(), r.size()))
+            .collect();
+        ctx.data_mut(|d| d.insert_temp(lifted_shape_id(), shape));
+        if let Some(pointer) = ctx.pointer_interact_pos() {
+            ctx.transform_layer_shapes(
+                layer,
+                egui::emath::TSTransform::from_translation(pointer - head.center()),
+            );
+        }
+    }
+}
+
+/// The silhouette of the block currently in hand — one rect per row it will
+/// occupy, positioned relative to the block's own top-left corner — so a drop
+/// marker can be drawn in the *shape* of what will land there rather than a
+/// rectangle covering its bounding box.
+///
+///   * A palette block ([`NodeKind`]) has nothing laid out in the flow to
+///     measure. Its rows come from what it will flatten to — a `FOR` inserts a
+///     head plus its `END`, everything else a single row — and its width from
+///     the palette chip being dragged (see [`palette_drag_size_id`]), which is
+///     literally the preview in the user's hand.
+///   * An existing block ([`DragItem::Row`]) is measured from the floating
+///     subtree itself by [`DragLift`], so a `FOR` loop's stepped outline (short
+///     head, indented body, short `END`) is reproduced exactly. That
+///     measurement is necessarily the previous frame's — the lifted rows are
+///     painted interleaved with the very drop strips that need it — which is
+///     invisible mid-drag; a drag's first frame falls back to a single block.
+fn dragged_block_shape(ui: &egui::Ui) -> Vec<egui::Rect> {
+    let ctx = ui.ctx();
+    let one = chip_h(ui) + 10.0;
+    // A width to fall back on when nothing has been measured yet. Wide enough
+    // to read as a block, narrow enough that it never looks like the old
+    // full-width bar.
+    let default_w = 160.0;
+    let stack = |w: f32, rows: usize| -> Vec<egui::Rect> {
+        (0..rows)
+            .map(|i| egui::Rect::from_min_size(egui::pos2(0.0, i as f32 * one), egui::vec2(w, one)))
+            .collect()
+    };
+    if let Some(kind) = egui::DragAndDrop::payload::<NodeKind>(ctx) {
+        let rows = match *kind {
+            NodeKind::ForFiles | NodeKind::ForFolders | NodeKind::ForEnvs => 2,
+            _ => 1,
+        };
+        let w = ctx
+            .data(|d| d.get_temp::<egui::Vec2>(palette_drag_size_id()))
+            .map(|s| s.x)
+            .filter(|w| *w >= 1.0)
+            .unwrap_or(default_w);
+        return stack(w, rows);
+    }
+    let dragging_row = egui::DragAndDrop::payload::<DragItem>(ctx)
+        .is_some_and(|d| matches!(&*d, DragItem::Row(_)));
+    if dragging_row
+        && let Some(shape) = ctx.data(|d| d.get_temp::<Vec<egui::Rect>>(lifted_shape_id()))
+        && !shape.is_empty()
+        && shape.iter().all(|r| r.width() >= 1.0 && r.height() >= 1.0)
+    {
+        // A subtree measured as shorter than a single row is a stale or
+        // degenerate reading; a marker that small would be invisible.
+        let h: f32 = shape
+            .iter()
+            .fold(f32::NEG_INFINITY, |acc, r| acc.max(r.bottom()));
+        if h >= one {
+            return shape;
+        }
+    }
+    stack(default_w, 1)
+}
+
+/// The bounding size of [`dragged_block_shape`] — what the insert strips
+/// animate a gap open to.
+fn dragged_block_size(ui: &egui::Ui) -> egui::Vec2 {
+    dragged_block_shape(ui)
+        .into_iter()
+        .reduce(egui::Rect::union)
+        .map_or(egui::Vec2::ZERO, |r| r.max.to_vec2())
+}
+
+/// Just the height of [`dragged_block_size`] — the dimension the insert strips
+/// animate open.
+fn dragged_block_h(ui: &egui::Ui) -> f32 {
+    dragged_block_size(ui).y
+}
+
+/// Paint the block that will land here as its own silhouette: one rounded,
+/// accent-tinted rect per row, laid out from `origin` and clipped to `clip`.
+///
+/// Clipping (rather than scaling) is what lets the marker animate open — the
+/// gap grows from nothing to the block's full height, revealing more of the
+/// same fixed shape, so the block never appears to stretch. The clip also
+/// bounds a very wide block to the editor.
+fn paint_drop_silhouette(
+    ui: &egui::Ui,
+    origin: egui::Pos2,
+    shape: &[egui::Rect],
+    clip: egui::Rect,
+    th: &GuiTheme,
+) {
+    if clip.width() < 1.0 || clip.height() < 1.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(clip);
+    for r in shape {
+        let rect = egui::Rect::from_min_size(origin + r.min.to_vec2(), r.size());
+        if rect.width() < 1.0 || rect.height() < 1.0 {
+            continue;
+        }
+        painter.rect(
+            // A hair of inset between stacked rows so a loop's head, body and
+            // `END` read as separate blocks rather than one column.
+            rect.shrink2(egui::vec2(0.0, 2.0)),
+            egui::CornerRadius::same(BLOCK_RADIUS as u8),
+            mix(th.panel, th.accent, 0.18),
+            egui::Stroke::new(1.5, th.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// The corner radius every block, chip and ghost shares, so an outline drawn
+/// around a block traces the same silhouette the block itself has.
+const BLOCK_RADIUS: f32 = 6.0;
+
+/// A closed polyline tracing `rect` with rounded corners, for dashing along.
+///
+/// `egui` can dash an arbitrary path but only knows how to *fill* a rounded
+/// rectangle, so a dashed rounded outline has to be approximated by hand. Eight
+/// segments per quarter-turn is indistinguishable from a curve at the radii
+/// blocks use, while staying cheap enough to rebuild every frame of a drag.
+fn rounded_rect_path(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    // A radius can never exceed half the shorter side, or the corners overlap
+    // and the path folds back on itself.
+    let r = radius
+        .min(rect.width() * 0.5)
+        .min(rect.height() * 0.5)
+        .max(0.0);
+    const SEGMENTS: usize = 8;
+    let mut path = Vec::with_capacity(SEGMENTS * 4 + 5);
+    // Corner centres and the sweep each one starts at, walking clockwise from
+    // the top-left corner in screen coordinates (y grows downwards).
+    let corners = [
+        (
+            egui::pos2(rect.left() + r, rect.top() + r),
+            std::f32::consts::PI,
+        ),
+        (
+            egui::pos2(rect.right() - r, rect.top() + r),
+            1.5 * std::f32::consts::PI,
+        ),
+        (egui::pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (
+            egui::pos2(rect.left() + r, rect.bottom() - r),
+            0.5 * std::f32::consts::PI,
+        ),
+    ];
+    for (centre, start) in corners {
+        for i in 0..=SEGMENTS {
+            let a = start + (i as f32 / SEGMENTS as f32) * 0.5 * std::f32::consts::PI;
+            path.push(egui::pos2(centre.x + r * a.cos(), centre.y + r * a.sin()));
+        }
+    }
+    // Close the loop so the final corner joins the first.
+    if let Some(&first) = path.first() {
+        path.push(first);
+    }
+    path
+}
+
 /// Paint a faint dashed "ghost" of a block into the current (base) layer,
 /// marking the slot a dragged block was lifted from. So if a block was picked
 /// up by accident, there's an obvious outline showing where it came from and
 /// where dropping it back would return it.
+///
+/// `rect` is the block's *own* rect — its indent already stripped off the left
+/// edge by the caller — so the outline traces exactly where the block sat
+/// rather than starting at the far left of the editor, which made a nested
+/// block's ghost look like it belonged to the whole flow.
 fn paint_origin_ghost(painter: &egui::Painter, rect: egui::Rect, th: &GuiTheme) {
     if rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
     let r = rect.expand(1.0);
-    painter.rect_filled(r, egui::CornerRadius::same(6), mix(th.panel, th.dim, 0.12));
-    // A dashed outline (four dashed edges) reads as "empty slot / drop back
-    // here" rather than a solid block.
+    let radius = BLOCK_RADIUS;
+    painter.rect_filled(
+        r,
+        egui::CornerRadius::same(radius as u8),
+        mix(th.panel, th.dim, 0.12),
+    );
+    // A dashed outline reads as "empty slot / drop back here" rather than a
+    // solid block; dashing round a rounded path (not the four straight edges)
+    // keeps its corners as round as the block's own.
     for shape in egui::Shape::dashed_line(
-        &[
-            r.left_top(),
-            r.right_top(),
-            r.right_bottom(),
-            r.left_bottom(),
-            r.left_top(),
-        ],
+        &rounded_rect_path(r, radius),
         egui::Stroke::new(1.0, th.dim),
         4.0,
         3.0,
     ) {
         painter.add(shape);
+    }
+}
+
+/// A modifier drop that is currently *pending* over a line — either a fresh
+/// clause dragged in from the palette, or one pulled off another line and
+/// carried here with its contents (see [`CarriedMod`]).
+///
+/// Both are answered by the same three questions — will it go here, why not,
+/// and what will it look like — so the drop zone handles one type rather than
+/// branching on the payload everywhere.
+#[derive(Clone)]
+enum PendingMod {
+    New(Modifier),
+    Moved(CarriedMod),
+}
+
+impl PendingMod {
+    fn reject_reason(&self, node: &FlowNode, s: &crate::i18n::Strings) -> Option<&'static str> {
+        match self {
+            PendingMod::New(m) => m.reject_reason(node, s),
+            PendingMod::Moved(carried) => carried.reject_reason(node, s),
+        }
+    }
+
+    /// Perform the drop on `node`. Used on a throwaway clone to work out what
+    /// the result would look like, so the preview and the drop can't disagree.
+    fn apply(&self, node: &mut FlowNode) -> bool {
+        match self {
+            PendingMod::New(m) => attach_to_node(node, *m),
+            PendingMod::Moved(carried) => carried.attach_to(node),
+        }
+    }
+}
+
+/// The chip a pending drop would add to `node`, and where in the chip cluster it
+/// would sit.
+///
+/// Worked out by *rehearsing the drop* on a throwaway clone and diffing the
+/// resulting chips against the current ones, so the preview can never drift from
+/// what the drop actually does — the same trick
+/// [`edit::detach_leaves_statement`] uses. `None` when the drop rewrites the
+/// line without adding a chip of its own (outlining the whole row is the honest
+/// preview then).
+fn preview_chip(
+    node: &FlowNode,
+    pending: &PendingMod,
+    req_ok: Option<bool>,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Option<(usize, String, f32)> {
+    let mut probe = node.clone();
+    if !pending.apply(&mut probe) {
+        return None;
+    }
+    let before = node_chips(node, req_ok, th, s);
+    let after = node_chips(&probe, req_ok, th, s);
+    if after.len() <= before.len() {
+        return None;
+    }
+    let idx = before
+        .iter()
+        .zip(after.iter())
+        .position(|(b, a)| b.ghost_shape() != a.ghost_shape())
+        .unwrap_or(before.len());
+    let (text, extra) = after.get(idx)?.ghost_shape();
+    Some((idx, text, extra))
+}
+
+/// The ctx-data key a row parks its drop preview under. The preview is computed
+/// by the drop zone, which is only laid out *after* the chip cluster it needs to
+/// open a gap in, so it is handed to the next frame rather than to this one — a
+/// lag of a single frame in the middle of a drag that lasts hundreds.
+fn mod_ghost_id(row_index: usize) -> egui::Id {
+    egui::Id::new(("pt_modghost", row_index))
+}
+
+/// A dashed, chip-shaped placeholder standing in for the block a pending drop
+/// would add, drawn inline in the chip cluster at the position it will occupy —
+/// so the line visibly opens up to make room and the user can see how the drop
+/// changes the statement *before* letting go.
+///
+/// Laid out with exactly the frame a real chip uses (same margins, same minimum
+/// height) and showing the chip's own text, which is what guarantees the gap is
+/// the size of the block that will fill it.
+fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
+    let h = chip_h(ui);
+    let rect = egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(h);
+                ui.add(
+                    egui::Label::new(RichText::new(text).color(th.dim))
+                        .selectable(false)
+                        .truncate(),
+                );
+                // The chip that lands here carries an inline editor (a name
+                // field, a concurrency box, a dropdown) that has no text of its
+                // own yet — reserve its width too, or the gap is narrower than
+                // the block about to fill it.
+                ui.add_space(extra_width);
+            });
+        })
+        .response
+        .rect;
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(6),
+        mix(th.panel, th.accent, 0.10),
+    );
+    for shape in egui::Shape::dashed_line(
+        &rounded_rect_path(rect, 6.0),
+        egui::Stroke::new(1.0, th.accent),
+        4.0,
+        3.0,
+    ) {
+        ui.painter().add(shape);
     }
 }
 
@@ -1559,6 +2722,7 @@ fn block_row(
     selected: bool,
     drop_pos: &InsertPos,
     titles: &[String],
+    lift: &mut DragLift,
     acts: &mut Vec<Act>,
 ) {
     let th = app.theme;
@@ -1602,7 +2766,36 @@ fn block_row(
         .as_deref()
         .is_some_and(|d| row_is_lifted(d, &row.path));
     let is_drag_head = drag_path.as_deref() == Some(row.path.as_slice());
+    // A chip dragged out on its own (rather than Ctrl-dragged to move the whole
+    // line) is lifted the same way a row is: it paints into a floating layer
+    // that follows the pointer and leaves a dashed ghost in the slot it came
+    // from. Without that, pulling a clause out of a line looked like nothing was
+    // happening at all.
+    let lifted_chip = dragged_chip(ui.ctx());
+    let chip_in_this_row = |which: DetachWhich| {
+        lifted_chip
+            .as_ref()
+            .is_some_and(|(p, w)| p.as_slice() == row.path.as_slice() && *w == which)
+    };
+    // What the chip in hand is actually carrying (`SHOW(Time, Status)`, not just
+    // "a SHOW"), read once here so every row's drop zone can ask whether that
+    // clause would fit — and so dropping it on another line re-creates it with
+    // its contents rather than as a fresh placeholder.
+    let carried_chip: Option<(Vec<usize>, DetachWhich, CarriedMod)> =
+        lifted_chip.as_ref().and_then(|(p, w)| {
+            let node = ed.flow.as_ref().and_then(|f| node_at(f, p))?;
+            Some((p.clone(), *w, carry_modifier(node, *w)?))
+        });
+    // The gap this row opened for a hovering modifier, decided by last frame's
+    // drop zone (see `mod_ghost_id`).
+    let mod_ghost: Option<(usize, String, f32)> = ui
+        .ctx()
+        .data(|d| d.get_temp(mod_ghost_id(row_index)))
+        .unwrap_or(None);
     let block_body = |ui: &mut egui::Ui| -> egui::Rect {
+        // Where the picked-up chip's floating layer ended up, so it can be moved
+        // under the pointer once everything lifted with it has been painted.
+        let mut chip_lift: Option<(egui::LayerId, egui::Rect)> = None;
         // Top-align the chip cluster (rather than the default centre alignment):
         // every chip is the same height, so top-alignment keeps them level while
         // avoiding egui's horizontal-centre re-centring, which otherwise drifts
@@ -1610,48 +2803,141 @@ fn block_row(
         let inner = ui.horizontal_top(|ui| {
             ui.add_space(row.depth as f32 * INDENT_STEP);
             match row.kind {
-                RowKind::Begin => static_chip(ui, &th, app.strings.report_node_begin, th.accent),
-                RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent),
+                RowKind::Begin => static_chip(
+                    ui,
+                    &th,
+                    app.strings.report_node_begin,
+                    th.accent,
+                    s.chip_help_begin,
+                ),
+                RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent, s.chip_help_end),
                 RowKind::Leaf | RowKind::LoopHead => {
                     let chips = node
                         .as_ref()
-                        .map(|n| node_chips(n, row.req_ok, &th))
+                        .map(|n| node_chips(n, row.req_ok, &th, s))
                         .unwrap_or_default();
-                    for chip in &chips {
-                        render_chip(
-                            ui,
-                            &th,
-                            s,
-                            chip,
-                            selected,
-                            &row.path,
-                            titles,
-                            &env_choices,
-                            acts,
-                        );
+                    // A tethered chip is pulled up against the chip it
+                    // qualifies and the pair is bracketed together afterwards
+                    // (see `paint_tether`); everything else keeps the normal
+                    // inter-chip gap.
+                    let gap = ui.spacing().item_spacing.x;
+                    let mut prev: Option<egui::Rect> = None;
+                    let mut tethers: Vec<(egui::Rect, egui::Rect)> = Vec::new();
+                    for (ci, chip) in chips.iter().enumerate() {
+                        // Open the gap *before* the chip the drop would land in
+                        // front of, so the rest of the line slides right and the
+                        // placeholder sits exactly where the new block will.
+                        if let Some((gi, text, extra)) = &mod_ghost
+                            && *gi == ci
+                        {
+                            ghost_chip(ui, &th, text, *extra);
+                        }
+                        if chip.tethered {
+                            ui.spacing_mut().item_spacing.x = TETHER_GAP;
+                        }
+                        let in_hand = chip.detach.is_some_and(&chip_in_this_row);
+                        let rect = if in_hand {
+                            let (layer, slot) = lift_chip(
+                                ui,
+                                &th,
+                                s,
+                                chip,
+                                selected,
+                                &row.path,
+                                row_index,
+                                titles,
+                                &env_choices,
+                                acts,
+                            );
+                            chip_lift = Some((layer, slot));
+                            slot
+                        } else {
+                            render_chip(
+                                ui,
+                                &th,
+                                s,
+                                chip,
+                                selected,
+                                &row.path,
+                                titles,
+                                &env_choices,
+                                acts,
+                            )
+                        };
+                        ui.spacing_mut().item_spacing.x = gap;
+                        // No bracket to a chip that is currently in hand: it would
+                        // join the baseline to an empty ghost, which reads as
+                        // "these two are one thing" at exactly the moment the
+                        // user is pulling them apart.
+                        if chip.tethered
+                            && !in_hand
+                            && let Some(anchor) = prev
+                        {
+                            tethers.push((anchor, rect));
+                        }
+                        prev = Some(rect);
+                    }
+                    // A clause that appends to the end of the line gets its gap
+                    // after the last chip.
+                    if let Some((gi, text, extra)) = &mod_ghost
+                        && *gi >= chips.len()
+                    {
+                        ghost_chip(ui, &th, text, *extra);
+                    }
+                    for (anchor, hanger) in tethers {
+                        paint_tether(ui.painter(), &th, anchor, hanger);
                     }
                 }
             }
         });
         if !with_items.is_empty() {
             let cluster = inner.response.rect;
-            let with_rect = with_block(ui, &th, s, &row.path, row.depth, &with_items, acts);
+            // Dragging the `WITH` chip detaches the *whole* block, fields and
+            // all, so the fields have to travel with it. Painting them into the
+            // chip's own floating layer keeps chip and fields rigidly together
+            // (one transform moves both) and leaves a ghost over the space they
+            // vacated, so what is being pulled out is what you see moving.
+            let lifting_with = chip_in_this_row(DetachWhich::WithBlock);
+            let with_rect = match chip_lift {
+                Some((layer, _)) if lifting_with => {
+                    let rect = ui
+                        .scope_builder(
+                            egui::UiBuilder::new()
+                                .layer_id(layer)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                            |ui| with_block(ui, &th, s, &row.path, row.depth, &with_items, acts),
+                        )
+                        .inner;
+                    paint_origin_ghost(ui.painter(), rect, &th);
+                    rect
+                }
+                _ => with_block(ui, &th, s, &row.path, row.depth, &with_items, acts),
+            };
             // Enclose the request line and its WITH fields in one subtle border
             // so the block reads as a single unit — you drop *around* it, never
             // into the middle of its WITH statements. The border hugs from the
-            // request line's indent down past the `END` footer.
-            let indent = row.depth as f32 * INDENT_STEP;
-            let unit = egui::Rect::from_min_max(
-                egui::pos2(cluster.left() + indent, cluster.top()),
-                egui::pos2(cluster.right().max(with_rect.right()), with_rect.bottom()),
-            )
-            .expand(3.0);
-            ui.painter().rect_stroke(
-                unit,
-                egui::CornerRadius::same(6),
-                egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.55)),
-                egui::StrokeKind::Outside,
-            );
+            // request line's indent down past the `END` footer. Suppressed while
+            // the WITH block is being pulled off: a border drawn around a
+            // half-empty unit says "still one thing" at exactly the wrong moment.
+            if !lifting_with {
+                let indent = row.depth as f32 * INDENT_STEP;
+                let unit = egui::Rect::from_min_max(
+                    egui::pos2(cluster.left() + indent, cluster.top()),
+                    egui::pos2(cluster.right().max(with_rect.right()), with_rect.bottom()),
+                )
+                .expand(3.0);
+                ui.painter().rect_stroke(
+                    unit,
+                    egui::CornerRadius::same(6),
+                    egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.55)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+        // Everything that belongs to the picked-up chip's layer is painted, so
+        // it is finally safe to move the layer under the pointer.
+        if let Some((layer, slot)) = chip_lift {
+            follow_pointer(ui.ctx(), layer, slot);
         }
         inner.response.rect
     };
@@ -1672,19 +2958,18 @@ fn block_row(
                 .layout(egui::Layout::top_down(egui::Align::Min)),
             block_body,
         );
+        // The row's laid-out rect starts at the editor's left margin because the
+        // indent is `add_space`d *inside* the layout; strip it back off so both
+        // the origin ghost and the lift's measurement describe the block itself,
+        // not the block plus a stripe of empty indent.
+        let content = indented_content(ir.response.rect, row.depth);
         // Leave a dashed ghost in the (now blank) origin slot so the lift is
         // obviously reversible — dropping the block back here restores it.
-        paint_origin_ghost(ui.painter(), ir.response.rect, &th);
-        // Only the head row sets the transform (the last writer would otherwise
-        // win): it centres the head on the pointer so the rest of the loop hangs
-        // below it, exactly as the single-block case centres its one row.
-        if is_drag_head && let Some(p) = ui.ctx().pointer_interact_pos() {
-            let delta = p - ir.response.rect.center();
-            ui.ctx().transform_layer_shapes(
-                layer_id,
-                egui::emath::TSTransform::from_translation(delta),
-            );
-        }
+        paint_origin_ghost(ui.painter(), content, &th);
+        // Hand the row to the shared lift; the single transform that puts the
+        // whole subtree under the pointer is applied once every row has been
+        // painted (see `DragLift`), never from here.
+        lift.add(layer_id, content, is_drag_head);
         return;
     }
     let block = ui.vertical(block_body);
@@ -1707,15 +2992,67 @@ fn block_row(
             ui.id().with(("pt_modzone", row_index)),
             egui::Sense::hover(),
         );
-        if let Some(m) = zresp.dnd_hover_payload::<Modifier>()
-            && m.applies_to(n)
-        {
-            ui.painter().rect_stroke(
-                zone_rect.expand(2.0),
-                egui::CornerRadius::same(6),
-                egui::Stroke::new(2.0, th.accent),
-                egui::StrokeKind::Outside,
-            );
+        // The zone takes a fresh clause from the palette *or* one pulled off
+        // another line — a `SHOW` lifted from one reported request drops onto
+        // the next, bringing the columns it was carrying with it.
+        let pending: Option<PendingMod> = if let Some(m) = zresp.dnd_hover_payload::<Modifier>() {
+            Some(PendingMod::New(*m))
+        } else if zresp.dnd_hover_payload::<DragItem>().is_some() {
+            carried_chip
+                .as_ref()
+                .filter(|(from, _, _)| from.as_slice() != row.path.as_slice())
+                .map(|(_, _, carried)| PendingMod::Moved(carried.clone()))
+        } else {
+            None
+        };
+
+        // Park the gap this row should open for the hovering clause. Computed
+        // here (where the hover is known) and consumed by the chip cluster on
+        // the next frame — see `mod_ghost_id`.
+        let ghost = match &pending {
+            Some(p) if p.reject_reason(n, s).is_none() => preview_chip(n, p, row.req_ok, &th, s),
+            _ => None,
+        };
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(mod_ghost_id(row_index), ghost.clone()));
+
+        if let Some(p) = &pending {
+            match p.reject_reason(n, s) {
+                None => {
+                    // A row that has already opened a gap showing exactly where
+                    // the clause lands needs no outline as well — the gap *is*
+                    // the highlight, and the box round the whole line only
+                    // competed with it.
+                    if ghost.is_none() {
+                        ui.painter().rect_stroke(
+                            zone_rect.expand(2.0),
+                            egui::CornerRadius::same(6),
+                            egui::Stroke::new(2.0, th.accent),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+                // A refusal gets its own (error-coloured) outline plus the
+                // reason at the pointer, so the chip springing back reads as
+                // "not here, because…" rather than as a missed drop.
+                Some(why) => {
+                    ui.painter().rect_stroke(
+                        zone_rect.expand(2.0),
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(2.0, th.err),
+                        egui::StrokeKind::Outside,
+                    );
+                    egui::Tooltip::always_open(
+                        ui.ctx().clone(),
+                        ui.layer_id(),
+                        ui.id().with(("pt_modwhy", row_index)),
+                        egui::PopupAnchor::Pointer,
+                    )
+                    .show(|ui| {
+                        ui.colored_label(th.err, why);
+                    });
+                }
+            }
         }
         if let Some(m) = release_payload::<Modifier>(&zresp)
             && m.applies_to(n)
@@ -1725,6 +3062,26 @@ fn block_row(
                 modifier: *m,
             });
         }
+        // Shift is read at the *drop*, not at the pick-up, so the user can
+        // change their mind mid-drag — and so the decision is made at the
+        // moment they can see where the clause is about to land.
+        let copy = ui.input(|i| i.modifiers.shift);
+        // Every guard is checked *before* taking the payload: releasing it is
+        // destructive, and swallowing a `DragItem::Row` here (or a clause this
+        // line won't take) would silently cancel a block reorder that the
+        // insert strip below is about to handle.
+        if let Some((from, which, carried)) = &carried_chip
+            && from.as_slice() != row.path.as_slice()
+            && carried.applies_to(n)
+            && release_payload::<DragItem>(&zresp).is_some()
+        {
+            acts.push(Act::MoveMod {
+                from: from.clone(),
+                which: *which,
+                to: row.path.clone(),
+                copy,
+            });
+        }
     }
 
     // ── Base insert strip: a full-width strip over the block that, when a base
@@ -1732,9 +3089,11 @@ fn block_row(
     // existing blocks slide down to make room) with a dashed placeholder where
     // the new block will land. The strip is sized to include the currently-open
     // gap (read from last frame) so the pointer stays over it as the gap opens —
-    // avoiding open/close flicker at the seam. The gap height matches a single
-    // block so the ghost is the same size as the block being dropped.
-    let gap_h = chip_h(ui) + 10.0;
+    // avoiding open/close flicker at the seam. The gap is sized to the block
+    // actually in hand (see `dragged_block_h`), so dragging a whole `FOR` loop
+    // or a request with `WITH` fields opens a gap the size of that whole block
+    // rather than a one-line sliver it obviously won't fit into.
+    let gap_h = dragged_block_h(ui);
     let gap_id = ui.id().with(("pt_gap", row_index));
     let prev_gap: f32 = ui.ctx().data(|d| d.get_temp(gap_id)).unwrap_or(0.0);
     let strip = egui::Rect::from_x_y_ranges(
@@ -1775,19 +3134,21 @@ fn block_row(
         }
     }
     if gap > 0.5 {
-        let indent = row.depth as f32 * INDENT_STEP;
+        // Indent the silhouette to the depth the block will *land* at, not the
+        // depth of the row it is hovering. They differ wherever a drop steps
+        // inward: after `BEGIN` (a synthetic depth-0 row whose statements are
+        // depth 1) and after a `FOR` header (which inserts into the loop body).
+        // A drop path's depth is one per body it nests inside, plus one for the
+        // top level, so it is read off the insert position itself and can't
+        // drift from where the block really goes.
+        let indent = (drop_pos.parent.len() + 1) as f32 * INDENT_STEP;
         let top = block_rect.bottom() + 2.0;
-        let ph = egui::Rect::from_min_max(
-            egui::pos2(strip.left() + indent, top),
-            egui::pos2(strip.right() - 8.0, top + gap - 4.0),
-        );
-        ui.painter().rect(
-            ph,
-            egui::CornerRadius::same(6),
-            mix(th.panel, th.accent, 0.18),
-            egui::Stroke::new(1.5, th.accent),
-            egui::StrokeKind::Inside,
-        );
+        let origin = egui::pos2(strip.left() + indent, top);
+        // The marker is a preview of the block: its own outline, at its own
+        // indent, revealed as the gap animates open.
+        let clip =
+            egui::Rect::from_min_max(origin, egui::pos2(strip.right() - 8.0, top + gap - 4.0));
+        paint_drop_silhouette(ui, origin, &dragged_block_shape(ui), clip, &th);
         ui.add_space(gap);
     }
 }
@@ -1815,7 +3176,23 @@ fn with_block(
             ui.horizontal(|ui| {
                 ui.add_space(field_indent);
                 let text = match item {
-                    WithItem::Field { name, query, .. } => format!("{name}: {query}"),
+                    // The field's own STATISTICS(…) belongs on its row: leaving
+                    // it out made a clause that is plainly there in the source
+                    // invisible in the block editor.
+                    WithItem::Field { name, query, stats } => {
+                        let mut t = format!("{name}: {query}");
+                        if !stats.is_empty() {
+                            t.push_str(&format!(
+                                " STATISTICS({})",
+                                stats
+                                    .iter()
+                                    .map(|k| k.keyword())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        t
+                    }
                     WithItem::ResponseFmt(fmt) => format!(
                         "RESPONSE {}",
                         match fmt {
@@ -1867,7 +3244,7 @@ fn with_block(
         });
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * INDENT_STEP);
-            static_chip(ui, th, "END", th.accent);
+            static_chip(ui, th, "END", th.accent, "");
         });
     })
     .response
@@ -1880,6 +3257,797 @@ fn with_block(
 /// top-level nodes (the append index). A no-op when there is no spare vertical
 /// space (the report already fills / overflows the viewport — the last row's own
 /// insert strip covers appending in that case).
+
+/// A header directive rendered in the settings strip: how to edit it and what
+/// its hover help says.
+struct HeaderSpec {
+    key: &'static str,
+    /// `true` for the directives worth showing even when unset (as a prompt),
+    /// rather than hiding them behind the add-setting menu.
+    always_shown: bool,
+    /// `true` when leaving this unset actually stops the report running, so the
+    /// prompt is drawn in the error colour. Only `collection:` qualifies:
+    /// everything else either has a working default (`output:` falls back to
+    /// `csv`, `root:` to the report's folder) or is simply absent.
+    required: bool,
+    kind: HeaderKind,
+}
+
+/// How one header directive is edited.
+enum HeaderKind {
+    /// Pick from the open collections.
+    Collection,
+    /// Pick from the loaded global environments.
+    Environment,
+    /// Pick one of the writers PaperTrail can produce.
+    ///
+    /// `# output:` names a *format*, never a filename — the runner derives the
+    /// file from the report's own name (only the CLI's `-o` flag takes a path),
+    /// and `output_extension_from_header` rejects anything that isn't one of
+    /// [`crate::report::writer::OUTPUT_EXTENSIONS`]. So this is a closed list,
+    /// and offering a free-text field with a file browser (as this first did)
+    /// only invited values the report would refuse to run with.
+    Format,
+    /// A path, typed or chosen with the file picker.
+    Path,
+    /// Free text (the `columns:` list).
+    Text,
+}
+
+fn header_specs() -> [HeaderSpec; 6] {
+    [
+        HeaderSpec {
+            key: "collection",
+            always_shown: true,
+            required: true,
+            kind: HeaderKind::Collection,
+        },
+        HeaderSpec {
+            key: "output",
+            always_shown: true,
+            required: false,
+            kind: HeaderKind::Format,
+        },
+        HeaderSpec {
+            key: "environment",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Environment,
+        },
+        HeaderSpec {
+            key: "root",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Path,
+        },
+        HeaderSpec {
+            key: "baseline",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Path,
+        },
+        HeaderSpec {
+            key: "columns",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Text,
+        },
+    ]
+}
+
+/// The hover help for a header directive.
+fn header_help(key: &str, s: &crate::i18n::Strings) -> &'static str {
+    match key {
+        "collection" => s.chip_help_hdr_collection,
+        "output" => s.chip_help_hdr_output,
+        "environment" => s.chip_help_hdr_environment,
+        "root" => s.chip_help_hdr_root,
+        "baseline" => s.chip_help_hdr_baseline,
+        _ => s.chip_help_hdr_columns,
+    }
+}
+
+/// One option in the `collection:` dropdown.
+///
+/// The label and the stored value are deliberately different things. What gets
+/// written into the directive has to be a *path*, because that is literally
+/// what the runner opens (`report_cli` does a `read_to_string` on it); but a
+/// path is a poor thing to pick from a list, so the user sees the collection's
+/// name and the path only as secondary detail.
+#[derive(Clone, Debug, PartialEq)]
+struct CollectionChoice {
+    /// Written into `# collection:` — relative to the report when it can be,
+    /// so a report and its collection can be moved together.
+    value: String,
+    /// The collection's name, which is what the user actually recognises.
+    label: String,
+    /// Where it is, shown under the name to tell two same-named collections
+    /// apart: relative to the workspace root for a workspace file, otherwise
+    /// the path as stored.
+    detail: String,
+    /// Whether it lives inside this report's workspace. Those are listed first
+    /// and shown by default; anything else is a deliberate reach outside.
+    in_workspace: bool,
+}
+
+/// The collections a report can bind to: every collection file in its
+/// workspace, plus any collection open in a tab.
+///
+/// The workspace is scanned rather than read from the open tabs because a
+/// workspace usually holds far more collections than are open at any moment,
+/// and those are exactly the ones a report living in that workspace is likely
+/// to want. Open tabs are still offered (a report doesn't have to live in a
+/// workspace at all), but only when they aren't already in the scan.
+fn collection_choices(
+    root: Option<&std::path::Path>,
+    report_path: Option<&std::path::Path>,
+    open: &[crate::collection::Collection],
+    unsaved_label: &str,
+) -> Vec<CollectionChoice> {
+    let mut out: Vec<CollectionChoice> = Vec::new();
+    let root_scope = root;
+
+    if let Some(root) = root {
+        for e in crate::workspace::scan_workspace(root, true) {
+            if e.is_dir || !is_collection_file(&e.path) {
+                continue;
+            }
+            out.push(CollectionChoice {
+                value: portable_ref(&e.path, report_path, root_scope),
+                label: collection_label(&e.path),
+                detail: e
+                    .path
+                    .strip_prefix(root)
+                    .unwrap_or(&e.path)
+                    .to_string_lossy()
+                    .into_owned(),
+                in_workspace: true,
+            });
+        }
+    }
+
+    for c in open {
+        match c.path.as_deref() {
+            Some(p) => {
+                // Already offered by the scan above — listing it twice would
+                // only invite picking the "wrong" identical one.
+                let value = portable_ref(p, report_path, root_scope);
+                if out.iter().any(|ch| ch.value == value) {
+                    continue;
+                }
+                out.push(CollectionChoice {
+                    value,
+                    label: c.name.clone(),
+                    detail: p.to_string_lossy().into_owned(),
+                    in_workspace: root.is_some_and(|r| p.starts_with(r)),
+                });
+            }
+            // An unsaved collection has no path to write, so it can only be
+            // referenced by name — which is the fallback
+            // `resolve_bound_collection` keeps for exactly this case. It won't
+            // resolve for the headless runner, hence the explicit label.
+            None => out.push(CollectionChoice {
+                value: c.name.clone(),
+                label: c.name.clone(),
+                detail: unsaved_label.to_string(),
+                in_workspace: false,
+            }),
+        }
+    }
+
+    // Workspace files first, then alphabetically, so the list is stable no
+    // matter what order the tabs happen to be in.
+    out.sort_by(|a, b| {
+        b.in_workspace
+            .cmp(&a.in_workspace)
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    out
+}
+
+/// Whether `path` is a collection, as opposed to the reports and environments
+/// that share a workspace with it.
+fn is_collection_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("hurl") | Some("json")
+    )
+}
+
+/// The name to show for a collection file: its filename without the extension.
+/// `# collection:` stores a path, but a path is not what the user named the
+/// thing, so the list shows this and keeps the path as detail.
+fn collection_label(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// The body of the `collection:` dropdown: the workspace's own collections
+/// under a heading, and anything else behind an opt-in toggle.
+///
+/// Collections outside the report's workspace are hidden by default because
+/// they are almost always the wrong answer — binding to one writes a path that
+/// escapes the workspace, so the report stops travelling with it. They stay one
+/// click away rather than being removed, since a report needn't live in a
+/// workspace at all (and when it doesn't, there is nothing to hide behind and
+/// everything is shown).
+fn collection_menu(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    choices: &[CollectionChoice],
+    current: &str,
+    picked: &mut Option<String>,
+    browse: &mut bool,
+) {
+    let (mine, others): (Vec<&CollectionChoice>, Vec<&CollectionChoice>) =
+        choices.iter().partition(|c| c.in_workspace);
+
+    let show_all_id = ui.make_persistent_id("pt_hdr_collection_show_all");
+    // With no workspace to scope to there is nothing to reveal, so the toggle
+    // would only be a switch that does nothing.
+    let mut show_all = mine.is_empty()
+        || ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(show_all_id))
+            .unwrap_or(false);
+
+    if !mine.is_empty() {
+        ui.label(
+            RichText::new(s.gui_report_ws_collections)
+                .color(th.dim)
+                .small(),
+        );
+        for c in &mine {
+            collection_item(ui, th, c, current, picked);
+        }
+    }
+
+    if !others.is_empty() {
+        if mine.is_empty() {
+            show_all = true;
+        } else {
+            ui.separator();
+            if ui
+                .checkbox(&mut show_all, s.gui_report_show_all_collections)
+                .changed()
+            {
+                ui.ctx().data_mut(|d| d.insert_temp(show_all_id, show_all));
+            }
+        }
+        if show_all {
+            if !mine.is_empty() {
+                ui.label(
+                    RichText::new(s.gui_report_other_collections)
+                        .color(th.dim)
+                        .small(),
+                );
+            }
+            for c in &others {
+                collection_item(ui, th, c, current, picked);
+            }
+        }
+    }
+
+    // A report outside a workspace, opened before any collection, has nothing
+    // to list at all — and `collection:` is the one setting a report can't run
+    // without. An empty menu would be a dead end, so say so and offer the way
+    // out. Browse is always available; the list is a shortcut, not the only way.
+    if choices.is_empty() {
+        ui.colored_label(th.dim, s.gui_report_no_collections);
+    }
+    if !choices.is_empty() {
+        ui.separator();
+    }
+    if ui.button(s.gui_report_browse).clicked() {
+        *browse = true;
+        ui.close();
+    }
+}
+
+/// One row of the collection dropdown: the name, with where it lives beneath it
+/// so two collections that share a name can still be told apart.
+fn collection_item(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    c: &CollectionChoice,
+    current: &str,
+    picked: &mut Option<String>,
+) {
+    if ui
+        .selectable_label(c.value == current, &c.label)
+        .on_hover_text(&c.detail)
+        .clicked()
+    {
+        *picked = Some(c.value.clone());
+    }
+    ui.label(RichText::new(&c.detail).color(th.dim).small());
+}
+
+/// The workspace a report belongs to, if any: the deepest open workspace root
+/// that contains it. Deepest, because workspaces can be nested and the closest
+/// one is the one whose collections are actually relevant.
+fn report_workspace_root(app: &GuiApp, ed: &ReportEditor) -> Option<std::path::PathBuf> {
+    let path = ed.report.path.as_deref()?;
+    app.session
+        .collections
+        .iter()
+        .filter_map(|c| c.workspace_root.as_ref())
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+}
+
+/// The panel the report settings are drawn in.
+///
+/// Enclosing them says what a column of chips above `BEGIN` could not: these
+/// are settings *for* the report, not the first steps *of* it. Unframed they
+/// read as blocks that merely happened not to be draggable. The muted fill and
+/// quiet border mark the boundary without competing with the flow for
+/// attention, and the frame's own left edge lines up with the blocks below so
+/// the two still read as one column.
+fn settings_frame(th: &GuiTheme) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(mix(th.panel, th.dim, 0.10))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, th.dim, 0.35)))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .corner_radius(BLOCK_RADIUS as u8)
+}
+
+/// The report's `# key: value` header directives, drawn as a pinned strip above
+/// `BEGIN`.
+///
+/// These are settings for the report as a *whole* — which collection it runs
+/// against, where its results go — not steps in the flow, so they are
+/// deliberately not blocks: there is nothing meaningful about reordering them,
+/// dropping one inside a loop, or binning them onto the trash bar. Keeping them
+/// in a fixed strip above `BEGIN` says exactly that, while still making them
+/// discoverable and editable, which they previously weren't from the GUI at all.
+///
+/// The two directives a report can't run without are always shown (as an unset
+/// prompt when empty); the rest appear once set, or on demand from the `+`.
+fn header_strip(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    let th = app.theme;
+    let s = &app.strings;
+    let Some(flow) = ed.flow.as_ref() else {
+        return;
+    };
+    // Built on demand rather than every frame: it scans the workspace off disk,
+    // and the list is only ever looked at while the dropdown is open.
+    let ws_root = report_workspace_root(app, ed);
+    let collections = || {
+        collection_choices(
+            ws_root.as_deref(),
+            ed.report.path.as_deref(),
+            &app.session.collections,
+            s.gui_report_collection_unsaved,
+        )
+    };
+    let envs: Vec<String> = app
+        .session
+        .global_envs
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    let formats: Vec<String> = crate::report::writer::OUTPUT_EXTENSIONS
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+
+    settings_panel(
+        ui,
+        &th,
+        s,
+        &|key| flow.header.get(key).unwrap_or_default().to_string(),
+        &collections,
+        &envs,
+        &formats,
+        acts,
+    );
+}
+
+/// The settings panel itself, given only the values it shows.
+///
+/// Split from `header_strip` so the layout can be exercised without standing up
+/// a whole `GuiApp`: the caller resolves each directive's current value and the
+/// choices its dropdowns offer, and this decides what is drawn and in what
+/// order.
+#[allow(clippy::too_many_arguments)]
+fn settings_panel(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    value_of: &dyn Fn(&str) -> String,
+    collections: &dyn Fn() -> Vec<CollectionChoice>,
+    envs: &Vec<String>,
+    formats: &Vec<String>,
+    acts: &mut Vec<Act>,
+) {
+    let specs = header_specs();
+    settings_frame(th).show(ui, |ui| {
+        // One setting per line, each starting at the same left edge as `BEGIN`
+        // below. Laying them out in a row instead left them ragged — a combo
+        // chip and a text chip are different widths and sit differently in a
+        // wrapped line.
+        ui.set_width(settings_width(ui));
+        for spec in &specs {
+            let value = value_of(spec.key);
+            if value.is_empty() && !spec.always_shown {
+                continue;
+            }
+            let choices = match spec.kind {
+                HeaderKind::Environment => Some(envs),
+                HeaderKind::Format => Some(formats),
+                _ => None,
+            };
+            ui.horizontal(|ui| header_chip(ui, th, s, spec, &value, choices, collections, acts));
+        }
+
+        // Optional directives that aren't set yet are offered from the button
+        // rather than shown as a row of empty prompts, which would bury the two
+        // that matter. It sits below the settings it appends to, where a list's
+        // "add another" belongs. When every setting is already present there is
+        // nothing to add, so it isn't drawn at all.
+        let missing: Vec<&HeaderSpec> = specs
+            .iter()
+            .filter(|sp| !sp.always_shown && value_of(sp.key).is_empty())
+            .collect();
+        if !missing.is_empty() {
+            header_add_menu(ui, s, &missing, acts);
+        }
+    });
+}
+
+/// How wide the settings panel is drawn.
+///
+/// Deliberately fixed rather than shrink-wrapped: the contents change width
+/// constantly (picking a longer collection name, adding a setting, clearing
+/// one) and a panel that resized with them would make the whole view twitch
+/// every time a dropdown was used. It still yields to a narrow editor pane so
+/// the panel can never overflow its column.
+///
+/// Wide enough for a realistic collection or baseline name to sit in its
+/// dropdown unabbreviated: these are file names, and truncating them to
+/// `billing-servi…` defeats the point of showing names instead of paths.
+fn settings_width(ui: &egui::Ui) -> f32 {
+    const SETTINGS_W: f32 = 460.0;
+    SETTINGS_W.min(ui.available_width())
+}
+
+/// The menu offering the optional directives that aren't set yet.
+///
+/// Spelled out rather than a bare `+`: on its own, a plus above the flow gives
+/// no hint whether it adds a *block* (which is what everything else in this
+/// view does) or a report-wide setting. The button also carries the explanation
+/// of what report settings are, which previously hung off a decorative icon
+/// beside it that did nothing else.
+fn header_add_menu(
+    ui: &mut egui::Ui,
+    s: &crate::i18n::Strings,
+    missing: &[&HeaderSpec],
+    acts: &mut Vec<Act>,
+) {
+    let label = format!("{}  {}", super::icons::PLUS, s.gui_report_add_setting);
+    ui.menu_button(label, |ui| {
+        for spec in missing {
+            if ui
+                .button(spec.key.to_uppercase())
+                .on_hover_text(header_help(spec.key, s))
+                .clicked()
+            {
+                // Seed with a placeholder so the chip appears; the user
+                // then types or picks the real value. An empty string
+                // would immediately be dropped again by `set_header`.
+                acts.push(Act::SetHeader {
+                    key: spec.key,
+                    value: Some(header_placeholder(spec)),
+                });
+                ui.close();
+            }
+        }
+    })
+    .response
+    .on_hover_text(s.gui_report_settings_help);
+}
+
+/// The value a freshly-added optional directive starts at.
+///
+/// Always `?`, the "present but not filled in yet" sentinel every editor here
+/// already understands (it renders as the unset prompt). It must not be the
+/// empty string: `set_header` treats an empty value as *remove this directive*,
+/// so an empty placeholder made picking a setting from the add menu do nothing
+/// at all — which is exactly what `columns:` used to do.
+fn header_placeholder(_spec: &HeaderSpec) -> String {
+    "?".to_string()
+}
+
+/// One chip in the header strip: an uppercase key label plus its editor.
+fn header_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    spec: &HeaderSpec,
+    value: &str,
+    choices: Option<&Vec<String>>,
+    collections: &dyn Fn() -> Vec<CollectionChoice>,
+    acts: &mut Vec<Act>,
+) {
+    // An unset required directive is drawn in the error colour: it is the one
+    // thing standing between the report and a run, so it should look like it.
+    let unset = value.is_empty() || value == "?";
+    let color = if unset && spec.required {
+        th.err
+    } else {
+        th.dim
+    };
+    let fill = mix(th.panel, color, 0.18);
+    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.45));
+    let text_col = if unset && spec.required {
+        th.err
+    } else {
+        th.text
+    };
+    let key = spec.key;
+
+    let combo = matches!(
+        spec.kind,
+        HeaderKind::Collection | HeaderKind::Environment | HeaderKind::Format
+    );
+
+    let scope = ui.scope(|ui| {
+        // A combo box sets its own (tallest) height; everything else has to be
+        // grown to match, exactly as in the flow's chips.
+        chip_shell(ui, fill, stroke, !combo, |ui| {
+            // The key label goes on the left, but a combo box is taller than a
+            // label and only sets the row height once it has been added — a
+            // label placed first would be "centred" in a still-short row and end
+            // up sitting above the combo's own text. So reserve its slot now and
+            // paint it after, centred against the finished row. (The flow's
+            // request chips do exactly this, for exactly this reason.)
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let galley = ui.painter().layout_no_wrap(key.to_uppercase(), font, color);
+            let gsize = galley.size();
+            let (label_rect, _) = ui.allocate_exact_size(gsize, egui::Sense::hover());
+            match spec.kind {
+                HeaderKind::Collection | HeaderKind::Environment | HeaderKind::Format => {
+                    // A collection is stored as a path but shown by name, so
+                    // the closed text has to be derived rather than echoed.
+                    let shown = if unset {
+                        s.gui_report_setting_unset.to_string()
+                    } else if matches!(spec.kind, HeaderKind::Collection) {
+                        collection_label(std::path::Path::new(value))
+                    } else {
+                        value.to_string()
+                    };
+                    let mut picked = None;
+                    let mut browse = false;
+                    egui::ComboBox::from_id_salt(("pt_hdr", key))
+                        .selected_text(RichText::new(shown).color(text_col))
+                        .show_ui(ui, |ui| {
+                            if matches!(spec.kind, HeaderKind::Collection) {
+                                collection_menu(
+                                    ui,
+                                    th,
+                                    s,
+                                    &collections(),
+                                    value,
+                                    &mut picked,
+                                    &mut browse,
+                                );
+                            } else {
+                                for c in choices.map(Vec::as_slice).unwrap_or_default() {
+                                    if ui.selectable_label(c == value, c).clicked() {
+                                        picked = Some(c.clone());
+                                    }
+                                }
+                            }
+                        });
+                    if browse {
+                        acts.push(Act::PickHeaderFile { key });
+                    }
+                    if let Some(v) = picked
+                        && v != value
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            value: Some(v),
+                        });
+                    }
+                }
+                HeaderKind::Path | HeaderKind::Text => {
+                    let current = if value == "?" { "" } else { value };
+                    let id = ui.make_persistent_id(("pt_hdr_text", key));
+                    if let Some(text) =
+                        inline_text_edit(ui, id, current, s.gui_report_setting_unset, 150.0)
+                        && text != current
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            value: Some(text),
+                        });
+                    }
+                    if matches!(spec.kind, HeaderKind::Path)
+                        && ui
+                            .small_button(super::icons::FOLDER)
+                            .on_hover_text(s.gui_report_browse)
+                            .clicked()
+                    {
+                        acts.push(Act::PickHeaderFile { key });
+                    }
+                }
+            }
+            // Anything actually set can be cleared, `collection:` included —
+            // an always-shown setting simply falls back to its unset prompt
+            // rather than disappearing, and the rest return to the add menu.
+            //
+            // An *optional* setting keeps its `×` even while unset: it was put
+            // here from the add menu and starts life showing the unset prompt,
+            // so without one there would be no way to take it off again.
+            if (!unset || !spec.always_shown) && detach_x(ui, color) {
+                acts.push(Act::SetHeader { key, value: None });
+            }
+            let cy = ui.min_rect().center().y;
+            ui.painter().galley(
+                egui::pos2(label_rect.left(), cy - gsize.y / 2.0),
+                galley,
+                color,
+            );
+        });
+    });
+    if ui.ctx().dragged_id().is_none() {
+        scope.response.on_hover_text(header_help(key, s));
+    }
+}
+
+/// Browse for the file (or folder, for `root:`) a path-valued header directive
+/// should point at, and store it relative to the report when that is shorter —
+/// a report and its data usually travel together, so an absolute path would
+/// break the moment the pair moved.
+fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) {
+    let seed = ed
+        .flow
+        .as_ref()
+        .and_then(|f| f.header.get(key))
+        .and_then(super::filepick::seed_dir)
+        .or_else(|| {
+            ed.report
+                .path
+                .as_deref()
+                .and_then(|p| p.parent())
+                .map(std::path::Path::to_path_buf)
+        });
+    let title = header_help(key, &app.strings);
+    // Only `root:` and `baseline:` are paths — `output:` names a format and is
+    // picked from a list, so it never reaches here.
+    let picked = match key {
+        "root" => super::filepick::pick_folder(title, seed.as_deref()),
+        // `collection:` is normally chosen from the dropdown, but that list can
+        // be empty (a report outside a workspace, opened before any collection),
+        // so Browse is offered there too and lands here.
+        "collection" => super::filepick::pick_file(
+            title,
+            seed.as_deref(),
+            &[("hurl", &["hurl"]), ("*", &["*"])],
+        ),
+        _ => super::filepick::pick_file(
+            title,
+            seed.as_deref(),
+            &[("baseline", &["baseline", "json"]), ("*", &["*"])],
+        ),
+    };
+    let Some(path) = picked else {
+        return;
+    };
+    // A browsed collection is relativised the same way a picked one is — the
+    // dropdown writes a portable `../`-walking ref, and Browse must not quietly
+    // bake in an absolute path instead.
+    let text = if key == "collection" {
+        portable_ref(
+            &path,
+            ed.report.path.as_deref(),
+            report_workspace_root(app, ed).as_deref(),
+        )
+    } else {
+        relative_to_report(&path, ed.report.path.as_deref())
+    };
+    ed.edit_flow(|flow| {
+        edit::set_header(flow, key, Some(&text));
+    });
+}
+
+/// `path` expressed relative to the report's own folder when it lives under it,
+/// else the absolute path.
+fn relative_to_report(path: &std::path::Path, report: Option<&std::path::Path>) -> String {
+    report
+        .and_then(|r| r.parent())
+        .and_then(|dir| path.strip_prefix(dir).ok())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `path` expressed relative to the report, walking *up* out of the report's
+/// folder where it has to (`../apis/billing.hurl`), so long as it stays inside
+/// `scope`.
+///
+/// This is what makes a workspace portable. A report in `reports/` binding to a
+/// collection in `apis/` shares no prefix with it, so a plain `strip_prefix`
+/// gives up and writes an absolute path — which is a path on *this* machine,
+/// and breaks the moment the workspace is handed to someone else. Both files
+/// are in the same workspace and will be copied together, so the way to say
+/// where the collection is, is by where it sits relative to the report.
+///
+/// `scope` bounds how far up we're willing to walk: outside it the two files
+/// aren't travelling together anyway, so a relative path would be a lie and the
+/// absolute one is the honest answer.
+fn portable_ref(
+    path: &std::path::Path,
+    report: Option<&std::path::Path>,
+    scope: Option<&std::path::Path>,
+) -> String {
+    let plain = relative_to_report(path, report);
+    if !std::path::Path::new(&plain).is_absolute() {
+        return plain;
+    }
+    let (Some(dir), Some(scope)) = (report.and_then(std::path::Path::parent), scope) else {
+        return plain;
+    };
+    if !path.starts_with(scope) || !dir.starts_with(scope) {
+        return plain;
+    }
+
+    // Drop the shared leading components, then step up once per component of
+    // the report's folder that remains.
+    let mut from = dir.components().peekable();
+    let mut to = path.components().peekable();
+    while let (Some(a), Some(b)) = (from.peek(), to.peek()) {
+        if a != b {
+            break;
+        }
+        from.next();
+        to.next();
+    }
+    let mut rel = std::path::PathBuf::new();
+    for _ in from {
+        rel.push("..");
+    }
+    rel.extend(to);
+    if rel.as_os_str().is_empty() {
+        return plain;
+    }
+    // Forward slashes even on Windows: the directive is written into a file
+    // that is meant to be read on someone else's machine, and every path API
+    // involved accepts them.
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// The `END` closing the whole flow, mirroring the `BEGIN` chip at the top.
+///
+/// Laid out exactly like a depth-0 block row (the same vertical/horizontal
+/// nesting) so it lines up with `BEGIN` rather than sitting at a different
+/// indent.
+fn flow_end_row(ui: &mut egui::Ui, th: &GuiTheme, s: &crate::i18n::Strings) {
+    ui.vertical(|ui| {
+        ui.horizontal_top(|ui| {
+            static_chip(ui, th, s.report_node_end, th.accent, s.chip_help_flow_end);
+        });
+    });
+}
+
+/// The "nothing here yet" line drawn between `BEGIN` and `END` when the report
+/// has no steps. Indented to sit where the first block will, and dimmed so it
+/// reads as guidance rather than as a block of its own.
+fn empty_flow_hint(ui: &mut egui::Ui, th: &GuiTheme, s: &crate::i18n::Strings) {
+    ui.horizontal(|ui| {
+        ui.add_space(INDENT_STEP);
+        ui.colored_label(th.dim, s.gui_report_empty_flow);
+    });
+    ui.add_space(2.0);
+}
+
 fn tail_drop_zone(
     ui: &mut egui::Ui,
     th: &GuiTheme,
@@ -1902,19 +4070,19 @@ fn tail_drop_zone(
             .dnd_hover_payload::<DragItem>()
             .is_some_and(|d| matches!(&*d, DragItem::Row(_)));
     if hovering {
-        // Match the insert-strip placeholder's fully-open height (a block's own
-        // `chip_h` plus the same padding, less the 4px inset) so the tail ghost
-        // is the same size as the block being dropped, not a fixed sliver.
-        let ghost_h = chip_h(ui) + 6.0;
-        let mark =
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() - 8.0, ghost_h));
-        ui.painter().rect(
-            mark,
-            egui::CornerRadius::same(6),
-            mix(th.panel, th.accent, 0.18),
-            egui::Stroke::new(1.5, th.accent),
-            egui::StrokeKind::Inside,
+        // Match the insert-strip placeholder's fully-open height (the block
+        // actually in hand, less the same 4px inset) so the tail ghost is the
+        // size of the block being dropped — including a whole `FOR` loop — not
+        // a fixed sliver.
+        let size = dragged_block_size(ui);
+        let clip = egui::Rect::from_min_size(
+            rect.left_top(),
+            egui::vec2(
+                (rect.width() - 8.0).max(1.0),
+                (size.y - 4.0).min(rect.height()).max(6.0),
+            ),
         );
+        paint_drop_silhouette(ui, rect.left_top(), &dragged_block_shape(ui), clip, th);
     }
     if let Some(kind) = release_payload::<NodeKind>(&resp) {
         acts.push(Act::DropNode {
@@ -2050,20 +4218,119 @@ fn inline_text_edit(
 }
 
 /// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
-fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32) {
+fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32, help: &str) {
     let fill = mix(th.panel, color, 0.22);
     let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.5));
-    chip_shell(ui, fill, stroke, true, |ui| {
-        ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+    let scope = ui.scope(|ui| {
+        chip_shell(ui, fill, stroke, true, |ui| {
+            ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+        });
     });
+    if !help.is_empty() && ui.ctx().dragged_id().is_none() {
+        scope.response.on_hover_text(help);
+    }
 }
 
 /// Render one [`Chip`]. The base chip is click-to-select, double-click-to-open
 /// the wizard, and a drag source that relocates or bins its whole row; a
 /// modifier chip shows a `×` that detaches it and is itself a drag source that
 /// bins the modifier.
+/// Render a chip that has been picked up on its own: into a floating layer that
+/// follows the pointer, with a dashed ghost left behind in its slot.
+///
+/// The chip still allocates its space in the row (so the line doesn't reflow
+/// under the pointer) and is still rendered by [`render_chip`], so it keeps its
+/// widget id and the drag stays alive.
+///
+/// Returns the floating layer and the *slot* rect. The caller applies the
+/// transform that puts the layer under the pointer, and only once it has
+/// finished adding to that layer: a `WITH` chip carries its whole field block
+/// with it, and transforming from here would move the chip while leaving the
+/// fields behind — the same "parts move at different speeds" bug [`DragLift`]
+/// exists to avoid.
+#[allow(clippy::too_many_arguments)]
+fn lift_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    selected: bool,
+    path: &[usize],
+    row_index: usize,
+    titles: &[String],
+    env_choices: &[String],
+    acts: &mut Vec<Act>,
+) -> (egui::LayerId, egui::Rect) {
+    // One lifted chip per row at most, so the row index is a sufficient key.
+    let layer_id = egui::LayerId::new(
+        egui::Order::Tooltip,
+        ui.id().with(("pt_drag_chip", row_index)),
+    );
+    let slot = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .layer_id(layer_id)
+                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+            |ui| render_chip(ui, th, s, chip, selected, path, titles, env_choices, acts),
+        )
+        .inner;
+    // Painted after the scope, into the *base* layer: the chip itself has moved
+    // to the floating layer, so the slot underneath is empty.
+    paint_origin_ghost(ui.painter(), slot, th);
+    (layer_id, slot)
+}
+
+/// Put a chip's floating layer under the pointer, anchored so the chip itself
+/// sits on the cursor and anything lifted with it hangs off at its natural
+/// offset. Call once, after everything that belongs to the layer is painted.
+fn follow_pointer(ctx: &egui::Context, layer_id: egui::LayerId, anchor: egui::Rect) {
+    if let Some(pointer) = ctx.pointer_interact_pos() {
+        ctx.transform_layer_shapes(
+            layer_id,
+            egui::emath::TSTransform::from_translation(pointer - anchor.center()),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    selected: bool,
+    path: &[usize],
+    titles: &[String],
+    env_choices: &[String],
+    acts: &mut Vec<Act>,
+) -> egui::Rect {
+    // The hover help is attached to a wrapper covering the whole chip rather
+    // than to any one widget inside it, so it shows over the label, the `×` and
+    // the inline combo/text field alike. It is suppressed mid-drag, where a
+    // tooltip trailing the pointer would just obscure the drop targets.
+    let scope = ui.scope(|ui| {
+        render_chip_body(ui, th, s, chip, selected, path, titles, env_choices, acts);
+    });
+    let rect = scope.response.rect;
+    // A detachable chip also spells out the drag gesture. It is not otherwise
+    // discoverable that a plain drag pulls one chip out of a line while Ctrl
+    // takes the whole line, and the two are easy to trigger by accident.
+    if ui.ctx().dragged_id().is_none() {
+        let help = match (chip.help.is_empty(), chip.detach.is_some()) {
+            (true, false) => String::new(),
+            (false, false) => chip.help.to_string(),
+            (true, true) => s.chip_help_drag_gesture.to_string(),
+            (false, true) => format!("{}\n\n{}", chip.help, s.chip_help_drag_gesture),
+        };
+        if !help.is_empty() {
+            scope.response.on_hover_text(help);
+        }
+    }
+    rect
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_chip_body(
     ui: &mut egui::Ui,
     th: &GuiTheme,
     s: &crate::i18n::Strings,
@@ -2128,6 +4395,10 @@ fn render_chip(
         }
         ChipEdit::Alias { text } => {
             alias_chip(ui, th, s, chip, path, text, acts);
+            return;
+        }
+        ChipEdit::Parallel { degree } => {
+            parallel_chip(ui, th, s, chip, path, *degree, acts);
             return;
         }
         _ => {}
@@ -2216,13 +4487,73 @@ fn alias_chip(
                 .sense(egui::Sense::click_and_drag()),
         );
         let id = ui.make_persistent_id(("pt_alias", path));
-        if let Some(text) = inline_text_edit(ui, id, current, s.gui_report_alias_hint, 96.0)
+        if let Some(text) =
+            inline_text_edit(ui, id, current, s.gui_report_alias_hint, ALIAS_FIELD_WIDTH)
             && text != current
         {
             acts.push(Act::SetAlias {
                 path: path.to_vec(),
                 text,
             });
+        }
+        if let Some(which) = chip.detach
+            && detach_x(ui, text_col)
+        {
+            acts.push(Act::DetachMod {
+                path: path.to_vec(),
+                which,
+            });
+        }
+        handle
+    });
+
+    if handle.dragged() {
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
+    }
+}
+
+/// The `PARALLEL` chip: a `PARALLEL` drag handle plus a small box for the
+/// optional max-concurrency. Leaving the box empty is meaningful — it is the
+/// plain `PARALLEL` form, where the limit comes from the prelude's
+/// `MAX_PARALLEL` — so a blank commits `None` rather than being ignored. Text
+/// that isn't a positive number is discarded on blur, which keeps the flow from
+/// ever holding the `PARALLEL(0)` the parser would reject on reload.
+fn parallel_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    path: &[usize],
+    current: Option<u32>,
+    acts: &mut Vec<Act>,
+) {
+    let (fill, stroke, text_col) = chip_colors(th, chip, false);
+    let shown = current.map(|n| n.to_string()).unwrap_or_default();
+    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+        let handle = ui.add(
+            egui::Label::new(RichText::new("PARALLEL").color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        let id = ui.make_persistent_id(("pt_parallel", path));
+        if let Some(text) = inline_text_edit(
+            ui,
+            id,
+            &shown,
+            s.node_form_parallel_degree,
+            PARALLEL_FIELD_WIDTH,
+        ) && text != shown
+        {
+            let degree = match text.trim() {
+                "" => Some(None),
+                t => t.parse::<u32>().ok().filter(|n| *n > 0).map(Some),
+            };
+            if let Some(degree) = degree {
+                acts.push(Act::SetParallelDegree {
+                    path: path.to_vec(),
+                    degree,
+                });
+            }
         }
         if let Some(which) = chip.detach
             && detach_x(ui, text_col)
@@ -2262,6 +4593,7 @@ fn combo_chip(
 ) {
     let (fill, stroke, text_col) = chip_colors(th, chip, selected);
     let mut picked: Option<String> = None;
+    let mut detached: Option<DetachWhich> = None;
     // A combo box already renders at the tallest chip height, so this chip does
     // not grow its row (which would only inflate the combo box further).
     let handle = chip_shell(ui, fill, stroke, false, |ui| {
@@ -2292,6 +4624,14 @@ fn combo_chip(
                     }
                 }
             });
+        // A detachable combo chip (a BASELINE/COMPARISON role) gets the same
+        // `×` as every other detachable chip, so the dropdown isn't the only
+        // thing you can do to it.
+        if let Some(which) = chip.detach
+            && detach_x(ui, text_col)
+        {
+            detached = Some(which);
+        }
         let cy = ui.min_rect().center().y;
         ui.painter().galley(
             egui::pos2(label_rect.left(), cy - gsize.y / 2.0),
@@ -2300,9 +4640,17 @@ fn combo_chip(
         );
         handle
     });
+    if let Some(which) = detached {
+        acts.push(Act::DetachMod {
+            path: path.to_vec(),
+            which,
+        });
+    }
 
+    // Same rule as every other chip: plain-drag pulls a detachable chip out of
+    // the line, Ctrl/Cmd-drag moves the whole line (see `chip_drag_payload`).
     if handle.dragged() {
-        handle.dnd_set_drag_payload(DragItem::Row(path.to_vec()));
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
     }
     if handle.double_clicked() {
         acts.push(Act::OpenWizard(path.to_vec()));
@@ -2613,6 +4961,23 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 let sel = ed.selection.clone();
                 super::report_wizard::open(ed, app, &sel);
             }
+            Act::MoveMod {
+                from,
+                which,
+                to,
+                copy,
+            } => {
+                let mut moved = false;
+                ed.edit_flow(|flow| {
+                    moved = transfer_modifier(flow, &from, which, &to, copy);
+                });
+                // Select the line the clause landed on, so the result of the
+                // drop is what's highlighted. A refused transfer leaves the
+                // selection (and the flow) exactly as it was.
+                if moved {
+                    ed.selection = to;
+                }
+            }
             Act::DetachMod { path, which } => {
                 ed.edit_flow(|flow| {
                     if detach_modifier(flow, &path, which) {
@@ -2659,6 +5024,20 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     edit::set_report_alias(flow, &path, &text);
                 });
                 ed.selection = path;
+            }
+            Act::SetParallelDegree { path, degree } => {
+                ed.edit_flow(|flow| {
+                    edit::set_parallel_degree(flow, &path, degree);
+                });
+                ed.selection = path;
+            }
+            Act::SetHeader { key, value } => {
+                ed.edit_flow(|flow| {
+                    edit::set_header(flow, key, value.as_deref());
+                });
+            }
+            Act::PickHeaderFile { key } => {
+                pick_header_file(ed, app, key);
             }
             Act::AddWith { path } => {
                 ed.selection = path.clone();
@@ -2724,6 +5103,112 @@ mod tests {
     use super::*;
     use crate::i18n::{Language, Strings};
 
+    /// The Source view's colouring is the terminal UI's, span for span.
+    ///
+    /// Rather than restate the highlighting rules (which would let the two
+    /// front-ends drift the moment one side gained a keyword), this walks the
+    /// laid-out job and checks every byte carries the colour the shared
+    /// highlighter assigned it for the same line.
+    #[test]
+    fn the_source_view_colours_match_the_terminal_uis_exactly() {
+        let spec = crate::theme::preset_for_language(&Language::English);
+        let th = GuiTheme::from_spec(&spec);
+        let theme = spec.to_theme();
+        let ctx = HlCtx::default();
+        let text = "# collection: api.hurl\nFOR f IN FILES \"*.json\"\n  REQUEST Health\nEND\n";
+
+        let job = highlight_job(
+            text,
+            &ctx,
+            &spec,
+            &th,
+            egui::FontId::monospace(12.0),
+            f32::INFINITY,
+        );
+
+        // Rebuild the expected colour for every byte from the ratatui spans.
+        let mut expected: Vec<egui::Color32> = Vec::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                expected.push(th.text);
+            }
+            for span in report_highlight::highlight_row(i, line, &ctx, &theme) {
+                let c = span
+                    .style
+                    .fg
+                    .map_or(th.text, |c| super::super::theme::from_ratatui(c, th.text));
+                expected.extend(std::iter::repeat_n(c, span.content.len()));
+            }
+        }
+        assert_eq!(
+            expected.len(),
+            job.text.len(),
+            "every byte of the source is covered exactly once"
+        );
+
+        for section in &job.sections {
+            let (start, end) = byte_span(section);
+            for (b, want) in expected.iter().enumerate().take(end).skip(start) {
+                assert_eq!(
+                    section.format.color, *want,
+                    "byte {b} of {text:?} is coloured like the terminal UI"
+                );
+            }
+        }
+
+        // Sanity: the keywords really are picked out, so a highlighter that
+        // silently returned one plain span couldn't pass the check above.
+        let distinct: std::collections::HashSet<_> =
+            job.sections.iter().map(|s| s.format.color).collect();
+        assert!(
+            distinct.len() > 2,
+            "the source is multi-coloured, not flat: {distinct:?}"
+        );
+    }
+
+    /// A script the parser rejects underlines exactly the offending line, which
+    /// is what makes a typo findable without reading the validation panel.
+    #[test]
+    fn the_line_the_parser_rejected_is_underlined() {
+        let spec = crate::theme::preset_for_language(&Language::English);
+        let th = GuiTheme::from_spec(&spec);
+        let text = "REQUEST Health\nOOPS not papertrail\nREQUEST Other\n";
+        let ctx = HlCtx {
+            error_line: Some(2),
+            ..Default::default()
+        };
+
+        let job = highlight_job(
+            text,
+            &ctx,
+            &spec,
+            &th,
+            egui::FontId::monospace(12.0),
+            f32::INFINITY,
+        );
+
+        let bad_start = text.find("OOPS").unwrap();
+        let bad_end = bad_start + "OOPS not papertrail".len();
+        for section in &job.sections {
+            let underlined = section.format.underline != egui::Stroke::NONE;
+            let (start, end) = byte_span(section);
+            let overlaps = start < bad_end && bad_start < end;
+            assert_eq!(
+                underlined, overlaps,
+                "only the rejected line is underlined (bytes {start}..{end})"
+            );
+        }
+    }
+
+    /// A layout section's byte range as plain `usize`s (egui wraps them in a
+    /// newtype).
+    fn byte_span(section: &egui::text::LayoutSection) -> (usize, usize) {
+        (
+            usize::from(section.byte_range.start),
+            usize::from(section.byte_range.end),
+        )
+    }
+
     /// Render a single chip in isolation and return the height of the frame it
     /// draws. Runs a few frames so egui's sizing settles, and matches the GUI's
     /// enlarged `button_padding` so combo/text-field chips are measured at the
@@ -2772,9 +5257,807 @@ mod tests {
             (label - combo).abs() < 0.5,
             "label {label} vs combo {combo}"
         );
+        // The PARALLEL chip, which hosts a small numeric field.
+        let parallel = chip_height(|ui, th, s, acts| {
+            let chip = Chip::parallel(Some(4), th.err);
+            render_chip(ui, th, s, &chip, false, &[0], &[], &[], acts);
+        });
+
+        assert!(parallel > 0.0);
         assert!(
             (label - alias).abs() < 0.5,
             "label {label} vs alias {alias}"
+        );
+        assert!(
+            (label - parallel).abs() < 0.5,
+            "label {label} vs parallel {parallel}"
+        );
+
+        // The flow's closing `END`, which brackets the whole report against the
+        // `BEGIN` at the top. It sits in the block column like any other row, so
+        // it has to line up with them.
+        let flow_end = chip_height(|ui, th, s, _acts| flow_end_row(ui, th, s));
+        assert!(
+            (label - flow_end).abs() < 0.5,
+            "label {label} vs flow end {flow_end}"
+        );
+    }
+
+    /// `BEGIN` and the flow's `END` are drawn from the same static-chip helper,
+    /// carry their own (distinct) hover help, and read as a matching pair.
+    #[test]
+    fn the_flow_is_bracketed_by_begin_and_a_matching_end() {
+        let s = Strings::for_language(&Language::English);
+        assert_ne!(
+            s.chip_help_flow_end, s.chip_help_end,
+            "the flow's END explains itself, not the loop END"
+        );
+        assert!(
+            s.chip_help_flow_end.contains("END"),
+            "the help names the block it describes"
+        );
+
+        // Both chips paint (a static chip with no text would silently vanish).
+        let begin = chip_height(|ui, th, s, _acts| {
+            static_chip(ui, th, s.report_node_begin, th.accent, s.chip_help_begin)
+        });
+        let end = chip_height(|ui, th, s, _acts| flow_end_row(ui, th, s));
+        assert!(begin > 0.0 && end > 0.0);
+        assert!(
+            (begin - end).abs() < 0.5,
+            "BEGIN {begin} and END {end} are the same size"
+        );
+    }
+
+    #[test]
+    fn the_settings_strip_covers_every_header_directive_the_language_has() {
+        // The parser exposes exactly these six directives; if one is added there
+        // and not here, the GUI would quietly be unable to set it.
+        let flow = crate::report::parse_flow(
+            "# collection: c.hurl\n# output: o.csv\n# environment: dev\n# root: /r\n\
+             # baseline: b.baseline\n# columns: a,b\nREQUEST login\n",
+        )
+        .expect("fixture parses");
+        let specs = header_specs();
+        for spec in &specs {
+            assert!(
+                flow.header.get(spec.key).is_some(),
+                "{} is a real directive",
+                spec.key
+            );
+        }
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|sp| sp.always_shown)
+                .map(|sp| sp.key)
+                .collect::<Vec<_>>(),
+            ["collection", "output"],
+            "only collection and output are always shown; the rest are opt-in"
+        );
+        // Being shown and being mandatory are different things: an absent
+        // `output:` still runs (the language defaults it to CSV), so only
+        // `collection:` earns the error-coloured unset prompt.
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|sp| sp.required)
+                .map(|sp| sp.key)
+                .collect::<Vec<_>>(),
+            ["collection"],
+            "only a missing collection actually stops the report running"
+        );
+
+        // Each directive explains itself in its own words.
+        let s = Strings::for_language(&Language::English);
+        let helps: Vec<&str> = specs.iter().map(|sp| header_help(sp.key, &s)).collect();
+        for (i, h) in helps.iter().enumerate() {
+            assert!(!h.is_empty(), "{} has help", specs[i].key);
+            assert!(
+                helps.iter().filter(|o| o == &h).count() == 1,
+                "{} has help of its own",
+                specs[i].key
+            );
+        }
+    }
+
+    /// `set_header` drops an empty value, so an empty placeholder made picking a
+    /// setting from the add menu silently do nothing — which is how `columns:`
+    /// became unaddable.
+    #[test]
+    fn every_addable_setting_starts_at_a_value_that_survives_being_set() {
+        for spec in header_specs().iter().filter(|sp| !sp.always_shown) {
+            assert!(
+                !header_placeholder(spec).is_empty(),
+                "{} would be dropped again the moment it was added",
+                spec.key
+            );
+        }
+    }
+
+    /// `# output:` names a format from a closed list — the runner derives the
+    /// filename and rejects anything else — so it must be picked, not typed at
+    /// with a file browser beside it.
+    #[test]
+    fn the_output_setting_offers_only_the_formats_the_runner_can_write() {
+        let spec = header_specs()
+            .into_iter()
+            .find(|sp| sp.key == "output")
+            .expect("output is a setting");
+        assert!(
+            matches!(spec.kind, HeaderKind::Format),
+            "output is chosen from a list, not typed or browsed for"
+        );
+
+        // Every offered format really is one the runner can write, and every
+        // format the runner can write is offered.
+        for ext in crate::report::writer::OUTPUT_EXTENSIONS {
+            assert!(
+                crate::report::writer::writer_for_extension(ext).is_some(),
+                "{ext} has a writer"
+            );
+            let flow = crate::report::parse_flow(&format!(
+                "# collection: c.hurl\n# output: {ext}\nREQUEST a\n"
+            ))
+            .expect("parses");
+            assert!(
+                crate::report::validate::validate(
+                    &flow,
+                    &crate::report::validate::Context::default(),
+                )
+                .iter()
+                .all(|d| !d.message.contains("unsupported output")),
+                "{ext} is accepted by the validator"
+            );
+        }
+
+        // No path-valued setting claims `output`, so the browse button is gone.
+        let paths: Vec<&str> = header_specs()
+            .iter()
+            .filter(|sp| matches!(sp.kind, HeaderKind::Path))
+            .map(|sp| sp.key)
+            .collect();
+        assert_eq!(paths, ["root", "baseline"]);
+    }
+
+    /// The button that adds a report setting says what it adds. A bare `+`
+    /// above the flow gives no hint whether it adds a *block* — which is what
+    /// everything else in this view does — or a report-wide setting.
+    #[test]
+    fn the_add_setting_button_says_what_it_adds() {
+        let ctx = egui::Context::default();
+        let s = Strings::for_language(&Language::English);
+        let specs = header_specs();
+        let missing: Vec<&HeaderSpec> = specs.iter().filter(|sp| !sp.always_shown).collect();
+
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut acts = Vec::new();
+            header_add_menu(ui, &s, &missing, &mut acts);
+        });
+        let painted: String = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.contains(s.gui_report_add_setting),
+            "the button is labelled, not a bare glyph (painted: {painted:?})"
+        );
+
+        // The label names the thing being added, in every language, so it can't
+        // drift back to something as vague as "Add".
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            assert!(
+                s.gui_report_add_setting.split_whitespace().count() >= 3,
+                "{lang:?} label {:?} names what it adds",
+                s.gui_report_add_setting
+            );
+        }
+    }
+
+    /// The settings sit in a column above `BEGIN`, each starting at the same
+    /// left edge as the flow — laid out in a row they were ragged against each
+    /// other, and the leading icon pushed the first one out of line with the
+    /// blocks below.
+    #[test]
+    fn the_settings_are_stacked_and_flush_with_the_flow() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let specs = header_specs();
+        let choices = vec!["dev".to_string()];
+
+        let mut rows: Vec<egui::Rect> = Vec::new();
+        let mut frame_rect = egui::Rect::NOTHING;
+        let mut begin_rect = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            rows.clear();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.vertical(|ui| {
+                    frame_rect = settings_frame(&th)
+                        .show(ui, |ui| {
+                            for spec in &specs {
+                                let r = ui.horizontal(|ui| {
+                                    let mut acts = Vec::new();
+                                    header_chip(
+                                        ui,
+                                        &th,
+                                        &s,
+                                        spec,
+                                        "dev",
+                                        Some(&choices),
+                                        &collection_choices_fixture,
+                                        &mut acts,
+                                    );
+                                });
+                                rows.push(r.response.rect);
+                            }
+                        })
+                        .response
+                        .rect;
+                    // The flow's first block, for comparison.
+                    begin_rect = ui
+                        .horizontal_top(|ui| {
+                            static_chip(ui, &th, s.report_node_begin, th.accent, s.chip_help_begin)
+                        })
+                        .response
+                        .rect;
+                });
+            });
+        }
+
+        // Every setting starts at the same left edge as every other.
+        let left = rows[0].left();
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                (r.left() - left).abs() < 0.5,
+                "row {i} starts at {} but the first starts at {left}",
+                r.left()
+            );
+        }
+        // Stacked, not side by side: each row sits below the one before it.
+        for pair in rows.windows(2) {
+            assert!(
+                pair[1].top() >= pair[0].bottom() - 0.5,
+                "rows overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The panel around them lines up with the flow below, so the settings
+        // and the blocks still read as one column.
+        assert!(
+            (frame_rect.left() - begin_rect.left()).abs() < 0.5,
+            "the settings panel starts at {} but BEGIN starts at {}",
+            frame_rect.left(),
+            begin_rect.left()
+        );
+        assert!(
+            frame_rect.bottom() <= begin_rect.top() + 0.5,
+            "the settings panel overlaps the flow"
+        );
+    }
+
+    /// The dropdown shows collections by name, but what it *stores* has to
+    /// stay a path — `report_cli` opens the directive's value straight off
+    /// disk, so a bare name would leave the report unrunnable headless.
+    #[test]
+    fn the_collection_dropdown_shows_names_but_stores_relative_paths() {
+        let root = std::env::temp_dir().join(format!("paperboy_cc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("apis")).expect("scratch workspace");
+        std::fs::write(
+            root.join("apis/billing.hurl"),
+            "GET https://x
+",
+        )
+        .expect("collection");
+        std::fs::write(
+            root.join("smoke.hurl"),
+            "GET https://x
+",
+        )
+        .expect("collection");
+        // Neither of these is a collection, so neither may be offered as one.
+        std::fs::write(
+            root.join("nightly.trail"),
+            "# collection: smoke.hurl
+",
+        )
+        .expect("report");
+        std::fs::write(
+            root.join("dev.vars"),
+            "K=v
+",
+        )
+        .expect("env");
+
+        let report = root.join("nightly.trail");
+        let choices = collection_choices(Some(&root), Some(&report), &[], "unsaved");
+
+        let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["billing", "smoke"],
+            "collections are listed by name, and only collections are listed"
+        );
+        let values: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(
+            values,
+            [
+                std::path::Path::new("apis/billing.hurl")
+                    .to_string_lossy()
+                    .as_ref(),
+                "smoke.hurl"
+            ],
+            "the stored value stays a path, relative to the report so the pair stays portable"
+        );
+        assert!(
+            choices.iter().all(|c| c.in_workspace),
+            "everything found by scanning the workspace is in the workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace has to survive being handed to someone else, so a report
+    /// bound to a collection in a sibling folder must say `../apis/…` rather
+    /// than an absolute path that only exists on the machine it was made on.
+    #[test]
+    fn a_collection_in_a_sibling_folder_is_referenced_relatively_so_it_stays_portable() {
+        let root = std::path::Path::new("/w");
+        let report = std::path::Path::new("/w/reports/nightly.trail");
+        let target = std::path::Path::new("/w/apis/billing.hurl");
+
+        assert_eq!(
+            portable_ref(target, Some(report), Some(root)),
+            "../apis/billing.hurl",
+            "it walks up out of reports/ and back down into apis/"
+        );
+        // Below the report, no walking up is needed.
+        assert_eq!(
+            portable_ref(
+                std::path::Path::new("/w/reports/sub/c.hurl"),
+                Some(report),
+                Some(root)
+            ),
+            "sub/c.hurl",
+            "a collection under the report is named directly"
+        );
+        // Outside the workspace the two files aren't travelling together, so a
+        // relative path would be a lie.
+        assert_eq!(
+            portable_ref(
+                std::path::Path::new("/elsewhere/legacy.hurl"),
+                Some(report),
+                Some(root)
+            ),
+            "/elsewhere/legacy.hurl",
+            "nothing outside the workspace is made to look relative to it"
+        );
+        // With no workspace to bound the walk, the old behaviour stands.
+        assert_eq!(
+            portable_ref(target, Some(report), None),
+            "/w/apis/billing.hurl",
+            "without a workspace there is no scope to stay inside"
+        );
+
+        // And what it writes is what the runners resolve: both front-ends send
+        // a relative ref back through the report's own directory.
+        assert_eq!(
+            crate::report::context::resolve_ref_path(Some(report), "../apis/billing.hurl"),
+            std::path::PathBuf::from("/w/reports/../apis/billing.hurl"),
+            "the relative ref resolves against the report's folder"
+        );
+    }
+
+    /// Collections open in a tab are still offered, marked as being from
+    /// outside the workspace so they can be told apart — and never listed
+    /// twice when the workspace scan already found them.
+    #[test]
+    fn open_collections_outside_the_workspace_are_offered_but_marked_as_such() {
+        let root = std::env::temp_dir().join(format!("paperboy_cc2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch workspace");
+        std::fs::write(
+            root.join("smoke.hurl"),
+            "GET https://x
+",
+        )
+        .expect("collection");
+        let report = root.join("nightly.trail");
+
+        let mut inside = crate::collection::Collection::new("smoke".to_string(), Vec::new());
+        inside.path = Some(root.join("smoke.hurl"));
+        let mut outside = crate::collection::Collection::new("legacy".to_string(), Vec::new());
+        outside.path = Some(std::path::PathBuf::from("/elsewhere/legacy.hurl"));
+        let scratch = crate::collection::Collection::new("Untitled".to_string(), Vec::new());
+
+        let choices = collection_choices(
+            Some(&root),
+            Some(&report),
+            &[inside, outside, scratch],
+            "unsaved",
+        );
+
+        assert_eq!(
+            choices.iter().filter(|c| c.label == "smoke").count(),
+            1,
+            "a collection both open and in the workspace is offered once, not twice"
+        );
+        let legacy = choices
+            .iter()
+            .find(|c| c.label == "legacy")
+            .expect("an open collection outside the workspace is still offered");
+        assert!(!legacy.in_workspace, "it is not in the workspace");
+        assert_eq!(
+            legacy.value, "/elsewhere/legacy.hurl",
+            "with nowhere shorter to be relative to, the path stays absolute"
+        );
+        let scratch = choices
+            .iter()
+            .find(|c| c.label == "Untitled")
+            .expect("an unsaved collection is offered");
+        assert_eq!(
+            (scratch.value.as_str(), scratch.detail.as_str()),
+            ("Untitled", "unsaved"),
+            "with no path to write it can only be referenced by name, and says so"
+        );
+        // Workspace collections sort first: they are the likely answer.
+        assert!(
+            choices[0].in_workspace,
+            "the workspace's own collections are offered first"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stand-in collection list for the layout tests, which are about
+    /// geometry rather than about what happens to be on disk.
+    fn collection_choices_fixture() -> Vec<CollectionChoice> {
+        vec![CollectionChoice {
+            value: "c.hurl".to_string(),
+            label: "c".to_string(),
+            detail: "c.hurl".to_string(),
+            in_workspace: true,
+        }]
+    }
+
+    /// Renders the settings panel over a fixed set of values and returns the
+    /// panel's rect plus the rect of every text run painted inside it.
+    fn run_settings_panel(
+        ctx: &egui::Context,
+        set: &[(&str, &str)],
+        avail: f32,
+    ) -> (egui::Rect, Vec<(String, egui::Rect)>) {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let envs = vec!["dev".to_string()];
+        let formats: Vec<String> = crate::report::writer::OUTPUT_EXTENSIONS
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        let owned: Vec<(String, String)> = set
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let value_of = move |key: &str| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+
+        let mut rect = egui::Rect::NOTHING;
+        let mut out = None;
+        // Three passes: combo boxes and galley measurements only settle once
+        // the layout has been seen at least once.
+        for _ in 0..3 {
+            let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_max_width(avail);
+                let mut acts = Vec::new();
+                rect = ui
+                    .scope(|ui| {
+                        settings_panel(
+                            ui,
+                            &th,
+                            &s,
+                            &value_of,
+                            &collection_choices_fixture,
+                            &envs,
+                            &formats,
+                            &mut acts,
+                        );
+                    })
+                    .response
+                    .rect;
+            });
+            out = Some(full);
+        }
+        let mut texts = Vec::new();
+        fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match sh {
+                egui::Shape::Text(t) => {
+                    out.push((
+                        t.galley.text().to_string(),
+                        egui::Rect::from_min_size(t.pos, t.galley.size()),
+                    ));
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|sh| walk(sh, out)),
+                _ => {}
+            }
+        }
+        for c in &out.expect("rendered").shapes {
+            walk(&c.shape, &mut texts);
+        }
+        (rect, texts)
+    }
+
+    /// "Add a report setting" appends to the list, so it belongs underneath it —
+    /// above the settings it read as a heading for them.
+    #[test]
+    fn the_add_setting_button_sits_below_the_settings_it_adds_to() {
+        let ctx = egui::Context::default();
+        let s = Strings::for_language(&Language::English);
+        let (_, texts) = run_settings_panel(&ctx, &[("collection", "c.hurl")], 600.0);
+
+        let button = texts
+            .iter()
+            .find(|(t, _)| t.contains(s.gui_report_add_setting))
+            .map(|(_, r)| *r)
+            .expect("the add button is drawn while settings are still missing");
+        let collection = texts
+            .iter()
+            .find(|(t, _)| t == "COLLECTION")
+            .map(|(_, r)| *r)
+            .expect("the collection setting is drawn");
+        assert!(
+            button.top() >= collection.bottom(),
+            "the add button at {} should sit below the settings ending at {}",
+            button.top(),
+            collection.bottom()
+        );
+
+        // With nothing left to add there is no button at all.
+        let (_, full) = run_settings_panel(
+            &ctx,
+            &[
+                ("collection", "c.hurl"),
+                ("output", "csv"),
+                ("environment", "dev"),
+                ("root", "/r"),
+                ("baseline", "b.baseline"),
+                ("columns", "a,b"),
+            ],
+            600.0,
+        );
+        assert!(
+            !full
+                .iter()
+                .any(|(t, _)| t.contains(s.gui_report_add_setting)),
+            "nothing is missing, so nothing offers to add it"
+        );
+    }
+
+    /// The panel keeps its width whatever it happens to contain: a box that
+    /// grew and shrank as dropdowns were used would make the view twitch.
+    #[test]
+    fn the_settings_panel_keeps_its_width_whatever_it_holds() {
+        let ctx = egui::Context::default();
+        let (bare, _) = run_settings_panel(&ctx, &[("collection", "c.hurl")], 600.0);
+        let (full, _) = run_settings_panel(
+            &ctx,
+            &[
+                ("collection", "c.hurl"),
+                ("output", "xlsx"),
+                ("environment", "dev"),
+                (
+                    "root",
+                    "/a/very/long/root/path/that/would/otherwise/stretch/things",
+                ),
+                ("baseline", "/another/rather/long/baseline/path.baseline"),
+                ("columns", "name,status,duration,size,assertions"),
+            ],
+            600.0,
+        );
+        assert!(
+            (bare.width() - full.width()).abs() < 0.5,
+            "one setting gives width {} but six give {}",
+            bare.width(),
+            full.width()
+        );
+
+        // It still yields to a column narrower than its fixed width, so the
+        // panel never forces a wide editor pane. It can only give back what its
+        // contents don't need: a dropdown has a minimum width of its own, which
+        // is the floor here, so the test asserts it shrank rather than naming a
+        // width the chips can't actually reach.
+        let (narrow, _) = run_settings_panel(&ctx, &[("collection", "c.hurl")], 120.0);
+        assert!(
+            narrow.width() < bare.width(),
+            "a 120px column still gave the panel {} (it takes {} when there is room)",
+            narrow.width(),
+            bare.width()
+        );
+    }
+
+    /// The key label in a combo-box setting is centred against the combo, not
+    /// left floating above it — a label added before the (taller) combo is
+    /// otherwise centred in a row that has not grown yet.
+    #[test]
+    fn a_settings_key_label_is_centred_against_its_dropdown() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let strings = Strings::for_language(&Language::English);
+        let choices = vec!["dev".to_string()];
+
+        for spec in &header_specs() {
+            let mut label = egui::Rect::NOTHING;
+            let mut chip = egui::Rect::NOTHING;
+            for _ in 0..3 {
+                let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let mut acts = Vec::new();
+                    chip = ui
+                        .horizontal(|ui| {
+                            header_chip(
+                                ui,
+                                &th,
+                                &strings,
+                                spec,
+                                "dev",
+                                Some(&choices),
+                                &collection_choices_fixture,
+                                &mut acts,
+                            );
+                        })
+                        .response
+                        .rect;
+                });
+                // The key is painted as a raw galley (see `header_chip`), so it
+                // is found among the text shapes rather than as a widget.
+                let want = spec.key.to_uppercase();
+                label = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| match &c.shape {
+                        egui::Shape::Text(t) if t.galley.text() == want => {
+                            Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{} label was not painted", spec.key));
+            }
+            assert!(
+                (label.center().y - chip.center().y).abs() < 2.0,
+                "{}: label centred at {} but the chip at {}",
+                spec.key,
+                label.center().y,
+                chip.center().y
+            );
+        }
+    }
+
+    #[test]
+    fn settings_chips_render_at_the_same_height_as_flow_chips() {
+        let specs = header_specs();
+        let baseline = chip_height(|ui, th, s, acts| {
+            let chip = Chip::base("REPORT".into(), th.subst);
+            render_chip(ui, th, s, &chip, false, &[0], &[], &[], acts);
+        });
+        for spec in &specs {
+            let choices = vec!["dev".to_string()];
+            let h = chip_height(|ui, th, s, acts| {
+                header_chip(
+                    ui,
+                    th,
+                    s,
+                    spec,
+                    "dev",
+                    Some(&choices),
+                    &collection_choices_fixture,
+                    acts,
+                );
+            });
+            assert!(
+                (h - baseline).abs() < 1.0,
+                "{} chip is {h}, flow chips are {baseline}",
+                spec.key
+            );
+        }
+    }
+
+    #[test]
+    fn a_picked_path_is_stored_relative_to_the_report_when_it_can_be() {
+        let report = std::path::Path::new("/w/reports/daily.paper");
+        assert_eq!(
+            relative_to_report(std::path::Path::new("/w/reports/out.csv"), Some(report)),
+            "out.csv",
+            "a sibling file travels with the report"
+        );
+        assert_eq!(
+            relative_to_report(std::path::Path::new("/elsewhere/out.csv"), Some(report)),
+            "/elsewhere/out.csv",
+            "anything outside the report's folder keeps its absolute path"
+        );
+        assert_eq!(
+            relative_to_report(std::path::Path::new("/w/out.csv"), None),
+            "/w/out.csv",
+            "an unsaved report has nothing to be relative to"
+        );
+    }
+
+    #[test]
+    fn every_chip_a_block_can_show_carries_hover_help() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        // One source line per block shape the palette can produce, so a chip
+        // added later without help text fails here rather than shipping bare.
+        let sources = [
+            "REQUEST login",
+            "REPORT REQUEST login AS Login RESPONSE PRETTY SHOW(Time) HIDE(Error)",
+            "REPORT userId",
+            "REPORT userId AS Id",
+            "REPORT \"{{a}}-{{b}}\" AS Combined",
+            "TOKEN = abc",
+            "LIST NAMES = [\"a\", \"b\"]",
+            "PARALLEL(3) FOR F IN FILES \"/d\"",
+            "FOR T IN ENVS BASELINE(\"dev\"), COMPARISON(\"prod\")",
+            "FOR T IN ENVS BASELINE(FILE(\"a.baseline\")), COMPARISON(\"prod\", \"uat\")",
+        ];
+        for src in sources {
+            let node = crate::report::edit::parse_one_node(src, true)
+                .unwrap_or_else(|| panic!("could not parse {src:?}"));
+            for chip in node_chips(&node, None, &th, &s) {
+                assert!(
+                    !chip.help.is_empty(),
+                    "chip {:?} of {src:?} has no hover help",
+                    chip.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_parallel_loop_shows_an_editable_degree_chip() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+
+        // With an explicit degree the chip carries it; the base chip beside it
+        // must not repeat the "PARALLEL(4)" prefix that the head label embeds.
+        let node =
+            crate::report::edit::parse_one_node("PARALLEL(4) FOR F IN FILES \"/d\"", true).unwrap();
+        let chips = node_chips(&node, None, &th, &s);
+        assert!(matches!(
+            chips[0].edit,
+            ChipEdit::Parallel { degree: Some(4) }
+        ));
+        assert!(
+            !chips[1].text.contains("PARALLEL"),
+            "base chip repeated the PARALLEL prefix: {:?}",
+            chips[1].text
+        );
+
+        // A plain PARALLEL has no explicit limit, so the box shows blank rather
+        // than inventing the runner's default.
+        let node =
+            crate::report::edit::parse_one_node("PARALLEL FOR F IN FILES \"/d\"", true).unwrap();
+        let chips = node_chips(&node, None, &th, &s);
+        assert!(matches!(chips[0].edit, ChipEdit::Parallel { degree: None }));
+
+        // A serial loop gets no PARALLEL chip at all.
+        let node = crate::report::edit::parse_one_node("FOR F IN FILES \"/d\"", true).unwrap();
+        let chips = node_chips(&node, None, &th, &s);
+        assert!(
+            !chips
+                .iter()
+                .any(|c| matches!(c.edit, ChipEdit::Parallel { .. }))
         );
     }
 
@@ -2915,6 +6198,158 @@ mod tests {
         );
     }
 
+    /// The mirror of the above: a chip drag lifts exactly that chip (so it can
+    /// float under the pointer and leave a ghost) and a row drag lifts none, so
+    /// the two lifts can never both fire for one drag.
+    /// A statistics clause present in the source has to be visible as a chip,
+    /// and the load-bearing rule has to leave the row's REPORT chip undraggable
+    /// on its own.
+    #[test]
+    fn a_named_column_shows_its_statistics_and_keeps_report_attached() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow = crate::report::parse_flow("REPORT TIER AS Plan STATISTICS(MEAN)\n")
+            .expect("fixture parses");
+        let chips = node_chips(&flow.nodes[0], None, &th, s);
+        assert!(
+            chips.iter().any(|c| c.text.contains("STATISTICS(MEAN)")),
+            "the statistics clause is drawn: {:?}",
+            chips.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let report = chips
+            .iter()
+            .find(|c| c.text == "REPORT")
+            .expect("the REPORT chip is drawn");
+        assert!(
+            report.detach.is_none(),
+            "REPORT is load-bearing here, so grabbing it moves the whole row"
+        );
+    }
+
+    /// The drop preview is computed by rehearsing the drop, so the ghost has to
+    /// be the very chip that appears — same text, same slot — once it lands.
+    #[test]
+    fn the_drop_preview_is_exactly_the_chip_the_drop_will_add() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow = crate::report::parse_flow("REPORT REQUEST A\n").expect("fixture parses");
+        let node = &flow.nodes[0];
+
+        let pending = PendingMod::New(Modifier::Show);
+        let (idx, text, _) =
+            preview_chip(node, &pending, Some(true), &th, s).expect("SHOW adds a chip");
+
+        let before = node_chips(node, Some(true), &th, s);
+        assert_eq!(idx, before.len(), "SHOW appends to the end of the line");
+
+        let mut after_node = node.clone();
+        assert!(pending.apply(&mut after_node));
+        assert_eq!(
+            node_chips(&after_node, Some(true), &th, s)[idx]
+                .ghost_shape()
+                .0,
+            text,
+            "the ghost's label is the landed chip's label, so the gap is its size"
+        );
+    }
+
+    /// Every block a user cannot compose out of something else has to be in the
+    /// palette, or the GUI simply can't write that statement.
+    #[test]
+    fn the_palette_offers_every_block_that_cannot_be_composed() {
+        for kind in NodeKind::ALL {
+            // A reported request is `REQUEST` plus the `REPORT` modifier, so it
+            // is the one kind the palette deliberately leaves out.
+            if matches!(kind, NodeKind::ReportRequest) {
+                assert!(
+                    !BASE_KINDS.contains(&kind),
+                    "{kind:?} is composed from REQUEST + REPORT, not offered directly"
+                );
+                continue;
+            }
+            assert!(
+                BASE_KINDS.contains(&kind),
+                "{kind:?} has no other route into a report, so the palette must offer it"
+            );
+        }
+    }
+
+    /// A chip that keeps its keyword in its inline editor rather than in `text`
+    /// still has to produce a full-sized ghost — `PARALLEL` came out a sliver.
+    #[test]
+    fn a_ghost_is_sized_from_what_the_chip_really_draws() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow = crate::report::parse_flow("FOR X IN FILES \"/a\"\n    REQUEST A\nEND\n")
+            .expect("fixture parses");
+
+        let (_, text, extra) = preview_chip(
+            &flow.nodes[0],
+            &PendingMod::New(Modifier::Parallel),
+            None,
+            &th,
+            s,
+        )
+        .expect("PARALLEL adds a chip");
+        assert_eq!(
+            text, "PARALLEL",
+            "the keyword is in the ghost, not an empty box"
+        );
+        assert!(
+            extra >= PARALLEL_FIELD_WIDTH,
+            "the concurrency box's width is reserved too, got {extra}"
+        );
+    }
+
+    /// A clause the line won't take gets no gap — the row must not open space
+    /// for a drop that is about to be refused.
+    #[test]
+    fn a_refused_drop_previews_nothing() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow =
+            crate::report::parse_flow("REPORT REQUEST A SHOW(Time)\n").expect("fixture parses");
+        let carried = crate::report::edit::carry_modifier(&flow.nodes[0], DetachWhich::Show)
+            .expect("the SHOW is there to pick up");
+        assert!(
+            preview_chip(
+                &flow.nodes[0],
+                &PendingMod::Moved(carried),
+                Some(true),
+                &th,
+                s
+            )
+            .is_none(),
+            "a request that already has SHOW opens no gap for another"
+        );
+    }
+
+    #[test]
+    fn dragged_chip_tracks_only_chip_drags() {
+        let ctx = egui::Context::default();
+        assert_eq!(dragged_chip(&ctx), None, "no drag → no lifted chip");
+
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            DragItem::Chip {
+                path: vec![0, 3],
+                which: DetachWhich::BaselineShow,
+            },
+        );
+        assert_eq!(
+            dragged_chip(&ctx),
+            Some((vec![0, 3], DetachWhich::BaselineShow)),
+            "the picked-up chip is identified by its row and its clause"
+        );
+
+        egui::DragAndDrop::set_payload(&ctx, DragItem::Row(vec![0, 3]));
+        assert_eq!(
+            dragged_chip(&ctx),
+            None,
+            "a whole-line drag must not also lift a chip out of that line"
+        );
+    }
+
     #[test]
     fn chip_drag_payload_detaches_plainly_and_moves_the_line_with_ctrl() {
         let ctx = egui::Context::default();
@@ -3026,5 +6461,750 @@ mod tests {
             );
             paint_origin_ghost(ui.painter(), egui::Rect::ZERO, &th);
         });
+    }
+
+    /// The dashed outline marking where a block was lifted from has to trace the
+    /// block, not the whole editor width: a nested block sits in from the left by
+    /// its indent, and the outline has to start there too.
+    #[test]
+    fn the_origin_outline_starts_at_the_blocks_own_indent() {
+        // A row's laid-out rect always begins at the editor's left margin,
+        // because the indent is `add_space`d inside the row's own layout.
+        let row = egui::Rect::from_min_size(egui::pos2(4.0, 40.0), egui::vec2(300.0, 22.0));
+
+        let top = indented_content(row, 0);
+        assert_eq!(top, row, "an unindented block is its own rect");
+
+        let nested = indented_content(row, 2);
+        assert_eq!(
+            nested.left(),
+            row.left() + 2.0 * INDENT_STEP,
+            "the outline starts where the nested block does"
+        );
+        assert_eq!(nested.right(), row.right(), "the right edge is untouched");
+        assert_eq!(nested.y_range(), row.y_range(), "the height is untouched");
+
+        // A row narrower than its own indent (only reachable from a degenerate
+        // layout pass) must not invert into a negative-width rect.
+        let tiny = indented_content(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 22.0)),
+            8,
+        );
+        assert!(tiny.width() > 0.0, "the outline never collapses: {tiny:?}");
+    }
+
+    /// The outline is as round as the block it replaces — dashed along a rounded
+    /// path rather than round the four straight edges, which left square corners
+    /// inside a rounded fill.
+    #[test]
+    fn the_origin_outline_is_as_rounded_as_a_block() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 40.0));
+        let path = rounded_rect_path(rect, BLOCK_RADIUS);
+        assert!(path.len() > 8, "a rounded path is more than four corners");
+        assert_eq!(path.first(), path.last(), "the path closes back on itself");
+        for p in &path {
+            assert!(
+                rect.expand(0.01).contains(*p),
+                "{p:?} escapes the rect it traces"
+            );
+        }
+        // The true corners are cut off: nothing sits within the radius square of
+        // a corner except along its arc, so no point lands *on* the corner.
+        for corner in [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ] {
+            let nearest = path
+                .iter()
+                .map(|p| (*p - corner).length())
+                .fold(f32::MAX, f32::min);
+            assert!(
+                nearest > BLOCK_RADIUS * 0.3,
+                "the path reaches the square corner {corner:?} (nearest {nearest})"
+            );
+        }
+        // A radius larger than the box can hold is clamped rather than folding
+        // the path inside out.
+        let thin = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 4.0));
+        for p in rounded_rect_path(thin, BLOCK_RADIUS) {
+            assert!(thin.expand(0.01).contains(p), "{p:?} escapes a thin rect");
+        }
+    }
+
+    /// The drop marker is a preview of the block that will land, so it has the
+    /// block's width — not a bar running to the right-hand edge of the editor.
+    #[test]
+    fn the_drop_marker_is_as_wide_as_the_block_being_dropped() {
+        let measure = |setup: &dyn Fn(&egui::Context)| -> egui::Vec2 {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+            let mut size = egui::Vec2::ZERO;
+            for _ in 0..2 {
+                setup(&ctx);
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    size = dragged_block_size(ui)
+                });
+            }
+            size
+        };
+
+        // An existing block reports the width the lift measured.
+        let moved = measure(&|ctx| {
+            egui::DragAndDrop::set_payload(ctx, DragItem::Row(vec![0]));
+            ctx.data_mut(|d| {
+                d.insert_temp(
+                    lifted_shape_id(),
+                    vec![egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(214.0, 60.0),
+                    )],
+                )
+            });
+        });
+        assert_eq!(moved, egui::vec2(214.0, 60.0));
+
+        // A palette block has nothing laid out in the flow to measure, so it
+        // reports the width of the chip actually in hand.
+        let from_palette = measure(&|ctx| {
+            egui::DragAndDrop::set_payload(ctx, NodeKind::Request);
+            ctx.data_mut(|d| d.insert_temp(palette_drag_size_id(), egui::vec2(96.0, 24.0)));
+        });
+        assert_eq!(from_palette.x, 96.0, "the palette chip's own width");
+
+        // With nothing measured yet (a drag's very first frame) the marker still
+        // has a sane block-like width rather than zero or the full editor.
+        let unmeasured = measure(&|ctx| egui::DragAndDrop::set_payload(ctx, NodeKind::Request));
+        assert!(
+            unmeasured.x > 40.0 && unmeasured.x < 400.0,
+            "unmeasured width {} is block-like",
+            unmeasured.x
+        );
+    }
+
+    /// A dragged `FOR` loop is not a rectangle — short head, indented body,
+    /// short `END` — and the drop marker has to say so, otherwise it promises a
+    /// solid slab nothing like the block in hand.
+    #[test]
+    fn the_drop_marker_takes_the_shape_of_the_block_being_dropped() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        // A loop's silhouette, relative to its own top-left.
+        let shape = vec![
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(140.0, 24.0)),
+            egui::Rect::from_min_size(egui::pos2(24.0, 24.0), egui::vec2(180.0, 24.0)),
+            egui::Rect::from_min_size(egui::pos2(0.0, 48.0), egui::vec2(50.0, 24.0)),
+        ];
+        let origin = egui::pos2(30.0, 100.0);
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paint_drop_silhouette(
+                ui,
+                origin,
+                &shape,
+                egui::Rect::from_min_size(origin, egui::vec2(400.0, 72.0)),
+                &th,
+            );
+        });
+
+        let painted: Vec<egui::Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(painted.len(), 3, "one rect per row, not one bounding box");
+        for (drawn, want) in painted.iter().zip(&shape) {
+            assert_eq!(
+                drawn.left(),
+                origin.x + want.left(),
+                "the row keeps its own indent"
+            );
+            assert_eq!(drawn.width(), want.width(), "the row keeps its own width");
+        }
+        // The stepped outline really is stepped: the three rows differ.
+        assert_ne!(painted[0].left(), painted[1].left());
+        assert_ne!(painted[0].width(), painted[2].width());
+        // A bounding-box marker would have covered this corner; the silhouette
+        // does not.
+        let under_the_end = egui::pos2(origin.x + 150.0, origin.y + 60.0);
+        assert!(
+            !painted.iter().any(|r| r.contains(under_the_end)),
+            "the marker filled in a gap the block does not occupy"
+        );
+    }
+
+    /// While the gap animates open the marker is *revealed*, never stretched —
+    /// a block that grew from a sliver to full height would read as the block
+    /// changing size on the way in.
+    #[test]
+    fn a_half_open_drop_marker_is_clipped_not_stretched() {
+        let ctx = egui::Context::default();
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let shape = vec![
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(140.0, 24.0)),
+            egui::Rect::from_min_size(egui::pos2(0.0, 24.0), egui::vec2(140.0, 24.0)),
+        ];
+        let origin = egui::pos2(0.0, 0.0);
+        let clipped = |h: f32| -> Vec<(egui::Rect, egui::Rect)> {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint_drop_silhouette(
+                    ui,
+                    origin,
+                    &shape,
+                    egui::Rect::from_min_size(origin, egui::vec2(400.0, h)),
+                    &th,
+                );
+            })
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) => Some((r.rect, c.clip_rect)),
+                _ => None,
+            })
+            .collect()
+        };
+
+        let full = clipped(48.0);
+        let half = clipped(20.0);
+        assert_eq!(full.len(), half.len(), "the same rows are always emitted");
+        for (a, b) in full.iter().zip(&half) {
+            assert_eq!(a.0, b.0, "the row's own geometry never changes");
+        }
+        assert!(
+            half[0].1.height() < full[0].1.height(),
+            "the half-open marker is held back by a shorter clip"
+        );
+    }
+
+    /// A raw input with a pointer sitting at `pos` and a real screen rect, so
+    /// `Context::pointer_interact_pos` reports something during the test frame.
+    fn input_with_pointer(pos: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        }
+    }
+
+    /// Every part of a picked-up subtree must move by the *same* delta.
+    ///
+    /// Regression test for dragging a whole `FOR` loop: the transform used to be
+    /// applied from inside the head row, and `Context::transform_layer_shapes`
+    /// only moves the shapes *already in* the layer — so the loop's body and its
+    /// `END`, painted after the head, stayed at their layout positions while the
+    /// head alone tracked the cursor, making the parts of one block appear to
+    /// move at different speeds.
+    #[test]
+    fn a_dragged_subtree_moves_every_row_by_the_same_delta() {
+        let ctx = egui::Context::default();
+        let head_rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(120.0, 20.0));
+        let body_rect = egui::Rect::from_min_size(egui::pos2(10.0, 34.0), egui::vec2(120.0, 20.0));
+        let end_rect = egui::Rect::from_min_size(egui::pos2(10.0, 58.0), egui::vec2(120.0, 20.0));
+        let fills = [
+            Color32::from_rgb(1, 2, 3),
+            Color32::from_rgb(4, 5, 6),
+            Color32::from_rgb(7, 8, 9),
+        ];
+        let rects = [head_rect, body_rect, end_rect];
+        let pointer = egui::pos2(400.0, 300.0);
+
+        // Two passes: egui settles its layout/ids on the first frame.
+        let mut out = ctx.run_ui(input_with_pointer(pointer), |_| {});
+        for _ in 0..2 {
+            out = ctx.run_ui(input_with_pointer(pointer), |ui| {
+                let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pt_test_drag"));
+                let mut lift = DragLift::default();
+                // Exactly what `block_row` does for a lifted row: paint it into
+                // the shared drag layer, then hand it to the lift.
+                for (i, (rect, fill)) in rects.iter().zip(fills).enumerate() {
+                    ui.scope_builder(egui::UiBuilder::new().layer_id(layer), |ui| {
+                        ui.painter()
+                            .rect_filled(*rect, egui::CornerRadius::ZERO, fill);
+                    });
+                    lift.add(layer, *rect, i == 0);
+                }
+                lift.follow_pointer(ui.ctx());
+            });
+        }
+
+        let painted = |fill: Color32| -> egui::Rect {
+            out.shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(r) if r.fill == fill => Some(r.rect),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no rect painted with fill {fill:?}"))
+        };
+
+        let deltas: Vec<egui::Vec2> = rects
+            .iter()
+            .zip(fills)
+            .map(|(rect, fill)| painted(fill).min - rect.min)
+            .collect();
+        for (i, delta) in deltas.iter().enumerate() {
+            assert!(
+                (*delta - deltas[0]).length() < 0.5,
+                "row {i} moved by {delta:?}, head moved by {:?}",
+                deltas[0]
+            );
+        }
+        // The subtree really did move (a no-op transform would trivially pass
+        // the equal-delta check above), anchored with the head on the pointer.
+        assert!(deltas[0].length() > 1.0, "the subtree never moved");
+        assert!(
+            (painted(fills[0]).center() - pointer).length() < 0.5,
+            "the head is not centred on the pointer"
+        );
+    }
+
+    /// The lift measures the whole subtree, not just its head, and keeps each
+    /// row separately — that silhouette is what the drop markers take the shape
+    /// of.
+    #[test]
+    fn the_lift_records_the_whole_subtrees_silhouette_for_the_drop_marker() {
+        let ctx = egui::Context::default();
+        // A `FOR` loop's real shape: a head, an indented (and here narrower)
+        // body row, then the `END` back at the head's indent.
+        let rects = [
+            egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(120.0, 20.0)),
+            egui::Rect::from_min_size(egui::pos2(20.0, 34.0), egui::vec2(90.0, 20.0)),
+            egui::Rect::from_min_size(egui::pos2(10.0, 58.0), egui::vec2(60.0, 20.0)),
+        ];
+        let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pt_test_measure"));
+        let mut lift = DragLift::default();
+        for (i, rect) in rects.iter().enumerate() {
+            lift.add(layer, *rect, i == 0);
+        }
+        lift.follow_pointer(&ctx);
+        let stored: Vec<egui::Rect> = ctx
+            .data(|d| d.get_temp(lifted_shape_id()))
+            .expect("the lift stashed a silhouette");
+        // One rect per row, positioned relative to the subtree's own top-left,
+        // so the whole thing spans 0.0 → 68.0 rather than the head's 20.0.
+        assert_eq!(stored.len(), rects.len());
+        assert_eq!(stored[0].min, egui::pos2(0.0, 0.0));
+        assert_eq!(stored.last().unwrap().bottom(), 68.0);
+        // The body row keeps its own indent and width — that stepped outline is
+        // the whole point of storing rows rather than a bounding box.
+        assert_eq!(stored[1].min, egui::pos2(10.0, 24.0));
+        assert_eq!(stored[1].width(), 90.0);
+
+        // And with nothing in hand the measurement is forgotten, so the next
+        // drag's first frame can't inherit this (bigger) block's shape.
+        DragLift::default().follow_pointer(&ctx);
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<Vec<egui::Rect>>(lifted_shape_id())),
+            None
+        );
+    }
+
+    /// The drop gap is sized to the block actually being dragged: one row for a
+    /// plain palette block, two for a `FOR` (which inserts a head *and* its
+    /// `END`), and the measured subtree height when an existing block is moved.
+    #[test]
+    fn the_drop_ghost_is_sized_to_the_block_being_dragged() {
+        let measure = |setup: &dyn Fn(&egui::Context)| -> f32 {
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+            let mut h = 0.0;
+            for _ in 0..2 {
+                setup(&ctx);
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| h = dragged_block_h(ui));
+            }
+            h
+        };
+
+        let idle = measure(&|_| {});
+        let leaf = measure(&|ctx| egui::DragAndDrop::set_payload(ctx, NodeKind::Request));
+        let loop_kind = measure(&|ctx| egui::DragAndDrop::set_payload(ctx, NodeKind::ForFiles));
+        let moved_subtree = measure(&|ctx| {
+            egui::DragAndDrop::set_payload(ctx, DragItem::Row(vec![0]));
+            ctx.data_mut(|d| {
+                d.insert_temp(
+                    lifted_shape_id(),
+                    vec![egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(120.0, 137.0),
+                    )],
+                )
+            });
+        });
+
+        assert!(idle > 0.0);
+        assert_eq!(leaf, idle, "a plain palette block opens a one-row gap");
+        assert_eq!(
+            loop_kind,
+            idle * 2.0,
+            "a FOR block inserts a head and an END, so its gap is two rows"
+        );
+        assert_eq!(
+            moved_subtree, 137.0,
+            "an existing block's gap matches its measured height"
+        );
+    }
+
+    /// A measured height smaller than a single block (a stale/degenerate
+    /// reading) never shrinks the ghost below one row.
+    #[test]
+    fn a_degenerate_measurement_never_shrinks_the_drop_ghost_below_one_block() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let mut h = 0.0;
+        let mut one = 0.0;
+        for _ in 0..2 {
+            egui::DragAndDrop::set_payload(&ctx, DragItem::Row(vec![0]));
+            ctx.data_mut(|d| {
+                d.insert_temp(
+                    lifted_shape_id(),
+                    vec![egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(120.0, 1.0),
+                    )],
+                )
+            });
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                h = dragged_block_h(ui);
+                one = chip_h(ui) + 10.0;
+            });
+        }
+        assert_eq!(h, one);
+    }
+}
+
+#[cfg(test)]
+mod baseline_show_chip_tests {
+    use super::node_chips;
+    use crate::gui::theme::GuiTheme;
+    use crate::i18n::{Language, Strings};
+
+    /// The chip labels a flow's first node renders as.
+    fn chip_labels(src: &str) -> Vec<String> {
+        let flow = crate::report::parser::parse_flow(src).expect("the fixture flow parses");
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        node_chips(&flow.nodes[0], None, &th, &s)
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
+    }
+
+    #[test]
+    fn a_baselines_show_clause_is_chipped_between_the_baseline_and_the_comparison() {
+        let chips = chip_labels(
+            "FOR TARGET IN ENVS BASELINE(\"prod\") SHOW(Time, Status), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        );
+        let at = |needle: &str| {
+            chips
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("expected a {needle} chip in {chips:?}"))
+        };
+        assert!(
+            at("prod") < at("SHOW(") && at("SHOW(") < at("stage"),
+            "the SHOW sits with the BASELINE it belongs to, not the comparison: {chips:?}"
+        );
+        assert!(
+            chips.iter().any(|c| c == "SHOW(Time, Status)"),
+            "and it names the fields it selects: {chips:?}"
+        );
+    }
+
+    #[test]
+    fn the_baselines_show_is_tethered_to_it_and_keeps_its_own_colour() {
+        let flow = crate::report::parser::parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        )
+        .expect("the fixture flow parses");
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let chips = node_chips(&flow.nodes[0], None, &th, &s);
+
+        let show = chips
+            .iter()
+            .find(|c| c.text.starts_with("SHOW("))
+            .expect("the SHOW is chipped");
+        assert!(
+            show.tethered,
+            "it is tied to the chip before it, not left floating between three peers"
+        );
+        assert_eq!(
+            show.color, th.ok,
+            "and it keeps SHOW's own colour — the tie is drawn, not implied by hue"
+        );
+
+        let baseline = chips
+            .iter()
+            .find(|c| c.text.contains("prod"))
+            .expect("the BASELINE is chipped");
+        assert_ne!(
+            show.color, baseline.color,
+            "so the two are still told apart at a glance"
+        );
+    }
+
+    #[test]
+    fn a_baseline_without_a_show_clause_gets_no_show_chip() {
+        let chips = chip_labels(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
+        );
+        assert!(
+            !chips.iter().any(|c| c.starts_with("SHOW(")),
+            "no clause, no chip — an empty SHOW would claim a restriction that isn't there: {chips:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod results_table_tests {
+    use super::{MIN_COL_W, fit_column_widths};
+
+    /// Total width of a laid-out table, gaps included.
+    fn spanned(widths: &[f32], spacing: f32) -> f32 {
+        widths.iter().sum::<f32>() + spacing * (widths.len() as f32 - 1.0)
+    }
+
+    #[test]
+    fn a_table_with_room_to_spare_grows_to_fill_the_whole_window() {
+        let widths = fit_column_widths(&[60.0, 100.0, 40.0], 800.0, 10.0);
+        assert!(
+            (spanned(&widths, 10.0) - 800.0).abs() < 0.01,
+            "the table spans the full width instead of huddling at the left edge: {widths:?}"
+        );
+        assert!(
+            widths[1] > widths[0] && widths[0] > widths[2],
+            "and the spare room is shared in proportion, so the column order is unchanged: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_squeezed_table_takes_the_room_from_its_widest_columns_first() {
+        // A narrow status column beside a sprawling body column: shrinking both
+        // by the same proportion would leave the status column unreadable for
+        // no gain, so only the greedy one should give ground.
+        let widths = fit_column_widths(&[50.0, 600.0], 400.0, 10.0);
+        assert!(
+            (widths[0] - 50.0).abs() < 0.01,
+            "the column that was already narrow is left alone: {widths:?}"
+        );
+        assert!(
+            widths[1] < 600.0,
+            "and the wide one absorbs the whole squeeze: {widths:?}"
+        );
+        assert!(
+            spanned(&widths, 10.0) <= 400.01,
+            "so everything still fits on screen: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn columns_that_all_want_the_same_width_are_squeezed_equally() {
+        let widths = fit_column_widths(&[300.0, 300.0, 300.0], 600.0, 0.0);
+        for w in &widths {
+            assert!(
+                (w - 200.0).abs() < 0.01,
+                "with nothing to choose between them they share the shortfall: {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_too_wide_even_for_its_minimums_overflows_so_it_can_be_scrolled() {
+        // Twenty columns can't be made readable in 200 pixels. Rather than
+        // grinding them all to slivers, the widths overrun the viewport and the
+        // caller's horizontal scroll bar takes over.
+        let widths = fit_column_widths(&[100.0; 20], 200.0, 0.0);
+        for w in &widths {
+            assert!(
+                *w >= MIN_COL_W,
+                "no column is shrunk past the point of showing anything: {widths:?}"
+            );
+        }
+        assert!(
+            spanned(&widths, 0.0) > 200.0,
+            "the overflow is what makes the scroll bar appear: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_columns_is_not_a_division_by_zero() {
+        assert!(
+            fit_column_widths(&[], 500.0, 10.0).is_empty(),
+            "an empty report lays out to nothing rather than panicking"
+        );
+    }
+}
+
+#[cfg(test)]
+mod results_render_tests {
+    use super::{MIN_COL_W, SPACING_X, fitted_column_widths, results_grid};
+    use crate::gui::theme::GuiTheme;
+    use crate::i18n::Language;
+    use crate::report::model::{OutputColumn, ReportResult, ReportRow};
+    use eframe::egui;
+
+    /// A result of `rows` rows whose every cell in column `c` holds `fills[c]`.
+    fn fixture(headers: &[&str], fills: &[&str], rows: usize) -> (ReportResult, Vec<OutputColumn>) {
+        let columns: Vec<OutputColumn> = headers
+            .iter()
+            .map(|h| OutputColumn {
+                header: h.to_string(),
+                sources: vec![h.to_string()],
+                stats: Vec::new(),
+            })
+            .collect();
+        let mut result = ReportResult::default();
+        for _ in 0..rows {
+            let mut row = ReportRow::default();
+            for (h, v) in headers.iter().zip(fills) {
+                row.cells.insert(h.to_string(), v.to_string());
+            }
+            result.rows.push(row);
+        }
+        (result, columns)
+    }
+
+    /// The widths the grid would give `columns` in a window `avail` wide, and
+    /// the total they span. Renders for real, so the measurement is the font's
+    /// and not a guess.
+    fn widths_at(result: &ReportResult, columns: &[OutputColumn], avail: f32) -> (Vec<f32>, f32) {
+        let ctx = egui::Context::default();
+        let mut widths = Vec::new();
+        // Twice: galley measurements only settle once the layout has been seen.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_max_width(avail);
+                ui.set_min_width(avail);
+                widths = fitted_column_widths(ui, result, columns, false);
+            });
+        }
+        let span = widths.iter().sum::<f32>() + SPACING_X * (widths.len() as f32 - 1.0);
+        (widths, span)
+    }
+
+    #[test]
+    fn a_narrow_table_is_stretched_across_the_whole_window() {
+        // Three tiny columns in a wide window: left to themselves they would
+        // huddle in the first hundred pixels and leave the rest blank.
+        let (result, columns) = fixture(&["A", "B", "C"], &["1", "2", "3"], 3);
+        let (widths, span) = widths_at(&result, &columns, 900.0);
+        assert!(
+            span > 850.0,
+            "the table spans essentially the whole 900px window: {widths:?} ({span})"
+        );
+    }
+
+    #[test]
+    fn a_wide_table_is_squeezed_to_stay_inside_the_window() {
+        // Six columns of long values in a narrow window have to be cut down
+        // rather than run off the right edge — the cell viewer is what recovers
+        // whatever the truncation hides.
+        let long = "a value long enough to want a column all to itself";
+        let (result, columns) = fixture(
+            &["One", "Two", "Three", "Four", "Five", "Six"],
+            &[long; 6],
+            4,
+        );
+        let (widths, span) = widths_at(&result, &columns, 600.0);
+        assert!(
+            span <= 600.5,
+            "everything fits inside the window: {widths:?} ({span})"
+        );
+    }
+
+    #[test]
+    fn a_column_of_long_values_is_given_more_room_than_a_column_of_short_ones() {
+        let (result, columns) = fixture(
+            &["Id", "Body"],
+            &["7", "a considerably longer captured value"],
+            5,
+        );
+        let (widths, _) = widths_at(&result, &columns, 800.0);
+        assert!(
+            widths[1] > widths[0] * 2.0,
+            "width follows what a column actually has to show: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_header_wider_than_its_values_still_gets_room_for_its_own_name() {
+        // A column of one-character values under a long header must be sized by
+        // the header, or the column would be unidentifiable.
+        let (result, columns) = fixture(&["A", "AnUncommonlyLongHeader"], &["1", "2"], 3);
+        let (widths, _) = widths_at(&result, &columns, 900.0);
+        assert!(
+            widths[1] > widths[0],
+            "the long header claims the wider column: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_more_columns_than_can_ever_fit_overflows_for_the_scroll_bar() {
+        // Thirty columns can't be shown legibly in 400 pixels at any width, so
+        // the grid deliberately overruns its window and the scroll area takes
+        // over, rather than grinding every column down to an ellipsis.
+        let headers: Vec<String> = (0..30).map(|i| format!("Col{i}")).collect();
+        let heads: Vec<&str> = headers.iter().map(|h| h.as_str()).collect();
+        let (result, columns) = fixture(&heads, &["value"; 30], 2);
+        let (widths, span) = widths_at(&result, &columns, 400.0);
+        assert!(
+            widths.iter().all(|w| *w >= MIN_COL_W),
+            "every column keeps a readable minimum: {widths:?}"
+        );
+        assert!(
+            span > 400.0,
+            "and the overflow is what puts the scroll bar there: {span}"
+        );
+    }
+
+    #[test]
+    fn drawing_the_grid_itself_survives_a_window_too_narrow_for_one_column() {
+        // A pathological pane width must not panic or divide by zero — it just
+        // scrolls.
+        let (result, columns) = fixture(&["A", "B", "C"], &["1", "2", "3"], 2);
+        let ctx = egui::Context::default();
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(1.0);
+            results_grid(&th, ui, &result, &columns, None);
+        });
+    }
+}
+
+#[cfg(test)]
+mod dry_run_view_tests {
+    use super::{EditorView, ReportEditor, ReportOrigin};
+
+    /// The Dry run button lives on the toolbar, which is above every view, but
+    /// the preview is drawn by the Results view. Pressing it from Blocks (where
+    /// you build the report, and so where you press it from) has to take you to
+    /// the preview — otherwise the button looks dead.
+    #[test]
+    fn a_dry_run_switches_to_the_view_that_actually_shows_it() {
+        let report = crate::report::Report::scratch("r");
+        let mut ed = ReportEditor::new(ReportOrigin::Session(0), report);
+        assert!(
+            ed.view == EditorView::Blocks,
+            "an editor opens on the Blocks view"
+        );
+
+        ed.show_preview(Box::new(crate::report::dry_run::DryRunReport::from_result(
+            crate::report::ReportResult::default(),
+            crate::report::flow::Header::default(),
+            Vec::new(),
+        )));
+
+        assert!(
+            ed.view == EditorView::Results,
+            "the preview should be on screen, not waiting in a view nobody is looking at"
+        );
+        assert!(ed.dry_run.is_some(), "and the preview itself is held");
     }
 }

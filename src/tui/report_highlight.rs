@@ -7,6 +7,11 @@
 //! (`render_editor_highlighted`), so the source looks identical whether or not
 //! it currently has edit focus.
 //!
+//! The GUI's Source view uses it too, converting the spans to egui text
+//! sections (`gui::report_editor::highlight_job`). Every theme colour is an
+//! `Color::Rgb` triple from the same `ThemeSpec`, so the translation is exact
+//! and the two front-ends can't drift apart.
+//!
 //! The highlighting is deliberately simple — enough to tell a well-formed flow
 //! from a malformed one at a glance:
 //! - PaperTrail keywords are drawn (bold) in a theme colour chosen by category,

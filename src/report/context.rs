@@ -138,6 +138,7 @@ pub fn report_diagnostics(
     active_env_id: Option<u64>,
     flow: &ReportFlow,
     report_path: Option<&Path>,
+    strings: &crate::i18n::Strings,
 ) -> Vec<Diagnostic> {
     let bound = resolve_bound_collection(collections, flow, report_path);
     let titles: Option<Vec<String>> = bound.map(|ci| {
@@ -184,6 +185,7 @@ pub fn report_diagnostics(
         base_var_names: base_var_names.as_deref(),
         all_env_var_names: Some(&all_env_var_names),
         request_entries: request_entries_owned.as_deref(),
+        strings,
     };
     validate::validate(flow, &ctx)
 }

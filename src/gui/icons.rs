@@ -24,7 +24,9 @@ pub const CARET_DOWN: &str = p::CARET_DOWN;
 pub const FOLDER: &str = p::FOLDER;
 /// A collection file (`.hurl` / `.json`) in the tree.
 pub const FILE: &str = p::FILE_TEXT;
-/// A PaperTrail report file (`.trail`) in the tree.
+/// A PaperTrail report file (`.trail`) in the tree. A chart, deliberately
+/// unlike the collection's document glyph — a report *produces* a table, it
+/// isn't another list of requests.
 pub const REPORT: &str = p::CHART_BAR;
 /// An environment file (`.vars`) in the tree, and the git-loaded env marker.
 pub const ENV: &str = p::KEY;
@@ -45,9 +47,6 @@ pub const RUNNING: &str = p::CIRCLE_NOTCH;
 pub const WARNING: &str = p::WARNING;
 /// A git-remote-linked collection or environment (formerly `⎇`).
 pub const GIT: &str = p::GIT_BRANCH;
-/// The "active" marker on the linked Global Environment (formerly `●`).
-pub const ACTIVE: &str = p::DOT;
-
 /// Save action (report editor Save button).
 pub const SAVE: &str = p::FLOPPY_DISK;
 /// Move a selected report block up in its list.
@@ -60,3 +59,11 @@ pub const STOP: &str = p::STOP;
 pub const EXPORT: &str = p::EXPORT;
 /// A row queued in the streaming results grid (formerly `·`).
 pub const ROW_SCHEDULED: &str = p::DOT_OUTLINE;
+/// Preview a report's projected rows without sending anything (the dry run).
+/// An eye rather than a second play glyph, so it can't be mistaken for Run.
+pub const PREVIEW: &str = p::EYE;
+/// A request / collection edited since it was last read from (or written to)
+/// disk. A pencil rather than the conventional `*` or `●`, because the marker
+/// shares the row's right-hand gutter with the pass/fail run marks and a dot
+/// there reads as "queued" (see [`ROW_SCHEDULED`]).
+pub const EDITED: &str = p::PENCIL_SIMPLE;

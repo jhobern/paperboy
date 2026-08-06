@@ -46,7 +46,130 @@ pub struct FormField {
     #[serde(default)]
     pub base64_prefix: Option<String>,
     pub enabled: bool,
+    /// A note about this field, round-tripped as a `# @desc …` line above it
+    /// exactly as for [`KvRow`]. `#[serde(default)]` keeps older saved states
+    /// loadable.
+    #[serde(default)]
+    pub desc: String,
 }
+
+/// One row of a `[Header]`/`[Cookies]`/`[Query]`/`[Options]` section:
+/// `key: value`, whether it is sent, and a free-text note about it.
+///
+/// The note is PaperBoy's own; Hurl has no concept of a per-row description.
+/// It round-trips as a `# @desc …` comment line directly above the row (see
+/// [`DESC_MARKER`]) — the same comment-encoding trick already used for entry
+/// titles, disabled rows and the `# [Reports]` block, so a file with notes is
+/// still a valid Hurl file that any other tool will run unchanged.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct KvRow {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+    /// A note about this row. Empty means "no note", which is by far the
+    /// common case and emits nothing.
+    pub desc: String,
+}
+
+impl KvRow {
+    /// An enabled, undescribed row — the shape almost every caller wants.
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            enabled: true,
+            desc: String::new(),
+        }
+    }
+
+    /// A row with an explicit enabled flag and no note.
+    pub fn toggled(key: impl Into<String>, value: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            enabled,
+            desc: String::new(),
+        }
+    }
+}
+
+impl From<(String, String, bool)> for KvRow {
+    fn from((key, value, enabled): (String, String, bool)) -> Self {
+        Self {
+            key,
+            value,
+            enabled,
+            desc: String::new(),
+        }
+    }
+}
+
+/// Compare a row against a bare `(key, value, enabled)` triple, as the many
+/// round-trip tests written before rows had descriptions do.
+///
+/// A described row is deliberately *not* equal to a triple: were the note
+/// ignored here, a test asserting the parsed rows would silently pass while a
+/// description leaked onto the wrong row. Tests that expect a note assert on
+/// [`KvRow::desc`] directly.
+#[cfg(test)]
+impl PartialEq<(String, String, bool)> for KvRow {
+    fn eq(&self, (key, value, enabled): &(String, String, bool)) -> bool {
+        self.key == *key && self.value == *value && self.enabled == *enabled && self.desc.is_empty()
+    }
+}
+
+/// Saved-state shape for a [`KvRow`].
+///
+/// Sessions written before rows had descriptions stored them as a plain
+/// `["key", "value", true]` array, so the untagged `Legacy` arm keeps every
+/// existing `state.json` (and any hand-written one) loadable — it simply comes
+/// back with no note. New state is always written in the `Full` form.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KvRowRepr {
+    Full {
+        key: String,
+        value: String,
+        #[serde(default = "enabled_by_default")]
+        enabled: bool,
+        #[serde(default)]
+        desc: String,
+    },
+    Legacy(String, String, bool),
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+impl<'de> Deserialize<'de> for KvRow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match KvRowRepr::deserialize(d)? {
+            KvRowRepr::Full {
+                key,
+                value,
+                enabled,
+                desc,
+            } => KvRow {
+                key,
+                value,
+                enabled,
+                desc,
+            },
+            KvRowRepr::Legacy(key, value, enabled) => KvRow {
+                key,
+                value,
+                enabled,
+                desc: String::new(),
+            },
+        })
+    }
+}
+
+/// The comment marker that carries a row's description in Hurl source. Chosen
+/// to look like an annotation rather than prose so the parser can tell the two
+/// apart and the comment scanner doesn't also capture it as a stray comment.
+pub(crate) const DESC_MARKER: &str = "# @desc ";
 
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
 /// as a real filesystem path (spaces and other characters unescaped, as the
@@ -85,8 +208,21 @@ fn push_line(out: &mut String, line: &str, enabled: bool) {
 /// Append one `key: value` request-section row to `out` (see [`push_line`] for
 /// the disabled-row handling). Shared by the Header, Cookies and Query
 /// sections, which are otherwise identical.
-fn push_kv_line(out: &mut String, k: &str, v: &str, enabled: bool) {
-    push_line(out, &format!("{k}: {v}"), enabled);
+fn push_kv_line(out: &mut String, row: &KvRow) {
+    push_desc(out, &row.desc);
+    push_line(out, &format!("{}: {}", row.key, row.value), row.enabled);
+}
+
+/// Emit a row's description as the `# @desc …` line above it, if it has one.
+/// A multi-line note becomes one marker line per line, so re-reading it
+/// reassembles the original text rather than swallowing the continuation as
+/// prose.
+fn push_desc(out: &mut String, desc: &str) {
+    for line in desc.lines() {
+        out.push_str(DESC_MARKER);
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 /// The Hurl source for one `[Form]`/`[Multipart]` field line (without the
@@ -188,7 +324,7 @@ pub struct HurlEntry {
     pub title: String,
     pub method: String,
     pub url: String,
-    pub headers: Vec<(String, String, bool)>,
+    pub headers: Vec<KvRow>,
     pub basic_auth: Option<(String, String)>,
     /// `[Form]` (all `Text`) or `[Multipart]` (any `File`) fields, chosen
     /// automatically by [`to_hurl`](HurlEntry::to_hurl). `#[serde(default)]`
@@ -198,18 +334,18 @@ pub struct HurlEntry {
     pub form_fields: Vec<FormField>,
     #[serde(default)]
     pub is_multipart: bool,
-    pub queries: Vec<(String, String, bool)>,
+    pub queries: Vec<KvRow>,
     /// `[Cookies]` `(name, value)` pairs — syntactic sugar over a `Cookie:`
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
-    pub cookies: Vec<(String, String, bool)>,
+    pub cookies: Vec<KvRow>,
     /// Request `[Options]` rows: `(name, value, enabled)` — e.g. `retry: 3`,
     /// `insecure: true`, `variable: host=example.net`. Behavioral per-request
     /// options honoured by the runner (and `hurl_core`). A disabled row
     /// round-trips as a `# name: value` comment, exactly like a disabled
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
-    pub options: Vec<(String, String, bool)>,
+    pub options: Vec<KvRow>,
     pub body: Option<String>,
     pub expected_status: Option<u16>,
     /// Expected response HTTP version prefix, e.g. `HTTP/1.1`, taken from the
@@ -224,7 +360,7 @@ pub struct HurlEntry {
     /// round-trip (and are checked by the runner); not surfaced in the
     /// wizard. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
-    pub response_headers: Vec<(String, String, bool)>,
+    pub response_headers: Vec<KvRow>,
     /// Expected response body (the implicit body assert that follows the
     /// response sections). Preserved so it round-trips; not surfaced in the
     /// wizard. `#[serde(default)]` keeps older saved states loadable.
@@ -281,20 +417,24 @@ pub struct HurlEntry {
 }
 
 impl HurlEntry {
-    /// Build an entry from user-entered form fields. `headers` is a list of
-    /// `(key, value, enabled)` triples; triples with an false enabled are skipped. An empty
-    /// `body` becomes `None`.
+    /// Build an entry from user-entered form fields. Rows with a blank key are
+    /// dropped and the rest are trimmed. An empty `body` becomes `None`.
     pub fn from_fields(
         name: &str,
         method: &str,
         url: &str,
-        headers: Vec<(String, String, bool)>,
+        headers: Vec<KvRow>,
         body: &str,
     ) -> Self {
         let headers = headers
             .into_iter()
-            .filter(|(k, _, _)| !k.trim().is_empty())
-            .map(|(k, v, e)| (k.trim().to_string(), v.trim().to_string(), e))
+            .filter(|r| !r.key.trim().is_empty())
+            .map(|r| KvRow {
+                key: r.key.trim().to_string(),
+                value: r.value.trim().to_string(),
+                enabled: r.enabled,
+                desc: r.desc,
+            })
             .collect();
         let body = if body.trim().is_empty() {
             None
@@ -335,10 +475,9 @@ impl HurlEntry {
         let has_content_length = self
             .headers
             .iter()
-            .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"));
+            .any(|r| r.key.eq_ignore_ascii_case("content-length"));
         if carries_body && !has_body && !has_content_length && !has_forms {
-            self.headers
-                .push(("Content-Length".to_string(), "0".to_string(), true));
+            self.headers.push(KvRow::new("Content-Length", "0"));
         }
     }
 
@@ -388,8 +527,8 @@ impl HurlEntry {
         };
         out.push_str(&format!("{method} {}\n", self.url));
         push_comments(&mut out, Headers);
-        for (k, v, enabled) in &self.headers {
-            push_kv_line(&mut out, k, v, *enabled);
+        for row in &self.headers {
+            push_kv_line(&mut out, row);
         }
         push_comments(&mut out, BasicAuth);
         if let Some((user, pass)) = &self.basic_auth {
@@ -398,15 +537,15 @@ impl HurlEntry {
         push_comments(&mut out, Cookies);
         if !self.cookies.is_empty() {
             out.push_str("[Cookies]\n");
-            for (k, v, enabled) in &self.cookies {
-                push_kv_line(&mut out, k, v, *enabled);
+            for row in &self.cookies {
+                push_kv_line(&mut out, row);
             }
         }
         push_comments(&mut out, Query);
         if !self.queries.is_empty() {
             out.push_str("[Query]\n");
-            for (k, v, enabled) in &self.queries {
-                push_kv_line(&mut out, k, v, *enabled);
+            for row in &self.queries {
+                push_kv_line(&mut out, row);
             }
         }
         push_comments(&mut out, Form);
@@ -429,14 +568,15 @@ impl HurlEntry {
                 "[Form]\n"
             });
             for f in &self.form_fields {
+                push_desc(&mut out, &f.desc);
                 push_line(&mut out, &form_field_line(f), f.enabled);
             }
         }
         push_comments(&mut out, Options);
         if !self.options.is_empty() {
             out.push_str("[Options]\n");
-            for (k, v, enabled) in &self.options {
-                push_kv_line(&mut out, k, v, *enabled);
+            for row in &self.options {
+                push_kv_line(&mut out, row);
             }
         }
         // The request body must follow every request `[Section]`: `hurl_core`
@@ -484,8 +624,8 @@ impl HurlEntry {
             out.push_str(&format!("{version} *\n"));
         }
         push_comments(&mut out, ResponseHeaders);
-        for (k, v, enabled) in &self.response_headers {
-            push_kv_line(&mut out, k, v, *enabled);
+        for row in &self.response_headers {
+            push_kv_line(&mut out, row);
         }
         push_comments(&mut out, Asserts);
         if !self.asserts.is_empty() {
@@ -596,7 +736,7 @@ mod tests {
         assert!(
             e.headers
                 .iter()
-                .any(|(k, v, _)| k == "Content-Length" && v == "0")
+                .any(|r| r.key == "Content-Length" && r.value == "0")
         );
     }
 
@@ -606,7 +746,7 @@ mod tests {
             let mut e = entry(m);
             e.ensure_run_content_length();
             assert!(
-                e.headers.iter().any(|(k, _, _)| k == "Content-Length"),
+                e.headers.iter().any(|r| r.key == "Content-Length"),
                 "expected Content-Length for {m}"
             );
         }
@@ -620,7 +760,7 @@ mod tests {
             assert!(
                 !e.headers
                     .iter()
-                    .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length")),
+                    .any(|r| r.key.eq_ignore_ascii_case("content-length")),
                 "did not expect Content-Length for {m}"
             );
         }
@@ -634,7 +774,7 @@ mod tests {
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|r| r.key.eq_ignore_ascii_case("content-length"))
         );
     }
 
@@ -648,26 +788,52 @@ mod tests {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         }];
         e.ensure_run_content_length();
         assert!(
             !e.headers
                 .iter()
-                .any(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
+                .any(|r| r.key.eq_ignore_ascii_case("content-length"))
         );
     }
 
     #[test]
     fn a_user_set_content_length_is_not_duplicated() {
         let mut e = entry("POST");
-        e.headers
-            .push(("content-length".to_string(), "5".to_string(), true));
+        e.headers.push(KvRow::toggled("content-length", "5", true));
         e.ensure_run_content_length();
         let count = e
             .headers
             .iter()
-            .filter(|(k, _, _)| k.eq_ignore_ascii_case("content-length"))
+            .filter(|r| r.key.eq_ignore_ascii_case("content-length"))
             .count();
         assert_eq!(count, 1);
+    }
+
+    /// `HurlEntry` is serialised verbatim into `~/.config/paperboy/state.json`,
+    /// so a state file written before rows grew a description (an array of
+    /// `[key, value, enabled]`) must still load.
+    #[test]
+    fn a_row_saved_before_descriptions_existed_still_loads() {
+        let legacy: KvRow = serde_json::from_str(r#"["X-Trace","on",false]"#)
+            .expect("the legacy three-element form must still deserialise");
+        assert_eq!(legacy.key, "X-Trace");
+        assert_eq!(legacy.value, "on");
+        assert!(!legacy.enabled);
+        assert_eq!(legacy.desc, "", "with no note, of course");
+    }
+
+    #[test]
+    fn a_described_row_round_trips_through_the_saved_state_format() {
+        let row = KvRow {
+            key: "X-Trace".into(),
+            value: "on".into(),
+            enabled: true,
+            desc: "staging only".into(),
+        };
+        let back: KvRow = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back.desc, "staging only");
+        assert_eq!(back.key, "X-Trace");
     }
 }

@@ -216,6 +216,9 @@ pub fn run(
         base_var_names: Some(&base_var_names_owned),
         all_env_var_names: Some(&all_env_var_names_owned),
         request_entries: Some(&entries),
+        // The headless runner has no language setting of its own — its output
+        // is read by scripts and CI logs, which is English territory.
+        strings: &crate::i18n::Strings::for_language(&crate::i18n::Language::English),
     };
     let diags = validate(&flow, &ctx);
     let has_error = diags.iter().any(|d| d.severity == Severity::Error);

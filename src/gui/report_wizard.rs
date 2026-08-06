@@ -17,8 +17,10 @@ use eframe::egui::{self, RichText};
 use crate::report::context;
 use crate::report::edit::node_at;
 use crate::report::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef, WithItem,
+    EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef,
+    WithItem,
 };
+use crate::report::model::StatKind;
 
 use super::app::GuiApp;
 use super::report_editor::ReportEditor;
@@ -31,11 +33,78 @@ pub enum Wizard {
     Assign(AssignForm),
     List(ListForm),
     Folders(FoldersForm),
-    /// Fallback for kinds without a dedicated form (reported variables, computed
-    /// columns, exotic producers): edit the raw statement text.
+    /// `REPORT <var>` / `REPORT <var> AS <name>`: which in-scope variables become
+    /// columns.
+    Vars(VarsForm),
+    /// `REPORT "<template>" AS <name>`: a computed column.
+    Computed(ComputedForm),
+    /// Fallback for kinds without a dedicated form (tuple-pattern loops, tuple
+    /// list literals, exotic producers): edit the raw statement text.
     Raw(RawForm),
     /// One `name: query` field of a report request's `WITH … END` block.
     WithField(WithFieldForm),
+}
+
+/// The `REPORT <var>` form. The checklist covers the variables the static scan
+/// can see; `other` is the escape hatch for names bound only at run time (by
+/// `ZIP`/`TUPLES FROM`, or supplied by an environment file).
+pub struct VarsForm {
+    path: Vec<usize>,
+    /// `(name, ticked)` over every variable in scope, in flow order.
+    vars: Vec<(String, bool)>,
+    other: String,
+    /// The `AS` name. Only meaningful for a single variable — `REPORT (A, B)`
+    /// emits two columns and so has no one name to give.
+    alias: String,
+    stats: Vec<(StatKind, bool)>,
+}
+
+impl VarsForm {
+    /// Every variable the form would report, ticked ones first then `other`.
+    fn chosen(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .vars
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let other = self.other.trim();
+        if !other.is_empty() && !v.iter().any(|n| n == other) {
+            v.push(other.to_string());
+        }
+        v
+    }
+
+    /// The node this form describes, or `None` when nothing is picked.
+    fn node(&self) -> Option<FlowNode> {
+        let chosen = self.chosen();
+        let (first, rest) = chosen.split_first()?;
+        let alias = self.alias.trim();
+        // An alias applies to exactly one column, so a multi-variable pick
+        // ignores it rather than silently dropping the extra variables.
+        if rest.is_empty() && !alias.is_empty() {
+            return Some(FlowNode::Report(ReportStmt::VarAs {
+                var: first.clone(),
+                name: alias.to_string(),
+                stats: self
+                    .stats
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(k, _)| *k)
+                    .collect(),
+            }));
+        }
+        Some(FlowNode::Report(ReportStmt::Vars(chosen)))
+    }
+}
+
+/// The `REPORT "<template>" AS <name>` form. Both halves are mandatory: the
+/// statement will not re-parse without them.
+pub struct ComputedForm {
+    path: Vec<usize>,
+    template: String,
+    alias: String,
+    stats: Vec<(StatKind, bool)>,
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -62,6 +131,10 @@ pub struct FoldersForm {
     var: String,
     dir: String,
     parallel: bool,
+    /// `PARALLEL`'s optional max-concurrency, kept as text so the box can be
+    /// left blank (meaning "use the prelude's MAX_PARALLEL") and so half-typed
+    /// input isn't clamped under the user's cursor.
+    degree: String,
 }
 
 /// The generic fallback form: the node's single statement line, edited as text
@@ -81,6 +154,19 @@ pub struct WithFieldForm {
     index: Option<usize>,
     name: String,
     query: String,
+    /// The `STATISTICS(…)` checklist: `(stat, on)` over every choosable stat, in
+    /// [`StatKind::CHOOSABLE`] order. None ticked ⇒ no clause.
+    stats: Vec<(StatKind, bool)>,
+}
+
+impl WithFieldForm {
+    fn stats(&self) -> Vec<StatKind> {
+        self.stats
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(k, _)| *k)
+            .collect()
+    }
 }
 
 /// The request form: pick the name, toggle whether it is *reported*, and — when
@@ -95,9 +181,12 @@ pub struct RequestForm {
     alias: String,
     /// The `SHOW(…)` checklist: `(field, included)`. All ticked ⇒ no clause.
     fields: Vec<(String, bool)>,
+    /// The `HIDE(…)` checklist over the same field list: `(field, hidden)`.
+    /// None ticked ⇒ no clause. `HIDE` subtracts from whatever `SHOW` selected,
+    /// so both lists cover the same names.
+    hide_fields: Vec<(String, bool)>,
     /// Preserved verbatim across the edit (the form doesn't expose them).
     with: Vec<WithItem>,
-    hide: Vec<String>,
 }
 
 impl RequestForm {
@@ -108,6 +197,15 @@ impl RequestForm {
             return Vec::new();
         }
         self.fields
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// The `HIDE(…)` list for the ticked rows; empty ⇒ no clause.
+    fn hide(&self) -> Vec<String> {
+        self.hide_fields
             .iter()
             .filter(|(_, on)| *on)
             .map(|(n, _)| n.clone())
@@ -127,7 +225,7 @@ impl RequestForm {
                 alias: self.alias_opt(),
                 response_fmt: self.response,
                 show: self.show(),
-                hide: self.hide.clone(),
+                hide: self.hide(),
                 with: self.with.clone(),
             })
         } else {
@@ -153,13 +251,20 @@ pub struct EnvsForm {
     var: String,
     compare: bool,
     parallel: bool,
+    /// `PARALLEL`'s optional max-concurrency, kept as text so the box can be
+    /// left blank (meaning "use the prelude's MAX_PARALLEL") and so half-typed
+    /// input isn't clamped under the user's cursor.
+    degree: String,
     entries: Vec<EnvEntry>,
     /// Loaded environment names an entry cycles through.
     choices: Vec<String>,
     /// Discovered `.baseline` snapshot paths a `FILE(…)` entry cycles through.
     snapshots: Vec<String>,
-    /// `BASELINE(…) SHOW(…)` fields, preserved verbatim (no editing UI).
-    baseline_show: Vec<String>,
+    /// `BASELINE(…) SHOW(…)` as a checklist: every field the loop body's
+    /// requests can emit, ticked when it is in `baseline_show`. Empty
+    /// `baseline_show` means "no SHOW clause", which is NOT the same as "show
+    /// everything" — so nothing is ticked by default.
+    baseline_show_fields: Vec<(String, bool)>,
 }
 
 impl EnvsForm {
@@ -170,6 +275,21 @@ impl EnvsForm {
         } else {
             v.to_string()
         }
+    }
+
+    /// The ticked `BASELINE(…) SHOW(…)` fields, in the checklist's canonical
+    /// order.
+    ///
+    /// Ticking nothing writes no `SHOW` clause at all — for a baseline that
+    /// means "copy nothing across", which is the language's default, so there
+    /// is no ambiguity with the request-level `SHOW` where empty means "show
+    /// everything".
+    fn selected_baseline_show(&self) -> Vec<String> {
+        self.baseline_show_fields
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// The [`EnvClause`] the current rows describe, or `None` when nothing is
@@ -199,7 +319,7 @@ impl EnvsForm {
             Some(EnvClause::Roles {
                 baseline,
                 comparisons,
-                baseline_show: self.baseline_show.clone(),
+                baseline_show: self.selected_baseline_show(),
             })
         } else {
             let names: Vec<String> = self
@@ -221,6 +341,10 @@ pub struct FilesForm {
     dir: String,
     glob: String,
     parallel: bool,
+    /// `PARALLEL`'s optional max-concurrency, kept as text so the box can be
+    /// left blank (meaning "use the prelude's MAX_PARALLEL") and so half-typed
+    /// input isn't clamped under the user's cursor.
+    degree: String,
 }
 
 impl FilesForm {
@@ -243,11 +367,56 @@ impl FilesForm {
 // Opening a wizard for a node
 // ---------------------------------------------------------------------------
 
+/// Build the [`VarsForm`] for a reported-variable node. The candidate list needs
+/// the bound collection so that the `[Captures]` of requests earlier in the flow
+/// are offered alongside the flow's own assignments and loop binders.
+fn build_vars(
+    app: &GuiApp,
+    flow: &crate::report::flow::ReportFlow,
+    report_path: Option<&std::path::Path>,
+    path: &[usize],
+    node: &FlowNode,
+) -> VarsForm {
+    let (chosen, alias, stats) = match node {
+        FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), String::new(), Vec::new()),
+        FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
+            (vec![var.clone()], name.clone(), stats.clone())
+        }
+        _ => (Vec::new(), String::new(), Vec::new()),
+    };
+    let entries = context::resolve_bound_collection(&app.session.collections, flow, report_path)
+        .map(|ci| app.session.collections[ci].entries.as_slice())
+        .unwrap_or(&[]);
+    let in_scope = crate::report::edit::vars_in_scope(flow, path, entries);
+    let mut vars: Vec<(String, bool)> = in_scope
+        .iter()
+        .map(|n| (n.clone(), chosen.contains(n)))
+        .collect();
+    // A variable already reported but no longer in scope still has to be
+    // visible, or opening the form would quietly drop it.
+    for c in &chosen {
+        if !vars.iter().any(|(n, _)| n == c) {
+            vars.push((c.clone(), true));
+        }
+    }
+    VarsForm {
+        path: path.to_vec(),
+        vars,
+        other: String::new(),
+        alias,
+        stats: StatKind::CHOOSABLE
+            .iter()
+            .map(|k| (*k, stats.contains(k)))
+            .collect(),
+    }
+}
+
 /// Open the appropriate configure wizard for the node at `path`. Requests, ENVS
 /// loops, single-variable FILES loops, assignments, list literals and FOLDERS
-/// loops each get a purpose-built form; every other kind (reported variables,
-/// computed columns, exotic producers) falls back to a raw single-line editor,
-/// so no node is ever left without a way to edit it.
+/// loops, reported variables and computed columns each get a purpose-built form;
+/// the handful of kinds with no palette entry (tuple-pattern loops, tuple list
+/// literals, `ZIP`/`CONCAT`/`TUPLES FROM` producers) fall back to a raw
+/// single-line editor, so no node is ever left without a way to edit it.
 pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
     let Some(flow) = ed.flow.clone() else {
         return;
@@ -299,6 +468,22 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
                 values: list_values_text(elems),
             })
         }
+        FlowNode::Report(ReportStmt::Vars(_)) | FlowNode::Report(ReportStmt::VarAs { .. }) => {
+            Wizard::Vars(build_vars(app, &flow, report_path.as_deref(), path, &node))
+        }
+        FlowNode::Report(ReportStmt::Computed {
+            template,
+            name,
+            stats,
+        }) => Wizard::Computed(ComputedForm {
+            path: path.to_vec(),
+            template: template.clone(),
+            alias: name.clone(),
+            stats: StatKind::CHOOSABLE
+                .iter()
+                .map(|k| (*k, stats.contains(k)))
+                .collect(),
+        }),
         _ => Wizard::Raw(RawForm {
             path: path.to_vec(),
             text: node.header_line(),
@@ -323,17 +508,21 @@ pub fn open_with_field(ed: &mut ReportEditor, path: &[usize], index: Option<usiz
                 _ => None,
             })
     });
-    let (index, name, query) = match existing {
-        Some(WithItem::Field { name, query, .. }) => (index, name, query),
+    let (index, name, query, stats) = match existing {
+        Some(WithItem::Field { name, query, stats }) => (index, name, query, stats),
         // Editing a non-field (bare `WITH RESPONSE`) or a stale index falls
         // through to a fresh append rather than silently doing nothing.
-        _ => (None, String::new(), String::new()),
+        _ => (None, String::new(), String::new(), Vec::new()),
     };
     ed.wizard = Some(Wizard::WithField(WithFieldForm {
         path: path.to_vec(),
         index,
         name,
         query,
+        stats: StatKind::CHOOSABLE
+            .iter()
+            .map(|k| (*k, stats.contains(k)))
+            .collect(),
     }));
 }
 
@@ -378,6 +567,53 @@ fn parse_list_values(text: &str) -> Vec<crate::report::flow::Element> {
         .collect()
 }
 
+/// Render `PARALLEL`'s max-concurrency box beside its checkbox. Disabled (but
+/// still visible) while the loop is serial, so the setting is discoverable
+/// without the checkbox row jumping in size as it is toggled.
+fn parallel_row(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    parallel: &mut bool,
+    degree: &mut String,
+) {
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut *parallel,
+            RichText::new(s.report_node_parallel_label).color(th.text),
+        );
+        ui.add_enabled_ui(*parallel, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(degree)
+                    .hint_text(s.node_form_parallel_degree)
+                    .desired_width(48.0),
+            );
+            ui.label(RichText::new(s.node_form_parallel_degree_label).color(th.dim));
+        });
+    });
+}
+
+/// The text shown in the max-concurrency box for an existing `PARALLEL` spec —
+/// blank for a plain `PARALLEL` (no explicit limit) or a serial loop.
+fn degree_text(parallel: &Option<ParallelSpec>) -> String {
+    parallel
+        .as_ref()
+        .and_then(|p| p.degree)
+        .map(|n| n.to_string())
+        .unwrap_or_default()
+}
+
+/// Turn the typed max-concurrency into a `ParallelSpec`, preserving `existing`
+/// when the loop stays serial is not the case. Anything that isn't a positive
+/// integer (including a blank box) becomes "no explicit limit", which is the
+/// plain `PARALLEL` form — the parser rejects `PARALLEL(0)`, so a 0 must never
+/// reach the flow.
+fn parallel_spec(on: bool, degree: &str) -> Option<ParallelSpec> {
+    on.then(|| ParallelSpec {
+        degree: degree.trim().parse::<u32>().ok().filter(|n| *n > 0),
+    })
+}
+
 fn build_folders(path: Vec<usize>, node: &FlowNode) -> FoldersForm {
     let (var, dir, parallel) = match node {
         FlowNode::ForEach {
@@ -388,7 +624,7 @@ fn build_folders(path: Vec<usize>, node: &FlowNode) -> FoldersForm {
         } => (
             pattern.named().next().unwrap_or("FOLDER").to_string(),
             dir.clone(),
-            parallel.is_some(),
+            *parallel,
         ),
         _ => unreachable!("build_folders called on a non-FOLDERS node"),
     };
@@ -396,7 +632,8 @@ fn build_folders(path: Vec<usize>, node: &FlowNode) -> FoldersForm {
         path,
         var,
         dir,
-        parallel,
+        parallel: parallel.is_some(),
+        degree: degree_text(&parallel),
     }
 }
 
@@ -477,13 +714,22 @@ fn build_request(
     for f in &show {
         push(f, &mut names);
     }
+    // A HIDE entry naming a field nothing else knows about still has to appear
+    // in the checklist, or applying the form would silently drop it.
+    for f in &hide {
+        push(f, &mut names);
+    }
     let all = show.is_empty();
     let fields = names
-        .into_iter()
+        .iter()
         .map(|n| {
-            let on = all || show.iter().any(|s| s == &n);
-            (n, on)
+            let on = all || show.iter().any(|s| s == n);
+            (n.clone(), on)
         })
+        .collect();
+    let hide_fields = names
+        .iter()
+        .map(|n| (n.clone(), hide.iter().any(|h| h == n)))
         .collect();
 
     RequestForm {
@@ -494,8 +740,8 @@ fn build_request(
         response,
         alias: alias.unwrap_or_default(),
         fields,
+        hide_fields,
         with,
-        hide,
     }
 }
 
@@ -506,13 +752,13 @@ fn build_envs(
     path: Vec<usize>,
     node: &FlowNode,
 ) -> EnvsForm {
-    let (var, clause, parallel) = match node {
+    let (var, clause, parallel, body) = match node {
         FlowNode::ForEnvs {
             var,
             clause,
             parallel,
-            ..
-        } => (var.clone(), clause.clone(), parallel.is_some()),
+            body,
+        } => (var.clone(), clause.clone(), *parallel, body.as_slice()),
         _ => unreachable!("build_envs called on a non-ENVS node"),
     };
 
@@ -565,15 +811,23 @@ fn build_envs(
         });
     }
 
+    let bound_entries =
+        context::resolve_bound_collection(&app.session.collections, flow, report_path)
+            .map(|ci| app.session.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+    let baseline_show_fields =
+        crate::report::edit::baseline_show_choices(bound_entries, body, &baseline_show);
+
     EnvsForm {
         path,
         var,
         compare,
-        parallel,
+        parallel: parallel.is_some(),
+        degree: degree_text(&parallel),
         entries,
         choices,
         snapshots,
-        baseline_show,
+        baseline_show_fields,
     }
 }
 
@@ -588,7 +842,7 @@ fn build_files(path: Vec<usize>, node: &FlowNode) -> FilesForm {
             pattern.named().next().unwrap_or("FILE").to_string(),
             dir.clone(),
             glob.clone().unwrap_or_default(),
-            parallel.is_some(),
+            *parallel,
         ),
         _ => unreachable!("build_files called on a non-FILES node"),
     };
@@ -597,7 +851,8 @@ fn build_files(path: Vec<usize>, node: &FlowNode) -> FilesForm {
         var,
         dir,
         glob,
-        parallel,
+        parallel: parallel.is_some(),
+        degree: degree_text(&parallel),
     }
 }
 
@@ -642,6 +897,11 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
         return;
     }
     let th = app.theme;
+    // Where a folder picker opens when the form's own field is still blank.
+    let fallback = app
+        .session
+        .picker_dir(crate::session::PickerKind::Other)
+        .map(|p| p.to_path_buf());
     let s = &app.strings;
     let mut outcome = Outcome::None;
 
@@ -651,10 +911,12 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
         match wiz {
             Wizard::Request(f) => request_ui(ui, &th, s, f),
             Wizard::Envs(f) => envs_ui(ui, &th, s, f),
-            Wizard::Files(f) => files_ui(ui, &th, s, f),
+            Wizard::Files(f) => files_ui(ui, &th, s, f, fallback.as_deref()),
             Wizard::Assign(f) => assign_ui(ui, &th, s, f),
             Wizard::List(f) => list_ui(ui, &th, s, f),
-            Wizard::Folders(f) => folders_ui(ui, &th, s, f),
+            Wizard::Folders(f) => folders_ui(ui, &th, s, f, fallback.as_deref()),
+            Wizard::Vars(f) => vars_ui(ui, &th, s, f),
+            Wizard::Computed(f) => computed_ui(ui, &th, s, f),
             Wizard::Raw(f) => raw_ui(ui, &th, s, f),
             Wizard::WithField(f) => with_field_ui(ui, &th, s, f),
         }
@@ -749,6 +1011,19 @@ fn request_ui(
                     ui.checkbox(on, RichText::new(name.as_str()).color(th.text));
                 }
             });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new(s.node_form_hide).color(th.dim));
+        ui.label(RichText::new(s.node_form_hide_hint).color(th.dim));
+        egui::ScrollArea::vertical()
+            .id_salt("pt_req_hide_fields")
+            .max_height(120.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (name, on) in &mut f.hide_fields {
+                    ui.checkbox(on, RichText::new(name.as_str()).color(th.text));
+                }
+            });
     }
 }
 
@@ -781,10 +1056,7 @@ fn envs_ui(
             }
         }
     });
-    ui.checkbox(
-        &mut f.parallel,
-        RichText::new(s.report_node_parallel_label).color(th.text),
-    );
+    parallel_row(ui, th, s, &mut f.parallel, &mut f.degree);
 
     ui.add_space(6.0);
     ui.label(RichText::new(s.node_envs_environments).color(th.dim));
@@ -836,6 +1108,13 @@ fn envs_ui(
                 remove = Some(i);
             }
         });
+        // The `SHOW` belongs to the BASELINE role, not to the loop, so it is
+        // drawn as an indented, boxed continuation of the baseline's own row —
+        // close enough to read as part of it, and impossible to mistake for
+        // something governing the comparisons listed below.
+        if compare && f.entries[i].baseline {
+            baseline_show_ui(ui, th, s, &mut f.baseline_show_fields);
+        }
     }
     if let Some(i) = make_baseline {
         for (j, e) in f.entries.iter_mut().enumerate() {
@@ -876,6 +1155,7 @@ fn files_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FilesForm,
+    fallback: Option<&std::path::Path>,
 ) {
     ui.heading(RichText::new(s.report_node_files_title).color(th.text));
     ui.add_space(4.0);
@@ -892,7 +1172,7 @@ fn files_ui(
                 if ui.button(s.gui_browse).clicked() {
                     if let Some(p) = super::filepick::pick_folder(
                         s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref(),
+                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
                     ) {
                         f.dir = p.to_string_lossy().into_owned();
                     }
@@ -903,10 +1183,7 @@ fn files_ui(
             ui.add(egui::TextEdit::singleline(&mut f.glob).desired_width(220.0));
             ui.end_row();
         });
-    ui.checkbox(
-        &mut f.parallel,
-        RichText::new(s.report_node_parallel_label).color(th.text),
-    );
+    parallel_row(ui, th, s, &mut f.parallel, &mut f.degree);
 }
 
 fn assign_ui(
@@ -957,6 +1234,7 @@ fn folders_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FoldersForm,
+    fallback: Option<&std::path::Path>,
 ) {
     ui.heading(RichText::new(s.node_folders_title).color(th.text));
     ui.add_space(4.0);
@@ -973,7 +1251,7 @@ fn folders_ui(
                 if ui.button(s.gui_browse).clicked() {
                     if let Some(p) = super::filepick::pick_folder(
                         s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref(),
+                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
                     ) {
                         f.dir = p.to_string_lossy().into_owned();
                     }
@@ -981,10 +1259,7 @@ fn folders_ui(
             });
             ui.end_row();
         });
-    ui.checkbox(
-        &mut f.parallel,
-        RichText::new(s.report_node_parallel_label).color(th.text),
-    );
+    parallel_row(ui, th, s, &mut f.parallel, &mut f.degree);
 }
 
 fn raw_ui(
@@ -1002,6 +1277,90 @@ fn raw_ui(
             .desired_rows(2)
             .font(egui::TextStyle::Monospace),
     );
+}
+
+/// Draw the statistics checklist shared by the `WITH`-field, reported-variable
+/// and computed-column forms. Laid out in columns because nine stacked
+/// checkboxes would push the OK / Cancel row off a short window.
+fn stats_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    stats: &mut [(StatKind, bool)],
+) {
+    ui.label(RichText::new(s.node_form_statistics).color(th.dim));
+    ui.label(RichText::new(s.node_form_statistics_hint).color(th.dim));
+    ui.horizontal_top(|ui| {
+        for chunk in stats.chunks_mut(5) {
+            ui.vertical(|ui| {
+                for (kind, on) in chunk {
+                    ui.checkbox(on, RichText::new(kind.label()).color(th.text));
+                }
+            });
+        }
+    });
+}
+
+fn vars_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut VarsForm,
+) {
+    ui.heading(RichText::new(s.report_node_vars_title).color(th.text));
+    ui.add_space(4.0);
+    if f.vars.is_empty() {
+        ui.label(RichText::new(s.report_node_vars_none).color(th.dim));
+    }
+    for (name, on) in &mut f.vars {
+        ui.checkbox(on, RichText::new(name.as_str()).color(th.text));
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(s.report_node_vars_other_label).color(th.dim));
+        ui.add(egui::TextEdit::singleline(&mut f.other).desired_width(200.0));
+    });
+    // A single column can be renamed and summarised; several cannot, so the
+    // rows disappear rather than sit there doing nothing.
+    if f.chosen().len() == 1 {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(s.report_node_alias_label).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.alias).desired_width(200.0));
+        });
+        if !f.alias.trim().is_empty() {
+            ui.add_space(6.0);
+            stats_ui(ui, th, s, &mut f.stats);
+        }
+    }
+}
+
+fn computed_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    f: &mut ComputedForm,
+) {
+    ui.heading(RichText::new(s.report_node_computed_title).color(th.text));
+    ui.add_space(4.0);
+    egui::Grid::new("pt_computed_grid")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new(s.report_node_computed_template_label).color(th.dim));
+            ui.add(
+                egui::TextEdit::singleline(&mut f.template)
+                    .hint_text(s.report_node_computed_template_hint)
+                    .desired_width(240.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.end_row();
+            ui.label(RichText::new(s.report_node_computed_name_label).color(th.dim));
+            ui.add(egui::TextEdit::singleline(&mut f.alias).desired_width(240.0));
+            ui.end_row();
+        });
+    ui.add_space(6.0);
+    stats_ui(ui, th, s, &mut f.stats);
 }
 
 fn with_field_ui(
@@ -1029,6 +1388,9 @@ fn with_field_ui(
             );
             ui.end_row();
         });
+
+    ui.add_space(6.0);
+    stats_ui(ui, th, s, &mut f.stats);
 }
 
 fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
@@ -1046,14 +1408,13 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 return;
             };
             let path = f.path.clone();
-            // Preserve the node's body and any explicit PARALLEL(n) degree; only
-            // the var/clause and the parallel on/off state change here.
-            let (body, existing_parallel) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path))
-            {
-                Some(FlowNode::ForEnvs { body, parallel, .. }) => (body.clone(), *parallel),
+            // Preserve the node's body; the var/clause and the PARALLEL
+            // toggle and degree are what this form edits.
+            let body = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+                Some(FlowNode::ForEnvs { body, .. }) => body.clone(),
                 _ => return,
             };
-            let parallel = f.parallel.then(|| existing_parallel.unwrap_or_default());
+            let parallel = parallel_spec(f.parallel, &f.degree);
             let node = FlowNode::ForEnvs {
                 var: f.var_or_default(),
                 clause,
@@ -1064,12 +1425,11 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
         }
         Wizard::Files(f) => {
             let path = f.path.clone();
-            let (body, existing_parallel) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path))
-            {
-                Some(FlowNode::ForEach { body, parallel, .. }) => (body.clone(), *parallel),
+            let body = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+                Some(FlowNode::ForEach { body, .. }) => body.clone(),
                 _ => return,
             };
-            let parallel = f.parallel.then(|| existing_parallel.unwrap_or_default());
+            let parallel = parallel_spec(f.parallel, &f.degree);
             let node = FlowNode::ForEach {
                 pattern: Pattern::single(f.var_or_default()),
                 producer: Producer::Files {
@@ -1107,19 +1467,17 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
         }
         Wizard::Folders(f) => {
             let path = f.path.clone();
-            // Preserve the loop body and any WITH role globs; only var/dir and
-            // the parallel toggle are edited here.
-            let (body, roles, existing_parallel) =
-                match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
-                    Some(FlowNode::ForEach {
-                        body,
-                        producer: Producer::Folders { roles, .. },
-                        parallel,
-                        ..
-                    }) => (body.clone(), roles.clone(), *parallel),
-                    _ => return,
-                };
-            let parallel = f.parallel.then(|| existing_parallel.unwrap_or_default());
+            // Preserve the loop body and any WITH role globs; var/dir and the
+            // PARALLEL toggle and degree are what this form edits.
+            let (body, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+                Some(FlowNode::ForEach {
+                    body,
+                    producer: Producer::Folders { roles, .. },
+                    ..
+                }) => (body.clone(), roles.clone()),
+                _ => return,
+            };
+            let parallel = parallel_spec(f.parallel, &f.degree);
             let node = FlowNode::ForEach {
                 pattern: Pattern::single(if f.var.trim().is_empty() {
                     "FOLDER".to_string()
@@ -1133,6 +1491,31 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 body,
                 parallel,
             };
+            ed.wizard_apply(app, &path, node);
+        }
+        Wizard::Vars(f) => {
+            let path = f.path.clone();
+            let Some(node) = f.node() else { return };
+            ed.wizard_apply(app, &path, node);
+        }
+        Wizard::Computed(f) => {
+            let path = f.path.clone();
+            let (template, alias) = (f.template.trim(), f.alias.trim());
+            // Either half missing and the statement would not re-parse, which
+            // would eject the user from the node editor.
+            if template.is_empty() || alias.is_empty() {
+                return;
+            }
+            let node = FlowNode::Report(ReportStmt::Computed {
+                template: template.to_string(),
+                name: alias.to_string(),
+                stats: f
+                    .stats
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(k, _)| *k)
+                    .collect(),
+            });
             ed.wizard_apply(app, &path, node);
         }
         Wizard::Raw(f) => {
@@ -1151,15 +1534,238 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 return;
             }
             let index = f.index;
+            let stats = f.stats();
             ed.commit_edit(app, |flow| match index {
                 Some(i) => {
-                    crate::report::edit::set_with_field(flow, &path, i, &name, &query);
+                    crate::report::edit::set_with_field(flow, &path, i, &name, &query, stats);
                 }
                 None => {
-                    crate::report::edit::add_with_field(flow, &path, &name, &query);
+                    crate::report::edit::add_with_field(flow, &path, &name, &query, stats);
                 }
             });
             ed.selection = path;
         }
+    }
+}
+
+/// The `BASELINE(…) SHOW(…)` checklist, drawn indented and boxed beneath the
+/// baseline it belongs to.
+///
+/// Kept a free function taking only the checklist so it can be exercised
+/// without building a whole [`EnvsForm`], and so the caller can render it
+/// mid-loop without holding a borrow on the rest of the form.
+fn baseline_show_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    fields: &mut [(String, bool)],
+) {
+    if fields.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        // The indent is the visual tie to the baseline row above it.
+        ui.add_space(24.0);
+        egui::Frame::new()
+            .fill(th.panel)
+            .stroke(egui::Stroke::new(1.0, th.dim))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(s.node_envs_baseline_show).color(th.accent));
+                        ui.label(
+                            RichText::new(format!("({})", s.node_envs_baseline_show_applies))
+                                .italics()
+                                .color(th.dim),
+                        );
+                    });
+                    ui.label(RichText::new(s.node_envs_baseline_show_hint).color(th.dim));
+                    egui::ScrollArea::vertical()
+                        .id_salt("pt_envs_baseline_show")
+                        .max_height(140.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (name, on) in fields.iter_mut() {
+                                ui.checkbox(on, RichText::new(name.as_str()).color(th.text));
+                            }
+                        });
+                });
+            });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::flow::{EnvClause, RoleRef};
+
+    /// An ENVS form in compare mode with the given `SHOW` checklist.
+    fn compare_form(fields: Vec<(String, bool)>) -> EnvsForm {
+        EnvsForm {
+            path: vec![0],
+            var: "TARGET".into(),
+            compare: true,
+            parallel: false,
+            degree: String::new(),
+            entries: vec![
+                EnvEntry {
+                    name: "prod".into(),
+                    baseline: true,
+                    file: false,
+                },
+                EnvEntry {
+                    name: "staging".into(),
+                    baseline: false,
+                    file: false,
+                },
+            ],
+            choices: vec!["prod".into(), "staging".into()],
+            snapshots: Vec::new(),
+            baseline_show_fields: fields,
+        }
+    }
+
+    /// One ticked variable plus a name is a renamed column; a second tick has to
+    /// drop back to the plain multi-column form, because `AS` names one column.
+    #[test]
+    fn a_named_single_variable_becomes_an_alias_and_a_pair_stays_plain() {
+        let mut form = VarsForm {
+            path: vec![0],
+            vars: vec![("TIER".into(), true), ("REGION".into(), false)],
+            other: String::new(),
+            alias: "Plan".into(),
+            stats: StatKind::CHOOSABLE.iter().map(|k| (*k, false)).collect(),
+        };
+        assert!(
+            matches!(
+                form.node(),
+                Some(FlowNode::Report(ReportStmt::VarAs { ref var, ref name, .. }))
+                    if var == "TIER" && name == "Plan"
+            ),
+            "a single ticked variable with a name is reported AS that name"
+        );
+        form.vars[1].1 = true;
+        assert!(
+            matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["TIER".to_string(), "REGION".to_string()]),
+            "two ticked variables report both columns and ignore the name"
+        );
+    }
+
+    /// The free-text row exists for variables the static scan cannot see, so it
+    /// has to reach the node even with nothing ticked.
+    #[test]
+    fn a_typed_variable_is_reported_even_when_nothing_is_ticked() {
+        let form = VarsForm {
+            path: vec![0],
+            vars: vec![("TIER".into(), false)],
+            other: "  RUNTIME_ONLY ".into(),
+            alias: String::new(),
+            stats: Vec::new(),
+        };
+        assert!(
+            matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["RUNTIME_ONLY".to_string()]),
+            "the typed name is trimmed and reported"
+        );
+    }
+
+    #[test]
+    fn ticking_a_baseline_field_writes_a_show_clause_on_the_baseline_role() {
+        let form = compare_form(vec![
+            ("Time".into(), true),
+            ("Status".into(), false),
+            ("Response".into(), true),
+        ]);
+        let Some(EnvClause::Roles {
+            baseline,
+            comparisons,
+            baseline_show,
+        }) = form.clause()
+        else {
+            panic!("a compare form describes a Roles clause")
+        };
+        assert_eq!(
+            baseline,
+            vec![RoleRef::Env("prod".into())],
+            "the baseline role is unaffected by the SHOW"
+        );
+        assert_eq!(
+            comparisons,
+            vec![RoleRef::Env("staging".into())],
+            "and so are the comparisons"
+        );
+        assert_eq!(
+            baseline_show,
+            vec!["Time".to_string(), "Response".to_string()],
+            "the ticked fields become the SHOW list, in the checklist's own order"
+        );
+    }
+
+    #[test]
+    fn ticking_nothing_leaves_the_baseline_with_no_show_clause_at_all() {
+        // Unlike a request's SHOW, where empty means "emit everything", an
+        // empty baseline SHOW means "carry nothing across" — so an untouched
+        // checklist must serialise to no clause rather than to every field.
+        let form = compare_form(vec![("Time".into(), false), ("Status".into(), false)]);
+        let Some(EnvClause::Roles { baseline_show, .. }) = form.clause() else {
+            panic!("a compare form describes a Roles clause")
+        };
+        assert!(
+            baseline_show.is_empty(),
+            "nothing ticked writes no SHOW: {baseline_show:?}"
+        );
+    }
+
+    #[test]
+    fn a_show_field_no_request_offers_is_still_listed_so_editing_cannot_drop_it() {
+        // Hand-written source may name a field the bound collection knows
+        // nothing about (or there may be no collection bound at all). It has to
+        // survive an open-and-apply round trip.
+        let flow = crate::report::parser::parse_flow(
+            "# collection: api.hurl\nFOR TARGET IN ENVS BASELINE(\"p\") SHOW(Handwritten), COMPARISON(\"s\")\n    REPORT REQUEST login\nEND\n",
+        )
+        .expect("the fixture flow parses");
+        let FlowNode::ForEnvs { clause, body, .. } = &flow.nodes[0] else {
+            panic!("the fixture's first node is the ENVS loop")
+        };
+        let EnvClause::Roles { baseline_show, .. } = clause else {
+            panic!("the fixture's clause has roles")
+        };
+        // No collection bound, so nothing but the intrinsics is discoverable —
+        // which is exactly the case where dropping the field would be easiest.
+        let fields = crate::report::edit::baseline_show_choices(&[], body, baseline_show);
+        assert!(
+            fields.iter().any(|(n, on)| n == "Handwritten" && *on),
+            "the unrecognised field is offered, and offered already ticked: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(n, _)| n == "Time"),
+            "alongside the intrinsics every request has: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_show_checklist_is_only_offered_for_reported_requests() {
+        // `REQUEST x` sends but emits nothing, so it contributes no fields for
+        // a baseline to carry across; only `REPORT REQUEST x` does.
+        let nodes = vec![
+            FlowNode::Request {
+                name: "warmup".into(),
+            },
+            FlowNode::Report(crate::report::flow::ReportStmt::Request {
+                name: "login".into(),
+                alias: None,
+                response_fmt: None,
+                show: Vec::new(),
+                hide: Vec::new(),
+                with: Vec::new(),
+            }),
+        ];
+        assert_eq!(
+            crate::report::edit::reported_requests(&nodes),
+            vec!["login".to_string()],
+            "only the reported request is a source of fields"
+        );
     }
 }

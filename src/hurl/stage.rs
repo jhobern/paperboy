@@ -205,6 +205,7 @@ mod tests {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         }
     }
 
@@ -444,6 +445,7 @@ mod tests {
             content_type: None,
             base64_prefix: Some("data:image/png;base64,".to_string()),
             enabled: true,
+            desc: String::new(),
         }])];
         let err = expand_base64_form_fields(&mut entries, Some(&dir))
             .expect_err("a missing base64 file must surface as a non-fatal error");
@@ -474,6 +476,7 @@ mod tests {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         }])];
         let result = stage_out_of_scope_form_files(&mut entries, Some(&collection_dir)).unwrap();
         assert!(
@@ -499,6 +502,7 @@ mod tests {
             content_type: None,
             base64_prefix: Some("data:x;base64,".to_string()),
             enabled: true,
+            desc: String::new(),
         }])];
         expand_base64_form_fields(&mut entries, Some(&dir)).unwrap();
 
@@ -519,6 +523,7 @@ mod tests {
             content_type: None,
             base64_prefix: Some("pfx-".to_string()),
             enabled: true,
+            desc: String::new(),
         }])];
         expand_base64_form_fields(&mut entries, None).unwrap();
         let f = &entries[0].form_fields[0];
@@ -538,6 +543,7 @@ mod tests {
             content_type: None,
             base64_prefix: None,
             enabled: true,
+            desc: String::new(),
         }])];
         assert!(
             expand_base64_form_fields(&mut entries, None).is_err(),

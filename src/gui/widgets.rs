@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::hurl::KvRow;
 use crate::i18n::Strings;
 
 use super::theme::{GuiTheme, method_color};
@@ -120,13 +121,43 @@ pub fn tree_header<R>(
     label: RichText,
     add_body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
+    tree_header_marked(ui, id_salt, default_open, false, label, None, add_body)
+}
+
+/// [`tree_header`] with an optional highlight colour painted as a full-width
+/// band behind the row and a matching bar down its left edge.
+///
+/// Colouring the *text* alone (which is all this used to do for the active
+/// environment) is easy to miss in a list of similar rows — the terminal UI
+/// gets away with less because a terminal list is denser. A filled band reads
+/// at a glance from anywhere in the panel.
+pub fn tree_header_marked<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    default_open: bool,
+    force_open: bool,
+    label: RichText,
+    highlight: Option<egui::Color32>,
+    add_body: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
         default_open,
     );
+    // `force_open` is how something *outside* this row (opening an environment
+    // from the workspace tree, say) says "reveal this one". It only ever opens:
+    // a caller asking to reveal a row the user has already opened must not
+    // toggle it shut.
+    if force_open && !state.is_open() {
+        state.set_open(true);
+    }
     let openness = state.openness(ui.ctx());
+
+    // The band has to be painted *under* the row's contents, so reserve a slot
+    // in the paint order now and fill it once the row's rect is known.
+    let band = highlight.map(|_| ui.painter().add(egui::Shape::Noop));
 
     let header = ui
         .horizontal(|ui| {
@@ -141,6 +172,23 @@ pub fn tree_header<R>(
         })
         .response
         .interact(egui::Sense::click());
+
+    if let (Some(band), Some(color)) = (band, highlight) {
+        let rect = header.rect.expand2(egui::vec2(0.0, 2.0));
+        let mut shapes = vec![egui::Shape::rect_filled(
+            rect,
+            3.0,
+            color.gamma_multiply(0.22),
+        )];
+        // A solid bar on the leading edge, so the row still reads as marked on
+        // a theme whose background leaves the translucent band very faint.
+        shapes.push(egui::Shape::rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+            1.0,
+            color,
+        ));
+        ui.painter().set(band, egui::Shape::Vec(shapes));
+    }
 
     if header.clicked() {
         state.toggle(ui);
@@ -177,45 +225,69 @@ pub fn method_combo(
     changed
 }
 
-/// An editable table of `(key, value, enabled)` rows (headers, query params,
-/// cookies, options). Returns true if anything changed. Adds a trailing
-/// "add row" button.
+/// One column title in a key/value table — dim and bold, so it reads as a
+/// label for the column rather than as another editable row.
+fn column_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str) {
+    ui.label(RichText::new(text).strong().color(theme.dim));
+}
+
+/// An editable table of [`KvRow`]s (headers, query params, cookies, options).
+/// Returns true if anything changed. Adds a trailing "add row" button.
 pub fn kv_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,
     s: &Strings,
     id: impl std::hash::Hash + std::fmt::Debug,
-    rows: &mut Vec<(String, String, bool)>,
+    rows: &mut Vec<KvRow>,
     key_hint: &str,
     val_hint: &str,
+    key_label: &str,
+    val_label: &str,
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
-    // The value must be the grid's *last* column for egui to stretch it to the
-    // full available width — otherwise a trailing "remove" column would be the
-    // one that fills and the value would stay content-sized (a narrow table).
-    // So the remove ✕ is tucked into the value cell via a right-to-left layout:
-    // ✕ pins to the right edge and the value fills everything to its left.
+    // The description must be the grid's *last* column for egui to stretch it to
+    // the full available width — otherwise a trailing "remove" column would be
+    // the one that fills. So the remove ✕ is tucked into the description cell
+    // via a right-to-left layout: ✕ pins to the right edge and the description
+    // fills everything to its left.
     //
-    // The key must grow too (a fixed-width key next to a filling value reads as
-    // "tiny key, huge value"): after reserving the fixed controls (checkbox, ✕,
-    // column spacing) the free width is split ~40% key / ~60% value.
+    // The key and value must grow too (fixed-width columns beside a filling one
+    // read as "tiny key, huge note"): after reserving the fixed controls
+    // (checkbox, ✕, column spacing) each takes a share of the free width.
     let key_w = split_key_width(ui, 72.0);
+    let val_w = key_w * 1.5;
     egui::Grid::new(id)
-        .num_columns(3)
+        .num_columns(4)
         .spacing([8.0, 4.0])
         .striped(true)
         .min_col_width(0.0)
         .show(ui, |ui| {
+            // Column titles, as in the terminal UI: without them a bare grid of
+            // text boxes gives no clue that the tick is "send this row" rather
+            // than "select".
+            column_header(ui, theme, "\u{2713}");
+            column_header(ui, theme, key_label);
+            column_header(ui, theme, val_label);
+            column_header(ui, theme, s.hdr_description);
+            ui.end_row();
             for i in 0..rows.len() {
-                if ui.checkbox(&mut rows[i].2, "").changed() {
+                if ui.checkbox(&mut rows[i].enabled, "").changed() {
                     changed = true;
                 }
                 // A disabled row (checkbox unticked) isn't sent, so grey its
                 // key/value out to read as inactive — matching the terminal UI.
-                let row_color = if rows[i].2 { theme.text } else { theme.dim };
-                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, row_color);
+                let row_color = if rows[i].enabled {
+                    theme.text
+                } else {
+                    theme.dim
+                };
+                let k = sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color);
                 if k.changed() {
+                    changed = true;
+                }
+                let v = sized_key(ui, val_w, &mut rows[i].value, val_hint, row_color);
+                if v.changed() {
                     changed = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -226,13 +298,17 @@ pub fn kv_editor(
                     {
                         remove = Some(i);
                     }
-                    let v = ui.add(
-                        egui::TextEdit::singleline(&mut rows[i].1)
-                            .hint_text(val_hint)
-                            .text_color(row_color)
+                    // The description is a note for whoever reads the file
+                    // later, not part of the request, so it is always dim —
+                    // even on an enabled row it shouldn't compete with the
+                    // value beside it.
+                    let d = ui.add(
+                        egui::TextEdit::singleline(&mut rows[i].desc)
+                            .hint_text(s.gui_hint_description)
+                            .text_color(theme.dim)
                             .desired_width(f32::INFINITY),
                     );
-                    if v.changed() {
+                    if d.changed() {
                         changed = true;
                     }
                 });
@@ -244,7 +320,7 @@ pub fn kv_editor(
         changed = true;
     }
     if ui.button(s.gui_add).clicked() {
-        rows.push((String::new(), String::new(), true));
+        rows.push(KvRow::toggled(String::new(), String::new(), true));
         changed = true;
     }
     changed
@@ -260,6 +336,8 @@ pub fn pair_editor(
     rows: &mut Vec<(String, String)>,
     key_hint: &str,
     val_hint: &str,
+    key_label: &str,
+    val_label: &str,
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
@@ -273,6 +351,11 @@ pub fn pair_editor(
         .striped(true)
         .min_col_width(0.0)
         .show(ui, |ui| {
+            // See `kv_editor`: titled columns, minus the enabled tick this
+            // table doesn't have.
+            column_header(ui, theme, key_label);
+            column_header(ui, theme, val_label);
+            ui.end_row();
             for i in 0..rows.len() {
                 let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, theme.text);
                 if k.changed() {
@@ -353,6 +436,82 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
 mod tests {
     use super::*;
 
+    /// Paint one `tree_header_marked` row and return the fills of every solid
+    /// rectangle it drew, so a test can tell a marked row from a plain one.
+    fn header_fills(highlight: Option<egui::Color32>) -> Vec<egui::Color32> {
+        let ctx = egui::Context::default();
+        let mut fills = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(300.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    tree_header_marked(
+                        ui,
+                        "env-row",
+                        false,
+                        false,
+                        RichText::new("dev"),
+                        highlight,
+                        |_ui| {},
+                    );
+                },
+            );
+            fills.clear();
+            // The band is pushed as a single `Shape::Vec`, so walk into groups
+            // rather than only looking at top-level shapes.
+            fn collect(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+                match shape {
+                    egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT => {
+                        out.push(r.fill)
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, out)),
+                    _ => {}
+                }
+            }
+            out.shapes
+                .iter()
+                .for_each(|s| collect(&s.shape, &mut fills));
+        }
+        fills
+    }
+
+    /// The active Global Environment has to be obvious at a glance, not a tinted
+    /// word among identically-shaped rows: a marked header paints a band plus a
+    /// solid leading bar in the highlight colour, and an unmarked one paints
+    /// neither.
+    #[test]
+    fn a_marked_tree_header_paints_a_band_in_the_highlight_colour() {
+        let mark = egui::Color32::from_rgb(0x3d, 0xd6, 0x8c);
+
+        let marked = header_fills(Some(mark));
+        assert!(
+            marked.contains(&mark),
+            "the solid leading bar uses the highlight colour: {marked:?}"
+        );
+        assert!(
+            marked
+                .iter()
+                .any(|c| *c != mark && c.r() > 0 && c.g() > c.r() && c.g() > c.b()),
+            "a translucent band of the same hue sits behind the row: {marked:?}"
+        );
+
+        let plain = header_fills(None);
+        assert!(
+            !plain.contains(&mark),
+            "an unmarked row paints no highlight: {plain:?}"
+        );
+        assert!(
+            plain.len() < marked.len(),
+            "the marking is the only difference between the two rows"
+        );
+    }
+
     /// A bare `desired_width` key field collapses to a sliver inside a grid
     /// whose last column fills; `sized_key` must instead render at the full
     /// [`split_key_width`] width. Regression test for "the key field is tiny".
@@ -408,6 +567,52 @@ mod tests {
         assert!(
             (rendered - key_w).abs() < 2.0,
             "key rendered {rendered}, expected ~{key_w}"
+        );
+    }
+
+    /// Whether the row's body was drawn — the observable half of "reveal this
+    /// environment": a caller outside the panel asks for it, and the collapsing
+    /// row opens without the user having clicked it.
+    fn body_drawn(force_open: bool, id: &'static str) -> bool {
+        let ctx = egui::Context::default();
+        let mut drawn = false;
+        for _ in 0..3 {
+            drawn = false;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(300.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    tree_header_marked(
+                        ui,
+                        id,
+                        false,
+                        force_open,
+                        RichText::new("dev"),
+                        None,
+                        |_ui| {
+                            drawn = true;
+                        },
+                    );
+                },
+            );
+        }
+        drawn
+    }
+
+    #[test]
+    fn a_collapsed_row_can_be_opened_by_its_caller_rather_than_by_a_click() {
+        assert!(
+            !body_drawn(false, "env-closed"),
+            "a default-closed row starts closed"
+        );
+        assert!(
+            body_drawn(true, "env-revealed"),
+            "asking to reveal it should open it with no click involved"
         );
     }
 }

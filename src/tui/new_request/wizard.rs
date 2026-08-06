@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::hurl::{FormFieldKind, METHODS};
+use crate::hurl::{FormFieldKind, KvRow, METHODS};
 use crate::i18n::Strings;
 
 use super::super::app::{
@@ -603,28 +603,37 @@ impl NewReq {
         target_names: Vec<String>,
         file_root: Option<PathBuf>,
     ) -> Self {
-        fn header_rows_from_triples(triples: &[(String, String, bool)]) -> KvdSection {
-            let rows = triples
+        fn header_rows_from_rows(model: &[KvRow]) -> KvdSection {
+            let rows = model
                 .iter()
-                .map(|(k, v, e)| {
+                .map(|r| {
                     let mut row = HeaderRow::new();
-                    row.key = Editor::new(k, false);
-                    row.value = Editor::new(v, false);
-                    row.enabled = *e;
+                    row.key = Editor::new(&r.key, false);
+                    row.value = Editor::new(&r.value, false);
+                    row.enabled = r.enabled;
+                    row.desc = Editor::new(&r.desc, false);
                     row
                 })
                 .collect();
-            KvdSection::from_rows(rows)
+            let section = KvdSection::from_rows(rows);
+            // A section that already carries notes opens with the Description
+            // column showing — otherwise a note written earlier (or imported
+            // from Postman) would be invisible until the user thought to
+            // reveal a column they had no reason to suspect held anything.
+            if model.iter().any(|r| !r.desc.is_empty()) {
+                section.desc_visible.set(true);
+            }
+            section
         }
 
         let method_idx = METHODS.iter().position(|m| *m == entry.method).unwrap_or(0);
-        let headers = header_rows_from_triples(&entry.headers);
+        let headers = header_rows_from_rows(&entry.headers);
 
-        let cookies = header_rows_from_triples(&entry.cookies);
+        let cookies = header_rows_from_rows(&entry.cookies);
 
-        let queries = header_rows_from_triples(&entry.queries);
+        let queries = header_rows_from_rows(&entry.queries);
 
-        let options = header_rows_from_triples(&entry.options);
+        let options = header_rows_from_rows(&entry.options);
 
         let form_fields = if entry.form_fields.is_empty() {
             Vec::new()

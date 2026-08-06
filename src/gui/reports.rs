@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, RichText};
 
 use super::app::GuiApp;
-use super::report_editor::{ReportEditor, ReportOrigin};
+use super::report_editor::ReportOrigin;
 use crate::persistence::PersistedReport;
 use crate::report::Report;
 
@@ -90,7 +90,7 @@ fn open_report(app: &mut GuiApp, i: usize) {
     report.path = pr.path.as_ref().map(PathBuf::from);
     report.git_origin = pr.git_origin.clone();
     report.dirty = false;
-    app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(i), report));
+    app.open_report_editor(ReportOrigin::Session(i), report);
     app.focus = super::Focus::Main;
 }
 
@@ -107,7 +107,7 @@ fn new_report(app: &mut GuiApp) {
         embedded_active: true,
     });
     let idx = app.session.reports.len() - 1;
-    app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(idx), report));
+    app.open_report_editor(ReportOrigin::Session(idx), report);
     app.focus = super::Focus::Main;
     app.session.save();
 }

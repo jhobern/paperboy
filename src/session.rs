@@ -11,7 +11,7 @@
 //! pure/duplicated helpers delegate to the free functions here (see
 //! [`effective_env`], [`shadowed_env_keys`], [`active_theme_spec`]).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -25,9 +25,13 @@ use crate::git_remote::GitOrigin;
 use crate::http::ApiResponse;
 use crate::hurl::RunStatus;
 use crate::i18n::{Language, Status};
-use crate::persistence::{self, PersistedEnv, PersistedReport, PersistedState, PersistedTab};
+use crate::persistence::{
+    self, GuiLayout, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState,
+    PersistedTab,
+};
 use crate::request::{self, AppVars, BatchRunUpdate, CaptureUpdate, RequestView};
 use crate::theme::{self, ThemeSpec};
+use crate::tui::remote::WorkspaceGitOrigin;
 
 // ── Shared pure helpers (called by both front-ends) ─────────────────────────
 
@@ -120,6 +124,16 @@ pub fn active_theme_spec(
     theme::preset_for_language(language)
 }
 
+/// Which "last used" directory a file picker should start from. Environments
+/// get their own memory because they usually live somewhere quite different
+/// from collections (a shared secrets folder vs. a project tree), so a single
+/// shared directory would send one picker to the other's folder every time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    Environment,
+    Other,
+}
+
 // ── The Session ─────────────────────────────────────────────────────────────
 
 /// The whole front-end-agnostic application state. The GUI holds one of these;
@@ -163,6 +177,10 @@ pub struct Session {
     pub recent_git_urls: Vec<String>,
     pub last_browse_dir: Option<PathBuf>,
     pub last_env_dir: Option<PathBuf>,
+    /// Window/panel geometry and last-open view for the graphical front-end.
+    /// The terminal UI never reads it but still round-trips it, so alternating
+    /// between the two front-ends doesn't wipe the GUI's layout.
+    pub gui: GuiLayout,
 
     /// A transient status message for the footer.
     pub status: Option<Status>,
@@ -171,6 +189,13 @@ pub struct Session {
     /// front-end never drops the reports the other front-end created. The GUI's
     /// reports panel manages these through [`Session::reports`] accessors.
     pub reports: Vec<PersistedReport>,
+    /// Workspace tabs restored with a vanished `workspace_root` that are known
+    /// to have been downloaded from git, paired with the tab index they were
+    /// restored at. Filled by [`Session::apply_persisted`]; the front-end drains
+    /// this to offer redownloading each one (see
+    /// [`crate::persistence::PendingWorkspaceReload`]) rather than silently
+    /// resetting the tab. Transient — never persisted.
+    pub pending_workspace_reloads: VecDeque<(usize, PendingWorkspaceReload)>,
     /// The active report index within a workspace tab, mirrored so persistence
     /// round-trips faithfully. Front-ends own their own richer view state.
     active_report: Option<usize>,
@@ -202,8 +227,10 @@ impl Default for Session {
             recent_git_urls: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            gui: GuiLayout::default(),
             status: None,
             reports: Vec::new(),
+            pending_workspace_reloads: VecDeque::new(),
             active_report: None,
         }
     }
@@ -402,12 +429,63 @@ impl Session {
         }
     }
 
+    /// The directory a file picker for `kind` should open at: the last folder
+    /// the user picked something of that kind from, falling back to the general
+    /// last-browsed folder so a first-ever environment picker still lands
+    /// somewhere useful rather than the process's working directory.
+    pub fn picker_dir(&self, kind: PickerKind) -> Option<&std::path::Path> {
+        let specific = match kind {
+            PickerKind::Environment => self.last_env_dir.as_deref(),
+            PickerKind::Other => None,
+        };
+        specific
+            .or(self.last_browse_dir.as_deref())
+            .filter(|d| d.is_dir())
+    }
+
+    /// Remember where a picker just landed, so the next one reopens there.
+    /// `path` may be the chosen file itself — its parent directory is stored.
+    pub fn remember_picker_dir(&mut self, kind: PickerKind, path: &std::path::Path) {
+        let dir = if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            path.parent().map(|p| p.to_path_buf())
+        };
+        let Some(dir) = dir.filter(|d| d.is_dir()) else {
+            return;
+        };
+        if kind == PickerKind::Environment {
+            self.last_env_dir = Some(dir.clone());
+        }
+        self.last_browse_dir = Some(dir);
+    }
+
     /// Close tab `idx` (the built-in Request tab at index 0 is never closed).
     pub fn close_tab(&mut self, idx: usize) {
+        self.close_tab_inner(idx, false);
+    }
+
+    /// Close tab `idx` *and* wipe its Workspace folder from disk. Only ever
+    /// valid for a tab whose folder the app downloaded itself
+    /// ([`Collection::workspace_downloaded_from_git`]) and only when the user
+    /// explicitly asked for it — a folder the user picked from their own
+    /// filesystem is never deleted, so this silently falls back to an ordinary
+    /// close for any other tab.
+    pub fn close_tab_deleting_workspace(&mut self, idx: usize) {
+        self.close_tab_inner(idx, true);
+    }
+
+    fn close_tab_inner(&mut self, idx: usize, delete_workspace: bool) {
         if idx == 0 || idx >= self.collections.len() {
             return;
         }
-        self.collections.remove(idx);
+        let removed = self.collections.remove(idx);
+        if delete_workspace
+            && removed.workspace_downloaded_from_git
+            && let Some(root) = &removed.workspace_root
+        {
+            crate::git_remote::cleanup(root);
+        }
         if self.active_tab >= self.collections.len() {
             self.active_tab = self.collections.len() - 1;
         }
@@ -425,8 +503,76 @@ impl Session {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        self.push_workspace_tab(name, root, None)
+    }
+
+    /// Open a Workspace whose (filtered) files were just downloaded from git
+    /// into `root` — a throwaway directory reused in place as the tab's
+    /// `workspace_root`, exactly like a locally picked folder, since its
+    /// checked-out files already sit at the right relative paths. `name` comes
+    /// from the repo URL rather than the meaningless temp-directory name, and
+    /// `origin` records the exact commit so the download can be repeated if
+    /// the folder later vanishes (e.g. the OS clears `/tmp`).
+    ///
+    /// Unlike a single-file load this directory is deliberately *not* cleaned
+    /// up afterwards — the tab reads from it live for as long as it stays open.
+    /// `workspace_downloaded_from_git` marks it as the app's own throwaway, so
+    /// closing the tab may offer to delete it (a folder the user picked
+    /// themselves must never be deleted).
+    pub fn open_workspace_from_git(
+        &mut self,
+        root: PathBuf,
+        name: String,
+        origin: Option<WorkspaceGitOrigin>,
+    ) -> usize {
+        self.push_workspace_tab(name, root, origin)
+    }
+
+    /// Rebind Workspace tab `idx` to `root`, a folder that has just been
+    /// redownloaded from git for a tab whose original download had vanished
+    /// (see [`Session::pending_workspace_reloads`]). The file that was open
+    /// last session is re-selected if it still exists in the new download —
+    /// its path has to be re-resolved *relatively*, because the fresh checkout
+    /// lands in a different temp directory than the one recorded.
+    pub fn rebind_redownloaded_workspace(
+        &mut self,
+        idx: usize,
+        root: PathBuf,
+        relative_selected_path: Option<String>,
+    ) {
+        let Some(col) = self.collections.get_mut(idx) else {
+            return;
+        };
+        let selected = relative_selected_path
+            .map(|rel| root.join(rel))
+            .filter(|p| p.exists());
+        col.workspace_root = Some(root);
+        col.workspace_downloaded_from_git = true;
+        // The redownload may not contain the file that was open last time (the
+        // filter or the commit's contents can differ), so a failed reopen just
+        // leaves the tab on its tree rather than being an error.
+        match selected {
+            Some(path) => {
+                if col.load_workspace_file(path).is_err() {
+                    col.path = None;
+                }
+            }
+            None => col.path = None,
+        }
+        self.status = Some(Status::WorkspaceReloaded);
+        self.save();
+    }
+
+    fn push_workspace_tab(
+        &mut self,
+        name: String,
+        root: PathBuf,
+        git_origin: Option<WorkspaceGitOrigin>,
+    ) -> usize {
         let mut col = Collection::new(name, Vec::new());
         col.workspace_root = Some(root);
+        col.workspace_downloaded_from_git = git_origin.is_some();
+        col.workspace_git_origin = git_origin;
         self.collections.push(col);
         let ci = self.collections.len() - 1;
         self.active_tab = ci;
@@ -682,6 +828,7 @@ impl Session {
             active_global_env: self
                 .active_env_id
                 .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
+            gui: self.gui,
         }
     }
 
@@ -714,18 +861,25 @@ impl Session {
         }
 
         if !state.tabs.is_empty() {
-            self.collections = state
-                .tabs
-                .into_iter()
-                .map(|tab| {
-                    let linked_env_id = tab
-                        .linked_env_index
-                        .and_then(|idx| self.global_envs.get(idx))
-                        .map(|e| e.id);
-                    let (col, _pending_reload) = tab.into_collection(linked_env_id);
-                    col
-                })
-                .collect();
+            let mut collections = Vec::with_capacity(state.tabs.len());
+            let mut reloads = VecDeque::new();
+            for (idx, tab) in state.tabs.into_iter().enumerate() {
+                let linked_env_id = tab
+                    .linked_env_index
+                    .and_then(|i| self.global_envs.get(i))
+                    .map(|e| e.id);
+                let (col, pending_reload) = tab.into_collection(linked_env_id);
+                // A git-downloaded Workspace whose folder has vanished since
+                // the last session (typically `/tmp` swept between restarts)
+                // is queued rather than silently reset — the front-end offers
+                // to redownload it, pinned to the exact commit it recorded.
+                if let Some(reload) = pending_reload {
+                    reloads.push_back((idx, reload));
+                }
+                collections.push(col);
+            }
+            self.collections = collections;
+            self.pending_workspace_reloads = reloads;
         }
 
         self.reports = state.reports;
@@ -740,6 +894,7 @@ impl Session {
             .last_env_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        self.gui = state.gui;
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
         self.confirm_on_delete_env = state.confirm_on_delete_env;
@@ -763,6 +918,7 @@ impl Session {
 mod workspace_tests {
     use super::*;
     use crate::collection::WsRow;
+    use crate::tui::remote::WorkspaceGitFilter;
 
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -844,6 +1000,74 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The exit warning has to count a Workspace tab's *parked* edits — a file
+    /// the user edited and then switched away from is precisely the case with
+    /// nothing on disk to fall back on — without double-counting the file the
+    /// tab is currently showing.
+    #[test]
+    fn unsaved_edits_are_counted_once_across_parked_and_loaded_workspace_files() {
+        let dir = tmp("count");
+        let mut s = Session::default();
+        s.collections.clear();
+        let ci = s.open_workspace(dir.clone());
+
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        s.collections[ci].entries[0].modified = true;
+        s.collections[ci].entries[1].modified = true;
+        assert_eq!(
+            s.collections[ci].unsaved_edit_count(),
+            2,
+            "the loaded file's own edits"
+        );
+
+        // Switching away parks those two and loads a clean file.
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        assert_eq!(
+            s.collections[ci].unsaved_edit_count(),
+            2,
+            "parked edits still count, and the clean loaded file adds none"
+        );
+
+        // Editing the new file too adds to the total rather than replacing it.
+        s.collections[ci].entries[0].modified = true;
+        assert_eq!(s.collections[ci].unsaved_edit_count(), 3);
+
+        // Coming back must not count the same edits twice: the file is now both
+        // loaded and still listed in `workspace_pending`.
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        assert_eq!(
+            s.collections[ci].unsaved_edit_count(),
+            3,
+            "a file that is both loaded and parked is counted once"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GUI's pixel geometry survives a save/load round-trip. (The matching
+    /// terminal-UI half — that it carries the field through untouched — is
+    /// asserted in `tui::tests`, where `TuiApp` is reachable.)
+    #[test]
+    fn the_gui_layout_round_trips_through_a_save_and_load() {
+        let layout = GuiLayout {
+            window: Some((1440.0, 900.0)),
+            left_width: Some(312.0),
+            env_height: Some(240.0),
+            response_height: Some(360.0),
+            report_diag_height: Some(96.0),
+            report_palette_width: Some(200.0),
+            view: crate::persistence::GuiView::Report(2),
+            report_source_view: true,
+        };
+
+        let mut s = Session::default();
+        s.gui = layout;
+        let saved = s.to_persisted();
+        let mut restored = Session::default();
+        restored.apply_persisted(saved);
+        assert_eq!(restored.gui, layout, "the GUI restores its own layout");
+    }
+
     #[test]
     fn load_workspace_file_on_a_bad_index_or_path_fails_without_panicking() {
         let dir = tmp("bad");
@@ -854,6 +1078,162 @@ mod workspace_tests {
         assert!(!s.load_workspace_file(ci, dir.join("nope.hurl")));
         // An out-of-range collection index is a graceful false.
         assert!(!s.load_workspace_file(999, dir.join("health.hurl")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edits_survive_switching_to_another_collection_and_back() {
+        let dir = tmp("pending");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+
+        // Edit the first request of health.hurl, exactly as the request editor
+        // does (write through to the entry, then flag it).
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        s.collections[ci].entries[0].url = "https://example.com/health?deep=1".into();
+        s.collections[ci].entries[0].modified = true;
+        assert!(s.collections[ci].workspace_file_edited(&dir.join("health.hurl")));
+
+        // Look at a different collection in the same Workspace tab...
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        assert_eq!(s.collections[ci].entries.len(), 2, "users.hurl is loaded");
+        // ...the edit is still remembered against the file it belongs to,
+        // even though those entries are no longer the tab's live ones.
+        assert!(
+            s.collections[ci].workspace_file_edited(&dir.join("health.hurl")),
+            "switching away must not discard unsaved edits"
+        );
+        // ...and the individual request still reads as edited, so the tree can
+        // pencil the row even while a different collection is the loaded one.
+        assert!(
+            s.collections[ci].workspace_request_edited(&dir.join("health.hurl"), 0),
+            "a parked request is still an edited request"
+        );
+        assert!(
+            !s.collections[ci].workspace_request_edited(&dir.join("api/users.hurl"), 0),
+            "an untouched request in the loaded file carries no pencil"
+        );
+
+        // ...and coming back hands them straight back rather than re-reading
+        // the (unchanged) file from disk.
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        assert_eq!(
+            s.collections[ci].entries[0].url,
+            "https://example.com/health?deep=1"
+        );
+        assert!(s.collections[ci].entries[0].modified);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_a_collection_clears_its_edit_markers_and_parked_edits() {
+        let dir = tmp("saved");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        s.collections[ci].entries[0].modified = true;
+        s.collections[ci].mark_saved();
+        assert!(
+            !s.collections[ci].workspace_file_edited(&dir.join("health.hurl")),
+            "a saved file matches disk, so it carries no pencil"
+        );
+
+        // A file saved while parked is likewise no longer pending, so
+        // reopening it reads the (now current) file rather than stale entries.
+        s.collections[ci].entries[0].modified = true;
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        assert!(
+            s.collections[ci]
+                .workspace_pending
+                .contains_key(&dir.join("health.hurl"))
+        );
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        s.collections[ci].mark_saved();
+        assert!(s.collections[ci].workspace_pending.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git_origin(url: &str) -> WorkspaceGitOrigin {
+        WorkspaceGitOrigin {
+            repo_url: url.to_string(),
+            commit_sha: "abc123".into(),
+            ref_kind: crate::git_remote::RefKind::Branch,
+            ref_name: "main".into(),
+            filter: WorkspaceGitFilter::All,
+        }
+    }
+
+    #[test]
+    fn a_workspace_opened_from_git_records_where_it_came_from() {
+        let dir = tmp("fromgit");
+        let mut s = Session::default();
+        let origin = git_origin("https://example.com/repo.git");
+        let ci = s.open_workspace_from_git(dir.clone(), "repo".into(), Some(origin.clone()));
+
+        assert!(s.collections[ci].is_workspace());
+        assert!(s.collections[ci].workspace_downloaded_from_git);
+        assert_eq!(
+            s.collections[ci]
+                .workspace_git_origin
+                .as_ref()
+                .map(|o| &o.repo_url),
+            Some(&origin.repo_url)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_a_downloaded_workspace_can_delete_its_folder_but_a_local_one_never_is() {
+        let downloaded = tmp("del_git");
+        let local = tmp("del_local");
+        let mut s = Session::default();
+
+        let ci = s.open_workspace_from_git(
+            downloaded.clone(),
+            "repo".into(),
+            Some(git_origin("https://example.com/repo.git")),
+        );
+        s.close_tab_deleting_workspace(ci);
+        assert!(!downloaded.exists(), "a git download is ours to delete");
+
+        // The same call on a folder the user chose themselves must leave it
+        // alone — deleting it would destroy files PaperBoy never created.
+        let ci = s.open_workspace(local.clone());
+        s.close_tab_deleting_workspace(ci);
+        assert!(local.exists(), "a user's own folder is never deleted");
+
+        let _ = std::fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn a_redownloaded_workspace_reselects_the_file_that_was_open_before() {
+        let dir = tmp("rebind");
+        let mut s = Session::default();
+        let ci = s.open_workspace_from_git(
+            dir.clone(),
+            "repo".into(),
+            Some(git_origin("https://example.com/repo.git")),
+        );
+
+        s.rebind_redownloaded_workspace(ci, dir.clone(), Some("api/users.hurl".into()));
+
+        assert_eq!(
+            s.collections[ci].workspace_root.as_deref(),
+            Some(dir.as_path())
+        );
+        assert!(s.collections[ci].workspace_downloaded_from_git);
+        assert_eq!(
+            s.collections[ci].path.as_deref(),
+            Some(dir.join("api/users.hurl").as_path())
+        );
+        assert!(matches!(
+            s.status,
+            Some(crate::i18n::Status::WorkspaceReloaded)
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

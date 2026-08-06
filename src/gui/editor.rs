@@ -8,6 +8,9 @@ use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, RichText, TextFormat};
 
 use crate::hurl::{FormField, FormFieldKind, HurlEntry};
+// Only the tests construct rows directly; the editor itself just borrows them.
+#[cfg(test)]
+use crate::hurl::KvRow;
 use crate::i18n::Strings;
 use crate::request::{SubstInfo, SubstKind, apply_request_json, build_request_json};
 
@@ -496,6 +499,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             changed = true;
         }
     } else {
+        // Resolved up front: the section body borrows the collection mutably,
+        // so the session can't be consulted from inside it.
+        let browse_fallback = app
+            .session
+            .picker_dir(crate::session::PickerKind::Other)
+            .map(|p| p.to_path_buf());
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -526,13 +535,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry) {
+                            if draw_section(*sec, ui, &theme, st, entry, browse_fallback.as_deref())
+                            {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry) {
+                        if draw_section(other, ui, &theme, st, entry, browse_fallback.as_deref()) {
                             changed = true;
                         }
                     }
@@ -579,6 +589,8 @@ fn draw_section(
     theme: &super::theme::GuiTheme,
     st: &Strings,
     entry: &mut HurlEntry,
+    // Where a `[Form]` file picker opens when the field is still blank.
+    browse_fallback: Option<&std::path::Path>,
 ) -> bool {
     let mut changed = false;
     match section {
@@ -593,6 +605,8 @@ fn draw_section(
                 &mut entry.queries,
                 st.gui_hint_key,
                 st.gui_hint_value,
+                st.hdr_key,
+                st.hdr_value,
             ) {
                 changed = true;
             }
@@ -606,6 +620,8 @@ fn draw_section(
                 &mut entry.headers,
                 st.gui_hint_header,
                 st.gui_hint_value,
+                st.gui_hint_header,
+                st.hdr_value,
             ) {
                 changed = true;
             }
@@ -630,7 +646,7 @@ fn draw_section(
             ui.add_space(8.0);
             ui.separator();
             ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
-            if form_editor(ui, theme, st, &mut entry.form_fields) {
+            if form_editor(ui, theme, st, &mut entry.form_fields, browse_fallback) {
                 changed = true;
             }
         }
@@ -671,6 +687,8 @@ fn draw_section(
                 &mut entry.cookies,
                 st.gui_hint_name,
                 st.gui_hint_value,
+                st.hdr_name,
+                st.hdr_value,
             ) {
                 changed = true;
             }
@@ -685,6 +703,8 @@ fn draw_section(
                 &mut entry.options,
                 st.gui_hint_option,
                 st.gui_hint_value,
+                st.hdr_option,
+                st.hdr_value,
             ) {
                 changed = true;
             }
@@ -720,6 +740,8 @@ fn draw_section(
                 &mut entry.captures,
                 st.gui_hint_name,
                 st.gui_hint_query,
+                st.hdr_name,
+                st.hdr_query,
             ) {
                 changed = true;
             }
@@ -776,6 +798,7 @@ fn form_editor(
     theme: &super::theme::GuiTheme,
     s: &Strings,
     fields: &mut Vec<FormField>,
+    browse_fallback: Option<&std::path::Path>,
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -856,7 +879,9 @@ fn form_editor(
                     {
                         if let Some(p) = super::filepick::pick_file(
                             s.gui_browse,
-                            super::filepick::seed_dir(&fields[i].value).as_deref(),
+                            super::filepick::seed_dir(&fields[i].value)
+                                .as_deref()
+                                .or(browse_fallback),
                             &[],
                         ) {
                             fields[i].value = p.to_string_lossy().into_owned();
@@ -964,7 +989,7 @@ mod tests {
 
         // The same request, plus one extra header, serialised back to Hurl.
         let mut edited = session.collections[0].entries[0].clone();
-        edited.headers.push(("X-Test".into(), "hello".into(), true));
+        edited.headers.push(KvRow::toggled("X-Test", "hello", true));
         let text = edited.to_hurl();
 
         let changed = apply_code_edit(&mut session, &mut code, &strings, 0, 0, true, &text);
@@ -972,7 +997,7 @@ mod tests {
         assert!(code.error.is_none(), "a valid edit clears the error");
         let hdrs = &session.collections[0].entries[0].headers;
         assert!(
-            hdrs.iter().any(|(k, v, _)| k == "X-Test" && v == "hello"),
+            hdrs.iter().any(|r| r.key == "X-Test" && r.value == "hello"),
             "expected the new header to be applied, got {hdrs:?}"
         );
     }

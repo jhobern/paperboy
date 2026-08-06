@@ -74,6 +74,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let active = app.session.active_env_id;
     let linked = app.session.collections[ci].linked_env_id;
 
+    // One-shot: consumed on the frame that shows the row, so a later manual
+    // collapse isn't fought by a request that never expires.
+    let reveal_target = app.reveal_env;
     let mut activate: Option<u64> = None;
     let mut link: Option<u64> = None;
     let mut delete: Option<u64> = None;
@@ -100,27 +103,42 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 let is_linked = linked == Some(id);
                 let name = app.session.global_envs[idx].name.clone();
                 let from_git = app.session.global_envs[idx].git_origin.is_some();
+                // The active environment is marked the way the terminal UI
+                // marks it — a leading tick in the "ok" colour with the name to
+                // match — plus a filled band behind the row, because a GUI list
+                // is sparse enough that colour alone is easy to skim past.
                 let header = format!(
                     "{}{}{}",
+                    if is_active {
+                        format!("{} ", super::icons::PASS)
+                    } else {
+                        String::new()
+                    },
                     if from_git {
                         format!("{} ", super::icons::GIT)
                     } else {
                         String::new()
                     },
                     name,
-                    if is_active {
-                        format!("  {}", super::icons::ACTIVE)
-                    } else {
-                        String::new()
-                    }
                 );
 
-                let header_color = if is_active { theme.accent } else { theme.text };
-                super::widgets::tree_header(
+                let mut text = RichText::new(header);
+                if is_active {
+                    text = text.color(theme.ok).strong();
+                } else {
+                    text = text.color(theme.text);
+                }
+                // Opening a `.vars` file from the workspace tree reveals it
+                // here: loading it alone would leave the user looking at a
+                // collapsed row and no sign anything had happened.
+                let reveal = reveal_target == Some(id);
+                let header = super::widgets::tree_header_marked(
                     ui,
                     ("env", id),
                     false,
-                    RichText::new(header).color(header_color),
+                    reveal,
+                    text,
+                    is_active.then_some(theme.ok),
                     |ui| {
                         // Wrap the action buttons so their fixed widths can't
                         // overflow (and report an over-wide content size) when
@@ -161,8 +179,16 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         }
                     },
                 );
+                // Scroll the revealed row into view — the panel is short and a
+                // workspace can hold more environments than fit in it.
+                if reveal {
+                    header.scroll_to_me(Some(egui::Align::Center));
+                }
             }
         });
+
+    // Whether or not the row was found, the request is spent after one frame.
+    app.reveal_env = None;
 
     if let Some(id) = activate {
         app.session.set_active_env(Some(id));

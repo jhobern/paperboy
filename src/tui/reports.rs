@@ -183,6 +183,12 @@ pub(crate) struct ReportTab {
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
+    /// The last dry-run preview, shown *in place of* the results grid until it
+    /// is dismissed (Esc) or superseded by a real run. It deliberately reuses
+    /// the results pane rather than a popup: a preview the user wants to read
+    /// alongside the flow — and drill into with the cell viewer — shouldn't be
+    /// a modal that steals every key and stacks above the windows it spawns.
+    pub(crate) dry_run: Option<Box<DryRunReport>>,
     /// Whether the current [`result`](Self::result) has been exported (CSV / JSON
     /// / HTML / XLSX) since it was produced. Set `false` every time a run yields
     /// a fresh result and `true` once an export of it completes, so a rerun can
@@ -360,6 +366,7 @@ impl ReportTab {
             node_selected: 0,
             node_undo: Vec::new(),
             result: None,
+            dry_run: None,
             results_exported: false,
             run_progress: None,
             results_panel,
@@ -739,7 +746,7 @@ impl TuiApp {
         // the target and refuse to write if its real path escapes the real
         // workspace root — otherwise a report that looks "inside" the workspace
         // would land somewhere else entirely on disk.
-        if report_escapes_root(&root, &full_path) {
+        if crate::workspace::escapes_root(&root, &full_path) {
             self.status = Some(Status::WorkspaceReportEscaped(
                 rel_path.display().to_string(),
             ));
@@ -856,6 +863,7 @@ impl TuiApp {
                         self.active_env_id,
                         &flow,
                         rt.report.path.as_deref(),
+                        &crate::i18n::Strings::for_language(&self.language),
                     );
                     (None, None, diags)
                 }
@@ -1241,6 +1249,8 @@ impl TuiApp {
                     .collect();
                 let rt = &mut self.reports[idx];
                 rt.result = Some(result);
+                // A real run supersedes the projection it was previewing.
+                rt.dry_run = None;
                 // A fresh run's output starts life unexported, so a later rerun
                 // can warn before discarding it (#2).
                 rt.results_exported = false;
@@ -1334,6 +1344,8 @@ impl TuiApp {
                 let rows = result.rows.len();
                 let errors = result.errors.len();
                 rt.result = Some(result);
+                // A real run supersedes the projection it was previewing.
+                rt.dry_run = None;
                 // The finalized result supersedes the skeleton and is likewise
                 // unexported until the user saves it somewhere (#2).
                 rt.results_exported = false;
@@ -1374,6 +1386,8 @@ impl TuiApp {
                 let errors = result.errors.len();
                 let rt = &mut self.reports[idx];
                 rt.result = Some(result);
+                // A real run supersedes the projection it was previewing.
+                rt.dry_run = None;
                 rt.results_exported = false;
                 rt.cell_cursor = None;
                 rt.view = ReportView::Results;
@@ -1561,7 +1575,7 @@ impl TuiApp {
     }
 
     /// Dry-run the active report: expand its flow with a no-op runner (no HTTP)
-    /// and open a preview overlay showing the projected output grid (identical
+    /// and show, in the results pane, the projected output grid (identical
     /// to what a real run would produce, but with all HTTP-response fields
     /// blank), plus any variable-availability warnings from static analysis and
     /// any producer / request-resolution problems — so misaligned `ZIP`s,
@@ -1594,8 +1608,11 @@ impl TuiApp {
                     .map(|d| d.message.clone())
                     .collect();
                 let preview = DryRunReport::from_result(result, header, var_warnings);
-                self.dry_run_scroll = 0;
-                self.overlay = Some(Overlay::ReportDryRun(Box::new(preview)));
+                self.reports[idx].dry_run = Some(Box::new(preview));
+                // Show it where results live, so the preview and the real thing
+                // occupy the same place and the same keys scroll both.
+                self.reports[idx].view = ReportView::Results;
+                self.reports[idx].results_panel.set_scroll(0);
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
         }
@@ -1781,45 +1798,6 @@ impl TuiApp {
             // Any other key keeps the popup open (supports Shift+Arrow
             // text-selection extension, etc.).
             _ => keep(self, title, content, panel),
-        }
-    }
-
-    /// Mirrors the Help overlay: Up/Down/PageUp/PageDown/Home/End scroll the
-    /// preview (the draw pass clamps overshoot against the real content height);
-    /// Esc, `q` or Enter close it, and — as with Help — any other key dismisses
-    /// it too. The overlay was already `take`n by the dispatcher, so closing is
-    /// just declining to put it back.
-    pub(crate) fn report_dry_run_key_handler(&mut self, key: KeyEvent, preview: Box<DryRunReport>) {
-        let keep = |app: &mut TuiApp, preview| {
-            app.overlay = Some(Overlay::ReportDryRun(preview));
-        };
-        match key.code {
-            KeyCode::Up => {
-                self.dry_run_scroll = self.dry_run_scroll.saturating_sub(1);
-                keep(self, preview);
-            }
-            KeyCode::Down => {
-                self.dry_run_scroll = self.dry_run_scroll.saturating_add(1);
-                keep(self, preview);
-            }
-            KeyCode::PageUp => {
-                self.dry_run_scroll = self.dry_run_scroll.saturating_sub(10);
-                keep(self, preview);
-            }
-            KeyCode::PageDown => {
-                self.dry_run_scroll = self.dry_run_scroll.saturating_add(10);
-                keep(self, preview);
-            }
-            KeyCode::Home => {
-                self.dry_run_scroll = 0;
-                keep(self, preview);
-            }
-            KeyCode::End => {
-                self.dry_run_scroll = u16::MAX;
-                keep(self, preview);
-            }
-            // Esc / q / Enter / any other key: close (overlay stays taken).
-            _ => {}
         }
     }
 
@@ -2248,11 +2226,17 @@ impl TuiApp {
             KeyCode::Char('e') => self.enter_report_edit(),
             KeyCode::Enter => self.open_report_node_editor(),
             KeyCode::Esc => {
-                if let Some(idx) = self.active_report_index()
-                    && self.reports[idx].view == ReportView::Nodes
-                {
-                    self.reports[idx].view = ReportView::Source;
-                    self.reports[idx].editor_view = ReportView::Source;
+                if let Some(idx) = self.active_report_index() {
+                    // A dry-run preview is occupying the results pane: Esc
+                    // dismisses it (revealing the last real run's grid again)
+                    // before it means anything else.
+                    if self.reports[idx].dry_run.is_some() {
+                        self.reports[idx].dry_run = None;
+                        self.reports[idx].results_panel.set_scroll(0);
+                    } else if self.reports[idx].view == ReportView::Nodes {
+                        self.reports[idx].view = ReportView::Source;
+                        self.reports[idx].editor_view = ReportView::Source;
+                    }
                 }
             }
             // Run the report against its bound collection and show the grid.
@@ -2941,54 +2925,9 @@ fn sanitize_file_stem(name: &str) -> String {
     }
 }
 
-/// Preview state for the report dry-run overlay ([`Overlay::ReportDryRun`]):
-/// the full [`ReportResult`] produced by expanding the flow with a no-op
-/// runner (so all loop iterations, ZIP pairings and nested scopes are resolved
-/// but no HTTP is sent) plus any variable-availability warnings from static
-/// analysis. The result's column model is populated with everything knowable
-/// without HTTP; intrinsic response fields (`HttpStatus`, `Time`, etc.) are
-/// blank, matching a real grid cell that received no response.
-pub(crate) struct DryRunReport {
-    /// Total rows the flow would emit (`0` = empty glob, mismatched ZIP, …).
-    pub(crate) rows: usize,
-    /// The full dry-run result, used to render the same output grid the real
-    /// run would show (via [`report_grid_lines`]).
-    pub(crate) result: ReportResult,
-    /// The flow's header (needed to resolve the `# columns:` directive for
-    /// [`report_grid_lines`]).
-    header: Header,
-    /// Deduplicated producer / resolution problems (empty glob, ZIP length
-    /// mismatch, unresolved request name, unloaded environment, …).
-    pub(crate) errors: Vec<String>,
-    /// Variable-availability warnings from static analysis (any `{{VAR}}`
-    /// that may not be defined when the request that references it runs).
-    pub(crate) var_warnings: Vec<String>,
-}
+use crate::report::dry_run::DryRunReport;
 
 impl DryRunReport {
-    /// Build the preview from an expanded [`ReportResult`] (no HTTP), the
-    /// flow's [`Header`] (for column resolution), and the variable-availability
-    /// `var_warnings` already extracted from the report's diagnostics.
-    fn from_result(result: ReportResult, header: Header, var_warnings: Vec<String>) -> Self {
-        // A Cartesian product can repeat the same producer error on every
-        // iteration — collapse duplicates while keeping first-seen order.
-        let mut seen = std::collections::HashSet::new();
-        let errors: Vec<String> = result
-            .errors
-            .iter()
-            .filter(|e| seen.insert((*e).clone()))
-            .cloned()
-            .collect();
-        let rows = result.rows.len();
-        Self {
-            rows,
-            result,
-            header,
-            errors,
-            var_warnings,
-        }
-    }
-
     /// Render the preview body as themed lines for the overlay draw pass.
     ///
     /// Layout:
@@ -3375,6 +3314,38 @@ fn draw_report_results(
     th: &Theme,
 ) {
     let inner_h = area.height.saturating_sub(2) as usize;
+
+    // A dry-run preview takes over the pane until it is dismissed, so the
+    // projection and the real thing are read in the same place. It renders as
+    // plain lines (notice, row count, grid, problems), so there is no sticky
+    // header and no cell cursor over it.
+    // The results panel clips, which is right for a grid but would silently cut
+    // off a long producer error or binding line — so the preview's lines are
+    // pre-wrapped to the pane width with an explicit `↵` marker, keeping them
+    // readable as single logical lines (as the popup did).
+    let preview_lines = app.reports[idx].dry_run.as_ref().map(|preview| {
+        crate::tui::draw::wrap_lines_with_marker(
+            preview.lines(s, th),
+            area.width.saturating_sub(2),
+            th,
+        )
+    });
+    if let Some(lines) = preview_lines {
+        let title = format!("{} — {}", s.report_dry_run_title, s.report_dry_run_hint);
+        let focused = app.report_body_focused();
+        let block = panel(title, focused, th);
+        let (inner, bar) = draw_report_panel(
+            f,
+            area,
+            block,
+            &mut app.reports[idx].results_panel,
+            &lines,
+            th,
+        );
+        app.report_pane_areas[ReportPane::Results.idx()] = inner;
+        app.report_pane_bars[ReportPane::Results.idx()] = bar;
+        return;
+    }
 
     let (lines, title) = {
         let rt = &app.reports[idx];
@@ -4262,35 +4233,6 @@ fn draw_report_validation(
         inner,
         MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
     );
-}
-
-/// Whether writing to `target` would physically escape workspace `root` once
-/// symlinks are resolved. `target` (a not-yet-created file) is checked via its
-/// **deepest existing ancestor**: the closest parent that exists on disk is
-/// canonicalised and compared against the canonicalised `root`. A symlinked
-/// directory component therefore fails the check even though a lexical `..`
-/// scan would pass it, and any subfolders still to be created underneath a
-/// real, in-root ancestor are inherently contained. Returns `false` (don't
-/// block) when `root` can't be canonicalised — an open workspace root always
-/// exists, so that only happens in degenerate cases where the later write will
-/// surface the real error.
-fn report_escapes_root(root: &std::path::Path, target: &std::path::Path) -> bool {
-    let Ok(canon_root) = root.canonicalize() else {
-        return false;
-    };
-    let mut ancestor = target;
-    loop {
-        if ancestor.exists() {
-            return match ancestor.canonicalize() {
-                Ok(real) => !real.starts_with(&canon_root),
-                Err(_) => true,
-            };
-        }
-        match ancestor.parent() {
-            Some(parent) => ancestor = parent,
-            None => return true,
-        }
-    }
 }
 
 #[cfg(test)]
