@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.4.2] - 2026-08-08
+
+### Fixed
+
+- **Copying no longer leaves a trail of unkillable processes behind.** Every
+  copy — from the Request, Response and Reports panels alike — stranded a
+  clipboard helper that was never cleaned up, so a long session accumulated
+  dozens of them in the system's process and application lists. They could not
+  be closed, because a process in that state can only be cleared by the program
+  that started it. PaperBoy now clears each helper as soon as it has done its
+  job.
+
+- **Copying no longer flashes an entry into the desktop's application bar.**
+  On GNOME and other desktops that lack the newer clipboard protocol, the
+  Wayland helper has to open a real window to take ownership of the clipboard,
+  which the desktop then shows as a running application for as long as the copy
+  survives. PaperBoy now prefers the X11 helper where one is reachable, which
+  needs no window at all and still reaches Wayland applications through the
+  usual clipboard bridge. Set `TUI_PANEL_SELECT_CLIPBOARD=wayland` to force the
+  previous behaviour on a desktop where the bridge is unavailable.
+
+- **Running the test suite no longer overwrites your clipboard.** Tests that
+  exercised a copy path wrote to the real desktop clipboard, discarding
+  whatever you had copied, and spawned a helper process for each one. Copies
+  are now disabled while the tests run.
+
+
 ## [0.4.1] - 2026-08-07
 
 ### Fixed

@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "paperboy"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "chrono",
@@ -4789,9 +4789,9 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tui-panel-select"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20891d513ada49151e4c432b0320eb66d280e51eb93159b6612f61bdcf9aa1b3"
+checksum = "6063738da1117054f5543f21c76527e943e9b64d3571bf79523a8927c36b26c0"
 dependencies = [
  "base64",
  "libc",

@@ -7261,8 +7261,8 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
 /// `y` re-triggers a copy of the active selection without disturbing it
 /// (unlike Esc, which clears it) — an explicit fallback for terminals
 /// that don't act on the automatic OSC 52 write from mouse-release.
-/// `copy_to_clipboard` itself just writes to stdout (best-effort, see
-/// `clipboard.rs`), so this only asserts the selection survives the key
+/// `copy_to_clipboard` is pinned to `ClipboardMode::None` under `cfg(test)`
+/// (see `clipboard.rs`), so this only asserts the selection survives the key
 /// press and that `y` is a no-op when there is nothing selected.
 #[test]
 fn y_recopies_the_active_selection_without_clearing_it() {
@@ -7337,9 +7337,9 @@ fn y_without_an_active_selection_is_a_no_op() {
 /// panel (Request JSON or Response) — so a user can grab the entire
 /// body without first having to drag-select every line of what might be
 /// a huge response. `whole_panel_text`/`can_copy` are the pure pieces of
-/// that logic (`copy_to_clipboard` itself just writes to stdout, see
-/// `clipboard.rs`), so this asserts on those directly plus the fact
-/// that pressing `y` doesn't create/disturb any selection state.
+/// that logic (`copy_to_clipboard` is pinned to `ClipboardMode::None` under
+/// `cfg(test)`, see `clipboard.rs`), so this asserts on those directly plus
+/// the fact that pressing `y` doesn't create/disturb any selection state.
 #[test]
 fn whole_panel_text_returns_the_full_response_body_when_the_response_panel_has_focus() {
     use ratatui::{Terminal, backend::TestBackend};

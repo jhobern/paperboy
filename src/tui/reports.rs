@@ -1784,7 +1784,7 @@ impl TuiApp {
             // `y` copies the panel selection to the clipboard, or — when
             // nothing is selected — the entire cell content.
             KeyCode::Char('y') => {
-                use tui_panel_select::clipboard::copy_to_clipboard;
+                use crate::tui::clipboard::copy_to_clipboard;
                 let text = panel
                     .selected_text(None)
                     .filter(|t| !t.is_empty())
@@ -2456,7 +2456,7 @@ impl TuiApp {
         };
 
         if let Some(text) = copy {
-            tui_panel_select::clipboard::copy_to_clipboard(&text);
+            crate::tui::clipboard::copy_to_clipboard(&text);
             self.status = Some(crate::i18n::Status::Copied);
         }
         if let Some(text) = new_text {

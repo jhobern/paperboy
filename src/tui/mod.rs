@@ -4,6 +4,7 @@
 //! Launched with `-r` / `--ratatui`.
 
 mod app;
+mod clipboard;
 mod draw;
 mod editor;
 mod git_save;
