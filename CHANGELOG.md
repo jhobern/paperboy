@@ -18,10 +18,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   that said so was drawn beside the chips and read as decoration — it never made
   clear which of the two owned the other. The pair now sits flush inside a single
   outline with the meeting corners squared off, the way a segmented control does,
-  and the qualifying half takes a desaturated tint of its anchor's colour so the
-  hue says the same thing as the shape. Hovering either half outlines both.
+  and hovering either half outlines both. Each chip keeps the colour its own kind
+  always has, so a `SHOW` still reads as a `SHOW`.
 
 ### Fixed
+
+- **Chips no longer sit a pixel out of line with each other.** A chip built
+  around a dropdown — `REQUEST`, `BASELINE`, `COMPARISON` — was sized by egui to
+  the same formula as every other chip, so the two agreed at egui's default text
+  size and drifted a fraction of a pixel apart once the app scaled its text up,
+  leaving an uneven bottom edge. The dropdown's height is now derived from the
+  chip height rather than arriving at it independently.
 
 - **A tethered clause now really does sit flush against the chip it qualifies.**
   The reduced spacing was applied while laying out the clause itself, but egui

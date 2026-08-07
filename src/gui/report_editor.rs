@@ -853,10 +853,9 @@ fn build_node_chips(
                 // The SHOW belongs to the BASELINE, so it follows it directly —
                 // before the COMPARISON, mirroring the source order — and is
                 // *tethered* to it, which merges the two into one segmented pill
-                // and restates the ownership in the colour (see `link_tethers`).
-                // The colour given here is only what an untethered SHOW would
-                // use; `link_tethers` replaces it with a desaturated tint of
-                // whichever chip it ends up qualifying.
+                // (see `link_tethers`). It keeps SHOW's own colour: the pill
+                // already says which chip it qualifies, so the hue is free to go
+                // on saying what kind of clause it is.
                 if !baseline_show.is_empty() {
                     chips.push(
                         Chip::modifier(
@@ -902,8 +901,7 @@ fn build_node_chips(
 /// The `STATISTICS(…)` chip for a named report column, or nothing when the
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
-/// whole — so the two are drawn as one segmented pill, and this colour is
-/// replaced by a tint of the column's (see [`link_tethers`]).
+/// whole — so the two are drawn as one segmented pill (see [`link_tethers`]).
 fn stats_chip(
     stats: &[crate::report::model::StatKind],
     th: &GuiTheme,
@@ -1739,20 +1737,7 @@ fn chip_corners(chip: &Chip) -> egui::CornerRadius {
     }
 }
 
-/// A subordinate version of a chip colour: the same hue, desaturated.
-///
-/// Desaturating in HSV rather than mixing towards a theme colour keeps the
-/// value, so the tint stays legible against the panel in light and dark themes
-/// alike — a mix towards the background would fade to unreadable in one of
-/// them.
-fn tint_of(anchor: Color32) -> Color32 {
-    let mut hsva = egui::ecolor::Hsva::from(anchor);
-    hsva.s *= 0.45;
-    hsva.into()
-}
-
-/// Work out how each tethered chip joins the chip it qualifies, and tint it to
-/// match.
+/// Work out how each tethered chip joins the chip it qualifies.
 ///
 /// A tethered chip is drawn as the right-hand segment of a single pill: the
 /// pair sits flush, the anchor keeps its rounded left corners and squares off
@@ -1762,11 +1747,10 @@ fn tint_of(anchor: Color32) -> Color32 {
 /// replaces was drawn *beside* the chips, and a thin line in a muted grey read
 /// as decoration — it never said which of the two owned the other.
 ///
-/// The hanger also takes the anchor's hue, desaturated. Sharing the colour
-/// outright would blur `BASELINE(prod) SHOW(Time) COMPARISON(stage)` into three
-/// identical-looking peers, which is why the SHOW used to keep a colour of its
-/// own; a desaturated tint keeps the two distinguishable while saying the SHOW
-/// is subordinate to the baseline rather than a third peer beside it.
+/// Only the shape changes: each chip keeps the colour its own kind always has,
+/// so a `SHOW` is recognisable as a `SHOW` wherever it appears. Restating the
+/// ownership in the hue as well would trade that away for something the pill
+/// already says.
 fn link_tethers(chips: &mut [Chip]) {
     for i in 1..chips.len() {
         if !chips[i].tethered {
@@ -1774,7 +1758,6 @@ fn link_tethers(chips: &mut [Chip]) {
         }
         chips[i - 1].join_next = true;
         chips[i].join_prev = true;
-        chips[i].color = tint_of(chips[i - 1].color);
     }
 }
 
@@ -4215,7 +4198,7 @@ fn tail_drop_zone(
 /// as one hosting a combo box or a text field.
 fn chip_h(ui: &egui::Ui) -> f32 {
     let sp = ui.spacing();
-    let row = ui.text_style_height(&egui::TextStyle::Button);
+    let row = ui.text_style_height(&egui::TextStyle::Body);
     (sp.interact_size.y.max(row + 2.0 * sp.button_padding.y)).ceil()
 }
 
@@ -4242,6 +4225,16 @@ fn chip_shell<R>(
         .inner_margin(egui::Margin::symmetric(8, 3))
         .corner_radius(corners)
         .show(ui, |ui| {
+            // egui sizes a combo box (and a button) to
+            // `max(interact_size.y, content + 2 * button_padding.y)`, which is
+            // the same formula `chip_h` uses — so the two *coincided* until the
+            // app scaled its text and they landed a fraction of a pixel apart,
+            // enough to round to a visibly uneven bottom edge next to a label
+            // chip. Pinning `interact_size.y` to the chip height makes the combo
+            // *derive* its height from `chip_h` instead of agreeing with it by
+            // arithmetic: the max can only resolve to `h`, because `h` is by
+            // definition at least the content plus its padding.
+            ui.spacing_mut().interact_size.y = h;
             ui.horizontal(|ui| {
                 if grow {
                     ui.set_min_height(h);
@@ -5315,13 +5308,27 @@ mod tests {
         )
     }
 
+    /// Apply the styling `GuiApp::new` applies, so a measurement taken here is
+    /// the one the app renders at.
+    ///
+    /// The text scaling matters as much as the padding: chip heights agreed at
+    /// egui's default sizes and drifted a fraction of a pixel apart once the
+    /// text grew, which is precisely the bug this harness missed by measuring an
+    /// unscaled context.
+    fn style_like_the_app(ctx: &egui::Context) {
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        ctx.all_styles_mut(|s| {
+            for (_, font) in s.text_styles.iter_mut() {
+                font.size *= 1.08;
+            }
+        });
+    }
+
     /// Render a single chip in isolation and return the height of the frame it
-    /// draws. Runs a few frames so egui's sizing settles, and matches the GUI's
-    /// enlarged `button_padding` so combo/text-field chips are measured at the
-    /// same size they render at in the app.
+    /// draws. Runs a few frames so egui's sizing settles.
     fn chip_height(build: impl Fn(&mut egui::Ui, &GuiTheme, &Strings, &mut Vec<Act>)) -> f32 {
         let ctx = egui::Context::default();
-        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        style_like_the_app(&ctx);
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let s = crate::i18n::Strings::for_language(&Language::English);
         let mut h = 0.0;
@@ -5432,11 +5439,12 @@ mod tests {
         });
 
         assert!(label > 0.0 && combo > 0.0 && alias > 0.0);
-        // All three must be the same height (uniform chips), within a sub-pixel
-        // rounding tolerance.
-        assert!(
-            (label - combo).abs() < 0.5,
-            "label {label} vs combo {combo}"
+        // Exactly equal, not merely close: a chip that is a fraction of a pixel
+        // short still rounds to a visibly uneven bottom edge beside its
+        // neighbour, which is how the combo chips came to sit a pixel high.
+        assert_eq!(
+            label, combo,
+            "a combo chip must be exactly as tall as a label chip"
         );
         // The PARALLEL chip, which hosts a small numeric field.
         let parallel = chip_height(|ui, th, s, acts| {
@@ -5445,22 +5453,22 @@ mod tests {
         });
 
         assert!(parallel > 0.0);
-        assert!(
-            (label - alias).abs() < 0.5,
-            "label {label} vs alias {alias}"
+        assert_eq!(
+            label, alias,
+            "an inline text field must be exactly as tall as a label chip"
         );
-        assert!(
-            (label - parallel).abs() < 0.5,
-            "label {label} vs parallel {parallel}"
+        assert_eq!(
+            label, parallel,
+            "the PARALLEL field must be exactly as tall as a label chip"
         );
 
         // The flow's closing `END`, which brackets the whole report against the
         // `BEGIN` at the top. It sits in the block column like any other row, so
         // it has to line up with them.
         let flow_end = chip_height(|ui, th, s, _acts| flow_end_row(ui, th, s));
-        assert!(
-            (label - flow_end).abs() < 0.5,
-            "label {label} vs flow end {flow_end}"
+        assert_eq!(
+            label, flow_end,
+            "the closing END must be exactly as tall as a label chip"
         );
     }
 
@@ -7064,7 +7072,7 @@ mod tests {
 mod baseline_show_chip_tests {
     use super::{
         CHIP_RADIUS, Chip, Color32, DetachWhich, ROUND_CHIP, chip_corners, link_tethers,
-        node_chips, split_tether, tint_of,
+        node_chips, split_tether,
     };
     use crate::gui::theme::GuiTheme;
     use crate::i18n::{Language, Strings};
@@ -7102,7 +7110,7 @@ mod baseline_show_chip_tests {
     }
 
     #[test]
-    fn the_baselines_show_is_tethered_to_it_and_takes_a_tint_of_its_colour() {
+    fn the_baselines_show_is_tethered_to_it_and_keeps_its_own_colour() {
         let flow = crate::report::parser::parse_flow(
             "FOR TARGET IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"stage\")\n    REQUEST A\nEND\n",
         )
@@ -7137,13 +7145,13 @@ mod baseline_show_chip_tests {
             "but the COMPARISON stays a peer — it qualifies the loop, not the baseline"
         );
         assert_eq!(
-            show.color,
-            tint_of(baseline.color),
-            "and the SHOW borrows the baseline's hue, so the colour says the same thing as the shape"
+            show.color, th.ok,
+            "and the SHOW keeps the colour every SHOW has, so it stays recognisable \
+             as a SHOW — the pill is what says which chip it belongs to"
         );
         assert_ne!(
             show.color, baseline.color,
-            "desaturated rather than identical, so the two are still told apart at a glance"
+            "so the two halves are still told apart at a glance"
         );
     }
 
