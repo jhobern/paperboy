@@ -1942,13 +1942,16 @@ impl TuiApp {
     /// user has edited. Such edits are kept only in memory — writing them to
     /// the plaintext state file would leak the secret — so they are lost when
     /// the app closes.
-    /// How many requests across every tab have edits that only exist in memory.
-    /// Drives the exit warning: unlike a `.hurl` file the user explicitly saved,
-    /// these have nowhere to survive a quit.
+    /// How many requests across every tab would lose their edits to a quit.
+    /// Drives the exit warning.
+    ///
+    /// Only Workspace tabs count: every other tab's entries are written to the
+    /// session state as they stand, so its edits are waiting — still marked as
+    /// edited — at the next start (see `Collection::edits_lost_on_exit`).
     pub(crate) fn unsaved_request_edits(&self) -> usize {
         self.collections
             .iter()
-            .map(|c| c.unsaved_edit_count())
+            .map(|c| c.edits_lost_on_exit())
             .sum()
     }
 

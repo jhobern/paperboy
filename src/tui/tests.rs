@@ -23754,6 +23754,16 @@ fn quitting_warns_about_unsaved_request_edits_even_with_confirmation_off() {
     app.collections[ci].entries.push(e);
     assert_eq!(
         app.unsaved_request_edits(),
+        0,
+        "a plain tab's edits are kept in the session state, so a quit does not \
+         lose them and must not claim otherwise"
+    );
+
+    // A Workspace tab is the case that does lose them: it is bound to a folder,
+    // so its entries are re-read from disk rather than restored.
+    app.collections[ci].workspace_root = Some(std::path::PathBuf::from("/tmp/pb-test-ws"));
+    assert_eq!(
+        app.unsaved_request_edits(),
         1,
         "the edited request is what's at stake"
     );

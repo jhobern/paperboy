@@ -1047,6 +1047,53 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Quitting only warns about edits a quit would really destroy.
+    ///
+    /// A plain tab's requests are written to the session state exactly as they
+    /// stand, edit markers and all, so they come back edited next start — the
+    /// warning used to count those and so appeared on every single quit, and
+    /// went on appearing no matter how many times it was dismissed, because
+    /// nothing about the edits ever changed.
+    #[test]
+    fn quitting_only_counts_edits_that_a_restart_would_not_bring_back() {
+        let dir = tmp("lost");
+        let mut s = Session::default();
+        s.collections.clear();
+
+        // A plain tab, edited and never saved to its file.
+        let mut plain = crate::collection::Collection::new(
+            "plain".to_string(),
+            vec![crate::hurl::HurlEntry::default()],
+        );
+        plain.path = Some(dir.join("plain.hurl"));
+        plain.entries[0].modified = true;
+        s.collections.push(plain);
+
+        // And a Workspace tab, likewise.
+        let ci = s.open_workspace(dir.clone());
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        s.collections[ci].entries[0].modified = true;
+
+        assert_eq!(
+            s.collections[0].unsaved_edit_count(),
+            1,
+            "closing the plain tab would still throw its edit away"
+        );
+        assert_eq!(
+            s.collections[0].edits_lost_on_exit(),
+            0,
+            "but quitting would not: the session state keeps it, still flagged"
+        );
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            1,
+            "while a Workspace tab is re-read from disk on restore, so its edit \
+             really would be gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The GUI's pixel geometry survives a save/load round-trip. (The matching
     /// terminal-UI half — that it carries the field through untouched — is
     /// asserted in `tui::tests`, where `TuiApp` is reachable.)

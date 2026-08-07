@@ -975,11 +975,14 @@ impl GuiApp {
         if !ctx.input(|i| i.viewport().close_requested()) || self.allow_close {
             return;
         }
+        // Only what a quit would actually destroy: a plain tab's edits are
+        // saved with the session and are still there (still flagged) next start,
+        // so warning about them cried wolf every single time.
         let count: usize = self
             .session
             .collections
             .iter()
-            .map(|c| c.unsaved_edit_count())
+            .map(|c| c.edits_lost_on_exit())
             .sum();
         if count == 0 {
             return;
@@ -992,7 +995,7 @@ impl GuiApp {
                 .session
                 .collections
                 .iter()
-                .filter(|c| c.has_any_unsaved_edits())
+                .filter(|c| c.edits_lost_on_exit() > 0)
                 .map(|c| c.name.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1056,6 +1059,15 @@ mod tests {
         e.url = "https://example.com".into();
         e.modified = true;
         crate::collection::Collection::new(name.to_string(), vec![e])
+    }
+
+    /// The same, but bound to a Workspace folder — the one kind of tab whose
+    /// edits a quit really does destroy, since its entries are re-read from
+    /// disk on restore rather than restored from the session state.
+    fn edited_workspace_collection(name: &str) -> crate::collection::Collection {
+        let mut c = edited_collection(name);
+        c.workspace_root = Some(std::path::PathBuf::from("/tmp/paperboy-test-ws"));
+        c
     }
 
     /// Closing a tab that is holding edits with nowhere on disk to go asks
@@ -1124,7 +1136,9 @@ mod tests {
 
         let mut session = Session::default();
         session.collections.clear();
-        session.collections.push(edited_collection("dirty"));
+        session
+            .collections
+            .push(edited_workspace_collection("dirty"));
         let mut app = GuiApp::for_test(session);
 
         let ctx = egui::Context::default();

@@ -35,6 +35,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   fixes the gap between two widgets when the *first* of them is added, so it had
   no effect and the pair was always drawn a full gap apart.
 
+- **Quitting no longer warns about edits that quitting would not lose.** The
+  warning counted every unsaved request edit, but an ordinary tab's requests are
+  written to the session state exactly as they are, edit markers included, so
+  those edits are still waiting — still flagged as unsaved — next time PaperBoy
+  starts. The dialog therefore reappeared on every quit, for the same requests,
+  no matter how many times it was dismissed. Only a Workspace tab genuinely
+  loses work on exit, because it is bound to a live folder and re-reads its
+  selected file from disk, so only its edits are counted now.
+
 
 ## [0.3.1] - 2026-08-06
 

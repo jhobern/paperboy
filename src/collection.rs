@@ -496,16 +496,6 @@ impl Collection {
         self.entries.iter().any(|e| e.user_added || e.modified)
     }
 
-    /// `true` when this tab is holding *any* request edit that exists only in
-    /// memory — the loaded file's, or a Workspace file's parked while the user
-    /// looks at another one. This is the question to ask before doing something
-    /// that discards them (closing the tab, quitting); [`Self::has_unsaved_edits`]
-    /// alone would miss a Workspace tab's parked files.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    pub fn has_any_unsaved_edits(&self) -> bool {
-        self.has_unsaved_edits() || !self.workspace_pending.is_empty()
-    }
-
     /// How many requests in this tab are added-but-unsaved or edited, counting
     /// a Workspace tab's parked files as well as the one it is showing.
     pub fn unsaved_edit_count(&self) -> usize {
@@ -528,6 +518,28 @@ impl Collection {
             })
             .sum();
         loaded + parked
+    }
+
+    /// How many of this tab's request edits would be gone for good after a
+    /// quit — the question to ask before warning about closing the app, as
+    /// opposed to [`Self::unsaved_edit_count`], which answers what closing
+    /// *this tab* would throw away.
+    ///
+    /// The two differ because quitting is not the same as discarding. A plain
+    /// tab's entries are written to the session state verbatim, edit markers
+    /// included, so its edits are still there — still flagged, still unsaved —
+    /// next time the app starts; warning about those taught the user to dismiss
+    /// a dialog that was never true. A Workspace tab is the exception: it is
+    /// bound to a live folder rather than to a snapshot, so its entries are
+    /// deliberately not persisted and its selected file is re-read from disk on
+    /// restore, which does drop anything edited but not saved.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn edits_lost_on_exit(&self) -> usize {
+        if self.workspace_root.is_some() {
+            self.unsaved_edit_count()
+        } else {
+            0
+        }
     }
 
     /// `true` when the workspace collection file at `path` has unsaved edits —
