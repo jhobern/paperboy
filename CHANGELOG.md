@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.6.0] - 2026-08-08
+
+### Added
+
+- **A Postman import can now be converted to Hurl on the way in.** Pass
+  `--postman-format hurl` and collections arrive as `.hurl` files and
+  environments as `.vars` files, so the imported folder owes nothing to
+  Postman. The default is unchanged: Postman's own JSON, byte for byte.
+
+- **Anything the conversion can't carry across is written down.** Hurl has no
+  pre-request scripts and no OAuth 2, so a converted import leaves a
+  `CONVERSION-NOTES.md` listing, request by request, exactly what was dropped —
+  and no file at all when nothing was. A collection this build can't read is
+  kept as its original JSON rather than converted into an empty one, so
+  converting can never cost you data.
+
+### Fixed
+
+- **Imported Postman requests now carry the auth they inherit.** A collection
+  or folder that sets its auth once at the top applies it to every request
+  underneath, which is how nearly every real collection is organised. PaperBoy
+  was only reading auth written on the request itself, so such a collection
+  imported as a set of unauthenticated requests. A request that opts out with
+  Postman's "No Auth" is respected too.
+
+- **API-key auth is now imported.** Previously only basic and bearer auth came
+  across; an API key sent as a header or a query parameter is now mapped as
+  well.
+
+- **Collection-level variables are no longer dropped on import.** A Postman
+  collection can define its own `{{base}}`-style defaults, without which its
+  URLs don't resolve. Converting to Hurl now writes them out as an environment
+  you can select.
+
 ## [0.5.0] - 2026-08-08
 
 ### Added

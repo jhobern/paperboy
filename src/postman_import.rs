@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use crate::postman::ConversionNote;
 use crate::postman_api::{
     ApiError, GENERAL_MIN_INTERVAL, ItemSummary, PostmanClient, RateInfo, STRICT_MIN_INTERVAL,
     sanitize_file_name, unique_file_name,
@@ -42,6 +43,9 @@ use crate::postman_api::{
 pub const COLLECTIONS_DIR: &str = "Collections";
 /// Subfolder for environments.
 pub const ENVIRONMENTS_DIR: &str = "Environments";
+
+/// Where an [`ImportFormat::Hurl`] import writes what it could not convert.
+pub const NOTES_FILE: &str = "CONVERSION-NOTES.md";
 
 /// How many times a single item is retried before it is recorded as failed.
 /// Kept low deliberately: with dozens of items, a long retry chain on each is
@@ -269,11 +273,6 @@ impl Progress {
 // ---------------------------------------------------------------------------
 
 /// The on-disk form imported items take.
-///
-/// Only [`ImportFormat::Raw`] exists today. Converting to Hurl on the way in
-/// is a separate change that needs `postman.rs` to grow collection-level
-/// variable and auth handling first; it slots in at [`render_collection`]
-/// without the engine changing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImportFormat {
     /// Postman's own JSON, byte for byte. PaperBoy opens `.json` collections
@@ -281,6 +280,13 @@ pub enum ImportFormat {
     /// and cannot lose anything.
     #[default]
     Raw,
+    /// Converted to Hurl: collections become `.hurl`, environments and
+    /// collection-level variables become `.vars`. This is the form to pick when
+    /// the point of the import is to stop depending on Postman — but Hurl
+    /// doesn't cover everything Postman does, so anything dropped is listed in
+    /// `CONVERSION-NOTES.md` at the root of the imported folder rather than
+    /// disappearing quietly.
+    Hurl,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +364,10 @@ pub struct ImportSummary {
     pub environments: usize,
     /// Items that could not be fetched, with the reason. Empty on a clean run.
     pub failures: Vec<(String, String)>,
+    /// Whether a `CONVERSION-NOTES.md` was written — i.e. the conversion to
+    /// Hurl left something behind that is worth reading about. Always false for
+    /// [`ImportFormat::Raw`], which converts nothing.
+    pub converted_with_notes: bool,
     pub elapsed: Duration,
 }
 
@@ -610,6 +620,7 @@ impl<'a> Importer<'a> {
 
         let mut taken_collections: HashSet<String> = HashSet::new();
         let mut taken_environments: HashSet<String> = HashSet::new();
+        let mut notes: Vec<ConversionNote> = Vec::new();
 
         for (kind, items) in [
             (ItemKind::Collection, &plan.collections),
@@ -658,10 +669,27 @@ impl<'a> Importer<'a> {
                         (ENVIRONMENTS_DIR, &mut taken_environments, &mut environments)
                     }
                 };
-                let (file_name, contents) = render(&display, &body, options.format, taken);
-                std::fs::write(staging.join(dir).join(&file_name), contents).map_err(io_err)?;
+                let rendered = render(&display, &body, kind, options.format, taken);
+                std::fs::write(staging.join(dir).join(&rendered.name), rendered.contents)
+                    .map_err(io_err)?;
                 *counter += 1;
+
+                // A collection's own variables become a `.vars` beside the
+                // environments, which is where anything selectable as one
+                // belongs — including when the workspace has no environments of
+                // its own and the folder wouldn't otherwise exist.
+                if let Some((stem, contents)) = rendered.vars {
+                    let name = unique_file_name(&stem, "vars", &mut taken_environments);
+                    let dir = staging.join(ENVIRONMENTS_DIR);
+                    std::fs::create_dir_all(&dir).map_err(io_err)?;
+                    std::fs::write(dir.join(name), contents).map_err(io_err)?;
+                }
+                notes.extend(rendered.notes);
             }
+        }
+
+        if let Some(report) = conversion_report(&plan.workspace_name, &notes) {
+            std::fs::write(staging.join(NOTES_FILE), report).map_err(io_err)?;
         }
 
         Ok(ImportSummary {
@@ -670,6 +698,7 @@ impl<'a> Importer<'a> {
             collections,
             environments,
             failures,
+            converted_with_notes: !notes.is_empty(),
             elapsed: self.clock.now().saturating_duration_since(started),
         })
     }
@@ -720,27 +749,139 @@ impl<'a> Importer<'a> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Turn one fetched item into a file name and contents.
+/// The files one fetched item turns into, plus whatever converting it lost.
+struct Rendered {
+    /// The item's own file, for the directory its kind implies.
+    name: String,
+    contents: String,
+    /// A `.vars` companion belonging in `Environments`, holding a collection's
+    /// own `{{variable}}` defaults — they have nowhere to live in a `.hurl`,
+    /// and without them the collection's URLs don't resolve.
+    vars: Option<(String, String)>,
+    notes: Vec<ConversionNote>,
+}
+
+/// Turn one fetched item into the files it should become.
 ///
-/// Split out because this is the single point conversion to Hurl will hook
-/// into: it is the only place that decides an extension or rewrites a body.
+/// This is the single place that decides an extension or rewrites a body, so
+/// conversion is contained here and the download engine is unaware of it.
+///
+/// Conversion never costs data: if a collection doesn't convert — an export
+/// shape we don't recognise, or one with no requests in it at all — the
+/// original JSON is written instead and the reason is noted. PaperBoy opens
+/// Postman JSON directly, so the fallback is still a usable collection.
 fn render(
     display: &str,
     body: &str,
+    kind: ItemKind,
     format: ImportFormat,
     taken: &mut HashSet<String>,
-) -> (String, String) {
-    match format {
-        ImportFormat::Raw => {
-            let name = unique_file_name(&sanitize_file_name(display), "json", taken);
-            (name, body.to_string())
+) -> Rendered {
+    let stem = sanitize_file_name(display);
+    let raw = |taken: &mut HashSet<String>| Rendered {
+        name: unique_file_name(&stem, "json", taken),
+        contents: body.to_string(),
+        vars: None,
+        notes: Vec::new(),
+    };
+    match (format, kind) {
+        (ImportFormat::Raw, _) => raw(taken),
+        (ImportFormat::Hurl, ItemKind::Collection) => {
+            let converted = crate::postman::convert_postman(body);
+            if converted.entries.is_empty() {
+                let mut out = raw(taken);
+                out.notes.push(ConversionNote {
+                    item: display.to_string(),
+                    detail: "no requests could be read, so the original Postman JSON was kept"
+                        .to_string(),
+                });
+                return out;
+            }
+            let vars = (!converted.variables.is_empty()).then(|| {
+                (
+                    format!("{stem} (collection variables)"),
+                    vars_text(&converted.variables),
+                )
+            });
+            Rendered {
+                name: unique_file_name(&stem, "hurl", taken),
+                contents: crate::hurl::collection_to_hurl(&converted.entries),
+                vars,
+                notes: converted.notes,
+            }
+        }
+        (ImportFormat::Hurl, ItemKind::Environment) => {
+            match crate::postman::postman_env_values(body) {
+                Some(values) => Rendered {
+                    name: unique_file_name(&stem, "vars", taken),
+                    contents: vars_text(&values),
+                    vars: None,
+                    notes: Vec::new(),
+                },
+                None => {
+                    let mut out = raw(taken);
+                    out.notes.push(ConversionNote {
+                        item: display.to_string(),
+                        detail: "not a recognisable environment export, so the original Postman \
+                                 JSON was kept"
+                            .to_string(),
+                    });
+                    out
+                }
+            }
         }
     }
 }
 
-/// Reserved for the conversion phase; see [`ImportFormat`].
-#[allow(dead_code)]
-fn render_collection() {}
+/// `KEY=value` lines — the `.vars` format, which is what both a converted
+/// environment and a collection's own variables become.
+fn vars_text(values: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in values {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push('\n');
+    }
+    out
+}
+
+/// The `CONVERSION-NOTES.md` body, or `None` when nothing was lost — an empty
+/// report is worse than no report, because a file that is always there stops
+/// being read.
+fn conversion_report(workspace: &str, notes: &[ConversionNote]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    // The workspace name is not always known — the headless import is given an
+    // id, and paying a call on the strict rate-limit bucket just to title a
+    // report would be a poor trade.
+    let subject = match workspace.trim() {
+        "" => "This folder".to_string(),
+        name => format!("`{name}`"),
+    };
+    let mut out = format!(
+        "# Conversion notes\n\n\
+         {subject} was imported from Postman and converted to Hurl. Hurl does not\n\
+         cover everything Postman does; this is what did not come across, so it can be\n\
+         handled by hand rather than discovered at runtime.\n\n\
+         Everything not listed here converted cleanly.\n"
+    );
+    let mut last = None;
+    for note in notes {
+        if last != Some(&note.item) {
+            let heading = if note.item.trim().is_empty() {
+                "(the collection itself)"
+            } else {
+                note.item.as_str()
+            };
+            out.push_str(&format!("\n## {heading}\n\n"));
+            last = Some(&note.item);
+        }
+        out.push_str(&format!("- {}\n", note.detail));
+    }
+    Some(out)
+}
 
 fn display_name(item: &ItemSummary, kind: ItemKind) -> String {
     let trimmed = item.name.trim();
@@ -1796,16 +1937,225 @@ mod tests {
     #[test]
     fn awkward_names_are_made_safe_on_disk() {
         let mut taken = HashSet::new();
-        let (name, _) = render("My API / v2: staging", "{}", ImportFormat::Raw, &mut taken);
-        assert!(!name.contains('/'));
-        assert!(name.ends_with(".json"));
+        let r = render(
+            "My API / v2: staging",
+            "{}",
+            ItemKind::Collection,
+            ImportFormat::Raw,
+            &mut taken,
+        );
+        assert!(!r.name.contains('/'));
+        assert!(r.name.ends_with(".json"));
     }
 
     #[test]
     fn rendering_raw_never_alters_the_body() {
         let mut taken = HashSet::new();
         let body = r#"{"a":[1,2,3],"b":"\u00e9"}"#;
-        let (_, out) = render("x", body, ImportFormat::Raw, &mut taken);
-        assert_eq!(out, body);
+        let r = render(
+            "x",
+            body,
+            ItemKind::Collection,
+            ImportFormat::Raw,
+            &mut taken,
+        );
+        assert_eq!(r.contents, body);
+    }
+    // -- Conversion to Hurl -------------------------------------------------
+
+    fn hurl_options() -> ImportOptions {
+        ImportOptions {
+            format: ImportFormat::Hurl,
+            ..Default::default()
+        }
+    }
+
+    /// A collection with a folder, an inherited bearer token, a collection
+    /// variable and a pre-request script — enough for every part of the
+    /// conversion to show up in one import.
+    const RICH_COLLECTION: &str = r#"{"collection":{
+      "info": { "name": "API", "schema": "https://schema.getpostman.com/..v2.1.0" },
+      "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{TOKEN}}" }] },
+      "variable": [{ "key": "base", "value": "https://api.example.com" }],
+      "item": [
+        { "name": "Users", "item": [
+          { "name": "List", "request": { "method": "GET", "url": "{{base}}/users" } }
+        ]},
+        { "name": "Legacy", "request": { "method": "GET", "url": "{{base}}/old" },
+          "event": [{ "listen": "prerequest",
+                      "script": { "exec": ["pm.environment.set('nonce', Date.now())"] } }] }
+      ]}}"#;
+
+    /// The point of the Hurl format: `.hurl` collections and `.vars`
+    /// environments, with no Postman JSON left in the folder at all.
+    #[test]
+    fn converting_writes_hurl_collections_and_vars_environments() {
+        let script = Scripted::new(vec![
+            res(200, RICH_COLLECTION),
+            res(
+                200,
+                r#"{"environment":{"name":"Prod","values":[{"key":"HOST","value":"x.example"}]}}"#,
+            ),
+        ]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let plan = ImportPlan {
+            workspace_id: "ws".into(),
+            workspace_name: "WS".into(),
+            collections: vec![item("API", "u1")],
+            environments: vec![item("Prod", "u2")],
+            remaining_month: None,
+        };
+        let dest = tmpdir("convert");
+        imp.download(&plan, &dest, &hurl_options()).unwrap();
+
+        let hurl = std::fs::read_to_string(dest.join(COLLECTIONS_DIR).join("API.hurl")).unwrap();
+        assert!(hurl.contains("GET {{base}}/users"), "{hurl}");
+        assert!(
+            hurl.contains("Users/List"),
+            "the folder survives as a title prefix: {hurl}"
+        );
+        assert!(
+            hurl.contains("Bearer {{TOKEN}}"),
+            "the collection's auth was applied to the request that inherits it: {hurl}"
+        );
+
+        let env = std::fs::read_to_string(dest.join(ENVIRONMENTS_DIR).join("Prod.vars")).unwrap();
+        assert_eq!(env, "HOST=x.example\n");
+
+        // The collection's own variables have nowhere to live in a `.hurl`, so
+        // they become an environment the user can actually select.
+        let vars = std::fs::read_to_string(
+            dest.join(ENVIRONMENTS_DIR)
+                .join("API (collection variables).vars"),
+        )
+        .unwrap();
+        assert_eq!(vars, "base=https://api.example.com\n");
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The whole point of writing `.hurl` is that PaperBoy can open it again.
+    /// A conversion that produced text its own parser rejects would look fine
+    /// on disk and fail the moment anyone used it.
+    #[test]
+    fn the_converted_hurl_parses_back_into_the_same_requests() {
+        let script = Scripted::new(vec![res(200, RICH_COLLECTION)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let dest = tmpdir("roundtrip");
+        imp.download(&plan_of(1, 0), &dest, &hurl_options())
+            .unwrap();
+
+        let text = std::fs::read_to_string(dest.join(COLLECTIONS_DIR).join("c0.hurl")).unwrap();
+        let reparsed = crate::hurl::parse_hurl(&text);
+        let direct = crate::postman::convert_postman(RICH_COLLECTION).entries;
+        assert_eq!(
+            reparsed.len(),
+            direct.len(),
+            "every request survives the round trip: {text}"
+        );
+        for (a, b) in reparsed.iter().zip(direct.iter()) {
+            assert_eq!(a.title, b.title);
+            assert_eq!(a.method, b.method);
+            assert_eq!(a.url, b.url);
+            assert_eq!(
+                a.headers.len(),
+                b.headers.len(),
+                "the inherited auth header survives too, on {}",
+                a.title
+            );
+        }
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// Converting is lossy, so what it lost is written down. A migration off
+    /// Postman needs to know what still has to be done by hand.
+    #[test]
+    fn what_conversion_dropped_is_written_to_a_notes_file() {
+        let script = Scripted::new(vec![res(200, RICH_COLLECTION)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let dest = tmpdir("notes");
+        let summary = imp
+            .download(&plan_of(1, 0), &dest, &hurl_options())
+            .unwrap();
+
+        assert!(summary.converted_with_notes);
+        let notes = std::fs::read_to_string(dest.join(NOTES_FILE)).unwrap();
+        assert!(notes.contains("Legacy"), "the request is named: {notes}");
+        assert!(
+            notes.contains("pre-request script"),
+            "and so is what it lost: {notes}"
+        );
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// A clean conversion writes no notes file at all: a report that is always
+    /// present is a report nobody reads.
+    #[test]
+    fn a_clean_conversion_leaves_no_notes_file() {
+        let script = Scripted::new(vec![res(
+            200,
+            r#"{"collection":{"info":{"name":"A","schema":"x"},
+                 "item":[{"name":"go","request":{"method":"GET","url":"https://x/y"}}]}}"#,
+        )]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let dest = tmpdir("clean");
+        let summary = imp
+            .download(&plan_of(1, 0), &dest, &hurl_options())
+            .unwrap();
+
+        assert!(!summary.converted_with_notes);
+        assert!(!dest.join(NOTES_FILE).exists());
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// Conversion must never cost data. An export this build can't read falls
+    /// back to the original JSON — which PaperBoy opens directly — rather than
+    /// writing an empty `.hurl` and calling it done.
+    #[test]
+    fn a_collection_that_cannot_be_converted_keeps_its_original_json() {
+        let body = r#"{"collection":{"info":{"name":"Odd","schema":"x"},"item":[]}}"#;
+        let script = Scripted::new(vec![res(200, body)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let dest = tmpdir("fallback");
+        imp.download(&plan_of(1, 0), &dest, &hurl_options())
+            .unwrap();
+
+        let kept = std::fs::read_to_string(dest.join(COLLECTIONS_DIR).join("c0.json")).unwrap();
+        assert_eq!(kept, body, "byte for byte, so nothing is lost");
+        assert!(
+            std::fs::read_to_string(dest.join(NOTES_FILE))
+                .unwrap()
+                .contains("original Postman JSON was kept"),
+            "and the fallback is explained rather than silent"
+        );
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The default format still writes Postman's JSON untouched, so choosing to
+    /// convert stays an opt-in.
+    #[test]
+    fn the_default_format_still_writes_postman_json() {
+        let script = Scripted::new(vec![res(200, RICH_COLLECTION)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let dest = tmpdir("raw-default");
+        let summary = imp
+            .download(&plan_of(1, 0), &dest, &ImportOptions::default())
+            .unwrap();
+
+        assert!(dest.join(COLLECTIONS_DIR).join("c0.json").is_file());
+        assert!(!summary.converted_with_notes);
+        assert!(!dest.join(NOTES_FILE).exists());
+        std::fs::remove_dir_all(&dest).ok();
     }
 }

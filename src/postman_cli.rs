@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::environment::{CliResolver, parse_vars_with};
 use crate::postman_api::{ApiError, PostmanClient, WorkspaceKind};
 use crate::postman_import::{
-    ImportError, ImportOptions, ImportPlan, Importer, ItemKind, parse_workspace_ref,
+    ImportError, ImportFormat, ImportOptions, ImportPlan, Importer, ItemKind, parse_workspace_ref,
 };
 
 /// What the import should fetch.
@@ -47,6 +47,7 @@ pub struct Args {
     pub out: Option<String>,
     pub what: Option<String>,
     pub base_url: Option<String>,
+    pub format: Option<String>,
     pub overwrite: bool,
 }
 
@@ -67,6 +68,15 @@ pub fn run(args: Args) -> i32 {
         }
         Some(Some(w)) => w,
         None => What::All,
+    };
+
+    let format = match args.format.as_deref().map(parse_format) {
+        Some(None) => {
+            eprintln!("error: --postman-format must be one of: postman, hurl");
+            return 2;
+        }
+        Some(Some(f)) => f,
+        None => ImportFormat::default(),
     };
 
     let client = PostmanClient::new(key, args.base_url.clone());
@@ -96,11 +106,21 @@ pub fn run(args: Args) -> i32 {
     let options = ImportOptions {
         include_collections: matches!(what, What::All | What::Collections),
         include_environments: matches!(what, What::All | What::Environments),
+        format,
         overwrite: args.overwrite,
-        ..Default::default()
     };
 
     download(&client, &workspace_id, &dest, &options)
+}
+
+/// `--postman-format`. `postman` keeps the JSON exactly as Postman sends it;
+/// `hurl` converts, which is lossy and says so in `CONVERSION-NOTES.md`.
+fn parse_format(v: &str) -> Option<ImportFormat> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "postman" | "raw" | "json" => Some(ImportFormat::Raw),
+        "hurl" => Some(ImportFormat::Hurl),
+        _ => None,
+    }
 }
 
 /// Where the API key comes from, in order of preference.
@@ -224,6 +244,13 @@ fn download(
                 // The folder is usable, but it is not what was asked for, so
                 // a script must be able to tell.
                 return 1;
+            }
+            if summary.converted_with_notes {
+                eprintln!(
+                    "\nSome things could not be converted to Hurl. See {}/{}",
+                    dest.display(),
+                    crate::postman_import::NOTES_FILE
+                );
             }
             eprintln!("Open it with: paperboy   (then Load ▸ Workspace)");
             0

@@ -623,6 +623,10 @@ browser address bar can be pasted straight in. The result is a folder of
   `--postman-key '{{ op://Private/Postman/credential }}'`. The key is never
   written to disk, and is stripped from any error message.
 - `--postman-what collections|environments|all` limits what is downloaded.
+- `--postman-format hurl` converts on the way in: collections become `.hurl`
+  files and environments become `.vars` files, so the result owes nothing to
+  Postman. See **Converting to Hurl** below. The default, `postman`, keeps
+  Postman's own JSON byte for byte — PaperBoy opens that directly too.
 - `--overwrite` replaces an existing destination; without it, a destination that
   exists and isn't empty is refused.
 - `--postman-base-url` points at a different tenant (EU Enterprise accounts use
@@ -633,6 +637,28 @@ workspace missing from the list is one your Postman account isn't a member of.
 
 Postman rate-limits its API, so an import is paced deliberately and tells you
 up front roughly how long it will take; a large workspace takes a minute or two.
+
+### Converting to Hurl
+
+`--postman-format hurl` writes Hurl rather than Postman JSON. What comes across:
+
+- Requests, folders (as `Folder/Name` titles), headers, query parameters,
+  raw bodies and form/multipart fields.
+- **Auth, including inheritance.** Postman applies a collection's or folder's
+  auth to every request that doesn't set its own, and `noauth` on a request
+  opts back out; all three levels are resolved, so a collection that
+  authenticates once at the top doesn't import as an unauthenticated one.
+  `basic`, `bearer` and `apikey` (header or query) are mapped.
+- **Collection variables**, which have nowhere to live in a `.hurl` file, become
+  `<name> (collection variables).vars` alongside the environments — select it
+  like any other environment and `{{base}}` resolves.
+- `pm.<store>.set("NAME", body.a.b)` calls in a test script, as `[Captures]`.
+
+Hurl doesn't cover everything Postman does, so anything dropped — a
+pre-request script, an OAuth 2 block, a GraphQL body — is listed by request in
+`CONVERSION-NOTES.md` at the root of the imported folder. No notes file means
+nothing was lost. A collection this build can't read is written out as its
+original JSON instead, so converting can never cost you data.
 
 ## Headless CLI mode
 

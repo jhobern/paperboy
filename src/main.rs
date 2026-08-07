@@ -151,6 +151,14 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     postman_base_url: Option<String>,
 
+    /// With `--postman-import`: the on-disk format — `postman` (default) keeps
+    /// Postman's own JSON exactly as sent, `hurl` converts collections to
+    /// `.hurl` and environments to `.vars`. Converting is lossy (Hurl has no
+    /// pre-request scripts, for one), so anything dropped is listed in
+    /// `CONVERSION-NOTES.md` in the imported folder.
+    #[arg(long, value_name = "FORMAT")]
+    postman_format: Option<String>,
+
     /// With `--postman-import`: replace the destination folder if it already
     /// exists. Without this, a destination that exists and is not empty is
     /// refused.
@@ -171,6 +179,7 @@ fn main() {
             out: cli.output,
             what: cli.postman_what,
             base_url: cli.postman_base_url,
+            format: cli.postman_format,
             overwrite: cli.overwrite,
         }));
     }
