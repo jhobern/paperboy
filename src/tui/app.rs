@@ -372,6 +372,30 @@ impl WorkspacePickerState {
     }
 }
 
+/// Take the overlay out of the app, but **only** when it is the one asked for.
+///
+/// The obvious spelling of this is a `let ... else` over `self.overlay.take()`,
+/// and it is wrong in a way that is easy to miss and severe when it happens:
+/// `take()` is evaluated before the pattern is matched, so an overlay that
+/// *doesn't* match has already been removed by the time the arm gives up, and
+/// is dropped. Anything polled on every pass of the event loop then quietly
+/// closes whatever the user just opened — which is exactly how the File and
+/// Settings menus, and the quit confirmation, once became unreachable.
+///
+/// Here the closure is handed the overlay and must give it back (as `Err`) if
+/// it isn't interested, so declining to match cannot lose it.
+///
+/// Prefer the [`take_overlay!`] macro, which writes the give-it-back arm.
+macro_rules! take_overlay {
+    ($app:expr, $pat:pat => $out:expr) => {
+        $app.take_overlay_matching(|overlay| match overlay {
+            $pat => Ok($out),
+            other => Err(other),
+        })
+    };
+}
+pub(crate) use take_overlay;
+
 pub(crate) enum Overlay {
     /// Top-level File menu: just "(L)oad" / "(S)ave", each opening its own
     /// grouped submenu (see `FileLoadMenu`/`FileSaveMenu`) — replaces the old
@@ -1320,6 +1344,24 @@ impl Default for TuiApp {
 }
 
 impl TuiApp {
+    /// The safe half of [`take_overlay!`]: hand the open overlay to `f`, which
+    /// either extracts what it wants from it or gives it back untouched.
+    ///
+    /// Returning the overlay in the `Err` case is what makes this safe — a
+    /// caller that isn't interested cannot accidentally drop what was open.
+    pub(crate) fn take_overlay_matching<T>(
+        &mut self,
+        f: impl FnOnce(Overlay) -> Result<T, Overlay>,
+    ) -> Option<T> {
+        match f(self.overlay.take()?) {
+            Ok(taken) => Some(taken),
+            Err(put_back) => {
+                self.overlay = Some(put_back);
+                None
+            }
+        }
+    }
+
     pub(crate) fn begin_mouse_frame(&self) {
         self.mouse_hits.borrow_mut().clear();
         self.mouse_top_layer.set(MouseLayer::Base);
@@ -3756,14 +3798,7 @@ impl TuiApp {
 
     /// Poll the wizard's in-flight git operation (called each frame).
     pub(crate) fn poll_git_updates(&mut self) {
-        // Check before taking. A `let ... else { return }` on `take()` would
-        // still have *taken* the overlay when the pattern doesn't match, so
-        // every other menu and dialog would be dropped on the next tick of the
-        // event loop — which reads as menus closing the instant they open.
-        if !matches!(self.overlay, Some(Overlay::RemoteGit(_))) {
-            return;
-        }
-        let Some(Overlay::RemoteGit(mut w)) = self.overlay.take() else {
+        let Some(mut w) = take_overlay!(self, Overlay::RemoteGit(w) => w) else {
             return;
         };
         match w.flow.poll() {
@@ -4076,10 +4111,7 @@ impl TuiApp {
     /// Poll the "save to git" wizard's in-flight background op (called each
     /// frame).
     pub(crate) fn poll_git_save_updates(&mut self) {
-        if !matches!(self.overlay, Some(Overlay::GitSave(_))) {
-            return;
-        }
-        let Some(Overlay::GitSave(mut w)) = self.overlay.take() else {
+        let Some(mut w) = take_overlay!(self, Overlay::GitSave(w) => w) else {
             return;
         };
         let Some(rx) = w.rx.as_ref() else {

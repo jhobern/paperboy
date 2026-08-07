@@ -535,7 +535,9 @@ impl TuiApp {
     }
 
     fn click_browser_row(&mut self, row: usize) {
-        let Some(Overlay::Browser(action, mut ex)) = self.overlay.take() else {
+        let Some((action, mut ex)) =
+            take_overlay!(self, Overlay::Browser(action, ex) => (action, ex))
+        else {
             return;
         };
         let len = ex.files().len();
@@ -553,7 +555,7 @@ impl TuiApp {
     }
 
     fn click_workspace_picker_row(&mut self, row: usize) {
-        let Some(Overlay::WorkspacePicker(mut picker)) = self.overlay.take() else {
+        let Some(mut picker) = take_overlay!(self, Overlay::WorkspacePicker(p) => p) else {
             return;
         };
         let activate = picker.selected == row;
@@ -1356,6 +1358,11 @@ impl TuiApp {
     }
 
     pub(crate) fn on_key_overlay(&mut self, key: KeyEvent) {
+        // Unlike the polls, this genuinely wants whatever is open: the match
+        // below is exhaustive and every arm either puts an overlay back or
+        // deliberately closes one. Taking unconditionally is only safe *because*
+        // of that — see `take_overlay!` before copying this shape anywhere that
+        // handles a single kind of overlay.
         let Some(overlay) = self.overlay.take() else {
             return;
         };

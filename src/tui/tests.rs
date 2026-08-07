@@ -24311,3 +24311,23 @@ fn quitting_still_works_when_the_loop_ticks_between_keystrokes() {
     press(&mut app, KeyCode::Enter);
     assert!(app.quit, "answering the quit confirmation must quit");
 }
+
+/// The guarantee the whole family of overlay polls rests on: declining to
+/// match must leave the overlay exactly where it was.
+#[test]
+fn taking_an_overlay_that_does_not_match_leaves_it_open() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileMenu(0));
+
+    let got = take_overlay!(&mut app, Overlay::RemoteGit(w) => w);
+    assert!(got.is_none(), "a File menu is not the git wizard");
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(0))),
+        "an overlay the caller declined must be put back untouched"
+    );
+
+    // ...and matching still hands it over, leaving nothing behind.
+    let got = take_overlay!(&mut app, Overlay::FileMenu(sel) => sel);
+    assert_eq!(got, Some(0));
+    assert!(app.overlay.is_none());
+}
