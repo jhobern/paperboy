@@ -12,8 +12,8 @@ use crate::environment::{Environment, PendingSecret, parse_vars_pending};
 use crate::git_remote::GitOrigin;
 use crate::hurl::HurlEntry;
 use crate::i18n::Language;
+use crate::remote_flow::WorkspaceGitOrigin;
 use crate::request::RequestView;
-use crate::tui::remote::WorkspaceGitOrigin;
 
 // ── Session state persistence ───────────────────────────────────────────────
 

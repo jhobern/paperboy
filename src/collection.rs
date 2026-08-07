@@ -193,7 +193,7 @@ pub struct Collection {
     /// between sessions), the app can offer to redownload the exact same
     /// commit rather than losing track of the workspace entirely — see
     /// `PersistedTab::into_collection`'s `PendingWorkspaceReload`.
-    pub workspace_git_origin: Option<crate::tui::remote::WorkspaceGitOrigin>,
+    pub workspace_git_origin: Option<crate::remote_flow::WorkspaceGitOrigin>,
     /// For a Workspace tab, the set of *expanded* node paths (absolute) in the
     /// file-tree — both folders (whose child entries are shown) and collection
     /// files (whose inline request names are shown). A node is visible when all

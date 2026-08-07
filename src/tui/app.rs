@@ -20,6 +20,7 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
+use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use tui_panel_select::MultiSelectPanel;
 use tui_panel_select::wrapcache::TextPos;
 

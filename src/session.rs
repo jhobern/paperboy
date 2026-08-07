@@ -38,9 +38,9 @@ use crate::persistence::{
     self, GuiLayout, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState,
     PersistedTab,
 };
+use crate::remote_flow::WorkspaceGitOrigin;
 use crate::request::{self, AppVars, BatchRunUpdate, CaptureUpdate, RequestView};
 use crate::theme::{self, ThemeSpec};
-use crate::tui::remote::WorkspaceGitOrigin;
 
 // ── Shared pure helpers (called by both front-ends) ─────────────────────────
 
@@ -984,7 +984,7 @@ impl Session {
 mod workspace_tests {
     use super::*;
     use crate::collection::WsRow;
-    use crate::tui::remote::WorkspaceGitFilter;
+    use crate::remote_flow::WorkspaceGitFilter;
 
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

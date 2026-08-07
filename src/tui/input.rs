@@ -26,6 +26,7 @@ use super::reports::ReportPane;
 use super::reports::{ReportView, grid_col_at_x, result_column_widths};
 use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
+use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use tui_panel_select::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;

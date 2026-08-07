@@ -19,6 +19,7 @@ use super::app::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
+use crate::remote_flow::{RefChoice, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use tui_panel_select::wrapcache::TextPos;
 
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL

@@ -22,7 +22,7 @@ use eframe::egui;
 
 use crate::git_remote::{self, GitOrigin, RefKind, RemoteRefs};
 use crate::i18n::{Status, Strings};
-use crate::tui::remote::{WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::remote_flow::{WorkspaceGitFilter, WorkspaceGitOrigin};
 
 use super::app::GuiApp;
 

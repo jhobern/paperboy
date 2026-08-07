@@ -8,103 +8,22 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::git_remote::{self, RefKind, RemoteRefs};
+use crate::git_remote::{self, RemoteRefs};
 use crate::i18n::Strings;
+use crate::remote_flow::{RefChoice, RemoteKind, WorkspaceGitFilter};
+
+// The wizard's data model, its file/ref narrowing and its background workers
+// live in `crate::remote_flow`, shared with the GUI so the two front-ends
+// cannot drift apart. What remains here is the terminal UI's presentation of
+// it: the stage the user is on and how each popup is drawn.
+pub(crate) use crate::remote_flow::{
+    build_ref_choices, filter_indices, relevant_files, spawn_workspace_redownload,
+};
 
 use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp};
 use super::draw::*;
 use super::editor::*;
 use super::theme::*;
-
-/// Whether the remote-git wizard is loading a collection, an environment, a
-/// PaperTrail `.trail`, or a whole Workspace (many collection files at once,
-/// filtered by extension).
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum RemoteKind {
-    Collection,
-    Environment,
-    Report,
-    Workspace,
-}
-
-/// Which files to download when loading a Workspace from git, offered as a
-/// small fixed picklist right after the branch/tag is chosen — a big repo
-/// may hold plenty of large, unrelated files that should never be pulled
-/// down just to browse its collections.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum WorkspaceGitFilter {
-    HurlAndJson,
-    HurlOnly,
-    JsonOnly,
-    All,
-}
-
-impl WorkspaceGitFilter {
-    pub(crate) const ALL: [WorkspaceGitFilter; 4] = [
-        WorkspaceGitFilter::HurlAndJson,
-        WorkspaceGitFilter::HurlOnly,
-        WorkspaceGitFilter::JsonOnly,
-        WorkspaceGitFilter::All,
-    ];
-
-    pub(crate) fn label(self, s: &Strings) -> &'static str {
-        match self {
-            WorkspaceGitFilter::HurlAndJson => s.git_ws_filter_hurl_json,
-            WorkspaceGitFilter::HurlOnly => s.git_ws_filter_hurl,
-            WorkspaceGitFilter::JsonOnly => s.git_ws_filter_json,
-            WorkspaceGitFilter::All => s.git_ws_filter_all,
-        }
-    }
-
-    /// Whether `path` (a repo-relative path as returned by `git ls-tree`)
-    /// should be downloaded under this filter (case-insensitive extension
-    /// match, mirroring `crate::workspace::scan_workspace`'s local filter).
-    pub(crate) fn matches(self, path: &str) -> bool {
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str());
-        match self {
-            WorkspaceGitFilter::All => true,
-            WorkspaceGitFilter::HurlAndJson => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
-            }
-            WorkspaceGitFilter::HurlOnly => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl"))
-            }
-            WorkspaceGitFilter::JsonOnly => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("json"))
-            }
-        }
-    }
-}
-
-/// Where a Workspace's downloaded files came from in git — remembered on
-/// [`crate::collection::Collection::workspace_git_origin`] so that if the
-/// temp download folder vanishes (e.g. the OS clears `/tmp` between
-/// sessions), the app can offer to redownload the exact same commit rather
-/// than losing track of the workspace entirely. Pinned to a commit **sha**,
-/// not just a branch/tag name, so a redownload restores exactly what was
-/// there before (not "whatever the branch points at now") — and a failed
-/// fetch of that exact sha is a reliable sign the remote's history no
-/// longer contains it (force-push, rebase, deleted branch/tag), reported to
-/// the user as such. Never holds a token (tokens are intentionally never
-/// persisted, same as [`crate::git_remote::GitOrigin`]).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WorkspaceGitOrigin {
-    pub(crate) repo_url: String,
-    pub(crate) commit_sha: String,
-    pub(crate) ref_kind: RefKind,
-    pub(crate) ref_name: String,
-    pub(crate) filter: WorkspaceGitFilter,
-}
-
-/// A branch or tag choice: `label` is shown to the user, `gitref` is the full
-/// ref (e.g. `refs/heads/main`) passed to `git fetch`.
-#[derive(Clone)]
-pub(crate) struct RefChoice {
-    pub(crate) label: String,
-    pub(crate) gitref: String,
-}
 
 /// Result messages from background git operations, delivered over a channel and
 /// polled each frame (like environment secret resolution).
@@ -222,74 +141,6 @@ impl RemoteWizard {
     }
 }
 
-/// Indices of `items` whose text contains `filter` (case-insensitive).
-pub(crate) fn filter_indices<'a>(items: impl Iterator<Item = &'a str>, filter: &str) -> Vec<usize> {
-    let f = filter.to_lowercase();
-    items
-        .enumerate()
-        .filter(|(_, s)| f.is_empty() || s.to_lowercase().contains(&f))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Narrow a git file listing to the paths worth showing in a single-file
-/// picker, so loading from a big repo isn't buried under unrelated files:
-///   * a Collection load shows only `.hurl` / `.json` files;
-///   * an Environment load shows only `.vars` / `.env` files (including
-///     `.env`-style dotfiles like `.env` and `.env.dev-au`).
-///
-/// If nothing matches (an unusually named repo), the full list is returned
-/// unchanged rather than leaving the user staring at an empty picker.
-pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> {
-    let keep = |path: &String| -> bool {
-        let p = std::path::Path::new(path);
-        let ext = p.extension().and_then(|e| e.to_str());
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        match kind {
-            RemoteKind::Collection => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
-            }
-            RemoteKind::Environment => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars")
-                    || e.eq_ignore_ascii_case("env")
-                    // Postman exports an environment as JSON.
-                    || e.eq_ignore_ascii_case("json"))
-                    || name.eq_ignore_ascii_case(".env")
-                    || name.to_ascii_lowercase().starts_with(".env.")
-            }
-            RemoteKind::Report => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("trail"))
-            }
-            // A Workspace load uses the file-type filter step, not this picker.
-            RemoteKind::Workspace => true,
-        }
-    };
-    let filtered: Vec<String> = files.iter().filter(|p| keep(p)).cloned().collect();
-    if filtered.is_empty() {
-        files.to_vec()
-    } else {
-        filtered
-    }
-}
-
-/// Build the flat, filterable branch+tag choice list (branches first).
-pub(crate) fn build_ref_choices(refs: &RemoteRefs, s: &Strings) -> Vec<RefChoice> {
-    let mut out = Vec::with_capacity(refs.branches.len() + refs.tags.len());
-    for b in &refs.branches {
-        out.push(RefChoice {
-            label: format!("[{}] {b}", s.git_branches),
-            gitref: git_remote::branch_ref(b),
-        });
-    }
-    for t in &refs.tags {
-        out.push(RefChoice {
-            label: format!("[{}] {t}", s.git_tags),
-            gitref: git_remote::tag_ref(t),
-        });
-    }
-    out
-}
-
 pub(crate) fn spawn_git_refs(url: String, token: Option<String>) -> Receiver<GitMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -338,47 +189,6 @@ pub(crate) fn spawn_git_checkout_workspace(repo: PathBuf, paths: Vec<String>) ->
         // repo (which now holds the downloaded workspace files) so it doesn't
         // linger on disk.
         if let Err(mpsc::SendError(GitMsg::Workspace(Ok(dir)))) = tx.send(GitMsg::Workspace(res)) {
-            git_remote::cleanup(&dir);
-        }
-    });
-    rx
-}
-
-/// Attempt to redownload a Workspace's files from git, pinned to the exact
-/// `commit_sha` recorded when it was first downloaded (see
-/// [`WorkspaceGitOrigin`]) — used when the local temp folder has vanished
-/// (e.g. `/tmp` was cleared) since the last session. Unlike the interactive
-/// wizard flow, this never prompts for a branch/tag or a file-type filter —
-/// both are already known — and never asks for a token (tokens are never
-/// persisted), so a private repo will fail here with an auth error; the
-/// user's only recourse in that case is to reload it manually through
-/// "Load Workspace from Git…", which does prompt for a token. A failure to
-/// fetch the exact recorded sha most often means the remote's history no
-/// longer contains it (force-push, rebase, or the branch/tag was deleted).
-pub(crate) fn spawn_workspace_redownload(
-    origin: WorkspaceGitOrigin,
-) -> Receiver<Result<PathBuf, String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = match git_remote::list_files(&origin.repo_url, None, &origin.commit_sha) {
-            Ok((files, repo, _sha)) => {
-                let matched: Vec<String> = files
-                    .into_iter()
-                    .filter(|p| origin.filter.matches(p))
-                    .collect();
-                match git_remote::checkout_files(&repo, &matched) {
-                    Ok(()) => Ok(repo),
-                    Err(e) => {
-                        git_remote::cleanup(&repo);
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        };
-        // If the caller gave up waiting (app closed mid-fetch), clean up any
-        // downloaded folder rather than leaking it.
-        if let Err(mpsc::SendError(Ok(dir))) = tx.send(result) {
             git_remote::cleanup(&dir);
         }
     });

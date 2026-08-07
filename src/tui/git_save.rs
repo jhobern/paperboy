@@ -30,8 +30,8 @@ use crate::i18n::Strings;
 use super::app::{MouseHitTarget, MouseLayer, TuiApp};
 use super::draw::*;
 use super::editor::*;
-use super::remote::{WorkspaceGitFilter, WorkspaceGitOrigin};
 use super::theme::*;
+use crate::remote_flow::{WorkspaceGitFilter, WorkspaceGitOrigin};
 
 /// What the "save to git" wizard is pushing: a single collection (+ optional
 /// environment), or an entire git-loaded Workspace folder.
