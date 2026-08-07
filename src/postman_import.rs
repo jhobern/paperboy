@@ -543,6 +543,23 @@ impl<'a> Importer<'a> {
         dest: &Path,
         options: &ImportOptions,
     ) -> Result<ImportSummary, ImportError> {
+        // Every exit from this call reports its outcome exactly once. An early
+        // `?` that skipped the `Failed` message would leave a consumer waiting
+        // for a message that never arrives — which is a hang, not an error.
+        let result = self.download_inner(plan, dest, options);
+        match &result {
+            Ok(summary) => self.send(ImportMsg::Done(Box::new(summary.clone()))),
+            Err(e) => self.send(ImportMsg::Failed(e.to_string())),
+        }
+        result
+    }
+
+    fn download_inner(
+        &mut self,
+        plan: &ImportPlan,
+        dest: &Path,
+        options: &ImportOptions,
+    ) -> Result<ImportSummary, ImportError> {
         let started = self.clock.now();
         ensure_destination(dest, options.overwrite)?;
         let staging = staging_path(dest);
@@ -560,14 +577,12 @@ impl<'a> Importer<'a> {
                     return Err(e);
                 }
                 summary.dest = dest.to_path_buf();
-                self.send(ImportMsg::Done(Box::new(summary.clone())));
                 Ok(summary)
             }
             Err(e) => {
                 // Nothing is left behind on failure: a partial folder that
                 // looks like a workspace is a trap.
                 let _ = std::fs::remove_dir_all(&staging);
-                self.send(ImportMsg::Failed(e.to_string()));
                 Err(e)
             }
         }
@@ -755,6 +770,50 @@ fn item_failure_is_survivable(e: &ApiError) -> bool {
         ApiError::RateLimited { monthly, .. } => !monthly,
         _ => true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace references
+// ---------------------------------------------------------------------------
+
+/// Pull a workspace id out of whatever the user supplied.
+///
+/// The id is a UUID, but nobody has one to hand — what people actually have is
+/// the address bar of the workspace they are looking at. Postman writes those
+/// as `https://go.postman.co/workspace/My-Team~<uuid>` or
+/// `.../workspace/<uuid>/overview`, so a pasted URL is accepted as readily as
+/// a bare id. Shared by the CLI and both wizards so all three take the same
+/// input.
+pub fn parse_workspace_ref(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if looks_like_uuid(trimmed) {
+        return Some(trimmed.to_ascii_lowercase());
+    }
+
+    // Walk the URL's segments (and the `name~uuid` form) looking for a UUID,
+    // rather than assuming a fixed position, because Postman's paths vary by
+    // view (`/overview`, `/request/…`, a query string, and so on).
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    without_query
+        .split('/')
+        .flat_map(|seg| seg.split('~'))
+        .find(|seg| looks_like_uuid(seg))
+        .map(|s| s.to_ascii_lowercase())
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    // 8-4-4-4-12 hex. Deliberately not a full RFC check: the aim is to tell a
+    // workspace id apart from a URL segment or a workspace name, and the
+    // server is the authority on whether it exists.
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, g)| g.len() == *len && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,6 +1539,113 @@ mod tests {
         std::fs::remove_dir_all(&dest).ok();
     }
 
+    #[test]
+    fn every_failure_still_reports_an_outcome() {
+        // A consumer waiting on the channel must always be released. An early
+        // return that skipped the final message would hang the caller rather
+        // than fail it — which is exactly what happened the first time the CLI
+        // was pointed at an occupied folder.
+        let dest = tmpdir("always-reports");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("mine.txt"), "x").unwrap();
+        let script = Scripted::new(vec![]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let (tx, rx) = channel();
+        let mut imp = Importer::new(&c).with_clock(&clock).with_progress(tx);
+        let _ = imp.download(&plan_of(1, 0), &dest, &ImportOptions::default());
+        drop(imp);
+        let msgs: Vec<_> = rx.iter().collect();
+        assert!(
+            msgs.iter().any(|m| matches!(m, ImportMsg::Failed(_))),
+            "a failed import must announce itself, got {msgs:?}"
+        );
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
+    fn a_successful_import_reports_done_exactly_once() {
+        let script = Scripted::new(vec![res(200, r#"{"collection":{"n":1}}"#)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let (tx, rx) = channel();
+        let mut imp = Importer::new(&c).with_clock(&clock).with_progress(tx);
+        let dest = tmpdir("done-once");
+        imp.download(&plan_of(1, 0), &dest, &ImportOptions::default())
+            .unwrap();
+        drop(imp);
+        let dones = rx
+            .iter()
+            .filter(|m| matches!(m, ImportMsg::Done(_)))
+            .count();
+        assert_eq!(dones, 1);
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    // -- opening the result -----------------------------------------------
+
+    #[test]
+    fn an_imported_folder_opens_as_a_paperboy_workspace() {
+        // The point of the whole feature. The engine and the workspace scanner
+        // are separate modules, and a folder that downloads perfectly but does
+        // not open is worth nothing, so the two halves are checked together.
+        let script = Scripted::new(vec![
+            res(
+                200,
+                r#"{"collection":{"info":{"name":"Billing","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[{"name":"Get","request":{"method":"GET","url":"https://example.test/x"}}]}}"#,
+            ),
+            res(
+                200,
+                r#"{"environment":{"name":"Prod","values":[{"key":"BASE","value":"https://example.test","enabled":true}]}}"#,
+            ),
+        ]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let plan = ImportPlan {
+            workspace_id: "ws".into(),
+            workspace_name: "WS".into(),
+            collections: vec![item("Billing", "u1")],
+            environments: vec![item("Prod", "u2")],
+            remaining_month: None,
+        };
+        let dest = tmpdir("opens");
+        imp.download(&plan, &dest, &ImportOptions::default())
+            .unwrap();
+
+        // The tree lists both files.
+        let entries = crate::workspace::scan_workspace(&dest, true);
+        let files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+        assert_eq!(files.len(), 2, "both files should appear in the tree");
+
+        // Each is classified as the right kind, not both as collections.
+        let coll = dest.join(COLLECTIONS_DIR).join("Billing.json");
+        let env = dest.join(ENVIRONMENTS_DIR).join("Prod.json");
+        assert!(
+            !crate::workspace::is_env_file(&coll),
+            "a collection must not be taken for an environment"
+        );
+        assert!(
+            crate::workspace::is_env_file(&env),
+            "an imported Postman environment must be recognised as one"
+        );
+
+        // And each actually parses into the app's own model.
+        let coll_text = std::fs::read_to_string(&coll).unwrap();
+        assert!(crate::postman::looks_like_postman(&coll_text));
+        assert_eq!(crate::postman::parse_collection(&coll_text).len(), 1);
+
+        let env_text = std::fs::read_to_string(&env).unwrap();
+        let values = crate::postman::postman_env_values(&env_text)
+            .expect("the imported environment should parse");
+        assert_eq!(
+            values,
+            vec![("BASE".to_string(), "https://example.test".to_string())]
+        );
+
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
     // -- destination safety ----------------------------------------------
 
     #[test]
@@ -1557,6 +1723,62 @@ mod tests {
             .unwrap();
         assert!(!dest.join("Collections/Ghost.json").exists());
         std::fs::remove_dir_all(&dest).ok();
+    }
+
+    // -- workspace references ---------------------------------------------
+
+    #[test]
+    fn a_bare_workspace_id_is_taken_as_is() {
+        let id = "12ece9e1-2abf-4edc-8e34-de66e74114d2";
+        assert_eq!(parse_workspace_ref(id), Some(id.to_string()));
+    }
+
+    #[test]
+    fn a_pasted_workspace_url_yields_its_id() {
+        // What a user actually has to hand is the address bar.
+        for url in [
+            "https://go.postman.co/workspace/My-Team~12ece9e1-2abf-4edc-8e34-de66e74114d2",
+            "https://go.postman.co/workspace/12ece9e1-2abf-4edc-8e34-de66e74114d2/overview",
+            "go.postman.co/workspace/Team~12ece9e1-2abf-4edc-8e34-de66e74114d2/request/123",
+            "https://go.postman.co/workspace/12ece9e1-2abf-4edc-8e34-de66e74114d2?tab=x",
+        ] {
+            assert_eq!(
+                parse_workspace_ref(url),
+                Some("12ece9e1-2abf-4edc-8e34-de66e74114d2".to_string()),
+                "failed on {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_quotes_and_space_are_tolerated() {
+        let id = "12ece9e1-2abf-4edc-8e34-de66e74114d2";
+        assert_eq!(
+            parse_workspace_ref(&format!("  \"{id}\"  ")),
+            Some(id.to_string())
+        );
+    }
+
+    #[test]
+    fn an_uppercase_id_is_normalised() {
+        assert_eq!(
+            parse_workspace_ref("12ECE9E1-2ABF-4EDC-8E34-DE66E74114D2"),
+            Some("12ece9e1-2abf-4edc-8e34-de66e74114d2".to_string())
+        );
+    }
+
+    #[test]
+    fn something_that_is_not_a_workspace_reference_is_rejected() {
+        for bad in [
+            "",
+            "   ",
+            "My Workspace",
+            "https://go.postman.co/workspace/My-Team",
+            "12ece9e1-2abf-4edc-8e34",
+            "zzzzzzzz-2abf-4edc-8e34-de66e74114d2",
+        ] {
+            assert_eq!(parse_workspace_ref(bad), None, "should reject {bad:?}");
+        }
     }
 
     // -- naming -----------------------------------------------------------

@@ -20,6 +20,7 @@ mod i18n;
 mod persistence;
 mod postman;
 mod postman_api;
+mod postman_cli;
 mod postman_import;
 mod report;
 mod report_cli;
@@ -40,10 +41,11 @@ use clap::Parser;
     version,
     about = "PaperBoy — a Rust-native API client (a Postman alternative).",
     long_about = "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
-Runs in one of three modes:\n\
+Runs in one of four modes:\n\
 \x20 TUI  (default)          a terminal user interface\n\
 \x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit\n\
-\x20 Report (-r/--report)    run a PaperTrail report against a collection, then exit",
+\x20 Report (-r/--report)    run a PaperTrail report against a collection, then exit\n\
+\x20 Import (--postman-import)  download a Postman workspace over the API, then exit",
     after_help = "Examples:\n\
 \x20 paperboy                            Launch the terminal UI (default)\n\
 \x20 paperboy -c collection.hurl         Run a collection headlessly\n\
@@ -53,7 +55,9 @@ Runs in one of three modes:\n\
 \x20 paperboy -r report.trail   Run a report, taking its collection/environment from the report's own headers\n\
 \x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.trail   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
-\x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\n\
+\x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
+\x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
+\x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\n\
 Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 {{ ... }} provider reference resolved when the environment is loaded:\n\
 \x20 Literal value       USERNAME=demo\n\
@@ -114,10 +118,60 @@ struct Cli {
     /// with the `gui` feature (`cargo install paperboy --features gui`).
     #[arg(short = 'g', long)]
     gui: bool,
+
+    /// Import a Postman workspace over the Postman API and exit. With
+    /// `--postman-workspace` it downloads that workspace's collections and
+    /// environments into `-o`; without one it lists the workspaces the key can
+    /// see, so you can pick an id.
+    #[arg(long)]
+    postman_import: bool,
+
+    /// With `--postman-import`: the workspace to download, as its id or as the
+    /// address of the workspace in Postman (both are accepted, so the browser
+    /// address bar can simply be pasted).
+    #[arg(long, value_name = "ID|URL")]
+    postman_workspace: Option<String>,
+
+    /// With `--postman-import`: the Postman API key. Defaults to
+    /// `$POSTMAN_API_KEY`. Accepts the same `{{ … }}` provider references as a
+    /// `.vars` file (e.g. `{{ op://Private/Postman/credential }}`), so the key
+    /// need not appear in your shell history.
+    #[arg(long, value_name = "KEY")]
+    postman_key: Option<String>,
+
+    /// With `--postman-import`: what to download — `all` (default),
+    /// `collections` or `environments`.
+    #[arg(long, value_name = "WHAT")]
+    postman_what: Option<String>,
+
+    /// With `--postman-import`: the API host, for tenants that are not on
+    /// `api.postman.com` (EU Enterprise uses `https://api.eu.postman.com`).
+    #[arg(long, value_name = "URL")]
+    postman_base_url: Option<String>,
+
+    /// With `--postman-import`: replace the destination folder if it already
+    /// exists. Without this, a destination that exists and is not empty is
+    /// refused.
+    #[arg(long)]
+    overwrite: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Headless Postman import (`--postman-import`): fetch a workspace over the
+    // Postman API and exit. Checked before `-c`/`-r` because it produces the
+    // collections those modes run, rather than running anything itself.
+    if cli.postman_import {
+        std::process::exit(postman_cli::run(postman_cli::Args {
+            key: cli.postman_key,
+            workspace: cli.postman_workspace,
+            out: cli.output,
+            what: cli.postman_what,
+            base_url: cli.postman_base_url,
+            overwrite: cli.overwrite,
+        }));
+    }
 
     // Headless report mode (`-r`): run a PaperTrail report. `-c` may be omitted
     // — the report's `# collection:` header (resolved relative to the report's

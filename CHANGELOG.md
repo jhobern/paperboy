@@ -8,7 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.3.2] - 2026-08-07
+## [0.4.0] - 2026-08-07
+
+### Added
+
+- **Download a whole Postman workspace from the command line.** Moving an
+  account into PaperBoy meant exporting each collection by hand, or writing a
+  script against the Postman API. `paperboy --postman-import` lists the
+  workspaces your API key can see, and
+  `paperboy --postman-import --postman-workspace <ID|URL> -o <FOLDER>`
+  downloads that workspace's collections and environments into a folder you can
+  open as a PaperBoy workspace. The workspace can be named by its id or by its
+  address in Postman, so the browser address bar can simply be pasted.
+
+  The key comes from `--postman-key` or `$POSTMAN_API_KEY`, and may be a
+  `{{ … }}` provider reference — `--postman-key '{{ op://Private/Postman/credential }}'`
+  works exactly as it would in a `.vars` file, so the key need not appear in
+  your shell history. It is never written to disk and is stripped from any error
+  message.
+
+  Postman rate-limits its API, and does so far more tightly for listing than for
+  fetching, so the import paces the two separately and adapts to the limits
+  reported in each response — a sixty-collection workspace takes about fifteen
+  seconds rather than the seventy a single uniform delay would cost. The run
+  says up front how many items it will fetch and roughly how long that will
+  take, and warns if it would consume most of what is left of your plan's
+  monthly API allowance.
+
+  A collection that has been deleted since the listing is reported and skipped
+  rather than ending the run; a rejected key or an exhausted monthly quota stops
+  it immediately, because neither improves by being retried. Everything is
+  written to a staging folder and moved into place in one step, so an
+  interrupted import never leaves a folder that looks like a workspace but is
+  missing half its collections, and an existing destination is left alone unless
+  `--overwrite` is given. `--postman-what` limits the import to just collections
+  or just environments.
+
+
 
 ### Added
 

@@ -598,6 +598,42 @@ up-to-date list. Highlights:
 | `Esc` | Cancel |
 | `q`, `Ctrl+C` | Quit |
 
+## Importing a Postman workspace
+
+Bring a whole Postman workspace across in one command, rather than exporting
+each collection by hand:
+
+```sh
+export POSTMAN_API_KEY='PMAK-…'
+
+# List the workspaces the key can see
+paperboy --postman-import
+
+# Download one into a folder you can open as a workspace
+paperboy --postman-import --postman-workspace 12ece9e1-… -o ~/API
+```
+
+The workspace may be given as its id or as its address in Postman, so the
+browser address bar can be pasted straight in. The result is a folder of
+`Collections/` and `Environments/` — open it with **Open ▸ Workspace**.
+
+- `--postman-key` supplies the key instead of `$POSTMAN_API_KEY`. It accepts the
+  same `{{ … }}` provider references as a `.vars` file, so the key needn't
+  appear in your shell history:
+  `--postman-key '{{ op://Private/Postman/credential }}'`. The key is never
+  written to disk, and is stripped from any error message.
+- `--postman-what collections|environments|all` limits what is downloaded.
+- `--overwrite` replaces an existing destination; without it, a destination that
+  exists and isn't empty is refused.
+- `--postman-base-url` points at a different tenant (EU Enterprise accounts use
+  `https://api.eu.postman.com`).
+
+A Postman API key carries its owner's own access — it can't be scoped — so a
+workspace missing from the list is one your Postman account isn't a member of.
+
+Postman rate-limits its API, so an import is paced deliberately and tells you
+up front roughly how long it will take; a large workspace takes a minute or two.
+
 ## Headless CLI mode
 
 Run a collection end-to-end from the command line, with no UI:
