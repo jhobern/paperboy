@@ -323,6 +323,34 @@ impl RemoteFlow {
         self.error = Some(message);
     }
 
+    /// The branches and tags exactly as the remote reported them, for a
+    /// front-end that presents the two separately rather than as one list.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn refs(&self) -> &RemoteRefs {
+        &self.refs
+    }
+
+    /// Whether the fetched checkout is still around. It is dropped as soon as
+    /// it has served its purpose, so a front-end offering "load this file" can
+    /// tell the user the repo needs browsing again rather than doing nothing.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn has_repo(&self) -> bool {
+        self.repo.is_some()
+    }
+
+    /// Whether a background operation is in flight.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
+    /// The commit the current file listing was fetched at, shown so the user
+    /// can see exactly what a download will be pinned to.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn commit_sha(&self) -> Option<&str> {
+        self.commit_sha.as_deref()
+    }
+
     /// The branch/tag choices to offer, as one filterable list.
     pub(crate) fn ref_choices(&self, s: &Strings) -> Vec<RefChoice> {
         build_ref_choices(&self.refs, s)
@@ -402,8 +430,7 @@ impl RemoteFlow {
 
     /// Go back to the URL step, discarding anything fetched. Used by "back"
     /// affordances in both front-ends.
-    // Wanted by the GUI's "back" button, which is not on this flow yet.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub(crate) fn back_to_connect(&mut self) {
         self.repo = None;
         self.files.clear();
@@ -414,6 +441,21 @@ impl RemoteFlow {
         self.busy = None;
         self.rx = None;
         self.step = Step::Connect;
+    }
+
+    /// Go back to the branch/tag step, discarding the fetched checkout but
+    /// keeping the refs — so picking a different branch doesn't mean listing
+    /// the repo's refs all over again.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn back_to_refs(&mut self) {
+        self.repo = None;
+        self.files.clear();
+        self.commit_sha = None;
+        self.chosen_path = None;
+        self.error = None;
+        self.busy = None;
+        self.rx = None;
+        self.step = Step::PickRef;
     }
 
     // -- polling ----------------------------------------------------------
@@ -559,6 +601,15 @@ impl RemoteFlow {
         flow.files = files;
         flow.repo = repo.map(TempRepo::new);
         flow
+    }
+
+    /// Pretend a ref listing arrived, for tests that start at the ref picker.
+    pub(crate) fn seed_refs(&mut self, branches: &[&str], tags: &[&str]) {
+        self.refs = RemoteRefs {
+            branches: branches.iter().map(|b| b.to_string()).collect(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        };
+        self.step = Step::PickRef;
     }
 
     /// Pretend a background operation is in flight, for drawing tests.
@@ -760,6 +811,25 @@ pub(crate) fn spawn_workspace_redownload(
 
 #[cfg(test)]
 mod tests {
+    /// A workspace downloaded from git records the *commit* it came from, not
+    /// just the branch name, so a later "reload" fetches the same bytes even if
+    /// the branch has moved on since.
+    #[test]
+    fn a_downloaded_workspace_remembers_the_exact_commit() {
+        let mut flow = super::RemoteFlow::new(super::RemoteKind::Workspace);
+        flow.url = "  https://example.test/repo.git  ".to_string();
+        flow.chosen_ws_filter = Some(super::WorkspaceGitFilter::All);
+        flow.seed_ref("refs/heads/main", "0123456789abcdef");
+
+        let origin = flow.workspace_origin().expect("both pieces were set");
+        assert_eq!(origin.commit_sha, "0123456789abcdef");
+        assert_eq!(origin.ref_name, "main");
+        assert_eq!(
+            origin.repo_url, "https://example.test/repo.git",
+            "the url is stored trimmed, so it matches on a later comparison"
+        );
+    }
+
     use super::*;
 
     fn refs_of(branches: &[&str], tags: &[&str]) -> RemoteRefs {

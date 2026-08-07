@@ -1026,9 +1026,6 @@ strings! {
     gui_git_pick_ref => "Pick a branch or tag", "Choisir une branche ou une étiquette", "Vælg en gren eller et tag";
     gui_git_load_title => "Load from Git", "Charger depuis Git", "Indlæs fra Git";
     gui_git_save_collection_title => "Save collection to Git", "Enregistrer la collection sur Git", "Gem samling til Git";
-    gui_git_connecting => "Connecting to remote…", "Connexion au dépôt distant…", "Forbinder til fjernlager…";
-    gui_git_fetching_files => "Fetching file list…", "Récupération de la liste des fichiers…", "Henter filliste…";
-    gui_git_loading_file => "Loading selected file…", "Chargement du fichier sélectionné…", "Indlæser valgt fil…";
     gui_git_saving => "Saving to remote…", "Enregistrement sur le dépôt distant…", "Gemmer til fjernlager…";
     gui_git_fetched_at => "Fetched at", "Récupéré à", "Hentet ved";
     gui_git_no_files => "No .hurl or .vars files match. Enable “Show all files” to browse everything.", "Aucun fichier .hurl ou .vars ne correspond. Activez « Afficher tous les fichiers » pour tout parcourir.", "Ingen .hurl- eller .vars-filer matcher. Slå “Vis alle filer” til for at gennemse alt.";
@@ -1040,8 +1037,6 @@ strings! {
     gui_git_err_not_collection => "The selected file is not a valid collection.", "Le fichier sélectionné n'est pas une collection valide.", "Den valgte fil er ikke en gyldig samling.";
     gui_git_err_collection_missing => "Collection not found.", "Collection introuvable.", "Samling ikke fundet.";
     gui_git_err_collection_closed => "Collection was closed before the save finished.", "La collection a été fermée avant la fin de l'enregistrement.", "Samlingen blev lukket, før lagringen var færdig.";
-    gui_git_err_unexpected_save => "Unexpected save result while loading.", "Résultat d'enregistrement inattendu pendant le chargement.", "Uventet lagringsresultat under indlæsning.";
-    gui_git_err_unexpected_load => "Unexpected load result while saving.", "Résultat de chargement inattendu pendant l'enregistrement.", "Uventet indlæsningsresultat under lagring.";
     gui_git_err_worker_ended => "Background git operation ended unexpectedly.", "L'opération git en arrière-plan s'est terminée de manière inattendue.", "Baggrunds-git-handlingen sluttede uventet.";
     gui_git_err_url_required => "Repository URL is required.", "L'URL du dépôt est requise.", "Lager-URL er påkrævet.";
     gui_git_err_pick_ref_first => "Choose a branch or tag first.", "Choisissez d'abord une branche ou une étiquette.", "Vælg først en gren eller et tag.";
