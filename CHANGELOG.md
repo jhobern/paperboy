@@ -42,6 +42,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   never loaded from Git.** It now starts from a suggested file name and the
   repository's default branch, as the terminal app does.
 
+- **Exported spreadsheets no longer arrive as a row of tiny columns.** Every
+  column in an `.xlsx` export was left at the spreadsheet's default width
+  regardless of what it held, so a URL or a response body became a tall, narrow
+  ribbon of wrapped text while the same run's HTML export looked fine. Columns
+  are now sized to their widest content — header, cells and statistics rows
+  alike — with a floor so short columns stay readable and a ceiling so one very
+  long value can't push everything else off the screen. Anything past the
+  ceiling still wraps, as before, so nothing is hidden. The header row is also
+  frozen and given a filter, so a long run can be scrolled and sifted without
+  losing track of which column is which.
+
 ## [0.4.2] - 2026-08-08
 
 ### Fixed

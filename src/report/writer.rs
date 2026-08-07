@@ -249,6 +249,29 @@ impl ReportWriter for XlsxWriter {
                 .map_err(|e| e.to_string())?;
         }
 
+        // Size the columns to their content. Left at Excel's 8.43-character
+        // default, every column comes out equally tiny and the wrapped cells
+        // become tall thin ribbons — the same run's HTML export looks right
+        // only because the browser sizes the table itself.
+        for (col, width) in xlsx_column_widths(&columns, result).into_iter().enumerate() {
+            sheet
+                .set_column_width(col as u16, width)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Keep the headers on screen while scrolling a long run, and let the
+        // reviewer filter it. The autofilter deliberately spans only the data
+        // rows: including the appended statistics rows below would let them be
+        // filtered away, or sorted into the middle of the data.
+        if !columns.is_empty() {
+            sheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+            let last_col = (columns.len() - 1) as u16;
+            let last_row = result.rows.len() as u32;
+            sheet
+                .autofilter(0, 0, last_row, last_col)
+                .map_err(|e| e.to_string())?;
+        }
+
         // Which columns are numeric (every non-empty cell parses as a number):
         // their cells are written as real numbers so the spreadsheet can run
         // statistics on them, instead of text that Excel flags "stored as text".
@@ -344,6 +367,78 @@ enum Tint {
     Green,
     Red,
     Amber,
+}
+
+/// The narrowest a column may be sized, in Excel character widths. Excel's own
+/// default is 8.43, and a report column is never usefully narrower than its
+/// (bold, filtered) header.
+const XLSX_MIN_COL_WIDTH: f64 = 9.0;
+
+/// The widest a column may be sized, in Excel character widths. Report cells
+/// can hold an entire JSON response body, so the width has to be capped or one
+/// such column pushes every other column off the screen — which is exactly what
+/// a sized-to-content-only export looks like. Cells are already wrapped and
+/// top-aligned, so anything longer than this stays fully visible by growing the
+/// row taller instead of the column wider.
+const XLSX_MAX_COL_WIDTH: f64 = 60.0;
+
+/// Padding added to a measured header, in characters: headers are bold (so
+/// wider per character than the body font Excel measures against) and carry an
+/// autofilter dropdown arrow, which overlaps the text without it.
+const XLSX_HEADER_PADDING: usize = 5;
+
+/// Padding added to a measured body cell, so text doesn't touch the gridline.
+const XLSX_CELL_PADDING: usize = 2;
+
+/// How wide a cell's text needs to be displayed, in characters.
+///
+/// Cells are wrapped, so what matters is the longest *line*, not the total
+/// length: a 40-line JSON body whose longest line is 30 characters needs 30,
+/// not 1200. Measured in `char`s rather than bytes so non-ASCII content isn't
+/// over-measured into a needlessly wide column.
+fn text_display_width(text: &str) -> usize {
+    text.lines().map(|l| l.chars().count()).max().unwrap_or(0)
+}
+
+/// Clamp a measured character count to the column-width range Excel is given.
+fn clamp_xlsx_width(measured: usize) -> f64 {
+    (measured as f64).clamp(XLSX_MIN_COL_WIDTH, XLSX_MAX_COL_WIDTH)
+}
+
+/// Per-column widths for the xlsx export, sized to the widest thing each column
+/// actually has to show — header, data cells and the appended statistics rows
+/// alike — then clamped to [`XLSX_MIN_COL_WIDTH`]..=[`XLSX_MAX_COL_WIDTH`].
+///
+/// Without this every column is left at Excel's 8.43-character default, so a
+/// report exports as a row of tiny columns full of wrapped ribbons of text,
+/// while the same run's HTML export looks fine (the browser sizes the table
+/// for us). Kept separate from the writing loop so the sizing can be tested
+/// without unzipping a workbook.
+fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f64> {
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .map(|c| text_display_width(&c.header) + XLSX_HEADER_PADDING)
+        .collect();
+    for row in &result.rows {
+        for (col, c) in columns.iter().enumerate() {
+            let value = c.value(row, &result.no_match_marker);
+            let want = text_display_width(&value) + XLSX_CELL_PADDING;
+            if want > widths[col] {
+                widths[col] = want;
+            }
+        }
+    }
+    // Statistics rows are bold, and their labels ("Mean", "Distribution") can
+    // be wider than anything in the column above them.
+    for srow in result.summary_rows(columns) {
+        for (col, width) in widths.iter_mut().enumerate() {
+            let want = text_display_width(&srow.text_cell(col)) + XLSX_HEADER_PADDING;
+            if want > *width {
+                *width = want;
+            }
+        }
+    }
+    widths.into_iter().map(clamp_xlsx_width).collect()
 }
 
 /// The colour tint for a cell, or `None` to leave it plain. Recognises the
@@ -726,6 +821,100 @@ mod tests {
             ..Default::default()
         };
         assert!(!column_is_numeric(&numeric_col, &empty));
+    }
+
+    /// Cells are wrapped, so a column only has to be as wide as the longest
+    /// *line* in it — otherwise one multi-line JSON body would demand a column
+    /// thousands of characters wide.
+    #[test]
+    fn text_width_measures_the_longest_line_not_the_whole_string() {
+        assert_eq!(text_display_width("abc"), 3);
+        assert_eq!(text_display_width("abc\nlonger line\nx"), 11);
+        assert_eq!(text_display_width(""), 0);
+        // Counted in chars, not bytes, so accented text isn't over-measured.
+        assert_eq!(text_display_width("héllo"), 5);
+    }
+
+    #[test]
+    fn measured_widths_are_clamped_to_the_readable_range() {
+        assert_eq!(clamp_xlsx_width(0), XLSX_MIN_COL_WIDTH);
+        assert_eq!(clamp_xlsx_width(1), XLSX_MIN_COL_WIDTH);
+        assert_eq!(clamp_xlsx_width(20), 20.0);
+        assert_eq!(clamp_xlsx_width(10_000), XLSX_MAX_COL_WIDTH);
+    }
+
+    /// The bug this fixes: with no widths written at all, every column came out
+    /// at Excel's 8.43-character default regardless of content.
+    #[test]
+    fn xlsx_columns_are_sized_to_their_widest_content() {
+        let res = ReportResult {
+            column_order: vec!["id".into(), "url".into()],
+            rows: vec![
+                row(&[
+                    ("id", "1"),
+                    ("url", "https://example.com/a/fairly/long/path"),
+                ]),
+                row(&[("id", "2"), ("url", "short")]),
+            ],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+
+        // "id" holds only single characters, so it falls back to the minimum
+        // rather than being sized down to nothing.
+        assert_eq!(widths[0], XLSX_MIN_COL_WIDTH);
+        // "url" is sized to its longest value plus padding.
+        assert_eq!(
+            widths[1],
+            ("https://example.com/a/fairly/long/path".len() + XLSX_CELL_PADDING) as f64
+        );
+        assert!(widths[1] > widths[0], "the wide column is genuinely wider");
+    }
+
+    #[test]
+    fn a_very_long_cell_is_capped_so_it_cannot_squeeze_out_every_other_column() {
+        let res = ReportResult {
+            column_order: vec!["body".into(), "id".into()],
+            rows: vec![row(&[("body", &"x".repeat(5_000)), ("id", "1")])],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(widths[0], XLSX_MAX_COL_WIDTH);
+        // The cap must not drag the other columns along with it.
+        assert_eq!(widths[1], XLSX_MIN_COL_WIDTH);
+    }
+
+    #[test]
+    fn a_long_header_widens_its_column_even_when_every_value_is_short() {
+        let res = ReportResult {
+            column_order: vec!["a_rather_long_column_header".into()],
+            rows: vec![row(&[("a_rather_long_column_header", "1")])],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(
+            widths[0],
+            ("a_rather_long_column_header".len() + XLSX_HEADER_PADDING) as f64
+        );
+    }
+
+    #[test]
+    fn statistics_labels_widen_the_column_they_sit_in() {
+        // A Distribution row is labelled "<header> = <value>", which is longer
+        // than the "Name" header or any of the one-character values above it,
+        // and lands in the first column.
+        let res = stats_result();
+        let header = stats_header("Name, Time STATISTICS(DISTRIBUTION)");
+        let columns = res.resolved_columns(&header);
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(
+            widths[0],
+            ("Time = 100".len() + XLSX_HEADER_PADDING) as f64,
+            "label column must fit its widest statistics label"
+        );
     }
 
     #[test]
