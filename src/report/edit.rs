@@ -19,8 +19,8 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleRef, WithItem,
+    Binder, EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow,
+    ReportStmt, ResponseFmt, RoleRef, WithItem,
 };
 use crate::report::model::StatKind;
 use crate::report::parse_flow;
@@ -977,6 +977,121 @@ pub(crate) fn set_parallel_degree(
     }
 }
 
+/// Rename the loop variable of the `FOR` at `path` — the inline text box on the
+/// loop chip.
+///
+/// Only a loop that binds a *single* named value can be renamed this way:
+/// `FOR f IN FILES "."` and `FOR t IN ENVS …` both can, while a destructuring
+/// pattern (`FOR name, url IN …`) or one with a `...` rest cannot, because the
+/// chip has one box and there would be no saying which binder it meant. Those
+/// keep to the wizard.
+///
+/// The name is checked against the parser's own identifier rule, so a box left
+/// empty or filled with something like `my file` is rejected rather than
+/// written out as text that would no longer parse. Returns whether it changed.
+pub(crate) fn set_loop_var(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    if !crate::report::parser::is_ident(t) {
+        return false;
+    }
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach { pattern, .. }) => {
+            if pattern.rest || pattern.binders.len() != 1 {
+                return false;
+            }
+            match &mut pattern.binders[0] {
+                Binder::Named(name) => {
+                    if name == t {
+                        return false;
+                    }
+                    *name = t.to_string();
+                    true
+                }
+                // `_` discards the value; renaming it would be introducing a
+                // binder, not editing one.
+                Binder::Discard => false,
+            }
+        }
+        Some(FlowNode::ForEnvs { var, .. }) => {
+            if var == t {
+                return false;
+            }
+            *var = t.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The folder/file a `FOR` loop draws from, when it is a single path the chip
+/// can show a picker for: `FILES "dir"`, `FOLDERS "dir"` and `TUPLES FROM
+/// "file"`. `None` for every other producer — a list literal, a `ZIP`/`CONCAT`
+/// of several, or a named `LIST` have no one path to pick.
+pub(crate) fn loop_dir(flow: &ReportFlow, path: &[usize]) -> Option<String> {
+    match node_at(flow, path) {
+        Some(FlowNode::ForEach { producer, .. }) => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir.clone()),
+            Producer::Tuples { path } => Some(path.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Point the loop at `path` at a different folder/file — the chip's picker and
+/// its inline path box.
+///
+/// Empty is rejected: a `FILES ""` reads as the process working directory,
+/// which is never what clearing a box was meant to ask for. Returns whether it
+/// changed.
+pub(crate) fn set_loop_dir(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach { producer, .. }) => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => {
+                if dir == t {
+                    return false;
+                }
+                *dir = t.to_string();
+                true
+            }
+            Producer::Tuples { path } => {
+                if path == t {
+                    return false;
+                }
+                *path = t.to_string();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Set (or clear, when `text` is blank) the `MATCH "glob"` of a `FILES` loop.
+/// Clearing is meaningful here, unlike the folder: a `FILES` with no `MATCH`
+/// simply takes every file.
+pub(crate) fn set_loop_glob(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach {
+            producer: Producer::Files { glob, .. },
+            ..
+        }) => {
+            let next = (!t.is_empty()).then(|| t.to_string());
+            if *glob == next {
+                return false;
+            }
+            *glob = next;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Set the `# key: value` header directive, or remove it entirely when `value`
 /// is `None` (or blank).
 ///
@@ -1737,6 +1852,107 @@ mod tests {
         let mut f = flow("REPORT userId\n");
         // A reported variable has nothing valid left without REPORT.
         assert!(detach_modifier(&mut f, &[0], DetachWhich::Report));
+    }
+
+    /// The loop chip's inline name box: it renames the one thing a single-binder
+    /// loop binds, and refuses anything the parser would not take back.
+    #[test]
+    fn set_loop_var_renames_a_single_binder_and_rejects_names_that_would_not_parse() {
+        let mut f = flow("FOR file IN FILES \".\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert!(set_loop_var(&mut f, &[0], "doc"));
+        assert!(
+            f.to_text().contains("FOR doc IN FILES"),
+            "the rename reached the source: {}",
+            f.to_text()
+        );
+
+        assert!(
+            !set_loop_var(&mut f, &[0], "doc"),
+            "no change is not a change"
+        );
+        for bad in ["", "   ", "my file", "2fast", "a-b"] {
+            assert!(
+                !set_loop_var(&mut f, &[0], bad),
+                "{bad:?} is not an identifier and must be refused"
+            );
+        }
+        assert!(
+            f.to_text().contains("FOR doc IN FILES"),
+            "and a refused name leaves the loop alone"
+        );
+
+        // An ENVS loop binds one name too, so it renames the same way.
+        let mut e = flow("FOR t IN ENVS BASELINE(\"prod\")\n  REQUEST A\nEND\n");
+        assert!(set_loop_var(&mut e, &[0], "target"));
+        assert!(e.to_text().contains("FOR target IN ENVS"));
+    }
+
+    /// A destructuring loop has more than one name, and the chip has one box --
+    /// there would be no saying which binder it meant, so it stays with the
+    /// wizard rather than guessing.
+    #[test]
+    fn set_loop_var_refuses_a_pattern_that_binds_more_than_one_name() {
+        let mut f = flow("FOR (NAME, URL) IN DOCS\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut f, &[0], "x"));
+        assert!(
+            f.to_text().contains("FOR (NAME, URL) IN"),
+            "the pattern is untouched: {}",
+            f.to_text()
+        );
+
+        // A `...` rest binds an unknown number of positions, so one box can
+        // speak for none of them either.
+        let mut r = flow("FOR (HEAD, ...) IN DOCS\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut r, &[0], "x"));
+
+        // `_` discards its position; renaming it would be adding a binder.
+        let mut d = flow("FOR _ IN FILES \".\"\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut d, &[0], "x"));
+    }
+
+    /// The folder box and its picker, over the three producers that have one
+    /// path to point at.
+    #[test]
+    fn the_loop_folder_can_be_read_and_repointed_for_the_producers_that_have_one() {
+        let mut files = flow("FOR f IN FILES \"cases\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&files, &[0]).as_deref(), Some("cases"));
+        assert!(set_loop_dir(&mut files, &[0], "other/cases"));
+        assert!(files.to_text().contains("FILES \"other/cases\""));
+        assert!(
+            !set_loop_dir(&mut files, &[0], "   "),
+            "clearing the folder would silently mean the working directory"
+        );
+
+        let mut folders = flow("FOR d IN FOLDERS \"envs\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&folders, &[0]).as_deref(), Some("envs"));
+        assert!(set_loop_dir(&mut folders, &[0], "environments"));
+        assert!(folders.to_text().contains("FOLDERS \"environments\""));
+
+        let mut tuples = flow("FOR t IN TUPLES FROM \"rows.csv\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&tuples, &[0]).as_deref(), Some("rows.csv"));
+        assert!(set_loop_dir(&mut tuples, &[0], "data/rows.csv"));
+        assert!(tuples.to_text().contains("TUPLES FROM \"data/rows.csv\""));
+
+        // A list literal has no single path, so the chip shows no picker.
+        let list = flow("FOR x IN [\"a\", \"b\"]\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&list, &[0]), None);
+    }
+
+    /// Unlike the folder, an empty glob is a real answer: `FILES` with no
+    /// `MATCH` takes every file.
+    #[test]
+    fn the_loop_glob_can_be_set_and_cleared() {
+        let mut f = flow("FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert!(!f.to_text().contains("MATCH"));
+        assert!(set_loop_glob(&mut f, &[0], "*.json"));
+        assert!(f.to_text().contains("MATCH \"*.json\""));
+
+        assert!(set_loop_glob(&mut f, &[0], ""));
+        assert!(
+            !f.to_text().contains("MATCH"),
+            "clearing the box drops the clause: {}",
+            f.to_text()
+        );
     }
 
     #[test]

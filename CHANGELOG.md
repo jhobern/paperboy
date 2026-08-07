@@ -12,6 +12,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A `FOR` loop's variable, folder and file pattern are now edited on the chip
+  itself.** The loop head used to be one long label, which gave no hint that the
+  folder it reads from or the name it binds were things you could change — both
+  were only ever found by opening the wizard. `FOR` is now followed by a box for
+  the loop variable, the source keyword, a box and a picker button for the
+  folder (or file, for `TUPLES FROM`), and a `FILES` loop's `MATCH` pattern. The
+  picker starts in the folder the loop already names and writes what you choose
+  back relative to the report, so a report stays portable. Parts that no single
+  box could speak for — a destructuring pattern like `FOR (NAME, URL) IN …`, a
+  list literal, a `FOLDERS … WITH` role list — are still shown as text and still
+  edited through the wizard.
+
 - **Workspaces can be organised into folders from the app.** Right-clicking any
   row in a Workspace tree (or the tree's own `New` menu) now offers "New
   folder…" alongside the three file kinds, so a workspace can be tidied up
@@ -45,6 +57,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   always has, so a `SHOW` still reads as a `SHOW`.
 
 ### Fixed
+
+- **Postman collections taken from an account backup now import.** Postman's
+  "Export all data" backup and its API wrap each collection in a
+  `{"collection": …}` envelope, where a single "Export collection" writes the
+  bare `{"info": …, "item": …}` document. PaperBoy only recognised the bare
+  shape, so every file in a backup's `Collections/` folder was not detected as
+  Postman at all, fell through to the Hurl parser and opened as "not a
+  collection". Both shapes are now unwrapped and imported.
 
 - **Chips no longer sit a pixel out of line with each other.** A chip built
   around a dropdown — `REQUEST`, `BASELINE`, `COMPARISON` — was sized by egui to

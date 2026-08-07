@@ -508,6 +508,39 @@ enum ChipEdit {
     Parallel {
         degree: Option<u32>,
     },
+    /// A `FOR` loop head, broken into the parts of it that are worth editing in
+    /// place: the loop variable, and — for the producers that draw from one
+    /// path — that path, with a picker beside it, plus a `FILES` loop's `MATCH`
+    /// glob.
+    ///
+    /// The point is legibility as much as convenience: a loop head rendered as
+    /// one long label gave no hint that the folder or the variable name were
+    /// things you could change, so both were only ever found through the
+    /// wizard. Boxes look editable.
+    Loop(LoopEdit),
+}
+
+/// The editable parts of a `FOR` loop head (see [`ChipEdit::Loop`]).
+#[derive(Clone)]
+struct LoopEdit {
+    /// The loop variable, when the pattern binds exactly one name. `None` for a
+    /// destructuring pattern (`FOR (A, B) IN …`) or a `_` discard, where one
+    /// box could not say which binder it meant — those keep to the wizard.
+    var: Option<String>,
+    /// The keyword between the variable and the source: `IN FILES`, `IN ENVS`,
+    /// `IN TUPLES FROM`, or plain `IN`.
+    keyword: String,
+    /// The single folder/file the loop draws from, and whether it is a file
+    /// (`TUPLES FROM`) rather than a folder, which decides which picker opens.
+    dir: Option<(String, bool)>,
+    /// A `FILES` loop's `MATCH` glob. `Some("")` when the loop is a `FILES` one
+    /// with no glob yet (so the box is offered); `None` when the producer has
+    /// no glob at all.
+    glob: Option<String>,
+    /// Whatever the producer is when it can't be broken up — a list literal, a
+    /// `ZIP`/`CONCAT`, or a named `LIST`. Shown as a plain label after the
+    /// keyword.
+    tail: String,
 }
 
 impl Chip {
@@ -530,6 +563,33 @@ impl Chip {
                     .unwrap_or_else(|| "PARALLEL".to_string()),
                 PARALLEL_FIELD_WIDTH,
             ),
+            ChipEdit::Loop(l) => {
+                let mut label = "FOR".to_string();
+                let mut extra = 0.0;
+                if let Some(v) = &l.var {
+                    label.push(' ');
+                    label.push_str(v);
+                    extra += LOOP_VAR_FIELD_WIDTH;
+                }
+                label.push(' ');
+                label.push_str(&l.keyword);
+                if let Some((dir, _)) = &l.dir {
+                    label.push(' ');
+                    label.push_str(dir);
+                    // The box and the picker button beside it.
+                    extra += LOOP_PATH_FIELD_WIDTH + PICKER_BUTTON_WIDTH;
+                }
+                if let Some(g) = &l.glob {
+                    label.push_str(" MATCH ");
+                    label.push_str(g);
+                    extra += LOOP_GLOB_FIELD_WIDTH;
+                }
+                if !l.tail.is_empty() {
+                    label.push(' ');
+                    label.push_str(&l.tail);
+                }
+                (label, extra)
+            }
         }
     }
 
@@ -614,6 +674,21 @@ impl Chip {
             join_next: false,
         }
     }
+    /// A `FOR` loop head whose variable, folder and glob are edited inline.
+    /// Still the row's base chip, so it stays the drag/select handle.
+    fn loop_head(edit: LoopEdit, color: Color32) -> Chip {
+        Chip {
+            text: String::new(),
+            color,
+            is_base: true,
+            detach: None,
+            edit: ChipEdit::Loop(edit),
+            help: "",
+            tethered: false,
+            join_prev: false,
+            join_next: false,
+        }
+    }
     /// A `PARALLEL` chip whose concurrency limit is edited inline.
     fn parallel(degree: Option<u32>, color: Color32) -> Chip {
         Chip {
@@ -627,6 +702,136 @@ impl Chip {
             join_prev: false,
             join_next: false,
         }
+    }
+}
+
+/// Break a `FOR` loop head into the parts the chip edits in place.
+///
+/// `envs` marks the `FOR … IN ENVS` form, whose source is a clause rendered as
+/// its own `BASELINE`/`COMPARISON` chips rather than a path, so it contributes
+/// only the variable and the keyword.
+fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
+    use crate::report::flow::{Binder, Producer};
+
+    // Only a pattern binding exactly one name can be edited through one box.
+    let var = match node {
+        FlowNode::ForEnvs { var, .. } => Some(var.clone()),
+        FlowNode::ForEach { pattern, .. } => match (pattern.rest, pattern.binders.as_slice()) {
+            (false, [Binder::Named(n)]) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if envs {
+        // A `Roles` clause is drawn as its own BASELINE/COMPARISON chips beside
+        // this one, so the head carries nothing more. A `Plain` list of
+        // environment names has no chips of its own and would otherwise vanish,
+        // so it is shown as the tail.
+        let tail = match node {
+            FlowNode::ForEnvs {
+                clause: crate::report::flow::EnvClause::Plain(names),
+                ..
+            } => names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        return LoopEdit {
+            var,
+            keyword: "IN ENVS".to_string(),
+            dir: None,
+            glob: None,
+            tail,
+        };
+    }
+    let FlowNode::ForEach { producer, .. } = node else {
+        return LoopEdit {
+            var,
+            keyword: "IN".to_string(),
+            dir: None,
+            glob: None,
+            tail: String::new(),
+        };
+    };
+    match producer {
+        // `FILES` always offers the glob box, even when the loop has no MATCH
+        // yet: an empty box invites the glob, where nothing at all hides that
+        // the loop can be narrowed.
+        Producer::Files { dir, glob } => LoopEdit {
+            var,
+            keyword: "IN FILES".to_string(),
+            dir: Some((dir.clone(), false)),
+            glob: Some(glob.clone().unwrap_or_default()),
+            tail: String::new(),
+        },
+        // A `FOLDERS` loop's `WITH role="glob"` list is several named globs
+        // rather than one, so it stays in the wizard and is shown as the tail.
+        Producer::Folders { dir, roles } => LoopEdit {
+            var,
+            keyword: "IN FOLDERS".to_string(),
+            dir: Some((dir.clone(), false)),
+            glob: None,
+            tail: if roles.is_empty() {
+                String::new()
+            } else {
+                let rs: Vec<String> = roles.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+                format!("WITH {}", rs.join(", "))
+            },
+        },
+        Producer::Tuples { path } => LoopEdit {
+            var,
+            keyword: "IN TUPLES FROM".to_string(),
+            // A file, so the picker opens a file dialog rather than a folder one.
+            dir: Some((path.clone(), true)),
+            glob: None,
+            tail: String::new(),
+        },
+        // No single path to point at: shown whole, as before.
+        other => LoopEdit {
+            var,
+            keyword: "IN".to_string(),
+            dir: None,
+            glob: None,
+            tail: producer_label(other),
+        },
+    }
+}
+
+/// A producer with no single path, rendered as the label the loop head used to
+/// carry. Mirrors `flow::producer_text`, which is private to the model.
+fn producer_label(p: &crate::report::flow::Producer) -> String {
+    use crate::report::flow::{Element, Producer};
+    fn element(e: &Element) -> String {
+        match e {
+            Element::Scalar(s) => format!("\"{s}\""),
+            Element::Tuple(parts) => {
+                let items: Vec<String> = parts.iter().map(|s| format!("\"{s}\"")).collect();
+                format!("({})", items.join(", "))
+            }
+        }
+    }
+    match p {
+        Producer::List(elems) => {
+            let items: Vec<String> = elems.iter().map(element).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Producer::Zip(ps) => {
+            let items: Vec<String> = ps.iter().map(producer_label).collect();
+            format!("ZIP({})", items.join(", "))
+        }
+        Producer::Concat(ps) => {
+            let items: Vec<String> = ps.iter().map(producer_label).collect();
+            format!("CONCAT({})", items.join(", "))
+        }
+        Producer::Named(n) => n.clone(),
+        Producer::Files { dir, glob } => match glob {
+            Some(g) => format!("FILES \"{dir}\" MATCH \"{g}\""),
+            None => format!("FILES \"{dir}\""),
+        },
+        Producer::Folders { dir, .. } => format!("FOLDERS \"{dir}\""),
+        Producer::Tuples { path } => format!("TUPLES FROM \"{path}\""),
     }
 }
 
@@ -790,25 +995,13 @@ fn build_node_chips(
         FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
             let mut chips = Vec::new();
             if let Some(spec) = parallel {
-                // The head label already embeds the PARALLEL prefix; strip it so
-                // it is not duplicated by the base chip below. PARALLEL uses the
-                // theme's *error* hue so it stands apart from the blue loop/set
-                // chips it sits beside (`PARALLEL(8) FOR …`).
+                // PARALLEL is its own chip, and uses the theme's *error* hue so
+                // it stands apart from the blue loop/set chips it sits beside
+                // (`PARALLEL(8) FOR …`). The loop head below is built from the
+                // node rather than from its label, so the prefix is never
+                // duplicated and there is nothing to strip back off.
                 chips.push(Chip::parallel(spec.degree, th.err).with_help(s.chip_help_parallel));
             }
-            let full = node.label();
-            let head = match parallel {
-                Some(spec) => {
-                    let prefix = match spec.degree {
-                        None => "PARALLEL".to_string(),
-                        Some(n) => format!("PARALLEL({n})"),
-                    };
-                    full.strip_prefix(&prefix)
-                        .map(|s| s.trim_start().to_string())
-                        .unwrap_or(full)
-                }
-                None => full,
-            };
             // For an ENVS comparison loop, split the BASELINE/COMPARISON clause
             // off the head into their own chips so a long compare line reads as
             // legible parts. They are edited through the ENVS wizard, so the
@@ -821,12 +1014,11 @@ fn build_node_chips(
                         comparisons,
                         baseline_show,
                     },
-                var,
                 ..
             } = node
             {
                 chips.push(
-                    Chip::base(format!("FOR {var} IN ENVS"), th.accent)
+                    Chip::loop_head(loop_edit_parts(node, true), th.accent)
                         .with_help(s.chip_help_for_envs),
                 );
                 // A single live-environment role becomes an inline dropdown; any
@@ -886,12 +1078,13 @@ fn build_node_chips(
                     );
                 }
             } else {
-                let help = if matches!(node, FlowNode::ForEnvs { .. }) {
+                let envs = matches!(node, FlowNode::ForEnvs { .. });
+                let help = if envs {
                     s.chip_help_for_envs
                 } else {
                     s.chip_help_for
                 };
-                chips.push(Chip::base(head, th.accent).with_help(help));
+                chips.push(Chip::loop_head(loop_edit_parts(node, envs), th.accent).with_help(help));
             }
             chips
         }
@@ -1010,6 +1203,26 @@ enum Act {
     SetAlias {
         path: Vec<usize>,
         text: String,
+    },
+    /// One of the loop chip's inline boxes committed: the loop variable, the
+    /// folder/file it draws from, or a `FILES` loop's `MATCH` glob.
+    SetLoopVar {
+        path: Vec<usize>,
+        text: String,
+    },
+    SetLoopDir {
+        path: Vec<usize>,
+        text: String,
+    },
+    SetLoopGlob {
+        path: Vec<usize>,
+        text: String,
+    },
+    /// The folder/file picker beside a loop's path box. `file` picks a file
+    /// (`TUPLES FROM`) rather than a folder.
+    PickLoopDir {
+        path: Vec<usize>,
+        file: bool,
     },
     /// The inline `PARALLEL` box committed a new max-concurrency for the loop at
     /// `path`; `None` clears it back to the prelude-driven default.
@@ -2339,6 +2552,14 @@ fn release_payload<T: std::any::Any + Send + Sync>(
 /// so the two can't drift apart.
 const ALIAS_FIELD_WIDTH: f32 = 96.0;
 const PARALLEL_FIELD_WIDTH: f32 = 44.0;
+/// A loop variable is an identifier, and short ones are the convention.
+const LOOP_VAR_FIELD_WIDTH: f32 = 72.0;
+/// A folder path is the longest thing on a loop head, and the one most worth
+/// being able to read without scrolling the row.
+const LOOP_PATH_FIELD_WIDTH: f32 = 150.0;
+const LOOP_GLOB_FIELD_WIDTH: f32 = 84.0;
+/// The folder/file picker button beside a loop's path box.
+const PICKER_BUTTON_WIDTH: f32 = 22.0;
 /// A combo chip's dropdown grows to fit its text, which the ghost already spells
 /// out; this is just the arrow and its padding.
 const COMBO_CHIP_WIDTH: f32 = 24.0;
@@ -4046,6 +4267,58 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) 
     });
 }
 
+/// The folder/file picker beside a loop's path box.
+///
+/// Seeded from the path the loop already names, resolved against the report's
+/// own folder, so browsing starts where the loop is looking rather than at the
+/// process working directory. What comes back is written relative to the report
+/// wherever it can be: a loop that hard-codes an absolute path stops working
+/// the moment the report is shared or moved, and picking a folder is exactly
+/// when that would otherwise happen without the user noticing.
+fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: bool) {
+    let report_dir = ed
+        .report
+        .path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf);
+    let current = ed
+        .flow
+        .as_ref()
+        .and_then(|f| edit::loop_dir(f, path))
+        .unwrap_or_default();
+    // Resolve the loop's own (usually relative) path against the report so the
+    // dialog opens on the folder it names.
+    let seed = if current.is_empty() {
+        report_dir.clone()
+    } else {
+        let joined = match &report_dir {
+            Some(dir) => dir.join(&current),
+            None => std::path::PathBuf::from(&current),
+        };
+        super::filepick::seed_dir(joined.to_string_lossy().as_ref()).or(report_dir.clone())
+    };
+
+    let title = if file {
+        app.strings.gui_pick_loop_file
+    } else {
+        app.strings.gui_pick_loop_folder
+    };
+    let picked = if file {
+        super::filepick::pick_file(title, seed.as_deref(), &[("*", &["*"])])
+    } else {
+        super::filepick::pick_folder(title, seed.as_deref())
+    };
+    let Some(picked) = picked else {
+        return;
+    };
+    let text = relative_to_report(&picked, ed.report.path.as_deref());
+    ed.edit_flow(|flow| {
+        edit::set_loop_dir(flow, path, &text);
+    });
+    ed.selection = path.to_vec();
+}
+
 /// `path` expressed relative to the report's own folder when it lives under it,
 /// else the absolute path.
 fn relative_to_report(path: &std::path::Path, report: Option<&std::path::Path>) -> String {
@@ -4500,6 +4773,11 @@ fn render_chip_body(
             parallel_chip(ui, th, s, chip, path, *degree, acts);
             return;
         }
+        ChipEdit::Loop(l) => {
+            let l = l.clone();
+            loop_chip(ui, th, s, chip, path, &l, acts);
+            return;
+        }
         _ => {}
     }
 
@@ -4617,6 +4895,105 @@ fn alias_chip(
 /// `MAX_PARALLEL` — so a blank commits `None` rather than being ignored. Text
 /// that isn't a positive number is discarded on blur, which keeps the flow from
 /// ever holding the `PARALLEL(0)` the parser would reject on reload.
+/// Render a `FOR` loop head with its editable parts inline: `FOR` (the drag
+/// handle) followed by a box for the loop variable, the source keyword, a box
+/// and picker for the folder/file, and a `FILES` loop's `MATCH` glob.
+///
+/// The parts that can't be edited in one box — a destructuring pattern, a list
+/// literal, a `FOLDERS … WITH` role list — are drawn as plain labels, exactly as
+/// the whole head used to be, and are still reached through the wizard.
+fn loop_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    path: &[usize],
+    l: &LoopEdit,
+    acts: &mut Vec<Act>,
+) {
+    let (fill, stroke, text_col) = chip_colors(th, chip, false);
+    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
+        // `FOR` is the drag/select handle, kept apart from the boxes beside it
+        // so a click meant for a field never starts a drag of the row.
+        let handle = ui.add(
+            egui::Label::new(RichText::new("FOR").color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        if let Some(var) = &l.var {
+            let id = ui.make_persistent_id(("pt_loop_var", path));
+            let resp = inline_text_edit(ui, id, var, s.chip_help_loop_var, LOOP_VAR_FIELD_WIDTH);
+            if let Some(text) = resp
+                && &text != var
+            {
+                acts.push(Act::SetLoopVar {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+        }
+        ui.add(
+            egui::Label::new(RichText::new(&l.keyword).color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::hover()),
+        );
+        if let Some((dir, is_file)) = &l.dir {
+            let id = ui.make_persistent_id(("pt_loop_dir", path));
+            let resp = inline_text_edit(ui, id, dir, s.chip_help_loop_dir, LOOP_PATH_FIELD_WIDTH);
+            if let Some(text) = resp
+                && &text != dir
+            {
+                acts.push(Act::SetLoopDir {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(super::icons::FOLDER).color(text_col))
+                        .frame(false),
+                )
+                .on_hover_text(s.chip_help_loop_dir)
+                .clicked()
+            {
+                acts.push(Act::PickLoopDir {
+                    path: path.to_vec(),
+                    file: *is_file,
+                });
+            }
+        }
+        if let Some(glob) = &l.glob {
+            ui.add(
+                egui::Label::new(RichText::new("MATCH").color(text_col))
+                    .selectable(false)
+                    .sense(egui::Sense::hover()),
+            );
+            let id = ui.make_persistent_id(("pt_loop_glob", path));
+            let resp = inline_text_edit(ui, id, glob, s.chip_help_loop_glob, LOOP_GLOB_FIELD_WIDTH);
+            if let Some(text) = resp
+                && &text != glob
+            {
+                acts.push(Act::SetLoopGlob {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+        }
+        if !l.tail.is_empty() {
+            ui.add(
+                egui::Label::new(RichText::new(&l.tail).color(text_col))
+                    .selectable(false)
+                    .sense(egui::Sense::hover()),
+            );
+        }
+        handle
+    });
+
+    if handle.dragged() {
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
+    }
+}
+
 fn parallel_chip(
     ui: &mut egui::Ui,
     th: &GuiTheme,
@@ -5123,6 +5500,27 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     edit::set_report_alias(flow, &path, &text);
                 });
                 ed.selection = path;
+            }
+            Act::SetLoopVar { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_var(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::SetLoopDir { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_dir(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::SetLoopGlob { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_glob(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::PickLoopDir { path, file } => {
+                pick_loop_dir(ed, app, &path, file);
             }
             Act::SetParallelDegree { path, degree } => {
                 ed.edit_flow(|flow| {
@@ -7065,6 +7463,129 @@ mod tests {
             });
         }
         assert_eq!(h, one);
+    }
+}
+
+/// The `FOR` loop head's inline editors: which parts of a loop the chip breaks
+/// out into boxes, and which it leaves as plain text for the wizard.
+#[cfg(test)]
+mod loop_chip_tests {
+    use super::{ChipEdit, LoopEdit, node_chips};
+    use crate::gui::theme::GuiTheme;
+    use crate::i18n::{Language, Strings};
+
+    /// The `LoopEdit` the first node of `src` builds its head chip from.
+    fn loop_edit(src: &str) -> LoopEdit {
+        let flow = crate::report::parser::parse_flow(src).expect("the fixture flow parses");
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        node_chips(&flow.nodes[0], None, &th, &s)
+            .into_iter()
+            .find_map(|c| match c.edit {
+                ChipEdit::Loop(l) => Some(l),
+                _ => None,
+            })
+            .expect("a loop renders a loop-head chip")
+    }
+
+    /// The commonest loop: every part of it is a box.
+    #[test]
+    fn a_files_loop_offers_boxes_for_its_variable_folder_and_glob() {
+        let l = loop_edit("FOR doc IN FILES \"cases\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("doc"));
+        assert_eq!(l.keyword, "IN FILES");
+        assert_eq!(
+            l.dir,
+            Some(("cases".to_string(), false)),
+            "the folder is editable and picked with a *folder* dialog"
+        );
+        assert_eq!(l.glob.as_deref(), Some("*.json"));
+        assert!(l.tail.is_empty(), "nothing is left over as dead text");
+    }
+
+    /// A `FILES` loop with no `MATCH` still offers the glob box: an empty box
+    /// invites the glob, where nothing at all hides that the loop can be
+    /// narrowed at all.
+    #[test]
+    fn a_files_loop_without_a_match_still_offers_an_empty_glob_box() {
+        let l = loop_edit("FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.glob.as_deref(), Some(""));
+    }
+
+    /// `TUPLES FROM` names a file, not a folder, so its picker must be a file
+    /// dialog — a folder picker could not select `rows.csv` at all.
+    #[test]
+    fn a_tuples_loop_picks_a_file_rather_than_a_folder() {
+        let l = loop_edit("FOR row IN TUPLES FROM \"rows.csv\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.keyword, "IN TUPLES FROM");
+        assert_eq!(l.dir, Some(("rows.csv".to_string(), true)));
+        assert_eq!(l.glob, None, "a tuples loop has no glob to offer");
+    }
+
+    /// A `FOLDERS … WITH role="glob"` list is several named globs rather than
+    /// one, so it stays with the wizard and is shown as plain text.
+    #[test]
+    fn a_folders_loops_role_list_is_left_as_text_beside_its_editable_folder() {
+        let l = loop_edit("FOR d IN FOLDERS \"envs\" WITH req=\"*.hurl\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.dir, Some(("envs".to_string(), false)));
+        assert_eq!(l.glob, None);
+        assert_eq!(l.tail, "WITH req=\"*.hurl\"");
+    }
+
+    /// A pattern that binds more than one name has no single thing a box could
+    /// rename, so no box is offered -- rather than one that silently renamed
+    /// whichever binder came first.
+    #[test]
+    fn a_destructuring_loop_offers_no_variable_box() {
+        let l = loop_edit("FOR (NAME, URL) IN DOCS\n  REQUEST A\nEND\n");
+        assert_eq!(l.var, None);
+        assert_eq!(l.tail, "DOCS", "the source is still shown");
+    }
+
+    /// A producer with no single path keeps the text it always had, so nothing
+    /// disappears from the head just because it can't be boxed.
+    #[test]
+    fn a_list_literal_keeps_its_text_and_offers_no_folder_picker() {
+        let l = loop_edit("FOR x IN [\"a\", \"b\"]\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("x"));
+        assert_eq!(l.keyword, "IN");
+        assert_eq!(l.dir, None, "there is no one folder to pick");
+        assert_eq!(l.tail, "[\"a\", \"b\"]");
+    }
+
+    /// An ENVS loop's variable is editable, but its roles are chips of their
+    /// own beside the head, so the head carries no tail for them.
+    #[test]
+    fn an_envs_loop_offers_its_variable_box_and_leaves_the_roles_to_their_chips() {
+        let l = loop_edit(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n  REQUEST A\nEND\n",
+        );
+        assert_eq!(l.var.as_deref(), Some("TARGET"));
+        assert_eq!(l.keyword, "IN ENVS");
+        assert_eq!(l.dir, None);
+        assert!(
+            l.tail.is_empty(),
+            "BASELINE/COMPARISON are chips, not text on the head"
+        );
+    }
+
+    /// A plain list of environments has no chips of its own, so it must stay
+    /// visible on the head rather than vanishing.
+    #[test]
+    fn an_envs_loop_over_named_environments_still_shows_them() {
+        let l = loop_edit("FOR e IN ENVS \"dev\", \"prod\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("e"));
+        assert_eq!(l.tail, "\"dev\", \"prod\"");
+    }
+
+    /// A `PARALLEL` loop's head is built from the node, not from its label, so
+    /// the prefix belongs to the PARALLEL chip alone and is never repeated.
+    #[test]
+    fn a_parallel_loops_head_does_not_repeat_the_parallel_prefix() {
+        let l = loop_edit("PARALLEL(4) FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("f"));
+        assert_eq!(l.keyword, "IN FILES");
+        assert!(!l.tail.contains("PARALLEL"));
     }
 }
 

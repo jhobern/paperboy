@@ -117,7 +117,11 @@ fn perr(i: &str) -> nom::Err<nom::error::Error<&str>> {
 
 /// `[A-Za-z_][A-Za-z0-9_]*` — the identifier predicate, used for header keys,
 /// assignment targets and binders.
-fn is_ident(s: &str) -> bool {
+///
+/// Exposed to `edit` so an inline field that renames a loop variable can refuse
+/// a name the parser would then reject, rather than writing text that no longer
+/// round-trips through `parse_flow`.
+pub(crate) fn is_ident(s: &str) -> bool {
     let mut c = s.chars();
     matches!(c.next(), Some(x) if x.is_ascii_alphabetic() || x == '_')
         && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
