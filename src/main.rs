@@ -19,6 +19,8 @@ mod hurl;
 mod i18n;
 mod persistence;
 mod postman;
+mod postman_api;
+mod postman_import;
 mod report;
 mod report_cli;
 mod request;
