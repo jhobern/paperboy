@@ -61,7 +61,8 @@ show         := 'SHOW' '(' IDENT (',' IDENT)* ')'
 hide         := 'HIDE' '(' IDENT (',' IDENT)* ')'
 with-block   := 'WITH' with-item* 'END'
 with-item    := response-fmt | field-def
-field-def    := IDENT ':' hurl-query                   # full Hurl query + filters
+field-def    := name ':' hurl-query                    # full Hurl query + filters
+                                                       # quote a multi-word name
 
 for-each     := [ parallel ] 'FOR' pattern 'IN' producer statement* 'END'
 for-envs     := [ parallel ] 'FOR' IDENT 'IN' 'ENVS' env-clause statement* 'END'

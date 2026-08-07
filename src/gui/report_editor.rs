@@ -20,6 +20,7 @@ use crate::report::edit::{
     set_request_name, transfer_modifier,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
+use crate::report::indent::{indent_for_new_line, is_end_line, matching_opener_indent};
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
@@ -1609,6 +1610,95 @@ fn highlight_job(
     job
 }
 
+/// The byte offset of char index `at` in `text` (clamped to the end).
+fn byte_at(text: &str, at: usize) -> usize {
+    text.char_indices()
+        .nth(at)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+/// The (row, column) — both counted in chars — of char index `at`.
+fn row_col_at(text: &str, at: usize) -> (usize, usize) {
+    let (mut row, mut col) = (0usize, 0usize);
+    for ch in text.chars().take(at) {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
+/// The char index at which `row` starts (clamped to the end of `text`).
+fn row_start(text: &str, row: usize) -> usize {
+    let mut idx = 0usize;
+    for (n, line) in text.split('\n').enumerate() {
+        if n == row {
+            return idx;
+        }
+        idx += line.chars().count() + 1; // + the newline itself
+    }
+    text.chars().count()
+}
+
+/// The text and new cursor position after Enter replaces the char range `sel`,
+/// with PaperTrail's auto-indent applied.
+///
+/// `egui`'s own Enter would insert a bare `\n`, dumping the caret in column 0
+/// of a nested block; this inherits the current line's indentation instead (and
+/// adds a level after a block opener), matching the terminal editor. Like that
+/// editor, a *mid-line* split stays a plain newline — the rule is for the
+/// ordinary "type to the end of the line, press Enter" flow, where anything else
+/// would be a surprise. What counts as "the end" is measured at `sel.end`, since
+/// that is where the caret lands once the selection is replaced, while the
+/// indent is taken from the line the selection *starts* on.
+fn newline_with_indent(text: &str, sel: std::ops::Range<usize>) -> (String, usize) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (row, _) = row_col_at(text, sel.start);
+    let (end_row, end_col) = row_col_at(text, sel.end);
+    let at_line_end = end_col == lines.get(end_row).map_or(0, |l| l.chars().count());
+    let indent = if at_line_end {
+        indent_for_new_line(lines.get(row).copied().unwrap_or(""))
+    } else {
+        String::new()
+    };
+    let (from, to) = (byte_at(text, sel.start), byte_at(text, sel.end));
+    let mut out = String::with_capacity(text.len() + 1 + indent.len());
+    out.push_str(&text[..from]);
+    out.push('\n');
+    out.push_str(&indent);
+    out.push_str(&text[to..]);
+    (out, sel.start + 1 + indent.chars().count())
+}
+
+/// If the line holding char index `at` now reads exactly `END`, snap it to its
+/// opener's indentation and return the corrected text with the cursor parked at
+/// the line end — so finishing a block dedents one level, as it does in the
+/// terminal editor. `None` when nothing needs changing (already aligned, not an
+/// `END`, or the nesting above is unbalanced, in which case guessing would be
+/// worse than leaving the typed text alone).
+fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (row, _) = row_col_at(text, at);
+    let line = *lines.get(row)?;
+    if !is_end_line(line) {
+        return None;
+    }
+    let indent = matching_opener_indent(&lines[..row])?;
+    let fixed = format!("{indent}{}", line.trim_start());
+    if fixed == line {
+        return None;
+    }
+    let start = row_start(text, row);
+    let cursor = start + fixed.chars().count();
+    let mut out: Vec<&str> = lines;
+    out[row] = &fixed;
+    Some((out.join("\n"), cursor))
+}
+
 /// The raw `.trail` source editor + validation panel.
 fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // Reserve room for the diagnostics panel at the bottom, then let the editor
@@ -1633,14 +1723,72 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
         .max_height(edit_h)
         .show(ui, |ui| {
             let mut text = ed.report.text.clone();
+            // Enter is intercepted *before* the widget sees it: egui would
+            // insert a bare newline, so the only way to auto-indent is to
+            // consume the key and perform the edit (and move the caret)
+            // ourselves. A modified Enter is left alone — Ctrl/Cmd+Enter runs
+            // the report, and Shift+Enter stays a plain newline escape hatch.
+            let te_id = ui.id().with("trail_source");
+            // Only intercept when there is a live cursor to work from: with no
+            // stored state we have no idea where the newline goes, so the key
+            // is left for egui rather than consumed and dropped on the floor.
+            let cursor = ui
+                .memory(|m| m.has_focus(te_id))
+                .then(|| egui::TextEdit::load_state(ui.ctx(), te_id))
+                .flatten()
+                .and_then(|s| s.cursor.char_range())
+                .map(|r| {
+                    let r = r.as_sorted_char_range();
+                    r.start.0..r.end.0
+                });
+            let mut new_cursor: Option<usize> = None;
+            let mut edited = false;
+            if let Some(range) = cursor
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            {
+                let (next, caret) = newline_with_indent(&text, range);
+                text = next;
+                new_cursor = Some(caret);
+                edited = true;
+            }
             let resp = ui.add(
                 egui::TextEdit::multiline(&mut text)
+                    .id(te_id)
                     .code_editor()
                     .desired_width(f32::INFINITY)
                     .desired_rows(20)
                     .layouter(&mut layouter),
             );
-            if resp.changed() {
+            // A line that has just become `END` dedents to its opener. Done
+            // after the widget so it also catches the `END` the user typed by
+            // hand, not just the one a newline left behind.
+            if (edited || resp.changed())
+                && let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+            {
+                let at = new_cursor.unwrap_or_else(|| {
+                    state
+                        .cursor
+                        .char_range()
+                        .map(|r| r.primary.index.0)
+                        .unwrap_or(0)
+                });
+                if let Some((next, caret)) = snap_end_line(&text, at) {
+                    text = next;
+                    new_cursor = Some(caret);
+                    edited = true;
+                }
+            }
+            if let Some(caret) = new_cursor
+                && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+            {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text_selection::CCursorRange::one(
+                        egui::text::CCursor::new(egui::text::CharIndex(caret)),
+                    )));
+                egui::TextEdit::store_state(ui.ctx(), te_id, state);
+            }
+            if edited || resp.changed() {
                 // Snapshot for undo only when transitioning from a saved
                 // baseline, to avoid one entry per keystroke.
                 if ed.undo.last().map(String::as_str) != Some(ed.report.text.as_str()) {
@@ -5879,6 +6027,91 @@ fn save_report(ed: &mut ReportEditor, app: &mut GuiApp) {
 mod tests {
     use super::*;
     use crate::i18n::{Language, Strings};
+
+    /// Enter at the end of an indented line carries that indentation over, so a
+    /// statement typed inside a loop body stays inside it visually.
+    #[test]
+    fn enter_inherits_the_current_lines_indent() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST r";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\n    ");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// A block opener indents its body one further level.
+    #[test]
+    fn enter_after_an_opener_adds_a_level() {
+        let text = "FOR F IN [\"a\"]";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "FOR F IN [\"a\"]\n    ");
+        assert_eq!(caret, out.chars().count());
+
+        let text = "    REPORT REQUEST p WITH";
+        let at = text.chars().count();
+        let (out, _) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REPORT REQUEST p WITH\n        ");
+    }
+
+    /// Splitting a line in the middle stays a plain newline: the text after the
+    /// caret moves down as-is, and silently inserting spaces in front of it
+    /// would corrupt what the user was splitting.
+    #[test]
+    fn a_mid_line_split_is_not_indented() {
+        let text = "    REQUEST rs";
+        let at = text.chars().count() - 1;
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REQUEST r\ns");
+        assert_eq!(caret, at + 1);
+    }
+
+    /// Enter with a selection replaces it, like any typed character.
+    #[test]
+    fn enter_replaces_the_selection() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST rXXX";
+        let start = text.chars().count() - 3;
+        let (out, caret) = newline_with_indent(text, start..text.chars().count());
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\n    ");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// A line that has become `END` snaps back to its opener's indentation.
+    #[test]
+    fn end_dedents_to_its_opener() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST r\n    END";
+        let at = text.chars().count();
+        let (out, caret) = snap_end_line(text, at).expect("END should snap");
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\nEND");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// Snapping is idempotent, and leaves alone anything it can't resolve — a
+    /// stray `END` is the user's to fix, not ours to guess at.
+    #[test]
+    fn end_snapping_leaves_aligned_or_unresolvable_lines_alone() {
+        let aligned = "FOR F IN [\"a\"]\n    REQUEST r\nEND";
+        assert!(snap_end_line(aligned, aligned.chars().count()).is_none());
+
+        let stray = "REQUEST r\n    END";
+        assert!(snap_end_line(stray, stray.chars().count()).is_none());
+
+        let not_an_end = "FOR F IN [\"a\"]\n    ENDPOINT = x";
+        assert!(snap_end_line(not_an_end, not_an_end.chars().count()).is_none());
+    }
+
+    /// Both helpers count in chars, so multi-byte text can't split a character
+    /// or land the caret mid-codepoint.
+    #[test]
+    fn indent_helpers_are_char_indexed_not_byte_indexed() {
+        let text = "    REQUEST \u{e9}\u{e9}\u{e9}";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REQUEST \u{e9}\u{e9}\u{e9}\n    ");
+        assert_eq!(caret, out.chars().count());
+        assert_eq!(row_col_at(text, at), (0, 15));
+        assert_eq!(row_start("\u{e9}\u{e9}\n x", 1), 3);
+    }
 
     /// The relative luminance of a colour, per WCAG 2.1.
     fn luminance(c: Color32) -> f64 {

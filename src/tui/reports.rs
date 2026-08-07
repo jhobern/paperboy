@@ -32,8 +32,10 @@ use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::flow::Header;
+use crate::report::indent::{
+    INDENT_UNIT, indent_for_new_line, is_end_line, matching_opener_indent,
+};
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
-use crate::report::parser::opens_block;
 use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
@@ -2419,10 +2421,7 @@ impl TuiApp {
                 KeyCode::Enter if !ctrl && !shift => {
                     let line = &editor.lines[editor.row];
                     if editor.col == line.chars().count() {
-                        let mut new_indent = leading_ws(line);
-                        if opens_block(line) {
-                            new_indent.push_str(INDENT_UNIT);
-                        }
+                        let new_indent = indent_for_new_line(line);
                         editor.checkpoint();
                         editor.newline();
                         editor.insert_str(&new_indent);
@@ -2602,15 +2601,6 @@ enum NamePartial {
     Quoted { text: String, start: usize },
 }
 
-/// One level of source indentation (matches the flow serializer's four spaces).
-const INDENT_UNIT: &str = "    ";
-
-/// The leading whitespace of `line`, as an owned string (used to inherit the
-/// current line's indentation onto a freshly-inserted newline).
-fn leading_ws(line: &str) -> String {
-    line.chars().take_while(|c| c.is_whitespace()).collect()
-}
-
 /// Pretty-print `raw` when its whole trimmed text is a single valid JSON
 /// document, so a drilled-into cell holding a JSON body is shown indented (one
 /// field per line) instead of a dense single line. Content that isn't valid
@@ -2639,24 +2629,10 @@ fn reindent_end_line(ed: &mut Editor) {
     let Some(line) = ed.lines.get(row) else {
         return;
     };
-    if !line.trim().eq_ignore_ascii_case("END") {
+    if !is_end_line(line) {
         return;
     }
-    // Walk upward tracking opener/END balance to find the matching opener.
-    let mut depth = 0i32;
-    let mut target: Option<String> = None;
-    for prev in ed.lines[..row].iter().rev() {
-        if prev.trim().eq_ignore_ascii_case("END") {
-            depth += 1;
-        } else if opens_block(prev) {
-            if depth == 0 {
-                target = Some(leading_ws(prev));
-                break;
-            }
-            depth -= 1;
-        }
-    }
-    let Some(indent) = target else {
+    let Some(indent) = matching_opener_indent(&ed.lines[..row]) else {
         return;
     };
     let trimmed = ed.lines[row].trim_start().to_string();

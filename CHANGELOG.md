@@ -42,6 +42,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   URLs don't resolve. Converting to Hurl now writes them out as an environment
   you can select.
 
+- **The GUI's report source editor now indents like the terminal one.** Pressing
+  Enter carried the caret back to column 0, so every line of a `FOR` or `WITH`
+  body had to be re-indented by hand. A new line now inherits the current line's
+  indentation and gains a level after a block opener, and a line that becomes
+  `END` snaps back to the indent of the block it closes. Splitting a line in the
+  middle is still a plain newline, and Shift+Enter remains an escape hatch. Both
+  front-ends now share one set of indentation rules.
+
 ## [0.5.0] - 2026-08-08
 
 ### Added
