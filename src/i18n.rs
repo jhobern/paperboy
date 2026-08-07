@@ -103,6 +103,8 @@ strings! {
     gui_unsaved_quit_q => "{n} request(s) in {t} have edits that have not been saved. Quitting now will lose them.", "{n} requête(s) dans {t} ont des modifications non enregistrées. Quitter maintenant les perdra.", "{n} anmodning(er) i {t} har ændringer, der ikke er gemt. Hvis du afslutter nu, går de tabt.";
     gui_unsaved_close_tab_q => "{n} request(s) in \"{t}\" have edits that have not been saved. Closing this tab will lose them.", "{n} requête(s) dans «\u{a0}{t}\u{a0}» ont des modifications non enregistrées. Fermer cet onglet les perdra.", "{n} anmodning(er) i \"{t}\" har ændringer, der ikke er gemt. Hvis du lukker denne fane, går de tabt.";
     gui_quit_anyway => "Quit anyway", "Quitter quand même", "Afslut alligevel";
+    gui_save_all_and_quit => "Save all changes", "Tout enregistrer", "Gem alle ændringer";
+    gui_saved_n_files => "Saved {n} file(s)", "{n} fichier(s) enregistré(s)", "Gemte {n} fil(er)";
     gui_close_anyway => "Close anyway", "Fermer quand même", "Luk alligevel";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
     view_json_label => "JSON", "JSON", "JSON";
@@ -829,9 +831,11 @@ strings! {
     gui_ws_new_collection => "New collection…", "Nouvelle collection…", "Ny samling…";
     gui_ws_new_report => "New report…", "Nouveau rapport…", "Ny rapport…";
     gui_ws_new_environment => "New environment…", "Nouvel environnement…", "Nyt miljø…";
+    gui_ws_new_folder => "New folder…", "Nouveau dossier…", "Ny mappe…";
     gui_ws_new_in_folder => "New in this folder", "Nouveau dans ce dossier", "Ny i denne mappe";
     gui_ws_new_in_root => "New in this workspace", "Nouveau dans cet espace de travail", "Ny i dette arbejdsområde";
     gui_ws_new_collection_title => "Name the new collection", "Nommez la nouvelle collection", "Navngiv den nye samling";
+    gui_ws_new_folder_title => "Name the new folder", "Nommez le nouveau dossier", "Navngiv den nye mappe";
     gui_ws_new_report_title => "Name the new report", "Nommez le nouveau rapport", "Navngiv den nye rapport";
     gui_ws_new_environment_title => "Name the new environment", "Nommez le nouvel environnement", "Navngiv det nye miljø";
     gui_workspace_filter_tooltip => "Toggle showing only .hurl/.json/.vars/.trail files", "Basculer l'affichage des seuls fichiers .hurl/.json/.vars/.trail", "Skift visning af kun .hurl/.json/.vars/.trail-filer";
@@ -1086,6 +1090,11 @@ pub fn fill(template: &str, args: &[&str]) -> String {
 #[derive(Clone, Debug)]
 pub enum Status {
     Saved,
+    /// A bulk save wrote this many files -- the answer to "Save all changes"
+    /// on the quit dialog, which spans however many collections were holding
+    /// edits rather than the single file `Saved` speaks for.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    SavedFiles(usize),
     Loaded,
     Cleared,
     NoResponse,
@@ -1312,6 +1321,7 @@ impl Status {
     pub fn text(&self, s: &Strings) -> String {
         match self {
             Status::Saved => s.file_saved.to_string(),
+            Status::SavedFiles(n) => s.gui_saved_n_files.replace("{n}", &n.to_string()),
             Status::Loaded => s.file_loaded.to_string(),
             Status::Cleared => s.clear_all_done.to_string(),
             Status::Copied => s.copied_to_clipboard.to_string(),

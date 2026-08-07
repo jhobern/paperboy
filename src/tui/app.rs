@@ -2897,6 +2897,9 @@ impl TuiApp {
                 self.load_workspace_file(ci, path.clone());
             }
             NewItemKind::Environment => {}
+            // Nothing to open: a new folder is somewhere to put files, and the
+            // tree already lists it (revealed above).
+            NewItemKind::Folder => {}
         }
         self.save_state();
         self.status = Some(Status::WsItemCreated(crate::workspace::display_name(

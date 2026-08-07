@@ -324,11 +324,19 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
             .replace("{n}", &count.to_string())
             .replace("{t}", &tabs),
     );
+    let save_all = app.strings.gui_save_all_and_quit;
     let mut decided = false;
+    let mut save_then_quit = false;
     modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
+            // Offered first: it is the only answer that keeps the work, so it
+            // should be the one the eye lands on before "Quit anyway".
+            if ui.button(save_all).clicked() {
+                save_then_quit = true;
+                decided = true;
+            }
             if ui.button(quit).clicked() {
                 app.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -339,6 +347,22 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
             }
         });
     });
+    if save_then_quit {
+        // A save that fails must not take the app down with it -- the dialog
+        // comes back reporting the file that refused, so the work is still
+        // there to be dealt with.
+        match app.save_all_unsaved_edits() {
+            Ok(_) => {
+                app.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                app.session.status = Some(crate::i18n::Status::Error(e));
+                app.dialog = Some(Dialog::UnsavedQuit { count, tabs });
+            }
+        }
+        return;
+    }
     if !decided {
         app.dialog = Some(Dialog::UnsavedQuit { count, tabs });
     }
@@ -773,10 +797,11 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
 }
 
 fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut text: String) {
-    let title = match kind {
+    let title = match &kind {
         PromptKind::BaseUrl => app.strings.gui_base_url_title,
         PromptKind::NewEnvName => app.strings.gui_new_env_name_title,
         PromptKind::NewCollectionName => app.strings.gui_new_collection_name_title,
+        PromptKind::NewWorkspaceFolder { .. } => app.strings.gui_ws_new_folder_title,
     };
     let lbl_ok = app.strings.gui_ok;
     let lbl_cancel = app.strings.gui_cancel;
@@ -799,7 +824,7 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
         return;
     }
     if submit {
-        match kind {
+        match &kind {
             PromptKind::BaseUrl => {
                 app.session.vars.base_url = text.clone();
                 app.session.save();
@@ -820,6 +845,10 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
                 };
                 app.session.add_collection(name);
                 app.session.save();
+            }
+            PromptKind::NewWorkspaceFolder { ci, dir } => {
+                let (ci, dir) = (*ci, dir.clone());
+                super::requests::new_workspace_folder(app, ci, &dir, text.trim());
             }
         }
         return;

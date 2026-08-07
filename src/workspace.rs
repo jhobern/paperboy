@@ -26,22 +26,28 @@ pub struct WsEntry {
     pub is_dir: bool,
 }
 
-/// The three kinds of file a workspace is made of, as something the user can
-/// ask for a *new* one of.
+/// The kinds of thing a workspace is made of, as something the user can ask for
+/// a *new* one of: the three file types, plus the folder they get organised
+/// into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NewItemKind {
     Collection,
     Report,
     Environment,
+    /// A subfolder. Unlike the file kinds it has no extension and no starter
+    /// content -- it exists purely to be dragged things into.
+    Folder,
 }
 
 impl NewItemKind {
-    /// The extension given to a name typed without one.
+    /// The extension given to a name typed without one. Empty for a folder,
+    /// which never gains one.
     pub fn extension(self) -> &'static str {
         match self {
             NewItemKind::Collection => "hurl",
             NewItemKind::Report => "trail",
             NewItemKind::Environment => "vars",
+            NewItemKind::Folder => "",
         }
     }
 
@@ -77,6 +83,9 @@ impl NewItemKind {
             // scratch report in a tab does rather than a bare comment.
             NewItemKind::Report => crate::report::Report::scratch(stem).text,
             NewItemKind::Environment => format!("# {stem}\n"),
+            // Unused: `create_item` makes a directory rather than writing a
+            // file for this kind.
+            NewItemKind::Folder => String::new(),
         }
     }
 }
@@ -105,7 +114,9 @@ pub fn create_item(
         return Err(NewItemError::EmptyName);
     }
     let mut rel = PathBuf::from(name);
-    if rel.extension().is_none() {
+    // A folder keeps exactly the name that was typed -- "v2" must not become
+    // "v2.hurl", and a dot in a folder name is the user's business.
+    if kind != NewItemKind::Folder && rel.extension().is_none() {
         rel.set_extension(kind.extension());
     }
     let lexically_safe = rel
@@ -125,6 +136,11 @@ pub fn create_item(
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| NewItemError::Io(format!("{}: {e}", parent.display())))?;
+    }
+    if kind == NewItemKind::Folder {
+        std::fs::create_dir_all(&full)
+            .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+        return Ok(full);
     }
     let stem = full
         .file_stem()
@@ -296,13 +312,14 @@ fn scan_dir(dir: &Path, depth: usize, filter_hurl_json: bool, out: &mut Vec<WsEn
     files.sort();
 
     for d in dirs {
-        // Recurse first into a scratch buffer so we can decide whether this
-        // directory is worth showing at all before committing any rows.
         let mut sub = Vec::new();
         scan_dir(&d, depth + 1, filter_hurl_json, &mut sub);
-        if filter_hurl_json && sub.is_empty() {
-            continue;
-        }
+        // Folders are always listed, even when the filter leaves them with
+        // nothing inside. The filter chooses which *files* are worth looking at;
+        // folders are the structure those files are organised into, and hiding
+        // an empty one makes the tree impossible to organise *with* -- a folder
+        // created to tidy things into would vanish the moment it was made, and
+        // there would be nowhere to drop the first file.
         let display_name = d
             .file_name()
             .and_then(|n| n.to_str())
@@ -760,22 +777,74 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The filter hides *files*, never folders: an empty folder, or one holding
+    /// only files the filter rejects, is still somewhere the user can put a
+    /// collection, and a freshly created folder would otherwise disappear
+    /// before anything could be moved into it.
     #[test]
-    fn filter_on_hides_directories_whose_subtree_has_no_matching_files() {
+    fn filter_on_still_lists_folders_that_hold_nothing_it_matches() {
         let root = tmp_dir("hide_empty");
         fs::create_dir_all(root.join("irrelevant")).unwrap();
         fs::write(root.join("irrelevant/notes.txt"), "").unwrap();
+        fs::create_dir_all(root.join("brand_new")).unwrap();
         fs::create_dir_all(root.join("relevant")).unwrap();
         fs::write(root.join("relevant/req.hurl"), "").unwrap();
 
         let entries = scan_workspace(&root, true);
         let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
         assert!(
-            !names.contains(&"irrelevant"),
-            "a folder with no matching descendants is hidden when filtered"
+            names.contains(&"brand_new"),
+            "a folder just created to organise into is still shown when filtered"
+        );
+        assert!(
+            names.contains(&"irrelevant"),
+            "and so is one whose only contents the filter rejects"
+        );
+        assert!(
+            !names.contains(&"notes.txt"),
+            "the rejected file itself stays hidden -- the filter still applies to files"
         );
         assert!(names.contains(&"relevant"));
         assert!(names.contains(&"req.hurl"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A new folder is made as a directory, not as a file with a folder-ish
+    /// name: it must gain no extension and hold no starter content.
+    #[test]
+    fn creating_a_folder_makes_a_directory_and_never_appends_an_extension() {
+        let root = tmp_dir("new_folder");
+
+        let made = create_item(&root, &root, "v2 endpoints", NewItemKind::Folder)
+            .expect("a plain name inside the root is allowed");
+        assert!(made.is_dir(), "a folder was created, not a file");
+        assert_eq!(
+            made.file_name().unwrap(),
+            "v2 endpoints",
+            "the name is exactly what was typed -- no .hurl was appended"
+        );
+
+        // A name that already contains a dot keeps it: that is a folder name,
+        // not an extension to be reasoned about.
+        let dotted = create_item(&root, &root, "v1.2", NewItemKind::Folder).unwrap();
+        assert_eq!(dotted.file_name().unwrap(), "v1.2");
+
+        // And the containment checks still apply.
+        assert!(
+            matches!(
+                create_item(&root, &root, "../escape", NewItemKind::Folder),
+                Err(NewItemError::Escapes(_))
+            ),
+            "a folder cannot be created outside the workspace"
+        );
+        assert!(
+            matches!(
+                create_item(&root, &root, "v2 endpoints", NewItemKind::Folder),
+                Err(NewItemError::Exists(_))
+            ),
+            "and an existing folder is not silently reused"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

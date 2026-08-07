@@ -753,14 +753,18 @@ fn sibling_dir(path: &std::path::Path) -> PathBuf {
     path.parent().unwrap_or(path).to_path_buf()
 }
 
-/// The three `New …` entries, shared by the header menu and every right-click
-/// menu so they can't drift apart. Returns the kind chosen, if any.
+/// The `New …` entries, shared by the header menu and every right-click menu so
+/// they can't drift apart. Returns the kind chosen, if any.
+///
+/// The folder entry sits below a separator: the other three make a file to work
+/// in, while a folder makes somewhere to put those files, which is a different
+/// enough intent to be worth the line.
 fn new_item_menu(
     ui: &mut egui::Ui,
-    labels: (&'static str, &'static str, &'static str),
+    labels: NewItemLabels,
 ) -> Option<crate::workspace::NewItemKind> {
     use crate::workspace::NewItemKind;
-    let (collection, report, env) = labels;
+    let (collection, report, env, folder) = labels;
     for (label, kind) in [
         (collection, NewItemKind::Collection),
         (report, NewItemKind::Report),
@@ -770,16 +774,24 @@ fn new_item_menu(
             return Some(kind);
         }
     }
+    ui.separator();
+    if ui.button(folder).clicked() {
+        return Some(NewItemKind::Folder);
+    }
     None
 }
 
+/// The `New …` menu labels: collection, report, environment, folder.
+type NewItemLabels = (&'static str, &'static str, &'static str, &'static str);
+
 /// The `New …` labels, pulled out of `Strings` once so the menu can be built
 /// while the tree is borrowed.
-fn new_item_labels(s: &crate::i18n::Strings) -> (&'static str, &'static str, &'static str) {
+fn new_item_labels(s: &crate::i18n::Strings) -> NewItemLabels {
     (
         s.gui_ws_new_collection,
         s.gui_ws_new_report,
         s.gui_ws_new_environment,
+        s.gui_ws_new_folder,
     )
 }
 
@@ -802,11 +814,26 @@ fn new_workspace_item(
     let Some(root) = app.session.collections[ci].workspace_root.clone() else {
         return;
     };
+    // A folder is asked for by name rather than through the platform's save
+    // dialog, which is built around naming a *file* and would append an
+    // extension the folder must not have.
+    if kind == crate::workspace::NewItemKind::Folder {
+        app.dialog = Some(super::app::Dialog::Prompt {
+            kind: super::app::PromptKind::NewWorkspaceFolder {
+                ci,
+                dir: dir.to_path_buf(),
+            },
+            text: String::new(),
+        });
+        return;
+    }
     let s = &app.strings;
     let (title, default) = match kind {
         NewItemKind::Collection => (s.gui_ws_new_collection_title, "collection.hurl"),
         NewItemKind::Report => (s.gui_ws_new_report_title, "report.trail"),
         NewItemKind::Environment => (s.gui_ws_new_environment_title, "environment.vars"),
+        // Diverted to the name prompt above.
+        NewItemKind::Folder => return,
     };
     let ext = kind.extension();
     let Some(chosen) = super::filepick::save_file(title, Some(dir), default, &[(ext, &[ext])])
@@ -843,6 +870,7 @@ fn new_workspace_item(
                     // A just-created environment is empty and worth showing.
                     reveal: true,
                 },
+                NewItemKind::Folder => return,
             };
             // The status is set first because opening may replace it with
             // something more specific, which is the more useful message.
@@ -851,6 +879,47 @@ fn new_workspace_item(
             if app.session.status.is_none() {
                 app.session.status = created;
             }
+        }
+        Err(NewItemError::EmptyName) => {}
+        Err(NewItemError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+        }
+        Err(NewItemError::Exists(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemExists(what));
+        }
+        Err(NewItemError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+        }
+    }
+}
+
+/// Create a subfolder in a Workspace tab, from the name typed into the prompt.
+///
+/// Folders are what makes a workspace navigable once it holds more than a
+/// handful of files, and until now the tree could only ever show the folders
+/// that already existed on disk. The name goes through the same
+/// [`crate::workspace::create_item`] containment checks as a new file, so a
+/// name with `..` or an absolute path in it is refused rather than quietly
+/// creating a folder outside the workspace.
+pub(super) fn new_workspace_folder(app: &mut GuiApp, ci: usize, dir: &std::path::Path, name: &str) {
+    use crate::workspace::{NewItemError, NewItemKind};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    match crate::workspace::create_item(&root, dir, name, NewItemKind::Folder) {
+        Ok(path) => {
+            // Reveal *and* expand it. A new folder is empty, so without being
+            // opened it is an unremarkable closed row, and the next thing the
+            // user wants is to drag something into it.
+            reveal_in_tree(app, ci, &path, &root);
+            app.session.collections[ci]
+                .workspace_expanded
+                .insert(path.clone());
+            app.session.status = Some(crate::i18n::Status::WsItemCreated(
+                crate::workspace::display_name(&root, &path),
+            ));
+            app.session.save();
         }
         Err(NewItemError::EmptyName) => {}
         Err(NewItemError::Escapes(what)) => {
@@ -1013,7 +1082,7 @@ fn ws_row_menu(
     resp: &egui::Response,
     dir: PathBuf,
     header: &'static str,
-    labels: (&'static str, &'static str, &'static str),
+    labels: NewItemLabels,
     actions: &mut Vec<WsAction>,
 ) {
     resp.context_menu(|ui| {
@@ -1136,7 +1205,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Collect the text of every id-clash complaint egui painted this frame.
@@ -1214,7 +1283,7 @@ mod tests {
     /// `state.json`. Set once and never unset: every test in this binary is
     /// better off writing to a scratch dir, and the environment is process-wide,
     /// so flipping it back mid-run would race the other test threads.
-    fn redirect_saved_state() {
+    pub(crate) fn redirect_saved_state() {
         static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         ONCE.get_or_init(|| {
             let dir =

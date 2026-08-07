@@ -1207,6 +1207,81 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// "Save all changes" on the quit dialog has to reach the files a Workspace
+    /// tab is *not* showing as well as the one it is: switching away from an
+    /// edited file parks its entries, and those are exactly as lost on exit as
+    /// the loaded file's.
+    #[test]
+    fn saving_all_workspace_edits_writes_the_parked_files_too_not_just_the_loaded_one() {
+        let dir = tmp("save_all");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+
+        // Edit one file, switch away (parking it), then edit the next.
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        s.collections[ci].entries[0].url = "https://example.com/health/v2".into();
+        s.collections[ci].entries[0].modified = true;
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        s.collections[ci].entries[0].url = "https://example.com/people".into();
+        s.collections[ci].entries[0].modified = true;
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            2,
+            "one edit parked and one loaded, both of them at risk"
+        );
+
+        let written = s.collections[ci]
+            .save_workspace_edits()
+            .expect("both files are writable");
+        assert_eq!(
+            written, 2,
+            "the parked file counts as much as the loaded one"
+        );
+
+        // Both edits are on disk, not merely marked as saved.
+        let parked = std::fs::read_to_string(dir.join("health.hurl")).unwrap();
+        assert!(
+            parked.contains("https://example.com/health/v2"),
+            "the file that was switched away from was written: {parked}"
+        );
+        let loaded = std::fs::read_to_string(dir.join("api/users.hurl")).unwrap();
+        assert!(
+            loaded.contains("https://example.com/people"),
+            "the file on screen was written: {loaded}"
+        );
+
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            0,
+            "with everything written there is nothing left for the dialog to warn about"
+        );
+        assert!(
+            s.collections[ci].workspace_pending.is_empty(),
+            "and no stale snapshot is left to be written back over a saved file later"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary tab is left alone: its edits are persisted with the session,
+    /// so a bulk save has nothing it needs to rescue and no file to guess at.
+    #[test]
+    fn saving_all_workspace_edits_leaves_an_ordinary_tab_alone() {
+        let mut plain = crate::collection::Collection::new("scratch".into(), Vec::new());
+        let mut e = crate::hurl::HurlEntry::default();
+        e.title = "req".into();
+        e.modified = true;
+        plain.entries.push(e);
+
+        let written = plain.save_workspace_edits().expect("a no-op cannot fail");
+        assert_eq!(written, 0, "nothing was written");
+        assert!(
+            plain.has_unsaved_edits(),
+            "and the edit is still flagged, because it is still unsaved -- it is \
+             just not in danger"
+        );
+    }
+
     fn git_origin(url: &str) -> WorkspaceGitOrigin {
         WorkspaceGitOrigin {
             repo_url: url.to_string(),

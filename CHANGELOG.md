@@ -10,7 +10,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.3.2] - 2026-08-07
 
+### Added
+
+- **Workspaces can be organised into folders from the app.** Right-clicking any
+  row in a Workspace tree (or the tree's own `New` menu) now offers "New
+  folder…" alongside the three file kinds, so a workspace can be tidied up
+  without leaving PaperBoy for a file manager. The new folder is revealed and
+  opened ready to have things dragged into it, and its name goes through the
+  same containment checks as a new file, so it can't be created outside the
+  workspace.
+
+- **"Save all changes" on the unsaved-changes warning.** Quitting with edits
+  that really would be lost now offers to write them out rather than only
+  offering to discard them. It saves exactly what the warning counts — every
+  edited file a Workspace tab is holding, including the ones it isn't currently
+  showing — and if a file can't be written the quit is called off and the file
+  that refused is named, so nothing is lost to a failed save.
+
 ### Changed
+
+- **The Workspace filter no longer hides folders.** With the filter on, a folder
+  containing nothing it matched was left out of the tree entirely, which made
+  the tree impossible to organise with: a folder created to tidy files into
+  disappeared the moment it was made, and there was nowhere to drop the first
+  one. The filter still applies to files, which is what it was for.
 
 - **A clause that qualifies another chip is now drawn as one pill with it.** In
   the report editor's drag-and-drop view, `SHOW(…)` belongs to the `BASELINE`

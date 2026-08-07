@@ -97,11 +97,22 @@ pub enum RenameTarget {
     Tab { ci: usize },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `NewWorkspaceFolder` carries the folder the new one goes inside.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PromptKind {
     BaseUrl,
     NewEnvName,
     NewCollectionName,
+    /// Name for a new subfolder in a Workspace tab's tree, with the tab and the
+    /// folder it goes inside. Asked for in-app rather than through the
+    /// platform's dialog, as the file kinds are: a save dialog is built around
+    /// choosing a *file* name, and the folder pickers offer existing folders,
+    /// so neither asks the question "what should this new folder be called?"
+    /// as directly as a text box does.
+    NewWorkspaceFolder {
+        ci: usize,
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Editable-code-view state for the request editor's Code section. Holds the
@@ -1002,6 +1013,29 @@ impl GuiApp {
             self.dialog = Some(Dialog::UnsavedQuit { count, tabs });
         }
     }
+
+    /// Write out every edit that quitting would otherwise destroy, and report
+    /// how many files were written. Backs "Save all changes" on the quit
+    /// dialog.
+    ///
+    /// The set of files is [`Collection::edits_lost_on_exit`]'s, not
+    /// [`Collection::unsaved_edit_count`]'s: an ordinary tab's edits survive a
+    /// quit inside the session state, so writing them out to a `.hurl` on the
+    /// way past would be making a decision -- where the file goes, and that the
+    /// edit is finished -- that the user never asked this button to make.
+    ///
+    /// A failure stops at the offending file rather than pressing on, so the
+    /// caller can name it. Files already written stay written and are no longer
+    /// flagged, so answering the dialog again retries only what is left.
+    pub(super) fn save_all_unsaved_edits(&mut self) -> Result<usize, String> {
+        let mut written = 0usize;
+        for c in &mut self.session.collections {
+            written += c.save_workspace_edits()?;
+        }
+        self.session.save();
+        self.session.status = Some(crate::i18n::Status::SavedFiles(written));
+        Ok(written)
+    }
 }
 
 /// Print any widget-id clash `egui` flagged this frame, when
@@ -1068,6 +1102,57 @@ mod tests {
         let mut c = edited_collection(name);
         c.workspace_root = Some(std::path::PathBuf::from("/tmp/paperboy-test-ws"));
         c
+    }
+
+    /// "Save all changes" has to leave nothing behind for the dialog to object
+    /// to a second time -- otherwise the button would appear to do nothing.
+    #[test]
+    fn saving_all_changes_writes_the_workspace_file_and_clears_the_quit_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_gui_save_all_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("health.hurl");
+        std::fs::write(&file, "GET https://example.com/health\n").unwrap();
+
+        // save_all_unsaved_edits() persists the session, which would otherwise
+        // land on the developer's own state.json.
+        super::requests::tests::redirect_saved_state();
+
+        let mut session = Session::default();
+        session.collections.clear();
+        let mut col = edited_workspace_collection("ws");
+        col.workspace_root = Some(dir.clone());
+        col.path = Some(file.clone());
+        col.entries[0].url = "https://example.com/health/v2".into();
+        session.collections.push(col);
+        let mut app = GuiApp::for_test(session);
+
+        assert_eq!(
+            app.session.collections[0].edits_lost_on_exit(),
+            1,
+            "the fixture starts with exactly the edit the dialog would warn about"
+        );
+
+        let written = app
+            .save_all_unsaved_edits()
+            .expect("the temporary file is writable");
+        assert_eq!(written, 1, "the one edited file was written");
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            on_disk.contains("https://example.com/health/v2"),
+            "the edit reached the file rather than just being marked saved: {on_disk}"
+        );
+        assert_eq!(
+            app.session.collections[0].edits_lost_on_exit(),
+            0,
+            "so a second close request would go straight through"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Closing a tab that is holding edits with nowhere on disk to go asks

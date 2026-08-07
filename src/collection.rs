@@ -247,6 +247,20 @@ pub fn next_collection_id() -> u64 {
     NEXT_COLLECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Write collection text to `path`, creating the folder it lives in if that has
+/// gone missing since the file was opened. The error carries the path, because
+/// a bulk save spans several files and "permission denied" on its own would not
+/// say which one refused.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn write_hurl(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 impl Collection {
     pub fn new(name: String, entries: Vec<HurlEntry>) -> Self {
         let mut c = Self {
@@ -588,9 +602,52 @@ impl Collection {
         }
     }
 
+    /// Write every edited file this Workspace tab is holding back to disk — the
+    /// one it is showing as well as the ones parked in `workspace_pending` —
+    /// and clear the edit markers. Returns how many files were written, or the
+    /// first path that could not be, so the caller can say which one failed.
+    ///
+    /// This is what "Save all changes" on the quit dialog needs, and it is
+    /// deliberately the same set of files that [`Self::edits_lost_on_exit`]
+    /// counts: an ordinary tab is left alone because its edits are persisted to
+    /// the session state rather than lost, so silently writing them out to a
+    /// file on the way out of the app would be doing something the user never
+    /// asked for. A Workspace tab's edits, by contrast, have a file they came
+    /// from and are otherwise dropped on exit.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn save_workspace_edits(&mut self) -> Result<usize, String> {
+        if self.workspace_root.is_none() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        // The loaded file first: saving it also drops its parked copy, so the
+        // parked pass below can't then write a stale snapshot back over it.
+        if self.has_unsaved_edits()
+            && let Some(path) = self.path.clone()
+        {
+            write_hurl(&path, &self.to_hurl())?;
+            written += 1;
+        }
+        let parked: Vec<(PathBuf, Vec<HurlEntry>)> = self
+            .workspace_pending
+            .iter()
+            .filter(|(path, _)| self.path.as_deref() != Some(path.as_path()))
+            .map(|(p, e)| (p.clone(), e.clone()))
+            .collect();
+        for (path, entries) in parked {
+            if !entries.iter().any(|e| e.user_added || e.modified) {
+                continue;
+            }
+            write_hurl(&path, &collection_to_hurl(&entries))?;
+            written += 1;
+        }
+        self.workspace_pending.clear();
+        self.mark_saved();
+        Ok(written)
+    }
+
     /// Re-read the request names of every expanded collection file that isn't
-    /// the currently-loaded one, populating `workspace_titles` from disk. Used
-    /// after restoring persisted state, where collections expanded last session
+    /// the currently-loaded one, populating `workspace_titles` from disk. Used    /// after restoring persisted state, where collections expanded last session
     /// must list their requests without having been opened yet this session.
     pub fn rebuild_expanded_titles(&mut self) {
         let loaded = self.path.clone();
