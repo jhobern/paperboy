@@ -1932,7 +1932,12 @@ fn results_grid(
 const TETHER_GAP: f32 = 0.0;
 
 /// The corner radius of a chip.
-const CHIP_RADIUS: u8 = 6;
+///
+/// Small on purpose. A large radius reads as a soft, toy-like pill; the shallow
+/// one here still says "this is a discrete object you can pick up" without the
+/// bubbliness. It is the single number most responsible for how playful or how
+/// businesslike the flow looks, so it is worth keeping deliberately low.
+const CHIP_RADIUS: u8 = 3;
 
 /// Fully rounded corners, for a chip that never joins a neighbour.
 const ROUND_CHIP: egui::CornerRadius = egui::CornerRadius::same(CHIP_RADIUS);
@@ -2452,7 +2457,7 @@ fn trash_bar(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         .fill(mix(th.panel, th.err, 0.14))
         .stroke(egui::Stroke::new(1.0, mix(th.panel, th.err, 0.5)))
         .inner_margin(egui::Margin::symmetric(8, 8))
-        .corner_radius(6);
+        .corner_radius(BLOCK_RADIUS as u8);
     let resp = frame
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2492,14 +2497,14 @@ fn trash_bar(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
 }
 
 /// One rounded, category-tinted palette chip.
+///
+/// Drawn through [`chip_shell`] rather than its own frame so a palette entry and
+/// the chip it drops into the flow are the same object visually — same rule,
+/// same tint, same corners. They differ only in that the palette chip is inert.
 fn palette_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, base: Color32) {
-    let frame = egui::Frame::NONE
-        .fill(mix(th.panel, base, 0.22))
-        .stroke(egui::Stroke::new(1.0, mix(th.panel, base, 0.5)))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .corner_radius(6);
-    frame.show(ui, |ui| {
-        ui.add(egui::Label::new(RichText::new(text).color(base)).selectable(false));
+    let tint = chip_tint(th, base);
+    chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).color(tint.text)).selectable(false));
     });
 }
 
@@ -2547,9 +2552,11 @@ fn release_payload<T: std::any::Any + Send + Sync>(
     resp.dnd_release_payload::<T>()
 }
 
-/// Widths of the inline editors embedded in a chip. Shared by the real chip and
-/// by the same-sized placeholder a pending drop draws (see [`Chip::ghost_shape`])
-/// so the two can't drift apart.
+/// Minimum widths of the inline editors embedded in a chip. Each field grows
+/// past this to fit what is actually in it (see [`fitted_field_width`]) and
+/// stops at [`FIELD_MAX_WIDTH`]; these are the resting sizes an empty box takes,
+/// and what the same-sized placeholder a pending drop draws uses (see
+/// [`Chip::ghost_shape`]) so the two can't drift apart.
 const ALIAS_FIELD_WIDTH: f32 = 96.0;
 const PARALLEL_FIELD_WIDTH: f32 = 44.0;
 /// A loop variable is an identifier, and short ones are the convention.
@@ -2558,8 +2565,18 @@ const LOOP_VAR_FIELD_WIDTH: f32 = 72.0;
 /// being able to read without scrolling the row.
 const LOOP_PATH_FIELD_WIDTH: f32 = 150.0;
 const LOOP_GLOB_FIELD_WIDTH: f32 = 84.0;
+/// How wide any inline field is allowed to grow to fit its contents.
+///
+/// A deep folder path would otherwise push a loop head past the width of the
+/// pane and put the rest of the statement out of sight. Past this the box
+/// scrolls internally, which is the old behaviour — but now only for the
+/// genuinely long values rather than for almost all of them.
+const FIELD_MAX_WIDTH: f32 = 320.0;
 /// The folder/file picker button beside a loop's path box.
-const PICKER_BUTTON_WIDTH: f32 = 22.0;
+///
+/// Wider than the glyph needs because the button now carries a frame: it looked
+/// like decoration when drawn flat, and users didn't discover it was a button.
+const PICKER_BUTTON_WIDTH: f32 = 28.0;
 /// A combo chip's dropdown grows to fit its text, which the ghost already spells
 /// out; this is just the arrow and its padding.
 const COMBO_CHIP_WIDTH: f32 = 24.0;
@@ -2809,7 +2826,7 @@ fn paint_drop_silhouette(
 
 /// The corner radius every block, chip and ghost shares, so an outline drawn
 /// around a block traces the same silhouette the block itself has.
-const BLOCK_RADIUS: f32 = 6.0;
+const BLOCK_RADIUS: f32 = 3.0;
 
 /// A closed polyline tracing `rect` with rounded corners, for dashing along.
 ///
@@ -2974,7 +2991,7 @@ fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
     let h = chip_h(ui);
     let rect = egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
+        .corner_radius(ROUND_CHIP)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(h);
@@ -3097,13 +3114,27 @@ fn block_row(
         let inner = ui.horizontal_top(|ui| {
             ui.add_space(row.depth as f32 * INDENT_STEP);
             match row.kind {
+                // Drawn in `dim`, not `accent`: this row is the one thing in the
+                // flow that is *not* in the file. It exists so there is
+                // somewhere to drop a first statement and somewhere for the
+                // top of the report to be. Giving it a keyword's colour made it
+                // look like syntax — users reasonably asked whether `BEGIN` was
+                // a word they had to write, and it isn't (the grammar has `END`,
+                // but no opening keyword at all). So it stays sentence case,
+                // stays translated, and reads as a caption.
                 RowKind::Begin => static_chip(
                     ui,
                     &th,
                     app.strings.report_node_begin,
-                    th.accent,
+                    th.dim,
                     s.chip_help_begin,
                 ),
+                // Deliberately the literal, untranslated "END": unlike the
+                // `Begin` row above, this one is not an editor invention. It
+                // renders a real `END` keyword that the parser requires and
+                // that the Source view shows verbatim, so translating or
+                // title-casing it would make the two views disagree about what
+                // is actually in the file.
                 RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent, s.chip_help_end),
                 RowKind::Leaf | RowKind::LoopHead => {
                     let mut chips = node
@@ -3478,8 +3509,7 @@ fn with_block(
     acts: &mut Vec<Act>,
 ) -> egui::Rect {
     let field_indent = (depth as f32 + 1.0) * INDENT_STEP;
-    let fill = mix(th.panel, th.subst, 0.22);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.5));
+    let tint = chip_tint(th, th.subst);
     ui.vertical(|ui| {
         for (i, item) in items.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -3510,13 +3540,13 @@ fn with_block(
                         }
                     ),
                 };
-                let lbl = chip_shell(ui, fill, stroke, true, ROUND_CHIP, |ui| {
+                let lbl = chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
                     let lbl = ui.add(
-                        egui::Label::new(RichText::new(&text).color(th.subst))
+                        egui::Label::new(RichText::new(&text).color(tint.text))
                             .selectable(false)
                             .sense(egui::Sense::click()),
                     );
-                    if detach_x(ui, th.subst) {
+                    if detach_x(ui, tint.text) {
                         acts.push(Act::RemoveWith {
                             path: path.to_vec(),
                             index: i,
@@ -4092,14 +4122,20 @@ fn header_chip(
     } else {
         th.dim
     };
-    let fill = mix(th.panel, color, 0.18);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.45));
-    let text_col = if unset && spec.required {
+    let mut tint = chip_tint(th, color);
+    if !(unset && spec.required) {
+        // A settings row is chrome, not a category: its rule would otherwise be
+        // a grey bar saying nothing. An *unset required* one keeps its red rule,
+        // where the bar is doing real work — it marks the row blocking the run.
+        tint.rule = None;
+    }
+    tint.text = if unset && spec.required {
         th.err
     } else {
         th.text
     };
     let key = spec.key;
+    let text_col = tint.text;
 
     let combo = matches!(
         spec.kind,
@@ -4109,7 +4145,7 @@ fn header_chip(
     let scope = ui.scope(|ui| {
         // A combo box sets its own (tallest) height; everything else has to be
         // grown to match, exactly as in the flow's chips.
-        chip_shell(ui, fill, stroke, !combo, ROUND_CHIP, |ui| {
+        chip_shell(ui, &tint, !combo, ROUND_CHIP, |ui| {
             // The key label goes on the left, but a combo box is taller than a
             // label and only sets the row height once it has been added — a
             // label placed first would be "centred" in a still-short row and end
@@ -4169,9 +4205,15 @@ fn header_chip(
                 HeaderKind::Path | HeaderKind::Text => {
                     let current = if value == "?" { "" } else { value };
                     let id = ui.make_persistent_id(("pt_hdr_text", key));
-                    if let Some(text) =
-                        inline_text_edit(ui, id, current, s.gui_report_setting_unset, 150.0)
-                        && text != current
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        current,
+                        s.gui_report_setting_unset,
+                        "",
+                        150.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != current
                     {
                         acts.push(Act::SetHeader {
                             key,
@@ -4390,10 +4432,21 @@ fn portable_ref(
 /// Laid out exactly like a depth-0 block row (the same vertical/horizontal
 /// nesting) so it lines up with `BEGIN` rather than sitting at a different
 /// indent.
+/// The closing caption of the whole flow, matching the synthetic `Begin` row at
+/// the top.
+///
+/// Dim, sentence case and translated, exactly like its opening partner and
+/// deliberately *unlike* the uppercase `END` that closes a `FOR` or a `WITH`.
+/// Those are real keywords the parser requires and the Source view prints
+/// verbatim; this one is punctuation the editor draws so the report reads as one
+/// bracketed block, and there is no node behind it to select, move or drop onto.
+/// Two things that look identical but behave completely differently is the worst
+/// of both, so the pair that isn't in the file is the pair that looks like a
+/// caption.
 fn flow_end_row(ui: &mut egui::Ui, th: &GuiTheme, s: &crate::i18n::Strings) {
     ui.vertical(|ui| {
         ui.horizontal_top(|ui| {
-            static_chip(ui, th, s.report_node_end, th.accent, s.chip_help_flow_end);
+            static_chip(ui, th, s.report_node_end, th.dim, s.chip_help_flow_end);
         });
     });
 }
@@ -4483,18 +4536,70 @@ fn chip_h(ui: &egui::Ui) -> f32 {
 /// field) is shorter, so `grow = true` reserves a [`chip_h`]-tall row and
 /// centres the content in it, lifting those chips to exactly the same height as
 /// a combo-box chip. Returns the content closure's value.
+/// Lay out a chip's label as two distinct kinds of word rather than one
+/// undifferentiated run: the editor's own keyword in the UI face, and any
+/// identifier the user supplied in the monospace face.
+///
+/// This is most of what makes a flow skimmable. `BASELINE(staging)` is two
+/// different things joined by punctuation — one is vocabulary the editor
+/// defines, the other is the user's own data — and setting them identically
+/// makes the reader parse the brackets to tell which is which. A face change
+/// does that pre-attentively, and it is the convention every code editor
+/// already teaches, so it needs no explaining.
+///
+/// egui has no bold variant of the default proportional font (only Phosphor is
+/// registered alongside it), so weight is not available as a channel here; face
+/// and the theme's brighter `strong` colour carry the emphasis instead.
+fn chip_label_job(ui: &egui::Ui, text: &str, color: Color32) -> egui::text::LayoutJob {
+    let base = egui::TextStyle::Button.resolve(ui.style());
+    let mono = egui::FontId::new(base.size, egui::FontFamily::Monospace);
+
+    // The keyword runs up to the first bracket or space; everything after it is
+    // the user's. A label with neither is all keyword (`GET`, `PARALLEL`).
+    let split = text.find(['(', ' ']).unwrap_or(text.len());
+    let (keyword, rest) = text.split_at(split);
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut push = |s: &str, font: egui::FontId| {
+        if s.is_empty() {
+            return;
+        }
+        job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color,
+                ..Default::default()
+            },
+        );
+    };
+    push(keyword, base.clone());
+    push(rest, mono);
+    job
+}
+
+/// A chip label, laid out by [`chip_label_job`] and sensing clicks and drags.
+fn chip_label(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let job = chip_label_job(ui, text, color);
+    ui.add(
+        egui::Label::new(job)
+            .selectable(false)
+            .sense(egui::Sense::click_and_drag()),
+    )
+}
+
 fn chip_shell<R>(
     ui: &mut egui::Ui,
-    fill: Color32,
-    stroke: egui::Stroke,
+    tint: &ChipTint,
     grow: bool,
     corners: egui::CornerRadius,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let h = chip_h(ui);
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(stroke)
+    let framed = egui::Frame::NONE
+        .fill(tint.fill)
+        .stroke(tint.stroke)
         .inner_margin(egui::Margin::symmetric(8, 3))
         .corner_radius(corners)
         .show(ui, |ui| {
@@ -4515,31 +4620,116 @@ fn chip_shell<R>(
                 content(ui)
             })
             .inner
-        })
-        .inner
+        });
+    // The category bar, painted after the frame so it sits over the border it
+    // replaces along that edge. It mirrors the chip's own left corner radii and
+    // squares off on the right, so on a tethered pill it stops cleanly at the
+    // seam instead of bulging past it.
+    if let Some(rule) = tint.rule {
+        let rect = framed.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + CHIP_RULE_W, rect.bottom()),
+            ),
+            egui::CornerRadius {
+                nw: corners.nw,
+                sw: corners.sw,
+                ne: 0,
+                se: 0,
+            },
+            rule,
+        );
+    }
+    framed.inner
 }
 
-/// The fill / stroke / text colours for a chip, honouring the selected-base
-/// highlight.
-fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> (Color32, egui::Stroke, Color32) {
-    if chip.is_base && selected {
+/// How strongly a chip's category colour is allowed to show, as blend factors
+/// against the panel colour: the background wash, the border, and how far the
+/// label text is pulled from the ordinary text colour toward the category hue.
+///
+/// These are deliberately one set of constants rather than a literal repeated at
+/// each chip site. A block flow puts five categories on screen at once, and when
+/// the fill, the border *and* the text were all near-full chroma the result read
+/// as coloured building blocks — several professional users called the editor
+/// childish on the strength of it. Quietening the surface while keeping the hue
+/// identifiable is a single judgement about the whole editor, so it is made in
+/// one place and every chip reads from it.
+///
+/// The *hue* per category is untouched (see [`kind_color`]): a `FOR` is the same
+/// colour it always was, just no longer shouted.
+///
+/// The fill and border are now barely tinted at all, because the category is
+/// carried by the rule down the chip's leading edge instead (see [`ChipTint`]).
+/// Spending the whole chip surface on the hue and spending a 3px bar on it say
+/// the same thing, but only one of them fills the window with colour.
+const CHIP_FILL_MIX: f32 = 0.05;
+const CHIP_STROKE_MIX: f32 = 0.16;
+const CHIP_TEXT_MIX: f32 = 0.45;
+
+/// The width of the category rule down a chip's leading edge.
+///
+/// It fits inside [`chip_shell`]'s existing 8px left inner margin, so turning
+/// the rule on cost no reflow: the label sits exactly where it always did, with
+/// 5px of clear space beside the bar.
+const CHIP_RULE_W: f32 = 3.0;
+
+/// How a chip is coloured: a near-neutral surface plus a full-strength category
+/// bar down its leading edge.
+///
+/// The bar is the reason the surface can be neutral. Colour used as a *fill*
+/// scales with the size of the thing filled, so a flow of blocks became a wall
+/// of colour; the same hue used as a rule is just as identifiable — the eye
+/// scans a column of coloured edges very well — while leaving the chip itself a
+/// quiet card. This is the pattern editors and issue trackers already use for
+/// exactly this reason.
+struct ChipTint {
+    fill: Color32,
+    stroke: egui::Stroke,
+    text: Color32,
+    /// The category bar, or `None` for a chip that shouldn't show one: a
+    /// selected chip (whose fill already carries the selection colour) and the
+    /// hanger of a tethered pair (whose leading edge is *inside* the pill, where
+    /// a bar would read as a divider rather than as a category).
+    rule: Option<Color32>,
+}
+
+/// The colours for a chip of category colour `color`.
+///
+/// Text is blended *from the theme's text colour toward* the category hue rather
+/// than being the hue itself: full-chroma text on a tint of the same hue is both
+/// loud and low-contrast, and the label has to stay comfortably readable — it is
+/// the part that actually says what the block does.
+fn chip_tint(th: &GuiTheme, color: Color32) -> ChipTint {
+    ChipTint {
+        fill: mix(th.panel, color, CHIP_FILL_MIX),
+        stroke: egui::Stroke::new(1.0, mix(th.panel, color, CHIP_STROKE_MIX)),
+        text: mix(th.text, color, CHIP_TEXT_MIX),
+        rule: Some(color),
+    }
+}
+
+/// The colours for a chip, honouring the selected-base highlight.
+fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
+    let mut tint = if chip.is_base && selected {
         // Keep the stroke *width* identical to the unselected state (only the
         // colour and fill change): a thicker stroke would expand the frame by a
         // pixel and shift the chip and its neighbours, so selecting a block
         // would visibly nudge it. Selection must recolour in place, never
         // resize or move.
-        (
-            th.select_bg,
-            egui::Stroke::new(1.0, th.select_fg),
-            th.select_fg,
-        )
+        ChipTint {
+            fill: th.select_bg,
+            stroke: egui::Stroke::new(1.0, th.select_fg),
+            text: th.select_fg,
+            rule: None,
+        }
     } else {
-        (
-            mix(th.panel, chip.color, 0.22),
-            egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5)),
-            chip.color,
-        )
+        chip_tint(th, chip.color)
+    };
+    if chip.join_prev {
+        tint.rule = None;
     }
+    tint
 }
 
 /// A small frameless `×` button. Returns whether it was clicked. Kept separate
@@ -4554,20 +4744,52 @@ fn detach_x(ui: &mut egui::Ui, col: Color32) -> bool {
     .clicked()
 }
 
+/// The width to give an inline field so its current value actually fits.
+///
+/// The fields used to be fixed-width, which meant anything longer than the
+/// guess — most real folder paths, and any alias longer than a word — was
+/// silently cut off, with no indication that the box held more than it showed.
+/// Measuring instead means a field is as wide as what is in it, clamped so a
+/// long path can't push the rest of the row off screen (past `max` the box
+/// scrolls, as before, but now only in the genuinely long cases).
+fn fitted_field_width(ui: &egui::Ui, text: &str, hint: &str, min: f32, max: f32) -> f32 {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    // Measure the hint too, so an *empty* box is still wide enough to show its
+    // placeholder rather than clipping it.
+    let measure = |t: &str| {
+        ui.painter()
+            .layout_no_wrap(t.to_string(), font.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    // Room for the text edit's own margin plus the caret sitting after the last
+    // character — without it the caret lands on the border when the box is full.
+    let padding = 12.0;
+    (measure(text).max(measure(hint)) + padding).clamp(min, max)
+}
+
 /// An inline single-line text field that commits on blur. The in-progress buffer
 /// lives in egui temp memory keyed by `id` (so it survives across frames while
 /// focused) and is dropped once committed / idle, keeping the field synced to
 /// the AST. Returns `Some(trimmed value)` on the frame focus is lost.
+///
+/// `hint` is the placeholder shown inside the empty box and must stay short
+/// enough to fit it; `help` is the full explanation, shown on hover. These were
+/// once the same string, so a field's entire explanation was crammed into a
+/// box a few characters wide and read as "Only files ...".
 fn inline_text_edit(
     ui: &mut egui::Ui,
     id: egui::Id,
     current: &str,
     hint: &str,
-    width: f32,
+    help: &str,
+    min_width: f32,
+    max_width: f32,
 ) -> Option<String> {
     let mut buf = ui
         .data(|d| d.get_temp::<String>(id))
         .unwrap_or_else(|| current.to_string());
+    let width = fitted_field_width(ui, &buf, hint, min_width, max_width);
     let resp = ui.add(
         egui::TextEdit::singleline(&mut buf)
             .hint_text(hint)
@@ -4575,8 +4797,19 @@ fn inline_text_edit(
             // for its button, so an inline field (the AS alias) doesn't read as
             // a darker, sunken box beside them.
             .background_color(ui.visuals().widgets.inactive.weak_bg_fill)
+            // Monospace for the same reason the identifier half of a chip label
+            // is (see `chip_label_job`): what goes in here is the user's own
+            // name for something, not the editor's vocabulary, and the two
+            // should not look alike. It also stops an alias and the keyword
+            // beside it from reading as one phrase.
+            .font(egui::TextStyle::Monospace)
             .desired_width(width),
     );
+    // Only when not being typed into: a tooltip popping up under the cursor
+    // while the user is editing is in the way of the thing they're editing.
+    if !help.is_empty() && !resp.has_focus() {
+        resp.clone().on_hover_text(help);
+    }
     if resp.lost_focus() {
         ui.data_mut(|d| d.remove::<String>(id));
         Some(buf.trim().to_string())
@@ -4591,11 +4824,12 @@ fn inline_text_edit(
 
 /// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
 fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32, help: &str) {
-    let fill = mix(th.panel, color, 0.22);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.5));
+    let tint = chip_tint(th, color);
+    let text_col = tint.text;
     let scope = ui.scope(|ui| {
-        chip_shell(ui, fill, stroke, true, ROUND_CHIP, |ui| {
-            ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+        chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
+            let job = chip_label_job(ui, text, text_col);
+            ui.add(egui::Label::new(job).selectable(false));
         });
     });
     if !help.is_empty() && ui.ctx().dragged_id().is_none() {
@@ -4781,15 +5015,12 @@ fn render_chip_body(
         _ => {}
     }
 
-    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
-    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
+    let tint = chip_colors(th, chip, selected);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         // The label is the drag/select handle, kept separate from the `×`
         // button so the button's click is never stolen by the drag sense.
-        let handle = ui.add(
-            egui::Label::new(RichText::new(&chip.text).color(text_col))
-                .selectable(false)
-                .sense(egui::Sense::click_and_drag()),
-        );
+        let handle = chip_label(ui, &chip.text, text_col);
         if let Some(which) = chip.detach
             && detach_x(ui, text_col)
         {
@@ -4856,17 +5087,24 @@ fn alias_chip(
     current: &str,
     acts: &mut Vec<Act>,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, false);
-    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("AS").color(text_col))
                 .selectable(false)
                 .sense(egui::Sense::click_and_drag()),
         );
         let id = ui.make_persistent_id(("pt_alias", path));
-        if let Some(text) =
-            inline_text_edit(ui, id, current, s.gui_report_alias_hint, ALIAS_FIELD_WIDTH)
-            && text != current
+        if let Some(text) = inline_text_edit(
+            ui,
+            id,
+            current,
+            s.gui_report_alias_hint,
+            "",
+            ALIAS_FIELD_WIDTH,
+            FIELD_MAX_WIDTH,
+        ) && text != current
         {
             acts.push(Act::SetAlias {
                 path: path.to_vec(),
@@ -4911,8 +5149,9 @@ fn loop_chip(
     l: &LoopEdit,
     acts: &mut Vec<Act>,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, false);
-    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         // `FOR` is the drag/select handle, kept apart from the boxes beside it
         // so a click meant for a field never starts a drag of the row.
         let handle = ui.add(
@@ -4922,7 +5161,15 @@ fn loop_chip(
         );
         if let Some(var) = &l.var {
             let id = ui.make_persistent_id(("pt_loop_var", path));
-            let resp = inline_text_edit(ui, id, var, s.chip_help_loop_var, LOOP_VAR_FIELD_WIDTH);
+            let resp = inline_text_edit(
+                ui,
+                id,
+                var,
+                s.gui_report_loop_var_hint,
+                s.chip_help_loop_var,
+                LOOP_VAR_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
             if let Some(text) = resp
                 && &text != var
             {
@@ -4939,7 +5186,15 @@ fn loop_chip(
         );
         if let Some((dir, is_file)) = &l.dir {
             let id = ui.make_persistent_id(("pt_loop_dir", path));
-            let resp = inline_text_edit(ui, id, dir, s.chip_help_loop_dir, LOOP_PATH_FIELD_WIDTH);
+            let resp = inline_text_edit(
+                ui,
+                id,
+                dir,
+                s.gui_report_loop_dir_hint,
+                s.chip_help_loop_dir,
+                LOOP_PATH_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
             if let Some(text) = resp
                 && &text != dir
             {
@@ -4948,14 +5203,23 @@ fn loop_chip(
                     text,
                 });
             }
-            if ui
+            // Framed, not flat. Drawn without a frame this read as an icon
+            // printed on the chip rather than as something to press, and users
+            // reported not realising a folder picker was there at all. The
+            // frame gives it egui's normal hover fill, and the pointing-hand
+            // cursor confirms it before the click.
+            let pick = ui
                 .add(
                     egui::Button::new(RichText::new(super::icons::FOLDER).color(text_col))
-                        .frame(false),
+                        .min_size(egui::vec2(PICKER_BUTTON_WIDTH, 0.0)),
                 )
-                .on_hover_text(s.chip_help_loop_dir)
-                .clicked()
-            {
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if *is_file {
+                    s.chip_help_loop_pick_file
+                } else {
+                    s.chip_help_loop_pick_folder
+                });
+            if pick.clicked() {
                 acts.push(Act::PickLoopDir {
                     path: path.to_vec(),
                     file: *is_file,
@@ -4963,13 +5227,25 @@ fn loop_chip(
             }
         }
         if let Some(glob) = &l.glob {
+            // The keyword carries the same explanation as the box beside it:
+            // "MATCH" alone says nothing to someone meeting it for the first
+            // time, and it is the word their eye lands on first.
             ui.add(
                 egui::Label::new(RichText::new("MATCH").color(text_col))
                     .selectable(false)
                     .sense(egui::Sense::hover()),
-            );
+            )
+            .on_hover_text(s.chip_help_loop_glob);
             let id = ui.make_persistent_id(("pt_loop_glob", path));
-            let resp = inline_text_edit(ui, id, glob, s.chip_help_loop_glob, LOOP_GLOB_FIELD_WIDTH);
+            let resp = inline_text_edit(
+                ui,
+                id,
+                glob,
+                s.gui_report_loop_glob_hint,
+                s.chip_help_loop_glob,
+                LOOP_GLOB_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
             if let Some(text) = resp
                 && &text != glob
             {
@@ -5003,9 +5279,10 @@ fn parallel_chip(
     current: Option<u32>,
     acts: &mut Vec<Act>,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, false);
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
     let shown = current.map(|n| n.to_string()).unwrap_or_default();
-    let handle = chip_shell(ui, fill, stroke, true, chip_corners(chip), |ui| {
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("PARALLEL").color(text_col))
                 .selectable(false)
@@ -5017,7 +5294,9 @@ fn parallel_chip(
             id,
             &shown,
             s.node_form_parallel_degree,
+            "",
             PARALLEL_FIELD_WIDTH,
+            FIELD_MAX_WIDTH,
         ) && text != shown
         {
             let degree = match text.trim() {
@@ -5067,12 +5346,13 @@ fn combo_chip(
     acts: &mut Vec<Act>,
     make_act: impl FnOnce(String) -> Act,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
+    let tint = chip_colors(th, chip, selected);
+    let text_col = tint.text;
     let mut picked: Option<String> = None;
     let mut detached: Option<DetachWhich> = None;
     // A combo box already renders at the tallest chip height, so this chip does
     // not grow its row (which would only inflate the combo box further).
-    let handle = chip_shell(ui, fill, stroke, false, chip_corners(chip), |ui| {
+    let handle = chip_shell(ui, &tint, false, chip_corners(chip), |ui| {
         // The keyword prefix is the interactive handle (drag to reorder, click
         // to select, double-click to open the wizard). It must be added *before*
         // the combo (so it sits on the left), but the combo is taller and only
@@ -5199,7 +5479,7 @@ fn palette_panel(
         .fill(th.raised())
         .stroke(egui::Stroke::new(1.0, th.accent))
         .inner_margin(8)
-        .corner_radius(6)
+        .corner_radius(BLOCK_RADIUS as u8)
         .show(ui, |ui| {
             let pick_request = ed.palette.as_ref().and_then(|p| p.pick_request);
             ui.horizontal(|ui| {
@@ -5599,6 +5879,338 @@ fn save_report(ed: &mut ReportEditor, app: &mut GuiApp) {
 mod tests {
     use super::*;
     use crate::i18n::{Language, Strings};
+
+    /// The relative luminance of a colour, per WCAG 2.1.
+    fn luminance(c: Color32) -> f64 {
+        let ch = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    /// The WCAG contrast ratio between two colours (1.0 = identical, 21.0 = the
+    /// most any pair can manage).
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (hi, lo) = {
+            let (x, y) = (luminance(a), luminance(b));
+            if x > y { (x, y) } else { (y, x) }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// A chip's label must stay comfortably readable on its own tint, in every
+    /// theme.
+    ///
+    /// This guards the change that quietened the blocks: the label colour is now
+    /// blended from the theme text colour toward the category hue rather than
+    /// being the hue itself, which is what makes the tinting safe to keep. Full
+    /// chroma text on a tint of the same hue used to fall as low as 2.3:1 for
+    /// `accent` chips on the English preset — text a user with ordinary eyesight
+    /// has to lean in to read. Anyone tempted to turn the colour back up will
+    /// trip this rather than find out from a customer.
+    ///
+    /// 4.5:1 is WCAG AA for body text. Checked against every built-in preset,
+    /// since a preset is a set of arbitrary RGB triples and a new one could
+    /// easily be picked that reads well in isolation but not behind a chip.
+    #[test]
+    fn every_chip_categorys_label_is_readable_on_its_own_tint_in_every_theme() {
+        for spec in crate::theme::builtin_presets() {
+            let th = GuiTheme::from_spec(&spec);
+            for kind in [
+                NodeKind::Request,
+                NodeKind::ReportRequest,
+                NodeKind::ReportVar,
+                NodeKind::ReportComputed,
+                NodeKind::Assign,
+                NodeKind::ForFiles,
+                NodeKind::ForFolders,
+                NodeKind::ForEnvs,
+                NodeKind::List,
+            ] {
+                let color = kind_color(kind, &th);
+                let tint = chip_tint(&th, color);
+                let ratio = contrast(tint.text, tint.fill);
+                assert!(
+                    ratio >= 4.5,
+                    "{} chip {kind:?}: label contrast {ratio:.2} is below WCAG AA",
+                    spec.name
+                );
+            }
+            // The error colour never comes from `kind_color` but is used for
+            // unset required settings — the one thing standing between the
+            // report and a run, so of all of them it must be legible.
+            let tint = chip_tint(&th, th.err);
+            assert!(
+                contrast(tint.text, tint.fill) >= 4.5,
+                "{} error chip",
+                spec.name
+            );
+        }
+    }
+
+    /// Categories are still told apart by colour, so quietening the chips must
+    /// not have quietened them into each other.
+    ///
+    /// Checked on the *rule* rather than the fill, because the rule is now where
+    /// the category lives: the surface is deliberately near-neutral, so fills
+    /// that were once far apart are now all within a few points of the panel
+    /// colour and would make this assertion meaningless.
+    #[test]
+    fn the_chip_categories_remain_visually_distinct_from_one_another() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let kinds = [
+            NodeKind::Request,
+            NodeKind::ReportVar,
+            NodeKind::Assign,
+            NodeKind::List,
+        ];
+        let rules: Vec<Color32> = kinds
+            .into_iter()
+            .map(|k| {
+                chip_tint(&th, kind_color(k, &th))
+                    .rule
+                    .expect("a category chip shows a rule")
+            })
+            .collect();
+        let labels: Vec<Color32> = kinds
+            .into_iter()
+            .map(|k| chip_tint(&th, kind_color(k, &th)).text)
+            .collect();
+        for channel in [&rules, &labels] {
+            for (i, a) in channel.iter().enumerate() {
+                for b in &channel[i + 1..] {
+                    let dist = (a.r() as i32 - b.r() as i32).abs()
+                        + (a.g() as i32 - b.g() as i32).abs()
+                        + (a.b() as i32 - b.b() as i32).abs();
+                    assert!(
+                        dist > 40,
+                        "two categories came out too close to tell apart: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The category rule is the full-strength hue, not a tint of it.
+    ///
+    /// The whole trade in moving the category from the fill to the rule is that
+    /// a *small* area can afford *full* chroma. Tinting the bar as well would
+    /// give up the identifiability the neutral surface was bought with, and
+    /// would do it invisibly — the editor would just slowly become grey.
+    #[test]
+    fn the_category_rule_carries_the_hue_at_full_strength() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        for kind in [NodeKind::Request, NodeKind::Assign, NodeKind::List] {
+            let color = kind_color(kind, &th);
+            let tint = chip_tint(&th, color);
+            assert_eq!(tint.rule, Some(color), "{kind:?} rule is the category hue");
+            // ...while the surface it sits on stays close to the panel.
+            let from_panel = (tint.fill.r() as i32 - th.panel.r() as i32).abs()
+                + (tint.fill.g() as i32 - th.panel.g() as i32).abs()
+                + (tint.fill.b() as i32 - th.panel.b() as i32).abs();
+            assert!(
+                from_panel < 60,
+                "{kind:?} chip fill drifted away from the panel colour ({from_panel})"
+            );
+        }
+    }
+
+    /// A selected chip and the hanger of a tethered pair show no rule.
+    ///
+    /// The first because its fill already carries the selection colour, and a
+    /// category bar inside it competes with that; the second because the
+    /// hanger's leading edge is the *seam* of a two-part pill, where a coloured
+    /// bar reads as a divider rather than as a category.
+    #[test]
+    fn chips_that_should_not_show_a_rule_do_not() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+
+        let mut chip = Chip::base("GET".to_string(), th.accent);
+        assert!(
+            chip_colors(&th, &chip, false).rule.is_some(),
+            "an ordinary base chip shows its category"
+        );
+        assert!(
+            chip_colors(&th, &chip, true).rule.is_none(),
+            "a selected chip drops the rule"
+        );
+
+        chip.join_prev = true;
+        assert!(
+            chip_colors(&th, &chip, false).rule.is_none(),
+            "the hanger of a tethered pair drops the rule"
+        );
+    }
+
+    /// The text of one laid-out section, for the label-face test below.
+    fn section_text(job: &egui::text::LayoutJob, i: usize) -> &str {
+        let r = &job.sections[i].byte_range;
+        &job.text[usize::from(r.start)..usize::from(r.end)]
+    }
+
+    /// A chip label is set as two runs — the editor's keyword and the user's
+    /// identifier — in two different faces.
+    ///
+    /// The split is what stops `BASELINE(staging)` reading as one word, so it is
+    /// worth pinning: a future label built with a different separator would
+    /// otherwise silently fall back to one undifferentiated run.
+    #[test]
+    fn a_chip_label_sets_the_keyword_and_the_identifier_in_different_faces() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            {
+                let col = Color32::WHITE;
+
+                let job = chip_label_job(ui, "BASELINE(staging)", col);
+                assert_eq!(job.sections.len(), 2, "keyword and identifier");
+                assert_eq!(section_text(&job, 0), "BASELINE");
+                assert_eq!(section_text(&job, 1), "(staging)");
+                assert_eq!(
+                    job.sections[1].format.font_id.family,
+                    egui::FontFamily::Monospace,
+                    "the user's own name is set in the monospace face"
+                );
+                assert_ne!(
+                    job.sections[0].format.font_id.family,
+                    egui::FontFamily::Monospace,
+                    "the keyword stays in the UI face"
+                );
+
+                // `REQUEST orders` splits on the space just the same.
+                let job = chip_label_job(ui, "REQUEST orders", col);
+                assert_eq!(section_text(&job, 0), "REQUEST");
+                assert_eq!(
+                    job.sections[1].format.font_id.family,
+                    egui::FontFamily::Monospace
+                );
+
+                // A bare keyword is a single run and stays in the UI face.
+                let job = chip_label_job(ui, "PARALLEL", col);
+                assert_eq!(job.sections.len(), 1);
+                assert_ne!(
+                    job.sections[0].format.font_id.family,
+                    egui::FontFamily::Monospace
+                );
+            }
+        });
+    }
+
+    /// The two synthetic sentinels are drawn as a matched pair, and neither is
+    /// dressed as a keyword.
+    ///
+    /// `Begin` and the flow's closing `End` are editor punctuation: no node
+    /// backs them, and nothing in the report file corresponds to them. The
+    /// uppercase `END` that closes a `FOR` or a `WITH` *is* in the file. Users
+    /// asked whether `BEGIN` was a word they had to write — it isn't — so the
+    /// two kinds must not look alike.
+    #[test]
+    fn the_synthetic_sentinels_are_captions_not_keywords() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&Language::English);
+
+        // Sentence case and translated, so they can never be mistaken for the
+        // literal keyword.
+        assert_ne!(s.report_node_begin, "BEGIN");
+        assert_ne!(s.report_node_end, "END");
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            assert_ne!(
+                s.report_node_end, "END",
+                "the synthetic end must not collide with the real keyword"
+            );
+        }
+
+        // ...and drawn in the dim colour rather than the keyword accent.
+        assert_ne!(
+            th.dim, th.accent,
+            "the test below is only meaningful if the two colours differ"
+        );
+    }
+
+    /// An inline field is as wide as what is in it, within bounds.
+    ///
+    /// Fixed widths were the reason aliases and folder paths appeared cut off
+    /// with nothing to say there was more text: the box simply ended. The clamp
+    /// matters as much as the growth — an unbounded field would let one deep
+    /// path push the rest of a loop head off the side of the pane.
+    #[test]
+    fn an_inline_field_grows_to_fit_its_value_but_not_without_limit() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let min = LOOP_PATH_FIELD_WIDTH;
+
+            let empty = fitted_field_width(ui, "", "", min, FIELD_MAX_WIDTH);
+            assert_eq!(empty, min, "an empty field rests at its minimum");
+
+            let short = fitted_field_width(ui, "envs", "", min, FIELD_MAX_WIDTH);
+            assert_eq!(short, min, "a value that already fits doesn't shrink it");
+
+            let long = fitted_field_width(
+                ui,
+                "reports/2026/quarterly/regional-breakdowns",
+                "",
+                min,
+                FIELD_MAX_WIDTH,
+            );
+            assert!(
+                long > min,
+                "a value wider than the box widens it ({long} vs {min})"
+            );
+
+            let absurd = fitted_field_width(ui, &"x".repeat(500), "", min, FIELD_MAX_WIDTH);
+            assert_eq!(
+                absurd, FIELD_MAX_WIDTH,
+                "growth stops at the cap rather than running off the pane"
+            );
+
+            // An empty box still has to show its own placeholder.
+            let hinted = fitted_field_width(ui, "", "*.json", 10.0, FIELD_MAX_WIDTH);
+            assert!(hinted > 10.0, "an empty field makes room for its hint");
+        });
+    }
+
+    /// The boxes' placeholders are short enough to actually fit them, and the
+    /// long explanations are kept separate.
+    ///
+    /// These were once the same string, so a field a few characters wide was
+    /// given a full sentence as its placeholder and rendered it as "Only files
+    /// ..." — which is what prompted this. Checked in every language, since a
+    /// translation is exactly where a "short" label quietly stops being short.
+    #[test]
+    fn a_fields_placeholder_is_short_and_its_explanation_is_not_the_same_string() {
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            for hint in [
+                s.gui_report_loop_var_hint,
+                s.gui_report_loop_dir_hint,
+                s.gui_report_loop_glob_hint,
+                s.gui_report_alias_hint,
+            ] {
+                assert!(
+                    hint.chars().count() <= 12,
+                    "{lang:?}: placeholder {hint:?} is too long to fit its box"
+                );
+            }
+            assert_ne!(
+                s.gui_report_loop_glob_hint, s.chip_help_loop_glob,
+                "{lang:?}: the placeholder must not be the explanation"
+            );
+            // The explanation, by contrast, has room to actually explain.
+            assert!(
+                s.chip_help_loop_glob.chars().count() > 40,
+                "{lang:?}: the MATCH explanation should say what a pattern is"
+            );
+            assert!(
+                s.chip_help_loop_pick_folder != s.chip_help_loop_dir,
+                "{lang:?}: the picker button explains itself, not the box"
+            );
+        }
+    }
 
     /// The Source view's colouring is the terminal UI's, span for span.
     ///

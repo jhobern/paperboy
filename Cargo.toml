@@ -77,9 +77,10 @@ egui_extras = { version = "0.35", optional = true }
 # render as empty "tofu" boxes on many systems), so we register the Phosphor
 # icon set at startup and draw all GUI icons from it — guaranteed to render
 # regardless of the host's installed fonts. `default-features = false` +
-# `regular` bundles only the one weight we use.
+# `light` bundles only the one weight we use — see `gui::app::GuiApp::new` for
+# why it's the light one, and `gui::icons` for why only one can be registered.
 egui-phosphor = { version = "0.13", default-features = false, optional = true, features = [
-    "regular",
+    "light",
 ] }
 # PNG decoding for the application/window icon and the status-bar logo. Already
 # in the tree transitively (egui image support); declared directly so we can

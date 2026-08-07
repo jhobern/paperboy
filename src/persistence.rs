@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::collection::Collection;
+use crate::env_panel::EnvSource;
 use crate::environment::{Environment, PendingSecret, parse_vars_pending};
 use crate::git_remote::GitOrigin;
 use crate::hurl::HurlEntry;
@@ -550,6 +551,10 @@ pub struct PersistedState {
     /// Environment, if any.
     #[serde(default)]
     pub active_global_env: Option<usize>,
+    /// Which source(s) the Environments panel lists. Shared by both front-ends
+    /// because they share the same row model and saved state file.
+    #[serde(default)]
+    pub env_source: EnvSource,
     /// GUI-only window/panel geometry and last-open view (see [`GuiLayout`]).
     /// Ignored by the terminal UI, which round-trips it untouched so using one
     /// front-end never discards the other's layout.
@@ -592,6 +597,7 @@ impl Default for PersistedState {
             active_theme: None,
             global_envs: Vec::new(),
             active_global_env: None,
+            env_source: EnvSource::Both,
             gui: GuiLayout::default(),
         }
     }

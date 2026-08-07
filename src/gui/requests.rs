@@ -345,6 +345,10 @@ enum WsAction {
         path: PathBuf,
         reveal: bool,
     },
+    /// Make a workspace environment file the active one, loading it first if it
+    /// isn't open yet — the whole point being to activate it without having to
+    /// open it and then find it again in the Environments panel.
+    ActivateEnv(PathBuf),
     /// Add a new collection/report/environment to the workspace, inside `dir`.
     NewItem {
         dir: PathBuf,
@@ -461,13 +465,14 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         )
     };
 
-    let (lbl_new, tip_new, lbl_in_folder, lbl_in_root) = {
+    let (lbl_new, tip_new, lbl_in_folder, lbl_in_root, lbl_set_active_env) = {
         let s = &app.strings;
         (
             s.gui_ws_new,
             s.gui_ws_new_tooltip,
             s.gui_ws_new_in_folder,
             s.gui_ws_new_in_root,
+            s.gui_ws_set_active_env,
         )
     };
     let s_new = new_item_labels(&app.strings);
@@ -733,7 +738,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 reveal: resp.double_clicked(),
                             });
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let hit = ui.button(lbl_set_active_env).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::ActivateEnv(path.clone()))
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
                 }
@@ -1085,7 +1101,27 @@ fn ws_row_menu(
     labels: NewItemLabels,
     actions: &mut Vec<WsAction>,
 ) {
+    ws_row_menu_with(resp, dir, header, labels, actions, |_| None);
+}
+
+/// [`ws_row_menu`] plus row-specific entries above the shared "New …" ones.
+///
+/// A row can only carry one context menu, so anything extra has to be built
+/// into the same closure rather than attached separately.
+fn ws_row_menu_with(
+    resp: &egui::Response,
+    dir: PathBuf,
+    header: &'static str,
+    labels: NewItemLabels,
+    actions: &mut Vec<WsAction>,
+    extra: impl FnOnce(&mut egui::Ui) -> Option<WsAction>,
+) {
     resp.context_menu(|ui| {
+        let mut extra = Some(extra);
+        if let Some(action) = extra.take().and_then(|f| f(ui)) {
+            actions.push(action);
+            ui.close();
+        }
         ui.label(header);
         ui.separator();
         if let Some(kind) = new_item_menu(ui, labels) {
@@ -1110,7 +1146,8 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             collection: path, ..
         }
         | WsAction::OpenReport(path)
-        | WsAction::OpenEnv { path, .. } => {
+        | WsAction::OpenEnv { path, .. }
+        | WsAction::ActivateEnv(path) => {
             app.session.collections[ci].workspace_selected = Some(path.clone());
         }
         // Opening or closing a folder isn't "working on" anything; a new or
@@ -1201,12 +1238,68 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             app.report_editor = None;
             app.session.save();
         }
+        // Activating a file that isn't open yet has to open it first. An
+        // already-open one is reused rather than loaded again, so activating
+        // twice can't leave two copies of the same file in the panel — and
+        // `set_active_env` is a toggle, so re-activating the active one turns
+        // substitution off, exactly as the Environments panel's button does.
+        WsAction::ActivateEnv(path) => {
+            let existing = app
+                .session
+                .global_envs
+                .iter()
+                .find(|e| e.path.as_deref() == Some(path.as_path()))
+                .map(|e| e.id);
+            let id = match existing {
+                Some(id) => Some(id),
+                None => app.session.open_workspace_environment(&path),
+            };
+            if id.is_some() {
+                // `set_active_env` is a toggle, so an already-active
+                // environment would be *deactivated* by it — not what "Set as
+                // active" asks for.
+                if app.session.active_env_id != id {
+                    app.session.set_active_env(id);
+                }
+                app.reveal_env = id;
+            }
+            app.session.save();
+        }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Right-clicking a workspace environment file offers making it the active
+    /// environment. The menu itself is egui-driven, so what's checked here is
+    /// the action it raises: loading the file if needed and activating it,
+    /// without the toggle behaviour that would *deactivate* an already-active
+    /// one.
+    #[test]
+    fn activating_a_workspace_environment_from_the_tree_loads_it_and_makes_it_active() {
+        let dir = ws_tmp("activate");
+        let env = dir.join("api/v1/dev.vars");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        apply_ws_action(&mut app, ci, WsAction::ActivateEnv(env.clone()));
+
+        assert_eq!(app.session.global_envs.len(), 1, "the file was loaded");
+        let id = app.session.global_envs[0].id;
+        assert_eq!(app.session.active_env_id, Some(id));
+        assert_eq!(app.reveal_env, Some(id), "and it is shown in the panel");
+
+        // Again: neither a second copy nor a deactivation.
+        apply_ws_action(&mut app, ci, WsAction::ActivateEnv(env));
+        assert_eq!(app.session.global_envs.len(), 1);
+        assert_eq!(app.session.active_env_id, Some(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Collect the text of every id-clash complaint egui painted this frame.
     ///
@@ -1246,7 +1339,7 @@ pub(crate) mod tests {
         // every row's width, and layout is exactly what decides whether two
         // widgets end up sharing an id at different rects.
         let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
         ctx.set_fonts(fonts);
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(

@@ -26,6 +26,11 @@ use tui_panel_select::wrapcache::TextPos;
 /// Marks a collection/environment title as loaded from git — shown before the
 /// name whenever `Collection::git_origin` / `env_git_origin` is set.
 pub(crate) const GIT_ICON: &str = "\u{2387}";
+/// Marks an Environments panel row as coming from the open Workspace folder,
+/// as opposed to an environment loaded from anywhere else. Deliberately a
+/// single-cell BMP glyph (⌂) rather than a folder emoji — see the note on
+/// [`SHADOW_ICON`] about terminals giving emoji double-cell width.
+pub(crate) const WORKSPACE_ICON: &str = "\u{2302}";
 /// Joins a collection tab to its linked Global Environment's sub-tab in the
 /// tab bar (see `draw_tabs`).
 pub(crate) const LINK_ICON: &str = "\u{1F517}";
@@ -2094,16 +2099,53 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // The activate/deactivate hint lives on this panel's bottom border (same
     // convention as the Requests list's Run/Run All hint) since it acts on
     // whichever row is selected here, regardless of which pane has focus.
-    let activate_hint = format!("a {}", s.foot_env_activate);
-    let block = panel(s.env_heading.to_string(), focused, th)
+    let activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
+    let source = app.effective_env_source();
+    let source_label = match source {
+        crate::env_panel::EnvSource::Both => s.env_source_both,
+        crate::env_panel::EnvSource::Global => s.env_source_global,
+        crate::env_panel::EnvSource::Workspace => s.env_source_workspace,
+    };
+    let title = if app.has_workspace_env_source() {
+        format!("{} · {}", s.env_heading, source_label)
+    } else {
+        s.env_heading.to_string()
+    };
+    let block = panel(title, focused, th)
         .title_bottom(Line::styled(activate_hint, Style::default().fg(th.dim)));
-    if app.global_envs.is_empty() {
-        let p = Paragraph::new(vec![
-            Line::styled(s.env_no_envs.to_string(), Style::default().fg(th.dim)),
-            Line::styled(
+    let rows = app.env_rows();
+    if rows.is_empty() {
+        let all_rows =
+            crate::env_panel::rows(&app.global_envs, &app.workspace_env_files(), "", source);
+        let any_rows = crate::env_panel::rows(
+            &app.global_envs,
+            &app.workspace_env_files(),
+            "",
+            crate::env_panel::EnvSource::Both,
+        );
+        // There are now three empty states with different fixes: load or create
+        // any environment, switch the source toggle, or clear/narrow the text
+        // filter. Say which one applies rather than sending the user to the
+        // wrong control.
+        let (first, hint) = if any_rows.is_empty() {
+            (
+                s.env_no_envs.to_string(),
                 format!("{} \u{2192} {}", s.file_menu, s.load_environment),
-                Style::default().fg(th.dim),
-            ),
+            )
+        } else if all_rows.is_empty() {
+            (
+                format!("{}{}", s.env_source_label, source_label),
+                s.env_source_no_matches.to_string(),
+            )
+        } else {
+            (
+                format!("{}{}", s.env_filter_label, app.env_query),
+                s.env_filter_no_matches.to_string(),
+            )
+        };
+        let p = Paragraph::new(vec![
+            Line::styled(first, Style::default().fg(th.dim)),
+            Line::styled(hint, Style::default().fg(th.dim)),
         ])
         .block(block)
         .wrap(Wrap { trim: false });
@@ -2121,28 +2163,36 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         );
         return;
     }
-    let sel = app
-        .global_env_idx
-        .min(app.global_envs.len().saturating_sub(1));
+    // An active filter takes a one-line strip below the list, so it's obvious
+    // the list is being narrowed (and by what) rather than mysteriously short —
+    // the same treatment the file browser's and Help's filters get.
+    let show_source_strip =
+        app.has_workspace_env_source() && source != crate::env_panel::EnvSource::Both;
+    let (list_area, filter_area) =
+        if app.env_query.is_empty() && !app.env_filter_typing && !show_source_strip {
+            (area, None)
+        } else {
+            let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+            (parts[0], Some(parts[1]))
+        };
+    let sel = app.global_env_idx.min(rows.len().saturating_sub(1));
     // Columns available for the name text (after the border, the leftmost
     // pencil column and the active-marker column). The selected row is shown
     // highlighted rather than with a leftmost caret, so no column is reserved
     // for one. Used to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2);
+    let text_w = list_area.width.saturating_sub(2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
-    let sel_len = app
-        .global_envs
-        .get(sel)
-        .map(|e| e.name.chars().count())
-        .unwrap_or(0);
+    let sel_len = rows.get(sel).map(|r| r.name.chars().count()).unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((text_w as usize).saturating_sub(1));
     let hscroll = (app.global_env_hscroll as usize).min(max_scroll);
-    let items: Vec<ListItem> = app
-        .global_envs
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, env)| {
-            let is_active = app.active_env_id == Some(env.id);
+        .map(|(i, row)| {
+            let env = row
+                .env_id()
+                .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
+            let is_active = row.env_id().is_some() && app.active_env_id == row.env_id();
             // Active: green name + a checkmark marker; git origin shows the
             // same ⎇ icon convention used elsewhere.
             let (marker, marker_fg) = if is_active {
@@ -2150,20 +2200,35 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             } else {
                 ("  ", th.dim)
             };
-            let name_color = if is_active { th.ok } else { th.text };
+            // A workspace environment that hasn't been opened yet is dimmed:
+            // it is a file the panel is offering, not something loaded that
+            // could be activated or edited until Enter opens it.
+            let name_color = if is_active {
+                th.ok
+            } else if env.is_none() {
+                th.dim
+            } else {
+                th.text
+            };
             let selected = i == sel;
             let mark_fg = if selected { th.bg } else { marker_fg };
             // A pencil in the leftmost column flags an environment with unsaved
             // (added or modified) variables — placed left of the name so it
             // matches the Requests list's modified/added marker convention
             // (and stays put rather than trailing a scrolling name).
-            let (pencil, pencil_fg) = if app.changed_env_count(env.id) > 0 {
+            let dirty = env.is_some_and(|e| app.changed_env_count(e.id) > 0);
+            let (pencil, pencil_fg) = if dirty {
                 ("\u{270e} ", th.accent)
             } else {
                 ("  ", th.dim)
             };
             let pencil_fg = if selected { th.bg } else { pencil_fg };
-            let git_prefix = if env.git_origin.is_some() {
+            // The two sources this panel merges are told apart by a leading
+            // icon: ⌂ for "from the open workspace folder", ⎇ for "from a git
+            // remote". A plain loaded environment gets neither.
+            let prefix = if row.workspace {
+                format!("{WORKSPACE_ICON} ")
+            } else if env.is_some_and(|e| e.git_origin.is_some()) {
                 format!("{GIT_ICON} ")
             } else {
                 String::new()
@@ -2172,7 +2237,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
                 Span::styled(pencil, Style::default().fg(pencil_fg)),
                 Span::styled(marker, Style::default().fg(mark_fg)),
             ];
-            let full = format!("{git_prefix}{}", env.name);
+            let full = format!("{prefix}{}", row.name);
             if selected {
                 // Same truncate-with-arrow-hints convention as the Requests
                 // list / entries popup: scroll the whole name so a very long
@@ -2205,12 +2270,39 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
     let mut st = ListState::default();
     st.select(Some(sel));
-    f.render_stateful_widget(list, area, &mut st);
+    f.render_stateful_widget(list, list_area, &mut st);
+    if let Some(strip) = filter_area {
+        // While typing, a block cursor marks where the next character lands —
+        // the strip is the only thing with focus, so without it there is no
+        // sign the keyboard is being captured.
+        let mut spans = vec![
+            Span::styled(s.env_source_label, Style::default().fg(th.dim)),
+            Span::styled(source_label, Style::default().fg(th.accent)),
+            Span::raw("  "),
+            Span::styled(s.env_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                app.env_query.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if app.env_filter_typing {
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+            strip,
+        );
+    }
     let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        x: list_area.x.saturating_add(1),
+        y: list_area.y.saturating_add(1),
+        width: list_area.width.saturating_sub(2),
+        height: list_area.height.saturating_sub(2),
     };
     app.push_mouse_hit(
         MouseLayer::Base,
@@ -2224,7 +2316,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     );
     let first = st.offset();
     let visible = inner.height as usize;
-    for row in first..app.global_envs.len().min(first + visible) {
+    for row in first..rows.len().min(first + visible) {
         app.push_mouse_hit(
             MouseLayer::Base,
             Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
@@ -3678,6 +3770,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("^r (Env popup)", s.help_revert_env),
                             ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
+                            (
+                                "a / right-click (workspace, List pane)",
+                                s.help_env_activate_workspace,
+                            ),
+                            ("/", s.help_env_filter),
+                            ("o", s.help_env_source),
                             ("x", s.help_env_delete),
                             ("u (Env panel)", s.help_env_reopen),
                             ("p (List pane)", s.help_env_link),

@@ -12,12 +12,9 @@ use ratatui_explorer::{
 };
 
 use crate::collection::Collection;
-use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, METHODS};
 use crate::i18n::{Language, Status, Strings};
-use crate::persistence::{
-    self, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState, PersistedTab,
-};
+use crate::persistence::{self, PendingWorkspaceReload, PersistedReport, PersistedState};
 use crate::request::{self, AppVars, build_request_json};
 
 use super::app::*;
@@ -111,6 +108,17 @@ impl TuiApp {
                 self.last_mouse_row = None;
             }
             self.on_mouse_raw_text_editor(ev);
+            return;
+        }
+        // A right-click on an environment — either a Workspace tree's
+        // environment file, or a row of the Environments panel — makes it the
+        // active one. A terminal has nowhere sensible to hang a context menu,
+        // so the one useful entry the GUI's menu offers is bound directly to
+        // the gesture instead.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Right))
+            && self.overlay.is_none()
+            && self.right_click_activate_env(point)
+        {
             return;
         }
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
@@ -388,7 +396,7 @@ impl TuiApp {
                 }
             }
             MouseScrollTarget::GlobalEnv => {
-                let len = self.global_envs.len();
+                let len = self.env_rows().len();
                 if len > 0 {
                     let next = (self.global_env_idx as i32 + dir).clamp(0, len as i32 - 1) as usize;
                     self.select_row_in_pane(Pane::GlobalEnv, next);
@@ -1451,12 +1459,29 @@ impl TuiApp {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Type-to-filter for the Global Environments panel, opened with `/`.
+        // It has to swallow keys as a mode rather than filtering on any
+        // keypress the way the file browser does: this panel binds bare letters
+        // to actions (`a` activate, `x` delete, `u` undo, `q` quit), so typing
+        // a name here without a mode would fire half of them. Handled before
+        // the main match for the same reason.
+        if self.env_filter_typing && self.on_key_env_filter(key, ctrl, alt) {
+            return;
+        }
         match key.code {
             // Esc dismisses every active mouse text selection first (the
             // active one and any additional Alt+Click+Drag regions), so
             // nothing lingers highlighted; only takes effect when there is
             // at least one, so it doesn't shadow any other key's behaviour.
             KeyCode::Esc if self.has_any_selection() => self.clear_selections(),
+            // Esc on the Environments panel clears an applied filter. Enter
+            // leaves the filter box with the filter still on (so the narrowed
+            // list can be navigated), and without this there'd be no way back
+            // to the full list short of backspacing the query out.
+            KeyCode::Esc if self.focus == Pane::GlobalEnv && !self.env_query.is_empty() => {
+                self.env_query.clear();
+                self.clamp_env_selection();
+            }
             // `y` (vim-style "yank") copies to the clipboard on demand — an
             // explicit fallback for terminals where the automatic
             // copy-on-mouse-release OSC 52 write isn't picked up (e.g. no
@@ -1514,6 +1539,17 @@ impl TuiApp {
             // deleted environment (mirroring how `x` deletes one there).
             KeyCode::Char('u') if self.focus == Pane::GlobalEnv => self.restore_deleted_env(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
+            // `s` would be mnemonic for "source" but is already the global
+            // Settings menu. `o` is deliberately scoped to the Environments
+            // panel and cycles the row origin filter without stealing a common
+            // app-wide shortcut.
+            KeyCode::Char('o') if self.focus == Pane::GlobalEnv => {
+                if self.has_workspace_env_source() {
+                    self.env_source = self.env_source.next();
+                    self.clamp_env_selection();
+                    self.save_state();
+                }
+            }
             // Ctrl+Shift+Left/Right reorders the active tab (index 0, the
             // built-in Request tab, never moves).
             KeyCode::Left if ctrl && shift => self.move_active_tab(false),
@@ -1531,6 +1567,14 @@ impl TuiApp {
                 self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // `/` starts filtering the Global Environments panel by name. It
+            // also focuses the panel, so it works as "find me an environment"
+            // from wherever you are rather than only once the panel is focused
+            // — with hundreds of environments that is the whole point of it.
+            KeyCode::Char('/') => {
+                self.focus = Pane::GlobalEnv;
+                self.env_filter_typing = true;
+            }
             // Shift+R opens a brand-new PaperTrail report tab (report tabs live
             // after the collection tabs in the same strip). In a Workspace tab
             // it instead opens the new-report folder browser, seeded to the
@@ -1591,8 +1635,8 @@ impl TuiApp {
             // Environment; elsewhere it renames the active tab. The panel arm
             // is listed first so it wins when that panel is focused (otherwise
             // the tab-rename shortcut would shadow it).
-            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                if let Some(env_id) = self.global_envs.get(self.global_env_idx).map(|e| e.id) {
+            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.env_rows().is_empty() => {
+                if let Some(env_id) = self.selected_env_id() {
                     self.open_prompt_rename_env(env_id);
                 }
             }
@@ -1602,15 +1646,19 @@ impl TuiApp {
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
             // Guarded by the confirm-on-delete-env preference; when it's off,
-            // delete straight away (still undoable with `u`).
-            KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                if self.confirm_on_delete_env {
-                    self.overlay = Some(Overlay::Confirm {
-                        action: ConfirmAction::DeleteEnv(self.global_env_idx),
-                        sel: 1,
-                    });
-                } else {
-                    self.delete_global_env(self.global_env_idx);
+            // delete straight away (still undoable with `u`). A workspace file
+            // that isn't loaded has nothing to delete — the panel lists it, but
+            // `x` is not a way to delete files off disk.
+            KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.env_rows().is_empty() => {
+                if let Some(idx) = self.selected_env_index() {
+                    if self.confirm_on_delete_env {
+                        self.overlay = Some(Overlay::Confirm {
+                            action: ConfirmAction::DeleteEnv(idx),
+                            sel: 1,
+                        });
+                    } else {
+                        self.delete_global_env(idx);
+                    }
                 }
             }
             KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
@@ -1622,8 +1670,24 @@ impl TuiApp {
             KeyCode::Char('c') if self.focus == Pane::List => self.start_workspace_transfer(false),
             // 'a' toggles activation of the selected Global Environment (at
             // most one may be active — activating one deactivates any other).
+            // On an unopened workspace file it loads the file first: activating
+            // it is exactly what you'd want next, and it's what Enter would
+            // have had to do anyway.
             KeyCode::Char('a') if self.focus == Pane::GlobalEnv => {
-                self.toggle_activate_env(self.global_env_idx);
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                if let Some(idx) = self.selected_env_index() {
+                    self.toggle_activate_env(idx);
+                }
+            }
+            // 'a' on a Workspace tree's environment file makes it the active
+            // environment — the terminal's answer to the GUI's right-click →
+            // "Set as active environment". It loads the file first if it isn't
+            // open yet, so activating one is a single keystroke from the tree
+            // rather than "Enter here, then find it again in the panel".
+            KeyCode::Char('a') if self.focus == Pane::List => {
+                self.activate_selected_workspace_env();
             }
             // 'p' in the Requests list links/unlinks a Global Environment to
             // the active collection.
@@ -1847,9 +1911,8 @@ impl TuiApp {
     /// Global Environments list, clamped the same way as the collections list.
     pub(crate) fn scroll_env_h(&mut self, delta: i32) {
         let len = self
-            .global_envs
-            .get(self.global_env_idx)
-            .map(|e| e.name.chars().count())
+            .selected_env_row()
+            .map(|r| r.name.chars().count())
             .unwrap_or(0);
         self.global_env_hscroll = clamp_hscroll(
             self.global_env_hscroll,
@@ -1857,6 +1920,83 @@ impl TuiApp {
             len,
             self.global_env_scroll_w.get(),
         );
+    }
+
+    /// Keys for the Global Environments panel's `/` filter, while it is
+    /// capturing. Returns `true` when the key was consumed.
+    ///
+    /// Printable characters extend the query and Backspace trims it, both
+    /// re-clamping the selection since the row the cursor was on may no longer
+    /// be there. Enter keeps the filter but hands the keyboard back to the
+    /// list, so the narrowed list can be navigated and acted on; Esc clears the
+    /// filter outright (the way out of a filter you no longer want). Up/Down
+    /// move the selection without leaving the filter, so a name can be typed
+    /// and a match picked in one go. Everything else falls through to the
+    /// panel's normal keys.
+    fn on_key_env_filter(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        match key.code {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                self.env_query.push(c);
+                self.clamp_env_selection();
+            }
+            KeyCode::Backspace => {
+                self.env_query.pop();
+                self.clamp_env_selection();
+            }
+            KeyCode::Esc => {
+                self.env_query.clear();
+                self.env_filter_typing = false;
+                self.clamp_env_selection();
+            }
+            KeyCode::Enter => self.env_filter_typing = false,
+            KeyCode::Up | KeyCode::Down => {
+                let len = self.env_rows().len();
+                if len > 0 {
+                    // Wrap the way the panel's own j/k navigation does.
+                    let cur = self.global_env_idx.min(len - 1) as i32;
+                    let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                    let next = (cur + delta).rem_euclid(len as i32) as usize;
+                    self.select_row_in_pane(Pane::GlobalEnv, next);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keep the Environments panel selection inside the (possibly just
+    /// narrowed) row list, and reset the name's horizontal scroll since the
+    /// selection is now on a different name.
+    fn clamp_env_selection(&mut self) {
+        self.global_env_idx = self
+            .global_env_idx
+            .min(self.env_rows().len().saturating_sub(1));
+        self.global_env_hscroll = 0;
+    }
+
+    /// Load the environment file the Environments panel selection is on, for a
+    /// workspace row that hasn't been opened yet. Leaves the selection on the
+    /// environment it became, so the action that triggered the load (Enter,
+    /// `a`) can go straight on to act on it. A no-op on an already-loaded row.
+    pub(crate) fn load_selected_env_row(&mut self) {
+        let Some(path) = self
+            .selected_env_row()
+            .and_then(|r| r.file().map(PathBuf::from))
+        else {
+            return;
+        };
+        let Some(p) = path.to_str() else {
+            return;
+        };
+        self.do_file_action(FileAction::LoadEnv, p);
+        if let Some(id) = self
+            .global_envs
+            .iter()
+            .find(|e| e.path.as_deref() == Some(path.as_path()))
+            .map(|e| e.id)
+        {
+            self.select_env_row_by_id(id);
+        }
     }
 
     pub(crate) fn panes(&self) -> Vec<Pane> {
@@ -2325,6 +2465,104 @@ impl TuiApp {
         }
     }
 
+    /// Right-click on a row: if it names an environment — a Workspace tree's
+    /// environment file, or a row of the Environments panel — select it and
+    /// make it active. Returns whether the click was consumed, so any other
+    /// right-click keeps its existing behaviour.
+    fn right_click_activate_env(&mut self, point: Position) -> bool {
+        match self.mouse_hit_at(point) {
+            Some(MouseHitTarget::SelectListRow(row)) => {
+                let ci = self.active_tab;
+                let Some(col) = self.collections.get(ci) else {
+                    return false;
+                };
+                if !col.is_workspace()
+                    || !matches!(
+                        col.ws_rows().into_iter().nth(row),
+                        Some(crate::collection::WsRow::Environment { .. })
+                    )
+                {
+                    return false;
+                }
+                self.select_row_in_pane(Pane::List, row);
+                self.activate_selected_workspace_env();
+                true
+            }
+            // In the panel the row may be a workspace file that isn't open yet;
+            // `a`'s handler already loads one before activating, so reuse it
+            // rather than repeating that logic here.
+            Some(MouseHitTarget::SelectGlobalEnvRow(row)) => {
+                self.select_row_in_pane(Pane::GlobalEnv, row);
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                let Some(idx) = self.selected_env_index() else {
+                    return true;
+                };
+                // "Make this active", not "toggle": right-clicking the active
+                // environment shouldn't turn substitution off.
+                if self.active_env_id != self.global_envs.get(idx).map(|e| e.id) {
+                    self.toggle_activate_env(idx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Make the Workspace tree's selected environment file the active
+    /// environment, loading it if it isn't open yet.
+    ///
+    /// Unlike [`Self::open_workspace_environment`] this doesn't open the
+    /// variables popup: the point of the gesture is to switch environment and
+    /// carry on with the request you were looking at, so nothing takes over the
+    /// screen. Nothing happens on any other kind of row, which keeps `a` from
+    /// doing something surprising elsewhere in the tree.
+    fn activate_selected_workspace_env(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        let Some(crate::collection::WsRow::Environment { path, .. }) = col
+            .is_workspace()
+            .then(|| col.ws_rows().into_iter().nth(col.list_cursor))
+            .flatten()
+        else {
+            return;
+        };
+        // Reuse an already-open copy rather than loading the file twice, which
+        // would leave two rows for one file in the Environments panel.
+        let existing = self
+            .global_envs
+            .iter()
+            .position(|e| e.path.as_deref() == Some(path.as_path()));
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                if let Some(p) = path.to_str() {
+                    self.do_file_action(FileAction::LoadEnv, p);
+                }
+                // A prompt (name collision, say) means the load hasn't happened
+                // yet; activating would act on the wrong environment.
+                if self.overlay.is_some() {
+                    return;
+                }
+                match self
+                    .global_envs
+                    .iter()
+                    .position(|e| e.path.as_deref() == Some(path.as_path()))
+                {
+                    Some(i) => i,
+                    None => return,
+                }
+            }
+        };
+        // `toggle_activate_env` would *deactivate* one that's already active,
+        // which isn't what "make this the active environment" asks for.
+        if self.active_env_id != Some(self.global_envs[idx].id) {
+            self.toggle_activate_env(idx);
+        }
+        self.select_env_row_by_id(self.global_envs[idx].id);
+    }
+
     /// Toggle the Workspace tree's extension filter (`Ctrl+F`): on shows only
     /// the workspace's own file types (`.hurl/.json/.vars/.trail`); off shows
     /// every file. Persisted via `workspace_filter_hurl_json` (shared with the
@@ -2511,7 +2749,7 @@ impl TuiApp {
                 self.select_row_in_pane(Pane::List, step(cur, len, delta));
             }
             Pane::GlobalEnv => {
-                let len = self.global_envs.len();
+                let len = self.env_rows().len();
                 self.select_row_in_pane(Pane::GlobalEnv, step(self.global_env_idx, len, delta));
             }
             Pane::Main => {
@@ -2558,10 +2796,11 @@ impl TuiApp {
                 self.clear_selections();
             }
             Pane::GlobalEnv => {
-                if self.global_envs.is_empty() {
+                let len = self.env_rows().len();
+                if len == 0 {
                     return;
                 }
-                self.global_env_idx = absolute_index.min(self.global_envs.len() - 1);
+                self.global_env_idx = absolute_index.min(len - 1);
                 self.focus = Pane::GlobalEnv;
                 self.global_env_hscroll = 0;
             }
@@ -2623,8 +2862,14 @@ impl TuiApp {
                 // showing that environment's variables (mirrors the old
                 // inline panel's Enter-to-edit-secret behaviour, but scoped
                 // to the popup rather than the collection-embedded panel).
-                if let Some(env) = self.global_envs.get(self.global_env_idx) {
-                    self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env.id)));
+                // A workspace file that isn't open yet is loaded first — the
+                // panel lists the whole workspace, so Enter is how you open
+                // one of them without going back to the tree.
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                if let Some(id) = self.selected_env_id() {
+                    self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(id)));
                 }
             }
             Pane::Main => {
@@ -2916,76 +3161,26 @@ impl TuiApp {
 
     /// Overwrite the current tabs / language / base URL from persisted state.
     /// `collections[0]` always remains the built-in Request tab.
-    pub(crate) fn apply_persisted(&mut self, state: PersistedState) {
-        self.language = state.language;
-        if !state.base_url.trim().is_empty() {
-            self.vars.base_url = state.base_url;
-        }
-        // Restore the global environment list first, gathering every
-        // environment's pending secrets into one batch so restoring several
-        // 1Password-backed environments only prompts for authorization once
-        // in total, not once per environment.
-        let mut pending_groups = Vec::new();
-        let mut global_envs = Vec::with_capacity(state.global_envs.len());
-        for pe in &state.global_envs {
-            let (env, pending) = pe.restore();
-            if !pending.is_empty() {
-                pending_groups.push(PendingEnvSecrets {
-                    env_id: env.id,
-                    pending,
-                });
-            }
-            global_envs.push(env);
-        }
-        self.active_env_id = state
-            .active_global_env
-            .and_then(|idx| global_envs.get(idx))
-            .map(|e| e.id);
-        self.global_envs = global_envs;
-        if !pending_groups.is_empty() {
-            self.pending_env.push(spawn_resolution_many(pending_groups));
-        }
-        if !state.tabs.is_empty() {
-            // Track tabs whose Workspace root vanished entirely since the
-            // last session (see `PersistedTab::into_collection`): a plain
-            // status message for ones with nothing to redownload (a local
-            // folder that was moved/deleted), or queued up for a
-            // redownload-confirm prompt (see `open_next_pending_workspace_reload`)
-            // for ones that are known to have come from git.
-            let mut missing_workspace_name = None;
-            let mut pending_reloads = std::collections::VecDeque::new();
-            let collections = state
-                .tabs
-                .into_iter()
-                .enumerate()
-                .map(|(i, tab)| {
-                    let had_root = tab.workspace_root.is_some();
-                    let name = tab.name.clone();
-                    let linked_env_id = tab
-                        .linked_env_index
-                        .and_then(|idx| self.global_envs.get(idx))
-                        .map(|e| e.id);
-                    let (col, pending_reload) = tab.into_collection(linked_env_id);
-                    if had_root && col.workspace_root.is_none() {
-                        match pending_reload {
-                            Some(reload) => pending_reloads.push_back((i, reload)),
-                            None => missing_workspace_name = Some(name),
-                        }
-                    }
-                    col
-                })
-                .collect();
-            self.collections = collections;
-            if let Some(name) = missing_workspace_name {
-                self.status = Some(Status::WorkspaceFolderMissing(name));
-            }
-            self.pending_workspace_reloads = pending_reloads;
-            self.open_next_pending_workspace_reload();
-        }
-        // Restore report tabs after the collections, then clamp the active tab
-        // against the *unified* tab count (collections + standalone reports).
-        self.reports = state
-            .reports
+    /// Restore from persisted state.
+    ///
+    /// Everything both front-ends share is restored by
+    /// [`Session::apply_persisted`]; what is left here is the terminal UI's own
+    /// view of reports, which it holds as richer
+    /// [`ReportTab`](crate::tui::reports::ReportTab)s than the plain
+    /// `PersistedReport`s the session carries.
+    pub(crate) fn apply_persisted(&mut self, mut state: PersistedState) {
+        // Taken before the session sees it: the session keeps `PersistedReport`s,
+        // but the terminal UI needs to build `ReportTab`s from the same rows, and
+        // cloning a whole report's source text twice for that is wasteful.
+        let persisted_reports = std::mem::take(&mut state.reports);
+        // The session clamps the active tab against *its* tab count, which knows
+        // nothing about the report tabs built below; re-clamp once they exist.
+        let wanted_tab = state.active_tab;
+
+        self.session.apply_persisted(state);
+        self.open_next_pending_workspace_reload();
+
+        self.reports = persisted_reports
             .into_iter()
             .map(|pr| {
                 // Re-link a workspace report to its root if the folder still
@@ -3032,7 +3227,7 @@ impl TuiApp {
                 self.focus_workspace_tree_on_report(ci, &path);
             }
         }
-        self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
+        self.active_tab = wanted_tab.min(self.tab_count().saturating_sub(1));
         // A workspace collection resumes focused on its tree (`Pane::List`, the
         // default), and so does a workspace report shown in the right pane — the
         // single tree keeps driving navigation. Nothing extra to set here (the
@@ -3041,44 +3236,21 @@ impl TuiApp {
         for i in 0..self.reports.len() {
             self.revalidate_report(i);
         }
-        self.last_browse_dir = state
-            .last_browse_dir
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        self.last_env_dir = state
-            .last_env_dir
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        self.confirm_on_exit = state.confirm_on_exit;
-        self.confirm_on_clear = state.confirm_on_clear;
-        self.confirm_on_delete_env = state.confirm_on_delete_env;
-        self.always_save_when_prompted = state.always_save_when_prompted;
-        self.list_width = state.list_width;
-        self.response_pct = state.response_pct;
-        self.recent_git_urls = state.recent_git_urls;
-        self.default_request_view = state.default_request_view;
-        self.run_all_batch_mode = state.run_all_batch_mode;
-        self.custom_themes = state.custom_themes;
-        self.active_theme = state.active_theme;
-        self.gui_layout = state.gui;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
     /// form only, so resolved secrets are never written to disk).
+    /// Snapshot for saving.
+    ///
+    /// Everything the two front-ends share is produced by
+    /// [`Session::to_persisted`] — there is one writer of that schema, so a
+    /// setting added to `Session` is persisted by both without a second edit
+    /// here. Only `reports` is overridden, because the terminal UI holds richer
+    /// [`ReportTab`](crate::tui::reports::ReportTab)s than the plain
+    /// `PersistedReport`s the session carries, and decides which of them are
+    /// worth writing out.
     pub(crate) fn to_persisted(&self) -> PersistedState {
         PersistedState {
-            language: self.language.clone(),
-            base_url: self.vars.base_url.clone(),
-            tabs: self
-                .collections
-                .iter()
-                .map(|c| {
-                    let linked_env_index = c
-                        .linked_env_id
-                        .and_then(|id| self.global_envs.iter().position(|e| e.id == id));
-                    PersistedTab::from_collection(c, linked_env_index)
-                })
-                .collect(),
             // Report tabs are persisted as source-text snapshots (see
             // `PersistedReport`) so an unsaved scratch report survives a restart.
             // Standalone reports and the *shown* embedded report of each
@@ -3105,38 +3277,18 @@ impl TuiApp {
                     pr
                 })
                 .collect(),
-            active_tab: self.active_tab,
-            last_browse_dir: self
-                .last_browse_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            last_env_dir: self
-                .last_env_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            confirm_on_exit: self.confirm_on_exit,
-            confirm_on_clear: self.confirm_on_clear,
-            confirm_on_delete_env: self.confirm_on_delete_env,
-            always_save_when_prompted: self.always_save_when_prompted,
-            list_width: self.list_width,
-            response_pct: self.response_pct,
-            recent_git_urls: self.recent_git_urls.clone(),
-            default_request_view: self.default_request_view,
-            run_all_batch_mode: self.run_all_batch_mode,
-            custom_themes: self.custom_themes.clone(),
-            active_theme: self.active_theme.clone(),
-            global_envs: self
-                .global_envs
-                .iter()
-                .map(PersistedEnv::from_environment)
-                .collect(),
-            gui: self.gui_layout,
-            active_global_env: self
-                .active_env_id
-                .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
+            ..self.session.to_persisted()
         }
     }
 
+    /// Persist the current state.
+    ///
+    /// Note for anyone reaching for [`Session::save`] instead: it exists, and
+    /// `Deref` makes `self.save()` compile, but it would write the session's own
+    /// `PersistedReport`s rather than the terminal UI's `ReportTab`s — silently
+    /// dropping unsaved report edits. Always go through this one. The
+    /// `save_state` name is kept distinct from `save` so the two can't be
+    /// confused at a call site.
     pub(crate) fn save_state(&self) {
         persistence::save_state(&self.to_persisted());
     }

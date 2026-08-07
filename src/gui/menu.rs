@@ -20,9 +20,177 @@ pub struct ThemeEditState {
     pub original_name: String,
 }
 
+// ── Alt-key menu mnemonics ──────────────────────────────────────────────────
+
+/// Keyboard access to the top-level menus, following the convention every
+/// desktop toolkit teaches: `Alt` on its own arms the menu bar and reveals each
+/// menu's mnemonic letter, and the letter then opens that menu. `Alt+F` as a
+/// single chord does the same thing in one go, because that is what most people
+/// who know the pattern actually press.
+///
+/// The underlines only appear while armed. Showing them permanently puts three
+/// pieces of keyboard trivia on screen for the whole session for the benefit of
+/// the one moment someone wants them, which is exactly the sort of chrome the
+/// rest of this restyle removed.
+#[derive(Default)]
+pub struct AltMenus {
+    /// Alt has been pressed and released alone: the bar is armed and a letter
+    /// will open a menu.
+    armed: bool,
+    /// Alt is currently held and nothing else has been pressed with it yet, so
+    /// releasing it now counts as "Alt on its own" rather than as a chord.
+    alt_alone: bool,
+    alt_was_down: bool,
+    /// Each menu's mnemonic and the widget id of its button, collected as the
+    /// bar is drawn. egui ids are deterministic frame to frame, so a letter
+    /// pressed now opens the menu registered on the previous frame.
+    ids: Vec<(char, egui::Id)>,
+}
+
+impl AltMenus {
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Note where a menu button ended up, so a mnemonic can open it.
+    fn register(&mut self, mnemonic: char, id: egui::Id) {
+        self.ids.retain(|(c, _)| *c != mnemonic);
+        self.ids.push((mnemonic, id));
+    }
+
+    fn id_for(&self, c: char) -> Option<egui::Id> {
+        self.ids
+            .iter()
+            .find(|(m, _)| m.eq_ignore_ascii_case(&c))
+            .map(|(_, id)| *id)
+    }
+}
+
+/// The first character of a mnemonic string, upper-cased. The i18n table holds
+/// these as one-character strings so a translator can pick a letter that suits
+/// their language's own words.
+fn mnemonic_char(s: &str) -> Option<char> {
+    s.chars().next().map(|c| c.to_ascii_uppercase())
+}
+
+/// Update the armed state from this frame's input, and open a menu if a
+/// mnemonic was pressed.
+///
+/// Run *before* the buttons are drawn, so opening a menu takes effect on the
+/// same frame the key arrives.
+fn handle_menu_mnemonics(app: &mut GuiApp, ctx: &egui::Context) {
+    // A text field having focus means the letters are being typed into it, not
+    // aimed at the menu bar; arming would swallow them.
+    if ctx.memory(|m| m.focused().is_some()) {
+        app.alt_menus.armed = false;
+        app.alt_menus.alt_alone = false;
+        return;
+    }
+
+    struct Frame {
+        alt_down: bool,
+        escape: bool,
+        // (letter, was Alt held) for each key pressed this frame.
+        pressed: Vec<(char, bool)>,
+    }
+    let f = ctx.input(|i| Frame {
+        alt_down: i.modifiers.alt,
+        escape: i.key_pressed(egui::Key::Escape),
+        pressed: i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => mnemonic_char(key.name()).map(|c| (c, modifiers.alt)),
+                _ => None,
+            })
+            .collect(),
+    });
+
+    // egui reports modifier keys through `modifiers` rather than as key events,
+    // so "was Alt pressed on its own" has to be read from the edges of that flag
+    // plus whether anything else arrived while it was held.
+    if f.alt_down && !app.alt_menus.alt_was_down {
+        app.alt_menus.alt_alone = true;
+    }
+    if !f.pressed.is_empty() {
+        app.alt_menus.alt_alone = false;
+    }
+
+    let mut opened = false;
+    for (c, with_alt) in &f.pressed {
+        // `Alt+F` as a chord, or `F` on its own once armed.
+        if (*with_alt || app.alt_menus.armed)
+            && let Some(id) = app.alt_menus.id_for(*c)
+        {
+            egui::Popup::open_id(ctx, id.with("popup"));
+            opened = true;
+            break;
+        }
+    }
+
+    if opened || f.escape {
+        app.alt_menus.armed = false;
+        app.alt_menus.alt_alone = false;
+    } else if !f.alt_down && app.alt_menus.alt_was_down && app.alt_menus.alt_alone {
+        // Alt pressed and released with nothing in between: toggle, so a second
+        // Alt puts the bar away again.
+        app.alt_menus.armed = !app.alt_menus.armed;
+        app.alt_menus.alt_alone = false;
+    }
+    app.alt_menus.alt_was_down = f.alt_down;
+}
+
+/// A menu title with its mnemonic underlined while the bar is armed.
+///
+/// Falls back to the plain title when the mnemonic doesn't occur in the
+/// translated title at all — a translator is free to pick a letter that isn't in
+/// the word (Danish "Indstillinger" happens to start with its own), and an
+/// underline drawn under the wrong character would be worse than none.
+fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char, armed: bool) -> egui::WidgetText {
+    if !armed {
+        return title.into();
+    }
+    let Some(pos) = title.to_uppercase().find(mnemonic) else {
+        return title.into();
+    };
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let color = ui.visuals().widgets.inactive.fg_stroke.color;
+    let mut job = egui::text::LayoutJob::default();
+    let mut push = |s: &str, underline: bool| {
+        if s.is_empty() {
+            return;
+        }
+        job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                underline: if underline {
+                    egui::Stroke::new(1.0, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                ..Default::default()
+            },
+        );
+    };
+    let end = pos + title[pos..].chars().next().map_or(0, |c| c.len_utf8());
+    push(&title[..pos], false);
+    push(&title[pos..end], true);
+    push(&title[end..], false);
+    job.into()
+}
+
 // ── Menu bar ────────────────────────────────────────────────────────────────
 
 pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
+    handle_menu_mnemonics(app, ui.ctx());
     egui::MenuBar::new().ui(ui, |ui| {
         file_menu(app, ui);
         settings_menu(app, ui);
@@ -42,6 +210,24 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Draw one top-level menu button, registering its mnemonic so `Alt`+letter can
+/// open it and underlining that letter while the bar is armed.
+fn top_menu<R>(
+    app: &mut GuiApp,
+    ui: &mut egui::Ui,
+    title: &str,
+    mnemonic: &str,
+    content: impl FnOnce(&mut GuiApp, &mut egui::Ui) -> R,
+) {
+    let armed = app.alt_menus.is_armed();
+    let Some(m) = mnemonic_char(mnemonic) else {
+        return;
+    };
+    let text = menu_title(ui, title, m, armed);
+    let resp = ui.menu_button(text, |ui| content(app, ui));
+    app.alt_menus.register(m, resp.response.id);
+}
+
 /// The File menu. Grouped into submenus by *verb* (New / Open / Save) rather
 /// than one flat list, because the local and Git variants of each had grown to
 /// a dozen sibling entries where "open" and "save" items were interleaved.
@@ -50,7 +236,8 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
 /// sniffs Postman JSON and Hurl alike, so a second command pointing at exactly
 /// the same loader only made the menu longer.
 fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.menu_button(app.strings.gui_menu_file, |ui| {
+    let (title, mnemonic) = (app.strings.gui_menu_file, app.strings.gui_menu_file_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
         if ui.button(app.strings.gui_new_collection_ellipsis).clicked() {
             app.dialog = Some(Dialog::Prompt {
                 kind: PromptKind::NewCollectionName,
@@ -142,7 +329,11 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.menu_button(app.strings.gui_menu_settings, |ui| {
+    let (title, mnemonic) = (
+        app.strings.gui_menu_settings,
+        app.strings.gui_menu_settings_key,
+    );
+    top_menu(app, ui, title, mnemonic, |app, ui| {
         ui.menu_button(app.strings.gui_language, |ui| {
             for (lang, label) in [
                 (Language::English, "English"),
@@ -257,7 +448,8 @@ fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 fn view_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
-    ui.menu_button(app.strings.gui_menu_view, |ui| {
+    let (title, mnemonic) = (app.strings.gui_menu_view, app.strings.gui_menu_view_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
         if ui
             .radio(!app.show_reports, app.strings.gui_request_response)
             .clicked()
@@ -948,5 +1140,183 @@ fn color_label(s: &Strings, i: usize) -> &'static str {
         8 => s.theme_c_pending,
         9 => s.theme_c_select_bg,
         _ => s.theme_c_select_fg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Language;
+    use crate::session::Session;
+
+    fn app() -> GuiApp {
+        GuiApp::for_test(Session::default())
+    }
+
+    /// Draw the menu bar once with the given input, so mnemonics are registered
+    /// and the key handling runs exactly as it does in the real app.
+    fn frame(app: &mut GuiApp, ctx: &egui::Context, input: egui::RawInput) {
+        let mut input = input;
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(900.0, 600.0),
+        ));
+        let _ = ctx.run_ui(input, |ui| menu_bar(app, ui));
+    }
+
+    fn alt_held() -> egui::RawInput {
+        egui::RawInput {
+            modifiers: egui::Modifiers::ALT,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn menu_mnemonics_are_unique_within_each_language() {
+        // A duplicate would make one of the two menus unreachable from the
+        // keyboard, and silently: the first match wins.
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = crate::i18n::Strings::for_language(&lang);
+            let keys = [
+                s.gui_menu_file_key,
+                s.gui_menu_view_key,
+                s.gui_menu_settings_key,
+            ];
+            for k in keys {
+                assert_eq!(
+                    k.chars().count(),
+                    1,
+                    "{lang:?} mnemonic {k:?} is not a single character"
+                );
+            }
+            let mut seen: Vec<char> = keys.iter().filter_map(|k| mnemonic_char(k)).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(before, seen.len(), "duplicate mnemonic in {lang:?}");
+        }
+    }
+
+    #[test]
+    fn pressing_alt_on_its_own_arms_the_menu_bar_and_a_second_alt_puts_it_away() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        frame(&mut a, &ctx, alt_held());
+        assert!(!a.alt_menus.is_armed(), "arming waits for the release");
+        frame(&mut a, &ctx, egui::RawInput::default());
+        assert!(a.alt_menus.is_armed());
+
+        frame(&mut a, &ctx, alt_held());
+        frame(&mut a, &ctx, egui::RawInput::default());
+        assert!(!a.alt_menus.is_armed());
+    }
+
+    #[test]
+    fn alt_used_as_a_chord_does_not_leave_the_bar_armed() {
+        // Alt+F opens File outright; it must not also leave the bar waiting for
+        // another letter once Alt comes back up.
+        let ctx = egui::Context::default();
+        let mut a = app();
+        frame(&mut a, &ctx, egui::RawInput::default());
+
+        let mut input = alt_held();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT,
+        });
+        frame(&mut a, &ctx, input);
+        frame(&mut a, &ctx, egui::RawInput::default());
+        assert!(!a.alt_menus.is_armed());
+    }
+
+    #[test]
+    fn a_mnemonic_opens_its_menu_both_as_a_chord_and_once_armed() {
+        for chord in [true, false] {
+            let ctx = egui::Context::default();
+            let mut a = app();
+            // One frame to register the buttons: egui ids are only known once
+            // the widgets have been laid out.
+            frame(&mut a, &ctx, egui::RawInput::default());
+            let file = a.alt_menus.id_for('F').expect("File menu registered");
+
+            let mut input = if chord {
+                alt_held()
+            } else {
+                frame(&mut a, &ctx, alt_held());
+                frame(&mut a, &ctx, egui::RawInput::default());
+                assert!(a.alt_menus.is_armed());
+                egui::RawInput::default()
+            };
+            let modifiers = if chord {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            };
+            input.events.push(egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            frame(&mut a, &ctx, input);
+
+            assert!(
+                egui::Popup::is_id_open(&ctx, file.with("popup")),
+                "chord={chord}: File menu should be open"
+            );
+            assert!(!a.alt_menus.is_armed(), "chord={chord}: opening disarms");
+        }
+    }
+
+    #[test]
+    fn escape_cancels_an_armed_menu_bar() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        frame(&mut a, &ctx, alt_held());
+        frame(&mut a, &ctx, egui::RawInput::default());
+        assert!(a.alt_menus.is_armed());
+
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        frame(&mut a, &ctx, input);
+        assert!(!a.alt_menus.is_armed());
+    }
+
+    #[test]
+    fn the_mnemonic_is_underlined_only_while_the_bar_is_armed() {
+        let ctx = egui::Context::default();
+        let underlined = |armed: bool| {
+            let mut found = Vec::new();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let text = menu_title(ui, "Settings", 'S', armed);
+                found = match text {
+                    egui::WidgetText::LayoutJob(job) => job
+                        .sections
+                        .iter()
+                        .filter(|s| s.format.underline != egui::Stroke::NONE)
+                        .map(|s| {
+                            job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)]
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>(),
+                    // A plain string carries no formatting at all, which is the
+                    // unarmed case.
+                    _ => Vec::new(),
+                };
+            });
+            found
+        };
+        assert_eq!(underlined(false), Vec::<String>::new());
+        assert_eq!(underlined(true), vec!["S".to_string()]);
     }
 }

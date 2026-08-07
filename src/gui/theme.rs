@@ -121,8 +121,13 @@ impl GuiTheme {
         // style in place (we force our own colours, so dark/light are identical).
         ctx.all_styles_mut(|style| {
             style.visuals = visuals.clone();
-            style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 4.0);
+            // Deliberately tighter than egui's defaults. Generous padding makes
+            // controls read as large friendly buttons; a tool that professionals
+            // look at all day wants a denser grid, and the extra rows it buys
+            // are worth more than the air. Kept in one place so the whole app
+            // moves together rather than drifting control by control.
+            style.spacing.item_spacing = egui::vec2(5.0, 5.0);
+            style.spacing.button_padding = egui::vec2(7.0, 3.0);
         });
     }
 }

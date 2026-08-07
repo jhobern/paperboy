@@ -266,6 +266,14 @@ strings! {
     env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
+    env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
+    env_source_label => "Source: ", "Source : ", "Kilde: ";
+    env_source_both => "Both", "Les deux", "Begge";
+    env_source_global => "Global", "Global", "Global";
+    env_source_workspace => "Workspace", "Workspace", "Workspace";
+    env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
+    foot_env_filter => "filter", "filtrer", "filtrér";
     env_collision_title => "Environment name already exists", "Ce nom d'environnement existe déjà", "Miljønavnet findes allerede";
     env_collision_replace => "Replace existing", "Remplacer l'existant", "Erstat eksisterende";
     env_collision_keep_both => "Keep both (duplicate name)", "Conserver les deux (nom en double)", "Behold begge (dublet navn)";
@@ -444,6 +452,9 @@ strings! {
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
+    help_env_filter => "filter the environments list by name (Esc clears it)", "filtrer la liste des environnements par nom (Échap l'efface)", "filtrér miljølisten efter navn (Esc rydder det)";
+    help_env_source => "cycle environment source", "changer la source des environnements", "skift miljøkilde";
+    help_env_activate_workspace => "activate the selected workspace environment file", "activer le fichier d'environnement sélectionné de l'espace de travail", "aktivér arbejdsområdets valgte miljøfil";
     help_revert_request => "revert the selected request to its last saved version on disk", "rétablir la requête sélectionnée à sa dernière version enregistrée sur le disque", "gendan den valgte anmodning til dens sidst gemte version på disken";
     help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
@@ -761,6 +772,14 @@ strings! {
     gui_load_vars_tooltip => "Load a .vars file", "Charger un fichier .vars", "Indlæs en .vars-fil";
     gui_new_environment => "New environment", "Nouvel environnement", "Nyt miljø";
     gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
+    gui_env_filter_hint => "Filter environments…", "Filtrer les environnements…", "Filtrér miljøer…";
+    gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
+    gui_env_source_both => "Both", "Les deux", "Begge";
+    gui_env_source_global => "Global", "Global", "Global";
+    gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
+    gui_env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
+    gui_env_open_workspace_tooltip => "In this workspace — click to open and expand it", "Dans cet espace de travail — cliquez pour l'ouvrir et le développer", "I dette arbejdsområde — klik for at åbne og udvide det";
+    gui_ws_set_active_env => "Set as active environment", "Définir comme environnement actif", "Angiv som aktivt miljø";
     gui_active => "Active", "Actif", "Aktiv";
     gui_active_tooltip => "Use this environment for substitution", "Utiliser cet environnement pour la substitution", "Brug dette miljø til substitution";
     gui_linked => "Linked", "Lié", "Tilknyttet";
@@ -787,6 +806,19 @@ strings! {
     gui_menu_file => "File", "Fichier", "Fil";
     gui_menu_view => "View", "Affichage", "Vis";
     gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
+    // The Alt-key mnemonic for each top-level menu: the letter that opens it
+    // after Alt (and the one underlined in its title while Alt is armed).
+    //
+    // Per language, and *not* derived from the first letter of the title,
+    // because the titles are translated and their initials collide: in French,
+    // "Fichier" and... nothing else, but in Danish "Fil" and "Vis" are fine
+    // while a fourth menu could easily clash. Keeping them in the table means a
+    // translator picks a letter that suits their own words (French uses P for
+    // "Paramètres", Danish I for "Indstillinger"), and the uniqueness test
+    // below catches a collision at build time rather than in the field.
+    gui_menu_file_key => "F", "F", "F";
+    gui_menu_view_key => "V", "A", "V";
+    gui_menu_settings_key => "S", "P", "I";
     gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";
     gui_menu_open => "Open", "Ouvrir", "Åbn";
     gui_menu_open_git => "Open from Git", "Ouvrir depuis Git", "Åbn fra Git";
@@ -933,7 +965,17 @@ strings! {
     chip_help_for => "FOR — repeats everything up to its END once per item. Open it to change the loop variable and its source.", "FOR — répète tout jusqu'à son END une fois par élément. Ouvrez-le pour changer la variable de boucle et sa source.", "FOR — gentager alt frem til sit END én gang pr. element. Åbn den for at ændre løkkevariablen og dens kilde.";
     chip_help_loop_var => "The loop variable — the name each item is bound to inside the loop.", "La variable de boucle — le nom auquel chaque élément est lié dans la boucle.", "Løkkevariablen — navnet hvert element bindes til inde i løkken.";
     chip_help_loop_dir => "The folder this loop reads from.", "Le dossier dans lequel cette boucle lit.", "Mappen denne løkke læser fra.";
-    chip_help_loop_glob => "Only files matching this pattern are used, e.g. *.json. Leave it blank for every file.", "Seuls les fichiers correspondant à ce motif sont utilisés, p.\u{a0}ex. *.json. Laissez vide pour tous les fichiers.", "Kun filer, der matcher dette mønster, bruges, f.eks. *.json. Lad det stå tomt for alle filer.";
+    chip_help_loop_glob => "A filename pattern, like *.json or report-*.csv. The loop skips any file whose name doesn't match it. Leave it blank to use every file in the folder.", "Un motif de nom de fichier, comme *.json ou rapport-*.csv. La boucle ignore tout fichier dont le nom n'y correspond pas. Laissez vide pour utiliser tous les fichiers du dossier.", "Et filnavnsmønster, som *.json eller rapport-*.csv. Løkken springer alle filer over, hvis navn ikke matcher. Lad det stå tomt for at bruge alle filer i mappen.";
+    // Short placeholders shown *inside* the empty boxes. Kept to a word or a
+    // literal example: the box is a few characters wide, so the full sentence
+    // (the `chip_help_*` strings above, now shown on hover) only ever appeared
+    // as an unreadable stub like "Only files ...".
+    gui_report_loop_var_hint => "name", "nom", "navn";
+    gui_report_loop_dir_hint => "folder", "dossier", "mappe";
+    gui_report_loop_glob_hint => "*.json", "*.json", "*.json";
+    // The folder/file picker button beside a loop's path box.
+    chip_help_loop_pick_folder => "Browse for the folder to loop over", "Parcourir pour choisir le dossier à parcourir", "Gennemse efter mappen, der skal løbes igennem";
+    chip_help_loop_pick_file => "Browse for the file to read the rows from", "Parcourir pour choisir le fichier dont les lignes seront lues", "Gennemse efter filen, som rækkerne skal læses fra";
     gui_pick_loop_folder => "Choose the folder to loop over", "Choisissez le dossier à parcourir", "Vælg mappen der skal løkkes over";
     gui_pick_loop_file => "Choose the file to loop over", "Choisissez le fichier à parcourir", "Vælg filen der skal løkkes over";
     chip_help_parallel => "PARALLEL — runs the loop's iterations at the same time. Type a number to cap how many run at once; leave it blank to use the default.", "PARALLEL — exécute les itérations de la boucle en même temps. Saisissez un nombre pour limiter combien s'exécutent à la fois ; laissez vide pour la valeur par défaut.", "PARALLEL — kører løkkens gennemløb samtidigt. Skriv et tal for at begrænse hvor mange der kører ad gangen; lad det stå tomt for standarden.";

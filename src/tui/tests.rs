@@ -24,6 +24,18 @@ use tui_panel_select::wrapcache::TextPos;
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL
 /// points at TEST-NET-1 (RFC 5737) so a started request hangs on connect,
 /// keeping `loading == true` deterministically for the assertion.
+/// A default `TuiApp` with a few fields set.
+///
+/// Most of these settings live on the shared [`Session`](crate::session::Session)
+/// rather than on `TuiApp` itself, so they can't be named in a `TuiApp { .. }`
+/// struct literal; a closure keeps the "build one that differs in exactly this"
+/// shape the tests were written in.
+fn app_with(init: impl FnOnce(&mut TuiApp)) -> TuiApp {
+    let mut app = TuiApp::default();
+    init(&mut app);
+    app
+}
+
 fn app_in_main_pane() -> TuiApp {
     let mut app = TuiApp::default();
     let entry = HurlEntry {
@@ -657,10 +669,9 @@ fn deleting_an_environment_asks_for_confirmation_by_default() {
 
 #[test]
 fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
-    let mut app = TuiApp {
-        confirm_on_delete_env: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_delete_env = false;
+    });
     add_empty_global_env(&mut app, "staging");
     app.focus = Pane::GlobalEnv;
     app.global_env_idx = 0;
@@ -679,10 +690,9 @@ fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
 
 #[test]
 fn u_reopens_the_most_recently_deleted_environment() {
-    let mut app = TuiApp {
-        confirm_on_delete_env: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_delete_env = false;
+    });
     add_empty_global_env(&mut app, "alpha");
     add_empty_global_env(&mut app, "bravo");
     app.focus = Pane::GlobalEnv;
@@ -1709,7 +1719,9 @@ fn a_disabled_header_row_renders_its_key_dimmed() {
     // path rather than as the live editor.
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
 
-    let th = super::theme::theme(&Language::English);
+    // Resolve through the app so this stays a test about text-vs-dim rather
+    // than about which palette happens to be the default.
+    let th = app.theme();
     let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
 
     // Enabled: the key text is drawn in the normal text colour.
@@ -2108,10 +2120,9 @@ fn declining_the_clear_confirmation_keeps_requests() {
 
 #[test]
 fn clearing_is_immediate_when_confirmation_is_disabled() {
-    let mut app = TuiApp {
-        confirm_on_clear: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_clear = false;
+    });
     app.collections[0]
         .entries
         .push(HurlEntry::from_fields("r", "GET", "http://h/x", vec![], ""));
@@ -2161,10 +2172,9 @@ fn declining_the_quit_confirmation_stays_open() {
 
 #[test]
 fn q_quits_immediately_when_confirmation_is_disabled() {
-    let mut app = TuiApp {
-        confirm_on_exit: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_exit = false;
+    });
     press(&mut app, KeyCode::Char('q'));
     assert!(app.quit, "q quits directly when confirmation is off");
 }
@@ -2303,12 +2313,11 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
 
 #[test]
 fn settings_survive_closing_all_collections() {
-    let mut app = TuiApp {
-        confirm_on_exit: false,
-        confirm_on_clear: false,
-        language: Language::French,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_exit = false;
+        a.confirm_on_clear = false;
+        a.language = Language::French;
+    });
 
     app.clear_all();
 
@@ -2342,10 +2351,9 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn browser_reopens_in_the_last_used_folder() {
     let dir = temp_dir("reopen");
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
 
     app.open_browser(FileAction::LoadEnv);
     match app.overlay {
@@ -2370,10 +2378,9 @@ fn selecting_a_file_remembers_its_folder() {
     let dir = temp_dir("select");
     std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::LoadEnv); // opens in `dir`: ["../", "staging.vars"]
 
     press(&mut app, KeyCode::Down); // highlight staging.vars
@@ -2390,10 +2397,9 @@ fn selecting_a_file_remembers_its_folder() {
 
 #[test]
 fn last_browse_dir_survives_persistence() {
-    let app = TuiApp {
-        last_browse_dir: Some(PathBuf::from("/some/dir")),
-        ..Default::default()
-    };
+    let app = app_with(|a| {
+        a.last_browse_dir = Some(PathBuf::from("/some/dir"));
+    });
 
     let snapshot = app.to_persisted();
     assert_eq!(snapshot.last_browse_dir.as_deref(), Some("/some/dir"));
@@ -2407,14 +2413,13 @@ fn last_browse_dir_survives_persistence() {
 fn env_picker_prefers_the_last_environment_folder() {
     let env_dir = temp_dir("envfolder");
     let other_dir = temp_dir("otherfolder");
-    let mut app = TuiApp {
+    let mut app = app_with(|app| {
         // A more-recent load of some other file type moved last_browse_dir…
-        last_browse_dir: Some(other_dir.clone()),
+        app.last_browse_dir = Some(other_dir.clone());
         // …but the environment picker should still reopen where the last
         // environment file came from.
-        last_env_dir: Some(env_dir.clone()),
-        ..Default::default()
-    };
+        app.last_env_dir = Some(env_dir.clone());
+    });
 
     app.open_browser(FileAction::LoadEnv);
     match app.overlay {
@@ -2431,10 +2436,9 @@ fn going_up_highlights_the_folder_just_left_so_right_returns() {
     let sub = dir.join("nested");
     std::fs::create_dir_all(&sub).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(sub.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(sub.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside `nested`
 
     // Left goes up to `dir`, and the folder we came from stays highlighted…
@@ -2467,10 +2471,9 @@ fn many_lefts_then_many_rights_return_to_the_starting_folder() {
     let d = c.join("d");
     std::fs::create_dir_all(&d).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(d.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(d.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside d
 
     // Three Lefts climb d → c → b → a.
@@ -2509,10 +2512,9 @@ fn descending_into_a_different_folder_clears_the_retrace_trail() {
     std::fs::create_dir_all(&c).unwrap();
     std::fs::create_dir_all(&z).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(a.join("b")),
-        ..Default::default()
-    };
+    let mut app = app_with(|app| {
+        app.last_browse_dir = Some(a.join("b"));
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside a/b
     press(&mut app, KeyCode::Left); // up to a, trail anchored at a/b
     assert!(app.browser_forward_path.is_some());
@@ -2549,10 +2551,9 @@ fn right_does_not_ascend_through_the_parent_row_but_enter_still_does() {
     let b = a.join("b");
     std::fs::create_dir_all(&b).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(b.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(b.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside b, highlight "../"
 
     // The "../" row is highlighted (index 0). Right must NOT ascend through it,
@@ -2589,10 +2590,9 @@ fn ctrl_r_resets_the_browser_to_the_folder_it_opened_in() {
     let sub = dir.join("nested");
     std::fs::create_dir_all(&sub).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens in `dir`
     assert_eq!(app.browser_origin_dir.as_ref(), Some(&dir));
 
@@ -2619,10 +2619,9 @@ fn selecting_an_env_file_updates_the_env_folder() {
     let dir = temp_dir("selectenv");
     std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::LoadEnv);
     press(&mut app, KeyCode::Down); // highlight staging.vars
     press(&mut app, KeyCode::Enter); // select it
@@ -2637,10 +2636,9 @@ fn selecting_an_env_file_updates_the_env_folder() {
 
 #[test]
 fn last_env_dir_survives_persistence() {
-    let app = TuiApp {
-        last_env_dir: Some(PathBuf::from("/env/dir")),
-        ..Default::default()
-    };
+    let app = app_with(|a| {
+        a.last_env_dir = Some(PathBuf::from("/env/dir"));
+    });
     let snapshot = app.to_persisted();
     assert_eq!(snapshot.last_env_dir.as_deref(), Some("/env/dir"));
 
@@ -4501,6 +4499,8 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_reload_var,
         s.help_env_rename,
         s.help_env_activate,
+        s.help_env_activate_workspace,
+        s.help_env_filter,
         s.help_env_delete,
         s.help_env_reopen,
         s.help_env_link,
@@ -7231,7 +7231,6 @@ fn request_json_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selec
 
 #[test]
 fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlight() {
-    use crate::i18n::Language;
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -7293,7 +7292,7 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
     // the highlight with the app's own explicit selection colour,
     // confined to the response panel.
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let select_bg = super::theme::theme(&Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     let buf = term.backend().buffer();
     let selected_cell = buf.cell((area.x + 2, area.y)).unwrap();
     assert_eq!(
@@ -7772,10 +7771,9 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
 fn main_panel_shows_and_copies_hurl_text_when_the_default_view_is_hurl() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let mut app = TuiApp {
-        default_request_view: RequestView::Hurl,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
@@ -7821,10 +7819,9 @@ fn main_panel_shows_and_copies_hurl_text_when_the_default_view_is_hurl() {
 fn hurl_view_shows_disabled_rows_as_comments() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let mut app = TuiApp {
-        default_request_view: RequestView::Hurl,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
     let ci = app.active_tab;
     let mut entry = HurlEntry {
         method: "GET".into(),
@@ -8360,7 +8357,6 @@ fn shift_arrow_extends_the_selection_and_scrolls_it_into_view() {
 /// without any special-case invalidation logic.
 #[test]
 fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
-    use crate::i18n::Language;
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
@@ -8434,7 +8430,7 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     let area = app.resp_text_area;
     let screen_row = area.y + row as u16 - app.resp_panel.scroll().min(row as u16);
     let cell = buf.cell((area.x + col as u16, screen_row)).unwrap();
-    let select_bg = super::theme::theme(&Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     assert_eq!(
         cell.bg, select_bg,
         "the highlighted cell must follow the character to its new screen position after resize"
@@ -8569,7 +8565,7 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
     // Both regions are actually painted on screen, with the app's own
     // distinct selection colour (not just tracked internally).
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let select_bg = super::theme::theme(&crate::i18n::Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     let buf = term.backend().buffer();
     assert_eq!(
         buf.cell((area.x + 2, area.y)).unwrap().bg,
@@ -8976,10 +8972,9 @@ fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
     }
     std::fs::create_dir_all(dir.join("sub")).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     let names = |app: &TuiApp| -> Vec<String> {
         match &app.overlay {
             Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
@@ -9063,10 +9058,9 @@ fn load_browser_type_to_filter_narrows_by_name() {
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     let names = |app: &TuiApp| -> Vec<String> {
         match &app.overlay {
             Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
@@ -11501,10 +11495,9 @@ fn picking_a_file_restores_the_wizard_with_the_path_and_inferred_content_type() 
     let dir = temp_dir("form_file_pick");
     std::fs::write(dir.join("avatar.png"), b"fake-png").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     open_form_on_file_value(&mut app);
     app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(matches!(app.overlay, Some(Overlay::Browser(..))));
@@ -11539,10 +11532,9 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
     let dir = temp_dir("form_file_cancel");
     std::fs::write(dir.join("avatar.png"), b"fake-png").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     open_form_on_file_value(&mut app);
     for ch in "old-value.png".chars() {
         press(&mut app, KeyCode::Char(ch));
@@ -12947,13 +12939,12 @@ fn editor_multiline_selection_uses_stream_semantics() {
 
 #[test]
 fn opening_the_git_wizard_offers_the_recent_urls_most_recent_first() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => assert_eq!(w.recent, app.recent_git_urls),
@@ -12963,13 +12954,12 @@ fn opening_the_git_wizard_offers_the_recent_urls_most_recent_first() {
 
 #[test]
 fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
 
     // Down (on the URL field) opens the dropdown instead of jumping fields.
@@ -13021,10 +13011,9 @@ fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
 
 #[test]
 fn up_from_the_first_recent_item_closes_the_dropdown() {
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/a.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/a.git".into()];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     press(&mut app, KeyCode::Down); // open dropdown at index 0
     press(&mut app, KeyCode::Up); // back out of the dropdown
@@ -13044,10 +13033,9 @@ fn up_from_the_first_recent_item_closes_the_dropdown() {
 
 #[test]
 fn typing_closes_the_dropdown_and_edits_the_field() {
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/a.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/a.git".into()];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     press(&mut app, KeyCode::Down); // open dropdown
     press(&mut app, KeyCode::Char('x'));
@@ -13076,10 +13064,9 @@ fn typing_closes_the_dropdown_and_edits_the_field() {
 #[test]
 fn completing_a_git_load_remembers_the_url_most_recent_first() {
     use super::editor::Editor;
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/old.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/old.git".into()];
+    });
     let mut w = RemoteWizard::new(RemoteKind::Collection, app.recent_git_urls.clone());
     w.url = Editor::new("https://example.test/new.git", false);
     w.selected_path = Some("api.hurl".into());
@@ -13098,13 +13085,12 @@ fn completing_a_git_load_remembers_the_url_most_recent_first() {
 
 #[test]
 fn reusing_the_same_url_moves_it_to_the_front_without_duplicating() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.remember_git_url("https://example.test/b.git");
     assert_eq!(
         app.recent_git_urls,
@@ -13855,10 +13841,9 @@ fn workspace_temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn space_confirms_the_current_directory_as_a_workspace_root_and_opens_the_picker() {
     let dir = workspace_temp_dir("space_confirm");
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::OpenWorkspace);
 
     press(&mut app, KeyCode::Char(' '));
@@ -17101,7 +17086,7 @@ fn theme_state(app: &TuiApp) -> &super::theme_editor::ThemeEditorState {
 }
 
 #[test]
-fn the_theme_list_starts_with_automatic_then_the_three_presets() {
+fn the_theme_list_starts_with_automatic_then_the_built_in_presets() {
     let app = TuiApp::default();
     let s = crate::i18n::Strings::for_language(&app.language);
     let entries = app.theme_picker_entries(&s);
@@ -17109,11 +17094,12 @@ fn the_theme_list_starts_with_automatic_then_the_three_presets() {
     assert_eq!(
         &entries[1..],
         &[
+            super::theme::PRESET_DEFAULT.to_string(),
             super::theme::PRESET_ENGLISH.to_string(),
             super::theme::PRESET_FRENCH.to_string(),
             super::theme::PRESET_DANISH.to_string(),
         ],
-        "the three presets follow, in language order"
+        "the neutral default leads, then one preset per bundled language"
     );
 }
 
@@ -17121,12 +17107,13 @@ fn the_theme_list_starts_with_automatic_then_the_three_presets() {
 fn selecting_a_preset_in_the_picker_activates_it() {
     let mut app = TuiApp::default();
     assert_eq!(
-        app.active_theme, None,
-        "starts on Automatic (follows language)"
+        app.active_theme.as_deref(),
+        Some(super::theme::PRESET_DEFAULT),
+        "a fresh install starts on the neutral default, not on Automatic"
     );
 
-    open_theme_editor(&mut app);
-    // Automatic(0) -> Britannia(1) -> Parisian Purple(2) -> Dannebrog(3).
+    open_theme_editor(&mut app); // opens on the active theme (Graphite, row 1)
+    // Graphite(1) -> Britannia(2) -> Parisian Purple(3) -> Dannebrog(4).
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
@@ -17136,7 +17123,8 @@ fn selecting_a_preset_in_the_picker_activates_it() {
         "hovering a preset activates it live"
     );
 
-    // Returning to Automatic clears the manual choice.
+    // Walking all the way back up to row 0 clears the manual choice.
+    press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
@@ -17211,9 +17199,10 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
     for c in "Nordic".chars() {
         press(&mut app, KeyCode::Char(c));
     }
-    // Move focus into the base list and pick Dannebrog (Britannia, Parisian,
-    // Dannebrog -> down twice from the first entry).
-    press(&mut app, KeyCode::Down); // Name -> Base (Britannia)
+    // Move focus into the base list and pick Dannebrog (Graphite, Britannia,
+    // Parisian, Dannebrog -> down three times from the first entry).
+    press(&mut app, KeyCode::Down); // Name -> Base (Graphite)
+    press(&mut app, KeyCode::Down); // -> Britannia
     press(&mut app, KeyCode::Down); // -> Parisian Purple
     press(&mut app, KeyCode::Down); // -> Dannebrog
     press(&mut app, KeyCode::Enter);
@@ -17510,7 +17499,11 @@ fn ctrl_d_deletes_a_custom_theme_but_never_a_preset() {
         matches!(app.status, Some(crate::i18n::Status::ThemeCannotDelete)),
         "presets can't be deleted"
     );
-    assert_eq!(app.all_themes().len(), 3, "the three presets remain");
+    assert_eq!(
+        app.all_themes().len(),
+        4,
+        "the built-in presets remain (Graphite plus one per language)"
+    );
 }
 
 #[test]
@@ -17536,8 +17529,25 @@ fn the_new_theme_popup_focus_toggles_between_name_and_base() {
 }
 
 #[test]
+fn a_fresh_install_starts_on_the_neutral_default_theme() {
+    // The language presets are decorative; a tool used at work should open on
+    // something quiet. "Follow language" stays available, it just isn't the
+    // starting point any more.
+    let app = TuiApp::default();
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some(super::theme::PRESET_DEFAULT)
+    );
+    assert_eq!(app.active_theme_spec().name, super::theme::PRESET_DEFAULT);
+}
+
+#[test]
 fn changing_language_follows_the_preset_unless_a_theme_is_set() {
-    let mut app = TuiApp::default();
+    let mut app = app_with(|app| {
+        // A fresh install now starts on the neutral default, so opt in to
+        // "Automatic" explicitly — that is the mode this test is about.
+        app.active_theme = None;
+    });
     assert_eq!(
         app.active_theme_spec().name,
         super::theme::PRESET_ENGLISH,
@@ -23641,7 +23651,8 @@ fn shift_m_moves_the_highlighted_workspace_file_into_the_folder_confirmed_with_s
     cursor_on_ws_row(&mut app, &src);
     // A tab pointing at the file must follow it, or saving would write the
     // file back to where it no longer is.
-    app.collections[app.active_tab].path = Some(src.clone());
+    let tab = app.active_tab;
+    app.collections[tab].path = Some(src.clone());
 
     press(&mut app, KeyCode::Char('M'));
     let Some(Overlay::Browser(action, ex)) = app.overlay.as_ref() else {
@@ -23779,4 +23790,500 @@ fn quitting_warns_about_unsaved_request_edits_even_with_confirmation_off() {
         ),
         "and the answer is asked for in the exit confirmation"
     );
+}
+
+// ── Environments panel: filter box and workspace environments ──────────────
+
+/// A workspace holding environment files, plus a TuiApp with it as the active
+/// tab and the Environments panel focused.
+fn env_panel_workspace(tag: &str, files: &[(&str, &str)]) -> (TuiApp, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("paperboy_envpanel_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, content) in files {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::GlobalEnv;
+    (app, dir)
+}
+
+/// With a workspace open the panel lists its environment files — including ones
+/// never opened — so a folder of them is browsable without hunting through the
+/// tree. Postman `.json` environments count, not just `.vars`.
+#[test]
+fn the_environments_panel_lists_the_open_workspaces_environment_files() {
+    let postman =
+        r#"{"environment":{"name":"Prod AU","values":[{"key":"url","value":"https://x"}]}}"#;
+    let (mut app, dir) = env_panel_workspace(
+        "lists",
+        &[
+            ("dev.vars", "TOKEN=t\n"),
+            ("Prod AU.json", postman),
+            // A Postman *collection* is not an environment and must not show.
+            ("orders.json", r#"{"info":{"name":"o"},"item":[]}"#),
+        ],
+    );
+    add_empty_global_env(&mut app, "hand-made");
+
+    let names: Vec<String> = app.env_rows().iter().map(|r| r.name.clone()).collect();
+    assert!(
+        names.contains(&"dev".to_string()) && names.contains(&"Prod AU".to_string()),
+        "both workspace environment files are listed, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"orders".to_string()),
+        "a Postman collection is not an environment"
+    );
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("hand-made"),
+        "environments from elsewhere follow the workspace's own"
+    );
+    assert!(
+        app.env_rows()
+            .iter()
+            .filter(|r| r.workspace)
+            .all(|r| r.env_id().is_none()),
+        "none of them are loaded yet"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enter on an unopened workspace row loads that file and opens its variables,
+/// so the panel is a way of *opening* a workspace environment, not just a list.
+#[test]
+fn enter_on_an_unopened_workspace_environment_row_loads_it() {
+    let (mut app, dir) = env_panel_workspace("enter", &[("dev.vars", "TOKEN=t\n")]);
+    app.global_env_idx = 0;
+    assert!(app.global_envs.is_empty());
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.global_envs.len(), 1, "the file was loaded");
+    assert_eq!(app.global_envs[0].name, "dev");
+    assert_eq!(
+        app.global_envs[0].path.as_deref(),
+        Some(dir.join("dev.vars").as_path())
+    );
+    let row = app.selected_env_row().unwrap();
+    assert!(
+        row.workspace && row.env_id() == Some(app.global_envs[0].id),
+        "the selection stayed on the row, which is now the loaded environment"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvPopup(_))),
+        "and its variables opened, as Enter on a loaded row does"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The panel lists an opened workspace environment once — as the environment it
+/// became — rather than once as a file and again as a global environment.
+#[test]
+fn an_opened_workspace_environment_is_not_listed_twice() {
+    let (mut app, dir) = env_panel_workspace("once", &[("dev.vars", "TOKEN=t\n")]);
+    press(&mut app, KeyCode::Enter);
+    app.overlay = None;
+
+    let rows = app.env_rows();
+    assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
+    assert!(rows[0].workspace && rows[0].env_id().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/` starts the filter, typing narrows the list, and Enter hands the keyboard
+/// back to the list with the filter still applied.
+#[test]
+fn slash_filters_the_environments_panel_by_name() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Westpac Prod");
+    add_empty_global_env(&mut app, "Westpac NZ Staging");
+    add_empty_global_env(&mut app, "Bendigo Prod");
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert_eq!(
+        app.focus,
+        Pane::GlobalEnv,
+        "`/` finds an environment from wherever you are"
+    );
+    assert!(app.env_filter_typing);
+
+    for c in "staging".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.env_query, "staging");
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["Westpac NZ Staging"],
+        "case-insensitive substring of the name"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.env_filter_typing, "Enter leaves the filter box");
+    assert_eq!(app.env_query, "staging", "but keeps the filter applied");
+}
+
+/// While filtering, the panel's own single-key actions must not fire: typing
+/// "a" into the box cannot be allowed to activate an environment.
+#[test]
+fn typing_a_filter_does_not_trigger_the_panels_letter_actions() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Aegon Staging");
+    let id = only_env_id(&app);
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "aegon".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    assert_eq!(app.env_query, "aegon");
+    assert_eq!(
+        app.active_env_id, None,
+        "`a` typed a letter, it didn't activate"
+    );
+    assert_eq!(app.global_envs.len(), 1, "`x` would have deleted, `q` quit");
+    assert!(!app.quit);
+
+    // Backspace trims, Esc clears the filter and leaves the box.
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.env_query, "aego");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.env_query.is_empty() && !app.env_filter_typing);
+
+    // With the filter gone the panel's keys work again.
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.active_env_id, Some(id));
+}
+
+/// The actions act on the row under the cursor, which is a row of the *filtered*
+/// list — the whole point being that you filter down to one and act on it.
+#[test]
+fn panel_actions_target_the_selected_row_of_the_filtered_list() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Alpha");
+    add_empty_global_env(&mut app, "Target");
+    add_empty_global_env(&mut app, "Zulu");
+    let target = app.global_envs[1].id;
+    app.focus = Pane::GlobalEnv;
+    app.confirm_on_delete_env = false;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "target".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.global_env_idx, 0, "the one match is the only row");
+
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(
+        app.active_env_id,
+        Some(target),
+        "activation followed the filtered selection, not list position 0"
+    );
+
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(
+        app.global_envs
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "Zulu"],
+        "and so did the delete"
+    );
+}
+
+/// A filter that matches nothing must leave the selection somewhere valid, and
+/// clearing it must bring the list back.
+#[test]
+fn a_filter_matching_nothing_empties_the_panel_without_stranding_the_selection() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Alpha");
+    add_empty_global_env(&mut app, "Beta");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 1;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "zzz".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(app.env_rows().is_empty());
+    assert_eq!(
+        app.global_env_idx, 0,
+        "clamped rather than left past the end"
+    );
+    assert_eq!(app.selected_env_row(), None);
+    // Acting on nothing is a no-op, not a panic. Enter also leaves the filter
+    // box, so the Esc below exercises the "clear an applied filter" path rather
+    // than the filter box's own Esc.
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.env_filter_typing);
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        app.env_rows().len(),
+        2,
+        "Esc on the panel clears an applied filter"
+    );
+}
+
+/// `o` narrows the Environments panel by source, and reuses the same clamping
+/// path as the name filter so the cursor never points past the visible rows.
+#[test]
+fn o_cycles_the_environment_source_filter_and_keeps_selection_valid() {
+    let (mut app, dir) = env_panel_workspace(
+        "source",
+        &[("dev.vars", "TOKEN=t\n"), ("prod.vars", "TOKEN=t\n")],
+    );
+    add_empty_global_env(&mut app, "hand-made");
+    app.global_env_idx = 2;
+
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Both);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["dev", "prod", "hand-made"]
+    );
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Global);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["hand-made"]
+    );
+    assert_eq!(app.global_env_idx, 0, "selection was clamped");
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Workspace);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["dev", "prod"]
+    );
+
+    app.env_query = "prod".into();
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["prod"],
+        "source and name filters compose in the TUI too"
+    );
+
+    let snapshot = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.env_source, crate::env_panel::EnvSource::Workspace);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workspace with one `.vars` file, its tree row selected.
+fn workspace_on_env_row(tag: &str) -> (TuiApp, usize, usize, std::path::PathBuf) {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_actenv_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("api.hurl"), "GET https://example.com\n").unwrap();
+    std::fs::write(dir.join("staging.vars"), "BASE=https://staging\n").unwrap();
+    let (mut app, ci) = workspace_app(&dir);
+    app.collections[ci].workspace_auto_prompt_dismissed = true;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let env_idx = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Environment { .. }))
+        .expect("an environment row exists");
+    app.collections[ci].list_cursor = env_idx;
+    (app, ci, env_idx, dir)
+}
+
+/// `a` on a workspace environment file loads it *and* makes it active, so
+/// switching environment from the tree is one keystroke rather than "open it,
+/// then go find it in the Environments panel".
+#[test]
+fn a_on_a_workspace_environment_file_loads_and_activates_it() {
+    let (mut app, _ci, _row, dir) = workspace_on_env_row("key");
+    assert!(app.global_envs.is_empty());
+
+    press(&mut app, KeyCode::Char('a'));
+
+    assert_eq!(app.global_envs.len(), 1);
+    let id = app.global_envs[0].id;
+    assert_eq!(app.active_env_id, Some(id), "and it is now the active one");
+    assert_eq!(
+        app.selected_env_id(),
+        Some(id),
+        "the Environments panel's cursor followed it, so it can be seen"
+    );
+    assert!(
+        app.overlay.is_none(),
+        "activating shouldn't take over the screen the way opening it does"
+    );
+
+    // Pressing it again must not toggle activation back off: the gesture says
+    // "make this active", not "toggle".
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(
+        app.global_envs.len(),
+        1,
+        "nor load a second copy of the file"
+    );
+    assert_eq!(app.active_env_id, Some(id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right-clicking the same row does the same thing — the gesture a GUI user
+/// reaches for, which a terminal has no room to answer with a context menu.
+#[test]
+fn right_clicking_a_workspace_environment_file_activates_it() {
+    let (mut app, ci, env_idx, dir) = workspace_on_env_row("mouse");
+    // Somewhere else, so the click has to move the selection itself.
+    app.collections[ci].list_cursor = 0;
+
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(env_idx));
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.collections[ci].list_cursor, env_idx);
+    assert_eq!(app.global_envs.len(), 1);
+    assert_eq!(app.active_env_id, Some(app.global_envs[0].id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right-clicking anything that isn't an environment file must not activate
+/// anything — the row kinds share a tree, so the guard has to be real.
+#[test]
+fn right_clicking_a_non_environment_row_does_nothing() {
+    let (mut app, ci, _env_idx, dir) = workspace_on_env_row("other");
+    let coll_idx = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Collection { .. }))
+        .expect("a collection row exists");
+
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(coll_idx));
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(app.global_envs.is_empty());
+    assert_eq!(app.active_env_id, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── One state, two front-ends ───────────────────────────────────────────────
+
+/// The terminal UI used to keep its own copy of every shared setting, and its
+/// own hand-written `to_persisted`. The two could — and did — drift: the
+/// Graphite default had to be written into `Session::default` *and*
+/// `TuiApp::default`, and a third place still disagreed.
+///
+/// Comparing the two snapshots as a whole rather than field by field is
+/// deliberate: a setting added to only one of them fails this test without
+/// anyone having to remember to extend it.
+#[test]
+fn both_front_ends_persist_exactly_the_same_shared_state() {
+    let from_tui = TuiApp::default().to_persisted();
+    let from_session = crate::session::Session::default().to_persisted();
+
+    let strip = |state: &crate::persistence::PersistedState| {
+        let mut v = serde_json::to_value(state).unwrap();
+        // Reports are the one field the terminal UI legitimately overrides: it
+        // holds richer `ReportTab`s and chooses which are worth writing out.
+        v.as_object_mut().unwrap().remove("reports");
+        v
+    };
+    assert_eq!(strip(&from_tui), strip(&from_session));
+}
+
+/// A shared preference changed through the terminal UI has to survive the trip
+/// out to `state.json` and back, *and* land in the same session field the GUI
+/// reads — which is the whole point of there being one copy.
+#[test]
+fn a_shared_preference_set_in_the_terminal_ui_round_trips_through_the_session() {
+    let app = app_with(|app| {
+        app.list_width = 51;
+        app.confirm_on_delete_env = false;
+        app.env_source = crate::env_panel::EnvSource::Workspace;
+        app.recent_git_urls = vec!["https://example.invalid/repo.git".to_string()];
+    });
+
+    let mut session = crate::session::Session::default();
+    session.apply_persisted(app.to_persisted());
+
+    assert_eq!(session.list_width, 51);
+    assert!(!session.confirm_on_delete_env);
+    assert_eq!(session.env_source, crate::env_panel::EnvSource::Workspace);
+    assert_eq!(session.recent_git_urls, app.recent_git_urls);
+}
+
+/// The terminal UI has no use for pixel geometry, but it shares one state file
+/// with the GUI, so saving from the terminal must not wipe the window layout.
+/// This used to be a `gui_layout` field on `TuiApp` that nothing ever read;
+/// now it is simply the session's own field, carried for free.
+#[test]
+fn saving_from_the_terminal_ui_preserves_the_guis_window_layout() {
+    let saved = crate::persistence::PersistedState {
+        gui: crate::persistence::GuiLayout {
+            window: Some((1234.0, 900.0)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut app = TuiApp::default();
+    app.apply_persisted(saved);
+
+    assert_eq!(app.to_persisted().gui.window, Some((1234.0, 900.0)));
+}
+
+/// `TuiApp` derefs to its `Session`, which makes `Session::save` reachable as
+/// `self.save()` — and that would persist the session's plain `PersistedReport`s
+/// instead of the terminal UI's `ReportTab`s, quietly losing unsaved report
+/// edits. Nothing may take that route.
+#[test]
+fn the_terminal_ui_never_persists_through_the_sessions_own_save() {
+    for file in ["app.rs", "input.rs", "draw.rs", "remote.rs", "reports.rs"] {
+        let src = std::fs::read_to_string(format!("src/tui/{file}")).unwrap();
+        // Comments are skipped: this rule is itself explained in prose next to
+        // `save_state`, and the explanation names the call it forbids.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            !code.contains("self.save()"),
+            "src/tui/{file} calls Session::save through Deref; use save_state() instead"
+        );
+    }
 }

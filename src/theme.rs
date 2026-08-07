@@ -105,11 +105,42 @@ impl ThemeSpec {
     }
 }
 
+/// The default theme, and the one a fresh install starts on.
+pub(crate) const PRESET_DEFAULT: &str = "Graphite";
 pub(crate) const PRESET_ENGLISH: &str = "Britannia";
 pub(crate) const PRESET_FRENCH: &str = "Parisian Purple";
 pub(crate) const PRESET_DANISH: &str = "Dannebrog";
 
-// English (default): Britannia — royal Union navy, soft claret-rose accent,
+// The default: Graphite — a near-neutral dark grey ground with a single
+// restrained blue accent.
+//
+// The language presets below are decorative: saturated flag colours with a
+// bright yellow selection. They are pleasant, and they stay, but they are not
+// what a tool should open on in an office — professional users read heavily
+// coloured chrome as unserious, and the report editor's blocks (which tint
+// themselves from `accent`, `ok`, `subst` and `pending`) amplify whatever the
+// theme gives them. Graphite keeps every hue distinguishable while spending far
+// less of the screen on colour: the status colours are pulled toward grey, the
+// selection is a quiet slate blue rather than school-bus yellow, and the accent
+// is the only strong hue in the interface.
+fn graphite() -> ThemeSpec {
+    ThemeSpec {
+        name: PRESET_DEFAULT.to_string(),
+        bg: [22, 24, 27],
+        panel: [30, 33, 37],
+        text: [226, 229, 233],
+        dim: [138, 145, 155],
+        accent: [88, 142, 191],
+        ok: [92, 168, 122],
+        err: [201, 96, 92],
+        subst: [110, 168, 178],
+        pending: [200, 154, 74],
+        select_bg: [58, 82, 112],
+        select_fg: [235, 240, 246],
+    }
+}
+
+// English: Britannia — royal Union navy, soft claret-rose accent,
 // parchment cream text (evoking the Union Jack).
 fn britannia() -> ThemeSpec {
     ThemeSpec {
@@ -166,9 +197,21 @@ fn dannebrog() -> ThemeSpec {
     }
 }
 
-/// The built-in presets, in display order (one per bundled language).
+/// The built-in presets, in display order: the default first, then one per
+/// bundled language.
 pub(crate) fn builtin_presets() -> Vec<ThemeSpec> {
-    vec![britannia(), parisian_purple(), dannebrog()]
+    vec![graphite(), britannia(), parisian_purple(), dannebrog()]
+}
+
+/// The theme a fresh install starts on (see [`crate::session::Session::default`]).
+///
+/// Deliberately not the same idea as [`preset_for_language`]: "Follow language"
+/// remains a thing the user can ask for, it just isn't what they get by
+/// default. An existing install keeps whatever it had — a theme is a setting,
+/// and an upgrade that silently repaints someone's editor is its own kind of
+/// unprofessional.
+pub(crate) fn default_preset() -> ThemeSpec {
+    graphite()
 }
 
 /// The preset a language defaults to when the user hasn't chosen a theme.

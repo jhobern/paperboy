@@ -111,9 +111,9 @@ pub fn panel_header(
 /// clips the content to the drag width but still places the neighbouring panel
 /// at the wider content edge — the "black strip" (see [`panel_header`]). We
 /// build the header by hand from a [`egui::collapsing_header::CollapsingState`]
-/// so the label can truncate, reusing egui's rotating-triangle icon and
-/// click-anywhere-to-toggle behaviour. Reused by the request tree, the
-/// environment list and (later) the workspace tree.
+/// so the label can truncate, with the same explicit Phosphor carets the
+/// workspace tree uses and click-anywhere-to-toggle behaviour. Reused by the
+/// request tree, the environment list and (later) the workspace tree.
 pub fn tree_header<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
@@ -140,7 +140,10 @@ pub fn tree_header_marked<R>(
     highlight: Option<egui::Color32>,
     add_body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
-    let id = ui.make_persistent_id(id_salt);
+    // The caller supplies a namespaced, model-derived salt; do not mix in the
+    // current Ui id, because filtered trees can move the same model row between
+    // containers and should still keep its own expansion state.
+    let id = egui::Id::new(id_salt);
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
@@ -153,7 +156,7 @@ pub fn tree_header_marked<R>(
     if force_open && !state.is_open() {
         state.set_open(true);
     }
-    let openness = state.openness(ui.ctx());
+    let open = state.is_open();
 
     // The band has to be painted *under* the row's contents, so reserve a slot
     // in the paint order now and fill it once the row's rect is known.
@@ -164,10 +167,19 @@ pub fn tree_header_marked<R>(
             // Reserve the full row width so short names still toggle across the
             // whole row, then draw the triangle + a truncating label.
             ui.set_min_width(ui.available_width());
-            let icon_w = ui.spacing().icon_width;
-            let (_rect, icon_resp) =
-                ui.allocate_exact_size(egui::vec2(icon_w, icon_w), egui::Sense::hover());
-            egui::collapsing_header::paint_default_icon(ui, openness, &icon_resp);
+            let caret = if open {
+                super::icons::CARET_DOWN
+            } else {
+                super::icons::CARET_RIGHT
+            };
+            // egui's built-in painted triangle is a tiny vector shape, so the
+            // closed state could read as "no affordance" beside the Phosphor
+            // glyphs used by the workspace tree. Text carets keep both trees
+            // visually consistent and use the icon font PaperBoy installs.
+            ui.add_sized(
+                egui::vec2(ui.spacing().icon_width, ui.spacing().interact_size.y),
+                egui::Label::new(caret).selectable(false),
+            );
             ui.add(egui::Label::new(label).truncate().selectable(false));
         })
         .response

@@ -155,6 +155,10 @@ pub struct GuiApp {
     /// row that was clicked is nowhere near the panel that ends up holding it.
     /// Cleared once the panel has had its chance to honour it.
     pub reveal_env: Option<u64>,
+    /// Filter text for the Environments panel's search box (a case-insensitive
+    /// substring of the environment name). Runtime-only, like the terminal
+    /// UI's — a filter is a way of finding something now, not a setting.
+    pub env_query: String,
     /// Report row selected in the reports panel, if the reports view is open.
     pub show_reports: bool,
     /// The open PaperTrail report editor (Scratch-style blocks + source view),
@@ -179,6 +183,8 @@ pub struct GuiApp {
     /// request edits, so the close request that follows isn't intercepted a
     /// second time (which would make the window impossible to close).
     pub(super) allow_close: bool,
+    /// Keyboard access to the top-level menus (Alt, then the mnemonic letter).
+    pub(super) alt_menus: super::menu::AltMenus,
 }
 
 /// The raw PNG bytes of the application logo, embedded at compile time so the
@@ -214,8 +220,15 @@ impl GuiApp {
         // Register the Phosphor icon font so the tree/button icons render (see
         // `gui::icons`). egui's bundled fonts don't cover them, so without this
         // every icon shows as an empty "tofu" box.
+        //
+        // Light rather than Regular: icons repeat down the tree and across every
+        // toolbar, so their stroke weight sets how busy the chrome looks. At
+        // Regular they compete with the labels they sit beside — the eye lands
+        // on the icon first even though the *name* is what the user is looking
+        // for. Light keeps them legible while letting the text lead. Every
+        // variant shares the same codepoints, so `gui::icons` needs no change.
         let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
         cc.egui_ctx.set_fonts(fonts);
 
         // Larger default text so the client reads comfortably as a desktop app.
@@ -238,6 +251,7 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            env_query: String::new(),
             dialog: None,
             theme,
             strings,
@@ -250,6 +264,7 @@ impl GuiApp {
             logo: None,
             layout_dirty: false,
             allow_close: false,
+            alt_menus: Default::default(),
         };
         app.restore_view();
         app.restore_workspace_selection();
@@ -270,6 +285,7 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            env_query: String::new(),
             dialog: None,
             theme,
             strings,
@@ -282,6 +298,7 @@ impl GuiApp {
             logo: None,
             layout_dirty: false,
             allow_close: false,
+            alt_menus: Default::default(),
         }
     }
 

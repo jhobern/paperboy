@@ -12,6 +12,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The Environments panel has a filter box, and shows the open workspace's
+  environments.** With an account's worth of environments loaded, finding the
+  one you want meant scrolling a list of hundreds. The panel now filters by
+  name — `/` in the terminal UI, a box above the list in the GUI — and, when a
+  Workspace tab is open, lists every environment file in that workspace
+  alongside the global ones, marked with a `⌂` (a folder icon in the GUI) so the
+  two can be told apart. Workspace files that haven't been opened yet are listed
+  too, dimmed, and open when you select them, so a folder of environments is
+  browsable without hunting through the tree for each one. In the terminal UI
+  `Esc` clears an applied filter, and Postman `.json` environments are now
+  recognised by the Workspace tree, so they appear as environments rather than
+  as collections.
+
+- **An environment file in a Workspace tree can be made the active environment
+  directly.** Previously it could only be opened, after which it still had to be
+  found again in the Environments panel and activated there. Right-clicking one
+  now offers "Set as active environment" in the GUI, and in the terminal UI both
+  `a` and a right-click on the row do the same — loading the file first if it
+  isn't open yet, reusing it if it is, and leaving the screen where it was.
+
 - **A `FOR` loop's variable, folder and file pattern are now edited on the chip
   itself.** The loop head used to be one long label, which gave no hint that the
   folder it reads from or the name it binds were things you could change — both
@@ -39,7 +59,58 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   showing — and if a file can't be written the quit is called off and the file
   that refused is named, so nothing is lost to a failed save.
 
+- **The Environments panel can be narrowed by source.** When a Workspace holds
+  hundreds of imported environments, hand-made global ones were buried in the
+  same list, and switching the name filter back and forth was a poor substitute
+  for saying which source you wanted. Both front-ends now offer a compact
+  Both/Global/Workspace source toggle that composes with the name filter and
+  remembers the choice across restarts.
+
+- **The GUI's top-level menus can be reached from the keyboard.** Pressing `Alt`
+  on its own arms the menu bar and underlines each menu's mnemonic letter, which
+  then opens that menu; `Alt`+letter as a single chord does the same thing in
+  one keystroke. `Esc`, a second `Alt`, or opening a menu puts the underlines
+  away again. The mnemonics are translated alongside the menu titles rather than
+  derived from them, so each language gets letters that suit its own words
+  (`F`/`V`/`S` in English, `F`/`A`/`P` in French, `F`/`V`/`I` in Danish).
+
 ### Changed
+
+- **The report editor has been restyled to look like a working tool.** The
+  drag-and-drop view is the part of PaperBoy used by people who don't otherwise
+  write code, and several of them reported it looked childish enough that they
+  were reluctant to show it to colleagues. Nothing about how it works has
+  changed — no gesture, command or layout is different — but six things about
+  how it looks are:
+
+  - A block's category is now carried by a colour bar down its leading edge
+    rather than by the fill of the whole block. The hues are unchanged and just
+    as easy to tell apart, but a flow of ten blocks is no longer ten filled
+    panels of colour.
+  - Chip and block corners are much less rounded, and spacing and control
+    padding are tighter throughout the GUI, which fits more of a report on
+    screen.
+  - Chip labels are now set as two kinds of word: the editor's own keywords in
+    the interface font, and names you supplied in a monospace one, so
+    `BASELINE(staging)` no longer reads as a single phrase. Inline fields are
+    monospace for the same reason.
+  - Chip label contrast has been fixed. Category-coloured text on a tint of the
+    same colour fell as low as 2.3:1 in places, which is below the accessibility
+    floor for body text; every category on every built-in theme now passes WCAG
+    AA, and there is a test to keep it that way.
+  - Icons throughout the GUI are drawn in a lighter weight so they stop
+    competing with the labels beside them.
+  - The synthetic row at the top of a flow is drawn as a caption rather than in
+    a keyword's colour. It marks where the report starts and, unlike the `END`
+    that closes a loop, is not something that appears in the file — colouring it
+    like syntax implied there was a `BEGIN` keyword to write, and there isn't.
+
+- **PaperBoy now opens on a neutral dark theme.** The three language themes are
+  saturated flag colours with a bright yellow selection, which look striking and
+  read as unserious in an office. A new "Graphite" preset — a near-neutral grey
+  ground with a single restrained blue accent — is what a fresh install starts
+  on. The language themes remain, "Follow language" remains a choice you can
+  make, and an existing install keeps whatever theme it already had.
 
 - **The Workspace filter no longer hides folders.** With the filter on, a folder
   containing nothing it matched was left out of the tree entirely, which made
@@ -56,7 +127,55 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and hovering either half outlines both. Each chip keeps the colour its own kind
   always has, so a `SHOW` still reads as a `SHOW`.
 
+- **The two front-ends now share one copy of the application state.** The
+  terminal UI kept its own duplicate of everything it had in common with the
+  graphical one — the open tabs, the global environments, the themes and every
+  persisted preference: 26 fields, plus a hand-written second copy of the code
+  that reads and writes `state.json`. The two could drift, and had: a default
+  changed in one place stayed unchanged in the other, and the terminal UI
+  carried a field of the GUI's window geometry that nothing there ever read,
+  purely so saving from the terminal didn't wipe it. `TuiApp` now owns a
+  `Session` and reads straight through it, so there is a single copy in the
+  process and a single writer of the state file. Nothing about either front-end
+  behaves differently, with one exception noted below.
+
+- **A Workspace whose folder has vanished now says so in the GUI too.** The
+  explanation ("the folder for this Workspace is gone") was written when the
+  terminal UI restored a session and was lost when the graphical one did, which
+  left an empty tab and no reason for it. Both front-ends now restore state
+  through the same code, so both report it.
+
 ### Fixed
+
+- **The `FOR` loop's inline fields are no longer cramped or cryptic.** Three
+  small things made loops harder to use than they needed to be. The boxes were
+  fixed-width, so any real folder path or an alias longer than a word was
+  visibly cut off with nothing to indicate there was more; they now grow to fit
+  what's in them, up to a limit that keeps the rest of the statement on screen.
+  The full explanation of a field was being used as the placeholder *inside* it,
+  where it rendered as an unreadable stub — most notably the `MATCH` pattern,
+  which read "Only files ..." — so the boxes now show a short placeholder
+  (`*.json`, `folder`, `name`) and the explanation appears on hover, on both the
+  box and the `MATCH` keyword itself. That explanation has been rewritten to say
+  what the field *is* — a filename pattern, with examples — rather than
+  describing what it filters out. Finally, the folder picker beside the path was
+  drawn without a frame and read as a printed-on icon rather than a button;
+  it now has a proper button frame, a pointing-hand cursor and a tooltip saying
+  what it opens.
+
+- **Environment rows now keep the same expand/collapse shape before and after
+  opening.** Workspace environment files used to be plain dimmed load rows with
+  no disclosure triangle, then silently changed into collapsible rows after
+  being clicked. Every environment row now carries the same right/down caret
+  icons as the Workspace tree, and expanding an unopened workspace environment
+  loads the file and reveals its variables in one gesture.
+
+- **The Response pane's compact view no longer shortens object keys.** It
+  shortened every long quoted string, so a body with descriptive key names came
+  out as rows of `"auth...ifier": "aneh...rucg"` — unreadable, which is the
+  opposite of what an overview is for. Only values are compacted now; a key is
+  left whole however long it is, recognised by the `:` that follows it (with any
+  spacing between). Copying still yields the full, uncompacted text.
 
 - **Postman environments now load at all.** PaperBoy only ever read `.vars`
   files, so a Postman environment export — a JSON document of `key`/`value`

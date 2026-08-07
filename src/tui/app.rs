@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -9,14 +9,12 @@ use ratatui_explorer::FileExplorer;
 
 use crate::collection::Collection;
 use crate::environment::{
-    EnvUpdate, EnvVar, Environment, PendingSecret, looks_like_env, parse_vars_pending,
-    spawn_resolution,
+    EnvVar, Environment, PendingSecret, looks_like_env, parse_vars_pending, spawn_resolution,
 };
 use crate::git_remote::{self, GitOrigin, RefKind};
-use crate::http::ApiResponse;
 use crate::hurl::{FormFieldKind, HurlEntry, RunStatus};
-use crate::i18n::{Language, Status, Strings};
-use crate::request::{self, AppVars, CaptureUpdate, build_request_json};
+use crate::i18n::{Status, Strings};
+use crate::request::{self, build_request_json};
 
 use super::editor::*;
 use super::git_save::*;
@@ -946,10 +944,6 @@ pub(crate) enum ClosedTab {
 }
 
 pub struct TuiApp {
-    pub(crate) language: Language,
-    pub(crate) vars: AppVars,
-    pub(crate) collections: Vec<Collection>,
-    pub(crate) active_tab: usize,
     /// Report tabs (PaperTrail `.trail` documents). *Standalone* reports show in
     /// the same tab bar after the collection tabs — the unified tab index
     /// (`active_tab`) counts collections first, then the standalone reports (see
@@ -960,17 +954,6 @@ pub struct TuiApp {
     /// `active_tab` is that collection index. See [`Self::active_is_report`] and
     /// [`Self::embedded_report_index`].
     pub(crate) reports: Vec<crate::tui::reports::ReportTab>,
-    pub(crate) response: Arc<Mutex<ApiResponse>>,
-
-    /// The global list of Environments, shared across all collections (see
-    /// the "Global Environments" panel, `Pane::GlobalEnv`). Individual
-    /// collections may `linked_env_id` one of these; at most one may be
-    /// `active_env_id` at a time.
-    pub(crate) global_envs: Vec<Environment>,
-    /// The currently-activated Global Environment, if any — its vars are
-    /// used for substitution in any collection (subject to being overridden
-    /// by that collection's own `linked_env_id`, if set, on name collision).
-    pub(crate) active_env_id: Option<u64>,
     /// Undo stack for deleted Global Environments: each entry is the list index
     /// the environment was removed from plus the environment itself, so `u`
     /// (in the Global Environments panel) can reopen the most recent one. The
@@ -978,12 +961,21 @@ pub struct TuiApp {
     pub(crate) deleted_envs: Vec<(usize, Environment)>,
 
     pub(crate) focus: Pane,
-    /// Selected row in the Global Environments list (panel showing env
-    /// NAMES only — see `Pane::GlobalEnv`). Renamed from the old `env_idx`,
-    /// which used to index the selected *variable* row inside the old
-    /// inline Environment panel; that per-variable selection now lives in
-    /// `Overlay::EnvPopup`'s own `EnvPopupState::idx`.
+    /// Selected row in the Global Environments list — an index into
+    /// [`Self::env_rows`], *not* into `global_envs`: the panel also lists the
+    /// open Workspace's environment files, including ones not loaded yet, and
+    /// the filter can hide any of them. Use [`Self::selected_env_row`] to get
+    /// at what it points to.
     pub(crate) global_env_idx: usize,
+    /// Type-to-filter query for the Global Environments panel (`/` starts it).
+    /// A case-insensitive substring of the environment name; empty means no
+    /// filtering. Runtime-only — a filter is a way of finding something now,
+    /// not a setting, so it isn't persisted across restarts.
+    pub(crate) env_query: String,
+    /// True while `/` filter entry is capturing keys for the Global
+    /// Environments panel, so letters type into the query instead of firing the
+    /// panel's single-key actions (`a`, `x`, `u`, …).
+    pub(crate) env_filter_typing: bool,
     /// Max scroll offset for the Response body (wrapped content rows −
     /// viewport height); cached each frame by `draw_response` from
     /// `resp_panel.clamp_scroll(..)` so a scrollbar drag between frames (and
@@ -1082,12 +1074,6 @@ pub struct TuiApp {
     /// end (no scrolling past into blank space).
     pub(crate) list_scroll_w: std::cell::Cell<u16>,
     pub(crate) global_env_scroll_w: std::cell::Cell<u16>,
-    pub(crate) response_pct: u16,
-    /// Width (columns) of the left column (Requests/Environment panels),
-    /// user-adjustable with `<`/`>` and persisted across restarts.
-    pub(crate) list_width: u16,
-
-    pub(crate) status: Option<Status>,
     pub(crate) overlay: Option<Overlay>,
     /// Vertical scroll offset (rows) into the currently-open Help popup's
     /// body — reset to 0 whenever Help is (re)opened or its tab is
@@ -1103,15 +1089,6 @@ pub struct TuiApp {
     pub(crate) help_query: String,
     pub(crate) quit: bool,
 
-    /// Receivers for in-flight background secret resolution (one per env load).
-    pub(crate) pending_env: Vec<Receiver<EnvUpdate>>,
-
-    /// Receivers for in-flight response captures (one per run of a capturing entry).
-    pub(crate) pending_captures: Vec<Receiver<CaptureUpdate>>,
-
-    /// Receivers for in-flight "Run All" (Alt+F5) passes over a whole collection.
-    pub(crate) pending_batch_runs: Vec<Receiver<request::BatchRunUpdate>>,
-
     /// Receivers for in-flight background report runs (one per running report),
     /// each tagged with its report id, drained by
     /// [`Self::poll_report_run_updates`]. A report runs on its own thread so the
@@ -1124,14 +1101,6 @@ pub struct TuiApp {
     /// discarded. Presence of a key also gates a second run of the same report.
     pub(crate) running_reports:
         std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
-
-    /// Folder the file browser last selected a file from; it reopens here.
-    pub(crate) last_browse_dir: Option<PathBuf>,
-
-    /// Folder the last *environment* file was loaded from; the environment
-    /// picker reopens here (falling back to `last_browse_dir`), so it isn't
-    /// dragged around by loads of unrelated file types.
-    pub(crate) last_env_dir: Option<PathBuf>,
 
     /// One-shot start folder for the *new-report* folder browser
     /// ([`FileAction::NewReportChooseFolder`]): the highlighted workspace folder
@@ -1152,43 +1121,6 @@ pub struct TuiApp {
     /// exactly where you started. Descending into any *other* folder (a genuine
     /// new navigation) clears it. Only meaningful while a browser overlay is up.
     pub(crate) browser_forward_path: Option<PathBuf>,
-
-    /// Settings (persisted): confirm before quitting / closing all collections.
-    pub(crate) confirm_on_exit: bool,
-    pub(crate) confirm_on_clear: bool,
-    /// Preferences (persisted): confirm before deleting a Global Environment
-    /// (`x` in the Global Environments panel). On by default; turn it off to
-    /// always delete immediately (the deletion stays undoable with `u`).
-    pub(crate) confirm_on_delete_env: bool,
-    /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
-    /// for unsaved in-memory edits (switching collections in a Workspace, or
-    /// pushing one to git) is skipped and the "Save" action taken
-    /// automatically. Off by default, so the prompt is shown.
-    pub(crate) always_save_when_prompted: bool,
-    /// Preferences (persisted): which of JSON / Hurl text the Main (Request)
-    /// panel shows by default, for every request. Changed from the
-    /// Preferences submenu (Settings → Preferences → Default Request View).
-    pub(crate) default_request_view: request::RequestView,
-    /// Preferences (persisted): run "Run All" (Alt+F5) in batch mode — the
-    /// whole collection in one Hurl execution, so Hurl's cookie jar and
-    /// `[Captures]` chain across every request. Off by default, so Run All
-    /// streams results as they finish (matching the CLI default), at the cost
-    /// of not carrying automatic cookies between requests.
-    pub(crate) run_all_batch_mode: bool,
-
-    /// User-created themes (persisted). Shown in the Theme editor alongside the
-    /// built-in presets; deletable (unlike presets) with `Ctrl+D`.
-    pub(crate) custom_themes: Vec<crate::tui::theme::ThemeSpec>,
-    /// The explicitly-chosen theme name, or `None` to follow the language's
-    /// preset. Set the moment the user picks any theme in the Theme editor;
-    /// while `None`, changing language also changes the effective theme.
-    pub(crate) active_theme: Option<String>,
-
-    /// The GUI's window/panel geometry, carried through untouched. The terminal
-    /// UI has no use for pixel sizes, but it shares one `state.json` with the
-    /// graphical front-end, so dropping the field here would silently reset the
-    /// GUI's layout every time the terminal UI saved.
-    pub(crate) gui_layout: crate::persistence::GuiLayout,
 
     /// `true` when the terminal supports the keyboard-enhancement protocol, so
     /// Ctrl+Enter is reported distinctly from a plain Enter. Advanced shortcuts
@@ -1215,11 +1147,6 @@ pub struct TuiApp {
     /// commits or the picker is cancelled, so an aborted flow never leaks
     /// state.
     pub(crate) pending_workspace_transfer: Option<PendingTransfer>,
-
-    /// Git URLs the user has loaded a collection/environment from, most recent
-    /// first. Offered as a pickable list in the "Load from Git" wizard and
-    /// persisted across restarts.
-    pub(crate) recent_git_urls: Vec<String>,
 
     /// Stack of recently closed tabs (with the index they were closed from),
     /// most-recently-closed last, so Ctrl+Shift+T can reopen them in order.
@@ -1271,14 +1198,6 @@ pub struct TuiApp {
     /// then add" on an [`Overlay::EnvCollision`] popup. Added to
     /// `global_envs` once the rename prompt is committed.
     pub(crate) pending_collision_env: Option<(Environment, Vec<PendingSecret>)>,
-    /// Workspace tabs restored with a vanished `workspace_root` that were
-    /// originally downloaded from git (see
-    /// `persistence::PersistedTab::into_collection`'s `PendingWorkspaceReload`),
-    /// queued up so each is offered a redownload one at a time via
-    /// [`Overlay::WorkspaceReloadConfirm`] rather than all popping up at once.
-    /// `usize` is the tab's index in `collections`.
-    pub(crate) pending_workspace_reloads:
-        std::collections::VecDeque<(usize, crate::persistence::PendingWorkspaceReload)>,
     /// A background redownload attempt in flight (see
     /// [`Overlay::WorkspaceReloadLoading`]): the tab index it's for, the
     /// previously-selected file's path relative to the old root (to
@@ -1302,22 +1221,48 @@ pub struct TuiApp {
     pub(crate) mouse_hits: RefCell<Vec<MouseHit>>,
     pub(crate) mouse_top_layer: Cell<MouseLayer>,
     pub(crate) mouse_hit_valid: Cell<bool>,
+
+    /// The front-end-agnostic application state: collections, environments,
+    /// themes, preferences and the persisted settings both front-ends share.
+    /// `TuiApp` derefs to it, so `self.collections` still reaches the one copy
+    /// that gets written to `state.json` — the terminal UI keeps only *view*
+    /// state (cursors, scroll offsets, overlays, focus, wrap caches) of its own.
+    pub(crate) session: crate::session::Session,
+}
+
+/// `TuiApp` owns the shared [`Session`] and reaches straight through it, so
+/// every existing `self.collections` / `self.status` / `self.list_width` call
+/// site keeps working while there is only one copy of that state in the process
+/// — and therefore only one writer of `state.json`.
+///
+/// A `Deref` rather than a wall of accessors because the alternative is ~2,200
+/// mechanical rewrites for no behavioural gain. The cost is that a method
+/// borrowing a session field and a view field at once now borrows all of
+/// `self`; where that bites, the fix is to name `self.session.<field>` and
+/// `self.<view field>` explicitly, which the borrow checker treats as disjoint.
+impl std::ops::Deref for TuiApp {
+    type Target = crate::session::Session;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for TuiApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
 }
 
 impl Default for TuiApp {
     fn default() -> Self {
         Self {
-            language: Language::default(),
-            vars: AppVars::default(),
-            collections: vec![Collection::new("Request".to_string(), Vec::new())],
-            active_tab: 0,
             reports: Vec::new(),
-            response: Arc::new(Mutex::new(ApiResponse::default())),
-            global_envs: Vec::new(),
-            active_env_id: None,
             deleted_envs: Vec::new(),
             focus: Pane::List,
             global_env_idx: 0,
+            env_query: String::new(),
+            env_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
             list_hscroll: 0,
@@ -1339,37 +1284,19 @@ impl Default for TuiApp {
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
             global_env_scroll_w: std::cell::Cell::new(0),
-            response_pct: 42,
-            list_width: 38,
-            status: None,
             overlay: None,
             help_scroll: 0,
             help_query: String::new(),
             quit: false,
-            pending_env: Vec::new(),
-            pending_captures: Vec::new(),
-            pending_batch_runs: Vec::new(),
             pending_report_runs: Vec::new(),
             running_reports: std::collections::HashMap::new(),
-            last_browse_dir: None,
-            last_env_dir: None,
             new_report_seed_dir: None,
             browser_origin_dir: None,
             browser_forward_path: None,
-            confirm_on_exit: true,
-            confirm_on_clear: true,
-            confirm_on_delete_env: true,
-            always_save_when_prompted: false,
-            default_request_view: request::RequestView::default(),
-            run_all_batch_mode: false,
-            custom_themes: Vec::new(),
-            active_theme: None,
-            gui_layout: crate::persistence::GuiLayout::default(),
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
             pending_workspace_transfer: None,
-            recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
             pending_node_folder: None,
@@ -1379,7 +1306,6 @@ impl Default for TuiApp {
             browser_query: String::new(),
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
-            pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
             pending_workspace_save: None,
             pending_workspace_move: None,
@@ -1387,6 +1313,7 @@ impl Default for TuiApp {
             mouse_hits: RefCell::new(Vec::new()),
             mouse_top_layer: Cell::new(MouseLayer::Base),
             mouse_hit_valid: Cell::new(false),
+            session: crate::session::Session::default(),
         }
     }
 }
@@ -1578,17 +1505,18 @@ impl TuiApp {
     /// Drain background secret-resolution results and apply them to the
     /// matching Global Environment, rebuilding affected request previews.
     pub(crate) fn poll_env_updates(&mut self) {
-        request::drain_env_updates(
-            &mut self.pending_env,
-            &mut self.global_envs,
-            &mut self.collections,
-        );
+        // Named through `session` because three simultaneous `&mut` borrows of
+        // distinct fields are only disjoint when the compiler can see the
+        // fields; going through `DerefMut` would borrow all of `self` thrice.
+        let s = &mut self.session;
+        request::drain_env_updates(&mut s.pending_env, &mut s.global_envs, &mut s.collections);
     }
 
     /// Drain completed response captures into their collections so subsequent
     /// requests can substitute the captured values.
     pub(crate) fn poll_capture_updates(&mut self) {
-        request::drain_capture_updates(&mut self.pending_captures, &mut self.collections);
+        let s = &mut self.session;
+        request::drain_capture_updates(&mut s.pending_captures, &mut s.collections);
     }
 
     /// Drain completed "Run All" passes: merge captured values into the
@@ -3177,6 +3105,85 @@ impl TuiApp {
         Some(id)
     }
 
+    /// The Environments panel's rows: the open Workspace's environment files
+    /// (loaded or not) followed by every other loaded environment, narrowed by
+    /// the `/` filter query. See [`crate::env_panel`].
+    ///
+    /// Recomputed on demand rather than cached, exactly as the Workspace tree's
+    /// [`crate::collection::Collection::ws_rows`] is — the folder scan is the
+    /// same one, and a cache would have to be invalidated on every file
+    /// created, moved or deleted from anywhere in the app.
+    pub(crate) fn env_rows(&self) -> Vec<crate::env_panel::EnvRow> {
+        let files = self.workspace_env_files();
+        crate::env_panel::rows(
+            &self.global_envs,
+            &files,
+            &self.env_query,
+            self.effective_env_source(),
+        )
+    }
+
+    pub(crate) fn workspace_env_files(&self) -> Vec<std::path::PathBuf> {
+        match self
+            .collections
+            .get(self.active_tab)
+            .and_then(|c| c.workspace_root.as_deref())
+        {
+            Some(root) => crate::workspace::scan_environments(root),
+            None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn has_workspace_env_source(&self) -> bool {
+        self.collections
+            .get(self.active_tab)
+            .and_then(|c| c.workspace_root.as_deref())
+            .is_some()
+    }
+
+    pub(crate) fn effective_env_source(&self) -> crate::env_panel::EnvSource {
+        if self.has_workspace_env_source() {
+            self.env_source
+        } else {
+            // With no Workspace tab open, two of the three source modes would
+            // be guaranteed-empty. Treat the hidden control as "Both" so a
+            // persisted Workspace-only choice does not make globals vanish.
+            crate::env_panel::EnvSource::Both
+        }
+    }
+
+    /// The Environments panel row the selection is on, if any.
+    pub(crate) fn selected_env_row(&self) -> Option<crate::env_panel::EnvRow> {
+        let rows = self.env_rows();
+        rows.get(self.global_env_idx.min(rows.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    /// The loaded environment the panel selection points at. `None` when the
+    /// selected row is a workspace file that hasn't been opened yet (there is
+    /// no environment to act on until it is).
+    pub(crate) fn selected_env_id(&self) -> Option<u64> {
+        self.selected_env_row().and_then(|r| r.env_id())
+    }
+
+    /// The index into `global_envs` of the panel's selected environment, for
+    /// the operations that still address environments positionally (delete and
+    /// its undo stack, activate).
+    pub(crate) fn selected_env_index(&self) -> Option<usize> {
+        let id = self.selected_env_id()?;
+        self.global_envs.iter().position(|e| e.id == id)
+    }
+
+    /// Move the Environments panel selection onto whichever row holds `id`, so
+    /// an environment that was just loaded, renamed or restored stays under the
+    /// cursor even though the row order is the panel's, not `global_envs`'.
+    pub(crate) fn select_env_row_by_id(&mut self, id: u64) {
+        if let Some(i) = self.env_rows().iter().position(|r| r.env_id() == Some(id)) {
+            self.global_env_idx = i;
+            self.global_env_hscroll = 0;
+        }
+    }
+
     /// The Global Environment id that "Save Environment" / secret-reload
     /// actions currently target: the selected row in the Global Environments
     /// list, or (if open) the environment shown in the entries popup.
@@ -3184,7 +3191,7 @@ impl TuiApp {
         if let Some(Overlay::EnvPopup(p)) = &self.overlay {
             return Some(p.env_id);
         }
-        self.global_envs.get(self.global_env_idx).map(|e| e.id)
+        self.selected_env_id()
     }
 
     /// The rows to show in the File → Save submenu, filtered to what actually
@@ -3316,9 +3323,11 @@ impl TuiApp {
             }
         }
         self.deleted_envs.push((idx, removed));
+        // The selection indexes panel rows, and deleting an environment
+        // removes one — clamp so it can't be left past the end.
         self.global_env_idx = self
             .global_env_idx
-            .min(self.global_envs.len().saturating_sub(1));
+            .min(self.env_rows().len().saturating_sub(1));
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
@@ -3336,8 +3345,11 @@ impl TuiApp {
         };
         let idx = idx.min(self.global_envs.len());
         let name = env.name.clone();
+        let id = env.id;
         self.global_envs.insert(idx, env);
-        self.global_env_idx = idx;
+        // Follow the environment to whichever panel row it landed on: the
+        // panel's order isn't `global_envs`' once a workspace is open.
+        self.select_env_row_by_id(id);
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
