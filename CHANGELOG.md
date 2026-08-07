@@ -53,6 +53,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   frozen and given a filter, so a long run can be scrolled and sifted without
   losing track of which column is which.
 
+- **A report that reuses a saved `.baseline` snapshot now warns before it
+  runs.** Referring to a snapshot file that isn't there — a renamed file, or a
+  typo — was the one baseline reference that got no advance check, so the
+  problem only appeared as an unmatched comparison once the whole run had
+  finished. The path is now checked alongside every other reference, once the
+  report has been saved somewhere for a relative path to resolve against.
+
 ## [0.4.2] - 2026-08-08
 
 ### Fixed

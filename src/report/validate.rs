@@ -471,9 +471,33 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
             if comparisons.is_empty() {
                 diags.push(Diagnostic::error(ctx.strings.diag_comparison_missing));
             }
+            // A `FILE(…)` snapshot stands in for a live run of its role, so a
+            // path that isn't there means the role produces nothing — which
+            // surfaces at run time only as an unmatched comparison, long after
+            // the run has been paid for. Warn up front instead, exactly as the
+            // `# baseline:` directive does, and for the same reason: it is only
+            // a non-fatal error at run time, and the check needs the report to
+            // be anchored (`ctx.root`) before a relative path means anything.
+            if let Some(root) = ctx.root {
+                for rel in baseline
+                    .iter()
+                    .chain(comparisons.iter())
+                    .filter_map(|r| match r {
+                        RoleRef::File(p) => Some(p),
+                        RoleRef::Env(_) => None,
+                    })
+                {
+                    let path = super::producers::resolve_path(Some(root), rel);
+                    if !path.exists() {
+                        diags.push(Diagnostic::warning(fill(
+                            ctx.strings.diag_baseline_missing,
+                            &[rel, &path.display().to_string()],
+                        )));
+                    }
+                }
+            }
             // Only live env-name refs are checked against the loaded set; a
-            // `FILE(…)` snapshot is a path resolved (and reported non-fatally if
-            // missing) at run time, not an environment.
+            // `FILE(…)` snapshot is a path, not an environment.
             baseline
                 .iter()
                 .chain(comparisons.iter())
@@ -1199,6 +1223,98 @@ mod tests {
             "expected a missing-snapshot warning: {warns:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `BASELINE(FILE(…))` role whose snapshot isn't on disk was the one
+    /// baseline reference with no preflight at all: unlike the `# baseline:`
+    /// directive it was skipped entirely, so a typo only showed up as an
+    /// unmatched comparison after a full run had already been paid for.
+    #[test]
+    fn missing_baseline_file_role_warns_when_anchored() {
+        let dir = std::env::temp_dir().join(format!("pb-vrole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flow = parse_flow(
+            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(FILE(\"missing.baseline\")), COMPARISON(\"prod\")\n    REPORT REQUEST Oauth\nEND\n",
+        )
+        .unwrap();
+        let t = titles();
+        let envs = vec!["prod".to_string()];
+        let ctx = Context {
+            request_titles: Some(&t),
+            env_names: Some(&envs),
+            root: Some(dir.as_path()),
+            ..Default::default()
+        };
+        let warns: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("was not found") && m.contains("missing.baseline")),
+            "expected a missing-snapshot warning: {warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_comparison_file_role_is_checked_too_and_a_present_one_stays_quiet() {
+        let dir = std::env::temp_dir().join(format!("pb-vrole-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prev.baseline"), "{}").unwrap();
+        let flow = parse_flow(
+            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(FILE(\"prev.baseline\")), COMPARISON(FILE(\"gone.baseline\"))\n    REPORT REQUEST Oauth\nEND\n",
+        )
+        .unwrap();
+        let t = titles();
+        let ctx = Context {
+            request_titles: Some(&t),
+            root: Some(dir.as_path()),
+            ..Default::default()
+        };
+        let warns: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            warns.iter().any(|m| m.contains("gone.baseline")),
+            "a comparison role's snapshot is checked as well: {warns:?}"
+        );
+        assert!(
+            !warns.iter().any(|m| m.contains("prev.baseline")),
+            "an existing snapshot must stay quiet: {warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `FILE(…)` role is a path, not an environment, so it must never be
+    /// reported as "not loaded" — the check that protects live env names.
+    #[test]
+    fn a_file_role_is_never_mistaken_for_an_unloaded_environment() {
+        let flow = parse_flow(
+            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(FILE(\"snap.baseline\")), COMPARISON(\"prod\")\n    REPORT REQUEST Oauth\nEND\n",
+        )
+        .unwrap();
+        let t = titles();
+        let envs = vec!["prod".to_string()];
+        // No `root`, so the filesystem check is skipped entirely: an unsaved
+        // report has nothing to resolve a relative path against.
+        let ctx = Context {
+            request_titles: Some(&t),
+            env_names: Some(&envs),
+            ..Default::default()
+        };
+        let msgs: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("snap.baseline")),
+            "an unanchored report must not report on the snapshot at all: {msgs:?}"
+        );
     }
 
     #[test]
