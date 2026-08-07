@@ -50,6 +50,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   middle is still a plain newline, and Shift+Enter remains an escape hatch. Both
   front-ends now share one set of indentation rules.
 
+- **Tab in the GUI report source editor now indents four spaces.** It inserted a
+  literal tab character, which nothing else in PaperBoy writes — so a report
+  saved from the source view was indented inconsistently with the same report
+  serialised by the block editor. Shift+Tab and Backspace clear a level in the
+  same four-column steps the terminal editor uses. Tab does not leave the field
+  (press Escape for that).
+
 ## [0.5.0] - 2026-08-08
 
 ### Added

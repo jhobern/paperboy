@@ -20,7 +20,9 @@ use crate::report::edit::{
     set_request_name, transfer_modifier,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
-use crate::report::indent::{indent_for_new_line, is_end_line, matching_opener_indent};
+use crate::report::indent::{
+    INDENT_UNIT, indent_for_new_line, is_end_line, matching_opener_indent,
+};
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
@@ -1674,6 +1676,83 @@ fn newline_with_indent(text: &str, sel: std::ops::Range<usize>) -> (String, usiz
     (out, sel.start + 1 + indent.chars().count())
 }
 
+/// The text and new cursor position after Tab indents one level over the char
+/// range `sel` (replacing any selection, as typing a character would).
+fn indent_at(text: &str, sel: std::ops::Range<usize>) -> (String, usize) {
+    let (from, to) = (byte_at(text, sel.start), byte_at(text, sel.end));
+    let mut out = String::with_capacity(text.len() + INDENT_UNIT.len());
+    out.push_str(&text[..from]);
+    out.push_str(INDENT_UNIT);
+    out.push_str(&text[to..]);
+    (out, sel.start + INDENT_UNIT.chars().count())
+}
+
+/// How many chars a de-indent at char index `at` should delete: back to the
+/// previous four-column stop within the run of spaces ending at the caret, so
+/// one press clears a whole level rather than a single space. `None` when the
+/// caret isn't preceded by a space, in which case the key means what it always
+/// did. Mirrors the terminal editor's Tab/Backspace rule.
+fn dedent_span(text: &str, at: usize) -> Option<usize> {
+    let (row, col) = row_col_at(text, at);
+    let chars: Vec<char> = text.split('\n').nth(row)?.chars().collect();
+    if col == 0 || chars.get(col - 1) != Some(&' ') {
+        return None;
+    }
+    let mut run_start = col;
+    while run_start > 0 && chars[run_start - 1] == ' ' {
+        run_start -= 1;
+    }
+    Some((col - run_start - 1) % INDENT_UNIT.len() + 1)
+}
+
+/// The text and new cursor position after deleting `n` chars before `at`.
+fn delete_before(text: &str, at: usize, n: usize) -> (String, usize) {
+    let start = at.saturating_sub(n);
+    let (from, to) = (byte_at(text, start), byte_at(text, at));
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..from]);
+    out.push_str(&text[to..]);
+    (out, start)
+}
+
+/// Handle the source editor's code-editing keys, which `egui`'s text area would
+/// otherwise take literally: Enter (auto-indent), Tab / Shift+Tab (indent by one
+/// four-space level rather than inserting a literal `\t`) and Backspace over
+/// indentation (clear a whole level). Returns the replacement text and caret
+/// position, or `None` to let the widget handle the key itself.
+///
+/// Tab stays in the field either way — `code_editor()` locks focus — so
+/// **Escape** is the way out of the editor (egui releases focus on it, and the
+/// focus filter deliberately lets it through).
+fn source_edit_key(
+    ui: &egui::Ui,
+    text: &str,
+    sel: std::ops::Range<usize>,
+) -> Option<(String, usize)> {
+    use egui::{Key, Modifiers};
+    if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+        return Some(newline_with_indent(text, sel));
+    }
+    if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+        return Some(indent_at(text, sel));
+    }
+    // Shift+Tab is always swallowed, even where there is no indentation to
+    // remove: with focus locked it can't mean "previous widget", and letting the
+    // widget see it would insert egui's own tab-flavoured indentation instead.
+    if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+        return dedent_span(text, sel.start).map(|n| delete_before(text, sel.start, n));
+    }
+    // Backspace is only taken when it really is deleting indentation, so an
+    // ordinary character delete (and every selection-aware case) stays egui's.
+    if sel.is_empty()
+        && let Some(n) = dedent_span(text, sel.start)
+        && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+    {
+        return Some(delete_before(text, sel.start, n));
+    }
+    None
+}
+
 /// If the line holding char index `at` now reads exactly `END`, snap it to its
 /// opener's indentation and return the corrected text with the cursor parked at
 /// the line end — so finishing a block dedents one level, as it does in the
@@ -1723,11 +1802,12 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
         .max_height(edit_h)
         .show(ui, |ui| {
             let mut text = ed.report.text.clone();
-            // Enter is intercepted *before* the widget sees it: egui would
-            // insert a bare newline, so the only way to auto-indent is to
-            // consume the key and perform the edit (and move the caret)
-            // ourselves. A modified Enter is left alone — Ctrl/Cmd+Enter runs
-            // the report, and Shift+Enter stays a plain newline escape hatch.
+            // The code-editing keys are intercepted *before* the widget sees
+            // them: egui would insert a bare newline or a literal tab, so the
+            // only way to indent PaperTrail's way is to consume the key and
+            // perform the edit (caret included) ourselves. Modified variants are
+            // left alone — Ctrl/Cmd+Enter runs the report, and Shift+Enter stays
+            // a plain-newline escape hatch.
             let te_id = ui.id().with("trail_source");
             // Only intercept when there is a live cursor to work from: with no
             // stored state we have no idea where the newline goes, so the key
@@ -1744,9 +1824,8 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
             let mut new_cursor: Option<usize> = None;
             let mut edited = false;
             if let Some(range) = cursor
-                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                && let Some((next, caret)) = source_edit_key(ui, &text, range)
             {
-                let (next, caret) = newline_with_indent(&text, range);
                 text = next;
                 new_cursor = Some(caret);
                 edited = true;
@@ -1754,6 +1833,9 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
             let resp = ui.add(
                 egui::TextEdit::multiline(&mut text)
                     .id(te_id)
+                    // Also locks focus, so Tab stays in the field (Escape is the
+                    // way out) — we just intercept it above to indent in spaces
+                    // rather than the literal `\t` egui would insert.
                     .code_editor()
                     .desired_width(f32::INFINITY)
                     .desired_rows(20)
@@ -6098,6 +6180,52 @@ mod tests {
 
         let not_an_end = "FOR F IN [\"a\"]\n    ENDPOINT = x";
         assert!(snap_end_line(not_an_end, not_an_end.chars().count()).is_none());
+    }
+
+    /// Tab indents one four-space level, replacing any selection.
+    #[test]
+    fn tab_indents_one_level() {
+        let (out, caret) = indent_at("REQUEST r", 0..0);
+        assert_eq!(out, "    REQUEST r");
+        assert_eq!(caret, 4);
+
+        let (out, caret) = indent_at("REQUEST rXX", 9..11);
+        assert_eq!(out, "REQUEST r    ");
+        assert_eq!(caret, 13);
+    }
+
+    /// A de-indent deletes back to the previous four-column stop within the run
+    /// of spaces at the caret, so one press clears a level rather than a space.
+    #[test]
+    fn dedent_walks_back_to_the_previous_four_stop() {
+        assert_eq!(dedent_span("        END", 8), Some(4));
+        assert_eq!(dedent_span("        END", 4), Some(4));
+        // A partial level is cleared on its own, landing on the stop below.
+        assert_eq!(dedent_span("      END", 6), Some(2));
+        assert_eq!(dedent_span("     END", 5), Some(1));
+
+        let (out, caret) = delete_before("        END", 8, 4);
+        assert_eq!(out, "    END");
+        assert_eq!(caret, 4);
+    }
+
+    /// Away from indentation the key keeps its ordinary meaning, so the widget
+    /// keeps its own (selection-aware) handling.
+    #[test]
+    fn dedent_declines_anywhere_but_a_run_of_spaces() {
+        assert_eq!(dedent_span("END", 3), None); // no space before the caret
+        assert_eq!(dedent_span("    END", 0), None); // start of the line
+        assert_eq!(dedent_span("\tEND", 1), None); // a tab is not our indent
+    }
+
+    /// Padding after content de-indents too — that's what Tab leaves behind
+    /// when it lands mid-line.
+    #[test]
+    fn dedent_also_clears_trailing_padding() {
+        assert_eq!(dedent_span("END    ", 7), Some(4));
+        let (out, caret) = delete_before("END    ", 7, 4);
+        assert_eq!(out, "END");
+        assert_eq!(caret, 3);
     }
 
     /// Both helpers count in chars, so multi-byte text can't split a character
