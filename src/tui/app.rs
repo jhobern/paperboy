@@ -20,7 +20,7 @@ use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::remote_flow::{FlowEvent, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use tui_panel_select::MultiSelectPanel;
 use tui_panel_select::wrapcache::TextPos;
 
@@ -3612,73 +3612,60 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Close the wizard, cleaning up any temp repo it created.
-    pub(crate) fn close_remote(&mut self, w: Box<RemoteWizard>) {
-        if let Some(repo) = &w.repo {
-            git_remote::cleanup(repo);
-        }
+    /// Close the wizard. Any temp repo it fetched is owned by the flow, which
+    /// cleans it up as it is dropped.
+    pub(crate) fn close_remote(&mut self, _w: Box<RemoteWizard>) {
         self.overlay = None;
     }
 
     /// Handle a key while the remote-git wizard is open.
     pub(crate) fn on_key_remote(&mut self, mut w: Box<RemoteWizard>, key: KeyEvent) {
-        match &mut w.stage {
-            RemoteStage::Connect { field, recent_sel } => match key.code {
+        match w.stage() {
+            RemoteStage::Connect => match key.code {
                 // While the recent-URLs dropdown has focus, Esc backs out of it
                 // rather than closing the whole wizard.
-                KeyCode::Esc if recent_sel.is_some() => *recent_sel = None,
+                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
                 KeyCode::Esc => return self.close_remote(w),
                 KeyCode::Tab | KeyCode::BackTab => {
-                    *field = 1 - *field;
-                    *recent_sel = None;
+                    w.field = 1 - w.field;
+                    w.recent_sel = None;
                 }
                 // On the URL field, Down opens (or moves down in) the recent-URLs
                 // dropdown instead of jumping to the token field.
-                KeyCode::Down if *field == 0 && !w.recent.is_empty() => {
-                    *recent_sel = Some(recent_sel.map_or(0, |i| (i + 1).min(w.recent.len() - 1)));
+                KeyCode::Down if w.field == 0 && !w.recent.is_empty() => {
+                    let last = w.recent.len() - 1;
+                    w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
                 }
-                KeyCode::Up if recent_sel.is_some() => {
-                    let i = recent_sel.unwrap();
-                    *recent_sel = if i == 0 { None } else { Some(i - 1) };
+                KeyCode::Up if w.recent_sel.is_some() => {
+                    let i = w.recent_sel.unwrap();
+                    w.recent_sel = if i == 0 { None } else { Some(i - 1) };
                 }
                 KeyCode::Up | KeyCode::Down => {
-                    *field = 1 - *field;
-                    *recent_sel = None;
-                }
-                KeyCode::Enter if recent_sel.is_some() => {
-                    // Pick the highlighted recent URL and connect immediately,
-                    // rather than just populating the field (which would force
-                    // the user to press Enter a second time).
-                    if let Some(url) = recent_sel.and_then(|i| w.recent.get(i)).cloned() {
-                        w.url = Editor::new(&url, false);
-                    }
-                    *recent_sel = None;
-                    if w.url.text().trim().is_empty() {
-                        let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_url_required.to_string());
-                    } else {
-                        w.rx = Some(spawn_git_refs(w.url.text(), w.token_opt()));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::Refs,
-                        };
-                    }
+                    w.field = 1 - w.field;
+                    w.recent_sel = None;
                 }
                 KeyCode::Enter => {
-                    if w.url.text().trim().is_empty() {
+                    // Picking a recent URL connects immediately, rather than
+                    // just populating the field (which would force the user to
+                    // press Enter a second time).
+                    if let Some(url) = w.recent_sel.and_then(|i| w.recent.get(i)).cloned() {
+                        w.url = Editor::new(&url, false);
+                    }
+                    w.recent_sel = None;
+                    w.sync_fields();
+                    if w.flow.url.trim().is_empty() {
                         let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_url_required.to_string());
+                        w.flow.fail(s.git_url_required.to_string());
                     } else {
-                        w.rx = Some(spawn_git_refs(w.url.text(), w.token_opt()));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::Refs,
-                        };
+                        w.reset_list();
+                        w.flow.connect();
                     }
                 }
                 _ => {
                     // Typing anything else closes the dropdown and edits the
                     // field normally.
-                    *recent_sel = None;
-                    let ed = if *field == 0 {
+                    w.recent_sel = None;
+                    let ed = if w.field == 0 {
                         &mut w.url
                     } else {
                         &mut w.token
@@ -3686,181 +3673,130 @@ impl TuiApp {
                     apply_edit_key(ed, key);
                 }
             },
-            RemoteStage::Loading { .. } => {
+            RemoteStage::Loading => {
                 if key.code == KeyCode::Esc {
                     return self.close_remote(w);
                 }
             }
-            RemoteStage::PickRef { refs, filter, sel } => {
-                let vis = filter_indices(refs.iter().map(|r| r.label.as_str()), filter);
+            RemoteStage::PickRef => {
+                let s = Strings::for_language(&self.language);
+                let choices = w.flow.ref_choices(&s);
+                let vis = filter_indices(choices.iter().map(|r| r.label.as_str()), &w.filter);
                 match key.code {
                     KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
+                    KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                    KeyCode::Down if w.sel + 1 < vis.len() => w.sel += 1,
                     KeyCode::Enter => {
-                        if let Some(&ri) = vis.get(*sel) {
-                            let choice = refs[ri].clone();
-                            w.chosen_ref = Some(choice.clone());
-                            w.rx =
-                                Some(spawn_git_files(w.url.text(), w.token_opt(), choice.gitref));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::Files,
-                            };
+                        if let Some(&ri) = vis.get(w.sel) {
+                            let choice = choices[ri].clone();
+                            w.reset_list();
+                            w.flow.choose_ref(choice);
                         }
                     }
                     KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
+                        w.filter.pop();
+                        w.sel = 0;
                     }
                     KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
+                        w.filter.push(c);
+                        w.sel = 0;
                     }
                     _ => {}
                 }
             }
-            RemoteStage::PickFile { files, filter, sel } => {
-                let vis = filter_indices(files.iter().map(|s| s.as_str()), filter);
+            RemoteStage::PickFile => {
+                let files = w.flow.pickable_files();
+                let vis = filter_indices(files.iter().map(|s| s.as_str()), &w.filter);
                 match key.code {
                     KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
+                    KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                    KeyCode::Down if w.sel + 1 < vis.len() => w.sel += 1,
                     KeyCode::Enter => {
-                        if let (Some(&fi), Some(repo)) = (vis.get(*sel), w.repo.clone()) {
+                        if let Some(&fi) = vis.get(w.sel) {
                             let path = files[fi].clone();
-                            w.selected_path = Some(path.clone());
-                            w.rx = Some(spawn_git_checkout(repo, path));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::File,
-                            };
+                            w.reset_list();
+                            w.flow.choose_file(path);
                         }
                     }
                     KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
+                        w.filter.pop();
+                        w.sel = 0;
                     }
                     KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
+                        w.filter.push(c);
+                        w.sel = 0;
                     }
                     _ => {}
                 }
             }
-            RemoteStage::PickWorkspaceFilter { sel } => match key.code {
+            RemoteStage::PickWorkspaceFilter => match key.code {
                 KeyCode::Esc => return self.close_remote(w),
-                KeyCode::Up => *sel = sel.saturating_sub(1),
-                KeyCode::Down => *sel = (*sel + 1).min(WorkspaceGitFilter::ALL.len() - 1),
+                KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                KeyCode::Down => w.sel = (w.sel + 1).min(WorkspaceGitFilter::ALL.len() - 1),
                 KeyCode::Enter => {
-                    let choice = WorkspaceGitFilter::ALL[*sel];
-                    w.chosen_workspace_filter = Some(choice);
-                    let matched: Vec<String> = w
-                        .files
-                        .iter()
-                        .filter(|p| choice.matches(p))
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
+                    let choice = WorkspaceGitFilter::ALL[w.sel];
+                    if !w.flow.all_files().iter().any(|p| choice.matches(p)) {
                         let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_workspace_no_matches.to_string());
-                    } else if let Some(repo) = w.repo.clone() {
-                        w.rx = Some(spawn_git_checkout_workspace(repo, matched));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::WorkspaceFiles,
-                        };
+                        w.flow.fail(s.git_workspace_no_matches.to_string());
+                    } else {
+                        w.flow.choose_workspace_filter(choice);
                     }
                 }
                 _ => {}
             },
-            RemoteStage::Error(_) => return self.close_remote(w),
+            // Any key dismisses the error, which returns to the step it came
+            // from rather than throwing away everything fetched so far.
+            RemoteStage::Error => {
+                w.flow.clear_error();
+                w.reset_list();
+            }
         }
         self.overlay = Some(Overlay::RemoteGit(w));
     }
 
     /// Poll the wizard's in-flight git operation (called each frame).
     pub(crate) fn poll_git_updates(&mut self) {
+        // Check before taking. A `let ... else { return }` on `take()` would
+        // still have *taken* the overlay when the pattern doesn't match, so
+        // every other menu and dialog would be dropped on the next tick of the
+        // event loop — which reads as menus closing the instant they open.
         if !matches!(self.overlay, Some(Overlay::RemoteGit(_))) {
             return;
         }
         let Some(Overlay::RemoteGit(mut w)) = self.overlay.take() else {
             return;
         };
-        let Some(rx) = w.rx.as_ref() else {
-            self.overlay = Some(Overlay::RemoteGit(w));
-            return;
-        };
-        match rx.try_recv() {
-            Ok(msg) => {
-                w.rx = None;
-                let keep_open = self.apply_git_msg(&mut w, msg);
+        match w.flow.poll() {
+            Some(event) => {
+                let keep_open = self.apply_flow_event(&w, event);
                 if keep_open {
                     self.overlay = Some(Overlay::RemoteGit(w));
-                } else if let Some(repo) = &w.repo {
-                    git_remote::cleanup(repo);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => self.overlay = Some(Overlay::RemoteGit(w)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                w.rx = None;
-                self.overlay = Some(Overlay::RemoteGit(w));
-            }
+            None => self.overlay = Some(Overlay::RemoteGit(w)),
         }
     }
 
-    /// Apply a completed git message to the wizard. Returns whether the wizard
-    /// should stay open (false = a file was loaded, close it).
-    pub(crate) fn apply_git_msg(&mut self, w: &mut RemoteWizard, msg: GitMsg) -> bool {
-        match msg {
-            GitMsg::Refs(Ok(refs)) => {
-                let s = Strings::for_language(&self.language);
-                w.stage = RemoteStage::PickRef {
-                    refs: build_ref_choices(&refs, &s),
-                    filter: String::new(),
-                    sel: 0,
-                };
-                true
-            }
-            GitMsg::Files(Ok((files, repo, sha))) => {
-                w.repo = Some(repo);
-                w.files = files.clone();
-                w.chosen_sha = Some(sha);
-                w.stage = if w.kind == RemoteKind::Workspace {
-                    RemoteStage::PickWorkspaceFilter { sel: 0 }
-                } else {
-                    // Only show files worth loading for this kind (a big repo
-                    // otherwise buries the one `.hurl`/`.vars` under noise).
-                    RemoteStage::PickFile {
-                        files: relevant_files(w.kind, &files),
-                        filter: String::new(),
-                        sel: 0,
-                    }
-                };
-                true
-            }
-            GitMsg::Workspace(Ok(repo)) => {
-                self.remember_git_url(&w.url.text());
-                let name = file_stem(&w.url.text(), "workspace");
-                let origin = self.build_workspace_git_origin(w);
-                // Ask the user whether to keep this download temporary (the
-                // old default behaviour) or save it to a permanent, chosen
-                // location right away — see `Overlay::WorkspaceStorageChoice`.
+    /// Act on a completed load. Returns whether the wizard should stay open
+    /// (false = something was loaded, so close it).
+    pub(crate) fn apply_flow_event(&mut self, w: &RemoteWizard, event: FlowEvent) -> bool {
+        match event {
+            FlowEvent::Workspace { root, name, origin } => {
+                self.remember_git_url(&w.flow.url);
+                // Ask the user whether to keep this download temporary (the old
+                // default behaviour) or save it to a permanent, chosen location
+                // right away — see `Overlay::WorkspaceStorageChoice`.
                 self.overlay = Some(Overlay::WorkspaceStorageChoice {
-                    repo: repo.clone(),
+                    repo: root,
                     name,
                     origin,
                     sel: 0,
                 });
-                // Ownership of the temp repo dir now belongs to the pending
-                // choice/tab — clear it here so `poll_git_updates`'s
-                // close-time cleanup (which deletes anything left in
-                // `w.repo`) doesn't remove the files we just downloaded.
-                w.repo = None;
                 false
             }
-            GitMsg::Content(Ok(text)) => {
-                let path = w.selected_path.clone().unwrap_or_default();
-                self.remember_git_url(&w.url.text());
-                let origin = self.build_git_origin(w);
-                match w.kind {
+            FlowEvent::Content { path, text, origin } => {
+                self.remember_git_url(&w.flow.url);
+                match w.kind() {
                     RemoteKind::Collection => {
                         let name = collection_name_from_path(&path, "remote");
                         if self.load_collection_text(name, &text, None) {
@@ -3884,55 +3820,12 @@ impl TuiApp {
                         self.open_loaded_report(report);
                         false
                     }
-                    // A Workspace load never reaches `PickFile`/`Content` —
-                    // it takes the `PickWorkspaceFilter` -> `GitMsg::Workspace`
-                    // path instead (see above). Unreachable in practice.
+                    // A Workspace load never produces `Content` — it takes the
+                    // filter/download path instead. Unreachable in practice.
                     RemoteKind::Workspace => false,
                 }
             }
-            GitMsg::Refs(Err(e))
-            | GitMsg::Files(Err(e))
-            | GitMsg::Content(Err(e))
-            | GitMsg::Workspace(Err(e)) => {
-                w.stage = RemoteStage::Error(e);
-                true
-            }
         }
-    }
-
-    /// Build the [`GitOrigin`] for the file the wizard just checked out, from
-    /// the ref chosen in `PickRef` and the path chosen in `PickFile`. `None` if
-    /// either piece of information is missing (shouldn't happen in practice —
-    /// both are set before a checkout is ever spawned).
-    fn build_git_origin(&self, w: &RemoteWizard) -> Option<GitOrigin> {
-        let choice = w.chosen_ref.as_ref()?;
-        let path = w.selected_path.clone()?;
-        let (ref_kind, ref_name) = git_remote::parse_ref_kind(&choice.gitref);
-        Some(GitOrigin {
-            repo_url: w.url.text(),
-            path,
-            ref_kind,
-            ref_name,
-        })
-    }
-
-    /// Build the [`WorkspaceGitOrigin`] for a Workspace whose files just
-    /// finished downloading, from the ref chosen in `PickRef`, the commit
-    /// sha resolved in `GitMsg::Files`, and the filter chosen in
-    /// `PickWorkspaceFilter`. `None` if any piece is missing (shouldn't
-    /// happen in practice — all three are set before the checkout is spawned).
-    fn build_workspace_git_origin(&self, w: &RemoteWizard) -> Option<WorkspaceGitOrigin> {
-        let choice = w.chosen_ref.as_ref()?;
-        let commit_sha = w.chosen_sha.clone()?;
-        let filter = w.chosen_workspace_filter?;
-        let (ref_kind, ref_name) = git_remote::parse_ref_kind(&choice.gitref);
-        Some(WorkspaceGitOrigin {
-            repo_url: w.url.text(),
-            commit_sha,
-            ref_kind,
-            ref_name,
-            filter,
-        })
     }
 
     /// Close the "save to git" wizard. Unlike the load wizard there is no

@@ -22,7 +22,6 @@
 // still being moved onto it one at a time; until both are, the parts only they
 // will call look dead. Remove this once `tui/remote.rs` and `gui/remote.rs`
 // drive the flow instead of their own copies.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -315,6 +314,15 @@ impl RemoteFlow {
         self.error = None;
     }
 
+    /// Record a failure the front-end detected itself, rather than one that
+    /// came back from git — an empty URL, or a filter that matches nothing.
+    /// It shows exactly like any other error, on the step the user is on.
+    pub(crate) fn fail(&mut self, message: String) {
+        self.busy = None;
+        self.rx = None;
+        self.error = Some(message);
+    }
+
     /// The branch/tag choices to offer, as one filterable list.
     pub(crate) fn ref_choices(&self, s: &Strings) -> Vec<RefChoice> {
         build_ref_choices(&self.refs, s)
@@ -394,6 +402,8 @@ impl RemoteFlow {
 
     /// Go back to the URL step, discarding anything fetched. Used by "back"
     /// affordances in both front-ends.
+    // Wanted by the GUI's "back" button, which is not on this flow yet.
+    #[allow(dead_code)]
     pub(crate) fn back_to_connect(&mut self) {
         self.repo = None;
         self.files.clear();
@@ -528,6 +538,41 @@ impl RemoteFlow {
             ref_name,
             filter,
         })
+    }
+}
+
+/// Test-only seeding, so a front-end's tests can put a flow on the step they
+/// care about without spawning threads or reaching a network. Driving the real
+/// transitions is [`RemoteFlow`]'s own job and is tested here.
+#[cfg(test)]
+impl RemoteFlow {
+    pub(crate) fn seed(
+        kind: RemoteKind,
+        url: &str,
+        step: Step,
+        files: Vec<String>,
+        repo: Option<PathBuf>,
+    ) -> Self {
+        let mut flow = RemoteFlow::new(kind);
+        flow.url = url.to_string();
+        flow.step = step;
+        flow.files = files;
+        flow.repo = repo.map(TempRepo::new);
+        flow
+    }
+
+    /// Pretend a background operation is in flight, for drawing tests.
+    pub(crate) fn seed_busy(&mut self, phase: Phase) {
+        self.busy = Some(phase);
+    }
+
+    /// Pretend a branch was chosen, for provenance assertions.
+    pub(crate) fn seed_ref(&mut self, gitref: &str, sha: &str) {
+        self.chosen_ref = Some(RefChoice {
+            label: gitref.to_string(),
+            gitref: gitref.to_string(),
+        });
+        self.commit_sha = Some(sha.to_string());
     }
 }
 

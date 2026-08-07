@@ -669,35 +669,37 @@ impl TuiApp {
 
     fn click_remote_wizard_row(&mut self, row: usize) {
         let mut activate = false;
+        let lang = self.language.clone();
         if let Some(Overlay::RemoteGit(w)) = self.overlay.as_mut() {
             let recent_len = w.recent.len();
-            match &mut w.stage {
-                RemoteStage::Connect { field, recent_sel } => {
+            match w.stage() {
+                RemoteStage::Connect => {
                     if row == 0 || row == 1 {
-                        *field = row as u8;
-                        *recent_sel = None;
+                        w.field = row as u8;
+                        w.recent_sel = None;
                     } else if row >= 10 {
                         let idx = row - 10;
                         if idx < recent_len {
-                            *recent_sel = Some(idx);
+                            w.recent_sel = Some(idx);
                             activate = true;
                         }
                     }
                 }
-                RemoteStage::PickRef { refs, sel, .. } => {
-                    if row < refs.len() {
-                        *sel = row;
+                RemoteStage::PickRef => {
+                    let s = Strings::for_language(&lang);
+                    if row < w.flow.ref_choices(&s).len() {
+                        w.sel = row;
                         activate = true;
                     }
                 }
-                RemoteStage::PickFile { files, sel, .. } => {
-                    if row < files.len() {
-                        *sel = row;
+                RemoteStage::PickFile => {
+                    if row < w.flow.pickable_files().len() {
+                        w.sel = row;
                         activate = true;
                     }
                 }
-                RemoteStage::PickWorkspaceFilter { sel } => {
-                    *sel = row.min(WorkspaceGitFilter::ALL.len().saturating_sub(1));
+                RemoteStage::PickWorkspaceFilter => {
+                    w.sel = row.min(WorkspaceGitFilter::ALL.len().saturating_sub(1));
                     activate = true;
                 }
                 _ => {}

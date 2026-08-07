@@ -19,7 +19,9 @@ use super::app::*;
 use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
-use crate::remote_flow::{RefChoice, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::remote_flow::{
+    FlowEvent, Phase, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
+};
 use tui_panel_select::wrapcache::TextPos;
 
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL
@@ -2765,7 +2767,7 @@ fn file_load_submenu_mnemonic_activates_the_item_immediately() {
     );
     press(&mut app, KeyCode::Char('g')); // "From (G)it…"
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Collection),
         "the git source both selects and activates without needing Enter"
     );
 }
@@ -2905,7 +2907,7 @@ fn file_menu_opens_the_remote_git_wizards() {
     press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Collection),
         "opens the collection git wizard"
     );
 
@@ -2918,7 +2920,7 @@ fn file_menu_opens_the_remote_git_wizards() {
     press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Environment),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Environment),
         "opens the environment git wizard"
     );
 }
@@ -2931,14 +2933,15 @@ fn connect_stage_toggles_fields_and_requires_a_url() {
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(w.stage, RemoteStage::Connect { field: 1, .. }));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(w.field, 1);
         }
         _ => panic!("wizard closed"),
     }
     // Enter with a blank URL surfaces an error rather than connecting.
     press(&mut app, KeyCode::Enter);
     match &app.overlay {
-        Some(Overlay::RemoteGit(w)) => assert!(matches!(w.stage, RemoteStage::Error(_))),
+        Some(Overlay::RemoteGit(w)) => assert_eq!(w.stage(), RemoteStage::Error),
         _ => panic!("wizard closed"),
     }
 }
@@ -2951,48 +2954,26 @@ fn esc_closes_the_wizard() {
     assert!(app.overlay.is_none(), "Esc closes the wizard");
 }
 
-#[test]
-fn ref_and_file_messages_advance_the_wizard() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-
-    // Refs -> PickRef with branches then tags.
-    let refs = RemoteRefs {
-        branches: vec!["main".into()],
-        tags: vec!["v1".into()],
-    };
-    assert!(app.apply_git_msg(&mut w, GitMsg::Refs(Ok(refs))));
-    match &w.stage {
-        RemoteStage::PickRef { refs, .. } => {
-            assert_eq!(refs.len(), 2);
-            assert_eq!(refs[0].gitref, "refs/heads/main");
-            assert_eq!(refs[1].gitref, "refs/tags/v1");
-        }
-        _ => panic!("expected PickRef"),
-    }
-
-    // Files -> PickFile and the temp repo is recorded.
-    let files = vec!["a.hurl".to_string(), "sub/b.hurl".to_string()];
-    let repo = std::env::temp_dir().join(format!("crab_test_repo_{}", std::process::id()));
-    std::fs::create_dir_all(&repo).unwrap();
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo.clone(), "deadbeef".to_string())))
-    ));
-    assert_eq!(w.repo.as_deref(), Some(repo.as_path()));
-    assert!(matches!(&w.stage, RemoteStage::PickFile { files, .. } if files.len() == 2));
-    std::fs::remove_dir_all(&repo).ok();
-}
+// The wizard's transitions themselves are tested in `crate::remote_flow`,
+// which both front-ends share. What is tested here is the terminal UI's half:
+// that it derives the right step to draw, and that it does the right thing
+// with a load once the flow hands one over.
 
 #[test]
 fn fetched_collection_content_is_loaded_as_a_tab() {
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.selected_path = Some("api/health.hurl".to_string());
+    let w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
     let before = app.collections.len();
 
     let hurl = "# Health\nGET http://127.0.0.1:8080/health\nHTTP 200\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api/health.hurl".to_string(),
+            text: hurl.to_string(),
+            origin: None,
+        },
+    );
 
     assert!(
         !keep_open,
@@ -3012,18 +2993,24 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
 
 #[test]
 fn fetched_collection_from_git_records_its_git_origin() {
-    use super::editor::Editor;
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.chosen_ref = Some(RefChoice {
-        label: "[Branches] main".into(),
-        gitref: "refs/heads/main".into(),
-    });
-    w.url = Editor::new("https://example.test/repo.git", false);
-    w.selected_path = Some("api/health.hurl".to_string());
+    let w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
+    let origin = crate::git_remote::GitOrigin {
+        repo_url: "https://example.test/repo.git".into(),
+        path: "api/health.hurl".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+    };
 
     let hurl = "GET http://127.0.0.1:8080/health\nHTTP 200\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api/health.hurl".to_string(),
+            text: hurl.to_string(),
+            origin: Some(origin),
+        },
+    );
     assert!(!keep_open, "a collection load closes the wizard");
 
     let ci = app.active_tab;
@@ -3048,11 +3035,17 @@ fn fetched_collection_from_git_records_its_git_origin() {
 #[test]
 fn fetched_environment_content_is_loaded() {
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Environment, Vec::new());
-    w.selected_path = Some("envs/staging.vars".to_string());
+    let w = RemoteWizard::new(RemoteKind::Environment, Vec::new());
 
     let vars = "BASE_URL=http://127.0.0.1:8080\nTOKEN=abc\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(vars.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "envs/staging.vars".to_string(),
+            text: vars.to_string(),
+            origin: None,
+        },
+    );
 
     assert!(!keep_open, "loading closes the wizard");
     assert_eq!(
@@ -3062,73 +3055,49 @@ fn fetched_environment_content_is_loaded() {
     );
 }
 
+/// An error takes precedence over whatever step it happened on, so the user
+/// sees what went wrong rather than a list that silently didn't change.
 #[test]
-fn a_git_error_is_shown_in_the_wizard() {
-    let mut app = TuiApp::default();
+fn an_error_is_what_the_wizard_draws_regardless_of_the_step_underneath() {
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    assert!(app.apply_git_msg(&mut w, GitMsg::Refs(Err("boom".into()))));
-    assert!(matches!(&w.stage, RemoteStage::Error(e) if e == "boom"));
+    assert_eq!(w.stage(), RemoteStage::Connect);
+    w.flow.fail("boom".into());
+    assert_eq!(w.stage(), RemoteStage::Error);
+    assert_eq!(w.flow.error(), Some("boom"));
+    // Dismissing it returns to the step it happened on rather than closing the
+    // wizard and discarding everything fetched so far.
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::RemoteGit(w)) => assert_eq!(w.stage(), RemoteStage::Connect),
+        _ => panic!("dismissing an error should not close the wizard"),
+    }
 }
 
 // ── Loading a Workspace from git ────────────────────────────────────────
 
 #[test]
-fn workspace_git_filter_matches_extensions_case_insensitively() {
-    assert!(WorkspaceGitFilter::HurlAndJson.matches("a/b.hurl"));
-    assert!(WorkspaceGitFilter::HurlAndJson.matches("a/b.JSON"));
-    assert!(!WorkspaceGitFilter::HurlAndJson.matches("a/b.txt"));
-    assert!(WorkspaceGitFilter::HurlOnly.matches("a/b.Hurl"));
-    assert!(!WorkspaceGitFilter::HurlOnly.matches("a/b.json"));
-    assert!(WorkspaceGitFilter::JsonOnly.matches("a/b.json"));
-    assert!(!WorkspaceGitFilter::JsonOnly.matches("a/b.hurl"));
-    assert!(WorkspaceGitFilter::All.matches("a/b.bin"));
-    assert!(WorkspaceGitFilter::All.matches("a/b"));
-}
-
-#[test]
-fn a_workspace_load_goes_to_the_file_filter_picker_instead_of_the_single_file_picker() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    let files = vec![
-        "a.hurl".to_string(),
-        "b.json".to_string(),
-        "big/blob.bin".to_string(),
-    ];
-    let repo = std::env::temp_dir().join(format!("crab_test_ws_repo_{}", std::process::id()));
-    std::fs::create_dir_all(&repo).unwrap();
-
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo.clone(), "deadbeef".to_string())))
-    ));
-    assert!(matches!(
-        &w.stage,
-        RemoteStage::PickWorkspaceFilter { sel: 0 }
-    ));
-    assert_eq!(
-        w.files.len(),
-        3,
-        "the full file listing is kept so the filter can be applied client-side"
-    );
-
-    std::fs::remove_dir_all(&repo).ok();
-}
-
-#[test]
 fn picking_a_workspace_filter_with_no_matches_shows_an_error_instead_of_downloading_nothing() {
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    w.files = vec!["big/blob.bin".to_string(), "readme.md".to_string()];
-    w.repo = Some(std::env::temp_dir().join("crab_test_ws_no_match"));
-    w.stage = RemoteStage::PickWorkspaceFilter { sel: 0 }; // .hurl/.json — matches nothing here
+    w.flow = RemoteFlow::seed(
+        RemoteKind::Workspace,
+        "https://example.test/repo.git",
+        Step::PickWorkspaceFilter,
+        vec!["big/blob.bin".to_string(), "readme.md".to_string()],
+        Some(std::env::temp_dir().join("crab_test_ws_no_match")),
+    );
+    // sel 0 is .hurl/.json, which matches nothing in that listing.
     app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
 
     press(&mut app, KeyCode::Enter);
 
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(&w.stage, RemoteStage::Error(_)),
+            assert_eq!(
+                w.stage(),
+                RemoteStage::Error,
                 "no matches shows an error instead of a silent no-op"
             );
         }
@@ -3138,24 +3107,24 @@ fn picking_a_workspace_filter_with_no_matches_shows_an_error_instead_of_download
 
 #[test]
 fn a_successful_workspace_download_opens_a_new_workspace_tab_bound_to_the_repo_dir() {
-    use super::editor::Editor;
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    w.url = Editor::new("https://example.test/my-repo.git", false);
+    let w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
     let repo = std::env::temp_dir().join(format!("crab_test_ws_ready_{}", std::process::id()));
     std::fs::create_dir_all(&repo).unwrap();
-    w.repo = Some(repo.clone());
 
     let before = app.collections.len();
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Workspace(Ok(repo.clone())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Workspace {
+            root: repo.clone(),
+            name: "my-repo".to_string(),
+            origin: None,
+        },
+    );
 
     assert!(
         !keep_open,
         "the wizard itself closes; the new storage-choice popup takes over"
-    );
-    assert!(
-        w.repo.is_none(),
-        "repo ownership moves to the pending choice so poll_git_updates won't delete it"
     );
     assert!(
         matches!(
@@ -3191,14 +3160,6 @@ fn a_successful_workspace_download_opens_a_new_workspace_tab_bound_to_the_repo_d
 }
 
 #[test]
-fn a_workspace_download_failure_is_shown_as_an_error() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    assert!(app.apply_git_msg(&mut w, GitMsg::Workspace(Err("no space left".into()))));
-    assert!(matches!(&w.stage, RemoteStage::Error(e) if e == "no space left"));
-}
-
-#[test]
 fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
@@ -3220,7 +3181,7 @@ fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     // …and "From Git" (sel 1) opens the wizard in Workspace mode.
     app.activate_file_load_source(FileKind::Workspace, 1);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Workspace),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Workspace),
         "the git source opens the wizard in Workspace mode"
     );
 }
@@ -3412,71 +3373,58 @@ fn spawn_workspace_redownload_fails_clearly_when_the_pinned_commit_is_gone() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Pump the wizard's background work until it reaches `want`, or the wizard
+/// closes because something finished loading. Real git calls are involved (all
+/// against a local repo, so they are quick), which is the point: this exercises
+/// the whole flow rather than hand-fed messages.
+fn pump_remote_until(app: &mut TuiApp, want: RemoteStage) {
+    for _ in 0..600 {
+        match &app.overlay {
+            Some(Overlay::RemoteGit(w)) if w.stage() == want => return,
+            Some(Overlay::RemoteGit(_)) => {}
+            // The wizard handed off to something else, which is as far as it
+            // goes; the caller asserts on whatever took over.
+            _ => return,
+        }
+        app.poll_git_updates();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the wizard never reached {want:?}");
+}
+
 #[test]
 fn a_full_workspace_git_download_records_the_commit_sha_and_filter_as_the_origin() {
-    // End-to-end through the interactive wizard: PickRef -> Files (sha
-    // captured) -> PickWorkspaceFilter (filter captured, Enter spawns
-    // the real download) -> Workspace download succeeds -> the new
-    // tab's `workspace_git_origin` has everything a later redownload
-    // would need.
+    // End-to-end through the interactive wizard against a real (local,
+    // offline) repo: connect -> pick a branch -> pick a file-type filter ->
+    // the download lands, and the new tab's `workspace_git_origin` has
+    // everything a later redownload would need.
     let (repo_url, commit_sha, base) = seed_ws_bare_repo();
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
     w.url = crate::tui::editor::Editor::new(&repo_url, false);
-    w.chosen_ref = Some(RefChoice {
-        label: "[Branches] main".into(),
-        gitref: "refs/heads/main".into(),
-    });
+    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
 
-    // A real (local, offline) `list_files` call, exactly like
-    // `spawn_git_files` would do, so `w.repo` is an actual git checkout
-    // that the later filter-driven `checkout_files` step can act on
-    // (unlike a bare freshly-`mkdir`'d directory, which has no `.git`).
-    let (files, repo_dir, listed_sha) =
-        crate::git_remote::list_files(&repo_url, None, "refs/heads/main").unwrap();
-    assert_eq!(listed_sha, commit_sha);
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo_dir.clone(), listed_sha.clone())))
-    ));
-    assert_eq!(
-        w.chosen_sha.as_deref(),
-        Some(commit_sha.as_str()),
-        "the resolved commit sha is remembered"
-    );
-    assert!(matches!(
-        &w.stage,
-        RemoteStage::PickWorkspaceFilter { sel: 0 }
-    ));
+    // Enter on the URL field lists the repo's refs.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickRef);
 
-    // Pressing Enter on the (default, sel 0 = HurlAndJson) filter choice
-    // both records `chosen_workspace_filter` and spawns the real
-    // (local, offline) download.
-    app.on_key_remote(
-        Box::new(w),
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    );
-    let Some(Overlay::RemoteGit(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open")
-    };
-    assert_eq!(
-        w.chosen_workspace_filter,
-        Some(WorkspaceGitFilter::HurlAndJson)
-    );
-    assert!(matches!(w.stage, RemoteStage::Loading { .. }));
-    let rx =
-        w.rx.take()
-            .expect("the workspace download should have been spawned");
-    let msg = rx.recv().expect("the download thread should send a result");
+    // `main` is the only branch, so it is the highlighted row; Enter on it
+    // lists that ref's files and, for a Workspace, goes to the filter step.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickWorkspaceFilter);
 
-    let keep_open = app.apply_git_msg(&mut w, msg);
-    assert!(!keep_open);
-    assert!(matches!(
-        &app.overlay,
-        Some(Overlay::WorkspaceStorageChoice { sel: 0, .. })
-    ));
-    // Enter on the default choice (sel 0 = keep temporarily) reproduces
-    // the old direct behaviour, creating the tab immediately.
+    // Enter on the default filter (sel 0 = .hurl and .json) downloads.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickWorkspaceFilter);
+
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::WorkspaceStorageChoice { sel: 0, .. })
+        ),
+        "the download finished and handed over to the storage-choice popup"
+    );
+    // Enter on the default choice (sel 0 = keep temporarily) creates the tab.
     press(&mut app, KeyCode::Enter);
     let ci = app.active_tab;
     let origin = app.collections[ci]
@@ -3484,7 +3432,10 @@ fn a_full_workspace_git_download_records_the_commit_sha_and_filter_as_the_origin
         .clone()
         .expect("a successful git Workspace download must record its origin");
     assert_eq!(origin.repo_url, repo_url);
-    assert_eq!(origin.commit_sha, commit_sha);
+    assert_eq!(
+        origin.commit_sha, commit_sha,
+        "the exact commit is pinned, not the branch"
+    );
     assert_eq!(origin.ref_kind, RefKind::Branch);
     assert_eq!(origin.ref_name, "main");
     assert_eq!(origin.filter, WorkspaceGitFilter::HurlAndJson);
@@ -12967,27 +12918,18 @@ fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
     press(&mut app, KeyCode::Down);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Connect {
-                    field: 0,
-                    recent_sel: Some(0)
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!((w.field, w.recent_sel), (0, Some(0)));
         }
         _ => panic!("wizard closed"),
     }
     press(&mut app, KeyCode::Down);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(
-                    w.stage,
-                    RemoteStage::Connect {
-                        field: 0,
-                        recent_sel: Some(1)
-                    }
-                ),
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(
+                (w.field, w.recent_sel),
+                (0, Some(1)),
                 "Down moves to the next item"
             );
         }
@@ -12999,12 +12941,8 @@ fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
             assert_eq!(w.url.text(), "https://example.test/b.git");
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Loading {
-                    phase: LoadPhase::Refs
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Loading);
+            assert_eq!(w.flow.busy(), Some(Phase::Refs));
         }
         _ => panic!("wizard closed"),
     }
@@ -13020,13 +12958,8 @@ fn up_from_the_first_recent_item_closes_the_dropdown() {
     press(&mut app, KeyCode::Up); // back out of the dropdown
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Connect {
-                    field: 0,
-                    recent_sel: None
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!((w.field, w.recent_sel), (0, None));
         }
         _ => panic!("wizard closed"),
     }
@@ -13042,14 +12975,10 @@ fn typing_closes_the_dropdown_and_edits_the_field() {
     press(&mut app, KeyCode::Char('x'));
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(
-                    w.stage,
-                    RemoteStage::Connect {
-                        field: 0,
-                        recent_sel: None
-                    }
-                ),
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(
+                (w.field, w.recent_sel),
+                (0, None),
                 "typing closes the dropdown"
             );
             assert_eq!(
@@ -13070,9 +12999,16 @@ fn completing_a_git_load_remembers_the_url_most_recent_first() {
     });
     let mut w = RemoteWizard::new(RemoteKind::Collection, app.recent_git_urls.clone());
     w.url = Editor::new("https://example.test/new.git", false);
-    w.selected_path = Some("api.hurl".into());
+    w.sync_fields();
 
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok("GET http://h/x\n".into())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api.hurl".into(),
+            text: "GET http://h/x\n".into(),
+            origin: None,
+        },
+    );
     assert!(!keep_open, "a collection load closes the wizard");
     assert_eq!(
         app.recent_git_urls,
@@ -16680,9 +16616,7 @@ fn git_wizard_loading_popup_is_wide_enough_for_the_full_title_even_with_a_short_
     // still grow to fit the title, not just the message/hint.
     use ratatui::{Terminal, backend::TestBackend};
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::Loading {
-        phase: LoadPhase::File,
-    };
+    w.flow.seed_busy(Phase::File);
     let s = crate::i18n::Strings::for_language(&Language::English);
     let th = crate::tui::theme::theme(&Language::English);
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -20459,7 +20393,7 @@ fn report_load_from_git_opens_the_report_remote_wizard() {
     app.activate_file_load_source(FileKind::Report, 1);
     assert!(matches!(
         &app.overlay,
-        Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Report
+        Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Report
     ));
 }
 
@@ -24287,4 +24221,93 @@ fn the_terminal_ui_never_persists_through_the_sessions_own_save() {
             "src/tui/{file} calls Session::save through Deref; use save_state() instead"
         );
     }
+}
+
+// ── The idle event-loop tick must not disturb what's on screen ──────────
+
+/// Everything `tui::run` calls once per pass of its event loop, before it
+/// looks at any input. Kept in one place so the test below stays in step with
+/// the loop it stands in for.
+fn idle_tick(app: &mut TuiApp) {
+    app.poll_capture_updates();
+    app.poll_git_updates();
+    app.poll_workspace_redownload_updates();
+    app.poll_git_save_updates();
+    app.poll_batch_run_updates();
+    app.poll_report_run_updates();
+}
+
+/// A poll for one overlay's background work must leave every *other* overlay
+/// alone. This is a regression test for a real one: `poll_git_updates` called
+/// `self.overlay.take()` in the `let ... else` scrutinee, which takes the
+/// overlay whether or not the pattern matches. Any menu therefore vanished on
+/// the very next tick of the event loop — within ~120ms of opening — which
+/// made the File and Settings menus unusable and left no way to quit.
+#[test]
+fn an_idle_tick_does_not_close_an_open_menu() {
+    // Every overlay a user can open with no git operation in flight; each must
+    // survive an idle tick untouched.
+    let openers: Vec<(&str, fn(&mut TuiApp))> = vec![
+        ("File", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileMenu(0))
+        }),
+        ("File > Load", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileLoadMenu(0))
+        }),
+        ("File > Save", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileSaveMenu(0))
+        }),
+        ("Settings", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Options(0))
+        }),
+        ("Preferences", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Preferences(0))
+        }),
+        ("Help", |a: &mut TuiApp| a.overlay = Some(Overlay::Help(0))),
+        ("Quit confirm", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Confirm {
+                action: ConfirmAction::Exit,
+                sel: 0,
+            })
+        }),
+    ];
+    for (name, open) in openers {
+        let mut app = TuiApp::default();
+        open(&mut app);
+        idle_tick(&mut app);
+        assert!(
+            app.overlay.is_some(),
+            "the {name} menu was closed by an idle event-loop tick"
+        );
+    }
+}
+
+/// The same guarantee driven the way a user gets there: press the key that
+/// opens the menu, then let the loop idle.
+#[test]
+fn the_file_menu_survives_the_event_loop_ticking_under_it() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(_))));
+    for _ in 0..5 {
+        idle_tick(&mut app);
+    }
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(_))),
+        "the File menu must stay open until the user closes it"
+    );
+}
+
+/// Quitting must keep working: the confirm dialog has to still be there for
+/// the keystroke that answers it.
+#[test]
+fn quitting_still_works_when_the_loop_ticks_between_keystrokes() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::Confirm {
+        action: ConfirmAction::Exit,
+        sel: 0,
+    });
+    idle_tick(&mut app);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.quit, "answering the quit confirmation must quit");
 }

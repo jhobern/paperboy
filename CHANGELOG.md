@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.4.1] - 2026-08-07
+
+### Fixed
+
+- **Menus in the terminal UI no longer close the instant they open.** The File
+  and Settings menus, and the quit confirmation, disappeared within a fraction
+  of a second of being opened, which left no way to reach any of them — or to
+  quit PaperBoy from its own interface. The wizard-polling that runs on every
+  pass of the event loop took the open overlay before checking whether the
+  overlay was the one it was interested in, and dropped whatever it found.
+
+### Changed
+
+- **Both front-ends now drive one shared "load from a git remote" flow.** The
+  terminal UI and the GUI each had their own copy of the wizard, and the copies
+  had drifted. The steps, the background work and the recorded provenance now
+  live in one place, so a fix or an improvement to the flow reaches both.
+
+
 ## [0.4.0] - 2026-08-07
 
 ### Added
