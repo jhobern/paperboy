@@ -58,6 +58,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Postman environments now load at all.** PaperBoy only ever read `.vars`
+  files, so a Postman environment export — a JSON document of `key`/`value`
+  entries — was rejected as "not an environment file", and the Load Environment
+  pickers hid `.json` outright so it couldn't even be selected. Postman
+  environments now import into the same model: enabled variables become
+  environment entries, and a value written as a provider reference
+  (`{{ op://… }}`, `{{ ssm:… }}`, `{{ env:… }}`) still resolves exactly as it
+  would in a `.vars` file. Variables Postman had disabled are skipped, since a
+  `.vars` environment has no "present but switched off" state. Both the bare
+  export and the `{"environment": …}` envelope an account backup writes are
+  accepted.
+
 - **Postman collections taken from an account backup now import.** Postman's
   "Export all data" backup and its API wrap each collection in a
   `{"collection": …}` envelope, where a single "Export collection" writes the

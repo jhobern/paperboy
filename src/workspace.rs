@@ -8,7 +8,10 @@
 //! collection — this module instead walks the real filesystem under a
 //! chosen root directory.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 /// Filesystem entries recurse at most this many levels deep below the
 /// workspace root, as a defensive guard against pathological symlink loops.
@@ -379,14 +382,69 @@ pub fn is_report_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("trail"))
 }
 
-/// Whether `path` is an environment file (`.vars`, case-insensitive). The
-/// Workspace tree uses this to tell an environment apart from a collection file
-/// (both are surfaced by [`is_matching_file`]), so selecting one opens it as a
-/// global environment rather than trying to parse it as a collection.
+/// Whether `path` is an environment file. A `.vars` file always is; a `.json`
+/// is one only if its contents are a Postman environment export, since Postman
+/// writes collections and environments to the same extension and only the
+/// content tells them apart. The Workspace tree uses this to tell an
+/// environment from a collection file (both are surfaced by
+/// [`is_matching_file`]), so selecting one opens it as a global environment
+/// rather than trying to parse it as a collection.
+///
+/// The `.json` answer is memoised: this is called for every row of every
+/// workspace redraw, and re-reading a folder of exports each frame would make
+/// scrolling the tree cost a full directory's worth of file reads. The cache
+/// key includes the file's length and modification time, so editing a file
+/// still re-classifies it.
 pub fn is_env_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("vars"))
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ext.eq_ignore_ascii_case("vars") {
+        return true;
+    }
+    if !ext.eq_ignore_ascii_case("json") {
+        return false;
+    }
+    is_postman_env_json(path)
+}
+
+/// Cached "is this `.json` a Postman environment export?" keyed by path, with
+/// the file's `(len, modified)` stamp so an edited file isn't answered from a
+/// stale entry.
+type JsonEnvCache = HashMap<PathBuf, ((u64, Option<SystemTime>), bool)>;
+static JSON_ENV_CACHE: LazyLock<Mutex<JsonEnvCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn is_postman_env_json(path: &Path) -> bool {
+    let stamp = std::fs::metadata(path)
+        .map(|m| (m.len(), m.modified().ok()))
+        .unwrap_or((0, None));
+    // A poisoned cache mutex must not take the UI down over a memo: fall back
+    // to reading the file directly.
+    if let Ok(cache) = JSON_ENV_CACHE.lock()
+        && let Some((cached_stamp, answer)) = cache.get(path)
+        && *cached_stamp == stamp
+    {
+        return *answer;
+    }
+    let answer = std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|c| crate::postman::postman_env_values(&c).is_some());
+    if let Ok(mut cache) = JSON_ENV_CACHE.lock() {
+        cache.insert(path.to_path_buf(), (stamp, answer));
+    }
+    answer
+}
+
+/// Every environment file under `root`, depth-first in the same order the
+/// Workspace tree shows them. Used by the Environments panel, which lists a
+/// workspace's environments alongside the loaded global ones whether or not
+/// they have been opened yet.
+pub fn scan_environments(root: &Path) -> Vec<PathBuf> {
+    scan_workspace(root, true)
+        .into_iter()
+        .filter(|e| !e.is_dir && is_env_file(&e.path))
+        .map(|e| e.path)
+        .collect()
 }
 
 /// Whether `path` is any file the Workspace tree surfaces — a collection

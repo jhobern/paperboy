@@ -181,12 +181,93 @@ impl Param {
     }
 }
 
+/// Unwrap the `{"<key>": {…}}` envelope Postman puts around a collection or an
+/// environment when it comes from the Postman API or an "Export all data"
+/// account backup (each `Collections/*.json` there is `{"collection": {"info":
+/// …, "item": …}}` and each `Environments/*.json` is `{"environment": {"name":
+/// …, "values": …}}`), as opposed to the bare documents a single "Export
+/// collection"/"Export environment" produces. `marker` is the field the inner
+/// document must carry for the value to be treated as an envelope, so a
+/// same-named field that happens to hold something else isn't mistaken for one.
+/// Anything else is returned untouched.
+fn unwrap_envelope(v: Value, key: &str, marker: &str) -> Value {
+    match v {
+        Value::Object(mut m) => match m.remove(key) {
+            Some(inner @ Value::Object(_)) if inner.get(marker).is_some() => inner,
+            // Not an envelope: put back what we took so the value is unchanged.
+            other => {
+                if let Some(other) = other {
+                    m.insert(key.to_string(), other);
+                }
+                Value::Object(m)
+            }
+        },
+        other => other,
+    }
+}
+
 /// `true` when `content` looks like a Postman collection export (an `info`
-/// block and an `item` array), as opposed to Hurl text.
+/// block and an `item` array), as opposed to Hurl text. Both the bare and the
+/// `{"collection": …}` enveloped shapes are recognized.
 pub fn looks_like_postman(content: &str) -> bool {
     serde_json::from_str::<Value>(content)
+        .map(|v| unwrap_envelope(v, "collection", "item"))
         .map(|v| v.get("info").is_some() && v.get("item").is_some())
         .unwrap_or(false)
+}
+
+/// A Postman environment export: a flat list of variables. Postman has no
+/// notion of PaperBoy's provider references, so every value imports as a
+/// literal — but a value that *is* written as `{{ op://… }}` / `{{ ssm:… }}`
+/// still classifies as a secret reference once it reaches
+/// [`crate::environment::parse_vars_pending`], exactly as in a `.vars` file.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PostmanEnv {
+    values: Vec<EnvValue>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct EnvValue {
+    #[serde(deserialize_with = "de_str")]
+    key: String,
+    #[serde(deserialize_with = "de_str")]
+    value: String,
+    /// Absent (or `null`) means enabled — Postman only writes this out when a
+    /// variable has been ticked off, so defaulting it to `false` (as
+    /// `#[serde(default)]` would) would silently drop every variable.
+    enabled: Option<bool>,
+}
+
+/// The `KEY`/value pairs of a Postman environment export, or `None` if
+/// `content` isn't one. Both the bare `{"name": …, "values": […]}` shape and
+/// the `{"environment": …}` envelope used by an account backup are accepted.
+///
+/// Variables Postman has disabled are dropped: they are the ones it would not
+/// send, and a `.vars` environment has no "present but off" state to map them
+/// onto. Keyless entries are dropped too, and a value carrying a newline is
+/// flattened to a space — a `.vars` file is line-based, so keeping the break
+/// would split one variable into two on the next save/reload.
+pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
+    let v = serde_json::from_str::<Value>(content).ok()?;
+    let v = unwrap_envelope(v, "environment", "values");
+    // A collection also has no `values`, but check `item` too so a document
+    // carrying both is never imported as an environment.
+    if !v.get("values").is_some_and(Value::is_array) || v.get("item").is_some() {
+        return None;
+    }
+    let env = serde_json::from_value::<PostmanEnv>(v).ok()?;
+    Some(
+        env.values
+            .into_iter()
+            .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
+            .map(|v| {
+                let value = v.value.replace(['\n', '\r'], " ");
+                (v.key.trim().to_string(), value.trim().to_string())
+            })
+            .collect(),
+    )
 }
 
 /// Parse a collection file's `content`: a Postman JSON export is imported,
@@ -205,7 +286,10 @@ pub fn parse_collection(content: &str) -> Vec<HurlEntry> {
 /// use (see [`crate::tree`]). Returns an empty vec if the JSON isn't a
 /// recognizable collection.
 pub fn import_postman(content: &str) -> Vec<HurlEntry> {
-    let Ok(root) = serde_json::from_str::<Collection>(content) else {
+    let Ok(root) = serde_json::from_str::<Value>(content)
+        .map(|v| unwrap_envelope(v, "collection", "item"))
+        .and_then(serde_json::from_value::<Collection>)
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -520,6 +604,38 @@ mod tests {
     fn non_postman_json_is_not_detected() {
         assert!(!looks_like_postman("{\"foo\": 1}"));
         assert!(!looks_like_postman("GET http://x/y\nHTTP 200\n"));
+    }
+
+    /// Postman's account backup ("Export all data") and its API wrap each
+    /// collection in a `{"collection": …}` envelope instead of exporting the
+    /// bare `{"info": …, "item": …}` shape, so both must import.
+    #[test]
+    fn enveloped_collection_export_is_detected_and_imported() {
+        let json = r#"{ "collection": {
+          "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [
+            { "name": "login", "request": { "method": "POST", "url": "{{url}}/login" } }
+          ]
+        }}"#;
+        assert!(looks_like_postman(json));
+        let e = import_postman(json);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].title, "login");
+        assert_eq!(e[0].method, "POST");
+        assert_eq!(e[0].url, "{{url}}/login");
+    }
+
+    /// A `collection` key that isn't the envelope (no `item` inside) must not
+    /// swallow the real document.
+    #[test]
+    fn collection_key_that_is_not_an_envelope_is_left_alone() {
+        let json = r#"{
+          "collection": "some-id",
+          "info": { "name": "demo" },
+          "item": [ { "name": "ping", "request": { "method": "GET", "url": "http://x/y" } } ]
+        }"#;
+        assert!(looks_like_postman(json));
+        assert_eq!(import_postman(json).len(), 1);
     }
 
     #[test]

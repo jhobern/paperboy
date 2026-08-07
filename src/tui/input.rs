@@ -6095,7 +6095,11 @@ fn browser_keep_file(action: FileAction, file: &ExplorerFile) -> bool {
             matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
         }
         FileAction::LoadEnv => {
-            matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars")
+                || e.eq_ignore_ascii_case("env")
+                // Postman exports an environment as JSON; the content check on
+                // load rejects a `.json` that turns out to be something else.
+                || e.eq_ignore_ascii_case("json"))
                 || name.eq_ignore_ascii_case(".env")
                 || name.to_ascii_lowercase().starts_with(".env.")
         }

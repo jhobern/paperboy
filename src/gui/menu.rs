@@ -546,7 +546,10 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
             title,
             dir.as_deref(),
             &[
-                (app.strings.gui_filter_environments, &["vars", "env"]),
+                (
+                    app.strings.gui_filter_environments,
+                    &["vars", "env", "json"],
+                ),
                 (app.strings.gui_filter_all, &["*"]),
             ],
         ),

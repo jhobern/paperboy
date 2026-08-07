@@ -354,7 +354,9 @@ impl LoadFlow {
         let name = name_from_repo_path(&path);
 
         remember_git_url(&mut app.session, &self.url);
-        if is_vars_file(&path) {
+        // `.json` covers both a Postman collection and a Postman environment,
+        // so the extension alone can't say which this is — ask the content.
+        if is_vars_file(&path) || crate::postman::postman_env_values(&content).is_some() {
             if app
                 .session
                 .load_environment_text(name, &content, None, Some(origin))
@@ -1366,7 +1368,10 @@ fn nonblank(s: &str) -> Option<String> {
 
 fn is_default_load_file(path: &str) -> bool {
     let ext = Path::new(path).extension().and_then(|e| e.to_str());
-    matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("vars"))
+    matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl")
+        || e.eq_ignore_ascii_case("vars")
+        // Postman exports both collections and environments as JSON.
+        || e.eq_ignore_ascii_case("json"))
 }
 
 fn is_vars_file(path: &str) -> bool {

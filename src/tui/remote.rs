@@ -250,7 +250,10 @@ pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> 
                 matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
             }
             RemoteKind::Environment => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars")
+                    || e.eq_ignore_ascii_case("env")
+                    // Postman exports an environment as JSON.
+                    || e.eq_ignore_ascii_case("json"))
                     || name.eq_ignore_ascii_case(".env")
                     || name.to_ascii_lowercase().starts_with(".env.")
             }
@@ -783,10 +786,21 @@ mod tests {
         assert_eq!(out, vec!["api/health.hurl", "postman/orders.json"]);
     }
 
+    /// `.json` is kept for environments as well as collections: the extension
+    /// can't tell a Postman environment export from a Postman collection, so
+    /// the picker shows both and the content check on load decides.
     #[test]
-    fn relevant_files_for_an_environment_keeps_vars_and_dotenv_style_files() {
+    fn relevant_files_for_an_environment_keeps_vars_dotenv_and_json_files() {
         let out = relevant_files(RemoteKind::Environment, &files());
-        assert_eq!(out, vec!["envs/dev.vars", ".env", ".env.dev-au"]);
+        assert_eq!(
+            out,
+            vec![
+                "postman/orders.json",
+                "envs/dev.vars",
+                ".env",
+                ".env.dev-au"
+            ]
+        );
     }
 
     #[test]

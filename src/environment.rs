@@ -484,16 +484,21 @@ pub fn parse_vars_pending(name: String, content: &str) -> (Environment, Vec<Pend
     let mut vars = Vec::new();
     let mut pending = Vec::new();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, raw)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        let raw = raw.trim().to_string();
+    // A Postman environment export (`.json`) is imported into the same model:
+    // its variables are just `KEY`/value pairs, so they go through the identical
+    // classification as `.vars` lines and behave the same from here on.
+    let pairs: Vec<(String, String)> = match crate::postman::postman_env_values(content) {
+        Some(pairs) => pairs,
+        None => content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, raw)| (key.trim().to_string(), raw.trim().to_string()))
+            .collect(),
+    };
+
+    for (key, raw) in pairs {
         let index = vars.len();
         vars.push(parse_var_pending(key, raw, index, &mut pending));
     }
@@ -760,10 +765,14 @@ fn extract_template(s: &str) -> Option<&str> {
     Some(s.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim())
 }
 
-/// Heuristic check that `content` is a `.vars` environment file: at least one
-/// non-comment `KEY=value` line whose key has no whitespace. This distinguishes
-/// it from a Hurl collection (whose lines are `METHOD url` / `Header: value`).
+/// Heuristic check that `content` is an environment file: a Postman
+/// environment export (`.json`), or a `.vars` file — at least one non-comment
+/// `KEY=value` line whose key has no whitespace. This distinguishes it from a
+/// Hurl collection (whose lines are `METHOD url` / `Header: value`).
 pub fn looks_like_env(content: &str) -> bool {
+    if crate::postman::postman_env_values(content).is_some() {
+        return true;
+    }
     content.lines().any(|line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1180,5 +1189,57 @@ mod tests {
         assert!(!looks_like_env("\n\n# just a comment\n"));
         // A URL query string ("KEY=val" but the key has spaces) is not a var line.
         assert!(!looks_like_env("GET http://x?a=b"));
+    }
+
+    /// A Postman environment export is an environment file too, in both the
+    /// bare shape and the `{"environment": …}` envelope an account backup uses.
+    #[test]
+    fn postman_environment_exports_are_loaded_as_environments() {
+        let bare = r#"{
+          "id": "abc", "name": "Staging",
+          "values": [
+            { "key": "url", "value": "https://staging.example", "enabled": true },
+            { "key": "token", "value": "t0k", "type": "secret" },
+            { "key": "old", "value": "gone", "enabled": false }
+          ]
+        }"#;
+        let enveloped = format!("{{ \"environment\": {} }}", bare);
+
+        for content in [bare, enveloped.as_str()] {
+            assert!(looks_like_env(content));
+            let (env, pending) = parse_vars_pending("Staging".into(), content);
+            assert!(pending.is_empty(), "plain literals need no resolution");
+            assert_eq!(
+                env.vars.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
+                vec!["url", "token"],
+                "a variable Postman disabled is not imported"
+            );
+            assert_eq!(env.vars[0].value, "https://staging.example");
+            assert!(env.vars[0].resolved);
+            // `raw` is what a later "Save Environment" writes out as `.vars`.
+            assert_eq!(env.to_vars_text(), "url=https://staging.example\ntoken=t0k");
+        }
+    }
+
+    /// A Postman value written as a provider reference is classified like the
+    /// same token in a `.vars` file, rather than being taken literally.
+    #[test]
+    fn postman_environment_value_can_be_a_provider_reference() {
+        let content = r#"{ "name": "e", "values": [
+            { "key": "TOKEN", "value": "{{ op://V/i/f }}" }
+        ]}"#;
+        let (env, pending) = parse_vars_pending("e".into(), content);
+        assert_eq!(env.vars[0].source, ValueSource::OnePassword);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// A Postman *collection* must not be mistaken for an environment.
+    #[test]
+    fn postman_collection_is_not_an_environment() {
+        let json = r#"{ "collection": {
+          "info": { "name": "demo" },
+          "item": [ { "name": "a", "request": { "method": "GET", "url": "http://x" } } ]
+        }}"#;
+        assert!(!looks_like_env(json));
     }
 }
