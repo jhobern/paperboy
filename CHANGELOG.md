@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.0] - 2026-08-08
+
+### Added
+
+- **The desktop app can now save Workspaces and Reports to Git, not just
+  collections.** Saving to Git in the desktop app could only ever push a single
+  collection to a single branch. It now offers the same choices the terminal
+  app has always had: push a whole Workspace folder back to where it came from,
+  push an open Report, save the collection's environment alongside it in the
+  same commit, and tag a release instead of committing to a branch. The
+  Workspace and Report entries appear under *Save to Git* and are only
+  selectable when there is something for them to push.
+
+### Changed
+
+- **Both apps now run the same saving logic.** Loading from Git was unified in
+  the previous release; saving now follows, so a fix or an improvement to
+  saving reaches the terminal and the desktop at the same time instead of one
+  of them drifting behind.
+
+### Fixed
+
+- **A rejected file path no longer sends the desktop app back to the start.**
+  Entering a path that would write outside the repository now reports the
+  problem on the path step itself, so it can be corrected in place.
+
+- **The terminal app now refuses file paths that escape the repository.** This
+  check existed only in the desktop app; a path like `../elsewhere.hurl` is now
+  rejected in both.
+
+- **Saving to Git from the desktop app no longer fails on a collection that was
+  never loaded from Git.** It now starts from a suggested file name and the
+  repository's default branch, as the terminal app does.
+
 ## [0.4.2] - 2026-08-08
 
 ### Fixed

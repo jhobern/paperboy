@@ -22,6 +22,7 @@ use super::remote::*;
 use crate::remote_flow::{
     FlowEvent, Phase, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
 };
+use crate::save_flow::{SaveTargetKind, TargetIntent};
 use tui_panel_select::wrapcache::TextPos;
 
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL
@@ -4915,7 +4916,8 @@ fn save_to_git_wizard_is_prefilled_from_the_collections_remembered_origin() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::Connect { field: 0 }));
+            assert_eq!(w.stage(), GitSaveStage::Connect);
+            assert_eq!(w.field, 0);
             assert_eq!(
                 w.url.text(),
                 "https://example.test/repo.git",
@@ -4927,7 +4929,7 @@ fn save_to_git_wizard_is_prefilled_from_the_collections_remembered_origin() {
                 "main",
                 "defaults to appending to the originally-loaded branch"
             );
-            assert!(w.target_kind == GitSaveTarget::Branch);
+            assert!(w.flow.target_kind == SaveTargetKind::Branch);
         }
         _ => panic!("expected the git-save wizard to open"),
     }
@@ -4954,9 +4956,10 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
         let Some(Overlay::GitSave(w)) = &mut app.overlay else {
             panic!()
         };
-        w.stage = GitSaveStage::ChoosePaths { field: 0 };
+        w.flow.seed_step(crate::save_flow::Step::ChoosePaths);
+        w.field = 0;
         assert!(
-            w.include_env,
+            w.flow.include_env,
             "an attached environment defaults to being included"
         );
     }
@@ -4966,8 +4969,9 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(!w.include_env, "space toggles the checkbox");
-            assert!(matches!(w.stage, GitSaveStage::ChoosePaths { field: 1 }));
+            assert!(!w.flow.include_env, "space toggles the checkbox");
+            assert_eq!(w.stage(), GitSaveStage::ChoosePaths);
+            assert_eq!(w.field, 1);
         }
         _ => panic!(),
     }
@@ -4975,7 +4979,7 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
     press(&mut app, KeyCode::Tab); // field 1 -> back to 0 (field 2 is now hidden)
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::ChoosePaths { field: 0 }))
+            assert_eq!((w.stage(), w.field), (GitSaveStage::ChoosePaths, 0))
         }
         _ => panic!("unchecking the env removed field 2 from the tab cycle"),
     }
@@ -4985,13 +4989,12 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
 fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existing() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: Some(RemoteRefs {
-            branches: vec!["main".into(), "develop".into()],
-            tags: vec!["v1".into()],
-        }),
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.flow.seed_refs_from(RemoteRefs {
+        branches: vec!["main".into(), "develop".into()],
+        tags: vec!["v1".into()],
+    });
+    w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Down); // open the dropdown at "main"
@@ -5001,8 +5004,8 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
         Some(Overlay::GitSave(w)) => {
             assert_eq!(w.target_name.text(), "develop");
             assert!(matches!(
-                w.stage,
-                GitSaveStage::ChooseTarget { sel: None, .. }
+                (w.stage(), w.sel),
+                (GitSaveStage::ChooseTarget, None)
             ));
         }
         _ => panic!(),
@@ -5011,8 +5014,8 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
     press(&mut app, KeyCode::Enter); // submit
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::CommitMessage));
-            assert!(w.target_intent == TargetIntent::ExistingBranch);
+            assert_eq!(w.stage(), GitSaveStage::CommitMessage);
+            assert!(w.flow.intent() == TargetIntent::ExistingBranch);
         }
         _ => panic!("expected to move to the commit-message step"),
     }
@@ -5023,13 +5026,12 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
     w.target_name = super::editor::Editor::blank();
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: Some(RemoteRefs {
-            branches: vec!["main".into()],
-            tags: vec![],
-        }),
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.flow.seed_refs_from(RemoteRefs {
+        branches: vec!["main".into()],
+        tags: vec![],
+    });
+    w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
     for ch in "feature-x".chars() {
@@ -5039,10 +5041,10 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::CommitMessage));
+            assert_eq!(w.stage(), GitSaveStage::CommitMessage);
             assert_eq!(w.target_name.text(), "feature-x");
             assert!(
-                w.target_intent == TargetIntent::NewRef,
+                w.flow.intent() == TargetIntent::NewRef,
                 "a name not on the remote is a brand-new ref"
             );
         }
@@ -5058,14 +5060,20 @@ fn choose_target_tab_toggles_between_branch_and_tag() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(w.target_kind == GitSaveTarget::Branch, "starts on Branch")
+            assert!(
+                w.flow.target_kind == SaveTargetKind::Branch,
+                "starts on Branch"
+            )
         }
         _ => panic!(),
     }
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(w.target_kind == GitSaveTarget::Tag, "Tab toggles to Tag")
+            assert!(
+                w.flow.target_kind == SaveTargetKind::Tag,
+                "Tab toggles to Tag"
+            )
         }
         _ => panic!(),
     }
@@ -5087,11 +5095,27 @@ fn app_git_save_wizard(app: &mut TuiApp, branch: &str) -> GitSaveWizard {
     });
     app.active_tab = ci;
     let mut w = GitSaveWizard::new(ci, &app.collections[ci], app.effective_env(ci));
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: None,
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.sel = None;
     w
+}
+
+/// Drive the real event-loop polling until the in-flight push finishes, exactly
+/// as the running app does, rather than reaching into the worker's channel.
+fn pump_git_save(app: &mut TuiApp) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.poll_git_save_updates();
+        match &app.overlay {
+            Some(Overlay::GitSave(w)) if w.stage() == GitSaveStage::Pushing => {}
+            _ => return,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the push never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -5166,24 +5190,24 @@ fn saving_to_git_appends_a_commit_and_updates_the_remembered_origin_and_markers(
     // `GitSaveWizard::new` already seeded (target = the original "main"
     // branch — the "append" case); the ChooseTarget/ChoosePaths key
     // handling itself is covered by the dedicated tests above.
-    w.include_env = false;
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.include_env = false;
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // spawns the real (local, offline) push
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    assert!(matches!(w.stage, GitSaveStage::Pushing));
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    let keep_open = app.apply_git_save_msg(&mut w, msg);
-    assert!(keep_open, "the Done stage stays open until dismissed");
-    assert!(
-        matches!(w.stage, GitSaveStage::Done),
-        "a successful push moves to Done"
-    );
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert_eq!(w.stage(), GitSaveStage::Pushing),
+        _ => panic!("wizard should still be open (Pushing)"),
+    }
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Done,
+            "a successful push moves to Done, and stays open until dismissed"
+        ),
+        _ => panic!("the Done stage stays open until dismissed"),
+    }
 
     assert!(matches!(app.status, Some(Status::GitSaved)));
     assert!(
@@ -5292,30 +5316,30 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
     // to the commit message (target/branch key handling is shared with the
     // collection flow, already covered above).
     assert!(
-        matches!(w.stage, GitSaveStage::Connect { .. }),
+        w.stage() == GitSaveStage::Connect,
         "opens on the Connect step"
     );
     assert_eq!(w.target_name.text(), "main");
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // enumerate the tree + push
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    assert!(
-        matches!(w.stage, GitSaveStage::Pushing),
-        "a workspace with files pushes immediately"
-    );
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    let keep_open = app.apply_git_save_msg(&mut w, msg);
-    assert!(keep_open);
-    assert!(
-        matches!(w.stage, GitSaveStage::Done),
-        "a successful workspace push moves to Done"
-    );
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Pushing,
+            "a workspace with files pushes immediately"
+        ),
+        _ => panic!("wizard should still be open (Pushing)"),
+    }
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Done,
+            "a successful workspace push moves to Done"
+        ),
+        _ => panic!("the Done stage stays open until dismissed"),
+    }
     assert!(matches!(app.status, Some(Status::GitSaved)));
 
     // The remembered origin is repinned to the freshly-pushed commit (no
@@ -5583,28 +5607,29 @@ fn saving_to_a_tag_that_already_exists_is_rejected_and_never_overwritten() {
     let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
         panic!("wizard should be open")
     };
-    w.include_env = false;
-    w.target_kind = GitSaveTarget::Tag;
+    w.flow.include_env = false;
+    w.flow.target_kind = SaveTargetKind::Tag;
     w.target_name = super::editor::Editor::new("v1.0", false);
-    w.target_intent = TargetIntent::NewRef;
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.seed_intent(TargetIntent::NewRef);
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // spawns the real push, which must self-reject
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    app.apply_git_save_msg(&mut w, msg);
-
-    match &w.stage {
-        GitSaveStage::Error(e) => assert!(
-            e.contains("already exists") || e.contains("never"),
-            "got: {e}"
-        ),
-        _ => panic!("expected the tag-exists rejection, got a different stage"),
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => {
+            let e = w.error_text();
+            assert_eq!(w.stage(), GitSaveStage::Error, "got: {e}");
+            // Specifically PaperBoy's own guard, not whatever git happened to
+            // say: the push must be refused before it is ever attempted.
+            assert_eq!(
+                e,
+                crate::i18n::Strings::for_language(&crate::i18n::Language::English).git_tag_exists,
+                "got: {e}"
+            );
+        }
+        _ => panic!("expected the tag-exists rejection to stay on screen"),
     }
     // The collection's remembered origin is untouched by a rejected save.
     assert_eq!(
@@ -20422,8 +20447,8 @@ fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
             assert!(matches!(
-                w.source,
-                crate::tui::git_save::GitSaveSource::Report { report_idx } if report_idx == idx
+                w.flow.source,
+                crate::save_flow::SaveSource::Report { report_idx } if report_idx == idx
             ));
             assert_eq!(w.collection_path.text(), "reports/nightly.trail");
         }

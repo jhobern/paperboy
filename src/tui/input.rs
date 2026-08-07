@@ -19,7 +19,7 @@ use crate::request::{self, AppVars, build_request_json};
 
 use super::app::*;
 use super::editor::*;
-use super::git_save::{GitSaveStage, GitSaveTarget};
+use super::git_save::GitSaveStage;
 use super::new_request::*;
 use super::remote::*;
 use super::reports::ReportPane;
@@ -27,6 +27,7 @@ use super::reports::{ReportView, grid_col_at_x, result_column_widths};
 use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
 use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::save_flow::SaveTargetKind;
 use crate::tui::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
@@ -715,30 +716,29 @@ impl TuiApp {
     fn click_git_save_wizard_row(&mut self, row: usize) {
         let mut activate = false;
         if let Some(Overlay::GitSave(w)) = self.overlay.as_mut() {
-            match &mut w.stage {
-                GitSaveStage::Connect { field } => {
-                    *field = row.min(2) as u8;
+            match w.stage() {
+                GitSaveStage::Connect => {
+                    w.field = row.min(2) as u8;
                 }
-                GitSaveStage::ChoosePaths { field } => {
-                    *field = row.min(2) as u8;
+                GitSaveStage::ChoosePaths => {
+                    w.field = row.min(2) as u8;
                     if row == 1 {
-                        w.include_env = !w.include_env;
+                        w.flow.include_env = !w.flow.include_env;
                     }
                 }
-                GitSaveStage::ChooseTarget { sel, refs } => {
+                GitSaveStage::ChooseTarget => {
                     if row == 0 {
-                        w.target_kind = if w.target_kind == GitSaveTarget::Branch {
-                            GitSaveTarget::Tag
+                        w.flow.target_kind = if w.flow.target_kind == SaveTargetKind::Branch {
+                            SaveTargetKind::Tag
                         } else {
-                            GitSaveTarget::Branch
+                            SaveTargetKind::Branch
                         };
                     } else if row == 1 {
-                        *sel = None;
+                        w.sel = None;
                     } else if row >= 10 {
                         let idx = row - 10;
-                        let branch_len = refs.as_ref().map(|r| r.branches.len()).unwrap_or(0);
-                        if idx < branch_len {
-                            *sel = Some(idx);
+                        if idx < w.flow.refs().branches.len() {
+                            w.sel = Some(idx);
                             activate = true;
                         }
                     }

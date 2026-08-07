@@ -13,9 +13,7 @@
 //! entries kick a flow off with [`RemoteUi::open_load`] /
 //! [`RemoteUi::open_load_workspace`] / [`RemoteUi::open_save_collection`].
 
-use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui;
@@ -24,6 +22,11 @@ use crate::git_remote::{self, GitOrigin, RefKind};
 use crate::i18n::{Status, Strings};
 use crate::remote_flow::{
     FlowEvent, RefChoice, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
+};
+
+use crate::environment::Environment;
+use crate::save_flow::{
+    SaveEvent, SaveFlow as CoreSaveFlow, SaveSource, SaveTargetKind, Step as CoreStep,
 };
 
 use super::app::GuiApp;
@@ -43,9 +46,15 @@ enum Flow {
     Save(SaveFlow),
 }
 
-#[derive(Clone, Copy)]
+/// What the save dialog was opened on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaveTarget {
     Collection(usize),
+    /// A whole workspace tab previously downloaded from git.
+    Workspace(usize),
+    /// The open report editor. The GUI has only ever one report open at a time,
+    /// so unlike the terminal UI there is no index to carry.
+    Report,
 }
 
 /// What a load flow is fetching: one file (a collection or an environment,
@@ -279,126 +288,218 @@ impl LoadFlow {
     }
 }
 
+/// The GUI's presentation of [`crate::save_flow`].
+///
+/// Like [`LoadFlow`], everything about *what a save does* lives in the shared
+/// flow — which the terminal UI drives too — and this owns only the dialog:
+/// which step is on screen, the branch dropdown selection, and errors the GUI
+/// raises itself before the flow is involved.
 struct SaveFlow {
     target: SaveTarget,
-    initialized: bool,
-    /// True when the target collection/environment no longer exists, so saving
-    /// is impossible; disables the Save button without matching on error text.
+    /// The shared state machine, built on the first frame once the app's tabs
+    /// can be read.
+    flow: Option<CoreSaveFlow>,
+    /// A snapshot of the collection's effective environment, used to build the
+    /// `.vars` that can ride along in the same commit.
+    env: Option<Environment>,
+    /// True when the target tab no longer exists, so saving is impossible; this
+    /// disables the buttons without matching on error text.
     blocked: bool,
-    item_name: String,
-    url: String,
-    token: String,
-    branch: String,
-    path: String,
-    message: String,
-    error: Option<String>,
-    rx: Option<Receiver<WorkerMsg>>,
-    busy_label: Option<&'static str>,
+    /// The branch picked from the dropdown, if the user used it.
+    selected_branch: usize,
+    /// The last step that wasn't a failure. The shared flow replaces the whole
+    /// step with `Failed`, which is right for the terminal UI's dedicated error
+    /// screen but wrong here: the GUI shows the error inline above the step, so
+    /// a rejected path must leave the user on the path step to fix it rather
+    /// than throwing them back to the URL.
+    last_step: SaveStep,
+    /// An error the GUI raised itself, kept apart from the flow's own so
+    /// neither can hide the other.
+    local_error: Option<String>,
 }
 
 impl SaveFlow {
     fn new(target: SaveTarget) -> Self {
         Self {
             target,
-            initialized: false,
+            flow: None,
+            env: None,
             blocked: false,
-            item_name: String::new(),
-            url: String::new(),
-            token: String::new(),
-            branch: "main".to_string(),
-            path: String::new(),
-            message: String::new(),
-            error: None,
-            rx: None,
-            busy_label: None,
+            selected_branch: 0,
+            last_step: SaveStep::Connect,
+            local_error: None,
         }
     }
 
+    /// Build the shared flow from whatever the dialog was opened on. Deferred to
+    /// the first frame because the tabs aren't reachable when the menu item is
+    /// clicked.
     fn ensure_initialized(&mut self, app: &GuiApp) {
-        if self.initialized {
+        if self.flow.is_some() || self.blocked {
             return;
         }
-        self.initialized = true;
-
         match self.target {
             SaveTarget::Collection(ci) => {
                 let Some(col) = app.session.collections.get(ci) else {
-                    self.error = Some(app.strings.gui_git_err_collection_missing.to_string());
-                    self.blocked = true;
-                    return;
+                    return self.block(app.strings.gui_git_err_collection_missing);
                 };
-                self.item_name = col.name.clone();
-                self.message = format!("{} {}", app.strings.gui_git_update_prefix, col.name);
-                if let Some(origin) = &col.git_origin {
-                    self.url = origin.repo_url.clone();
-                    self.branch = origin.ref_name.clone();
-                    self.path = origin.path.clone();
-                } else {
-                    self.path = default_save_path(&col.name, col.path.as_deref(), "hurl");
-                }
+                let env = app.session.effective_env(ci);
+                self.flow = Some(CoreSaveFlow::for_collection(ci, col, env.as_ref()));
+                self.env = env;
+            }
+            SaveTarget::Workspace(ci) => {
+                let Some(col) = app.session.collections.get(ci) else {
+                    return self.block(app.strings.gui_git_err_collection_missing);
+                };
+                let Some(origin) = col.workspace_git_origin.clone() else {
+                    return self.block(app.strings.gui_git_err_ws_not_from_git);
+                };
+                self.flow = Some(CoreSaveFlow::for_workspace(ci, col, &origin));
+            }
+            SaveTarget::Report => {
+                let Some(editor) = app.report_editor.as_ref() else {
+                    return self.block(app.strings.gui_git_err_collection_missing);
+                };
+                self.flow = Some(CoreSaveFlow::for_report(0, &editor.report));
             }
         }
+    }
+
+    fn block(&mut self, message: &str) {
+        self.blocked = true;
+        self.local_error = Some(message.to_string());
     }
 
     fn is_busy(&self) -> bool {
-        self.rx.is_some()
+        self.flow.as_ref().is_some_and(CoreSaveFlow::is_busy)
     }
 
-    fn token_opt(&self) -> Option<String> {
-        nonblank(self.token.trim())
+    /// Which step to draw. A blocked dialog stays on the first step so its
+    /// explanation is visible; a failure keeps the user wherever they were,
+    /// with the reason shown above it.
+    fn step(&self) -> SaveStep {
+        let Some(flow) = self.flow.as_ref() else {
+            return SaveStep::Connect;
+        };
+        match flow.step() {
+            CoreStep::Failed(_) => self.last_step,
+            CoreStep::Connect => SaveStep::Connect,
+            CoreStep::ChoosePaths => SaveStep::ChoosePaths,
+            CoreStep::ChooseTarget => SaveStep::ChooseTarget,
+            CoreStep::CommitMessage => SaveStep::CommitMessage,
+            CoreStep::Done => SaveStep::Done,
+        }
+    }
+
+    /// Remember the step being drawn, so a later failure can return to it.
+    /// Called once per frame, before drawing.
+    fn remember_step(&mut self) {
+        let step = self.step();
+        self.last_step = step;
+    }
+
+    /// Whichever error is current: the GUI's own, or the flow's.
+    fn error(&self) -> Option<&str> {
+        self.local_error
+            .as_deref()
+            .or_else(|| self.flow.as_ref().and_then(CoreSaveFlow::error))
+    }
+
+    fn clear_errors(&mut self) {
+        self.local_error = None;
+        if let Some(flow) = self.flow.as_mut() {
+            flow.clear_error();
+        }
+    }
+
+    /// The label for the operation in flight, so the dialog says what it is
+    /// waiting on rather than just greying out.
+    fn busy_label(&self, s: &Strings) -> Option<&'static str> {
+        self.flow.as_ref()?.busy().map(|p| p.label(s))
     }
 
     fn poll(&mut self, app: &mut GuiApp) -> bool {
-        let Some(msg) = poll_worker(
-            &mut self.rx,
-            &mut self.busy_label,
-            &mut self.error,
-            &app.strings,
-        ) else {
+        let Some(flow) = self.flow.as_mut() else {
             return false;
         };
-
-        match msg {
-            WorkerMsg::Save(Ok(_)) => self.finish_save(app),
-            WorkerMsg::Save(Err(e)) => {
-                self.error = Some(e);
-                false
-            }
+        match flow.poll(&app.strings) {
+            Some(SaveEvent::Pushed { commit_sha }) => self.finish_save(app, &commit_sha),
+            None => false,
         }
     }
 
-    fn finish_save(&mut self, app: &mut GuiApp) -> bool {
-        let origin = GitOrigin {
-            repo_url: self.url.trim().to_string(),
-            path: self.path.trim().to_string(),
-            ref_kind: RefKind::Branch,
-            ref_name: self.branch.trim().to_string(),
+    /// After a successful push: clear the tab's edit markers exactly as a local
+    /// save does and, for a branch target only, remember where it now lives. A
+    /// tag is a snapshot, so later edits keep following the branch.
+    fn finish_save(&mut self, app: &mut GuiApp, commit_sha: &str) -> bool {
+        let Some(flow) = self.flow.as_ref() else {
+            return false;
         };
-
-        match self.target {
-            SaveTarget::Collection(ci) => {
+        let repin = flow.target_kind.repins_origin();
+        match flow.source {
+            SaveSource::Collection { ci } => {
                 let Some(col) = app.session.collections.get_mut(ci) else {
-                    self.error = Some(app.strings.gui_git_err_collection_closed.to_string());
+                    self.local_error = Some(app.strings.gui_git_err_collection_closed.to_string());
                     return false;
                 };
-                col.git_origin = Some(origin);
-                // The push is the collection's save — clear its edit markers
-                // exactly as a local Save does.
+                if repin {
+                    col.git_origin = Some(flow.pushed_origin());
+                }
+                // The push *is* this collection's save, so clear its edit
+                // markers exactly as a local Save does.
                 col.mark_saved();
+                if repin
+                    && flow.include_env
+                    && let Some(env_id) = self.env.as_ref().map(|e| e.id)
+                    && let Some(env) = app.session.global_envs.iter_mut().find(|e| e.id == env_id)
+                {
+                    env.git_origin = Some(GitOrigin {
+                        path: flow.env_path.trim().to_string(),
+                        ..flow.pushed_origin()
+                    });
+                }
+            }
+            SaveSource::Workspace { ci, filter, .. } => {
+                // A workspace push commits the folder as it sits on disk, so
+                // there are no per-request markers to clear. Repin to the exact
+                // commit just pushed, so a later redownload fetches this state
+                // rather than wherever the branch has moved to by then.
+                if repin && let Some(col) = app.session.collections.get_mut(ci) {
+                    col.workspace_git_origin = Some(WorkspaceGitOrigin {
+                        repo_url: flow.url.trim().to_string(),
+                        commit_sha: commit_sha.to_string(),
+                        ref_kind: RefKind::Branch,
+                        ref_name: flow.target_name.trim().to_string(),
+                        filter,
+                    });
+                }
+            }
+            SaveSource::Report { .. } => {
+                if let Some(editor) = app.report_editor.as_mut() {
+                    editor.report.dirty = false;
+                    if repin {
+                        editor.report.git_origin = Some(flow.pushed_origin());
+                    }
+                }
             }
         }
 
-        remember_git_url(&mut app.session, &self.url);
+        remember_git_url(&mut app.session, &flow.url);
         app.session.status = Some(Status::GitSaved);
         app.session.save();
         true
     }
 }
 
-/// A finished background push. Loading has no equivalent here: its workers
-/// belong to [`crate::remote_flow`], which both front-ends share.
-enum WorkerMsg {
-    Save(Result<String, String>),
+/// Which step of the save dialog is on screen. Derived from the shared flow by
+/// [`SaveFlow::step`] rather than tracked alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveStep {
+    Connect,
+    ChoosePaths,
+    ChooseTarget,
+    CommitMessage,
+    Done,
 }
 
 #[derive(Default)]
@@ -417,6 +518,13 @@ enum UiAction {
     KeepWorkspaceTemp,
     /// Copy the downloaded Workspace somewhere permanent, then open that.
     SaveWorkspacePermanently,
+    /// Save, step 1: connect to the repo and list its branches and tags.
+    SaveConnect,
+    /// Save, step 2: accept the in-repo paths and move on to the target ref.
+    SaveChoosePaths,
+    /// Save, step 3: accept the branch/tag and move on to the commit message.
+    SaveChooseTarget,
+    /// Save, final step: build the payload and push it.
     Save,
 }
 
@@ -444,6 +552,17 @@ impl RemoteUi {
         self.flow = Some(Flow::Save(SaveFlow::new(SaveTarget::Collection(ci))));
     }
 
+    /// Begin saving the whole Workspace tab `ci` came from back to the git
+    /// remote it was downloaded from.
+    pub fn open_save_workspace(&mut self, ci: usize) {
+        self.flow = Some(Flow::Save(SaveFlow::new(SaveTarget::Workspace(ci))));
+    }
+
+    /// Begin saving the open report to a git remote.
+    pub fn open_save_report(&mut self) {
+        self.flow = Some(Flow::Save(SaveFlow::new(SaveTarget::Report)));
+    }
+
     fn is_open(&self) -> bool {
         self.flow.is_some()
     }
@@ -461,6 +580,7 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     };
     if let Flow::Save(save) = &mut flow {
         save.ensure_initialized(app);
+        save.remember_step();
     }
 
     if flow.poll(app) {
@@ -504,12 +624,42 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
                 start_list_refs(load, &app.strings);
             }
         }
-        UiAction::BackToConnect => {
-            if let Flow::Load(load) = &mut flow {
+        UiAction::SaveConnect => {
+            if let Flow::Save(save) = &mut flow {
+                save.clear_errors();
+                if let Some(f) = save.flow.as_mut() {
+                    f.submit_connect(&app.strings);
+                }
+            }
+        }
+        UiAction::SaveChoosePaths => {
+            if let Flow::Save(save) = &mut flow {
+                save.clear_errors();
+                if let Some(f) = save.flow.as_mut() {
+                    f.submit_paths(&app.strings);
+                }
+            }
+        }
+        UiAction::SaveChooseTarget => {
+            if let Flow::Save(save) = &mut flow {
+                save.clear_errors();
+                if let Some(f) = save.flow.as_mut() {
+                    f.submit_target();
+                }
+            }
+        }
+        UiAction::BackToConnect => match &mut flow {
+            Flow::Load(load) => {
                 load.flow.back_to_connect();
                 load.local_error = None;
             }
-        }
+            Flow::Save(save) => {
+                save.clear_errors();
+                if let Some(f) = save.flow.as_mut() {
+                    f.back_to_connect();
+                }
+            }
+        },
         UiAction::BrowseFiles => {
             if let Flow::Load(load) = &mut flow {
                 start_list_files(load, &app.strings);
@@ -548,6 +698,7 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         }
         UiAction::Save => {
             if let Flow::Save(save) = &mut flow {
+                save.clear_errors();
                 start_save(save, app);
             }
         }
@@ -930,87 +1081,196 @@ fn draw_load_pick_file(
 
 fn draw_save(ui: &mut egui::Ui, save: &mut SaveFlow, colors: UiColors, s: &Strings) -> UiAction {
     let busy = save.is_busy();
+    let busy_label = save.busy_label(s);
+    let error = save.error().map(str::to_string);
+    draw_busy_and_error(ui, busy_label, error.as_deref(), colors);
+
+    if save.blocked {
+        // There is nothing left to save; only the way out is offered.
+        return if ui.button(s.gui_cancel).clicked() {
+            UiAction::Cancel
+        } else {
+            UiAction::None
+        };
+    }
+
+    let step = save.step();
+    let Some(flow) = save.flow.as_mut() else {
+        return UiAction::None;
+    };
     let mut action = UiAction::None;
 
-    draw_busy_and_error(ui, save.busy_label, save.error.as_deref(), colors);
-
-    ui.colored_label(colors.accent, s.gui_git_repo_url);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut save.url).desired_width(f32::INFINITY),
-    );
-    ui.add_space(4.0);
-    ui.colored_label(colors.accent, s.gui_git_token);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut save.token).desired_width(f32::INFINITY),
-    );
-    ui.add_space(4.0);
-    ui.colored_label(colors.accent, s.gui_git_branch);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut save.branch).desired_width(f32::INFINITY),
-    );
-    ui.add_space(4.0);
-    ui.colored_label(colors.accent, s.gui_git_path);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut save.path).desired_width(f32::INFINITY),
-    );
-    ui.add_space(4.0);
-    ui.colored_label(colors.accent, s.gui_git_commit_message);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut save.message).desired_width(f32::INFINITY),
-    );
-    ui.add_space(8.0);
-
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                !busy
-                    && !save.url.trim().is_empty()
-                    && !save.branch.trim().is_empty()
-                    && !save.path.trim().is_empty()
-                    && !save.blocked,
-                egui::Button::new(s.gui_git_save),
-            )
-            .clicked()
-        {
-            action = UiAction::Save;
+    match step {
+        SaveStep::Connect => {
+            ui.colored_label(colors.accent, s.gui_git_repo_url);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut flow.url).desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
+            ui.colored_label(colors.accent, s.gui_git_token);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut flow.token).desired_width(f32::INFINITY),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !flow.url.trim().is_empty(),
+                        egui::Button::new(s.gui_git_connect),
+                    )
+                    .clicked()
+                {
+                    action = UiAction::SaveConnect;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new(s.gui_cancel))
+                    .clicked()
+                {
+                    action = UiAction::Cancel;
+                }
+            });
         }
-        if ui
-            .add_enabled(!busy, egui::Button::new(s.gui_cancel))
-            .clicked()
-        {
-            action = UiAction::Cancel;
+        SaveStep::ChoosePaths => {
+            ui.colored_label(colors.accent, s.gui_git_path);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut flow.path).desired_width(f32::INFINITY),
+            );
+            if save.env.is_some() && flow.source.can_include_env() {
+                ui.add_space(6.0);
+                ui.add_enabled(
+                    !busy,
+                    egui::Checkbox::new(&mut flow.include_env, s.git_save_include_env_label),
+                );
+                if flow.include_env {
+                    ui.add_space(4.0);
+                    ui.colored_label(colors.accent, s.git_save_env_path_label);
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut flow.env_path).desired_width(f32::INFINITY),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !flow.path.trim().is_empty(),
+                        egui::Button::new(s.gui_git_next),
+                    )
+                    .clicked()
+                {
+                    action = UiAction::SaveChoosePaths;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new(s.gui_git_back))
+                    .clicked()
+                {
+                    action = UiAction::BackToConnect;
+                }
+            });
         }
-    });
+        SaveStep::ChooseTarget => {
+            // Branch or tag is the one choice with real consequences here — a
+            // tag is never overwritten — so it is a visible toggle rather than
+            // something inferred from the name.
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut flow.target_kind,
+                    SaveTargetKind::Branch,
+                    s.gui_git_branches,
+                );
+                ui.selectable_value(&mut flow.target_kind, SaveTargetKind::Tag, s.gui_git_tags);
+            });
+            ui.add_space(4.0);
+            ui.colored_label(
+                colors.accent,
+                if flow.target_kind == SaveTargetKind::Branch {
+                    s.gui_git_branch
+                } else {
+                    s.gui_git_tag
+                },
+            );
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut flow.target_name).desired_width(f32::INFINITY),
+            );
 
-    action
-}
-
-fn poll_worker(
-    rx: &mut Option<Receiver<WorkerMsg>>,
-    busy_label: &mut Option<&'static str>,
-    error: &mut Option<String>,
-    s: &Strings,
-) -> Option<WorkerMsg> {
-    let result = rx.as_ref().map(Receiver::try_recv)?;
-    match result {
-        Ok(msg) => {
-            *rx = None;
-            *busy_label = None;
-            Some(msg)
+            // Offer the branches that already exist, so appending to one is a
+            // click rather than an exact-spelling exercise.
+            let branches = flow.refs().branches.clone();
+            if flow.target_kind == SaveTargetKind::Branch && !branches.is_empty() {
+                ui.add_space(4.0);
+                egui::ComboBox::from_id_salt("git_save_existing_branch")
+                    .selected_text(s.gui_git_existing_branch)
+                    .show_ui(ui, |ui| {
+                        for (i, branch) in branches.iter().enumerate() {
+                            if ui
+                                .selectable_label(save.selected_branch == i, branch)
+                                .clicked()
+                            {
+                                save.selected_branch = i;
+                                flow.target_name = branch.clone();
+                            }
+                        }
+                    });
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !flow.target_name.trim().is_empty(),
+                        egui::Button::new(s.gui_git_next),
+                    )
+                    .clicked()
+                {
+                    action = UiAction::SaveChooseTarget;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new(s.gui_git_back))
+                    .clicked()
+                {
+                    action = UiAction::BackToConnect;
+                }
+            });
         }
-        Err(TryRecvError::Empty) => None,
-        Err(TryRecvError::Disconnected) => {
-            *rx = None;
-            *busy_label = None;
-            *error = Some(s.gui_git_err_worker_ended.to_string());
-            None
+        SaveStep::CommitMessage => {
+            ui.colored_label(colors.accent, s.gui_git_commit_message);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut flow.message).desired_width(f32::INFINITY),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !busy && !flow.message.trim().is_empty(),
+                        egui::Button::new(s.gui_git_save),
+                    )
+                    .clicked()
+                {
+                    action = UiAction::Save;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new(s.gui_cancel))
+                    .clicked()
+                {
+                    action = UiAction::Cancel;
+                }
+            });
+        }
+        SaveStep::Done => {
+            ui.colored_label(colors.accent, s.gui_git_saved);
+            ui.add_space(8.0);
+            if ui.button(s.gui_close).clicked() {
+                action = UiAction::Cancel;
+            }
         }
     }
+
+    action
 }
 
 fn start_list_refs(load: &mut LoadFlow, s: &Strings) {
@@ -1047,55 +1307,28 @@ fn start_checkout(load: &mut LoadFlow, s: &Strings) {
     load.flow.choose_file(path);
 }
 
+/// Final save step: look up whatever the dialog was opened on — it may have
+/// been closed while the dialog was up — hand it to the shared flow to turn
+/// into files, and let the flow push. The lookup is the only part that has to
+/// live here; the validation and the push are shared with the terminal UI.
 fn start_save(save: &mut SaveFlow, app: &mut GuiApp) {
-    let Some(url) = nonblank(save.url.trim()) else {
-        save.error = Some(app.strings.gui_git_err_url_required.to_string());
+    let Some(flow) = save.flow.as_ref() else {
         return;
     };
-    let Some(branch) = nonblank(save.branch.trim()) else {
-        save.error = Some(app.strings.gui_git_err_branch_required.to_string());
-        return;
+    let payload = match &flow.source {
+        SaveSource::Workspace { root, .. } => CoreSaveFlow::workspace_payload(root, &app.strings),
+        SaveSource::Collection { ci } => match app.session.collections.get(*ci) {
+            Some(col) => flow.collection_payload(col, save.env.as_ref(), &app.strings),
+            None => Err(app.strings.git_save_source_gone.to_string()),
+        },
+        SaveSource::Report { .. } => match app.report_editor.as_ref() {
+            Some(editor) => Ok(flow.report_payload(&editor.report)),
+            None => Err(app.strings.git_save_source_gone.to_string()),
+        },
     };
-    let path = match clean_repo_path(&save.path, &app.strings) {
-        Ok(path) => path,
-        Err(e) => {
-            save.error = Some(e);
-            return;
-        }
-    };
-    let message = nonblank(save.message.trim()).unwrap_or_else(|| {
-        let item = if save.item_name.trim().is_empty() {
-            app.strings.gui_untitled
-        } else {
-            save.item_name.trim()
-        };
-        format!("{} {item}", app.strings.gui_git_update_prefix)
-    });
-
-    let content = match save.target {
-        SaveTarget::Collection(ci) => {
-            let Some(col) = app.session.collections.get(ci) else {
-                save.error = Some(app.strings.gui_git_err_collection_missing.to_string());
-                return;
-            };
-            col.to_hurl()
-        }
-    };
-
-    save.url = url.clone();
-    save.branch = branch.clone();
-    save.path = path.clone();
-    save.message = message.clone();
-    save.error = None;
-    save.rx = Some(spawn_save(
-        url,
-        save.token_opt(),
-        branch,
-        path,
-        content,
-        message,
-    ));
-    save.busy_label = Some(app.strings.gui_git_saving);
+    if let Some(flow) = save.flow.as_mut() {
+        flow.submit_message(payload);
+    }
 }
 
 fn start_workspace_checkout(load: &mut LoadFlow, s: &Strings) {
@@ -1150,45 +1383,6 @@ fn save_workspace_permanently(load: &mut LoadFlow, app: &mut GuiApp) -> bool {
     true
 }
 
-fn spawn_save(
-    url: String,
-    token: Option<String>,
-    branch: String,
-    path: String,
-    content: String,
-    message: String,
-) -> Receiver<WorkerMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        // The three remote-git calls are dependent, so they live in one worker
-        // and the GUI only polls a single result while the window stays alive.
-        let author = git_remote::author_identity();
-        let target_ref = git_remote::branch_ref(&branch);
-        let result = match git_remote::fetch_base(&url, token.as_deref(), &target_ref) {
-            Ok((repo, base_sha)) => {
-                let pushed = (|| {
-                    let new_sha = git_remote::commit_files(
-                        &repo,
-                        &base_sha,
-                        &[(path, content)],
-                        &message,
-                        &author.0,
-                        &author.1,
-                    )?;
-                    git_remote::push_commit(&url, token.as_deref(), &repo, &new_sha, &target_ref)?;
-                    Ok(new_sha)
-                })();
-                git_remote::scrub_remote(&repo);
-                git_remote::cleanup(&repo);
-                pushed
-            }
-            Err(e) => Err(e),
-        };
-        let _ = tx.send(WorkerMsg::Save(result));
-    });
-    rx
-}
-
 fn nonblank(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -1237,49 +1431,6 @@ fn file_stem_from_url(url: &str) -> String {
     }
 }
 
-fn default_save_path(name: &str, local_path: Option<&Path>, ext: &str) -> String {
-    if let Some(file_name) = local_path
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-    {
-        return file_name.to_string();
-    }
-
-    let mut file_name = name
-        .trim()
-        .chars()
-        .map(|ch| if matches!(ch, '/' | '\\') { '_' } else { ch })
-        .collect::<String>();
-    if file_name.is_empty() {
-        file_name = "paperboy".to_string();
-    }
-    if Path::new(&file_name).extension().is_none() {
-        file_name.push('.');
-        file_name.push_str(ext);
-    }
-    file_name
-}
-
-fn clean_repo_path(path: &str, s: &Strings) -> Result<String, String> {
-    let mut cleaned = path.trim().replace('\\', "/");
-    while let Some(rest) = cleaned.strip_prefix("./") {
-        cleaned = rest.to_string();
-    }
-    if cleaned.is_empty() {
-        return Err(s.gui_git_err_path_required.to_string());
-    }
-    for component in Path::new(&cleaned).components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(s.gui_git_err_path_relative.to_string());
-            }
-        }
-    }
-    Ok(cleaned)
-}
-
 fn short_sha(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
@@ -1296,6 +1447,8 @@ fn remember_git_url(session: &mut crate::session::Session, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::Collection;
+    use crate::hurl::HurlEntry;
     use crate::i18n::Language;
     use crate::remote_flow::Step;
     use crate::session::Session;
@@ -1580,6 +1733,221 @@ mod tests {
                 .iter()
                 .any(|c| c.workspace_root.is_some()),
             "the workspace tab was opened"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    /// Stand in for the egui frame loop for a save, mirroring
+    /// [`pump_until_past`]. Returns whether the push finished.
+    fn pump_save_until_past(save: &mut SaveFlow, app: &mut GuiApp, step: SaveStep) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if save.poll(app) {
+                return true;
+            }
+            if save.step() != step || save.error().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stuck on {step:?} (error: {:?})",
+                save.error()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(save.error(), None, "flow failed on {step:?}");
+        false
+    }
+
+    /// Wait for the branch/tag listing, which is fetched in the background
+    /// while the target step is already on screen.
+    fn pump_save_until_refs(save: &mut SaveFlow, app: &mut GuiApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while save.is_busy() {
+            assert!(!save.poll(app), "the flow finished before the refs arrived");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ref listing never arrived (error: {:?})",
+                save.error()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(save.error(), None, "listing the refs failed");
+    }
+
+    /// A session whose *only* tab is a collection with one request, so
+    /// `Collection(0)` is unambiguous.
+    fn session_with_collection() -> Session {
+        let mut session = Session::default();
+        session.collections.clear();
+        let col = Collection::new(
+            "Demo".to_string(),
+            vec![HurlEntry {
+                method: "GET".to_string(),
+                url: "https://example.com/a".to_string(),
+                // Unsaved, as a tab about to be pushed would be.
+                user_added: true,
+                ..Default::default()
+            }],
+        );
+        session.collections.push(col);
+        session
+    }
+
+    /// A save opened on a tab that has since been closed must say so and offer
+    /// no way to push, rather than failing somewhere deep in the worker.
+    #[test]
+    fn saving_a_collection_that_is_gone_is_blocked_up_front() {
+        let app = GuiApp::for_test(Session::default());
+        let gone = app.session.collections.len();
+        let mut save = SaveFlow::new(SaveTarget::Collection(gone));
+        save.ensure_initialized(&app);
+        assert!(save.blocked);
+        assert_eq!(
+            save.error(),
+            Some(app.strings.gui_git_err_collection_missing)
+        );
+        assert!(save.flow.is_none(), "no push machinery is built at all");
+    }
+
+    /// Pushing a workspace back needs somewhere to push it to. A tab opened
+    /// from a local folder has no remote, so the dialog explains that instead
+    /// of presenting an empty URL box that can never work.
+    #[test]
+    fn saving_a_workspace_that_did_not_come_from_git_is_blocked() {
+        let app = GuiApp::for_test(session_with_collection());
+        let mut save = SaveFlow::new(SaveTarget::Workspace(0));
+        save.ensure_initialized(&app);
+        assert!(save.blocked);
+        assert_eq!(save.error(), Some(app.strings.gui_git_err_ws_not_from_git));
+    }
+
+    /// The dialog's steps are derived from the shared flow rather than tracked
+    /// beside it, so the two can't disagree about where the user is.
+    #[test]
+    fn the_save_step_shown_follows_the_shared_flow() {
+        let app = GuiApp::for_test(session_with_collection());
+        let mut save = SaveFlow::new(SaveTarget::Collection(0));
+        save.ensure_initialized(&app);
+        assert_eq!(save.step(), SaveStep::Connect);
+
+        let flow = save.flow.as_mut().unwrap();
+        flow.seed_step(CoreStep::ChoosePaths);
+        assert_eq!(save.step(), SaveStep::ChoosePaths);
+        save.flow
+            .as_mut()
+            .unwrap()
+            .seed_step(CoreStep::ChooseTarget);
+        assert_eq!(save.step(), SaveStep::ChooseTarget);
+        save.flow
+            .as_mut()
+            .unwrap()
+            .seed_step(CoreStep::CommitMessage);
+        assert_eq!(save.step(), SaveStep::CommitMessage);
+        save.flow.as_mut().unwrap().seed_step(CoreStep::Done);
+        assert_eq!(save.step(), SaveStep::Done);
+    }
+
+    /// A failure puts the dialog back on the first step *and* keeps the message
+    /// visible, so the user can correct the URL or token and retry.
+    #[test]
+    fn a_failed_save_returns_to_the_first_step_with_the_reason() {
+        let app = GuiApp::for_test(session_with_collection());
+        let mut save = SaveFlow::new(SaveTarget::Collection(0));
+        save.ensure_initialized(&app);
+        save.flow
+            .as_mut()
+            .unwrap()
+            .seed_step(CoreStep::Failed("remote hung up".into()));
+        assert_eq!(save.step(), SaveStep::Connect);
+        assert_eq!(save.error(), Some("remote hung up"));
+        save.clear_errors();
+        assert_eq!(save.error(), None);
+    }
+
+    /// A path escaping the repository would write outside the checkout when the
+    /// commit is applied, so it is refused before any worker starts.
+    #[test]
+    fn a_save_path_that_escapes_the_repository_is_refused() {
+        let app = GuiApp::for_test(session_with_collection());
+        let s = Strings::for_language(&Language::English);
+        let mut save = SaveFlow::new(SaveTarget::Collection(0));
+        save.ensure_initialized(&app);
+        let flow = save.flow.as_mut().unwrap();
+        flow.seed_step(CoreStep::ChoosePaths);
+        save.remember_step();
+        let flow = save.flow.as_mut().unwrap();
+        flow.path = "../outside.hurl".to_string();
+        assert!(!flow.submit_paths(&s));
+        assert_eq!(save.step(), SaveStep::ChoosePaths, "the user stays put");
+        assert!(save.error().is_some());
+    }
+
+    /// The whole save path against a real repository: connect, choose the path
+    /// and the branch, and push. This is the counterpart to
+    /// `a_file_can_be_loaded_from_a_real_repository_end_to_end`, and the test
+    /// the GUI lacked while it carried its own copy of the push.
+    #[test]
+    fn a_collection_can_be_saved_to_a_real_repository_end_to_end() {
+        let (repo_url, base) = seed_bare_repo();
+        let mut app = GuiApp::for_test(session_with_collection());
+        let s = Strings::for_language(&Language::English);
+
+        let mut save = SaveFlow::new(SaveTarget::Collection(0));
+        save.ensure_initialized(&app);
+        let flow = save.flow.as_mut().unwrap();
+        flow.url = repo_url.clone();
+        flow.submit_connect(&s);
+        assert_eq!(save.step(), SaveStep::ChoosePaths);
+
+        let flow = save.flow.as_mut().unwrap();
+        flow.path = "demo.hurl".to_string();
+        assert!(flow.submit_paths(&s));
+
+        // The refs are fetched while the user is already on the target step, so
+        // wait for the listing rather than for the step to change.
+        pump_save_until_refs(&mut save, &mut app);
+        let flow = save.flow.as_mut().unwrap();
+        assert!(
+            flow.refs().branches.iter().any(|b| b == "main"),
+            "the branch listing arrived so an existing branch can be appended to"
+        );
+        flow.target_name = "main".to_string();
+        assert!(flow.submit_target());
+        assert_eq!(save.step(), SaveStep::CommitMessage);
+
+        save.flow.as_mut().unwrap().message = "from the GUI".to_string();
+        start_save(&mut save, &mut app);
+        assert!(
+            pump_save_until_past(&mut save, &mut app, SaveStep::CommitMessage),
+            "the push completed"
+        );
+
+        // The commit really landed: read it back out of the bare repo.
+        let bare = base.join("bare.git");
+        let out = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "show",
+                "main:demo.hurl",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "demo.hurl is on main: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("https://example.com/a"),
+            "the request itself was committed, not an empty file"
+        );
+
+        let col = &app.session.collections[0];
+        assert_eq!(
+            col.git_origin.as_ref().map(|o| o.path.as_str()),
+            Some("demo.hurl"),
+            "the collection remembers where it now lives"
+        );
+        assert!(
+            col.entries.iter().all(|e| !e.user_added && !e.modified),
+            "the push counts as this tab's save, so the edit markers are cleared"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

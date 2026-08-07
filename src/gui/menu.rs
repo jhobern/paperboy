@@ -300,6 +300,36 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
                 close_menu = true;
                 ui.close();
             }
+            // Only offered where it can work: a workspace push needs a tab that
+            // came from git, and a report push needs a report to be open.
+            let ci = app.active_ci();
+            let is_ws = app
+                .session
+                .collections
+                .get(ci)
+                .is_some_and(|c| c.workspace_git_origin.is_some());
+            if ui
+                .add_enabled(
+                    is_ws,
+                    egui::Button::new(app.strings.gui_menu_item_workspace),
+                )
+                .clicked()
+            {
+                app.remote.open_save_workspace(ci);
+                close_menu = true;
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    app.report_editor.is_some(),
+                    egui::Button::new(app.strings.file_kind_report),
+                )
+                .clicked()
+            {
+                app.remote.open_save_report();
+                close_menu = true;
+                ui.close();
+            }
         });
         ui.separator();
 

@@ -21,6 +21,7 @@ use super::git_save::*;
 use super::new_request::*;
 use super::remote::*;
 use crate::remote_flow::{FlowEvent, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::save_flow::{SaveFlow, SaveSource, SaveTargetKind};
 use tui_panel_select::MultiSelectPanel;
 use tui_panel_select::wrapcache::TextPos;
 
@@ -3872,35 +3873,24 @@ impl TuiApp {
     }
 
     /// Handle a key while the "save to git" wizard is open.
+    ///
+    /// Every decision about what a keystroke *means* for the save itself lives
+    /// in [`crate::save_flow`]; this maps keys onto it and manages the editors.
     pub(crate) fn on_key_git_save(&mut self, mut w: Box<GitSaveWizard>, key: KeyEvent) {
-        match &mut w.stage {
-            GitSaveStage::Connect { field } => match key.code {
+        let s = Strings::for_language(&self.language);
+        match w.stage() {
+            GitSaveStage::Connect => match key.code {
                 KeyCode::Esc => return self.close_git_save(),
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    *field = 1 - *field
+                    w.field = 1 - w.field;
                 }
                 KeyCode::Enter => {
-                    if w.url.text().trim().is_empty() {
-                        let s = Strings::for_language(&self.language);
-                        w.stage = GitSaveStage::Error(s.git_url_required.to_string());
-                    } else if matches!(w.source, GitSaveSource::Workspace { .. }) {
-                        // A Workspace push has no per-file path to choose (the
-                        // whole tree is committed as-is), so skip ChoosePaths
-                        // and go straight to picking the branch/tag, spawning
-                        // the refs fetch as ChoosePaths would have.
-                        let url = w.url.text();
-                        let token = w.token_opt();
-                        w.rx = Some(spawn_git_save_refs(url, token));
-                        w.stage = GitSaveStage::ChooseTarget {
-                            sel: None,
-                            refs: None,
-                        };
-                    } else {
-                        w.stage = GitSaveStage::ChoosePaths { field: 0 };
-                    }
+                    w.sync();
+                    w.flow.submit_connect(&s);
+                    w.field = 0;
                 }
                 _ => {
-                    let ed = if *field == 0 {
+                    let ed = if w.field == 0 {
                         &mut w.url
                     } else {
                         &mut w.token
@@ -3908,20 +3898,21 @@ impl TuiApp {
                     apply_edit_key(ed, key);
                 }
             },
-            GitSaveStage::ChoosePaths { field } => {
-                let has_env = w.has_env;
-                let include_env = w.include_env;
+            GitSaveStage::ChoosePaths => {
+                // Only the fields actually on screen take focus: the checkbox
+                // and the env path are absent without an environment, and the
+                // env path is hidden while the checkbox is unticked.
                 let mut visible = vec![0u8];
-                if has_env {
+                if w.has_env() {
                     visible.push(1);
-                    if include_env {
+                    if w.flow.include_env {
                         visible.push(2);
                     }
                 }
                 match key.code {
                     KeyCode::Esc => return self.close_git_save(),
                     KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                        let idx = visible.iter().position(|f| f == field).unwrap_or(0);
+                        let idx = visible.iter().position(|f| *f == w.field).unwrap_or(0);
                         let back = matches!(key.code, KeyCode::BackTab | KeyCode::Up);
                         let n = visible.len();
                         let next = if back {
@@ -3929,25 +3920,19 @@ impl TuiApp {
                         } else {
                             (idx + 1) % n
                         };
-                        *field = visible[next];
+                        w.field = visible[next];
                     }
-                    KeyCode::Char(' ') if *field == 1 => w.include_env = !w.include_env,
+                    KeyCode::Char(' ') if w.field == 1 => {
+                        w.flow.include_env = !w.flow.include_env;
+                    }
                     KeyCode::Enter => {
-                        let paths_ok = !w.collection_path.text().trim().is_empty()
-                            && (!w.include_env || !w.env_path.text().trim().is_empty());
-                        if paths_ok {
-                            let url = w.url.text();
-                            let token = w.token_opt();
-                            w.rx = Some(spawn_git_save_refs(url, token));
-                            w.stage = GitSaveStage::ChooseTarget {
-                                sel: None,
-                                refs: None,
-                            };
+                        w.sync();
+                        if w.flow.submit_paths(&s) {
+                            w.sel = None;
                         }
                     }
                     _ => {
-                        let f = *field;
-                        let ed = match f {
+                        let ed = match w.field {
                             2 => Some(&mut w.env_path),
                             1 => None, // the checkbox has no text to type into
                             _ => Some(&mut w.collection_path),
@@ -3958,73 +3943,59 @@ impl TuiApp {
                     }
                 }
             }
-            GitSaveStage::ChooseTarget { sel, refs } => {
-                let branches = refs
-                    .as_ref()
-                    .map(|r| r.branches.clone())
-                    .unwrap_or_default();
+            GitSaveStage::ChooseTarget => {
+                let branches = w.flow.refs().branches.clone();
                 match key.code {
-                    KeyCode::Esc if sel.is_some() => *sel = None,
+                    KeyCode::Esc if w.sel.is_some() => w.sel = None,
                     KeyCode::Esc => return self.close_git_save(),
                     KeyCode::Tab | KeyCode::BackTab => {
-                        w.target_kind = if w.target_kind == GitSaveTarget::Branch {
-                            GitSaveTarget::Tag
+                        w.flow.target_kind = if w.flow.target_kind == SaveTargetKind::Branch {
+                            SaveTargetKind::Tag
                         } else {
-                            GitSaveTarget::Branch
+                            SaveTargetKind::Branch
                         };
                     }
-                    KeyCode::Down if sel.is_none() => {
+                    KeyCode::Down if w.sel.is_none() => {
                         if !branches.is_empty() {
-                            *sel = Some(0);
+                            w.sel = Some(0);
                         }
                     }
                     KeyCode::Down => {
-                        if let Some(i) = *sel {
-                            *sel = Some((i + 1).min(branches.len().saturating_sub(1)));
+                        if let Some(i) = w.sel {
+                            w.sel = Some((i + 1).min(branches.len().saturating_sub(1)));
                         }
                     }
                     KeyCode::Up => {
-                        if let Some(i) = *sel {
-                            *sel = if i == 0 { None } else { Some(i - 1) };
+                        if let Some(i) = w.sel {
+                            w.sel = if i == 0 { None } else { Some(i - 1) };
                         }
                     }
-                    KeyCode::Enter if sel.is_some() => {
-                        if let Some(name) = sel.and_then(|i| branches.get(i)) {
+                    KeyCode::Enter if w.sel.is_some() => {
+                        if let Some(name) = w.sel.and_then(|i| branches.get(i)) {
                             w.target_name = Editor::new(name, false);
-                            w.target_kind = GitSaveTarget::Branch;
+                            w.flow.target_kind = SaveTargetKind::Branch;
                         }
-                        *sel = None;
+                        w.sel = None;
                     }
                     KeyCode::Enter => {
-                        let name = w.target_name.text().trim().to_string();
-                        if !name.is_empty() {
-                            let is_existing_branch = w.target_kind == GitSaveTarget::Branch
-                                && branches.iter().any(|b| b == &name);
-                            w.target_intent = if is_existing_branch {
-                                TargetIntent::ExistingBranch
-                            } else {
-                                TargetIntent::NewRef
-                            };
-                            if w.commit_msg.text().trim().is_empty() {
-                                let ci = w.ci;
-                                let default_msg =
-                                    format!("Update {} via PaperBoy", self.collections[ci].name);
-                                w.commit_msg = Editor::new(&default_msg, false);
-                            }
-                            w.stage = GitSaveStage::CommitMessage;
+                        w.sync();
+                        if w.flow.submit_target() {
+                            // The flow may have restored a cleared commit
+                            // message; show what it will actually push.
+                            w.commit_msg = Editor::new(&w.flow.message, false);
                         }
                     }
-                    KeyCode::Backspace if sel.is_none() => {
+                    KeyCode::Backspace if w.sel.is_none() => {
                         w.target_name.backspace();
                     }
-                    KeyCode::Char(c) if sel.is_none() => {
+                    KeyCode::Char(c) if w.sel.is_none() => {
                         w.target_name.insert(c);
                     }
                     _ => {
                         // Typing anything while the dropdown is open closes it
                         // and edits the field normally (matches the load
                         // wizard's recent-URL dropdown behaviour).
-                        *sel = None;
+                        w.sel = None;
                         apply_edit_key(&mut w.target_name, key);
                     }
                 }
@@ -4032,69 +4003,9 @@ impl TuiApp {
             GitSaveStage::CommitMessage => match key.code {
                 KeyCode::Esc => return self.close_git_save(),
                 KeyCode::Enter => {
-                    if !w.commit_msg.text().trim().is_empty() {
-                        let ci = w.ci;
-                        let files = match &w.source {
-                            GitSaveSource::Workspace { root, .. } => {
-                                match crate::workspace::collect_files_for_commit(root) {
-                                    Ok(files) if !files.is_empty() => files,
-                                    Ok(_) => {
-                                        let s = Strings::for_language(&self.language);
-                                        w.stage = GitSaveStage::Error(
-                                            s.git_save_workspace_empty.to_string(),
-                                        );
-                                        self.overlay = Some(Overlay::GitSave(w));
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        w.stage = GitSaveStage::Error(e.to_string());
-                                        self.overlay = Some(Overlay::GitSave(w));
-                                        return;
-                                    }
-                                }
-                            }
-                            GitSaveSource::Collection => {
-                                // Refuse to push a file PaperBoy couldn't read
-                                // back (see `SaveCollection`): an empty-path
-                                // file field breaks reparsing.
-                                if let Some((req, field)) =
-                                    self.collections[ci].first_empty_file_field()
-                                {
-                                    let s = Strings::for_language(&self.language);
-                                    w.stage = GitSaveStage::Error(
-                                        Status::SaveUnreadableEmptyFile { req, field }.text(&s),
-                                    );
-                                    self.overlay = Some(Overlay::GitSave(w));
-                                    return;
-                                }
-                                let col = &self.collections[ci];
-                                let mut files = vec![(w.collection_path.text(), col.to_hurl())];
-                                if w.include_env
-                                    && let Some(env) = w.env.as_ref()
-                                {
-                                    files.push((w.env_path.text(), env.to_vars_text()));
-                                }
-                                files
-                            }
-                            GitSaveSource::Report { report_idx } => {
-                                // Push the report's source text as-is to the
-                                // chosen path (no accompanying env file).
-                                let text = self.reports[*report_idx].report.text.clone();
-                                vec![(w.collection_path.text(), text)]
-                            }
-                        };
-                        w.rx = Some(spawn_git_save_push(
-                            w.url.text(),
-                            w.token_opt(),
-                            w.origin_gitref.clone(),
-                            w.target_kind,
-                            w.target_name.text(),
-                            w.target_intent,
-                            files,
-                            w.commit_msg.text(),
-                        ));
-                        w.stage = GitSaveStage::Pushing;
-                    }
+                    w.sync();
+                    let payload = self.git_save_payload(&w, &s);
+                    w.flow.submit_message(payload);
                 }
                 _ => apply_edit_key(&mut w.commit_msg, key),
             },
@@ -4103,9 +4014,36 @@ impl TuiApp {
                     return self.close_git_save();
                 }
             }
-            GitSaveStage::Done | GitSaveStage::Error(_) => return self.close_git_save(),
+            GitSaveStage::Done | GitSaveStage::Error => return self.close_git_save(),
         }
         self.overlay = Some(Overlay::GitSave(w));
+    }
+
+    /// Assemble the files this save will commit, reading whatever the wizard is
+    /// pointed at out of the app's own tabs. The assembly rules themselves
+    /// (including the refusals) belong to [`crate::save_flow`].
+    fn git_save_payload(
+        &self,
+        w: &GitSaveWizard,
+        s: &Strings,
+    ) -> Result<Vec<crate::save_flow::SaveFile>, String> {
+        match &w.flow.source {
+            SaveSource::Workspace { root, .. } => SaveFlow::workspace_payload(root, s),
+            SaveSource::Collection { ci } => {
+                let col = self
+                    .collections
+                    .get(*ci)
+                    .ok_or_else(|| s.git_save_source_gone.to_string())?;
+                w.flow.collection_payload(col, w.env.as_ref(), s)
+            }
+            SaveSource::Report { report_idx } => {
+                let rt = self
+                    .reports
+                    .get(*report_idx)
+                    .ok_or_else(|| s.git_save_source_gone.to_string())?;
+                Ok(w.flow.report_payload(&rt.report))
+            }
+        }
     }
 
     /// Poll the "save to git" wizard's in-flight background op (called each
@@ -4114,136 +4052,77 @@ impl TuiApp {
         let Some(mut w) = take_overlay!(self, Overlay::GitSave(w) => w) else {
             return;
         };
-        let Some(rx) = w.rx.as_ref() else {
-            self.overlay = Some(Overlay::GitSave(w));
-            return;
-        };
-        match rx.try_recv() {
-            Ok(msg) => {
-                w.rx = None;
-                let keep_open = self.apply_git_save_msg(&mut w, msg);
-                self.overlay = if keep_open {
-                    Some(Overlay::GitSave(w))
-                } else {
-                    None
-                };
-            }
-            Err(mpsc::TryRecvError::Empty) => self.overlay = Some(Overlay::GitSave(w)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                w.rx = None;
-                self.overlay = Some(Overlay::GitSave(w));
-            }
+        let s = Strings::for_language(&self.language);
+        if let Some(crate::save_flow::SaveEvent::Pushed { commit_sha }) = w.flow.poll(&s) {
+            self.finish_git_save(&w, &commit_sha);
         }
+        self.overlay = Some(Overlay::GitSave(w));
     }
 
-    /// Apply a completed "save to git" message. Returns whether the wizard
-    /// should stay open (both a completed push and a failure stay open, to
-    /// show a result/error until the user dismisses it).
-    pub(crate) fn apply_git_save_msg(&mut self, w: &mut GitSaveWizard, msg: GitSaveMsg) -> bool {
-        match msg {
-            GitSaveMsg::Refs(Ok(refs)) => {
-                if let GitSaveStage::ChooseTarget { refs: r, .. } = &mut w.stage {
-                    *r = Some(refs);
-                }
-                true
-            }
-            GitSaveMsg::Refs(Err(e)) => {
-                w.stage = GitSaveStage::Error(e);
-                true
-            }
-            GitSaveMsg::Pushed(Ok(new_sha)) => {
-                self.finish_git_save(w, &new_sha);
-                w.stage = GitSaveStage::Done;
-                true
-            }
-            GitSaveMsg::Pushed(Err(err)) => {
-                let s = Strings::for_language(&self.language);
-                w.stage = GitSaveStage::Error(match err {
-                    GitSaveError::TagExists => s.git_tag_exists.to_string(),
-                    GitSaveError::RefExistsRace => s.git_ref_exists_race.to_string(),
-                    GitSaveError::Other(e) => e,
-                });
-                true
-            }
-        }
-    }
-
-    /// After a successful push: clear the "new"/"modified" markers (same as
-    /// a local Save) and, for a **branch** target only, remember it as the
-    /// collection's (and, if included, the environment's) new git origin. A
-    /// tag-target save clears the markers too but leaves the remembered
-    /// branch origin untouched, per spec.
+    /// After a successful push: clear the "new"/"modified" markers, exactly as
+    /// a local save does, and — for a **branch** target only — remember where
+    /// the item now lives. A tag save clears the markers too but leaves the
+    /// remembered branch origin alone: a tag is a snapshot, so later edits must
+    /// keep following the branch rather than a frozen point on it.
     fn finish_git_save(&mut self, w: &GitSaveWizard, new_sha: &str) {
-        let ci = w.ci;
-        if let GitSaveSource::Report { report_idx } = &w.source {
-            // A report push has no per-request markers; just clear the dirty
-            // flag and, for a branch target, repin the report's git origin to
-            // the path/branch just pushed (a tag save leaves it untouched,
-            // mirroring the collection flow).
-            let idx = *report_idx;
-            if let Some(rt) = self.reports.get_mut(idx) {
-                rt.report.dirty = false;
-                if w.target_kind == GitSaveTarget::Branch {
-                    rt.report.git_origin = Some(GitOrigin {
-                        repo_url: w.url.text(),
-                        path: w.collection_path.text(),
+        let repin = w.flow.target_kind.repins_origin();
+        match &w.flow.source {
+            SaveSource::Report { report_idx } => {
+                // A report has no per-request markers; just clear its dirty
+                // flag and repin it like a collection.
+                if let Some(rt) = self.reports.get_mut(*report_idx) {
+                    rt.report.dirty = false;
+                    if repin {
+                        rt.report.git_origin = Some(w.flow.pushed_origin());
+                    }
+                }
+            }
+            SaveSource::Workspace { ci, filter, .. } => {
+                // A workspace push commits the on-disk tree, not the in-memory
+                // collection, so there are no per-request markers to clear.
+                // Repin to the exact commit just pushed, so a later redownload
+                // fetches this state rather than whatever the branch points at
+                // by then.
+                if repin && let Some(col) = self.collections.get_mut(*ci) {
+                    col.workspace_git_origin = Some(WorkspaceGitOrigin {
+                        repo_url: w.flow.url.trim().to_string(),
+                        commit_sha: new_sha.to_string(),
                         ref_kind: RefKind::Branch,
-                        ref_name: w.target_name.text(),
+                        ref_name: w.flow.target_name.trim().to_string(),
+                        filter: *filter,
                     });
                 }
             }
-            self.remember_git_url(&w.url.text());
-            self.save_state();
-            self.status = Some(Status::GitSaved);
-            return;
-        }
-        if let GitSaveSource::Workspace { filter, .. } = &w.source {
-            // A Workspace push commits the on-disk tree, not the in-memory
-            // collection, so there are no per-request "modified" markers to
-            // clear. For a branch target, repin the remembered origin to the
-            // exact commit just pushed so a later redownload fetches it (and
-            // follows the same branch); a tag target leaves the origin
-            // untouched, mirroring the collection flow.
-            if w.target_kind == GitSaveTarget::Branch {
-                self.collections[ci].workspace_git_origin = Some(WorkspaceGitOrigin {
-                    repo_url: w.url.text(),
-                    commit_sha: new_sha.to_string(),
-                    ref_kind: RefKind::Branch,
-                    ref_name: w.target_name.text(),
-                    filter: *filter,
-                });
-            }
-            self.remember_git_url(&w.url.text());
-            self.save_state();
-            self.status = Some(Status::GitSaved);
-            return;
-        }
-        self.mark_collection_saved(ci);
-        if w.include_env
-            && let Some(env_id) = w.env.as_ref().map(|e| e.id)
-        {
-            self.mark_env_saved(env_id);
-        }
-        if w.target_kind == GitSaveTarget::Branch {
-            self.collections[ci].git_origin = Some(GitOrigin {
-                repo_url: w.url.text(),
-                path: w.collection_path.text(),
-                ref_kind: RefKind::Branch,
-                ref_name: w.target_name.text(),
-            });
-            if w.include_env
-                && let Some(env_id) = w.env.as_ref().map(|e| e.id)
-                && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
-            {
-                env.git_origin = Some(GitOrigin {
-                    repo_url: w.url.text(),
-                    path: w.env_path.text(),
-                    ref_kind: RefKind::Branch,
-                    ref_name: w.target_name.text(),
-                });
+            SaveSource::Collection { ci } => {
+                let ci = *ci;
+                self.mark_collection_saved(ci);
+                let env_id = w
+                    .flow
+                    .include_env
+                    .then(|| w.env.as_ref().map(|e| e.id))
+                    .flatten();
+                if let Some(env_id) = env_id {
+                    self.mark_env_saved(env_id);
+                }
+                if repin {
+                    let origin = w.flow.pushed_origin();
+                    if let Some(col) = self.collections.get_mut(ci) {
+                        col.git_origin = Some(origin.clone());
+                    }
+                    // The environment went up in the same commit, so it is
+                    // reachable at its own path on the same branch.
+                    if let Some(env_id) = env_id
+                        && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
+                    {
+                        env.git_origin = Some(GitOrigin {
+                            path: w.flow.env_path.trim().to_string(),
+                            ..origin
+                        });
+                    }
+                }
             }
         }
-        self.remember_git_url(&w.url.text());
+        self.remember_git_url(&w.flow.url);
         self.save_state();
         self.status = Some(Status::GitSaved);
     }
