@@ -202,12 +202,16 @@ fn draw_code_section(
     let mut changed = false;
 
     // Representation toggle (Hurl source vs. resolved JSON), mirroring the TUI.
+    let (lbl_json, lbl_hurl) = (
+        app.strings.gui_code_repr_json,
+        app.strings.gui_code_repr_hurl,
+    );
     ui.horizontal(|ui| {
-        if widgets::selectable(ui, !*code_show_hurl, "JSON").clicked() {
+        if widgets::selectable(ui, !*code_show_hurl, lbl_json).clicked() {
             *code_show_hurl = false;
             app.code_edit.key = None;
         }
-        if widgets::selectable(ui, *code_show_hurl, "Hurl").clicked() {
+        if widgets::selectable(ui, *code_show_hurl, lbl_hurl).clicked() {
             *code_show_hurl = true;
             app.code_edit.key = None;
         }
@@ -350,6 +354,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     {
         let entry = &mut app.session.collections[ci].entries[sel];
         let name_label = app.strings.gui_name;
+        let url_hint = app.strings.gui_hint_url;
         ui.horizontal(|ui| {
             ui.label(RichText::new(name_label).color(theme.dim));
             let name = ui.add(
@@ -363,14 +368,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if widgets::method_combo(ui, "method", &mut entry.method) {
+            if widgets::method_combo(ui, &theme, "method", &mut entry.method) {
                 changed = true;
             }
             let send_w = 92.0;
             let url = ui.add_sized(
                 [ui.available_width() - send_w, 24.0],
                 egui::TextEdit::singleline(&mut entry.url)
-                    .hint_text("https://api.example.com/path")
+                    .hint_text(url_hint)
                     .font(egui::TextStyle::Monospace),
             );
             if url.changed() {
@@ -774,7 +779,7 @@ fn assert_editor(
                 egui::TextEdit::singleline(&mut asserts[i])
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("jsonpath \"$.status\" == \"ok\""),
+                    .hint_text(s.gui_hint_assert),
             );
             if r.changed() {
                 changed = true;
@@ -861,7 +866,7 @@ fn form_editor(
                 fields[i].kind = kind;
                 let hint = match kind {
                     FormFieldKind::Text => s.gui_hint_value,
-                    _ => "/path/to/file",
+                    _ => s.gui_hint_file_path,
                 };
                 // Value fills the last column; the remove ✕ is tucked to its
                 // right (see the note in `widgets::kv_editor`).

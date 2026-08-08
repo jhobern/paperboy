@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.2] - 2026-08-08
+
+### Fixed
+
+- **Saving a workspace or a report to Git said "Save collection to Git"**. The
+  dialog had one hardcoded title for all three save targets, so two of the
+  three announced themselves as something they weren't. Each target now titles
+  its own dialog.
+- **A dialog could crash the GUI instead of asking its question.** The shared
+  modal shell unwrapped egui's "did the window draw?" result twice; a frame in
+  which the window wasn't drawn panicked. An undrawn frame is now simply not an
+  answer — the dialog stays open and asks again.
+
+### Changed
+
+- **The GUI's last hardcoded display strings now come from the translation
+  table**, so French and Danish get them too: the language names in Settings,
+  the Raw Request view's JSON / Hurl toggle, the URL, assertion and file-path
+  field hints, and the name a new report is created with.
+- **A custom HTTP verb's badge follows the theme.** Methods PaperBoy has no
+  colour for fell back to a fixed grey, which was the only colour in the GUI
+  that ignored the active theme; they now use the theme's dim colour.
+
+
 ## [0.7.1] - 2026-08-08
 
 ### Changed

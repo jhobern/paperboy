@@ -134,9 +134,13 @@ impl GuiTheme {
 
 /// The badge colour for an HTTP method, from the shared `hurl::method_rgb`
 /// table (so GET/POST/… colours match the terminal UI exactly).
-pub fn method_color(method: &str) -> Color32 {
+///
+/// A method the table has no colour for (a custom verb) falls back to the
+/// caller's `fallback` rather than a fixed grey, so every colour the GUI paints
+/// still comes from the active theme.
+pub fn method_color(method: &str, fallback: Color32) -> Color32 {
     match crate::hurl::method_rgb(method) {
         Some((r, g, b)) => Color32::from_rgb(r, g, b),
-        None => Color32::GRAY,
+        None => fallback,
     }
 }

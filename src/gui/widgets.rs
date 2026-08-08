@@ -210,25 +210,33 @@ pub fn tree_header_marked<R>(
 }
 
 /// A coloured HTTP-method badge, matching the terminal UI's method colours.
-pub fn method_badge(ui: &mut egui::Ui, method: &str) {
-    let col = method_color(method);
+/// `theme` supplies the colour for any verb the shared table doesn't name.
+pub fn method_badge(ui: &mut egui::Ui, theme: &GuiTheme, method: &str) {
+    let col = method_color(method, theme.dim);
     ui.label(RichText::new(method).strong().monospace().color(col));
 }
 
 /// A method picker combo box. Returns true if the method changed.
 pub fn method_combo(
     ui: &mut egui::Ui,
+    theme: &GuiTheme,
     id: impl std::hash::Hash + std::fmt::Debug,
     method: &mut String,
 ) -> bool {
     let mut changed = false;
-    let col = method_color(method);
+    let col = method_color(method, theme.dim);
     egui::ComboBox::from_id_salt(id)
         .selected_text(RichText::new(method.clone()).strong().color(col))
         .width(96.0)
         .show_ui(ui, |ui| {
             for m in METHODS {
-                if selectable(ui, method == m, RichText::new(m).color(method_color(m))).clicked() {
+                if selectable(
+                    ui,
+                    method == m,
+                    RichText::new(m).color(method_color(m, theme.dim)),
+                )
+                .clicked()
+                {
                     *method = m.to_string();
                     changed = true;
                 }

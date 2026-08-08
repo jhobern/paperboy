@@ -546,6 +546,9 @@ strings! {
     tabs_heading => "Collections", "Collections", "Samlinger";
     suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
+    // The GUI numbers its scratch reports so several can be told apart in the
+    // list; `{n}` is the report's position.
+    gui_new_report_name => "Report {n}", "Rapport {n}", "Rapport {n}";
     status_not_report => "The active tab is not a report.", "L'onglet actif n'est pas un rapport.", "Den aktive fane er ikke en rapport.";
     report_bound_status => "Report bound to", "Rapport lié à", "Rapport bundet til";
     report_source_heading => "Report Source", "Source du rapport", "Rapportkilde";
@@ -727,6 +730,10 @@ strings! {
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
+    // The two representations the Raw Request view can show. Both are format
+    // names rather than words, so they read the same in every language.
+    gui_code_repr_json => "JSON", "JSON", "JSON";
+    gui_code_repr_hurl => "Hurl", "Hurl", "Hurl";
     gui_code_parse_error => "Invalid request text — edits not applied.", "Texte de requête invalide — modifications non appliquées.", "Ugyldig anmodningstekst — ændringer ikke anvendt.";
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";
@@ -758,6 +765,12 @@ strings! {
     gui_hint_description => "note", "note", "note";
     gui_hint_option => "option", "option", "indstilling";
     gui_hint_field => "field", "champ", "felt";
+    // Example-shaped hints. The URL and the Hurl assertion are literal syntax
+    // (a URL, a Hurl expression), so they stay identical across languages;
+    // only the file-path placeholder has words to translate.
+    gui_hint_url => "https://api.example.com/path", "https://api.example.com/path", "https://api.example.com/path";
+    gui_hint_assert => "jsonpath \"$.status\" == \"ok\"", "jsonpath \"$.status\" == \"ok\"", "jsonpath \"$.status\" == \"ok\"";
+    gui_hint_file_path => "/path/to/file", "/chemin/vers/fichier", "/sti/til/fil";
     gui_hint_key_upper => "KEY", "CLÉ", "NØGLE";
     // Response viewer.
     gui_error => "Error", "Erreur", "Fejl";
@@ -1087,6 +1100,8 @@ strings! {
     gui_git_pick_ref => "Pick a branch or tag", "Choisir une branche ou une étiquette", "Vælg en gren eller et tag";
     gui_git_load_title => "Load from Git", "Charger depuis Git", "Indlæs fra Git";
     gui_git_save_collection_title => "Save collection to Git", "Enregistrer la collection sur Git", "Gem samling til Git";
+    gui_git_save_workspace_title => "Save workspace to Git", "Enregistrer l'espace de travail sur Git", "Gem workspace til Git";
+    gui_git_save_report_title => "Save report to Git", "Enregistrer le rapport sur Git", "Gem rapport til Git";
     gui_git_fetched_at => "Fetched at", "Récupéré à", "Hentet ved";
     gui_git_no_files => "No .hurl or .vars files match. Enable “Show all files” to browse everything.", "Aucun fichier .hurl ou .vars ne correspond. Activez « Afficher tous les fichiers » pour tout parcourir.", "Ingen .hurl- eller .vars-filer matcher. Slå “Vis alle filer” til for at gennemse alt.";
     gui_git_checkout_gone => "The temporary checkout was cleaned up. Go Back and Browse files again to retry.", "L'extraction temporaire a été nettoyée. Revenez en arrière et parcourez à nouveau les fichiers pour réessayer.", "Den midlertidige udtjekning blev ryddet op. Gå tilbage og gennemse filer igen for at prøve igen.";

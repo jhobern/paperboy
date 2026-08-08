@@ -142,7 +142,7 @@ fn render_node(
         let row = ui
             .push_id(("req_row", i), |ui| {
                 ui.horizontal(|ui| {
-                    super::widgets::method_badge(ui, &entry.method);
+                    super::widgets::method_badge(ui, theme, &entry.method);
                     let text = if is_sel {
                         RichText::new(&label).strong().color(theme.text)
                     } else {
@@ -653,7 +653,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 ui.horizontal(|ui| {
                                     ui.add_space(*depth as f32 * WS_INDENT);
                                     if let Some(m) = &method {
-                                        super::widgets::method_badge(ui, m);
+                                        super::widgets::method_badge(ui, &theme, m);
                                     }
                                     let text = if is_sel {
                                         RichText::new(name).strong().color(theme.text)

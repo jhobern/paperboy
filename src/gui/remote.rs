@@ -721,7 +721,11 @@ impl Flow {
                 LoadTarget::File => s.gui_git_load_title,
                 LoadTarget::Workspace => s.gui_git_load_workspace_title,
             },
-            Flow::Save(_) => s.gui_git_save_collection_title,
+            Flow::Save(save) => match save.target {
+                SaveTarget::Collection(_) => s.gui_git_save_collection_title,
+                SaveTarget::Workspace(_) => s.gui_git_save_workspace_title,
+                SaveTarget::Report => s.gui_git_save_report_title,
+            },
         }
     }
 
@@ -1807,6 +1811,24 @@ mod tests {
             Some(app.strings.gui_git_err_collection_missing)
         );
         assert!(save.flow.is_none(), "no push machinery is built at all");
+    }
+
+    /// Every save target gets its own dialog title. They all used to read
+    /// "Save collection to Git", so pushing a workspace or a report announced
+    /// itself as something it wasn't.
+    #[test]
+    fn each_save_target_titles_its_own_dialog() {
+        let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let title = |t| Flow::Save(SaveFlow::new(t)).title(&s);
+        assert_eq!(
+            title(SaveTarget::Collection(0)),
+            s.gui_git_save_collection_title
+        );
+        assert_eq!(
+            title(SaveTarget::Workspace(0)),
+            s.gui_git_save_workspace_title
+        );
+        assert_eq!(title(SaveTarget::Report), s.gui_git_save_report_title);
     }
 
     /// Pushing a workspace back needs somewhere to push it to. A tab opened

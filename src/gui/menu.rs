@@ -373,9 +373,9 @@ fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
     top_menu(app, ui, title, mnemonic, |app, ui| {
         ui.menu_button(app.strings.gui_language, |ui| {
             for (lang, label) in [
-                (Language::English, "English"),
-                (Language::French, "Français"),
-                (Language::Danish, "Dansk"),
+                (Language::English, app.strings.lang_english),
+                (Language::French, app.strings.lang_french),
+                (Language::Danish, app.strings.lang_danish),
             ] {
                 if ui.radio(app.session.language == lang, label).clicked() {
                     app.session.language = lang;
@@ -556,7 +556,7 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
     let save_all = app.strings.gui_save_all_and_quit;
     let mut decided = false;
     let mut save_then_quit = false;
-    modal(ctx, title, |ui| {
+    let _ = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -616,7 +616,7 @@ fn unsaved_close_tab_dialog(
             .replace("{t}", &name),
     );
     let mut decided = false;
-    modal(ctx, title, |ui| {
+    let _ = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -654,7 +654,7 @@ fn close_git_workspace_dialog(
             .replace("{p}", &root.display().to_string()),
     );
     let mut decided = false;
-    modal(ctx, title, |ui| {
+    let _ = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -708,7 +708,7 @@ fn workspace_reload_dialog(
         app.strings.workspace_reload_save_hint,
     );
     let mut answer: Option<bool> = None;
-    modal(ctx, title, |ui| {
+    let _ = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(4.0);
         ui.label(hint);
@@ -736,15 +736,19 @@ fn workspace_reload_dialog(
 }
 
 /// A centred modal window shell shared by every dialog.
-fn modal<R>(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+///
+/// Returns `None` when egui declined to show the window at all (it is opened
+/// non-collapsible, so in practice this only happens if the viewport is in a
+/// state where nothing can be drawn). Callers treat that as "no answer this
+/// frame" and leave the dialog armed rather than deciding for the user — a
+/// render path must never panic, and an unanswered dialog simply reappears.
+fn modal<R>(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, add)
-        .unwrap()
-        .inner
-        .unwrap()
+        .and_then(|r| r.inner)
 }
 
 /// Open a collection / environment / workspace through a native OS picker.
@@ -1073,7 +1077,9 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
             }
         });
         (keep, go)
-    });
+    })
+    // A frame egui never drew is not an answer: keep the dialog open.
+    .unwrap_or((true, false));
     if !keep {
         return;
     }
@@ -1125,7 +1131,9 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
             }
         });
         (keep, go)
-    });
+    })
+    // A frame egui never drew is not an answer: keep the dialog open.
+    .unwrap_or((true, false));
     if !keep {
         return;
     }
@@ -1204,7 +1212,9 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
             }
         });
         action
-    });
+    })
+    // A frame egui never drew is not an answer: keep the dialog open.
+    .unwrap_or(Action::Keep);
 
     match action {
         Action::Cancel => {}
