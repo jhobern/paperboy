@@ -136,6 +136,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **`ENVS BASELINE(…) SHOW(Time)` now actually shows the baseline field.** The
+  clause is meant to put the baseline's value beside the candidate's as
+  `baseline.<request>.<field>`, but the copy could only see fields the rows
+  already carried — and an intrinsic like `Time` is suppressed on any request
+  that declares its own `[Reports]`/`WITH` fields. The result was that the
+  documented example produced no baseline column at all, in the results grid or
+  in any export. Naming an intrinsic in a baseline `SHOW(…)` now keeps it on the
+  rows, exactly as naming it in the request's own `SHOW(…)` does.
+
 - **Clicking the Request or Response panel in the terminal UI now selects it.**
   Those two panels — and the report view's — were the only ones a click didn't
   focus, so they could only be reached from the keyboard.

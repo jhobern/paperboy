@@ -59,8 +59,10 @@ pub struct Roles {
     /// Field suffixes from the `BASELINE(…) SHOW(…)` clause.  For each such
     /// field, matching baseline cells (`<alias>.<field>`) are copied into the
     /// candidate row as `baseline.<alias>.<field>` — but only for aliases where
-    /// the candidate itself emits that field.
-    baseline_show: Vec<String>,
+    /// the candidate itself emits that field.  The emit phase reads this too, so
+    /// that naming an intrinsic here also keeps it on the rows (see
+    /// [`Exec::baseline_show`](super::run)).
+    pub(crate) baseline_show: Vec<String>,
 }
 
 /// Extract the comparison roles a flow configures, or `None` when it has no

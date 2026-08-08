@@ -221,6 +221,9 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
+    ex.baseline_show = super::compare::comparison_roles(flow)
+        .map(|r| r.baseline_show)
+        .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
     // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
@@ -344,6 +347,15 @@ struct Exec<'a> {
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
+    /// Field names from the flow's `ENVS BASELINE(…) SHOW(…)` clause. These
+    /// count as explicitly-shown fields for *every* request in the run, because
+    /// the finalize-phase copy that produces `baseline.<alias>.<field>` can only
+    /// see fields the rows actually carry — and intrinsics like `Time` are
+    /// suppressed by default on any request that declares its own fields. Without
+    /// this the documented `BASELINE("prod") SHOW(Time)` example emits nothing at
+    /// all. It is a flow-wide property, so it is seeded once and inherited by
+    /// every forked iteration.
+    baseline_show: Vec<String>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -361,6 +373,7 @@ struct ExecState {
     target: Option<String>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
+    baseline_show: Vec<String>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -385,6 +398,7 @@ impl<'a> Exec<'a> {
             broadcast: HashMap::new(),
             column_order: Vec::new(),
             errors: Vec::new(),
+            baseline_show: Vec::new(),
         }
     }
 
@@ -401,6 +415,7 @@ impl<'a> Exec<'a> {
             target: self.target.clone(),
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
+            baseline_show: self.baseline_show.clone(),
         }
     }
 
@@ -419,6 +434,7 @@ impl<'a> Exec<'a> {
             broadcast: state.broadcast,
             column_order: Vec::new(),
             errors: Vec::new(),
+            baseline_show: state.baseline_show,
         }
     }
 
@@ -814,8 +830,12 @@ impl<'a> Exec<'a> {
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
                 // [Reports] and WITH fields are always kept; intrinsics survive
-                // only when SHOW explicitly lists them.
-                !INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
+                // only when SHOW explicitly lists them — either the statement's
+                // own SHOW, or the loop-level `ENVS BASELINE(…) SHOW(…)`, whose
+                // whole purpose is to put that field beside its baseline copy.
+                !INTRINSIC_FIELDS.contains(&suffix)
+                    || show.iter().any(|s| s == suffix)
+                    || self.baseline_show.iter().any(|s| s == suffix)
             });
         }
         // Bare request: all cells (all 5 intrinsics) are kept.  SHOW on a bare
@@ -3402,6 +3422,47 @@ mod tests {
         let res = run_flow(&flow, &ctx);
         assert!(res.images.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `BASELINE(…) SHOW(Time)` on the loop must surface the intrinsic even
+    /// though the request declares its own `[Reports]` field (which normally
+    /// suppresses intrinsics): otherwise the finalize-phase copy has no
+    /// `<alias>.Time` cell to work from and the clause silently does nothing.
+    /// This is the documented tutorial example (§10.2).
+    #[test]
+    fn baseline_show_surfaces_the_intrinsic_on_a_request_with_declared_fields() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("A", "jsonpath \"$.a\"")])];
+        let src = "FOR T IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"staging\")\n    REPORT REQUEST r AS proc\nEND\n";
+        let res = run(
+            src,
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("proc.Time"), Some(&"7".to_string()));
+        assert_eq!(cells.get("baseline.proc.Time"), Some(&"7".to_string()));
+        // The other intrinsics stay suppressed - only the SHOWn one comes back.
+        assert_eq!(cells.get("proc.HttpStatus"), None);
+        assert_eq!(cells.get("proc.Response"), None);
+        // And it must reach the rendered columns, not just the row model.
+        let flow = parse_flow(src).unwrap();
+        let cols = res.resolved_columns(&flow.header);
+        let headers: Vec<&str> = cols.iter().map(|c| c.header.as_str()).collect();
+        assert!(
+            headers.contains(&"baseline.proc.Time"),
+            "columns were {headers:?}"
+        );
     }
 
     #[test]
