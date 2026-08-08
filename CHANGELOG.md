@@ -162,6 +162,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   also sit where the fields below them will be even when the table is empty, so
   adding the first row no longer makes the headings jump apart.
 
+- **The workspace tree and the results grid are no longer rebuilt on every
+  frame.** Drawing the workspace list re-read the whole folder tree off disk —
+  a recursive directory scan sixty times a second, so simply moving the mouse
+  over a workspace was continuous filesystem I/O. Drawing a results grid
+  re-measured every cell in the table to size its columns, and computed the
+  `STATISTICS` summary rows once *per column* while doing it. Both now reuse
+  their last answer until something they depend on actually changes: about 8×
+  less work for the tree and 6× for the grid, and more on a large workspace or
+  a long report.
+
+  The tree is re-read whenever PaperBoy itself creates, moves or deletes a
+  file, and otherwise at most a few times a second, so a change made outside
+  PaperBoy (another editor, a `git pull`) still appears without a refresh.
+
 ### Fixed
 
 - **The report validation panel no longer flickers when the mouse moves.** Two

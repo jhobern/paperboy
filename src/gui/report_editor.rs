@@ -2319,9 +2319,104 @@ fn fitted_column_widths(
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
     let icon_w = if show_icons { 18.0 + SPACING_X } else { 0.0 };
-    let natural = natural_column_widths(ui, result, columns);
+    let natural = cached_natural_widths(ui, result, columns);
     let avail = (ui.available_width() - icon_w).max(0.0);
+    // Fitting is pure arithmetic over the naturals, so it stays uncached and
+    // the grid still follows the window as it is dragged.
     fit_column_widths(&natural, avail, SPACING_X)
+}
+
+/// [`natural_column_widths`], reused between frames while nothing it depends on
+/// has changed.
+///
+/// Measuring is not cheap — a `String` per cell, a text layout per column, and
+/// a full pass over the summary rows — and the grid is redrawn on every frame,
+/// including the ones where all that happened was the mouse moving. The widths
+/// only depend on the values, the columns and the font, so they are kept in
+/// egui's own per-frame memory (rather than on `ReportEditor`) because the grid
+/// is drawn by free functions that are also called from the dry-run preview and
+/// from tests.
+fn cached_natural_widths(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> Vec<f32> {
+    let key = widths_fingerprint(ui, result, columns);
+    let id = egui::Id::new("report_grid_widths");
+    if let Some((cached_key, widths)) = ui.data(|d| d.get_temp::<(u64, Vec<f32>)>(id))
+        && cached_key == key
+    {
+        return widths;
+    }
+    let widths = natural_column_widths(ui, result, columns);
+    ui.data_mut(|d| d.insert_temp(id, (key, widths.clone())));
+    widths
+}
+
+/// FNV-1a's starting value.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, continuing from `seed`.
+///
+/// Used instead of a `DefaultHasher` per cell in [`widths_fingerprint`]: the
+/// fingerprint runs over every cell of the table on every frame, and building a
+/// SipHash state for each of tens of thousands of cells costs more than hashing
+/// their bytes does. This is not a hash anyone attacks — it guards a cache of
+/// column widths — so the cheap mixing function is the right one.
+fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = seed;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Everything [`natural_column_widths`] reads, in one number.
+///
+/// This hashes the cell *text* rather than something cheaper like the row
+/// count, because a streaming run replaces rows in place: the grid is built as
+/// a skeleton of empty rows and each one is overwritten as its result arrives,
+/// so a key that only counted rows would pin the columns at the width of an
+/// empty table for the whole run. Hashing the text is still far less work than
+/// laying it out — no allocation, one pass — which is what makes the cache
+/// worth having rather than a second copy of the same cost.
+///
+/// **Maintenance:** anything `natural_column_widths` starts reading has to be
+/// added here too, or the widths will stop following it.
+fn widths_fingerprint(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The font decides how wide any of it renders.
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    font.size.to_bits().hash(&mut h);
+    format!("{:?}", font.family).hash(&mut h);
+    result.no_match_marker.hash(&mut h);
+    for col in columns {
+        col.header.hash(&mut h);
+        // A column's own definition decides what it pulls out of each row, and
+        // its statistics decide whether there are summary rows to measure.
+        format!("{:?}", col.stats).hash(&mut h);
+        format!("{:?}", col.sources).hash(&mut h);
+    }
+    result.rows.len().hash(&mut h);
+    for row in &result.rows {
+        // `cells` and `vars` are hash maps, so their iteration order changes
+        // from run to run. Combining each entry's hash with `^` makes the
+        // fingerprint depend on the contents and not on the order they come
+        // out in — the same trap that made the validation panel flicker.
+        let mut cells = 0u64;
+        for (k, v) in row.cells.iter().chain(&row.vars) {
+            cells ^= fnv1a(k.as_bytes(), fnv1a(v.as_bytes(), FNV_OFFSET));
+        }
+        cells.hash(&mut h);
+        row.target.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Lay a cell's content out in a slot exactly `w` wide.
@@ -2357,6 +2452,10 @@ fn natural_column_widths(
     columns: &[crate::report::model::OutputColumn],
 ) -> Vec<f32> {
     let font = egui::TextStyle::Body.resolve(ui.style());
+    // Computed once, not once per column: `summary_rows` walks every row of
+    // every column, so calling it inside the per-column loop below made finding
+    // the widths quadratic in the number of columns.
+    let summary = result.summary_rows(columns);
     // Leave room for the cell's own padding so text isn't flush against the
     // next column.
     let pad = 6.0;
@@ -2386,7 +2485,7 @@ fn natural_column_widths(
                     &col.value(row, &result.no_match_marker),
                 )));
             }
-            for srow in result.summary_rows(columns) {
+            for srow in &summary {
                 consider(truncate_cell(&flatten_cell(&srow.text_cell(c))));
             }
             measure(&col.header).max(measure(&longest))
@@ -9180,6 +9279,148 @@ mod results_render_tests {
             result.rows.push(row);
         }
         (result, columns)
+    }
+
+    /// Render the grid twice in one context, so the second pass sees whatever
+    /// the first left in egui's memory, and report the widths each time.
+    fn widths_across_two_frames(
+        first: &(ReportResult, Vec<OutputColumn>),
+        then: impl FnOnce(&mut ReportResult),
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ctx = egui::Context::default();
+        let (mut result, columns) = (first.0.clone(), first.1.clone());
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut draw = |ctx: &egui::Context, result: &ReportResult, out: &mut Vec<f32>| {
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_max_width(4000.0);
+                    ui.set_min_width(4000.0);
+                    // The *natural* widths are what is cached; fitting them to
+                    // the window is pure arithmetic on top.
+                    *out = super::cached_natural_widths(ui, result, &columns);
+                });
+            }
+        };
+        draw(&ctx, &result, &mut a);
+        then(&mut result);
+        draw(&ctx, &result, &mut b);
+        (a, b)
+    }
+
+    /// The widths are cached between frames, and a streaming run replaces its
+    /// rows **in place** — the grid starts as a skeleton of empty rows that are
+    /// overwritten as results arrive. A cache keyed on anything less than the
+    /// cell text would therefore pin the columns at the width of an empty table
+    /// for the whole run.
+    #[test]
+    fn cached_widths_follow_a_row_that_is_filled_in_place() {
+        let empty = fixture(&["Result"], &[""], 4);
+        let (before, after) = widths_across_two_frames(&empty, |result| {
+            for row in &mut result.rows {
+                row.cells.insert(
+                    "Result".to_string(),
+                    "a much longer value than the header".to_string(),
+                );
+            }
+        });
+        assert!(
+            after[0] > before[0] + 20.0,
+            "the column grew for the arriving values: {before:?} then {after:?}"
+        );
+    }
+
+    /// The same table two frames running must measure the same, or the columns
+    /// would twitch as the mouse moves.
+    #[test]
+    fn cached_widths_are_stable_when_nothing_changes() {
+        let table = fixture(&["A", "B"], &["one", "two"], 5);
+        let (before, after) = widths_across_two_frames(&table, |_| {});
+        assert_eq!(before, after);
+    }
+
+    /// The fingerprint is hand-maintained, so it gets the same contract test the
+    /// validation cache has: it must move for every input the measurement reads.
+    #[test]
+    fn the_width_fingerprint_notices_every_input_it_guards() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (base_res, base_cols) = fixture(&["A"], &["one"], 2);
+            let base = super::widths_fingerprint(ui, &base_res, &base_cols);
+
+            let mut r = base_res.clone();
+            r.rows[0]
+                .cells
+                .insert("A".to_string(), "changed".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a cell's text"
+            );
+
+            let mut r = base_res.clone();
+            r.rows.push(ReportRow::default());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a new row"
+            );
+
+            let mut r = base_res.clone();
+            r.no_match_marker = "\u{2014}".to_string();
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the no-match marker, which is what an empty cell renders as"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].target = Some("staging".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the row's ENVS target"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].vars.insert("v".to_string(), "x".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a variable a columns: directive could show"
+            );
+
+            let (_, wider) = fixture(&["A Much Longer Header"], &["one"], 2);
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &wider),
+                "the column header"
+            );
+
+            let mut cols = base_cols.clone();
+            cols[0].stats = vec![crate::report::model::StatKind::Count];
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &cols),
+                "statistics, which add summary rows to measure"
+            );
+
+            // Two rows whose cells were inserted in a different order are the
+            // same table, and must not look like a change: `cells` is a hash
+            // map, and iterating one straight into the hasher is exactly what
+            // made the validation panel flicker.
+            let (a, cols2) = fixture(&["A", "B"], &["one", "two"], 1);
+            let mut b = ReportResult::default();
+            let mut row = ReportRow::default();
+            row.cells.insert("B".to_string(), "two".to_string());
+            row.cells.insert("A".to_string(), "one".to_string());
+            b.rows.push(row);
+            assert_eq!(
+                super::widths_fingerprint(ui, &a, &cols2),
+                super::widths_fingerprint(ui, &b, &cols2),
+                "insertion order is not a difference"
+            );
+        });
     }
 
     /// The widths the grid would give `columns` in a window `avail` wide, and

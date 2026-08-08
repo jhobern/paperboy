@@ -216,6 +216,7 @@ pub fn report_diagnostics(
 /// only: validation asks what is in scope, never what it is set to, and hashing
 /// values would invalidate the cache on every keystroke in the environment
 /// editor.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn diagnostics_fingerprint(
     collections: &[Collection],
     global_envs: &[Environment],

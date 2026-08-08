@@ -3,9 +3,11 @@
 //! request model, parser, serializer and `[Captures]`/`[Asserts]` evaluation
 //! live in the [`crate::hurl`] module.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::git_remote::GitOrigin;
 use crate::hurl::{HurlEntry, collection_to_hurl};
@@ -118,6 +120,34 @@ impl WsRow {
     }
 }
 
+/// How long a workspace tree scan is reused before the disk is read again.
+///
+/// The scan is a recursive `read_dir` of the whole workspace, and the graphical
+/// front-end asks for the tree once per frame — so at 60fps this was real
+/// filesystem I/O sixty times a second, growing with the size of the tree, just
+/// to redraw a list that hadn't changed.
+///
+/// The window is deliberately short and deliberately *time*-based rather than
+/// invalidated by the app's own file operations. A tree can change from outside
+/// PaperBoy (another editor, a `git pull`, a test run dropping result files),
+/// so a cache keyed only on things PaperBoy knows it did would go stale in
+/// exactly the cases the tree matters most. A third of a second is below the
+/// threshold at which a file list reads as "live", and it still collapses
+/// ~95% of the scans.
+const WS_SCAN_TTL: Duration = Duration::from_millis(300);
+
+/// The last workspace tree read off disk, and what it was read for.
+#[derive(Clone)]
+struct WsScan {
+    root: PathBuf,
+    filter_hurl_json: bool,
+    taken_at: Instant,
+    /// [`crate::workspace::tree_generation`] when this was taken, so PaperBoy's
+    /// own file operations don't have to wait out [`WS_SCAN_TTL`].
+    generation: u64,
+    entries: Vec<crate::workspace::WsEntry>,
+}
+
 /// A loaded Hurl collection (one .hurl file).
 #[derive(Clone)]
 pub struct Collection {
@@ -223,6 +253,11 @@ pub struct Collection {
     /// expanded collection from disk (see [`Self::rebuild_expanded_titles`]).
     /// Derived state — not persisted.
     pub workspace_titles: HashMap<PathBuf, Vec<String>>,
+    /// The most recent workspace tree read off disk, reused for [`WS_SCAN_TTL`]
+    /// so redrawing the tree isn't a recursive `read_dir` every frame. Purely
+    /// derived state: dropping it only costs one extra scan, which is why it is
+    /// neither persisted nor part of any equality check.
+    workspace_scan: RefCell<Option<WsScan>>,
     /// Unsaved edits belonging to workspace collection files that are **not**
     /// the currently-loaded one.
     ///
@@ -285,6 +320,7 @@ impl Collection {
             workspace_expanded: HashSet::new(),
             workspace_selected: None,
             workspace_titles: HashMap::new(),
+            workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
         };
         c.sync_folder_to_selected();
@@ -336,11 +372,34 @@ impl Collection {
     /// collection file opens it (with inline requests beneath); selecting a
     /// report embeds it in the right pane.  Empty for a non-Workspace tab.
     pub fn ws_rows(&self) -> Vec<WsRow> {
+        self.ws_rows_at(Instant::now())
+    }
+
+    /// [`Self::ws_rows`] as of a given moment, so the scan cache's expiry can be
+    /// tested without sleeping.
+    pub(crate) fn ws_rows_at(&self, now: Instant) -> Vec<WsRow> {
+        self.ws_rows_as_of(now, crate::workspace::tree_generation())
+    }
+
+    /// [`Self::ws_rows`] as of a given moment *and* a given tree generation.
+    ///
+    /// The generation is a parameter rather than read from the global counter
+    /// so a test of the time-based expiry can't be perturbed by another test
+    /// running in parallel that happens to create a workspace file.
+    pub(crate) fn ws_rows_as_of(&self, now: Instant, generation: u64) -> Vec<WsRow> {
         let Some(root) = &self.workspace_root else {
             return Vec::new();
         };
 
-        let full_tree = crate::workspace::scan_workspace(root, self.workspace_filter_hurl_json);
+        self.refresh_scan(root, now, generation);
+        // Held across the whole loop so the tree is walked in place rather than
+        // cloned out of the cache every frame — the point of the cache is to
+        // stop doing work per frame, not to trade I/O for an allocation.
+        let scan = self.workspace_scan.borrow();
+        let full_tree = scan
+            .as_ref()
+            .map(|s| s.entries.as_slice())
+            .unwrap_or_default();
         let mut out = Vec::new();
 
         // `ancestor_at[d]` holds the absolute path of the most-recently-visited
@@ -374,8 +433,8 @@ impl Collection {
                 if visible {
                     let expanded = self.workspace_expanded.contains(&entry.path);
                     out.push(WsRow::Folder {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                         expanded,
                     });
@@ -383,32 +442,57 @@ impl Collection {
             } else if visible {
                 if crate::workspace::is_report_file(&entry.path) {
                     out.push(WsRow::Report {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                     });
                 } else if crate::workspace::is_env_file(&entry.path) {
                     out.push(WsRow::Environment {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                     });
                 } else {
                     let expanded = self.workspace_expanded.contains(&entry.path);
-                    let path = entry.path.clone();
                     out.push(WsRow::Collection {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                         open: expanded,
                     });
                     if expanded {
-                        out.extend(self.request_rows_for(&path, d + 1));
+                        out.extend(self.request_rows_for(&entry.path, d + 1));
                     }
                 }
             }
         }
         out
+    }
+
+    /// Read the workspace tree off disk if what's cached is missing, stale, or
+    /// was taken for a different root or filter.
+    ///
+    /// The *visibility* half of [`Self::ws_rows_at`] (the expand/collapse
+    /// filter) is deliberately left out of the cache: expanding a folder must
+    /// feel instant, and re-filtering an already-scanned tree costs nothing.
+    fn refresh_scan(&self, root: &Path, now: Instant, generation: u64) {
+        let mut slot = self.workspace_scan.borrow_mut();
+        let usable = slot.as_ref().is_some_and(|s| {
+            s.root == root
+                && s.filter_hurl_json == self.workspace_filter_hurl_json
+                && s.generation == generation
+                && now.saturating_duration_since(s.taken_at) < WS_SCAN_TTL
+        });
+        if usable {
+            return;
+        }
+        *slot = Some(WsScan {
+            root: root.to_path_buf(),
+            filter_hurl_json: self.workspace_filter_hurl_json,
+            taken_at: now,
+            generation,
+            entries: crate::workspace::scan_workspace(root, self.workspace_filter_hurl_json),
+        });
     }
 
     /// The request rows shown under an expanded collection at `path`, indented
@@ -733,5 +817,148 @@ impl Collection {
         self.folder = tree::folder_of(&self.entries, idx);
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
+    }
+}
+
+#[cfg(test)]
+mod ws_scan_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_ws_scan_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn workspace_at(root: &Path) -> Collection {
+        let mut c = Collection::new("ws".into(), Vec::new());
+        c.workspace_root = Some(root.to_path_buf());
+        c
+    }
+
+    fn names(rows: &[WsRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                WsRow::Folder { name, .. }
+                | WsRow::Report { name, .. }
+                | WsRow::Environment { name, .. }
+                | WsRow::Collection { name, .. } => name.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The graphical front-end asks for the tree once per frame. Reading it off
+    /// disk that often is real I/O on every mouse move, so a scan is reused for
+    /// [`WS_SCAN_TTL`] — and then genuinely re-read, because a workspace can
+    /// change from outside PaperBoy.
+    #[test]
+    fn the_workspace_tree_is_read_off_disk_at_most_once_per_ttl() {
+        let root = tmp_root("ttl");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        let c = workspace_at(&root);
+
+        // The generation is held fixed: this test is about the *time* window,
+        // and PaperBoy is not the one making the change.
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["a.hurl"]);
+
+        // A file appears behind PaperBoy's back. Within the window the tree is
+        // the one already in hand — that is the whole point of the cache.
+        fs::write(root.join("b.hurl"), "").unwrap();
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0 + WS_SCAN_TTL / 2, 7)),
+            vec!["a.hurl"],
+            "still serving the cached scan"
+        );
+
+        // Once the window passes, the disk is read again and the new file shows
+        // up without anyone having told PaperBoy about it.
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0 + WS_SCAN_TTL + Duration::from_millis(1), 7)),
+            vec!["a.hurl", "b.hurl"],
+            "the tree catches up with the filesystem"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cache must not answer a question it wasn't asked: changing the
+    /// filter (or the root) has to re-read, however fresh the last scan is.
+    #[test]
+    fn changing_the_filter_or_the_root_bypasses_a_fresh_scan() {
+        let root = tmp_root("keys");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        fs::write(root.join("notes.txt"), "").unwrap();
+        let mut c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["a.hurl"], "filtered");
+
+        c.workspace_filter_hurl_json = false;
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["a.hurl", "notes.txt"],
+            "showing everything, at the very same instant"
+        );
+
+        let other = tmp_root("keys_other");
+        fs::write(other.join("z.hurl"), "").unwrap();
+        c.workspace_root = Some(other.clone());
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["z.hurl"],
+            "a different root is a different tree"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    /// PaperBoy's own edits must not have to wait out the window: creating a
+    /// file and then not finding it in the tree is a bug, not a stale cache.
+    #[test]
+    fn the_app_s_own_file_operations_show_up_at_once() {
+        let root = tmp_root("generation");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        let c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_at(t0)), vec!["a.hurl"]);
+
+        crate::workspace::create_item(&root, &root, "b", crate::workspace::NewItemKind::Collection)
+            .expect("created");
+        assert_eq!(
+            names(&c.ws_rows_at(t0)),
+            vec!["a.hurl", "b.hurl"],
+            "at the very same instant, well inside the scan window"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Expanding a folder is a *view* change, not a filesystem one, so it must
+    /// take effect on the very next frame rather than waiting out the TTL.
+    #[test]
+    fn expanding_a_folder_shows_its_contents_immediately() {
+        let root = tmp_root("expand");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/inner.hurl"), "").unwrap();
+        let mut c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["sub"], "collapsed");
+
+        c.workspace_expanded.insert(root.join("sub"));
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["sub", "inner.hurl"],
+            "no wait for the scan window: the filter isn't cached"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
