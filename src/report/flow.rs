@@ -198,10 +198,14 @@ pub enum Producer {
     List(Vec<Element>),
     /// `FILES "dir" [MATCH "glob"]`.
     Files { dir: String, glob: Option<String> },
-    /// `FOLDERS "dir" [WITH role="glob", …]`.
+    /// `FOLDERS "dir" [MATCH "glob"] [WITH role="glob"[?], …]`.
+    ///
+    /// `glob` filters subfolder *names* the way `FILES … MATCH` filters file
+    /// names, and likewise recurses when it contains `**`.
     Folders {
         dir: String,
-        roles: Vec<(String, String)>,
+        glob: Option<String>,
+        roles: Vec<RoleBinding>,
     },
     /// `TUPLES FROM "file"`.
     Tuples { path: String },
@@ -212,6 +216,35 @@ pub enum Producer {
     Concat(Vec<Producer>),
     /// A previously declared `LIST` referenced by name.
     Named(String),
+}
+
+/// One `FOLDERS … WITH role="glob"` binding: the role name, the glob that picks
+/// its file inside each folder, and whether the role is **optional**.
+///
+/// A required role must match exactly one file. An optional role (written with a
+/// trailing `?`) may match none — it then binds the empty string, so a group
+/// missing a genuinely optional input (a document with no back side, a folder
+/// with no expected-result file) still produces a row instead of failing the
+/// run. Matching *more* than one file is an error either way: ambiguity is never
+/// silently resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleBinding {
+    pub name: String,
+    pub glob: String,
+    pub optional: bool,
+}
+
+#[cfg(test)]
+impl RoleBinding {
+    /// A required role (the default form) -- a test convenience, since the
+    /// parser and the editors always build the struct literally.
+    pub fn required(name: impl Into<String>, glob: impl Into<String>) -> Self {
+        RoleBinding {
+            name: name.into(),
+            glob: glob.into(),
+            optional: false,
+        }
+    }
 }
 
 /// One element of a list literal: a scalar or a tuple.
@@ -578,16 +611,22 @@ fn producer_text(p: &Producer) -> String {
             Some(g) => format!("FILES {} MATCH {}", quote(dir), quote(g)),
             None => format!("FILES {}", quote(dir)),
         },
-        Producer::Folders { dir, roles } => {
-            if roles.is_empty() {
-                format!("FOLDERS {}", quote(dir))
-            } else {
+        Producer::Folders { dir, glob, roles } => {
+            let mut out = format!("FOLDERS {}", quote(dir));
+            if let Some(g) = glob {
+                out.push_str(&format!(" MATCH {}", quote(g)));
+            }
+            if !roles.is_empty() {
                 let rs: Vec<String> = roles
                     .iter()
-                    .map(|(k, v)| format!("{k}={}", quote(v)))
+                    .map(|r| {
+                        let opt = if r.optional { "?" } else { "" };
+                        format!("{}={}{opt}", r.name, quote(&r.glob))
+                    })
                     .collect();
-                format!("FOLDERS {} WITH {}", quote(dir), rs.join(", "))
+                out.push_str(&format!(" WITH {}", rs.join(", ")));
             }
+            out
         }
         Producer::Tuples { path } => format!("TUPLES FROM {}", quote(path)),
         Producer::Zip(ps) => {

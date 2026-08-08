@@ -769,17 +769,19 @@ fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
             glob: Some(glob.clone().unwrap_or_default()),
             tail: String::new(),
         },
-        // A `FOLDERS` loop's `WITH role="glob"` list is several named globs
-        // rather than one, so it stays in the wizard and is shown as the tail.
-        Producer::Folders { dir, roles } => LoopEdit {
+        // `FOLDERS` takes the same `MATCH` glob as `FILES` (matching the folder
+        // name, and recursing when it contains `**`), so it gets the same box.
+        // Its `WITH role="glob"` list is several named globs rather than one, so
+        // that part stays in the wizard and is shown as the tail.
+        Producer::Folders { dir, glob, roles } => LoopEdit {
             var,
             keyword: "IN FOLDERS".to_string(),
             dir: Some((dir.clone(), false)),
-            glob: None,
+            glob: Some(glob.clone().unwrap_or_default()),
             tail: if roles.is_empty() {
                 String::new()
             } else {
-                let rs: Vec<String> = roles.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+                let rs: Vec<String> = roles.iter().map(role_label).collect();
                 format!("WITH {}", rs.join(", "))
             },
         },
@@ -804,6 +806,14 @@ fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
 
 /// A producer with no single path, rendered as the label the loop head used to
 /// carry. Mirrors `flow::producer_text`, which is private to the model.
+/// A single `WITH` role binding as it is written in the source, so the chip's
+/// tail reads back exactly what the file says — including the `?` that marks a
+/// role as optional.
+fn role_label(r: &crate::report::flow::RoleBinding) -> String {
+    let opt = if r.optional { "?" } else { "" };
+    format!("{}=\"{}\"{opt}", r.name, r.glob)
+}
+
 fn producer_label(p: &crate::report::flow::Producer) -> String {
     use crate::report::flow::{Element, Producer};
     fn element(e: &Element) -> String {
@@ -833,7 +843,10 @@ fn producer_label(p: &crate::report::flow::Producer) -> String {
             Some(g) => format!("FILES \"{dir}\" MATCH \"{g}\""),
             None => format!("FILES \"{dir}\""),
         },
-        Producer::Folders { dir, .. } => format!("FOLDERS \"{dir}\""),
+        Producer::Folders { dir, glob, .. } => match glob {
+            Some(g) => format!("FOLDERS \"{dir}\" MATCH \"{g}\""),
+            None => format!("FOLDERS \"{dir}\""),
+        },
         Producer::Tuples { path } => format!("TUPLES FROM \"{path}\""),
     }
 }
@@ -8514,13 +8527,27 @@ mod loop_chip_tests {
     }
 
     /// A `FOLDERS … WITH role="glob"` list is several named globs rather than
-    /// one, so it stays with the wizard and is shown as plain text.
+    /// one, so it stays with the wizard and is shown as plain text. Its single
+    /// `MATCH` glob, however, is the same one box `FILES` gets -- offered empty
+    /// when the loop has none, so the way to narrow the walk is visible.
     #[test]
     fn a_folders_loops_role_list_is_left_as_text_beside_its_editable_folder() {
         let l = loop_edit("FOR d IN FOLDERS \"envs\" WITH req=\"*.hurl\"\n  REQUEST A\nEND\n");
         assert_eq!(l.dir, Some(("envs".to_string(), false)));
-        assert_eq!(l.glob, None);
+        assert_eq!(l.glob, Some(String::new()));
         assert_eq!(l.tail, "WITH req=\"*.hurl\"");
+    }
+
+    /// A recursive, filtered `FOLDERS` walk: the `MATCH` glob fills the same box
+    /// `FILES` uses, and an optional role keeps its `?` in the tail so the chip
+    /// reads back exactly what the file says.
+    #[test]
+    fn a_folders_loop_shows_its_match_glob_in_the_glob_box() {
+        let l = loop_edit(
+            "FOR d IN FOLDERS \"cases\" MATCH \"**/case_*\" WITH front=\"*f.jpg\", back=\"*b.jpg\"?\n  REQUEST A\nEND\n",
+        );
+        assert_eq!(l.glob, Some("**/case_*".to_string()));
+        assert_eq!(l.tail, "WITH front=\"*f.jpg\", back=\"*b.jpg\"?");
     }
 
     /// A pattern that binds more than one name has no single thing a box could

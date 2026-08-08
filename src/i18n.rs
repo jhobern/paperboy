@@ -523,7 +523,7 @@ strings! {
     help_grammar_list => "name a source so a loop can reuse it below", "nommer une source pour qu'une boucle la réutilise", "navngiv en kilde, så en løkke kan genbruge den nedenfor";
     help_grammar_list_literal => "an inline list of scalars or (\"a\", \"b\") tuples", "une liste littérale de scalaires ou de tuples (\"a\", \"b\")", "en inline-liste af skalarer eller (\"a\", \"b\")-tupler";
     help_grammar_files => "file paths under a folder (glob *, ** — not regex)", "chemins de fichiers dans un dossier (glob *, ** — pas regex)", "filstier i en mappe (glob *, ** — ikke regex)";
-    help_grammar_folders => "subfolders; each role-glob binds one file per folder", "sous-dossiers ; chaque glob de rôle lie un fichier par dossier", "undermapper; hvert rolle-glob binder én fil per mappe";
+    help_grammar_folders => "subfolders (glob filters names, ** recurses); each role-glob binds one file per folder, r=\"g\"? optional", "sous-dossiers (le glob filtre les noms, ** descend) ; chaque glob de rôle lie un fichier par dossier, r=\"g\"? facultatif", "undermapper (glob filtrerer navne, ** går i dybden); hvert rolle-glob binder én fil per mappe, r=\"g\"? valgfri";
     help_grammar_tuples => "rows from a .csv/.tsv/.json file (headers name fields)", "lignes d'un fichier .csv/.tsv/.json (les en-têtes nomment les champs)", "rækker fra en .csv/.tsv/.json-fil (overskrifter navngiver felter)";
     help_grammar_zip => "pair sources positionally (must be equal length)", "apparier les sources par position (longueurs égales)", "par kilder positionelt (skal have samme længde)";
     help_grammar_concat => "append sources end-to-end (same arity)", "concaténer les sources bout à bout (même arité)", "sammenkæd kilder efter hinanden (samme aritet)";

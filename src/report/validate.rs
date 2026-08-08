@@ -705,7 +705,7 @@ fn resolve_entry_by_name<'a>(
 /// so they must be treated as defined inside the loop body.
 fn producer_static_named_fields(producer: &Producer) -> Vec<String> {
     match producer {
-        Producer::Folders { roles, .. } => roles.iter().map(|(r, _)| r.clone()).collect(),
+        Producer::Folders { roles, .. } => roles.iter().map(|r| r.name.clone()).collect(),
         // ZIP/CONCAT: union the named fields from all sub-producers.
         Producer::Zip(ps) | Producer::Concat(ps) => {
             ps.iter().flat_map(producer_static_named_fields).collect()

@@ -1469,12 +1469,12 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             let path = f.path.clone();
             // Preserve the loop body and any WITH role globs; var/dir and the
             // PARALLEL toggle and degree are what this form edits.
-            let (body, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+            let (body, glob, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
                 Some(FlowNode::ForEach {
                     body,
-                    producer: Producer::Folders { roles, .. },
+                    producer: Producer::Folders { glob, roles, .. },
                     ..
-                }) => (body.clone(), roles.clone()),
+                }) => (body.clone(), glob.clone(), roles.clone()),
                 _ => return,
             };
             let parallel = parallel_spec(f.parallel, &f.degree);
@@ -1486,6 +1486,7 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 }),
                 producer: Producer::Folders {
                     dir: f.dir.clone(),
+                    glob,
                     roles,
                 },
                 body,

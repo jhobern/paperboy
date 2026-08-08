@@ -2,7 +2,8 @@
 //! iterates. Everything that yields multiple items is a producer:
 //! - `[ … ]`                literal (handled inline in [`super::run`]),
 //! - `FILES "dir" [MATCH …]`  file paths (glob; `**` recurses),
-//! - `FOLDERS "dir" [WITH r="glob", …]`  subfolders, one file per role,
+//! - `FOLDERS "dir" [MATCH "glob"] [WITH r="glob"[?], …]`  subfolders (glob
+//!   filters folder names; `**` recurses), one file per role,
 //! - `TUPLES FROM "file"`   one tuple per CSV/TSV/JSON row,
 //! - `ZIP(a, b, …)`         positional N-tuples (equal length required).
 //!
@@ -15,6 +16,7 @@
 //! orchestrates them (resolving `LIST` names, substituting `{{var}}`s in paths,
 //! applying the `# root:` base directory).
 
+use super::flow::RoleBinding;
 use std::path::{Path, PathBuf};
 
 /// One item produced by a loop source: its positional `values` (for pattern
@@ -120,52 +122,119 @@ fn collect_files(
     Ok(())
 }
 
-/// List immediate subfolders of `dir` (sorted) for a `FOLDERS` producer.
-pub fn list_folders(dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// List subfolders of `dir` (sorted) for a `FOLDERS "dir" [MATCH glob]`
+/// producer. The glob filters folder *names* exactly as `FILES … MATCH` filters
+/// file names, and likewise recurses into subdirectories when it contains `**`
+/// — so `FOLDERS "." MATCH "**"` walks a whole input tree the way a nested
+/// per-case layout (`<type>/<batch>/<case>/`) requires.
+pub fn list_folders(dir: &Path, glob: Option<&str>) -> Result<Vec<PathBuf>, String> {
     if !dir.is_dir() {
         return Err(format!("directory not found: {}", dir.display()));
     }
+    let recursive = glob.is_some_and(|g| g.contains("**"));
+    // Only the glob's last segment names the folder; a leading `**/` (or a bare
+    // `**`) is the recursion marker, not part of the name pattern.
+    let name_pat: Option<String> = glob
+        .map(|g| g.rsplit('/').next().unwrap_or(g).to_string())
+        .filter(|p| p != "**");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if path.is_dir() {
-            out.push(path);
-        }
-    }
+    collect_folders(dir, recursive, name_pat.as_deref(), &mut out)?;
     out.sort();
     Ok(out)
 }
 
-/// For one `FOLDERS … WITH role="glob", …` subfolder, resolve each role to the
-/// single file in the folder matching its glob. Exactly one match per role is
-/// required (0 or >1 is an error, so a mis-shaped group fails loudly).
+fn collect_folders(
+    dir: &Path,
+    recursive: bool,
+    name_pat: Option<&str>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        // As in `collect_files`, `file_type()` never follows a symlink, so a
+        // directory *symlink* is skipped rather than descended — that is what
+        // stops a self-referential link recursing forever.
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let matches = match name_pat {
+            Some(pat) => glob_match(pat, &name),
+            None => true,
+        };
+        if matches {
+            out.push(path.clone());
+        }
+        if recursive {
+            collect_folders(&path, recursive, name_pat, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// For one `FOLDERS … WITH role="glob"[?], …` subfolder, resolve each role to
+/// the file in the folder matching its glob.
+///
+/// A **required** role must match exactly one file; an **optional** role
+/// (`role="glob"?`) may match none, binding the empty string, so a genuinely
+/// optional input (a document with no back side) doesn't fail the run. Matching
+/// more than one file is always an error — ambiguity is never resolved silently.
+///
+/// Returns `Ok(None)` when a *required* role matches nothing and `on_missing` is
+/// [`Missing::Skip`], meaning "this folder is not one of the ones being looked
+/// for". A recursive walk passes `Skip` (it *searches* a tree, so the
+/// intermediate folders it necessarily visits are simply not results); a
+/// non-recursive walk passes [`Missing::Error`] (it *enumerates* a known set, so
+/// a mis-shaped member is a mistake worth failing loudly on).
 pub fn folder_roles(
     folder: &Path,
-    roles: &[(String, String)],
-) -> Result<Vec<(String, String)>, String> {
+    roles: &[RoleBinding],
+    on_missing: Missing,
+) -> Result<Option<Vec<(String, String)>>, String> {
     let mut named = Vec::new();
-    for (role, glob) in roles {
-        let mut matches = list_files(folder, Some(glob))?;
+    for role in roles {
+        let mut matches = list_files(folder, Some(&role.glob))?;
         match matches.len() {
             1 => named.push((
-                role.clone(),
+                role.name.clone(),
                 matches.remove(0).to_string_lossy().into_owned(),
             )),
-            0 => {
-                return Err(format!(
-                    "role '{role}' matched no file in {} (glob {glob:?})",
-                    folder.display()
-                ));
-            }
+            0 if role.optional => named.push((role.name.clone(), String::new())),
+            0 => match on_missing {
+                Missing::Skip => return Ok(None),
+                Missing::Error => {
+                    return Err(format!(
+                        "role '{}' matched no file in {} (glob {:?})",
+                        role.name,
+                        folder.display(),
+                        role.glob
+                    ));
+                }
+            },
             n => {
                 return Err(format!(
-                    "role '{role}' matched {n} files in {} (glob {glob:?}); expected exactly one",
-                    folder.display()
+                    "role '{}' matched {n} files in {} (glob {:?}); expected exactly one",
+                    role.name,
+                    folder.display(),
+                    role.glob
                 ));
             }
         }
     }
-    Ok(named)
+    Ok(Some(named))
+}
+
+/// What a *required* role matching no file means for the folder being examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// Fail the run naming the folder and glob (a flat, enumerated folder set).
+    Error,
+    /// Skip the folder — it isn't one of the ones being searched for (a
+    /// recursive walk, whose intermediate folders never carry the role files).
+    Skip,
 }
 
 /// Read a `TUPLES FROM "file"` manifest into items. `.csv`/`.tsv` treat the
@@ -387,6 +456,17 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    fn req(name: &str, glob: &str) -> RoleBinding {
+        RoleBinding::required(name, glob)
+    }
+
+    fn opt(name: &str, glob: &str) -> RoleBinding {
+        RoleBinding {
+            optional: true,
+            ..RoleBinding::required(name, glob)
+        }
+    }
+
     #[test]
     fn folder_roles_require_exactly_one_match() {
         let d = tmpdir("roles");
@@ -394,17 +474,120 @@ mod tests {
         fs::write(d.join("scan_back.jpg"), "x").unwrap();
         let named = folder_roles(
             &d,
-            &[
-                ("FRONT".into(), "*_front.jpg".into()),
-                ("BACK".into(), "*_back.jpg".into()),
-            ],
+            &[req("FRONT", "*_front.jpg"), req("BACK", "*_back.jpg")],
+            Missing::Error,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(named[0].0, "FRONT");
         assert!(named[0].1.ends_with("scan_front.jpg"));
         // A role matching nothing is an error.
-        let err = folder_roles(&d, &[("LABEL".into(), "*.pdf".into())]).unwrap_err();
+        let err = folder_roles(&d, &[req("LABEL", "*.pdf")], Missing::Error).unwrap_err();
         assert!(err.contains("LABEL"));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn optional_role_matching_nothing_binds_empty_rather_than_failing() {
+        let d = tmpdir("optrole");
+        fs::write(d.join("scan_front.jpg"), "x").unwrap();
+        let named = folder_roles(
+            &d,
+            &[req("FRONT", "*_front.jpg"), opt("BACK", "*_back.jpg")],
+            Missing::Error,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(named[1].0, "BACK");
+        assert_eq!(named[1].1, "");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn optional_role_matching_several_files_is_still_an_error() {
+        // Optional means "may be absent", never "pick one of these for me":
+        // silently choosing between two candidates would make the report depend
+        // on directory order.
+        let d = tmpdir("optambig");
+        fs::write(d.join("a_back.jpg"), "x").unwrap();
+        fs::write(d.join("b_back.jpg"), "x").unwrap();
+        let err = folder_roles(&d, &[opt("BACK", "*_back.jpg")], Missing::Error).unwrap_err();
+        assert!(err.contains("BACK"), "{err}");
+        assert!(err.contains("expected exactly one"), "{err}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn missing_skip_reports_the_folder_as_no_match_instead_of_failing() {
+        let d = tmpdir("skiprole");
+        let got = folder_roles(&d, &[req("FRONT", "*_front.jpg")], Missing::Skip).unwrap();
+        assert!(got.is_none());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn list_folders_without_a_glob_lists_immediate_children_only() {
+        let d = tmpdir("flat");
+        fs::create_dir_all(d.join("case_a/inner")).unwrap();
+        fs::create_dir_all(d.join("case_b")).unwrap();
+        let got = list_folders(&d, None).unwrap();
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["case_a", "case_b"]);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn list_folders_filters_folder_names_by_glob() {
+        let d = tmpdir("fglob");
+        fs::create_dir_all(d.join("case_a")).unwrap();
+        fs::create_dir_all(d.join("case_b")).unwrap();
+        fs::create_dir_all(d.join("scratch")).unwrap();
+        let got = list_folders(&d, Some("case_*")).unwrap();
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["case_a", "case_b"]);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn list_folders_recurses_on_double_star() {
+        // The nested `<type>/<batch>/<case>` layout the C# generators walk: a
+        // bare `**` filters nothing, so every folder at every depth is yielded.
+        let d = tmpdir("frec");
+        fs::create_dir_all(d.join("passports/june/case_1")).unwrap();
+        fs::create_dir_all(d.join("licences/case_2")).unwrap();
+        let all = list_folders(&d, Some("**")).unwrap();
+        assert_eq!(all.len(), 5, "{all:?}");
+        // With a name pattern, only the leaf case folders come back — at
+        // whatever depth they happen to sit. The order is by full path (so the
+        // run is reproducible), not by folder name.
+        let cases = list_folders(&d, Some("**/case_*")).unwrap();
+        let names: Vec<String> = cases
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["case_2", "case_1"]);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_folders_does_not_follow_symlinked_directories_into_a_cycle() {
+        let d = tmpdir("fcycle");
+        fs::create_dir_all(d.join("case_1")).unwrap();
+        std::os::unix::fs::symlink(&d, d.join("loop")).unwrap();
+        let got = list_folders(&d, Some("**")).unwrap();
+        // Terminates, and the symlink is not itself listed as a folder.
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["case_1"]);
         fs::remove_dir_all(&d).ok();
     }
 

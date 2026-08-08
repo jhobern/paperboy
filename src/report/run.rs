@@ -46,7 +46,7 @@ use crate::hurl::{EntryOutcome, RunOutput};
 
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleRef, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
 use super::model::{ReportResult, ReportRow};
 use super::producers::{self, ProducerItem};
@@ -1045,15 +1045,30 @@ impl<'a> Exec<'a> {
                     .map(|p| ProducerItem::scalar(p.to_string_lossy().into_owned()))
                     .collect())
             }
-            Producer::Folders { dir, roles } => {
+            Producer::Folders { dir, glob, roles } => {
                 let dir = producers::resolve_path(root, &self.subst_unquoted(dir));
-                let roles: Vec<(String, String)> = roles
+                let glob = glob.as_ref().map(|g| self.subst_unquoted(g));
+                let roles: Vec<RoleBinding> = roles
                     .iter()
-                    .map(|(r, g)| (r.clone(), self.subst_unquoted(g)))
+                    .map(|r| RoleBinding {
+                        name: r.name.clone(),
+                        glob: self.subst_unquoted(&r.glob),
+                        optional: r.optional,
+                    })
                     .collect();
+                // A recursive walk searches a tree, so the intermediate folders
+                // it must visit simply aren't results; a flat walk enumerates a
+                // known set, so a mis-shaped member stays a loud failure.
+                let on_missing = if glob.as_deref().is_some_and(|g| g.contains("**")) {
+                    producers::Missing::Skip
+                } else {
+                    producers::Missing::Error
+                };
                 let mut items = Vec::new();
-                for folder in producers::list_folders(&dir)? {
-                    let named = producers::folder_roles(&folder, &roles)?;
+                for folder in producers::list_folders(&dir, glob.as_deref())? {
+                    let Some(named) = producers::folder_roles(&folder, &roles, on_missing)? else {
+                        continue;
+                    };
                     items.push(ProducerItem {
                         values: vec![folder.to_string_lossy().into_owned()],
                         named,
@@ -2113,6 +2128,95 @@ mod tests {
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
         assert!(res.rows[0].cells.get("FILE").unwrap().ends_with("a.jpg"));
         assert_eq!(fake.call_count(), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// End-to-end: a recursive `FOLDERS … MATCH "**"` walk with roles yields one
+    /// row per *case* folder, wherever it sits in the tree, and silently passes
+    /// over the intermediate container folders that carry no role files. Without
+    /// the skip, every `<type>`/`<batch>` folder on the way down would fail the
+    /// run for a role that was never meant to match there.
+    #[test]
+    fn recursive_folders_loop_skips_containers_and_binds_roles() {
+        let d = tmpdir("folders_rec");
+        for case in ["passports/june/case_1", "licences/case_2"] {
+            let c = d.join(case);
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("scan_front.jpg"), "x").unwrap();
+        }
+        // One case also has a back image; the other doesn't, which is exactly
+        // what the optional role is for.
+        std::fs::write(d.join("licences/case_2/scan_back.jpg"), "x").unwrap();
+
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" MATCH \"**\" WITH front=\"*_front.jpg\", back=\"*_back.jpg\"?\n    REPORT REQUEST up\n    REPORT (CASE)\n    REPORT \"{{front}}\" AS Front\n    REPORT \"{{back}}\" AS Back\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
+        // Sorted by full path, so `licences/case_2` comes first.
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Front")
+                .unwrap()
+                .ends_with("scan_front.jpg")
+        );
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Back")
+                .unwrap()
+                .ends_with("scan_back.jpg")
+        );
+        // The case with no back image still produced a row, with an empty cell.
+        assert_eq!(res.rows[1].cells.get("Back").unwrap(), "");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A *flat* `FOLDERS` walk enumerates a known set, so a member missing a
+    /// required role is still a loud failure rather than a quiet omission.
+    #[test]
+    fn flat_folders_loop_still_fails_on_a_missing_required_role() {
+        let d = tmpdir("folders_flat");
+        std::fs::create_dir_all(d.join("case_1")).unwrap();
+        let fake = Fake::new(&[]);
+        let entries: [HurlEntry; 0] = [];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" WITH front=\"*_front.jpg\"\n    REPORT (CASE)\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.rows.is_empty());
+        assert!(
+            res.errors.iter().any(|e| e.contains("front")),
+            "{:?}",
+            res.errors
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

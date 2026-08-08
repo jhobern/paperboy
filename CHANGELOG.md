@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.1] - 2026-08-12
+
+### Added
+
+- **PaperTrail `FOLDERS` loops can now walk a nested tree.** `FOR CASE IN
+  FOLDERS "inputs" MATCH "**/case_*"` takes the same `MATCH` glob `FILES`
+  already took: it filters folder **names**, and recurses through the tree when
+  the glob contains `**` (a bare `MATCH "**"` filters nothing and simply visits
+  every folder at every depth). Previously `FOLDERS` could only see the
+  immediate children of one directory, so an input set laid out as
+  `<type>/<batch>/<case>/` — the shape most test corpora actually have — had to
+  be flattened by hand before a report could be run over it.
+
+  Because a recursive walk necessarily passes through container folders that
+  hold no case files, such a folder is now **skipped** rather than failing the
+  run: a recursive walk *searches* a tree for the folders that fit the shape.
+  A flat `FOLDERS "cases"` walk still *enumerates* a set you named, so there a
+  mis-shaped member remains a loud error, exactly as before.
+
+  In both editors the glob box that `FILES` loops offer is now offered for
+  `FOLDERS` loops too, so the way to narrow (or deepen) the walk is visible
+  rather than something you have to know to type.
+
+- **`FOLDERS … WITH` roles can be marked optional** with a trailing `?`:
+  `WITH front="*_front.*", back="*_back.*"?`. An optional role that matches no
+  file binds the empty string instead of failing the run, so a genuinely
+  optional input — a document with no back side, a case with no expected-result
+  file — no longer forces you to either split the corpus in two or drop the
+  role entirely. Matching *more* than one file stays an error whether or not
+  the role is optional: PaperTrail will not pick one of two candidates for you,
+  because the choice would silently depend on directory order.
+
+
 ## [0.7.0] - 2026-08-09
 
 ### Added

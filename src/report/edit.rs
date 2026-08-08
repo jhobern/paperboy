@@ -377,6 +377,7 @@ impl NodeKind {
                 pattern: Pattern::single("FOLDER"),
                 producer: Producer::Folders {
                     dir: String::new(),
+                    glob: None,
                     roles: Vec::new(),
                 },
                 body: Vec::new(),
@@ -673,8 +674,8 @@ pub(crate) fn vars_in_scope(
                     push(name, &mut out);
                 }
                 if let Producer::Folders { roles, .. } = producer {
-                    for (role, _) in roles {
-                        push(role, &mut out);
+                    for role in roles {
+                        push(&role.name, &mut out);
                     }
                 }
                 nodes = body;
@@ -1078,7 +1079,7 @@ pub(crate) fn set_loop_glob(flow: &mut ReportFlow, path: &[usize], text: &str) -
     let t = text.trim();
     match node_at_mut(flow, path) {
         Some(FlowNode::ForEach {
-            producer: Producer::Files { glob, .. },
+            producer: Producer::Files { glob, .. } | Producer::Folders { glob, .. },
             ..
         }) => {
             let next = (!t.is_empty()).then(|| t.to_string());

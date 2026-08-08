@@ -29,7 +29,7 @@ use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
     Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt,
-    RoleRef, WithItem,
+    RoleBinding, RoleRef, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -1094,7 +1094,7 @@ pub(crate) struct FilesForm {
     pub(crate) folders: bool,
     /// A `FOLDERS` loop's `WITH role="glob"` clauses, preserved verbatim across
     /// an edit (the form doesn't expose them, but must not drop them).
-    pub(crate) roles: Vec<(String, String)>,
+    pub(crate) roles: Vec<RoleBinding>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -1113,7 +1113,7 @@ impl FilesForm {
         glob: Option<String>,
         parallel: Option<ParallelSpec>,
         folders: bool,
-        roles: Vec<(String, String)>,
+        roles: Vec<RoleBinding>,
     ) -> Self {
         let selected = if dir.trim().is_empty() { 1 } else { 0 };
         FilesForm {
@@ -1134,12 +1134,9 @@ impl FilesForm {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<FilesRow> {
-        let mut rows = vec![FilesRow::Var, FilesRow::Folder];
-        // `FOLDERS` has no `MATCH` clause in the grammar, so the row would be
-        // a field that can't be written.
-        if !self.folders {
-            rows.push(FilesRow::Match);
-        }
+        // Both producers take a `MATCH` glob: over file names for `FILES`, over
+        // folder names (recursing on `**`) for `FOLDERS`.
+        let mut rows = vec![FilesRow::Var, FilesRow::Folder, FilesRow::Match];
         rows.push(FilesRow::Parallel);
         if self.parallel {
             rows.push(FilesRow::Degree);
@@ -1159,6 +1156,7 @@ impl FilesForm {
         if self.folders {
             Producer::Folders {
                 dir: self.dir.clone(),
+                glob: self.glob_opt(),
                 roles: self.roles.clone(),
             }
         } else {
@@ -2255,16 +2253,17 @@ impl TuiApp {
                     Vec::new(),
                 ),
                 // `FOLDERS` shares the form: same variable, same folder picker,
-                // same PARALLEL rows — it just has no `MATCH` glob.
+                // same `MATCH` glob (which also drives its recursion) and the
+                // same PARALLEL rows.
                 Some(FlowNode::ForEach {
                     pattern,
-                    producer: Producer::Folders { dir, roles },
+                    producer: Producer::Folders { dir, glob, roles },
                     parallel,
                     ..
                 }) if pattern.is_single() => (
                     pattern.named().next().unwrap_or("FOLDER").to_string(),
                     dir.clone(),
-                    None,
+                    glob.clone(),
                     *parallel,
                     true,
                     roles.clone(),

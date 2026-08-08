@@ -8,12 +8,12 @@ use nom::{
     character::complete::{char, multispace0, multispace1, not_line_ending, satisfy},
     combinator::{eof, map, opt, peek, recognize, value, verify},
     multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair},
+    sequence::{delimited, pair, preceded, separated_pair, tuple},
 };
 
 use crate::report::flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ParallelSpec, Pattern, Producer,
-    ReportFlow, ReportStmt, ResponseFmt, RoleRef, WithItem,
+    ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -594,17 +594,32 @@ fn folders_src(i: &str) -> IResult<&str, Producer> {
     map(
         preceded(
             kw("FOLDERS"),
-            pair(
+            tuple((
                 string_lit,
+                opt(preceded(kw("MATCH"), string_lit)),
                 opt(preceded(
                     kw("WITH"),
-                    separated_list1(sym(','), separated_pair(ident, sym('='), string_lit)),
+                    separated_list1(sym(','), role_binding),
                 )),
-            ),
+            )),
         ),
-        |(dir, roles)| Producer::Folders {
+        |(dir, glob, roles)| Producer::Folders {
             dir,
+            glob,
             roles: roles.unwrap_or_default(),
+        },
+    )(i)
+}
+
+/// One `role="glob"` binding, with an optional trailing `?` marking the role
+/// optional (it may match no file, binding empty, rather than failing the run).
+fn role_binding(i: &str) -> IResult<&str, RoleBinding> {
+    map(
+        pair(separated_pair(ident, sym('='), string_lit), opt(sym('?'))),
+        |((name, glob), mark)| RoleBinding {
+            name,
+            glob,
+            optional: mark.is_some(),
         },
     )(i)
 }
@@ -937,6 +952,27 @@ mod tests {
             "LIST PAIRS = ZIP(FILES \"fronts\" MATCH \"*.jpg\", FILES \"backs\")\nFOR (F, B) IN PAIRS\n    REQUEST r\nEND\n",
         );
         assert_round_trips("FOR ROW IN TUPLES FROM \"m.csv\"\n    REQUEST r\nEND\n");
+    }
+
+    #[test]
+    fn folders_match_glob_and_optional_roles_round_trip() {
+        let flow = assert_round_trips(
+            "FOR CASE IN FOLDERS \"cases\" MATCH \"**/case_*\" WITH front=\"*_front.*\", back=\"*_back.*\"?\n    REQUEST r\nEND\n",
+        );
+        if let FlowNode::ForEach { producer, .. } = &flow.nodes[0] {
+            match producer {
+                Producer::Folders { glob, roles, .. } => {
+                    assert_eq!(glob.as_deref(), Some("**/case_*"));
+                    assert!(!roles[0].optional);
+                    assert!(roles[1].optional, "trailing ? marks the role optional");
+                }
+                other => panic!("expected FOLDERS, got {other:?}"),
+            }
+        } else {
+            panic!("expected ForEach");
+        }
+        // MATCH without roles, and roles without MATCH, are both still valid.
+        assert_round_trips("FOR D IN FOLDERS \"cases\" MATCH \"**\"\n    REQUEST r\nEND\n");
     }
 
     #[test]
