@@ -359,6 +359,7 @@ impl NodeKind {
                 template: "value".into(),
                 name: "column".into(),
                 stats: Vec::new(),
+                image: None,
             }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
@@ -793,6 +794,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     name: "field".into(),
                     query: "HttpStatus".into(),
                     stats: Vec::new(),
+                    image: None,
                 });
             }
         }
@@ -806,6 +808,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     var,
                     name: "name".into(),
                     stats: Vec::new(),
+                    image: None,
                 });
             }
             _ => {}
@@ -1157,6 +1160,7 @@ pub(crate) fn add_with_field(
             name: name.to_string(),
             query: query.to_string(),
             stats,
+            image: None,
         });
         Some(with.len() - 1)
     } else {
@@ -1180,6 +1184,9 @@ pub(crate) fn set_with_field(
             name: n,
             query: q,
             stats: st,
+            // The form doesn't edit the `IMAGE(…)` hint, so it is left alone
+            // rather than being cleared by an unrelated rename.
+            image: _,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
@@ -1433,6 +1440,7 @@ impl CarriedMod {
                         var,
                         name: name.clone(),
                         stats: Vec::new(),
+                        image: None,
                     });
                 }
                 _ => {}
@@ -2658,7 +2666,9 @@ REQUEST A
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
                 assert!(matches!(
                     &with[0],
-                    WithItem::Field { name, query, stats }
+                    WithItem::Field {
+                        name, query, stats, ..
+                    }
                         if name == "Code"
                             && query == "HttpStatus"
                             && stats == &[StatKind::Count, StatKind::Mean]

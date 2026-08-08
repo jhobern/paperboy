@@ -67,6 +67,16 @@ pub trait EntryRunner: Sync {
     /// interpreter only ever passes single-entry `base`s, so `entries` holds one
     /// [`EntryOutcome`] on success.
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput;
+
+    /// Whether this runner sends nothing over the network. A dry run answers
+    /// `true`, which also suppresses the convenience fetch an `IMAGE` column
+    /// does for an `http(s)` value — a "no requests sent" run that quietly made
+    /// a hundred GETs would be lying. Local paths and `data:` URIs still
+    /// resolve, so a dry run of a file-driven image report still shows its
+    /// pictures.
+    fn offline(&self) -> bool {
+        false
+    }
 }
 
 /// Production [`EntryRunner`]: routes each send through
@@ -92,6 +102,10 @@ impl EntryRunner for LiveRunner {
 pub struct DryRunner;
 
 impl EntryRunner for DryRunner {
+    fn offline(&self) -> bool {
+        true
+    }
+
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
             entries: vec![EntryOutcome {
@@ -223,6 +237,8 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         no_match_marker,
         errors: ex.errors,
         column_stats: flow.column_stats(),
+        column_images: flow.column_images(),
+        images: HashMap::new(),
     }
 }
 
@@ -252,6 +268,43 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
                 .push(format!("baseline {}: {e}", path.display())),
         }
     }
+    resolve_images(result, flow, ctx);
+}
+
+/// Resolve every `IMAGE` column's cell value to picture bytes, filling
+/// [`ReportResult::images`].
+///
+/// Done here, after the comparison collapse, because that is the point at which
+/// the row set and the resolved columns are final — resolving earlier would
+/// fetch pictures for baseline rows that are about to be folded away.
+///
+/// Failures are recorded as run *notes*, never errors: a report whose subject is
+/// an API run must not fail because an illustration beside it was unreachable.
+/// The cell simply stays as its text, which is what CSV and JSON would have
+/// written anyway.
+fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    let columns = result.resolved_columns(&flow.header);
+    let image_columns: Vec<&super::model::OutputColumn> =
+        columns.iter().filter(|c| c.image.is_some()).collect();
+    if image_columns.is_empty() {
+        return;
+    }
+    let mut resolver = super::image::ImageResolver::new();
+    resolver.offline = ctx.runner.offline();
+    let mut images = HashMap::new();
+    for (r, row) in result.rows.iter().enumerate() {
+        for col in &image_columns {
+            let value = col.value(row, &result.no_match_marker);
+            if value.is_empty() || value == result.no_match_marker {
+                continue;
+            }
+            if let Some(img) = resolver.resolve(&value, ctx.root.as_deref()) {
+                images.insert((r, col.header.clone()), img);
+            }
+        }
+    }
+    result.images = images;
+    result.errors.extend(resolver.notes);
 }
 
 /// Mutable interpreter state threaded through the walk.
@@ -1614,6 +1667,7 @@ mod tests {
             header: "m".into(),
             sources: vec!["process.missing".into()],
             stats: Vec::new(),
+            image: None,
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }
@@ -3257,6 +3311,97 @@ mod tests {
         assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
         // Intrinsic first, then [Reports], then WITH.
         assert_eq!(res.column_order, vec!["r.Response", "r.A", "r.B"]);
+    }
+
+    /// End-to-end: a file-driven report whose column carries `IMAGE` resolves
+    /// each row's value into [`ReportResult::images`], keyed by `(row, header)`,
+    /// while the cell text is left exactly as produced.
+    #[test]
+    fn an_image_column_resolves_local_files_during_the_run() {
+        let dir = tmpdir("images");
+        let png = crate::report::image::tests::png_1x1();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        std::fs::write(dir.join("b.png"), &png).unwrap();
+        // A third value that is not a picture at all: it must leave the cell as
+        // text and note the problem, never fail the report.
+        std::fs::write(dir.join("c.png"), b"not an image").unwrap();
+
+        let flow = parse_flow(
+            "FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame IMAGE(HEIGHT 60)\nEND\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        assert_eq!(res.rows.len(), 3);
+        let row_of = |name: &str| {
+            res.rows
+                .iter()
+                .position(|r| r.cells.get("Frame").is_some_and(|v| v.ends_with(name)))
+                .unwrap_or_else(|| panic!("row for {name}"))
+        };
+        for name in ["a.png", "b.png"] {
+            let img = res
+                .images
+                .get(&(row_of(name), "Frame".to_string()))
+                .unwrap_or_else(|| panic!("resolved {name}"));
+            assert_eq!(img.mime, "image/png");
+            assert_eq!(img.bytes, png);
+        }
+        assert!(
+            !res.images
+                .contains_key(&(row_of("c.png"), "Frame".to_string())),
+            "a non-picture value resolves to nothing"
+        );
+        assert!(
+            !res.rows[row_of("c.png")].cells["Frame"].is_empty(),
+            "and its cell keeps its text"
+        );
+        assert!(
+            res.errors.iter().any(|e| e.contains("c.png")),
+            "with a note saying why: {:?}",
+            res.errors
+        );
+        // The clause reaches the resolved columns, so a writer can size the box.
+        let cols = res.resolved_columns(&flow.header);
+        assert_eq!(
+            cols[0].image.and_then(|i| i.height),
+            Some(60),
+            "the IMAGE clause reaches the output column"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A column *without* `IMAGE` is never resolved, however picture-like its
+    /// values look — the clause is the only thing that turns text into a
+    /// picture, so a report never pays for IO it didn't ask for.
+    #[test]
+    fn a_column_without_the_clause_resolves_no_images() {
+        let dir = tmpdir("noimages");
+        std::fs::write(dir.join("a.png"), crate::report::image::tests::png_1x1()).unwrap();
+        let flow =
+            parse_flow("FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame\nEND\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.images.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

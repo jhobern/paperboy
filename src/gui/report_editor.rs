@@ -988,6 +988,7 @@ fn build_node_chips(
             template,
             name,
             stats,
+            ..
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -3779,7 +3780,9 @@ fn with_block(
                     // The field's own STATISTICS(…) belongs on its row: leaving
                     // it out made a clause that is plainly there in the source
                     // invisible in the block editor.
-                    WithItem::Field { name, query, stats } => {
+                    WithItem::Field {
+                        name, query, stats, ..
+                    } => {
                         let mut t = format!("{name}: {query}");
                         if !stats.is_empty() {
                             t.push_str(&format!(
@@ -8865,6 +8868,7 @@ mod results_render_tests {
                 header: h.to_string(),
                 sources: vec![h.to_string()],
                 stats: Vec::new(),
+                image: None,
             })
             .collect();
         let mut result = ReportResult::default();

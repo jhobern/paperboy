@@ -229,7 +229,7 @@ impl ReportWriter for HtmlWriter {
             out.push_str("</th>");
         }
         out.push_str("</tr>\n</thead>\n<tbody>\n");
-        for row in &result.rows {
+        for (r, row) in result.rows.iter().enumerate() {
             out.push_str("<tr>");
             for c in &columns {
                 let value = c.value(row, &result.no_match_marker);
@@ -242,7 +242,14 @@ impl ReportWriter for HtmlWriter {
                 out.push_str("<td");
                 out.push_str(class);
                 out.push('>');
-                push_escaped(&mut out, &value);
+                // An `IMAGE` column embeds the picture as a `data:` URI so the
+                // file stays self-contained (the whole point of the HTML
+                // export): a `<img src="http://…">` would break the moment the
+                // pre-signed URL it came from expired.
+                match result.images.get(&(r, c.header.clone())) {
+                    Some(img) => push_html_image(&mut out, img, c.image, &value),
+                    None => push_escaped(&mut out, &value),
+                }
                 out.push_str("</td>");
             }
             out.push_str("</tr>\n");
@@ -266,6 +273,36 @@ impl ReportWriter for HtmlWriter {
         out.push_str("</table>\n</body>\n</html>\n");
         Ok(out.into_bytes())
     }
+}
+
+/// Append an `<img>` for a resolved picture, sized per the column's `IMAGE`
+/// clause. The cell's text becomes the `alt`/`title`, so the source it came
+/// from is still available on hover and to a screen reader.
+fn push_html_image(
+    out: &mut String,
+    img: &super::model::ImageData,
+    spec: Option<crate::report::flow::ImageSpec>,
+    value: &str,
+) {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
+    let style = match spec.and_then(|s| s.scaled_size(img.natural)) {
+        Some((w, h)) => format!("width:{}px;height:{}px", w.round(), h.round()),
+        // A `FIT` column has no fixed box, so the picture is capped to the
+        // column instead -- the browser's equivalent of fitting to the cell.
+        None => "max-width:100%;height:auto".to_string(),
+    };
+    out.push_str("<img style=\"");
+    out.push_str(&style);
+    out.push_str("\" alt=\"");
+    push_escaped(out, value);
+    out.push_str("\" title=\"");
+    push_escaped(out, value);
+    out.push_str("\" src=\"data:");
+    out.push_str(&img.mime);
+    out.push_str(";base64,");
+    out.push_str(&b64);
+    out.push_str("\">");
 }
 
 /// Append `text` to `out` with the five XML/HTML special characters escaped, so
@@ -295,6 +332,10 @@ impl ReportWriter for XlsxWriter {
         use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
 
         let columns = result.resolved_columns(header);
+        // Pixel boxes for every picture that is going to be embedded, worked
+        // out up front because they drive the row heights and column widths,
+        // which have to be set before the cells are written.
+        let boxes = xlsx_image_boxes(&columns, result);
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();
 
@@ -327,7 +368,22 @@ impl ReportWriter for XlsxWriter {
         // default, every column comes out equally tiny and the wrapped cells
         // become tall thin ribbons — the same run's HTML export looks right
         // only because the browser sizes the table itself.
-        for (col, width) in xlsx_column_widths(&columns, result).into_iter().enumerate() {
+        let mut widths = xlsx_column_widths(&columns, result);
+        // An image column is sized to its widest picture, not to the URL or
+        // path text underneath it -- the text is only a fallback there, and
+        // sizing to it would leave every picture clipped.
+        for (col, c) in columns.iter().enumerate() {
+            if c.image.is_none() {
+                continue;
+            }
+            let widest = (0..result.rows.len())
+                .filter_map(|r| boxes.get(&(r, col)))
+                .fold(0.0f64, |acc, (w, _)| acc.max(*w));
+            if widest > 0.0 {
+                widths[col] = clamp_xlsx_width(px_to_char_width(widest));
+            }
+        }
+        for (col, width) in widths.into_iter().enumerate() {
             sheet
                 .set_column_width(col as u16, width)
                 .map_err(|e| e.to_string())?;
@@ -357,6 +413,16 @@ impl ReportWriter for XlsxWriter {
         // Data rows.
         for (r, row) in result.rows.iter().enumerate() {
             let excel_row = (r + 1) as u32;
+            // A row carrying pictures has to be tall enough for the tallest of
+            // them, or Excel draws the image overflowing into the rows below.
+            let tallest = (0..columns.len())
+                .filter_map(|col| boxes.get(&(r, col)))
+                .fold(0.0f64, |acc, (_, h)| acc.max(*h));
+            if tallest > 0.0 {
+                sheet
+                    .set_row_height_pixels(excel_row, tallest.ceil() as u32)
+                    .map_err(|e| e.to_string())?;
+            }
             for (col, c) in columns.iter().enumerate() {
                 let value = c.value(row, &result.no_match_marker);
                 let fmt = match cell_tint(&c.header, &value) {
@@ -365,6 +431,32 @@ impl ReportWriter for XlsxWriter {
                     Some(Tint::Amber) => &amber,
                     None => &body_fmt,
                 };
+                // An embedded picture replaces the cell's text rather than
+                // sitting on top of it: the value is a URL or a path, which
+                // would show through around the image and is of no interest to
+                // the reader once the picture is there. It stays in the CSV and
+                // JSON exports, which is where it is actually useful.
+                if let Some(img) = result.images.get(&(r, c.header.clone())) {
+                    let mut image = rust_xlsxwriter::Image::new_from_buffer(&img.bytes)
+                        .map_err(|e| e.to_string())?
+                        // The alt text is the value, so the information isn't
+                        // lost -- a screen reader, or anyone who clicks the
+                        // picture, still gets the source it came from.
+                        .set_alt_text(&value);
+                    if c.image.is_some_and(|i| i.fit) {
+                        sheet
+                            .insert_image_fit_to_cell(excel_row, col as u16, &image, true)
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        if let Some((w, h)) = boxes.get(&(r, col)) {
+                            image = image.set_scale_to_size(*w, *h, false);
+                        }
+                        sheet
+                            .insert_image(excel_row, col as u16, &image)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    continue;
+                }
                 match parse_report_number(&value) {
                     Some(n) if numeric[col] => sheet
                         .write_number_with_format(excel_row, col as u16, n, fmt)
@@ -477,6 +569,41 @@ fn text_display_width(text: &str) -> usize {
 /// Clamp a measured character count to the column-width range Excel is given.
 fn clamp_xlsx_width(measured: usize) -> f64 {
     (measured as f64).clamp(XLSX_MIN_COL_WIDTH, XLSX_MAX_COL_WIDTH)
+}
+
+/// Excel's column width unit is "characters of the default font", which is
+/// about 7 pixels wide, plus ~5px of cell padding. Converting the other way is
+/// what lets an image column be sized to its pictures.
+fn px_to_char_width(px: f64) -> usize {
+    (((px - 5.0).max(0.0)) / 7.0).ceil() as usize
+}
+
+/// The pixel `(width, height)` box each embedded picture is drawn in, keyed by
+/// `(row index, column index)`.
+///
+/// Computed before anything is written because the boxes drive both the row
+/// heights and the image columns' widths, and Excel wants those set before the
+/// cells. `FIT` columns are absent from the map: their sizing is the cell's, so
+/// they neither need nor should get a row-height bump.
+fn xlsx_image_boxes(
+    columns: &[OutputColumn],
+    result: &ReportResult,
+) -> std::collections::HashMap<(usize, usize), (f64, f64)> {
+    let mut out = std::collections::HashMap::new();
+    for (col, c) in columns.iter().enumerate() {
+        let Some(spec) = c.image else { continue };
+        if spec.fit {
+            continue;
+        }
+        for r in 0..result.rows.len() {
+            if let Some(img) = result.images.get(&(r, c.header.clone()))
+                && let Some(size) = spec.scaled_size(img.natural)
+            {
+                out.insert((r, col), size);
+            }
+        }
+    }
+    out
 }
 
 /// Per-column widths for the xlsx export, sized to the widest thing each column
@@ -912,6 +1039,7 @@ mod tests {
             header: "Time".into(),
             sources: vec!["Time".into()],
             stats: Vec::new(),
+            image: None,
         };
         let res = ReportResult {
             no_match_marker: "-".into(),
@@ -1147,6 +1275,107 @@ mod tests {
         let bytes = XlsxWriter.write(&res, &header).unwrap();
         assert!(!bytes.is_empty(), "xlsx with stats produced bytes");
         assert_eq!(&bytes[..2], b"PK", "still a valid ZIP container");
+    }
+
+    /// A result whose `Frame` column is an IMAGE column holding one resolved
+    /// 1x1 PNG in row 0.
+    fn image_result() -> (ReportResult, Header) {
+        use crate::report::flow::ImageSpec;
+        let png = crate::report::image::tests::png_1x1();
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Frame".into()],
+            rows: vec![row(&[("Name", "a"), ("Frame", "shots/a.png")])],
+            ..Default::default()
+        };
+        res.column_images.insert(
+            "Frame".to_string(),
+            ImageSpec {
+                height: Some(60),
+                ..Default::default()
+            },
+        );
+        res.images.insert(
+            (0, "Frame".to_string()),
+            crate::report::model::ImageData {
+                bytes: png,
+                mime: "image/png".to_string(),
+                natural: (1, 1),
+            },
+        );
+        (res, Header::default())
+    }
+
+    /// The picture reaches the workbook as a real media part, and the cell's
+    /// source text is not also written beside it.
+    #[test]
+    fn xlsx_embeds_a_resolved_picture_as_a_media_part() {
+        let (res, header) = image_result();
+        let bytes = XlsxWriter.write(&res, &header).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        // A ZIP stores each member's name uncompressed in its local header, so
+        // the media part is findable without unzipping.
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(
+            hay.contains("xl/media/image"),
+            "the workbook should carry an embedded picture"
+        );
+        assert!(
+            hay.contains("xl/drawings/drawing1.xml"),
+            "and the drawing that anchors it"
+        );
+    }
+
+    /// HTML inlines the picture as a `data:` URI so the export is a single
+    /// self-contained file, keeping the source value as alt/title text.
+    #[test]
+    fn html_inlines_a_resolved_picture_as_a_data_uri() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains("<img style=\"width:60px;height:60px\""),
+            "sized from the IMAGE clause and the 1x1 aspect ratio: {html}"
+        );
+        assert!(
+            html.contains("data:image/png;base64,"),
+            "inlined rather than linked: {html}"
+        );
+        assert!(
+            html.contains("alt=\"shots/a.png\""),
+            "the source value survives as alt text: {html}"
+        );
+    }
+
+    /// `IMAGE` is a render hint, so formats that cannot show a picture keep
+    /// writing the value exactly as before — CSV and JSON stay lossless.
+    #[test]
+    fn text_formats_ignore_the_image_clause_entirely() {
+        let (res, header) = image_result();
+        let text = String::from_utf8(CsvWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(text, "Name,Frame\r\na,shots/a.png\r\n");
+        let bytes = JsonWriter.write(&res, &header).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["rows"][0]["Frame"].as_str(),
+            Some("shots/a.png"),
+            "JSON carries the value, not the picture"
+        );
+    }
+
+    /// A row whose value never resolved (a bad path, an offline fetch) has no
+    /// entry in `images`, and must fall back to its text rather than a blank.
+    #[test]
+    fn an_unresolved_image_cell_falls_back_to_its_text() {
+        let (mut res, header) = image_result();
+        res.rows
+            .push(row(&[("Name", "b"), ("Frame", "missing.png")]));
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains("missing.png</td>") || html.contains(">missing.png<"),
+            "the unresolved row keeps its text: {html}"
+        );
+        // And the workbook still writes, with one picture rather than two.
+        let bytes = XlsxWriter.write(&res, &header).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("xl/media/image2"));
     }
 
     #[test]

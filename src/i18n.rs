@@ -515,6 +515,7 @@ strings! {
     help_grammar_show => "keep only these response fields (drop a heavy Response)", "ne garder que ces champs de réponse (retirer une réponse volumineuse)", "behold kun disse svarfelter (drop et tungt Response)";
     help_grammar_hide => "drop these response fields (applied last)", "retirer ces champs de réponse (appliqué en dernier)", "fjern disse svarfelter (anvendes sidst)";
     help_grammar_statistics => "summary footer for a column: MEAN/MEDIAN/… or DISTRIBUTION", "pied de résumé d'une colonne : MEAN/MEDIAN/… ou DISTRIBUTION", "opsummeringsfod for en kolonne: MEAN/MEDIAN/… eller DISTRIBUTION";
+    help_grammar_image => "draw the column's value (URL, path, base64) as a picture; HEIGHT/WIDTH/FIT size it", "dessine la valeur de la colonne (URL, chemin, base64) comme une image ; HEIGHT/WIDTH/FIT la dimensionnent", "tegn kolonnens værdi (URL, sti, base64) som et billede; HEIGHT/WIDTH/FIT angiver størrelsen";
     help_grammar_with => "field may alias an intrinsic, add STATISTICS, or be quoted", "un champ peut aliaser un intrinsèque, STATISTICS, ou être cité", "et felt kan aliasere en intrinsic, STATISTICS eller citeres";
     help_grammar_parallel => "prefix a FOR to run its iterations concurrently", "préfixer un FOR pour exécuter ses itérations en parallèle", "sæt foran et FOR for at køre dets gentagelser samtidigt";
     help_grammar_for => "loop over a source, binding VAR each pass; END closes it", "boucler sur une source, en liant VAR à chaque passage ; END la ferme", "gennemløb en kilde og bind VAR hver gang; END lukker den";

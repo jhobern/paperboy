@@ -12,8 +12,8 @@ use nom::{
 };
 
 use crate::report::flow::{
-    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ParallelSpec, Pattern, Producer,
-    ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, WithItem,
+    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, Pattern,
+    Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -377,17 +377,18 @@ fn report_vars(i: &str) -> IResult<&str, ReportStmt> {
     map(paren_list1(ident), ReportStmt::Vars)(i)
 }
 
-/// `REPORT "<template>" AS <name> [STATISTICS(…)]`.
+/// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE[(…)]]`.
 fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
     let (i, template) = string_lit(i)?;
     let (i, name) = preceded(kw("AS"), str_or_word)(i)?;
-    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
+    let (i, (stats, image)) = column_clauses(i)?;
     Ok((
         i,
         ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
         },
     ))
 }
@@ -400,18 +401,98 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
 fn report_single(i: &str) -> IResult<&str, ReportStmt> {
     let (i, var) = ident(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
-    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
+    let (i, (stats, image)) = column_clauses(i)?;
     Ok((
         i,
-        match (alias, stats.is_empty()) {
-            (Some(name), _) => ReportStmt::VarAs { var, name, stats },
+        match (alias, stats.is_empty() && image.is_none()) {
+            (Some(name), _) => ReportStmt::VarAs {
+                var,
+                name,
+                stats,
+                image,
+            },
+            // A bare `REPORT X` is a plain variable column, but one carrying a
+            // clause needs a named column to hang the clause on, so the
+            // variable name becomes the header.
             (None, false) => {
                 let name = var.clone();
-                ReportStmt::VarAs { var, name, stats }
+                ReportStmt::VarAs {
+                    var,
+                    name,
+                    stats,
+                    image,
+                }
             }
             (None, true) => ReportStmt::Vars(vec![var]),
         },
     ))
+}
+
+/// The optional trailing column clauses -- `STATISTICS(…)` and `IMAGE[(…)]` --
+/// in either order, since neither is more natural than the other.
+fn column_clauses(i: &str) -> IResult<&str, (Vec<StatKind>, Option<ImageSpec>)> {
+    let mut rest = i;
+    let mut stats = Vec::new();
+    let mut image = None;
+    loop {
+        if let Ok((r, s)) = statistics_clause(rest) {
+            stats = s;
+            rest = r;
+            continue;
+        }
+        if image.is_none()
+            && let Ok((r, im)) = image_clause(rest)
+        {
+            image = Some(im);
+            rest = r;
+            continue;
+        }
+        return Ok((rest, (stats, image)));
+    }
+}
+
+/// `IMAGE` / `IMAGE(HEIGHT n | WIDTH n | FIT, …)` -- the render hint that makes
+/// a column's value be drawn as a picture by writers that can show one.
+fn image_clause(i: &str) -> IResult<&str, ImageSpec> {
+    let (i, _) = kw("IMAGE")(i)?;
+    let (i, opts) = opt(paren_list1(image_opt))(i)?;
+    let mut spec = ImageSpec::default();
+    for opt in opts.into_iter().flatten() {
+        match opt {
+            ImageOpt::Height(n) => spec.height = Some(n),
+            ImageOpt::Width(n) => spec.width = Some(n),
+            ImageOpt::Fit => spec.fit = true,
+        }
+    }
+    Ok((i, spec))
+}
+
+#[derive(Clone, Copy)]
+enum ImageOpt {
+    Height(u32),
+    Width(u32),
+    Fit,
+}
+
+fn image_opt(i: &str) -> IResult<&str, ImageOpt> {
+    let px = preceded(multispace0, nom::character::complete::u32);
+    alt((
+        value(ImageOpt::Fit, kw("FIT")),
+        map(
+            preceded(kw("HEIGHT"), verify(px, |n: &u32| *n > 0)),
+            ImageOpt::Height,
+        ),
+        map(
+            preceded(
+                kw("WIDTH"),
+                verify(
+                    preceded(multispace0, nom::character::complete::u32),
+                    |n: &u32| *n > 0,
+                ),
+            ),
+            ImageOpt::Width,
+        ),
+    ))(i)
 }
 
 /// `STATISTICS(stat, …)` — the summary-statistics clause on a `REPORT … AS …`.
@@ -467,17 +548,19 @@ fn with_field_name(i: &str) -> IResult<&str, String> {
     alt((string_lit, ident))(i)
 }
 
-/// `name: <rest of line> [STATISTICS(…)]` — a full Hurl query (may contain `:`
-/// and quotes) or an intrinsic name, with an optional trailing statistics
-/// clause. `name` may be quoted to allow spaces.
+/// `name: <rest of line> [STATISTICS(…)] [IMAGE[(…)]]` — a full Hurl query (may
+/// contain `:` and quotes) or an intrinsic name, with optional trailing
+/// statistics and image clauses. `name` may be quoted to allow spaces.
 fn with_field(i: &str) -> IResult<&str, WithItem> {
     let (i, name) = with_field_name(i)?;
     let (i, _) = sym(':')(i)?;
     let (i, rest) = not_line_ending(i)?;
-    // Peel an optional trailing `STATISTICS(…)` off the query text (the same
-    // whole-word, outside-quotes rule the `columns:` directive uses), leaving
-    // the bare query.
-    let (query, stats) = crate::report::model::split_statistics(rest);
+    // Peel the optional trailing `STATISTICS(…)`/`IMAGE(…)` clauses off the
+    // query text (the same whole-word, outside-quotes rule the `columns:`
+    // directive uses), leaving the bare query. It has to be done textually
+    // here rather than with a combinator because the query itself runs to the
+    // end of the line and may contain almost anything.
+    let (query, stats, image) = crate::report::model::split_column_clauses(rest);
     let query = query.trim();
     if query.is_empty() {
         return Err(perr(i));
@@ -488,6 +571,7 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
             name,
             query: query.to_string(),
             stats,
+            image,
         },
     ))
 }
@@ -1067,7 +1151,9 @@ mod tests {
         match &flow.nodes[0] {
             FlowNode::Report(ReportStmt::Request { with, .. }) => {
                 match &with[0] {
-                    WithItem::Field { name, query, stats } => {
+                    WithItem::Field {
+                        name, query, stats, ..
+                    } => {
                         assert_eq!(name, "Response Time");
                         assert_eq!(query, "Time");
                         assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
@@ -1429,7 +1515,9 @@ mod tests {
             "REPORT Time AS \"Response time\" STATISTICS(MEAN, MEDIAN)\nREPORT Overall AS Verdict STATISTICS(DISTRIBUTION)\n",
         );
         match &flow.nodes[0] {
-            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
+            FlowNode::Report(ReportStmt::VarAs {
+                var, name, stats, ..
+            }) => {
                 assert_eq!(var, "Time");
                 assert_eq!(name, "Response time");
                 assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
@@ -1442,6 +1530,109 @@ mod tests {
             Some(&vec![StatKind::Mean, StatKind::Median])
         );
         assert_eq!(cs.get("Verdict"), Some(&vec![StatKind::Distribution]));
+    }
+
+    #[test]
+    fn report_image_clause_parses_and_round_trips() {
+        use crate::report::flow::ImageSpec;
+        // Bare `IMAGE`, each sizing option, and `FIT` all survive a parse →
+        // serialize round-trip, and are collected by column header.
+        let flow = assert_round_trips(
+            "REPORT Frame AS Face IMAGE
+REPORT Doc AS Page IMAGE(HEIGHT 110)
+REPORT Sig AS Mark IMAGE(WIDTH 200, HEIGHT 100)
+REPORT Thumb AS Small IMAGE(FIT)
+",
+        );
+        let ci = flow.column_images();
+        assert_eq!(ci.get("Face"), Some(&ImageSpec::default()));
+        assert_eq!(
+            ci.get("Page"),
+            Some(&ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            ci.get("Mark"),
+            Some(&ImageSpec {
+                width: Some(200),
+                height: Some(100),
+                fit: false
+            })
+        );
+        assert_eq!(
+            ci.get("Small"),
+            Some(&ImageSpec {
+                fit: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn report_image_and_statistics_parse_in_either_order() {
+        use crate::report::flow::ImageSpec;
+        use crate::report::model::StatKind;
+        // Neither clause is more natural than the other, so both orders parse;
+        // serialization normalises to STATISTICS-then-IMAGE.
+        for src in [
+            "REPORT Frame AS Face STATISTICS(COUNT) IMAGE(HEIGHT 60)
+",
+            "REPORT Frame AS Face IMAGE(HEIGHT 60) STATISTICS(COUNT)
+",
+        ] {
+            let flow = parse_flow(src).expect("parse");
+            assert_eq!(
+                flow.column_stats().get("Face"),
+                Some(&vec![StatKind::Count]),
+                "{src}"
+            );
+            assert_eq!(
+                flow.column_images().get("Face"),
+                Some(&ImageSpec {
+                    height: Some(60),
+                    ..Default::default()
+                }),
+                "{src}"
+            );
+            assert_eq!(
+                flow.to_text(),
+                "REPORT Frame AS Face STATISTICS(COUNT) IMAGE(HEIGHT 60)\n",
+                "both orders serialize the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn with_field_image_clause_parses_and_round_trips() {
+        use crate::report::flow::ImageSpec;
+        // The clause is available on a `WITH` field too, where the value is a
+        // Hurl query rather than a variable.
+        let flow = assert_round_trips(
+            "REPORT REQUEST face WITH\n    Frame: jsonpath \"$.frame_url\" IMAGE(HEIGHT 110)\n    Status: HttpStatus\nEND\n",
+        );
+        assert_eq!(
+            flow.column_images().get("face.Frame"),
+            Some(&ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn image_rejects_a_zero_or_missing_size() {
+        // A zero-pixel picture is never what was meant, and an option list that
+        // parses nothing should fail loudly rather than silently yielding a
+        // bare IMAGE.
+        for src in [
+            "REPORT Frame AS Face IMAGE(HEIGHT 0)\n",
+            "REPORT Frame AS Face IMAGE(HEIGHT)\n",
+            "REPORT Frame AS Face IMAGE(TALL 10)\n",
+        ] {
+            assert!(parse_flow(src).is_err(), "{src} should not parse");
+        }
     }
 
     #[test]

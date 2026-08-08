@@ -8,9 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.7.1] - 2026-08-12
+## [0.8.0] - 2026-08-12
 
 ### Added
+
+- **PaperTrail columns can hold pictures (`IMAGE`).** A column whose value is a
+  picture *source* — an image URL the response handed back, a path on disk, a
+  `data:` URI or a bare base64 blob — can be marked `IMAGE`, and every export
+  that can show a picture draws it instead of the text:
+
+  ```
+  REPORT REQUEST face AS f WITH
+      Frame: jsonpath "$.best_frame.url" IMAGE(HEIGHT 110)
+      Score: jsonpath "$.best_frame.score"
+  END
+  ```
+
+  The clause goes wherever `STATISTICS(…)` goes — on a `REPORT … AS …`, on a
+  computed column, on a `WITH` field, or inline in `# columns:` — and takes
+  `HEIGHT n`, `WIDTH n` (either alone scales proportionally, both together fix
+  the box) or `FIT` to size to the cell. With no options a picture is drawn
+  110 px high.
+
+  `IMAGE` is a **render hint, never a value**: the cell keeps its text. That is
+  what keeps the CSV and JSON exports byte-for-byte what they were, keeps
+  baseline snapshots textual, and lets a format that can't show pictures fall
+  back to the text with no rule of its own. The **xlsx** export embeds the
+  picture (widening the column and heightening the row to fit) and keeps the
+  source as its alt text; **HTML** inlines it as a `data:` URI so the export
+  stays a single self-contained file.
+
+  Where the picture comes from is worked out from the **value's shape**, so one
+  clause covers every case and a report never has to declare which kind it
+  meant. A value that can't be turned into a picture leaves the cell as text and
+  records a note — a broken thumbnail must never fail a report. `IMAGE` columns
+  are left out of baseline/`ENVS` comparison, because picture URLs are usually
+  signed and expiring and diffing them would flag every row while burying the
+  changes that matter. A **dry run** still resolves local paths and `data:`
+  URIs, but never fetches a URL: a run that reports "no requests sent" must not
+  quietly have made a hundred GETs.
 
 - **PaperTrail `FOLDERS` loops can now walk a nested tree.** `FOR CASE IN
   FOLDERS "inputs" MATCH "**/case_*"` takes the same `MATCH` glob `FILES`

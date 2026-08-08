@@ -141,6 +141,7 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         result.column_order.insert(0, RESULT_COLUMN.to_string());
     }
 
+    let excluded: HashSet<String> = result.column_images.keys().cloned().collect();
     let rows = std::mem::take(&mut result.rows);
 
     let mut baseline_by_key: HashMap<Vec<String>, ReportRow> = HashMap::new();
@@ -182,7 +183,7 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         let mut emitted = false;
         for comp in &roles.comparisons {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
-                let verdict = compute_result(baseline, &cand);
+                let verdict = compute_result(baseline, &cand, &excluded);
                 cand.cells.insert(RESULT_COLUMN.to_string(), verdict);
                 // Copy baseline cells for each SHOW field, but only for aliases
                 // where the candidate row already emits that field.  This avoids
@@ -225,7 +226,16 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
 /// `(baseline)` suffix, candidate as-is) showing only differing fields. Field
 /// values that parse as JSON are embedded structurally; others as JSON strings.
 /// Returns [`MATCH`] when all agree, or [`NO_BASELINE`] when there is no baseline.
-pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
+///
+/// `exclude` names cell keys the diff must ignore. `IMAGE` columns go in it:
+/// the picture sources such a column holds are typically timestamped or signed
+/// URLs that differ on every run, so comparing them would fill the `Result`
+/// column with changes that mean nothing while burying the ones that do.
+pub(super) fn compute_result(
+    baseline: Option<&ReportRow>,
+    cand: &ReportRow,
+    exclude: &HashSet<String>,
+) -> String {
     let Some(base) = baseline else {
         return NO_BASELINE.to_string();
     };
@@ -234,6 +244,9 @@ pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> 
     let mut cand_diffs = serde_json::Map::new();
 
     for key in comparable_keys(cand, base) {
+        if exclude.contains(&key) {
+            continue;
+        }
         let b = base.cells.get(&key).map(String::as_str).unwrap_or("");
         let c = cand.cells.get(&key).map(String::as_str).unwrap_or("");
         if b != c {
@@ -357,6 +370,59 @@ mod tests {
         let r = comparison_roles(&flow).expect("roles");
         assert!(r.baseline.contains("prod"));
         assert_eq!(r.comparisons, vec!["staging"]);
+    }
+
+    /// An `IMAGE` column holds a *picture source* — usually a signed, expiring
+    /// URL that differs on every run. Diffing it would report a change on every
+    /// row and bury the ones that matter, so it is excluded.
+    #[test]
+    fn image_columns_are_left_out_of_the_diff() {
+        use crate::report::flow::ImageSpec;
+        let rows = || {
+            vec![
+                row(
+                    &["a"],
+                    "prod",
+                    &[
+                        ("face.Frame", "https://x/1?sig=aaa"),
+                        ("face.overall", "CLEAR"),
+                    ],
+                ),
+                row(
+                    &["a"],
+                    "staging",
+                    &[
+                        ("face.Frame", "https://x/2?sig=bbb"),
+                        ("face.overall", "CLEAR"),
+                    ],
+                ),
+            ]
+        };
+        let mut result = ReportResult {
+            rows: rows(),
+            ..Default::default()
+        };
+        result
+            .column_images
+            .insert("face.Frame".to_string(), ImageSpec::default());
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert_eq!(
+            result.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string()),
+            "the differing picture source must not count as a change"
+        );
+
+        // Without the IMAGE clause the very same values do count — the
+        // exclusion is the clause's doing, not a special case for URLs.
+        let mut plain = ReportResult {
+            rows: rows(),
+            ..Default::default()
+        };
+        apply(&mut plain, &roles(&["prod"], &["staging"]));
+        assert_ne!(
+            plain.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string())
+        );
     }
 
     #[test]

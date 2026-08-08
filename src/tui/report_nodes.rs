@@ -28,8 +28,8 @@ use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
-    Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt,
-    RoleBinding, RoleRef, WithItem,
+    Element, EnvClause, FlowNode, ImageSpec, ParallelSpec, Pattern, Producer, ReportStmt,
+    ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -357,6 +357,9 @@ pub(crate) struct VarsForm {
     pub(crate) other: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// An `IMAGE(…)` render hint the statement already carries. The form
+    /// doesn't expose it, but must not silently drop it when writing back.
+    pub(crate) image: Option<ImageSpec>,
     pub(crate) selected: usize,
 }
 
@@ -370,6 +373,7 @@ impl VarsForm {
         chosen: &[String],
         alias: Option<String>,
         stats: &[StatKind],
+        image: Option<ImageSpec>,
         in_scope: Vec<String>,
     ) -> Self {
         let mut names = in_scope;
@@ -379,6 +383,7 @@ impl VarsForm {
             }
         }
         VarsForm {
+            image,
             report_id,
             path,
             vars: names
@@ -443,7 +448,7 @@ impl VarsForm {
             .collect();
         // A single variable with a name or statistics is the `VarAs` form;
         // anything else is the plain variable list.
-        if rest.is_empty() && (!alias.is_empty() || !stats.is_empty()) {
+        if rest.is_empty() && (!alias.is_empty() || !stats.is_empty() || self.image.is_some()) {
             return Some(FlowNode::Report(ReportStmt::VarAs {
                 var: first.clone(),
                 // `STATISTICS` needs a column to attach to, so an unnamed one
@@ -454,6 +459,7 @@ impl VarsForm {
                     alias.to_string()
                 },
                 stats,
+                image: self.image,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -485,6 +491,9 @@ pub(crate) struct ComputedForm {
     pub(crate) template: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// An `IMAGE(…)` render hint the statement already carries; preserved
+    /// verbatim, as in [`VarsForm`].
+    pub(crate) image: Option<ImageSpec>,
     pub(crate) selected: usize,
 }
 
@@ -517,6 +526,7 @@ impl ComputedForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
+            image: self.image,
         }))
     }
 }
@@ -646,6 +656,9 @@ pub(crate) struct WithFieldForm {
     /// `(stat, ticked)` over [`StatKind::CHOOSABLE`], in that order. None
     /// ticked ⇒ no `STATISTICS(…)` clause.
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// An `IMAGE(…)` render hint the field already carries; preserved verbatim
+    /// (the form doesn't expose it, but must not drop it).
+    pub(crate) image: Option<ImageSpec>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -657,15 +670,19 @@ impl WithFieldForm {
         index: Option<usize>,
         existing: Option<&WithItem>,
     ) -> Self {
-        let (name, query, stats) = match existing {
-            Some(WithItem::Field { name, query, stats }) => {
-                (name.clone(), query.clone(), stats.clone())
-            }
+        let (name, query, stats, image) = match existing {
+            Some(WithItem::Field {
+                name,
+                query,
+                stats,
+                image,
+            }) => (name.clone(), query.clone(), stats.clone(), *image),
             // A bare `WITH RESPONSE` isn't a named field, so editing it falls
             // through to a fresh one rather than silently rewriting it.
-            _ => (String::new(), String::new(), Vec::new()),
+            _ => (String::new(), String::new(), Vec::new(), None),
         };
         WithFieldForm {
+            image,
             report_id,
             path,
             index,
@@ -705,6 +722,7 @@ impl WithFieldForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
+            image: self.image,
         })
     }
 }
@@ -1570,11 +1588,14 @@ impl TuiApp {
         let Some((report_id, path, node)) = self.selected_node(idx) else {
             return false;
         };
-        let (chosen, alias, stats) = match &node {
-            FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), None, Vec::new()),
-            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
-                (vec![var.clone()], Some(name.clone()), stats.clone())
-            }
+        let (chosen, alias, stats, image) = match &node {
+            FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), None, Vec::new(), None),
+            FlowNode::Report(ReportStmt::VarAs {
+                var,
+                name,
+                stats,
+                image,
+            }) => (vec![var.clone()], Some(name.clone()), stats.clone(), *image),
             _ => return false,
         };
         // The candidate list needs the bound collection to include the captures
@@ -1589,7 +1610,7 @@ impl TuiApp {
             Err(_) => Vec::new(),
         };
         self.overlay = Some(Overlay::ReportNodeVars(Box::new(VarsForm::build(
-            report_id, path, &chosen, alias, &stats, in_scope,
+            report_id, path, &chosen, alias, &stats, image, in_scope,
         ))));
         true
     }
@@ -1685,6 +1706,7 @@ impl TuiApp {
             template,
             name,
             stats,
+            image,
         }) = node
         else {
             return false;
@@ -1694,6 +1716,7 @@ impl TuiApp {
             path,
             template,
             alias: name,
+            image,
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))

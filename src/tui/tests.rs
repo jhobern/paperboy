@@ -20250,7 +20250,7 @@ fn report_with_result(text: &str, column_order: &[&str]) -> (TuiApp, usize) {
         column_order: column_order.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     (app, idx)
 }
@@ -22735,7 +22735,7 @@ fn report_with_multi_row_result() -> (TuiApp, usize) {
         column_order: cols.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
@@ -22854,7 +22854,7 @@ fn report_with_n_rows(n: usize) -> (TuiApp, usize) {
         column_order: vec!["Col1".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
@@ -23031,7 +23031,7 @@ fn cell_popup_pretty_prints_a_json_cell() {
         column_order: vec!["Body".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     press(&mut app, KeyCode::Enter); // initialise cursor at (0,0)
@@ -23299,6 +23299,7 @@ fn report_statistics_render_a_summary_footer_row() {
         no_match_marker: String::new(),
         errors: Vec::new(),
         column_stats,
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
@@ -23370,7 +23371,7 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         column_order: vec!["A".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
