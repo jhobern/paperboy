@@ -133,6 +133,82 @@ fn highlight_code_editable(
     job
 }
 
+/// Which substitution statuses appear in `text` — the legend's whole input.
+///
+/// The legend used to be collected by running the *highlighter* over the buffer
+/// and throwing the resulting [`LayoutJob`] away, so every frame paid for a
+/// second full colouring pass to learn four booleans. This walks the same
+/// placeholders without building anything, and stops as soon as it has seen
+/// everything there is to see.
+fn substitution_statuses(
+    text: &str,
+    vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+) -> SubstSeen {
+    let mut seen = SubstSeen::default();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let Some(close_rel) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        let inner = rest[open + 2..close].trim();
+        if let Some(info) = vars.get(inner) {
+            seen.mark(info.kind);
+            if shadowed.contains(inner) {
+                seen.shadowed = true;
+            }
+        }
+        rest = &rest[close + 2..];
+    }
+    seen
+}
+
+/// [`highlight_code_editable`], reused between frames while nothing it depends
+/// on has changed. See the report source editor's equivalent for why: the
+/// layouter is asked for a job on every frame, and rebuilding it re-scans the
+/// whole buffer.
+fn cached_code_job(
+    ui: &egui::Ui,
+    text: &str,
+    vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+    th: &GuiTheme,
+    font: FontId,
+) -> LayoutJob {
+    use std::hash::{Hash, Hasher};
+    let id = egui::Id::new("code_edit_highlight");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    crate::gui::report_editor::fnv1a(text.as_bytes(), crate::gui::report_editor::FNV_OFFSET)
+        .hash(&mut h);
+    font.size.to_bits().hash(&mut h);
+    // Both are hash maps/sets, so combine each entry order-independently.
+    let mut refs = 0u64;
+    for (k, info) in vars {
+        refs ^= crate::gui::report_editor::fnv1a(
+            k.as_bytes(),
+            crate::gui::report_editor::FNV_OFFSET ^ info.kind as u64,
+        );
+    }
+    for k in shadowed {
+        refs ^= crate::gui::report_editor::fnv1a(k.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    }
+    refs.hash(&mut h);
+    // The colours themselves come from the theme.
+    format!("{:?}", (th.text, th.subst, th.pending, th.err, th.ok)).hash(&mut h);
+    let key = h.finish();
+
+    if let Some((cached_key, job)) = ui.data(|d| d.get_temp::<(u64, LayoutJob)>(id))
+        && cached_key == key
+    {
+        return job;
+    }
+    let mut ignored = SubstSeen::default();
+    let job = highlight_code_editable(text, vars, shadowed, th, font, &mut ignored);
+    ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
+    job
+}
+
 /// Re-parse edited Code-view `text` back into the selected entry. On success it
 /// applies the result (preserving the UI-only `user_added` flag for Hurl; the
 /// JSON view carries over the fields it doesn't expose from the current entry)
@@ -230,15 +306,7 @@ fn draw_code_section(
     }
 
     // Legend: which substitution statuses appear in the current buffer.
-    let mut seen = SubstSeen::default();
-    let _ = highlight_code_editable(
-        &app.code_edit.buf,
-        subst_vars,
-        shadowed,
-        theme,
-        FontId::monospace(12.0),
-        &mut seen,
-    );
+    let seen = substitution_statuses(&app.code_edit.buf, subst_vars, shadowed);
 
     // A fixed-height editor that fills the panel (not shrink-wrapped to its
     // text), leaving room below for the legend and any parse error.
@@ -257,15 +325,7 @@ fn draw_code_section(
     let theme_l = theme;
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let mut s = SubstSeen::default();
-        let mut job = highlight_code_editable(
-            buf.as_str(),
-            subst_vars_l,
-            shadowed_l,
-            theme_l,
-            font,
-            &mut s,
-        );
+        let mut job = cached_code_job(ui, buf.as_str(), subst_vars_l, shadowed_l, theme_l, font);
         job.wrap.max_width = wrap;
         ui.fonts_mut(|f| f.layout_job(job))
     };
@@ -1058,5 +1118,137 @@ mod tests {
         assert!(!changed, "malformed JSON must not report a change");
         assert!(code.error.is_some(), "malformed JSON records an error");
         assert_eq!(session.collections[0].entries[0].method, before_method);
+    }
+}
+
+#[cfg(test)]
+mod highlight_cache_tests {
+    use super::*;
+    use crate::gui::theme::GuiTheme;
+    use crate::request::{SubstInfo, SubstKind};
+
+    fn vars() -> HashMap<String, SubstInfo> {
+        [
+            (
+                "BASE",
+                SubstInfo {
+                    shown: Some("https://x".into()),
+                    kind: SubstKind::Literal,
+                },
+            ),
+            (
+                "TOKEN",
+                SubstInfo {
+                    shown: None,
+                    kind: SubstKind::Pending,
+                },
+            ),
+            (
+                "SECRET",
+                SubstInfo {
+                    shown: Some("s".into()),
+                    kind: SubstKind::Loaded,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// The legend used to be built by running the highlighter over the whole
+    /// buffer and throwing the coloured job away. The cheap scan that replaced
+    /// it has to report exactly what that pass did, or the legend would start
+    /// listing the wrong statuses.
+    #[test]
+    fn the_legend_scan_agrees_with_the_highlighter_it_replaced() {
+        let vars = vars();
+        let shadowed: HashSet<String> = ["SECRET".to_string()].into_iter().collect();
+        for text in [
+            "",
+            "GET {{ BASE }}/a",
+            "GET {{BASE}}/a\nAuth: {{ TOKEN }}\nX: {{ SECRET }}\n",
+            "{{ UNKNOWN }} and an unclosed {{ one",
+            "no placeholders at all",
+        ] {
+            let mut from_highlighter = SubstSeen::default();
+            let _ = highlight_code_editable(
+                text,
+                &vars,
+                &shadowed,
+                &GuiTheme::from_spec(&crate::theme::default_preset()),
+                FontId::monospace(12.0),
+                &mut from_highlighter,
+            );
+            let scanned = substitution_statuses(text, &vars, &shadowed);
+            assert_eq!(
+                (
+                    scanned.loaded,
+                    scanned.literal,
+                    scanned.pending,
+                    scanned.failed,
+                    scanned.shadowed
+                ),
+                (
+                    from_highlighter.loaded,
+                    from_highlighter.literal,
+                    from_highlighter.pending,
+                    from_highlighter.failed,
+                    from_highlighter.shadowed
+                ),
+                "disagreed on {text:?}"
+            );
+        }
+    }
+
+    /// The cached job must be the one the highlighter would have built, and must
+    /// follow an edit rather than holding on to the previous buffer.
+    #[test]
+    fn the_cached_job_matches_a_freshly_built_one_and_follows_an_edit() {
+        let vars = vars();
+        let shadowed = HashSet::new();
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        let font = FontId::monospace(12.0);
+
+        let sections = |text: &str| {
+            let mut got = Vec::new();
+            // Twice, so the second pass is the one served from the cache.
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let job = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone());
+                    got = job
+                        .sections
+                        .iter()
+                        .map(|s| (s.byte_range.clone(), s.format.color))
+                        .collect();
+                });
+            }
+            got
+        };
+
+        let fresh = |text: &str| {
+            let mut ignored = SubstSeen::default();
+            highlight_code_editable(text, &vars, &shadowed, &th, font.clone(), &mut ignored)
+                .sections
+                .iter()
+                .map(|s| (s.byte_range.clone(), s.format.color))
+                .collect::<Vec<_>>()
+        };
+
+        let one = "GET {{ BASE }}/a";
+        assert_eq!(sections(one), fresh(one), "same colouring, cached or not");
+
+        let two = "GET {{ TOKEN }}/a";
+        assert_eq!(
+            sections(two),
+            fresh(two),
+            "an edit re-colours rather than serving the previous buffer"
+        );
+        assert_ne!(
+            sections(one),
+            sections(two),
+            "and the two really do colour differently"
+        );
     }
 }

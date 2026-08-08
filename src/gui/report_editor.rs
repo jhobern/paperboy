@@ -1697,6 +1697,72 @@ fn highlight_job(
     job
 }
 
+/// [`highlight_job`], reused between frames while nothing it depends on has
+/// changed.
+///
+/// `TextEdit` asks its layouter for a job on every frame, and building one
+/// re-tokenises the whole document — around 270µs for a 200-line report, on
+/// every frame, whether or not a key was pressed. Cloning a cached job costs a
+/// fraction of that, and handing it to `layout_job` as before leaves egui's own
+/// galley cache in charge of the actual text layout (which is what keeps this
+/// correct across a font or scale change).
+#[allow(clippy::too_many_arguments)]
+fn cached_highlight_job(
+    ui: &egui::Ui,
+    id: egui::Id,
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    th: &GuiTheme,
+    font: egui::FontId,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let key = highlight_key(text, ctx, spec, &font, wrap_width);
+    if let Some((cached_key, job)) = ui.data(|d| d.get_temp::<(u64, egui::text::LayoutJob)>(id))
+        && cached_key == key
+    {
+        return job;
+    }
+    let job = highlight_job(text, ctx, spec, th, font, wrap_width);
+    ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
+    job
+}
+
+/// Everything [`highlight_job`] reads, in one number.
+///
+/// **Maintenance:** anything the highlighter starts colouring by has to be
+/// added here, or the colours will stop following it.
+fn highlight_key(
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    font: &egui::FontId,
+    wrap_width: f32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The document itself dominates, so it is hashed with the cheap mixer
+    // rather than a SipHash pass over every byte.
+    fnv1a(text.as_bytes(), FNV_OFFSET).hash(&mut h);
+    ctx.error_line.hash(&mut h);
+    ctx.collection_resolves.hash(&mut h);
+    // Both name sets are hash sets, so their iteration order is not stable:
+    // combine each name's hash with `^` so the key depends on the membership
+    // and not on the order it comes out in.
+    let mut names = 0u64;
+    for e in &ctx.loaded_envs {
+        names ^= fnv1a(e.as_bytes(), FNV_OFFSET);
+    }
+    for r in &ctx.request_names {
+        names ^= fnv1a(r.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    }
+    names.hash(&mut h);
+    spec.hash(&mut h);
+    font.size.to_bits().hash(&mut h);
+    wrap_width.to_bits().hash(&mut h);
+    h.finish()
+}
+
 /// The byte offset of char index `at` in `text` (clamped to the end).
 fn byte_at(text: &str, at: usize) -> usize {
     text.char_indices()
@@ -1874,12 +1940,13 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let hl = highlight_ctx(ed, app);
     let spec = app.session.active_theme_spec();
     let th = app.theme;
-    // The layout job is rebuilt on every keystroke, so egui's galley cache is
-    // what keeps this cheap: an unchanged job hashes to the same key and the
-    // laid-out text is reused.
+    // `TextEdit` asks for a job every frame; re-tokenising the whole document
+    // that often is the expensive part, so it is cached and egui's galley cache
+    // still handles the layout itself.
+    let job_id = egui::Id::new("report_source_highlight");
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let job = highlight_job(buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        let job = cached_highlight_job(ui, job_id, buf.as_str(), &hl, &spec, &th, font, wrap_width);
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
     egui::ScrollArea::vertical()
@@ -2393,7 +2460,7 @@ fn cached_natural_widths(
 }
 
 /// FNV-1a's starting value.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(super) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// FNV-1a over `bytes`, continuing from `seed`.
 ///
@@ -2402,7 +2469,7 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// SipHash state for each of tens of thousands of cells costs more than hashing
 /// their bytes does. This is not a hash anyone attacks — it guards a cache of
 /// column widths — so the cheap mixing function is the right one.
-fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+pub(super) fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
     let mut h = seed;
     for b in bytes {
         h ^= *b as u64;
@@ -9318,6 +9385,90 @@ mod results_render_tests {
             result.rows.push(row);
         }
         (result, columns)
+    }
+
+    /// The source editor asks its layouter for a job on every frame, so the job
+    /// is cached — but it has to follow every input the highlighter colours by.
+    #[test]
+    fn the_highlight_key_notices_every_input_it_guards() {
+        use crate::tui::report_highlight::HlCtx;
+        let text = "REPORT REQUEST login AS l\n";
+        let ctx = HlCtx {
+            error_line: None,
+            collection_resolves: true,
+            loaded_envs: ["dev".to_string()].into_iter().collect(),
+            request_names: ["login".to_string()].into_iter().collect(),
+        };
+        let spec = crate::theme::default_preset();
+        let font = egui::FontId::monospace(12.0);
+        let key = |t: &str, c: &HlCtx, s: &crate::theme::ThemeSpec, f: &egui::FontId, w: f32| {
+            super::highlight_key(t, c, s, f, w)
+        };
+        let base = key(text, &ctx, &spec, &font, 800.0);
+
+        assert_ne!(
+            base,
+            key("REPORT REQUEST logout AS l\n", &ctx, &spec, &font, 800.0),
+            "the source text"
+        );
+
+        let mut c = ctx.clone();
+        c.error_line = Some(1);
+        assert_ne!(base, key(text, &c, &spec, &font, 800.0), "the error line");
+
+        c.error_line = None;
+        c.collection_resolves = false;
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "whether the collection binds — it is what makes a name green"
+        );
+
+        c.collection_resolves = true;
+        c.request_names = ["other".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which requests exist"
+        );
+
+        c.request_names = ctx.request_names.clone();
+        c.loaded_envs = ["prod".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which environments are loaded"
+        );
+
+        let other_theme = crate::theme::preset_for_language(&crate::i18n::Language::French);
+        assert_ne!(
+            base,
+            key(text, &ctx, &other_theme, &font, 800.0),
+            "the theme, which is where every colour comes from"
+        );
+
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &egui::FontId::monospace(18.0), 800.0),
+            "the font size"
+        );
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &font, 400.0),
+            "the wrap width, which the job carries"
+        );
+
+        // Two contexts holding the same names in a different insertion order are
+        // the same context: both are hash sets, and iterating one straight into
+        // the hasher is what made the validation panel flicker.
+        let mut same = ctx.clone();
+        same.request_names.insert("zzz".to_string());
+        same.request_names.remove("zzz");
+        assert_eq!(
+            base,
+            key(text, &same, &spec, &font, 800.0),
+            "the same set is the same key"
+        );
     }
 
     /// Render the grid twice in one context, so the second pass sees whatever

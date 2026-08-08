@@ -36,7 +36,7 @@ pub(crate) const THEME_COLOR_COUNT: usize = 11;
 /// (not `ratatui::Color`) so they persist to `state.json` without depending on
 /// ratatui's optional serde feature, and so the theme editor can adjust each
 /// channel directly. Convert to a runtime [`Theme`] with [`ThemeSpec::to_theme`].
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ThemeSpec {
     pub(crate) name: String,
     pub(crate) bg: [u8; 3],

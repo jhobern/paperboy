@@ -176,6 +176,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   file, and otherwise at most a few times a second, so a change made outside
   PaperBoy (another editor, a `git pull`) still appears without a refresh.
 
+- **Syntax highlighting is no longer recomputed on every frame.** Both the
+  PaperTrail source editor and the request Code view re-ran their highlighter
+  over the entire buffer each frame — every keyword, `{{ VAR }}` and error line
+  re-classified sixty times a second for text that hadn't changed. Each now
+  keeps its last colouring and rebuilds only when something it depends on
+  moves: the text, the error line, the loaded environments, the request names,
+  the theme, the font size or the wrap width.
+
+  The Code view was additionally running a *second*, complete highlighting pass
+  purely to find out which kinds of substitution appeared in the buffer, so it
+  could label the legend beneath it — and threw the coloured result away. That
+  pass is now a plain scan that only answers that question.
+
 ### Fixed
 
 - **The report validation panel no longer flickers when the mouse moves.** Two

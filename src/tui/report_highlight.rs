@@ -36,7 +36,7 @@ use super::theme::Theme;
 /// `COMPARISON` env names light up green when loaded, amber when not). Built
 /// fresh each draw from `TuiApp`; `Default` (nothing resolves) is used by the
 /// unit tests.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct HlCtx {
     /// 1-based line the parser rejected, recoloured to the error style.
     pub error_line: Option<usize>,
