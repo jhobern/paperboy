@@ -25,6 +25,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
   excluded from a comparison run's compared fields, since they always differ.
 
+### Fixed
+
+- **Typing in a report block and pressing Run threw the typing away.** The
+  header's buttons acted before the blocks below them were redrawn, so an
+  inline field that had not yet been committed — it commits when it loses
+  focus, which is the very click that pressed the button — never got the
+  chance: Run ran the *previous* version of the report and the edit was lost
+  with it. Run, Dry run, Save and Close now act at the end of the frame that
+  pressed them, on what is actually on screen.
+- **Deleting or moving a block while typing in another one could rename the
+  wrong block.** The same collision inside the Blocks view: the field's commit
+  was applied *after* the structural edit, so it landed on whichever block had
+  shuffled into that position — renaming a block the user never touched, and
+  losing the edit they had actually made. Field commits are now applied first,
+  while the positions they were written against still hold, and the toolbar's
+  delete/move act on the block that was highlighted when the button was
+  pressed.
+- **Clicking the `SHOW(…)` on an ENVS comparison loop did nothing.** A report
+  request's `SHOW` opens the field checklist when clicked; the baseline's own
+  `SHOW` — whose checklist lives in the ENVS form — did not, leaving no way to
+  reach it by clicking the thing it belongs to.
+
 ## [0.7.2] - 2026-08-08
 
 ### Fixed

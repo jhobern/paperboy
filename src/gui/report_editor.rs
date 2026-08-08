@@ -104,6 +104,27 @@ pub struct ReportEditor {
     /// exported as though it were them). Dismissing the preview brings them
     /// straight back.
     pub dry_run: Option<Box<crate::report::dry_run::DryRunReport>>,
+    /// A toolbar button pressed this frame, run *after* the body has been drawn
+    /// (see [`ToolbarAct`]).
+    pending_toolbar: Option<ToolbarAct>,
+}
+
+/// A toolbar button press, deferred to the end of the frame that pressed it.
+///
+/// The header strip is drawn before the view below it, and the inline chip
+/// fields in that view commit what has been typed into them when they lose
+/// focus — which is the same frame the button click takes focus away. Acting
+/// immediately therefore acted on the *pre-edit* report: Run ran the old flow
+/// (and switched to Results, so the field was never redrawn and the typing was
+/// simply dropped), and Save wrote the old text. Deferring to the end of the
+/// frame lets the field commit first, so a button always acts on what is on
+/// screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolbarAct {
+    Run,
+    DryRun,
+    Save,
+    Close,
 }
 
 /// One results cell opened in the inspector window: the column header (title)
@@ -148,6 +169,7 @@ impl ReportEditor {
             palette_w: 168.0,
             inspector: None,
             dry_run: None,
+            pending_toolbar: None,
         };
         ed.reparse();
         ed
@@ -1146,9 +1168,14 @@ enum Act {
         report: bool,
         name: String,
     },
-    MoveUp,
-    MoveDown,
-    Delete,
+    /// Move the block at `path` up (`up`) or down among its siblings. The path
+    /// is captured when the button is pressed rather than read back from the
+    /// selection later, because a value commit applied first re-selects the
+    /// field it wrote — the move has to act on what was highlighted on screen.
+    Move {
+        path: Vec<usize>,
+        up: bool,
+    },
     /// A palette block was dragged and dropped at `pos` (from the always-visible
     /// palette list). The node is built at drop time so request kinds pick up a
     /// default name from the bound collection.
@@ -1261,6 +1288,24 @@ enum Act {
     },
 }
 
+impl Act {
+    /// Whether this action only writes a value the user typed into an inline
+    /// field, leaving the shape of the flow alone. These are applied first (see
+    /// [`apply_block_actions`]) because their paths were resolved against the
+    /// tree as drawn.
+    fn is_value_commit(&self) -> bool {
+        matches!(
+            self,
+            Act::SetAlias { .. }
+                | Act::SetLoopVar { .. }
+                | Act::SetLoopDir { .. }
+                | Act::SetLoopGlob { .. }
+                | Act::SetParallelDegree { .. }
+                | Act::SetHeader { .. }
+        )
+    }
+}
+
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // Take the editor out so we can freely borrow `app.session` alongside it.
     let Some(mut ed) = app.report_editor.take() else {
@@ -1268,6 +1313,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
     let th = app.theme;
     let mut close = false;
+    ed.pending_toolbar = None;
 
     // Fold any streamed run updates into the grid, and keep repainting while a
     // run is live so the grid fills in real time.
@@ -1305,14 +1351,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 .button(format!("{} {}", super::icons::CLOSE, app.strings.gui_close))
                 .clicked()
             {
-                close = true;
+                ed.pending_toolbar = Some(ToolbarAct::Close);
             }
             let save = ui.add_enabled(
                 ed.report.dirty,
                 egui::Button::new(format!("{} {}", super::icons::SAVE, app.strings.gui_save)),
             );
             if save.clicked() {
-                save_report(&mut ed, app);
+                ed.pending_toolbar = Some(ToolbarAct::Save);
             }
             // Run toggles to Stop while a run is in flight.
             if ed.is_running() {
@@ -1336,7 +1382,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     )),
                 );
                 if run.clicked() {
-                    ed.start_run(app);
+                    ed.pending_toolbar = Some(ToolbarAct::Run);
                 }
                 // Dry run sits beside Run, disabled on the same terms: it
                 // expands the flow for real, so a flow with errors can't be
@@ -1352,7 +1398,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     )
                     .on_hover_text(app.strings.gui_report_dry_run_tooltip);
                 if dry.clicked() {
-                    ed.start_dry_run(app);
+                    ed.pending_toolbar = Some(ToolbarAct::DryRun);
                 }
             }
         });
@@ -1448,6 +1494,17 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // handled inside `blocks_view` so it doesn't fire while typing.
     if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
         ed.undo();
+    }
+
+    // The header's buttons act here, at the end of the frame that pressed them,
+    // so any inline field that committed on losing focus above has already been
+    // folded into the report (see [`ToolbarAct`]).
+    match ed.pending_toolbar.take() {
+        Some(ToolbarAct::Run) => ed.start_run(app),
+        Some(ToolbarAct::DryRun) => ed.start_dry_run(app),
+        Some(ToolbarAct::Save) => save_report(&mut ed, app),
+        Some(ToolbarAct::Close) => close = true,
+        None => {}
     }
 
     if !close {
@@ -2479,7 +2536,10 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             .on_hover_text(app.strings.gui_report_move_up)
             .clicked()
         {
-            acts.push(Act::MoveUp);
+            acts.push(Act::Move {
+                path: ed.selection.clone(),
+                up: true,
+            });
         }
         if ui
             .add_enabled(
@@ -2489,7 +2549,10 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             .on_hover_text(app.strings.gui_report_move_down)
             .clicked()
         {
-            acts.push(Act::MoveDown);
+            acts.push(Act::Move {
+                path: ed.selection.clone(),
+                up: false,
+            });
         }
         if ui
             .add_enabled(
@@ -2502,7 +2565,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            acts.push(Act::Delete);
+            acts.push(Act::DeletePath(ed.selection.clone()));
         }
     });
     ui.separator();
@@ -2607,7 +2670,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     // Delete key removes the selection (but not while a text field has focus).
     let typing = ui.memory(|m| m.focused().is_some());
     if !typing && !ed.selection.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-        acts.push(Act::Delete);
+        acts.push(Act::DeletePath(ed.selection.clone()));
     }
 
     // The delete drop target lives here — a distinct full-width bar that only
@@ -5314,13 +5377,21 @@ fn chip_drag_payload(ui: &egui::Ui, chip: &Chip, path: &[usize]) -> DragItem {
     }
 }
 
-/// Whether a plain click on this (non-base) chip should open the request wizard
-/// to edit it. True for the `SHOW` / `HIDE` / `RESPONSE` clauses, whose fields
-/// are picked in the request wizard rather than typed inline.
+/// Whether a plain click on this (non-base) chip should open a wizard to edit
+/// it. True for the `SHOW` / `HIDE` / `RESPONSE` clauses, whose fields are
+/// picked in the request wizard rather than typed inline, and for an ENVS
+/// loop's `BASELINE … SHOW(…)`, whose checklist lives in the ENVS wizard — the
+/// wizard opened is the one belonging to the chip's own node, so both land in
+/// the right place.
 fn chip_opens_wizard_on_click(chip: &Chip) -> bool {
     matches!(
         chip.detach,
-        Some(DetachWhich::Show | DetachWhich::Hide | DetachWhich::Response)
+        Some(
+            DetachWhich::Show
+                | DetachWhich::Hide
+                | DetachWhich::Response
+                | DetachWhich::BaselineShow
+        )
     )
 }
 
@@ -5871,8 +5942,21 @@ fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
 }
 
 /// Apply the collected block actions to the editor and session.
+///
+/// Value commits are applied before anything else. An inline chip field commits
+/// what has been typed into it when it loses focus — which is the same click
+/// that presses a button on the toolbar drawn *above* it, so both land in the
+/// same batch, with the toolbar's action first (it was drawn first). Both carry
+/// paths describing the tree as it was on screen, but a structural action
+/// rewrites those paths out from under the commit: applied in collection order,
+/// deleting one block would land the edit on whichever block shuffled up into
+/// its slot — renaming a block the user never touched, and losing the edit they
+/// did make. Sorting the commits to the front keeps every path meaning what it
+/// meant when it was drawn. The partition is stable, so commits keep their own
+/// relative order, and so does everything else.
 fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) {
-    for act in acts {
+    let (commits, rest): (Vec<Act>, Vec<Act>) = acts.into_iter().partition(Act::is_value_commit);
+    for act in commits.into_iter().chain(rest) {
         match act {
             Act::Select(path) => {
                 ed.selection = path;
@@ -5901,9 +5985,7 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     super::report_wizard::open(ed, app, &sel);
                 }
             }
-            Act::MoveUp | Act::MoveDown => {
-                let up = matches!(act, Act::MoveUp);
-                let path = ed.selection.clone();
+            Act::Move { path, up } => {
                 let mut new_sel = None;
                 ed.edit_flow(|flow| {
                     new_sel = move_node(flow, &path, up);
@@ -5911,13 +5993,6 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 if let Some(ns) = new_sel {
                     ed.selection = ns;
                 }
-            }
-            Act::Delete => {
-                let path = ed.selection.clone();
-                ed.edit_flow(|flow| {
-                    remove_node(flow, &path);
-                });
-                ed.selection = Vec::new();
             }
             Act::DropNode { pos, node } => {
                 ed.edit_flow(|flow| insert_node(flow, &pos, node));
@@ -7974,7 +8049,7 @@ mod tests {
     }
 
     #[test]
-    fn only_show_hide_response_chips_open_the_wizard_on_click() {
+    fn clause_chips_open_the_wizard_on_click() {
         assert!(chip_opens_wizard_on_click(&Chip::modifier(
             "SHOW".into(),
             egui::Color32::WHITE,
@@ -7989,6 +8064,13 @@ mod tests {
             "RESPONSE".into(),
             egui::Color32::WHITE,
             DetachWhich::Response
+        )));
+        // An ENVS loop's BASELINE SHOW is picked the same way, in the ENVS
+        // wizard — its chip has to open too, or its checklist is unreachable.
+        assert!(chip_opens_wizard_on_click(&Chip::modifier(
+            "SHOW(Time)".into(),
+            egui::Color32::WHITE,
+            DetachWhich::BaselineShow
         )));
         // REPORT / WITH / plain base chips are not opened this way.
         assert!(!chip_opens_wizard_on_click(&Chip::modifier(
@@ -8986,5 +9068,180 @@ mod dry_run_view_tests {
             "the preview should be on screen, not waiting in a view nobody is looking at"
         );
         assert!(ed.dry_run.is_some(), "and the preview itself is held");
+    }
+}
+
+#[cfg(test)]
+mod toolbar_commit_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+
+    /// Every piece of text painted this frame, with the rect it was painted in,
+    /// so a test can click a widget by the label it shows.
+    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn input() -> egui::RawInput {
+        let mut i = egui::RawInput::default();
+        i.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 760.0),
+        ));
+        i
+    }
+
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let mut i = input();
+        i.events.push(egui::Event::PointerMoved(pos));
+        i.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        i.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        i
+    }
+
+    /// An app with one bound collection and the given report open in its editor.
+    fn app_with_report(text: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entry = crate::hurl::HurlEntry {
+            title: "A".into(),
+            url: "http://127.0.0.1:1/".into(),
+            ..Default::default()
+        };
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        let mut app = GuiApp::for_test(session);
+        let mut report = crate::report::Report::scratch("r");
+        report.set_text(text.to_string());
+        app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(0), report));
+        app
+    }
+
+    /// The same collision inside the Blocks view, where the button queues a
+    /// *structural* edit: the field commit carries the path of the block it was
+    /// drawn on, so it has to be applied while that path still means what it
+    /// meant on screen. Applied after a deletion instead, it lands on whichever
+    /// block shuffled into that slot — renaming a block the user never touched.
+    #[test]
+    fn a_field_commit_is_not_applied_to_a_block_that_moved_under_it() {
+        let mut app = app_with_report(
+            "# collection: api\nREPORT REQUEST A AS One\nREPORT REQUEST A AS Two\nREPORT REQUEST A AS Three\n",
+        );
+        let ctx = egui::Context::default();
+
+        let out = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let painted = painted(&out.shapes);
+        let two = painted
+            .iter()
+            .find(|(t, _)| t == "Two")
+            .map(|(_, r)| *r)
+            .expect("the second block's alias field");
+        let trash = painted
+            .iter()
+            .find(|(t, _)| t.contains(app.strings.gui_report_delete_block))
+            .map(|(_, r)| *r)
+            .expect("the Delete block button");
+
+        // Click into the second block's alias and type, without leaving it.
+        let caret = egui::pos2(two.right() - 1.0, two.center().y);
+        let _ = ctx.run_ui(click_at(caret), |ui| super::ui(&mut app, ui));
+        let mut typing = input();
+        typing.events.push(egui::Event::Text("x".into()));
+        let _ = ctx.run_ui(typing, |ui| super::ui(&mut app, ui));
+
+        // With the *first* block selected, delete it while the second block's
+        // field still holds uncommitted text.
+        app.report_editor.as_mut().unwrap().selection = vec![0];
+        // egui resolves a click against the previous frame's widgets, so the
+        // Delete button has to have been drawn enabled once before it can be
+        // pressed.
+        let _ = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let _ = ctx.run_ui(click_at(trash.center()), |ui| super::ui(&mut app, ui));
+
+        let text = &app.report_editor.as_ref().expect("editor open").report.text;
+        assert!(!text.contains("AS One"), "the selected block is deleted");
+        assert!(
+            text.contains("AS Twox"),
+            "the edited block keeps its own edit: {text:?}"
+        );
+        assert!(
+            text.contains("AS Three"),
+            "and the block below it is left alone: {text:?}"
+        );
+    }
+
+    /// Typing in an inline chip field and pressing a toolbar button in one go
+    /// must keep what was typed: the field commits when the click takes its
+    /// focus away, and the button acts on the result. Before, the button acted
+    /// first and switched view, so the field was never redrawn, its commit
+    /// never ran, and the typing was silently thrown away.
+    #[test]
+    fn a_toolbar_press_keeps_what_was_being_typed() {
+        let mut app = app_with_report("# collection: api\nREPORT REQUEST A AS Old\n");
+        let ctx = egui::Context::default();
+
+        // Frame 1: lay the editor out so the alias field has a position.
+        let out = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let painted = painted(&out.shapes);
+        let alias = painted
+            .iter()
+            .find(|(t, _)| t == "Old")
+            .map(|(_, r)| *r)
+            .expect("the alias field shows its current value");
+        let dry = painted
+            .iter()
+            .find(|(t, _)| t.contains(app.strings.gui_report_dry_run))
+            .map(|(_, r)| *r)
+            .expect("the Dry run button is on the toolbar");
+
+        // Frame 2: click into the alias field, putting the caret after "Old".
+        let caret = egui::pos2(alias.right() - 1.0, alias.center().y);
+        let _ = ctx.run_ui(click_at(caret), |ui| super::ui(&mut app, ui));
+
+        // Frame 3: type, without leaving the field.
+        let mut typing = input();
+        typing.events.push(egui::Event::Text("er".into()));
+        let _ = ctx.run_ui(typing, |ui| super::ui(&mut app, ui));
+        assert!(
+            app.report_editor
+                .as_ref()
+                .is_some_and(|ed| ed.report.text.contains("AS Old")),
+            "still uncommitted while the field has focus"
+        );
+
+        // Frame 4: press Dry run straight from the field.
+        let _ = ctx.run_ui(click_at(dry.center()), |ui| super::ui(&mut app, ui));
+        let ed = app.report_editor.as_ref().expect("the editor stays open");
+        assert!(
+            ed.report.text.contains("AS Older"),
+            "the typing survives the button press: {:?}",
+            ed.report.text
+        );
+        assert!(ed.view == EditorView::Results, "and the button still acted");
     }
 }
