@@ -1090,6 +1090,13 @@ pub struct TuiApp {
     /// adjusting that panel's scroll even if the cursor briefly leaves the
     /// scrollbar's one-column-wide hit area. Cleared on `Up`.
     pub(crate) scrollbar_drag: Option<Pane>,
+    /// Whether the pointer has actually moved since the left button went down
+    /// over a text panel. `begin` on a panel always leaves a degenerate
+    /// one-character region behind, so "is anything selected?" cannot tell a
+    /// deliberate drag from a plain click — and a plain click must not copy
+    /// (it is how a panel is focused). Set by the `Drag` handlers, cleared on
+    /// `Down`, read on `Up`. Runtime-only.
+    pub(crate) mouse_drag_moved: bool,
     /// Screen text areas for the report view's three panels (Source,
     /// Validation, Results), recorded during draw for mouse hit-testing
     /// (selection begin/drag + scrollbar click/drag), analogous to
@@ -1320,6 +1327,7 @@ impl Default for TuiApp {
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,
+            mouse_drag_moved: false,
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
             report_scrollbar_drag: None,

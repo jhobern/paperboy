@@ -67,6 +67,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Clicking the Request or Response panel in the terminal UI now selects it.**
+  Those two panels — and the report view's — were the only ones a click didn't
+  focus, so they could only be reached from the keyboard.
+
+- **A click no longer overwrites your clipboard.** Releasing the mouse used to
+  copy unconditionally, and with nothing selected that meant copying the whole
+  panel, so simply clicking on a response replaced whatever you had copied
+  earlier. Dragging out a selection still copies it on release, and `y` still
+  copies the whole focused panel when nothing is selected.
+
 - **Imported Postman requests now carry the auth they inherit.** A collection
   or folder that sets its auth once at the top applies it to every request
   underneath, which is how nearly every real collection is organised. PaperBoy

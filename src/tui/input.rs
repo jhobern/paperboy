@@ -123,6 +123,9 @@ impl TuiApp {
         {
             return;
         }
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.mouse_drag_moved = false;
+        }
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && !ev.modifiers.contains(KeyModifiers::ALT)
         {
@@ -158,6 +161,14 @@ impl TuiApp {
                 } else {
                     None
                 };
+                // Clicking a panel selects it, like clicking any other pane —
+                // this is how the Main and Response panels are reachable with
+                // the mouse at all. (They begin a text selection too; that used
+                // to be *all* they did, so they were the only panes you had to
+                // reach with the keyboard.)
+                if let Some(pane) = pane {
+                    self.focus = pane;
+                }
                 if ev.modifiers.contains(KeyModifiers::ALT) {
                     // Alt+Click *adds* a region: finalize whichever panel
                     // currently holds the live one (keeping it, and any
@@ -186,6 +197,7 @@ impl TuiApp {
                     return;
                 }
                 self.drag_selection_to((ev.column, ev.row));
+                self.mouse_drag_moved = true;
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.scrollbar_drag.take().is_some() {
@@ -193,7 +205,9 @@ impl TuiApp {
                 }
                 self.main_panel.end_drag();
                 self.resp_panel.end_drag();
-                self.copy_selection_to_clipboard();
+                if self.mouse_drag_moved {
+                    self.copy_selection_only();
+                }
             }
             _ => {}
         }
@@ -896,13 +910,16 @@ impl TuiApp {
                     return;
                 }
                 self.drag_report_selection_to((ev.column, ev.row));
+                self.mouse_drag_moved = true;
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.report_scrollbar_drag.take().is_some() {
                     return;
                 }
                 self.end_report_drags();
-                self.copy_report_selection_to_clipboard();
+                if self.mouse_drag_moved {
+                    self.copy_report_selection_only();
+                }
             }
             _ => {}
         }
@@ -1081,23 +1098,14 @@ impl TuiApp {
     /// falling back — with nothing selected — to the whole text of whichever
     /// panel the current view primarily shows (results grid in the results
     /// view, else the flow source). Bound to `y` and the mouse-release handler,
-    /// mirroring [`copy_selection_to_clipboard`].
+    /// mirroring [`Self::copy_selection_to_clipboard`].
     pub(crate) fn copy_report_selection_to_clipboard(&mut self) {
+        if self.copy_report_selection_only() {
+            return;
+        }
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        let parts: Vec<String> = {
-            let rt = &self.reports[idx];
-            let mut parts = rt.source_panel.selected_parts(None);
-            parts.extend(rt.validation_panel.selected_parts(None));
-            parts.extend(rt.results_panel.selected_parts(None));
-            parts
-        };
-        if !parts.is_empty() {
-            copy_to_clipboard(&parts.join("\n\n"));
-            self.status = Some(Status::Copied);
-            return;
-        }
         let rt = &self.reports[idx];
         let whole = match rt.view {
             crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
@@ -1111,6 +1119,28 @@ impl TuiApp {
             copy_to_clipboard(text);
             self.status = Some(Status::Copied);
         }
+    }
+
+    /// The report-view counterpart of [`Self::copy_selection_only`]: copy only
+    /// genuinely selected regions, with no whole-panel fallback, so that
+    /// releasing a click that selected nothing leaves the clipboard alone.
+    pub(crate) fn copy_report_selection_only(&mut self) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        let parts: Vec<String> = {
+            let rt = &self.reports[idx];
+            let mut parts = rt.source_panel.selected_parts(None);
+            parts.extend(rt.validation_panel.selected_parts(None));
+            parts.extend(rt.results_panel.selected_parts(None));
+            parts
+        };
+        if parts.is_empty() {
+            return false;
+        }
+        copy_to_clipboard(&parts.join("\n\n"));
+        self.status = Some(Status::Copied);
+        true
     }
 
     /// The Main/Response text panel for `pane` (immutable), or `None` for a
@@ -1336,25 +1366,44 @@ impl TuiApp {
         scratch.selected_parts(None)
     }
 
-    /// Copy every active text selection region to the clipboard via OSC 52
-    /// (see `concatenated_selection_text`). Shared by the mouse-release
-    /// handler (drag-to-select) and the `y` keyboard shortcut, the latter
-    /// existing because OSC 52 write-back isn't picked up by every terminal
-    /// emulator / multiplexer config, so users need an explicit, repeatable
-    /// way to retry the copy without having to redo every drag.
+    /// Copy every active text selection region to the clipboard (see
+    /// `concatenated_selection_text`). Bound to the `y` shortcut, which exists
+    /// because a copy can silently fail depending on the terminal emulator /
+    /// multiplexer, so users need an explicit, repeatable way to retry without
+    /// having to redo every drag.
     ///
     /// With nothing selected, `y` falls back to copying the *whole* content
     /// of whichever of the Main (Request JSON) / Response panels currently
     /// has focus — so the whole request/response can be grabbed without
-    /// first having to drag-select every line of a possibly huge body.
+    /// first having to drag-select every line of a possibly huge body. The
+    /// mouse-release path deliberately does *not* do this; see
+    /// [`Self::copy_selection_only`].
     pub(crate) fn copy_selection_to_clipboard(&mut self) {
-        if let Some(text) = self.concatenated_selection_text() {
-            copy_to_clipboard(&text);
-            self.status = Some(Status::Copied);
-        } else if let Some(text) = self.whole_panel_text(self.focus) {
+        if self.copy_selection_only() {
+            return;
+        }
+        if let Some(text) = self.whole_panel_text(self.focus) {
             copy_to_clipboard(&text);
             self.status = Some(Status::Copied);
         }
+    }
+
+    /// Copy only what is genuinely selected, reporting whether anything was.
+    ///
+    /// This is the mouse-release path, which deliberately has *no* whole-panel
+    /// fallback: a release that follows no drag is how a panel is focused, and
+    /// filling the clipboard with the entire panel because of it would quietly
+    /// throw away whatever the user had copied earlier. The caller gates this
+    /// on `mouse_drag_moved` as well, because `begin` always leaves a
+    /// degenerate one-character region behind that would otherwise count as a
+    /// selection.
+    pub(crate) fn copy_selection_only(&mut self) -> bool {
+        if let Some(text) = self.concatenated_selection_text() {
+            copy_to_clipboard(&text);
+            self.status = Some(Status::Copied);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn on_key_overlay(&mut self, key: KeyEvent) {

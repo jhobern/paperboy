@@ -7874,6 +7874,118 @@ fn y_with_no_selection_copies_the_whole_focused_panel_without_creating_a_selecti
     assert!(app.extra_selections().is_empty());
 }
 
+/// The Main and Response panels are the only panes with no keyboard shortcut
+/// that moves focus straight onto them, so a click has to do it — and used to
+/// not, leaving them unreachable with the mouse.
+#[test]
+fn clicking_a_text_panel_focuses_it() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "focus".into(),
+        method: "GET".into(),
+        url: "http://example.com/".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "a response body".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::List;
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let click = |app: &mut TuiApp, area: ratatui::layout::Rect| {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    let main = app.main_text_area;
+    assert!(main.width > 0 && main.height > 0, "main panel must render");
+    click(&mut app, main);
+    assert_eq!(app.focus, Pane::Main);
+
+    let resp = app.resp_text_area;
+    assert!(resp.width > 0 && resp.height > 0, "response must render");
+    click(&mut app, resp);
+    assert_eq!(app.focus, Pane::Response);
+}
+
+/// Clicking a panel to focus it must leave the clipboard alone. Mouse-up used
+/// to run the same "copy, or else copy the whole panel" path as `y`, so simply
+/// selecting the Response panel silently replaced whatever the user had copied
+/// with the entire response body.
+#[test]
+fn a_click_that_selects_nothing_does_not_copy() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "click".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "whole response body".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    let ev = |kind| MouseEvent {
+        kind,
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.status = None;
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left)));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left)));
+
+    assert_eq!(
+        app.focus,
+        Pane::Response,
+        "the click still selects the pane"
+    );
+    assert!(
+        !matches!(app.status, Some(Status::Copied)),
+        "a click with nothing selected must not copy"
+    );
+
+    // A real drag still copies on release, as before.
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left)));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        matches!(app.status, Some(Status::Copied)),
+        "dragging out a selection must still copy on release"
+    );
+}
+
 #[test]
 fn main_panel_drag_extracts_the_expected_text() {
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
