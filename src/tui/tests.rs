@@ -25112,3 +25112,226 @@ fn the_options_hint_describes_what_enter_does_on_the_current_row() {
         );
     }
 }
+
+/// Every browser filters by typing, not just the three "open an existing X"
+/// pickers that started with it. The folder pickers are where it was missed and
+/// where it matters most: a `FOR … IN FILES` loop's source folder is chosen by
+/// walking a real corpus tree, which is exactly the crowded case the filter
+/// exists for.
+#[test]
+fn folder_pickers_filter_by_typing_too() {
+    let dir = temp_dir("folderfilter");
+    for d in ["auth-fixtures", "sub", "another"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenWorkspace,
+        FileAction::MoveWorkspaceItemChooseFolder,
+        FileAction::SaveWorkspaceChooseFolder,
+        FileAction::NewReportChooseFolder,
+        FileAction::PickFormFile(0),
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.browser_query, "au", "{action:?} did not take the query");
+        let shown = names(&app);
+        assert!(
+            shown.iter().any(|n| n == "auth-fixtures/"),
+            "matching folder shown for {action:?}: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|n| n == "sub/"),
+            "non-matching folder hidden for {action:?}: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|n| n == "../"),
+            "the way out survives the filter for {action:?}: {shown:?}"
+        );
+    }
+}
+
+/// `Space` picks the current directory in the three folder pickers, so it must
+/// never be swallowed into the filter query there — that would take away the
+/// only way to confirm. Everywhere else a space is an ordinary filter
+/// character, because file names contain them.
+#[test]
+fn space_still_confirms_in_the_folder_pickers() {
+    let dir = temp_dir("folderspace");
+    std::fs::create_dir_all(dir.join("cases")).unwrap();
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenWorkspace,
+        FileAction::MoveWorkspaceItemChooseFolder,
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.browser_query.is_empty(),
+            "{action:?} put a space into the query instead of confirming"
+        );
+        assert!(
+            !matches!(app.overlay, Some(Overlay::Browser(..))),
+            "{action:?} did not act on Space"
+        );
+    }
+
+    // A save-to-folder picker has a filename field for that, so Space there is
+    // an ordinary character and does filter.
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::SaveWorkspaceChooseFolder);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.browser_query, " ");
+}
+
+/// In a "save to folder" picker the same keys mean different things either side
+/// of Tab: they narrow the folder list while the list has focus, and type a
+/// name once the filename field does. Without the focus check the filter would
+/// eat the filename.
+#[test]
+fn save_folder_typing_filters_the_list_but_names_the_file() {
+    let dir = temp_dir("savefolderfilter");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::SaveCollectionChooseFolder);
+    assert!(!app.browser_name_focused, "the list starts focused");
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.browser_query, "au", "the list is being filtered");
+    let before = app.browser_name.text();
+
+    // Tab to the filename field: the same keys now type a name.
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_name_focused);
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(app.browser_query, "au", "the query is left alone");
+    assert_ne!(
+        app.browser_name.text(),
+        before,
+        "the keystroke reached the filename field"
+    );
+}
+
+/// A query is typed to find something *here*, and almost never matches anything
+/// inside the folder it just found — carrying it across a descent left the new
+/// directory showing nothing but `../`, with no visible cause. Arriving
+/// anywhere new clears it.
+#[test]
+fn moving_to_another_folder_clears_the_filter() {
+    let dir = temp_dir("filterdescent");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    std::fs::write(dir.join("auth-fixtures").join("zebra.hurl"), "x").unwrap();
+
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::OpenCollection);
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    if let Some(Overlay::Browser(_, ex)) = &mut app.overlay {
+        let idx = ex
+            .files()
+            .iter()
+            .position(|f| f.name == "auth-fixtures/")
+            .expect("the matching folder is listed");
+        ex.set_selected_idx(idx);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        app.browser_query.is_empty(),
+        "the query does not follow us into the folder"
+    );
+    let shown = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex
+            .files()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>(),
+        _ => panic!("browser closed"),
+    };
+    assert!(
+        shown.iter().any(|n| n == "zebra.hurl"),
+        "so the folder shows its contents rather than looking empty: {shown:?}"
+    );
+
+    // And the same on the way back up.
+    press(&mut app, KeyCode::Char('z'));
+    assert_eq!(app.browser_query, "z");
+    press(&mut app, KeyCode::Left);
+    assert!(
+        app.browser_query.is_empty(),
+        "ascending clears it as well: {:?}",
+        app.browser_query
+    );
+}
+
+/// The filter strip has to actually appear, in the pickers that already had one
+/// and in the "save to folder" pickers that grew one — the latter now stack a
+/// list, the strip, an optional format row and the filename box, and a layout
+/// that silently dropped a row would leave the filter invisible while it was
+/// still narrowing the list.
+#[test]
+fn the_filter_strip_is_drawn_in_every_picker_shape() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = temp_dir("filterstrip");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    let s = Strings::for_language(&crate::i18n::Language::English);
+
+    for action in [
+        FileAction::OpenCollection,             // list + strip
+        FileAction::PickReportNodeFolder,       // folder picker
+        FileAction::SaveCollectionChooseFolder, // list + strip + name box
+        FileAction::SaveReportCsvChooseFolder,  // list + strip + formats + name
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        // Nothing typed yet: no strip, so it costs no space when unused.
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(term.backend().buffer()).contains(s.browser_filter_label.trim()),
+            "{action:?} showed a filter strip with no query"
+        );
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('u'));
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("Filter: au"),
+            "{action:?} filtered the list without saying so:\n{text}"
+        );
+        // The list itself is still drawn, and still narrowed.
+        assert!(
+            text.contains("auth-fixtures"),
+            "{action:?} lost the list:\n{text}"
+        );
+    }
+}

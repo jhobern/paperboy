@@ -272,7 +272,34 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   could label the legend beneath it — and threw the coloured result away. That
   pass is now a plain scan that only answers that question.
 
+### Changed
+
+- **Every terminal-UI file picker can be filtered by typing.** Only the three
+  "open an existing collection / environment / report" pickers took a typed
+  filter; the folder pickers did not — including the one that chooses the
+  source folder for a `FOR … IN FILES/FOLDERS` loop, which is browsed against a
+  real corpus tree and is exactly where sifting a crowded directory matters. All
+  of them now narrow as you type, with the same `Filter:` strip showing what is
+  being matched.
+
+  Two keys keep their existing meaning: in a "save to folder" picker typing only
+  filters while the *list* has focus (Tab moves to the filename field, where the
+  same keys type a name), and in the three folder pickers `Space` still confirms
+  the current directory rather than entering a space.
+
 ### Fixed
+
+- **A file browser filter no longer makes the folder you open look empty.** The
+  typed filter stayed applied when you moved to another directory, so descending
+  into a folder you had just filtered *to* showed nothing but `../` — the query
+  that matched the folder's name rarely matches anything inside it. The filter
+  now belongs to the directory it was typed in and clears when you arrive
+  somewhere new.
+
+- **The `FOR … IN FILES` source-folder picker no longer says it is choosing a
+  Workspace.** It borrowed the Workspace picker's hint line wholesale, so it
+  offered "Space choose as Workspace" while actually setting a loop's source
+  folder.
 
 - **Stopping a report in the visual editor stops it now, not eventually.** Stop
   raised the worker's cancel flag but kept hold of the run, so the button stayed

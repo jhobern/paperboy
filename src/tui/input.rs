@@ -4192,7 +4192,10 @@ impl TuiApp {
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
-            FileAction::PickReportNodeFolder => s.browser_hint_workspace,
+            // Shares the Workspace picker's shape (Space confirms the current
+            // directory) but not its meaning — this folder becomes a loop's
+            // source, not a Workspace root.
+            FileAction::PickReportNodeFolder => s.browser_hint_node_folder,
             FileAction::SaveWorkspaceChooseFolder | FileAction::PostmanDestChooseFolder => {
                 s.browser_hint_workspace_save
             }
@@ -5266,6 +5269,20 @@ impl TuiApp {
         });
     }
 
+    /// Drop any type-to-filter query after the browser has changed directory.
+    ///
+    /// A query is typed to find something *here*; it almost never matches
+    /// anything inside the folder it just found, so carrying it across a
+    /// descent made the new directory look empty (only `../` survives the
+    /// filter) with no visible cause. Navigation is the whole point of a folder
+    /// picker, so the query is scoped to one directory and cleared on arrival.
+    fn browser_clear_query_on_move(&mut self, action: FileAction, ex: &mut FileExplorer) {
+        if !self.browser_query.is_empty() {
+            self.browser_query.clear();
+            self.apply_browser_filter(action, ex);
+        }
+    }
+
     fn browser_key_handler(
         &mut self,
         key: KeyEvent,
@@ -5304,17 +5321,28 @@ impl TuiApp {
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
         }
-        // Type-to-filter for the load pickers: printable keys narrow the file
-        // list by name (case-insensitive substring) on top of the extension
-        // filter, so a crowded folder can be sifted by just typing. Handled
-        // before the generic key match below so letters that double as vim
-        // motions here (h/j/k/l/q) filter instead of navigating. Backspace
-        // trims the query; the first Esc clears it (a second Esc, with an empty
-        // query, then cancels via the generic handler).
-        if browser_filters_by_ext(action) && !save_folder {
+        // Type-to-filter, in every browser: printable keys narrow the list by
+        // name (case-insensitive substring) on top of any extension filter, so
+        // a crowded folder can be sifted by just typing. Handled before the
+        // generic key match below so letters that double as vim motions here
+        // (h/j/k/l/q) filter instead of navigating. Backspace trims the query;
+        // the first Esc clears it (a second Esc, with an empty query, then
+        // cancels via the generic handler).
+        //
+        // Two carve-outs, both about a key that already means something here:
+        //  * a "save to folder" picker has an inline filename editor, so typing
+        //    only filters while the *list* has focus — Tab moves to the field,
+        //    where the same keys type a name;
+        //  * a folder picker takes `Space` as "choose this directory", so a
+        //    space never enters the query there (see
+        //    [`browser_confirms_on_space`]).
+        if !save_folder || !self.browser_name_focused {
             match key.code {
                 KeyCode::Char(c)
-                    if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+                    if !ctrl
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !c.is_control()
+                        && !(c == ' ' && browser_confirms_on_space(action)) =>
                 {
                     self.browser_query.push(c);
                     self.apply_browser_filter(action, &mut ex);
@@ -5402,12 +5430,14 @@ impl TuiApp {
                     // Enter) to ascend.
                     if key.code == KeyCode::Enter && !self.browser_confined_at_root(action, &ex) {
                         self.browser_ascend(&mut ex);
+                        self.browser_clear_query_on_move(action, &mut ex);
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else if ex.current().is_dir {
                     // Descend into the directory (handled by the explorer).
                     let target = ex.current().path.clone();
                     let _ = ex.handle(&Event::Key(key));
+                    self.browser_clear_query_on_move(action, &mut ex);
                     // If this descent retraces the upward trail, re-select
                     // the next folder down it so a run of Rights unwinds a
                     // run of Lefts exactly. Stepping into any other folder
@@ -5490,6 +5520,7 @@ impl TuiApp {
                     && origin.is_dir()
                 {
                     let _ = ex.set_cwd(&origin);
+                    self.browser_clear_query_on_move(action, &mut ex);
                 }
                 self.browser_forward_path = None;
                 self.overlay = Some(Overlay::Browser(action, ex));
@@ -5503,6 +5534,7 @@ impl TuiApp {
                 // inside the workspace, so there's nowhere higher to go.
                 if !self.browser_confined_at_root(action, &ex) {
                     self.browser_ascend(&mut ex);
+                    self.browser_clear_query_on_move(action, &mut ex);
                 }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
@@ -6304,6 +6336,19 @@ fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
     let rest = descendant.strip_prefix(ancestor).ok()?;
     let first = rest.components().next()?;
     Some(ancestor.join(first))
+}
+
+/// Whether `Space` confirms the current directory for this action, rather than
+/// being an ordinary character. The folder pickers have no filename to type, so
+/// they took `Space` as "choose this folder"; type-to-filter must therefore
+/// leave it alone in exactly these three, and only these three.
+fn browser_confirms_on_space(action: FileAction) -> bool {
+    matches!(
+        action,
+        FileAction::OpenWorkspace
+            | FileAction::MoveWorkspaceItemChooseFolder
+            | FileAction::PickReportNodeFolder
+    )
 }
 
 /// Whether the local load browser filters by extension for this action. The

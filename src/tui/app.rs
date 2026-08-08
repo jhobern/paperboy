@@ -28,7 +28,7 @@ use crate::save_flow::{SaveFlow, SaveSource, SaveTargetKind};
 use tui_panel_select::MultiSelectPanel;
 use tui_panel_select::wrapcache::TextPos;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum FileAction {
     SaveRequest,
     LoadRequest,

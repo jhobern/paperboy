@@ -3425,6 +3425,26 @@ pub(crate) fn draw_footer(
 /// highlighting the format that matches `filename`'s extension (an unknown or
 /// absent extension highlights CSV, the writer's fallback). Cycled with ↑/↓
 /// while the filename field is focused — see `cycle_browser_export_format`.
+/// The one-line "Filter: <query>" strip drawn beneath a browser's list while a
+/// type-to-filter query is active, so it is obvious the list is being narrowed
+/// (and by what) rather than mysteriously short.
+fn draw_browser_filter_strip(f: &mut Frame, row: Rect, query: &str, s: &Strings, th: &Theme) {
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                query.to_string(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        // Fill the theme panel background (like the export-format strip and the
+        // Help filter) so the strip blends with the explorer's own `th.panel`
+        // block instead of showing the terminal's default background.
+        .style(Style::default().bg(th.panel)),
+        row,
+    );
+}
+
 fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &Strings, th: &Theme) {
     use crate::report::writer::OUTPUT_EXTENSIONS;
     let cur = std::path::Path::new(filename)
@@ -4373,21 +4393,30 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // above it (CSV/JSON/HTML/XLSX; the active one derived from the
                 // typed extension, cycled with ↑/↓ while the name is focused).
                 let show_formats = *action == FileAction::SaveReportCsvChooseFolder;
-                let rows = if show_formats {
-                    Layout::vertical([
-                        Constraint::Min(3),
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                    ])
-                    .split(area)
-                } else {
-                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area)
-                };
-                ex.widget().render_ref(rows[0], f.buffer_mut());
-                let name_row = if show_formats { rows[2] } else { rows[1] };
-                if show_formats {
-                    draw_export_format_strip(f, rows[1], &app.browser_name.text(), s, th);
+                // The type-to-filter strip only appears while a query is
+                // active, so it takes a row of its own between the list and
+                // whatever sits below it rather than reserving space always.
+                let show_query = !app.browser_query.is_empty();
+                let mut heights = vec![Constraint::Min(3)];
+                if show_query {
+                    heights.push(Constraint::Length(1));
                 }
+                if show_formats {
+                    heights.push(Constraint::Length(1));
+                }
+                heights.push(Constraint::Length(3));
+                let rows = Layout::vertical(heights).split(area);
+                ex.widget().render_ref(rows[0], f.buffer_mut());
+                let mut next = 1;
+                if show_query {
+                    draw_browser_filter_strip(f, rows[next], &app.browser_query, s, th);
+                    next += 1;
+                }
+                if show_formats {
+                    draw_export_format_strip(f, rows[next], &app.browser_name.text(), s, th);
+                    next += 1;
+                }
+                let name_row = rows[next];
                 let focused = app.browser_name_focused;
                 let label = if *action == FileAction::SaveWorkspaceChooseFolder {
                     s.browser_foldername_label
@@ -4426,21 +4455,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
                 ex.widget().render_ref(rows[0], f.buffer_mut());
                 register_browser_hits(app, ex, rows[0]);
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
-                        Span::styled(
-                            app.browser_query.clone(),
-                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                        ),
-                    ]))
-                    // Fill the theme panel background (like the export-format
-                    // strip and the Help filter) so the strip blends with the
-                    // explorer's own `th.panel` block instead of showing the
-                    // terminal's default background.
-                    .style(Style::default().bg(th.panel)),
-                    rows[1],
-                );
+                draw_browser_filter_strip(f, rows[1], &app.browser_query, s, th);
             } else {
                 ex.widget().render_ref(area, f.buffer_mut());
                 register_browser_hits(app, ex, area);
