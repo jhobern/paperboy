@@ -18,11 +18,6 @@
 //! GUI polls each frame. That suits two front-ends with completely different
 //! event loops better than either owning the other's scheduler.
 
-// The state machine below is complete and tested, but the two front-ends are
-// still being moved onto it one at a time; until both are, the parts only they
-// will call look dead. Remove this once `tui/remote.rs` and `gui/remote.rs`
-// drive the flow instead of their own copies.
-
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
