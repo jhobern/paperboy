@@ -89,6 +89,9 @@ pub enum SaveKind {
     Response,
     /// Export the open report editor's last run results (format by extension).
     ReportResults,
+    /// Save the open report editor's last run as a `.baseline` snapshot, for a
+    /// later run to diff against via `BASELINE(FILE(…))`.
+    ReportBaseline,
 }
 
 #[derive(Clone)]

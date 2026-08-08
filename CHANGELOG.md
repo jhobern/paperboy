@@ -65,6 +65,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   filename the terminal UI does, `{time}` token included, with the other three
   formats still one click away.
 
+- **The GUI can now save a run as a `.baseline` snapshot.** Only the terminal UI
+  could, so producing the file that `BASELINE(FILE(…))` and the `# baseline:`
+  directive read meant switching front-ends. A Baseline button now sits beside
+  Export in the results view, suggesting the same `<report>.baseline` name.
+
 ## [0.5.0] - 2026-08-08
 
 ### Added

@@ -882,6 +882,7 @@ strings! {
     gui_save_environment_title => "Save environment", "Enregistrer l'environnement", "Gem miljø";
     gui_save_response_title => "Save response", "Enregistrer la réponse", "Gem svar";
     gui_save_results_title => "Export report results", "Exporter les résultats du rapport", "Eksportér rapportresultater";
+    gui_save_baseline_title => "Save report baseline", "Enregistrer la référence du rapport", "Gem rapport-basislinje";
     gui_unsupported_format => "Unsupported format:", "Format non pris en charge\u{a0}:", "Ikke-understøttet format:";
     gui_save => "Save", "Enregistrer", "Gem";
     gui_nothing_to_save => "Nothing to save.", "Rien à enregistrer.", "Intet at gemme.";
@@ -1006,6 +1007,7 @@ strings! {
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
+    gui_report_save_baseline => "Baseline…", "Référence…", "Basislinje…";
     gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
     gui_report_running => "Running…", "Exécution…", "Kører…";
     gui_report_cell_hint => "Click a cell to inspect its full value", "Cliquez sur une cellule pour voir sa valeur complète", "Klik på en celle for at se dens fulde værdi";

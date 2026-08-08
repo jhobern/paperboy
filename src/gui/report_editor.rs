@@ -1945,6 +1945,24 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             if export.clicked() {
                 open_export_dialog(app);
             }
+            // Saving the run as a snapshot is a different thing from exporting
+            // it for reading, so it gets its own button rather than hiding as a
+            // format in the export dialog: the file it writes is an input to a
+            // later run, not a report anyone opens.
+            let baseline = ui
+                .add_enabled(
+                    has_rows,
+                    egui::Button::new(format!(
+                        "{} {}",
+                        super::icons::SAVE,
+                        app.strings.gui_report_save_baseline
+                    )),
+                )
+                .on_hover_text(app.strings.help_report_baseline)
+                .on_disabled_hover_text(app.strings.report_baseline_no_result);
+            if baseline.clicked() {
+                super::menu::save_via_picker(app, super::app::SaveKind::ReportBaseline);
+            }
         });
     });
     ui.separator();

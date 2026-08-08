@@ -859,6 +859,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Environment(_) => app.strings.gui_save_environment_title,
         SaveKind::Response => app.strings.gui_save_response_title,
         SaveKind::ReportResults => app.strings.gui_save_results_title,
+        SaveKind::ReportBaseline => app.strings.gui_save_baseline_title,
     };
     // Seed the dialog from any remembered path (collections/environments) and a
     // sensible default filename.
@@ -891,6 +892,14 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             })
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        // A baseline snapshot is named the same way, so a report's results file
+        // and its snapshot sit side by side under one stem.
+        SaveKind::ReportBaseline => app
+            .report_editor
+            .as_ref()
+            .map(|e| crate::report::writer::export_path(&e.report, "baseline"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         SaveKind::Response => String::new(),
     };
     let picker_kind = match kind {
@@ -909,6 +918,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             SaveKind::Environment(_) => "environment.vars".into(),
             SaveKind::Response => "response.txt".into(),
             SaveKind::ReportResults => "results.csv".into(),
+            SaveKind::ReportBaseline => "report.baseline".into(),
         });
     let result_filters = report_result_filters(
         std::path::Path::new(&current)
@@ -920,6 +930,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Collection => &[("Hurl", &["hurl"]), ("All files", &["*"])],
         SaveKind::Environment(_) => &[("Vars", &["vars"]), ("All files", &["*"])],
         SaveKind::ReportResults => &result_filters,
+        SaveKind::ReportBaseline => &[("Baseline", &["baseline"]), ("All files", &["*"])],
         SaveKind::Response => &[("All files", &["*"])],
     };
     let Some(path) = super::filepick::save_file(title, dir.as_deref(), &default_name, filters)
@@ -940,6 +951,9 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
     if matches!(kind, SaveKind::ReportResults) {
         return export_report_results(app, &path_str);
     }
+    if matches!(kind, SaveKind::ReportBaseline) {
+        return save_report_baseline(app, path);
+    }
     let content = match kind {
         SaveKind::Collection => Some(app.session.collections[app.active_ci()].to_hurl()),
         SaveKind::Environment(id) => app
@@ -949,7 +963,7 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
             .find(|e| e.id == id)
             .map(|e| e.to_vars_text()),
         SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
-        SaveKind::ReportResults => None,
+        SaveKind::ReportResults | SaveKind::ReportBaseline => None,
     };
     let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
@@ -967,7 +981,7 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
                 e.path = Some(path.to_path_buf());
             }
         }
-        SaveKind::Response | SaveKind::ReportResults => {}
+        SaveKind::Response | SaveKind::ReportResults | SaveKind::ReportBaseline => {}
     }
     app.session.save();
     Ok(())
@@ -1002,6 +1016,30 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
         ed.results_exported = true;
     }
     app.session.status = Some(crate::i18n::Status::ReportExported(path.to_string()));
+    Ok(())
+}
+
+/// Write the open report editor's last run to `path` as a `.baseline` JSON
+/// snapshot — PaperTrail's "Source B", which a later run diffs against once its
+/// `# baseline:` directive or a `BASELINE(FILE(…))` role points at the file.
+///
+/// Like a results export, this marks the run exported: the result is on disk
+/// now, so a rerun needn't warn about discarding it.
+fn save_report_baseline(app: &mut GuiApp, path: &Path) -> Result<(), String> {
+    let result = app
+        .report_editor
+        .as_ref()
+        .and_then(|e| e.result.as_ref())
+        .ok_or_else(|| app.strings.report_baseline_no_result.to_string())?;
+    crate::report::Baseline::from_result(result)
+        .save(path)
+        .map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    if let Some(ed) = app.report_editor.as_mut() {
+        ed.results_exported = true;
+    }
+    app.session.status = Some(crate::i18n::Status::ReportBaselineSaved(
+        path.display().to_string(),
+    ));
     Ok(())
 }
 
@@ -1219,9 +1257,64 @@ mod tests {
         GuiApp::for_test(Session::default())
     }
 
-    /// The declared output format leads the export dialog's filters, so the
-    /// default choice is the one the report asked for.
+    /// Saving a baseline writes a snapshot the report engine can load straight
+    /// back — the whole point of the button, and the thing a compile check
+    /// can't tell you.
     #[test]
+    fn saving_a_baseline_writes_a_snapshot_that_loads_again() {
+        use crate::report::model::{ReportResult, ReportRow};
+
+        let mut app = app();
+        let mut ed = crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        );
+        let mut result = ReportResult::default();
+        result.rows.push(ReportRow {
+            cells: [("Time".to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+            key: vec!["a".to_string()],
+            ..Default::default()
+        });
+        ed.result = Some(result);
+        app.report_editor = Some(ed);
+
+        let dir = std::env::temp_dir().join(format!("pb_gui_baseline_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.baseline");
+        let saved = save_report_baseline(&mut app, &path);
+        let loaded = crate::report::Baseline::load(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(saved.is_ok(), "saving should succeed: {saved:?}");
+        let loaded = loaded.expect("the snapshot must load back");
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(
+            loaded.rows[0].cells.get("Time").map(String::as_str),
+            Some("100")
+        );
+        // The run is on disk now, so a rerun needn't warn about losing it.
+        assert!(app.report_editor.as_ref().unwrap().results_exported);
+    }
+
+    /// With nothing to snapshot the button reports why rather than writing an
+    /// empty file that a later run would silently diff against.
+    #[test]
+    fn saving_a_baseline_without_a_run_is_refused() {
+        let mut app = app();
+        app.report_editor = Some(crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        ));
+        let path = std::env::temp_dir().join("pb_gui_baseline_never_written.baseline");
+        let err = save_report_baseline(&mut app, &path).expect_err("no result, no snapshot");
+        assert_eq!(err, app.strings.report_baseline_no_result);
+        assert!(!path.exists(), "nothing should have been written");
+    }
+
+    /// The declared output format leads the export dialog's filters, so the
+    /// default choice is the one the report asked for.    #[test]
     fn the_reports_own_output_format_leads_the_export_filters() {
         for (ext, expected) in [("xlsx", "Excel"), ("json", "JSON"), ("html", "HTML")] {
             let filters = report_result_filters(ext);
