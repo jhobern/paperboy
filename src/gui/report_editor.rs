@@ -1268,6 +1268,14 @@ enum Act {
         path: Vec<usize>,
         index: usize,
     },
+    /// Attach `STATISTICS(…)` to the `WITH` field at `index` of the report
+    /// request at `path` — the drop a `WITH` field row accepts. Its own action
+    /// rather than an [`Act::AttachMod`] because a field is addressed by
+    /// (path, index) and isn't a `FlowNode` a modifier can be attached to.
+    AttachWithStats {
+        path: Vec<usize>,
+        index: usize,
+    },
     /// A header-strip chip committed a `# key: value` directive; `None` removes
     /// the directive (see [`edit::set_header`]).
     SetHeader {
@@ -3986,6 +3994,58 @@ fn with_block(
                         index: i,
                     });
                 }
+                // A `WITH` field is a report column with a name of its own, so
+                // it is what a `STATISTICS` clause attaches to — the request
+                // line above has no single column to summarise. The row is
+                // therefore its own drop target: without one the clause bounced
+                // off every part of a `WITH` block, and there was no way at all
+                // to add a summary to a field by dragging.
+                let zone = egui::Rect::from_x_y_ranges(
+                    lbl.rect.left()..=ui.max_rect().right(),
+                    lbl.rect.y_range(),
+                );
+                let zresp = ui.interact(
+                    zone,
+                    ui.id().with(("pt_withstats", path, i)),
+                    egui::Sense::hover(),
+                );
+                if let Some(m) = zresp.dnd_hover_payload::<Modifier>() {
+                    let ok = *m == Modifier::Statistics && edit::with_stats_applies(items, i);
+                    ui.painter().rect_stroke(
+                        zone.expand(2.0),
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(2.0, if ok { th.accent } else { th.err }),
+                        egui::StrokeKind::Outside,
+                    );
+                    // The refusals a field row can give differ from a node's, so
+                    // they are spelled out here rather than through
+                    // `Modifier::reject_reason` (which only speaks about nodes).
+                    if !ok {
+                        let why = if *m != Modifier::Statistics {
+                            s.mod_reject_with_field
+                        } else {
+                            s.mod_reject_present
+                        };
+                        egui::Tooltip::always_open(
+                            ui.ctx().clone(),
+                            ui.layer_id(),
+                            ui.id().with(("pt_withwhy", path, i)),
+                            egui::PopupAnchor::Pointer,
+                        )
+                        .show(|ui| {
+                            ui.colored_label(th.err, why);
+                        });
+                    }
+                }
+                if let Some(m) = release_payload::<Modifier>(&zresp)
+                    && *m == Modifier::Statistics
+                    && edit::with_stats_applies(items, i)
+                {
+                    acts.push(Act::AttachWithStats {
+                        path: path.to_vec(),
+                        index: i,
+                    });
+                }
             });
         }
         ui.horizontal(|ui| {
@@ -6251,6 +6311,12 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
             Act::RemoveWith { path, index } => {
                 ed.edit_flow(|flow| {
                     detach_modifier(flow, &path, DetachWhich::With(index));
+                });
+                ed.selection = path;
+            }
+            Act::AttachWithStats { path, index } => {
+                ed.edit_flow(|flow| {
+                    edit::attach_with_stats(flow, &path, index);
                 });
                 ed.selection = path;
             }

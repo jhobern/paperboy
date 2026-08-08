@@ -347,6 +347,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // Mirrors the TUI edit-request wizard, which shows the request Name above
     // the Method/URL row. The Name is the display title in the request tree.
     let send_label = format!("{} {}", app.strings.gui_send, super::icons::PLAY);
+    // The keyboard shortcuts have nowhere else to announce themselves.
+    let app_strings_send_tooltip = app.strings.gui_send_tooltip;
     {
         let entry = &mut app.session.collections[ci].entries[sel];
         let name_label = app.strings.gui_name;
@@ -376,11 +378,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             if url.changed() {
                 changed = true;
             }
-            let btn = ui.add_sized(
-                [80.0, 24.0],
-                egui::Button::new(RichText::new(send_label).strong().color(theme.select_fg))
-                    .fill(theme.accent),
-            );
+            let btn = ui
+                .add_sized(
+                    [80.0, 24.0],
+                    egui::Button::new(RichText::new(send_label).strong().color(theme.select_fg))
+                        .fill(theme.accent),
+                )
+                .on_hover_text(app_strings_send_tooltip);
             if btn.clicked() {
                 send = true;
             }

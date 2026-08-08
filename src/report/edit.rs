@@ -847,6 +847,40 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
     true
 }
 
+/// Attach `STATISTICS(COUNT)` to the `WITH` field at `index` of the report
+/// request at `path`, returning whether anything changed.
+///
+/// A `WITH` field is a report column in its own right — it has a name, and the
+/// grammar lets it carry its own `STATISTICS(…)` — but it is not a `FlowNode`,
+/// so [`attach_modifier`] (which addresses nodes by path) can't reach it. That
+/// left the block editor able to *show* a field's `STATISTICS` while giving no
+/// way to add one: the clause bounced off the `WITH` row, and dropping it on the
+/// request line above attaches to nothing, because a request's columns are named
+/// by its fields rather than by the request.
+///
+/// `COUNT` is the seed for the same reason it is in [`attach_to_node`]: it is
+/// the one statistic that means something for a text column as well as a numeric
+/// one. The field wizard refines it.
+pub(crate) fn attach_with_stats(flow: &mut ReportFlow, path: &[usize], index: usize) -> bool {
+    let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path) else {
+        return false;
+    };
+    match with.get_mut(index) {
+        Some(WithItem::Field { stats, .. }) if stats.is_empty() => {
+            *stats = vec![StatKind::Count];
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether [`attach_with_stats`] would do anything — i.e. whether the `WITH`
+/// item at `index` is a named field that hasn't already got a `STATISTICS`
+/// clause. Drives the drop highlight, so the preview and the drop agree.
+pub(crate) fn with_stats_applies(with: &[WithItem], index: usize) -> bool {
+    matches!(with.get(index), Some(WithItem::Field { stats, .. }) if stats.is_empty())
+}
+
 /// Report the variable a `SET` assignment at `path` defines: insert a
 /// `REPORT (KEY)` statement immediately after the assignment (which itself
 /// stays, since it is what actually sets the variable), returning the new
@@ -2187,10 +2221,59 @@ REQUEST A
         );
     }
 
+    /// A `WITH` field is the report column a request actually names, so it is
+    /// what STATISTICS attaches to — the request line above summarises nothing.
+    /// The block editor could show a field's STATISTICS but had no way to add
+    /// one, because a field isn't a node a modifier can be dropped on.
+    #[test]
+    fn statistics_attaches_to_a_with_field() {
+        let mut flow =
+            parse_flow("REPORT REQUEST svc WITH\n    Elapsed: Time\n    RESPONSE RAW\nEND\n")
+                .expect("fixture parses");
+        // The request line itself still refuses it: its columns are its fields.
+        assert!(
+            !attach_modifier(&mut flow, &[0], Modifier::Statistics),
+            "a report request names no single column"
+        );
+
+        assert!(
+            with_stats_applies(with_of(&flow), 0),
+            "a named field takes it"
+        );
+        assert!(attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            flow.to_text().contains("Elapsed: Time STATISTICS(COUNT)"),
+            "the clause lands on the field: {}",
+            flow.to_text()
+        );
+
+        // Only once, and never on a bare `WITH RESPONSE` item (which has no name
+        // to put a column under) or a field that isn't there.
+        assert!(!with_stats_applies(with_of(&flow), 0), "already has one");
+        assert!(!attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            !with_stats_applies(with_of(&flow), 1),
+            "RESPONSE RAW is not a column"
+        );
+        assert!(!attach_with_stats(&mut flow, &[0], 1));
+        assert!(!attach_with_stats(&mut flow, &[0], 9), "no such field");
+
+        // And it round-trips back through the parser as a field clause.
+        let again = parse_flow(&flow.to_text()).expect("reparses");
+        assert_eq!(again.to_text(), flow.to_text());
+    }
+
+    /// The `WITH` items of the report request at the root of `flow`.
+    fn with_of(flow: &ReportFlow) -> &[WithItem] {
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { with, .. }) => with,
+            other => panic!("expected a report request, got {other:?}"),
+        }
+    }
+
     /// Every refusal has to distinguish "wrong kind of block" from "it's
     /// already there" — telling someone REPORT only goes on a request while
-    /// they hover a reported request is worse than saying nothing.
-    #[test]
+    /// they hover a reported request is worse than saying nothing.    #[test]
     fn a_duplicate_modifier_is_refused_as_a_duplicate_not_as_a_wrong_block() {
         let flow = parse_flow("REPORT REQUEST A\nREQUEST B\nREPORT TIER AS Plan\n")
             .expect("fixture parses");

@@ -243,6 +243,46 @@ fn column_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str) {
     ui.label(RichText::new(text).strong().color(theme.dim));
 }
 
+/// A column title that *allocates* `w`, exactly as the cell below it does.
+///
+/// A bare label only claims the width of its own text, so on an empty table the
+/// grid's columns shrank to fit the words "Header Value Description" and the
+/// titles bunched together — then sprang apart the moment a row was added and
+/// the real fields set the column widths. Sizing the titles from the same
+/// numbers as the fields keeps every label still.
+fn sized_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str, w: f32) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(w);
+            column_header(ui, theme, text);
+        },
+    );
+}
+
+/// The four column widths of a [`kv_editor`] row: tick, key, value, note.
+///
+/// The description used to be whatever the key and value left over — and they
+/// claimed 40% + 60% of the row between them, so it collapsed to a sliver you
+/// couldn't read a word in. All three text columns are now shares of the same
+/// free width, so a note has room without starving the key or the value.
+///
+/// Every width is returned (rather than letting the last column fill) because
+/// the header row has to allocate exactly what the rows below it do; see
+/// [`sized_header`].
+fn kv_widths(ui: &egui::Ui) -> (f32, f32, f32, f32) {
+    let check = ui.spacing().interact_size.y + 4.0;
+    // The tick, the remove ✕ and the three gaps between the four columns are
+    // fixed furniture; only what's left is shared out.
+    let fixed = check + ui.spacing().interact_size.y + 8.0 + 3.0 * 8.0;
+    let free = (ui.available_width() - fixed).max(240.0);
+    let key = free * 0.28;
+    let val = free * 0.38;
+    (check, key, val, free - key - val)
+}
+
 /// An editable table of [`KvRow`]s (headers, query params, cookies, options).
 /// Returns true if anything changed. Adds a trailing "add row" button.
 pub fn kv_editor(
@@ -258,17 +298,12 @@ pub fn kv_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
-    // The description must be the grid's *last* column for egui to stretch it to
-    // the full available width — otherwise a trailing "remove" column would be
-    // the one that fills. So the remove ✕ is tucked into the description cell
-    // via a right-to-left layout: ✕ pins to the right edge and the description
-    // fills everything to its left.
-    //
-    // The key and value must grow too (fixed-width columns beside a filling one
-    // read as "tiny key, huge note"): after reserving the fixed controls
-    // (checkbox, ✕, column spacing) each takes a share of the free width.
-    let key_w = split_key_width(ui, 72.0);
-    let val_w = key_w * 1.5;
+    // The remove ✕ is tucked into the description cell via a right-to-left
+    // layout — ✕ pins to the right edge and the description fills everything to
+    // its left — rather than being a fifth column, so the note stays adjacent
+    // to the value it annotates.
+    let (check_w, key_w, val_w, desc_w) = kv_widths(ui);
+    let row_h = ui.spacing().interact_size.y;
     egui::Grid::new(id)
         .num_columns(4)
         .spacing([8.0, 4.0])
@@ -278,13 +313,19 @@ pub fn kv_editor(
             // Column titles, as in the terminal UI: without them a bare grid of
             // text boxes gives no clue that the tick is "send this row" rather
             // than "select".
-            column_header(ui, theme, "\u{2713}");
-            column_header(ui, theme, key_label);
-            column_header(ui, theme, val_label);
-            column_header(ui, theme, s.hdr_description);
+            sized_header(ui, theme, "\u{2713}", check_w);
+            sized_header(ui, theme, key_label, key_w);
+            sized_header(ui, theme, val_label, val_w);
+            sized_header(ui, theme, s.hdr_description, desc_w);
             ui.end_row();
             for i in 0..rows.len() {
-                if ui.checkbox(&mut rows[i].enabled, "").changed() {
+                if ui
+                    .add_sized(
+                        [check_w, row_h],
+                        egui::Checkbox::without_text(&mut rows[i].enabled),
+                    )
+                    .changed()
+                {
                     changed = true;
                 }
                 // A disabled row (checkbox unticked) isn't sent, so grey its
@@ -302,28 +343,33 @@ pub fn kv_editor(
                 if v.changed() {
                     changed = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                        .on_hover_text(s.gui_remove)
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                    // The description is a note for whoever reads the file
-                    // later, not part of the request, so it is always dim —
-                    // even on an enabled row it shouldn't compete with the
-                    // value beside it.
-                    let d = ui.add(
-                        egui::TextEdit::singleline(&mut rows[i].desc)
-                            .hint_text(s.gui_hint_description)
-                            .text_color(theme.dim)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if d.changed() {
-                        changed = true;
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(desc_w, row_h),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_width(desc_w);
+                        if ui
+                            .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                            .on_hover_text(s.gui_remove)
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        // The description is a note for whoever reads the file
+                        // later, not part of the request, so it is always dim —
+                        // even on an enabled row it shouldn't compete with the
+                        // value beside it.
+                        let d = ui.add(
+                            egui::TextEdit::singleline(&mut rows[i].desc)
+                                .hint_text(s.gui_hint_description)
+                                .text_color(theme.dim)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if d.changed() {
+                            changed = true;
+                        }
+                    },
+                );
                 ui.end_row();
             }
         });
@@ -568,6 +614,77 @@ mod tests {
             );
         }
         (key_w, rendered)
+    }
+
+    /// Render a `kv_editor` with `n` rows in a fixed-width window and report
+    /// the width the whole table claimed.
+    fn kv_table_width(n: usize) -> f32 {
+        let ctx = egui::Context::default();
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let mut rows: Vec<KvRow> = (0..n)
+            .map(|i| KvRow::new(&format!("Header-{i}"), "a value"))
+            .collect();
+        let mut w = 0.0;
+        // Grid column widths settle from the previous pass, so run a few.
+        for _ in 0..4 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(900.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let before = ui.min_rect().width();
+                    kv_editor(
+                        ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                    );
+                    w = ui.min_rect().width() - before;
+                },
+            );
+        }
+        w
+    }
+
+    /// The column titles used to be bare labels, so an empty table sized its
+    /// columns to the words "Header Value Description" and everything jumped
+    /// when the first row appeared. The table must claim the same width either
+    /// way.
+    #[test]
+    fn empty_and_filled_tables_lay_out_their_columns_identically() {
+        let empty = kv_table_width(0);
+        let filled = kv_table_width(2);
+        assert!(
+            (empty - filled).abs() < 1.0,
+            "empty table was {empty} wide, filled was {filled}"
+        );
+    }
+
+    /// The description column used to be whatever the key (40%) and value (60%)
+    /// left over — i.e. nothing. It must get a readable share of its own.
+    #[test]
+    fn the_description_column_gets_a_readable_share() {
+        let ctx = egui::Context::default();
+        let mut got = (0.0, 0.0, 0.0, 0.0);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| got = kv_widths(ui),
+        );
+        let (check, key, val, desc) = got;
+        assert!(desc > 150.0, "description was only {desc} wide");
+        assert!(key > 150.0 && val > key, "key {key}, value {val}");
+        // Nothing may overflow the row: the four columns plus the fixed
+        // furniture have to fit what the table was given.
+        let total = check + key + val + desc + 3.0 * 8.0 + 24.0;
+        assert!(total <= 900.0, "columns sum to {total}, wider than the row");
     }
 
     #[test]

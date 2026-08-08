@@ -142,6 +142,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   about to pick up is visible before the drag starts rather than only once the
   block is in mid-air.
 
+- **`STATISTICS` can be dropped onto a `WITH` field.** A request's `WITH` fields
+  are the columns it actually produces, and the grammar has always allowed a
+  summary on one — but the block editor had nowhere to drop it, because a field
+  isn't a block. Each field row is now its own drop target, and the request line
+  above it explains why it refuses (it names no single column of its own).
+
+### Changed
+
+- **The visual report editor's Send button is gone from the menu bar.** It ran
+  whatever request was selected in the active collection — the same thing the
+  Send button beside the URL does — but it was drawn on every screen, including
+  ones with no request in sight, so it could fire at something off-screen. The
+  keyboard shortcuts it advertised now appear on the real Send button.
+
+- **Key/value tables give their Description column room to be read.** The key
+  and value columns between them claimed the entire width, leaving the note a
+  sliver a word wouldn't fit in; all three now take a share. The column titles
+  also sit where the fields below them will be even when the table is empty, so
+  adding the first row no longer makes the headings jump apart.
+
 ### Fixed
 
 - **The report validation panel no longer flickers when the mouse moves.** Two
