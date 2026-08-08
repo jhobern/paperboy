@@ -36,6 +36,80 @@ pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
 /// The list of supported output extensions, for help/error text.
 pub const OUTPUT_EXTENSIONS: [&str; 4] = ["csv", "json", "html", "xlsx"];
 
+/// The preferred output extension for `report`: its `# output:` header format
+/// when that names a supported writer, else `csv`.
+///
+/// Used by both front-ends to seed their export picker, so a report declaring
+/// `# output: xlsx` exports `.xlsx` by default (and the user can still choose
+/// another format in the dialog). An unparseable report, or one naming a format
+/// PaperBoy can't write, falls back to CSV rather than refusing to export.
+pub fn report_output_extension(report: &crate::report::Report) -> String {
+    report
+        .flow()
+        .ok()
+        .and_then(|f| f.header.output().map(|o| o.trim().to_ascii_lowercase()))
+        .filter(|ext| writer_for_extension(ext).is_some())
+        .unwrap_or_else(|| "csv".to_string())
+}
+
+/// Where an export with extension `ext` lands: alongside a saved report (same
+/// stem), else `<name>.<ext>` in the current directory for a scratch report.
+///
+/// When the report *name* carries an output token (`{time}`), the expanded name
+/// wins — even for a saved report — and lands in the report's own folder (or the
+/// current directory for a scratch report), so repeated runs write distinct
+/// timestamped files rather than overwriting one export. Shared by both
+/// front-ends and by both kinds of export (a results file and a `.baseline`
+/// snapshot), so the same report always suggests the same name.
+pub fn export_path(report: &crate::report::Report, ext: &str) -> std::path::PathBuf {
+    if let Some(p) = tokened_output_path(report, ext) {
+        return p;
+    }
+    if let Some(path) = &report.path {
+        return path.with_extension(ext);
+    }
+    std::path::PathBuf::from(format!("{}.{ext}", sanitize_file_stem(&report.name)))
+}
+
+/// The output path when the report name carries an output token (`{time}`): the
+/// token-expanded, sanitised name as the file stem with extension `ext`, placed
+/// in the saved report's own folder (or the current directory for a scratch
+/// report). `None` when the name has no token, so callers fall back to their
+/// normal (file-stem-based) derivation.
+fn tokened_output_path(report: &crate::report::Report, ext: &str) -> Option<std::path::PathBuf> {
+    if !crate::report::name_has_output_token(&report.name) {
+        return None;
+    }
+    let stem = sanitize_file_stem(&crate::report::expand_output_tokens(&report.name));
+    let file = format!("{stem}.{ext}");
+    match report.path.as_ref().and_then(|p| p.parent()) {
+        Some(d) => Some(d.join(file)),
+        None => Some(std::path::PathBuf::from(file)),
+    }
+}
+
+/// Turn a display name into a safe single-segment file stem (replacing path
+/// separators and other awkward characters with `_`), so a scratch report's
+/// name can't escape the current directory when exported.
+fn sanitize_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "report".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Writes a report as RFC 4180 CSV (comma-separated, `\r\n` line endings,
 /// minimal quoting). The header row is the resolved column headers; each data
 /// row coalesces its column sources, substituting the no-match marker for an
@@ -625,6 +699,51 @@ mod tests {
     use super::*;
     use crate::report::model::{ReportResult, ReportRow};
     use std::collections::HashMap;
+
+    /// The `# output:` directive picks the export format, whatever its case.
+    #[test]
+    fn the_output_directive_chooses_the_export_extension() {
+        let r = crate::report::Report::from_text("s", "# output: XLSX\n# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "xlsx");
+    }
+
+    /// Anything PaperBoy can't write — and a report with no directive at all —
+    /// falls back to CSV, so the export button always does something.
+    #[test]
+    fn an_unwritable_or_absent_output_directive_falls_back_to_csv() {
+        let r = crate::report::Report::from_text("s", "# output: pdf\n# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "csv");
+        let r = crate::report::Report::from_text("s", "# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "csv");
+        let r = crate::report::Report::from_text("s", "this is not a report at all {{{\n");
+        assert_eq!(report_output_extension(&r), "csv");
+    }
+
+    /// An export lands beside the report it came from, under its own stem.
+    #[test]
+    fn an_export_lands_beside_a_saved_report() {
+        let mut r = crate::report::Report::from_text("sample", "# collection: c.hurl\n");
+        r.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
+        assert_eq!(
+            export_path(&r, "xlsx"),
+            std::path::PathBuf::from("/tmp/reports/sample.xlsx")
+        );
+        // The same rule names a baseline snapshot, so the two agree.
+        assert_eq!(
+            export_path(&r, "baseline"),
+            std::path::PathBuf::from("/tmp/reports/sample.baseline")
+        );
+    }
+
+    /// A scratch report has no file to sit beside, so its display name becomes
+    /// the stem — sanitised, so it can't escape the current directory.
+    #[test]
+    fn a_scratch_reports_name_is_sanitised_into_the_stem() {
+        let r = crate::report::Report::from_text("s", "# name: ../../etc/passwd\n");
+        let p = export_path(&r, "csv");
+        assert_eq!(p, std::path::PathBuf::from("______etc_passwd.csv"));
+        assert_eq!(p.components().count(), 1, "must stay a single segment");
+    }
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {

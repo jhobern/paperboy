@@ -57,6 +57,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   same four-column steps the terminal editor uses. Tab does not leave the field
   (press Escape for that).
 
+- **The GUI now exports report results in the format the report asks for.** Its
+  save dialog always defaulted to CSV, ignoring the `# output:` directive, so a
+  report declaring `# output: xlsx` had to have its extension retyped by hand
+  every time — while the terminal UI had offered the declared format as the
+  default all along. The dialog now leads with that format and suggests the same
+  filename the terminal UI does, `{time}` token included, with the other three
+  formats still one click away.
+
 ## [0.5.0] - 2026-08-08
 
 ### Added

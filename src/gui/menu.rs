@@ -823,6 +823,34 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
     }
 }
 
+/// The results-export dialog's format filters, with `ext`'s own format moved to
+/// the front.
+///
+/// The dialog applies its first filter by default, so leading with the format
+/// the report's `# output:` directive declares means exporting a report that
+/// says `# output: xlsx` writes a spreadsheet without the user touching the
+/// dropdown — while the other three stay one click away. This is what gives the
+/// GUI the terminal UI's behaviour, whose export picker is seeded the same way.
+/// An unrecognised extension leaves the order alone, so CSV leads as before.
+fn report_result_filters(ext: &str) -> Vec<super::filepick::Filter<'static>> {
+    const ALL: [super::filepick::Filter<'static>; 4] = [
+        ("CSV", &["csv"]),
+        ("JSON", &["json"]),
+        ("HTML", &["html"]),
+        ("Excel", &["xlsx"]),
+    ];
+    let want = ext.to_ascii_lowercase();
+    let mut filters = ALL.to_vec();
+    if let Some(i) = filters
+        .iter()
+        .position(|(_, exts)| exts.contains(&want.as_str()))
+    {
+        let leading = filters.remove(i);
+        filters.insert(0, leading);
+    }
+    filters
+}
+
 /// Save the active collection / environment / response / report results through
 /// a native OS save picker.
 pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
@@ -848,13 +876,20 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             .and_then(|e| e.path.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        // Default a results export to `<report>.csv` beside the report (or the
-        // current dir for a scratch report).
+        // A results export defaults to the format the report's `# output:`
+        // directive declares (CSV when it declares none), beside the report --
+        // the same name the terminal UI suggests, `{time}` token included. The
+        // dialog can still be pointed at any of the other formats.
         SaveKind::ReportResults => app
             .report_editor
             .as_ref()
-            .and_then(|e| e.report.path.as_ref())
-            .map(|p| p.with_extension("csv").to_string_lossy().into_owned())
+            .map(|e| {
+                crate::report::writer::export_path(
+                    &e.report,
+                    &crate::report::writer::report_output_extension(&e.report),
+                )
+            })
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
         SaveKind::Response => String::new(),
     };
@@ -875,15 +910,16 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             SaveKind::Response => "response.txt".into(),
             SaveKind::ReportResults => "results.csv".into(),
         });
+    let result_filters = report_result_filters(
+        std::path::Path::new(&current)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default(),
+    );
     let filters: &[super::filepick::Filter] = match kind {
         SaveKind::Collection => &[("Hurl", &["hurl"]), ("All files", &["*"])],
         SaveKind::Environment(_) => &[("Vars", &["vars"]), ("All files", &["*"])],
-        SaveKind::ReportResults => &[
-            ("CSV", &["csv"]),
-            ("JSON", &["json"]),
-            ("HTML", &["html"]),
-            ("Excel", &["xlsx"]),
-        ],
+        SaveKind::ReportResults => &result_filters,
         SaveKind::Response => &[("All files", &["*"])],
     };
     let Some(path) = super::filepick::save_file(title, dir.as_deref(), &default_name, filters)
@@ -1181,6 +1217,33 @@ mod tests {
 
     fn app() -> GuiApp {
         GuiApp::for_test(Session::default())
+    }
+
+    /// The declared output format leads the export dialog's filters, so the
+    /// default choice is the one the report asked for.
+    #[test]
+    fn the_reports_own_output_format_leads_the_export_filters() {
+        for (ext, expected) in [("xlsx", "Excel"), ("json", "JSON"), ("html", "HTML")] {
+            let filters = report_result_filters(ext);
+            assert_eq!(filters[0].0, expected, "{ext} should lead");
+            assert_eq!(filters.len(), 4, "every format stays available");
+        }
+        // Case is irrelevant: `# output: XLSX` is the same directive.
+        assert_eq!(report_result_filters("XLSX")[0].0, "Excel");
+    }
+
+    /// With no (or an unwritable) format declared, the list keeps its usual
+    /// order, so CSV remains the default it has always been.
+    #[test]
+    fn an_unknown_export_format_leaves_csv_leading() {
+        for ext in ["", "csv", "pdf"] {
+            let filters = report_result_filters(ext);
+            assert_eq!(filters[0].0, "CSV", "{ext:?} should leave CSV leading");
+            assert_eq!(
+                filters.iter().map(|f| f.0).collect::<Vec<_>>(),
+                vec!["CSV", "JSON", "HTML", "Excel"]
+            );
+        }
     }
 
     /// Draw the menu bar once with the given input, so mnemonics are registered

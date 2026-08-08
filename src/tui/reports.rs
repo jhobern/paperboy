@@ -40,8 +40,9 @@ use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
 use crate::report::validate::{Diagnostic, Severity};
-use crate::report::writer::{CsvWriter, writer_for_extension};
-use crate::report::{expand_output_tokens, name_has_output_token};
+use crate::report::writer::{
+    CsvWriter, export_path, report_output_extension, writer_for_extension,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1459,10 +1460,13 @@ impl TuiApp {
     /// saved report's stem (or its tab name) with a `.csv` extension.
     pub(crate) fn default_report_csv_filename(&self) -> String {
         match self.active_report_index() {
-            Some(idx) => csv_export_path(&self.reports[idx].report)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "report.csv".to_string()),
+            Some(idx) => export_path(
+                &self.reports[idx].report,
+                &report_output_extension(&self.reports[idx].report),
+            )
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "report.csv".to_string()),
             None => "report.csv".to_string(),
         }
     }
@@ -1542,7 +1546,7 @@ impl TuiApp {
     /// the saved report's stem (or its tab name) with a `.baseline` extension.
     pub(crate) fn default_report_baseline_filename(&self) -> String {
         match self.active_report_index() {
-            Some(idx) => baseline_export_path(&self.reports[idx].report)
+            Some(idx) => export_path(&self.reports[idx].report, "baseline")
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "report.baseline".to_string()),
@@ -2813,91 +2817,6 @@ fn relative_path(from_dir: &std::path::Path, to: &std::path::Path) -> Option<std
         None
     } else {
         Some(rel)
-    }
-}
-
-/// Where an exported CSV lands: alongside a saved report (same stem, `.csv`
-/// extension), else `<name>.csv` in the current directory for a scratch report.
-/// When the report *name* carries an output token (`{time}`), the expanded name
-/// wins — even for a saved report — and lands in the report's own folder (or the
-/// current directory for a scratch report), so repeated runs write distinct
-/// timestamped files rather than overwriting one export.
-fn csv_export_path(report: &Report) -> std::path::PathBuf {
-    let ext = report_output_extension(report);
-    if let Some(p) = tokened_output_path(report, &ext) {
-        return p;
-    }
-    if let Some(path) = &report.path {
-        return path.with_extension(&ext);
-    }
-    let stem = sanitize_file_stem(&report.name);
-    std::path::PathBuf::from(format!("{stem}.{ext}"))
-}
-
-/// The preferred output extension for `report`: its `# output:` header format
-/// when that names a supported writer (csv/json/xlsx), else `csv`. Used to seed
-/// the export picker so a report declaring `# output: xlsx` exports `.xlsx` by
-/// default (the user can still type another extension).
-fn report_output_extension(report: &Report) -> String {
-    report
-        .flow()
-        .ok()
-        .and_then(|f| f.header.output().map(|o| o.trim().to_ascii_lowercase()))
-        .filter(|ext| writer_for_extension(ext).is_some())
-        .unwrap_or_else(|| "csv".to_string())
-}
-
-/// The default `.baseline` snapshot path for `report`: its own file with a
-/// `.baseline` extension, or a sanitised `<name>.baseline` for a scratch report
-/// with no file yet. Mirrors [`csv_export_path`] (including the `{time}` token).
-fn baseline_export_path(report: &Report) -> std::path::PathBuf {
-    if let Some(p) = tokened_output_path(report, "baseline") {
-        return p;
-    }
-    if let Some(path) = &report.path {
-        return path.with_extension("baseline");
-    }
-    let stem = sanitize_file_stem(&report.name);
-    std::path::PathBuf::from(format!("{stem}.baseline"))
-}
-
-/// The output path when the report name carries an output token (`{time}`): the
-/// token-expanded, sanitised name as the file stem with extension `ext`, placed
-/// in the saved report's own folder (or the current directory for a scratch
-/// report). `None` when the name has no token, so callers fall back to their
-/// normal (file-stem-based) derivation.
-fn tokened_output_path(report: &Report, ext: &str) -> Option<std::path::PathBuf> {
-    if !name_has_output_token(&report.name) {
-        return None;
-    }
-    let stem = sanitize_file_stem(&expand_output_tokens(&report.name));
-    let file = format!("{stem}.{ext}");
-    let dir = report.path.as_ref().and_then(|p| p.parent());
-    Some(match dir {
-        Some(d) => d.join(file),
-        None => std::path::PathBuf::from(file),
-    })
-}
-
-/// Turn a display name into a safe single-segment file stem (replacing path
-/// separators and other awkward characters with `_`), so a scratch report's
-/// name can't escape the current directory when exported.
-fn sanitize_file_stem(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "report".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -4223,7 +4142,7 @@ mod export_path_tests {
         let mut report = Report::from_text("sample", "# name: run_{time}\n# collection: c.hurl\n");
         report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
 
-        let csv = csv_export_path(&report);
+        let csv = export_path(&report, &report_output_extension(&report));
         assert_eq!(csv.parent(), Some(std::path::Path::new("/tmp/reports")));
         let file = csv.file_name().unwrap().to_string_lossy().into_owned();
         assert!(file.starts_with("run_"), "expanded name used: {file}");
@@ -4240,7 +4159,7 @@ mod export_path_tests {
         let mut report = Report::from_text("sample", "# name: My Report\n# collection: c.hurl\n");
         report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
         assert_eq!(
-            csv_export_path(&report),
+            export_path(&report, &report_output_extension(&report)),
             std::path::PathBuf::from("/tmp/reports/sample.csv"),
             "unchanged behaviour when the name has no token"
         );
