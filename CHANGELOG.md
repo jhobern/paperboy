@@ -67,6 +67,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The report results grid now scrolls sideways.** A report with more columns
+  than fit on screen clipped the rest away with no way to reach them; the
+  arrow keys now carry the view along with the cell cursor, so walking right
+  brings the remaining columns into view (and walking back returns).
+
 - **Clicking the Request or Response panel in the terminal UI now selects it.**
   Those two panels — and the report view's — were the only ones a click didn't
   focus, so they could only be reached from the keyboard.

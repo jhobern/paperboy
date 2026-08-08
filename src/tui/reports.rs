@@ -222,6 +222,13 @@ pub(crate) struct ReportTab {
     /// without touching the cursor) is *not* immediately yanked back to the
     /// highlighted cell. `None` forces a re-centre on the next draw.
     pub(crate) results_scrolled_to: Option<(usize, usize)>,
+    /// Index of the leftmost grid column drawn in the results pane. A report
+    /// can easily have more columns than fit, and the grid clips rather than
+    /// wraps, so without this the columns past the right edge were simply
+    /// unreachable. Recomputed on draw to keep `cell_cursor`'s column fully
+    /// visible (the viewport follows the cursor, which Left/Right move), and
+    /// clamped to the current column count. Runtime-only.
+    pub(crate) results_col_offset: usize,
     /// When this report was opened from a Workspace tree, the workspace root it
     /// belongs to. This is a *link*, not UI state: the report is shown in the
     /// right pane of the Workspace collection tab rooted here, while that tab's
@@ -375,6 +382,7 @@ impl ReportTab {
             results_panel,
             cell_cursor: None,
             results_scrolled_to: None,
+            results_col_offset: 0,
             workspace_root: None,
             embedded_active: true,
         }
@@ -1265,6 +1273,7 @@ impl TuiApp {
                 // A new run invalidates the cell cursor (column layout may
                 // change) — reset it so the cursor starts fresh on the new grid.
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
                 // Show the (greyed) grid straight away so the run's shape/size
                 // is visible before any request completes — unless the user is
                 // mid-edit, in which case just stage it (they can flip with Tab).
@@ -1355,6 +1364,7 @@ impl TuiApp {
                 // The finalized grid may have different columns/rows than the
                 // streamed skeleton — reset cursor so it starts fresh.
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
@@ -1393,6 +1403,7 @@ impl TuiApp {
                 rt.dry_run = None;
                 rt.results_exported = false;
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
                 self.status = Some(Status::ReportRunDone { rows, errors });
@@ -2865,6 +2876,7 @@ impl DryRunReport {
                 None,
                 th,
                 None,
+                0,
             ));
         }
 
@@ -3242,6 +3254,22 @@ fn draw_report_results(
         return;
     }
 
+    // Slide the grid sideways so the cursor's column is on screen. The grid
+    // clips rather than wraps, so without this the columns past the right edge
+    // are unreachable; recomputed every frame because it is cheap and, unlike
+    // the vertical scroll, nothing else moves it.
+    if let Some(result) = &app.reports[idx].result {
+        let rt = &app.reports[idx];
+        let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
+        let widths = result_column_widths(result, &header);
+        let show_icons = rt.run_progress.is_some();
+        let avail =
+            (area.width.saturating_sub(2) as usize).saturating_sub(if show_icons { 2 } else { 0 });
+        let cursor_col = rt.cell_cursor.map(|(_, c)| c).unwrap_or(0);
+        app.reports[idx].results_col_offset =
+            follow_col_offset(&widths, cursor_col, avail, rt.results_col_offset);
+    }
+
     let (lines, title) = {
         let rt = &app.reports[idx];
         match &rt.result {
@@ -3258,7 +3286,14 @@ fn draw_report_results(
                 // grid greys unfinished rows and shows a status icon per row so
                 // it doubles as a live progress indicator.
                 let states = rt.run_progress.as_ref().map(|p| p.states.as_slice());
-                let lines = report_grid_lines(result, &header, states, th, rt.cell_cursor);
+                let lines = report_grid_lines(
+                    result,
+                    &header,
+                    states,
+                    th,
+                    rt.cell_cursor,
+                    rt.results_col_offset,
+                );
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
                 } else {
@@ -3393,13 +3428,16 @@ fn draw_report_results(
 /// indicator. When `None` (a completed or static result) no icon column is
 /// drawn and every row uses the normal text colour. `cursor` highlights the
 /// selected cell using the theme's selection colours so the active cell reads
-/// as distinct from its row's text style.
+/// as distinct from its row's text style. `col_offset` is the index of the
+/// leftmost column to draw, so columns that don't fit can be scrolled into
+/// view; the status-icon prefix stays pinned to the left edge regardless.
 fn report_grid_lines(
     result: &ReportResult,
     header: &crate::report::flow::Header,
     states: Option<&[RowState]>,
     th: &Theme,
     cursor: Option<(usize, usize)>, // (data_row, col) 0-indexed
+    col_offset: usize,
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
     if columns.is_empty() {
@@ -3447,6 +3485,7 @@ fn report_grid_lines(
         header_style,
         None,
         cursor_style,
+        col_offset,
     ));
     lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
@@ -3480,6 +3519,7 @@ fn report_grid_lines(
             text_style,
             cursor_col,
             cursor_style,
+            col_offset,
         ));
         lines.push(Line::from(spans));
     }
@@ -3501,6 +3541,7 @@ fn report_grid_lines(
             summary_style,
             None,
             cursor_style,
+            col_offset,
         ));
         lines.push(Line::from(spans));
     }
@@ -3579,16 +3620,52 @@ pub(crate) fn result_column_widths(
     grid_column_widths(&headers, &body, &summary_body)
 }
 
-/// Map an x offset within a grid row to a column index. The grid layout has
-/// each column occupying `widths[i]` characters followed by a two-space gutter
-/// (before the next column); an optional 2-character status-icon prefix is
-/// present when `show_icons` is true. Clicks that fall in a gutter are
-/// assigned to the preceding column; clicks past the last column's end return
-/// the last column index.
-pub(crate) fn grid_col_at_x(widths: &[usize], x_off: usize, show_icons: bool) -> usize {
+/// The leftmost grid column to draw so that `cursor_col` is fully visible in
+/// `avail` display columns, given the current offset. Scrolls left whenever the
+/// cursor is left of the viewport and right by the fewest columns that bring
+/// the cursor's right edge back inside it — so a column wider than the whole
+/// pane still becomes the leftmost one rather than pinning the view.
+pub(crate) fn follow_col_offset(
+    widths: &[usize],
+    cursor_col: usize,
+    avail: usize,
+    current: usize,
+) -> usize {
     if widths.is_empty() {
         return 0;
     }
+    let last = widths.len() - 1;
+    let cursor_col = cursor_col.min(last);
+    // Never leave the cursor off the left edge.
+    let mut off = current.min(cursor_col);
+    // Width of columns `off..=cursor_col`, including the two-space gutters
+    // between them.
+    let span = |off: usize| -> usize {
+        widths[off..=cursor_col].iter().sum::<usize>() + 2 * (cursor_col - off)
+    };
+    while off < cursor_col && span(off) > avail {
+        off += 1;
+    }
+    off
+}
+
+/// Map an x offset within a grid row to a column index. The grid layout has/// each column occupying `widths[i]` characters followed by a two-space gutter
+/// (before the next column); an optional 2-character status-icon prefix is
+/// present when `show_icons` is true. Clicks that fall in a gutter are
+/// assigned to the preceding column; clicks past the last column's end return
+/// the last column index. `col_offset` is the leftmost drawn column, so the
+/// returned index is absolute even when the grid is scrolled sideways.
+pub(crate) fn grid_col_at_x(
+    widths: &[usize],
+    x_off: usize,
+    show_icons: bool,
+    col_offset: usize,
+) -> usize {
+    if widths.is_empty() {
+        return 0;
+    }
+    let col_offset = col_offset.min(widths.len() - 1);
+    let widths = &widths[col_offset..];
     // Strip the icon prefix so `x` is relative to the first column's start.
     let x = if show_icons {
         x_off.saturating_sub(2)
@@ -3602,28 +3679,31 @@ pub(crate) fn grid_col_at_x(widths: &[usize], x_off: usize, show_icons: bool) ->
         // except when we're on the last column (no gutter after it).
         let next_col_start = pos + w + 2;
         if ci + 1 == widths.len() || x < next_col_start {
-            return ci;
+            return col_offset + ci;
         }
         pos = next_col_start;
     }
-    widths.len() - 1
+    col_offset + widths.len() - 1
 }
 
 /// Produce the per-cell spans for one grid row. Each cell is padded (or
 /// truncated with `…`) to its column width; columns are joined with a two-space
 /// gutter. The column at `cursor_col` (if any) uses `cursor_style` instead of
 /// `base_style` so the selected cell is visually highlighted. Used for both the
-/// header row (always `cursor_col = None`) and each data row.
+/// header row (always `cursor_col = None`) and each data row. Columns before
+/// `col_offset` are skipped entirely, which is how the grid scrolls sideways;
+/// `cursor_col` is still an absolute column index.
 fn grid_row_cell_spans(
     fields: &[String],
     widths: &[usize],
     base_style: Style,
     cursor_col: Option<usize>,
     cursor_style: Style,
+    col_offset: usize,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
+    for (i, field) in fields.iter().enumerate().skip(col_offset) {
+        if i > col_offset {
             spans.push(Span::styled("  ".to_string(), base_style));
         }
         let w = widths[i];

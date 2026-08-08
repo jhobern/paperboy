@@ -982,7 +982,8 @@ impl TuiApp {
             return false;
         }
         let show_icons = self.reports[idx].run_progress.is_some();
-        let clicked_col = grid_col_at_x(&widths, x_off, show_icons).min(n_cols - 1);
+        let col_offset = self.reports[idx].results_col_offset;
+        let clicked_col = grid_col_at_x(&widths, x_off, show_icons, col_offset).min(n_cols - 1);
         let new_cell = (data_row, clicked_col);
         let prev_cell = self.reports[idx].cell_cursor;
         if prev_cell == Some(new_cell) {

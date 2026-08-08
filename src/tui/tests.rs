@@ -10059,7 +10059,7 @@ fn the_request_list_shows_a_named_entrys_name_instead_of_its_url() {
     app.collections.push(col);
     app.active_tab = 1;
 
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 1, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
@@ -13691,7 +13691,7 @@ fn requests_list_breadcrumb_shows_the_current_folder() {
     app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
     app.focus = Pane::List;
 
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 0, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
@@ -16261,7 +16261,7 @@ fn the_loaded_collection_name_is_accent_and_others_are_dim() {
 
     let th = super::theme::theme(&Language::English);
     let s = Strings::for_language(&Language::English);
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw::draw_collection_left(f, area, &app, ci, &s, &th);
@@ -22739,6 +22739,119 @@ fn report_with_multi_row_result() -> (TuiApp, usize) {
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
+}
+
+/// `follow_col_offset` is the whole of the horizontal-scroll policy, so pin
+/// down its edges: it never leaves the cursor off the left, scrolls right by
+/// the fewest columns that fit, and gives up gracefully on a column wider than
+/// the pane rather than pinning the view somewhere useless.
+#[test]
+fn follow_col_offset_keeps_the_cursor_column_in_view() {
+    use super::reports::follow_col_offset;
+
+    let widths = [10usize, 10, 10, 10];
+    // Column 0 with plenty of room: no movement.
+    assert_eq!(follow_col_offset(&widths, 0, 60, 0), 0);
+    // Two columns (10 + 2 + 10 = 22) fit in 24 but three (34) don't.
+    assert_eq!(follow_col_offset(&widths, 1, 24, 0), 0);
+    assert_eq!(follow_col_offset(&widths, 2, 24, 0), 1);
+    // Scrolling back left always wins over the remembered offset.
+    assert_eq!(follow_col_offset(&widths, 0, 24, 2), 0);
+    // A column wider than the pane becomes the leftmost one.
+    assert_eq!(follow_col_offset(&widths, 3, 4, 0), 3);
+    // Degenerate inputs don't panic.
+    assert_eq!(follow_col_offset(&[], 3, 40, 2), 0);
+    // A cursor past the end clamps to the last column (3): columns 1..=3 fit
+    // in 40 display columns, but all four (46) would not.
+    assert_eq!(follow_col_offset(&widths, 99, 40, 0), 1);
+}
+
+/// A click must land on the column the user actually sees, which means the
+/// hit-test has to be told how far the grid has been scrolled sideways.
+#[test]
+fn grid_col_at_x_accounts_for_the_horizontal_offset() {
+    use super::reports::grid_col_at_x;
+
+    let widths = [10usize, 10, 10];
+    // Unscrolled: x 0..=11 is column 0, 12..=23 is column 1.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 0), 0);
+    assert_eq!(grid_col_at_x(&widths, 12, false, 0), 1);
+    // Scrolled by one: the same x now lands one column further right.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 1), 1);
+    assert_eq!(grid_col_at_x(&widths, 12, false, 1), 2);
+    // The status-icon prefix is still stripped first.
+    assert_eq!(grid_col_at_x(&widths, 2, true, 1), 1);
+    // An out-of-range offset clamps rather than panicking.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 9), 2);
+}
+
+/// The results grid clips rather than wraps, so columns past the right edge
+/// were simply unreachable. Walking the cell cursor right must carry the
+/// viewport with it and bring the last column on screen.
+#[test]
+fn walking_the_cell_cursor_right_scrolls_the_grid_sideways() {
+    use crate::report::model::{ReportResult, ReportRow};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Six columns of wide values: far more than a 60-column terminal shows.
+    let cols: Vec<String> = (0..6).map(|c| format!("Column{c}")).collect();
+    let mut row = ReportRow::default();
+    for (c, name) in cols.iter().enumerate() {
+        row.cells.insert(name.clone(), format!("value-{c}-wide"));
+    }
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: cols.clone(),
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        column_stats: Default::default(),
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut draw = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    let before = draw(&mut app);
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    assert!(
+        before.contains("Column0"),
+        "the first column starts on screen"
+    );
+    assert!(
+        !before.contains("Column5"),
+        "the last column starts off screen: {before}"
+    );
+
+    // Walk the cursor to the last column, redrawing as the user would see it.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Right);
+        draw(&mut app);
+    }
+    assert_eq!(app.reports[idx].cell_cursor, Some((0, 5)));
+    let after = draw(&mut app);
+    assert!(
+        app.reports[idx].results_col_offset > 0,
+        "the viewport must have followed the cursor"
+    );
+    assert!(
+        after.contains("Column5"),
+        "the last column must now be visible: {after}"
+    );
+
+    // …and walking back brings the first column back into view.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Left);
+        draw(&mut app);
+    }
+    let back = draw(&mut app);
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    assert!(back.contains("Column0"), "scrolled back: {back}");
 }
 
 #[test]
