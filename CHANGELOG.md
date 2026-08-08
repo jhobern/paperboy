@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.3] - 2026-08-08
+
+### Added
+
+- **Reports can break a request's `Time` into its parts.** Three new per-request
+  intrinsics sit alongside `Time` and always sum to it: `TimeSetup` (DNS, TCP
+  connect and the TLS handshake), `TimeWait` (request sent → first response
+  byte, the closest thing to "what the server took") and `TimeDownload`
+  (receiving the body). They answer the question `Time` alone can't: when a wide
+  `PARALLEL(…)` run makes response times climb, was that the server, or was it
+  your own machine and uplink getting to it?
+
+  Unlike the other intrinsics these are emitted **only** when a `SHOW(…)` or
+  `columns:` clause names them, so no existing report gains columns; the request
+  form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
+  excluded from a comparison run's compared fields, since they always differ.
+
 ## [0.7.2] - 2026-08-08
 
 ### Fixed

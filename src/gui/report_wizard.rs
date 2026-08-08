@@ -190,10 +190,15 @@ pub struct RequestForm {
 }
 
 impl RequestForm {
-    /// The `SHOW(…)` list for the ticked rows; empty when every field is ticked
-    /// (⇒ emit all, no clause).
+    /// The `SHOW(…)` list for the ticked rows; empty when the ticked set is
+    /// exactly what the request emits without a clause — every field except the
+    /// opt-in timing intrinsics (⇒ no clause).
     fn show(&self) -> Vec<String> {
-        if self.fields.iter().all(|(_, on)| *on) {
+        if self
+            .fields
+            .iter()
+            .all(|(n, on)| *on != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&n.as_str()))
+        {
             return Vec::new();
         }
         self.fields
@@ -719,11 +724,15 @@ fn build_request(
     for f in &hide {
         push(f, &mut names);
     }
+    // No SHOW clause means "everything this request already emits" — which
+    // excludes the opt-in timing intrinsics, so they must start un-ticked or
+    // simply opening and applying the form would switch them on.
     let all = show.is_empty();
     let fields = names
         .iter()
         .map(|n| {
-            let on = all || show.iter().any(|s| s == n);
+            let on = (all && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&n.as_str()))
+                || show.iter().any(|s| s == n);
             (n.clone(), on)
         })
         .collect();

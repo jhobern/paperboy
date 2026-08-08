@@ -44,10 +44,20 @@ pub const NO_BASELINE: &str = "no baseline";
 pub const NO_CANDIDATE: &str = "no candidate";
 
 /// Per-request intrinsic column suffixes. These are excluded from the compared
-/// "reported fields": `Time` always differs, and `HttpStatus`/`Asserts`/`Error`/
-/// `Response` already have their own columns. A request with *no* reported
-/// fields falls back to comparing its `Response` (see [`comparable_keys`]).
-const INTRINSICS: [&str; 5] = ["HttpStatus", "Time", "Asserts", "Error", "Response"];
+/// "reported fields": `Time` (and its `TimeSetup`/`TimeWait`/`TimeDownload`
+/// parts) always differs, and `HttpStatus`/`Asserts`/`Error`/`Response` already
+/// have their own columns. A request with *no* reported fields falls back to
+/// comparing its `Response` (see [`comparable_keys`]).
+const INTRINSICS: [&str; 8] = [
+    "HttpStatus",
+    "Time",
+    "TimeSetup",
+    "TimeWait",
+    "TimeDownload",
+    "Asserts",
+    "Error",
+    "Response",
+];
 
 /// The baseline/comparison environment roles that drive a comparison run.
 pub struct Roles {

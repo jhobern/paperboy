@@ -200,11 +200,16 @@ impl RequestForm {
         for f in &hide {
             push(f, &mut names);
         }
+        // No SHOW clause means "everything this request already emits" — which
+        // excludes the opt-in timing intrinsics, so they must start un-ticked or
+        // simply opening and applying the form would switch them on.
         let all = current_show.is_empty();
         let fields: Vec<ShowRow> = names
             .iter()
             .map(|name| {
-                let included = all || current_show.iter().any(|s| s == name);
+                let included = (all
+                    && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&name.as_str()))
+                    || current_show.iter().any(|s| s == name);
                 ShowRow {
                     name: name.clone(),
                     included,
@@ -264,11 +269,15 @@ impl RequestForm {
         self.visible_rows().len().saturating_sub(1)
     }
 
-    /// The `SHOW(…)` field list for the ticked rows, in row order. When every
-    /// field is ticked it returns empty (⇒ no `SHOW` clause, the "emit all"
-    /// default), so leaving everything on removes any existing clause.
+    /// The `SHOW(…)` field list for the ticked rows, in row order. When the
+    /// ticked set is exactly what the request emits with no clause — every
+    /// field except the opt-in timing intrinsics — it returns empty (⇒ no
+    /// `SHOW` clause), so leaving the form as it opened removes any existing
+    /// clause rather than freezing the current selection into one.
     fn show(&self) -> Vec<String> {
-        if self.fields.iter().all(|r| r.included) {
+        if self.fields.iter().all(|r| {
+            r.included != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&r.name.as_str())
+        }) {
             return Vec::new();
         }
         self.fields

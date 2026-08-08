@@ -105,6 +105,9 @@ impl EntryRunner for DryRunner {
                 asserts: Vec::new(),
                 captures: Vec::new(),
                 duration_ms: 0,
+                setup_ms: 0,
+                wait_ms: 0,
+                download_ms: 0,
                 ok: true,
                 error: None,
             }],
@@ -708,6 +711,9 @@ impl<'a> Exec<'a> {
         // Intrinsics (fixed order).
         cells.push((format!("{alias}.HttpStatus"), eo.status.to_string()));
         cells.push((format!("{alias}.Time"), eo.duration_ms.to_string()));
+        cells.push((format!("{alias}.TimeSetup"), eo.setup_ms.to_string()));
+        cells.push((format!("{alias}.TimeWait"), eo.wait_ms.to_string()));
+        cells.push((format!("{alias}.TimeDownload"), eo.download_ms.to_string()));
         cells.push((format!("{alias}.Asserts"), asserts_summary(&eo)));
         cells.push((
             format!("{alias}.Error"),
@@ -734,6 +740,9 @@ impl<'a> Exec<'a> {
             let value = match query.trim() {
                 "HttpStatus" => eo.status.to_string(),
                 "Time" => eo.duration_ms.to_string(),
+                "TimeSetup" => eo.setup_ms.to_string(),
+                "TimeWait" => eo.wait_ms.to_string(),
+                "TimeDownload" => eo.download_ms.to_string(),
                 "Asserts" => asserts_summary(&eo),
                 "Error" => eo.error.clone().unwrap_or_default(),
                 "Response" => response.clone(),
@@ -764,10 +773,18 @@ impl<'a> Exec<'a> {
                 // only when SHOW explicitly lists them.
                 !INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
             });
+        } else {
+            // Bare request: intrinsics are kept, except the opt-in ones.  The
+            // timing breakdown is diagnostic detail, so adding it must not
+            // silently widen every existing report's output — it appears only
+            // when SHOW asks for it.  Everything else on a bare request is
+            // already present, so SHOW is otherwise a no-op for inclusion; only
+            // HIDE can narrow the output further.
+            cells.retain(|(k, _)| {
+                let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
+                !OPT_IN_INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
+            });
         }
-        // Bare request: all cells (all 5 intrinsics) are kept.  SHOW on a bare
-        // request names fields that are already present, so it is a no-op for
-        // inclusion; only HIDE can narrow the output further.
 
         // Apply HIDE in all branches: remove any field whose suffix is in `hide`.
         if !hide.is_empty() {
@@ -1115,8 +1132,28 @@ fn asserts_summary(eo: &EntryOutcome) -> String {
 /// The intrinsic column suffixes every `REPORT REQUEST` emits (before any
 /// `[Reports]`/`WITH` fields), in their fixed emission order. Shared so
 /// validation of a `SHOW(...)` selector knows the always-present field names.
-pub(crate) const INTRINSIC_FIELDS: [&str; 5] =
-    ["HttpStatus", "Time", "Asserts", "Error", "Response"];
+///
+/// `Time` is the whole transfer; `TimeSetup`/`TimeWait`/`TimeDownload` are its
+/// parts (see [`crate::hurl::EntryOutcome::setup_ms`]) and always sum to it.
+/// They exist because `Time` alone can't answer "was the server slow, or was my
+/// own machine?" — under a wide `PARALLEL` run, connection setup and a
+/// saturated uplink inflate `Time` while the server is untouched, and only the
+/// breakdown shows that.
+/// The subset of [`INTRINSIC_FIELDS`] that a request emits *only* when SHOW
+/// names it. Unlike the rest, these are diagnostic detail rather than part of
+/// the default shape of a report, so they stay out of the way until asked for.
+pub(crate) const OPT_IN_INTRINSIC_FIELDS: [&str; 3] = ["TimeSetup", "TimeWait", "TimeDownload"];
+
+pub(crate) const INTRINSIC_FIELDS: [&str; 8] = [
+    "HttpStatus",
+    "Time",
+    "TimeSetup",
+    "TimeWait",
+    "TimeDownload",
+    "Asserts",
+    "Error",
+    "Response",
+];
 
 /// Evaluate one `[Reports]`/`WITH` field query against an already-received
 /// response, *tolerantly*: a non-match (or an unsupported query type) returns
@@ -1240,6 +1277,9 @@ mod tests {
         headers: Vec<(String, String)>,
         asserts: Vec<(bool,)>,
         duration_ms: u64,
+        setup_ms: u64,
+        wait_ms: u64,
+        download_ms: u64,
         error: Option<String>,
     }
 
@@ -1327,6 +1367,9 @@ mod tests {
                     .collect(),
                 captures: c.captures,
                 duration_ms: c.duration_ms,
+                setup_ms: c.setup_ms,
+                wait_ms: c.wait_ms,
+                download_ms: c.download_ms,
                 ok: c.error.is_none(),
                 error: c.error.clone(),
             };
@@ -2201,6 +2244,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -2287,6 +2333,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -2381,6 +2430,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -3123,6 +3175,94 @@ mod tests {
         assert_eq!(cells.get("r.Foo"), Some(&"7".to_string()));
         // Intrinsic precedes WITH field in the column order.
         assert_eq!(res.column_order, vec!["r.Time", "r.Foo"]);
+    }
+
+    #[test]
+    fn time_breakdown_is_opt_in_on_a_bare_request() {
+        // A bare request keeps its default intrinsics but not the timing parts:
+        // adding them must not silently widen every existing report.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run("REPORT REQUEST r\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.Time"), Some(&"90".to_string()));
+        assert_eq!(cells.get("r.TimeSetup"), None);
+        assert_eq!(cells.get("r.TimeWait"), None);
+        assert_eq!(cells.get("r.TimeDownload"), None);
+    }
+
+    #[test]
+    fn show_selects_individual_time_breakdown_columns() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r SHOW(Time, TimeWait)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.TimeWait"), Some(&"25".to_string()));
+        // SHOW on a bare request only opts the breakdown in; the other
+        // intrinsics it does not name stay as they were.
+        assert_eq!(cells.get("r.Time"), Some(&"90".to_string()));
+        assert_eq!(cells.get("r.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("r.TimeSetup"), None);
+        assert_eq!(cells.get("r.TimeDownload"), None);
+    }
+
+    #[test]
+    fn time_breakdown_is_available_to_with_fields_and_declared_show() {
+        // With declared fields, intrinsics are suppressed unless SHOWn, and the
+        // breakdown can also be aliased by a WITH field query like any other
+        // intrinsic.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"x\":7}".into(),
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r SHOW(TimeSetup) WITH\n    Server: TimeWait\n    Body: TimeDownload\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.TimeSetup"), Some(&"60".to_string()));
+        assert_eq!(cells.get("r.Server"), Some(&"25".to_string()));
+        assert_eq!(cells.get("r.Body"), Some(&"5".to_string()));
+        assert_eq!(cells.get("r.Time"), None, "intrinsics suppressed");
+        assert_eq!(res.column_order, vec!["r.TimeSetup", "r.Server", "r.Body"]);
     }
 
     #[test]

@@ -18658,6 +18658,9 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
                 asserts: Vec::new(),
                 captures: Vec::new(),
                 duration_ms: 7,
+                setup_ms: 0,
+                wait_ms: 0,
+                download_ms: 0,
                 ok: true,
                 error: None,
             }],
@@ -21731,8 +21734,15 @@ fn report_node_request_form_opens_with_fields() {
     assert!(names.contains(&"Response"), "shows an intrinsic: {names:?}");
     assert!(names.contains(&"Time"), "shows an intrinsic: {names:?}");
     assert!(
-        form.fields.iter().all(|r| r.included),
-        "no SHOW clause ⇒ every field ticked"
+        names.contains(&"TimeWait"),
+        "offers the opt-in timing intrinsics: {names:?}"
+    );
+    // No SHOW clause ⇒ the ticks mirror what the request actually emits, which
+    // is every field bar the opt-in timing intrinsics.
+    assert!(
+        form.fields.iter().all(|r| r.included
+            != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&r.name.as_str())),
+        "no SHOW clause ⇒ every field ticked except the opt-in ones"
     );
 }
 
@@ -21744,9 +21754,9 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, Asserts, Error, Response, status. The Response field is the 5th
-    // field ⇒ row index 4 + 4 = 8.
-    for _ in 0..8 {
+    // Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error, Response,
+    // status. The Response field is the 8th field ⇒ row index 7 + 4 = 11.
+    for _ in 0..11 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -21761,8 +21771,9 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     assert!(app.overlay.is_none(), "the form closes on apply");
 }
 
-/// Applying with every field ticked writes no `SHOW` clause (the "emit all"
-/// default), and clears any pre-existing one.
+/// Applying with the default set ticked — every field bar the opt-in timing
+/// intrinsics — writes no `SHOW` clause, and clears any pre-existing one.
+/// Ticking an opt-in one does write a clause, since it changes what is emitted.
 #[test]
 fn report_node_request_form_all_ticked_removes_show() {
     let (mut app, idx) = node_show_app(&["status"]);
@@ -21796,7 +21807,9 @@ fn report_node_request_form_all_ticked_removes_show() {
             let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
                 unreachable!()
             };
-            !form.fields[i].included
+            let row = &form.fields[i];
+            !row.included
+                && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&row.name.as_str())
         };
         if unticked {
             press(&mut app, KeyCode::Char(' '));
@@ -21809,7 +21822,35 @@ fn report_node_request_form_all_ticked_removes_show() {
     let text = &app.reports[idx].report.text;
     assert!(
         !text.contains("SHOW("),
-        "all ticked ⇒ the SHOW clause is removed: {text:?}"
+        "the default set ticked ⇒ the SHOW clause is removed: {text:?}"
+    );
+}
+
+/// Ticking an opt-in timing intrinsic writes a `SHOW` clause naming it, so the
+/// breakdown reaches the report only when it is asked for.
+#[test]
+fn report_node_request_form_ticking_a_timing_part_writes_show() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
+    // Time, TimeSetup, … ⇒ TimeSetup is the 3rd field, row index 2 + 4 = 6.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Down);
+    }
+    {
+        let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+            panic!("form open");
+        };
+        assert_eq!(form.fields[2].name, "TimeSetup");
+        assert!(!form.fields[2].included, "opt-in starts un-ticked");
+    }
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("SHOW(") && text.contains("TimeSetup"),
+        "the opt-in field is named in SHOW: {text:?}"
     );
 }
 

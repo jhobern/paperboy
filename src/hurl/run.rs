@@ -55,6 +55,25 @@ pub struct EntryOutcome {
     /// milliseconds (excludes assert/capture processing). Reports surface this
     /// as the per-request "Time" column.
     pub duration_ms: u64,
+    /// The `duration_ms` breakdown, from libcurl's own timers, so a report can
+    /// separate what the *server* did from what the local machine and network
+    /// spent getting to it. Each is summed over the entry's calls (a redirect
+    /// chain contributes every hop), so the three always add up to
+    /// `duration_ms`.
+    ///
+    /// Connection setup: DNS resolution, TCP connect and the TLS handshake —
+    /// everything before the request could start being sent. PaperBoy builds a
+    /// fresh client per request, so every request pays this in full; under a
+    /// heavily parallel run it is also the part that suffers most from local
+    /// CPU and uplink contention, which is precisely why it is worth seeing
+    /// apart from the rest.
+    pub setup_ms: u64,
+    /// Time in flight: from the request starting to go out to the first byte of
+    /// the response arriving. The closest thing to "what the server took",
+    /// and the figure to watch when a parallel run makes `Time` climb.
+    pub wait_ms: u64,
+    /// Time spent receiving the response body, after its first byte.
+    pub download_ms: u64,
     /// `true` when the runner reported no errors for this entry (status
     /// expectation, asserts and transport all satisfied).
     pub ok: bool,
@@ -332,6 +351,25 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         e.errors.first().map(|er| render_error(er, lines))
     };
 
+    // Split the transfer time into connection setup / in-flight / download,
+    // summed across calls so a redirect chain accounts for every hop. libcurl
+    // reports its timers as offsets from the start of each transfer:
+    // `pre_transfer` is "connected, TLS done, about to send", `start_transfer`
+    // is "first response byte in". Saturating throughout: the timers are
+    // independent samples and a stalled transfer can report them out of order,
+    // which must never underflow into an absurd duration.
+    let (setup_ms, wait_ms, download_ms) = e.calls.iter().fold((0, 0, 0), |(s, w, d), c| {
+        let t = &c.timings;
+        let pre = t.pre_transfer;
+        let start = t.start_transfer.max(pre);
+        let total = t.total.max(start);
+        (
+            s + pre.as_millis() as u64,
+            w + (start - pre).as_millis() as u64,
+            d + (total - start).as_millis() as u64,
+        )
+    });
+
     (
         EntryOutcome {
             method,
@@ -344,6 +382,9 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
             asserts,
             captures,
             duration_ms: e.transfer_duration.as_millis() as u64,
+            setup_ms,
+            wait_ms,
+            download_ms,
             ok: e.errors.is_empty(),
             error: entry_error.clone(),
         },
@@ -460,6 +501,24 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Feature: the transfer time is reported both whole and broken into its
+    /// connection-setup / in-flight / download parts, and the parts add up.
+    #[test]
+    fn timing_breakdown_partitions_the_total() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        // Millisecond truncation of each part can lose up to 1ms apiece, so the
+        // sum can trail the total slightly; it must never exceed it.
+        let parts = e.setup_ms + e.wait_ms + e.download_ms;
+        assert!(
+            parts <= e.duration_ms && e.duration_ms - parts <= 3,
+            "parts {parts} should account for total {}",
+            e.duration_ms
+        );
     }
 
     /// Feature: the implicit `HTTP <code>` status line surfaces in the mapped
