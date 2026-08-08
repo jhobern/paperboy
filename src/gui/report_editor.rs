@@ -64,6 +64,10 @@ pub struct ReportEditor {
     /// that line the way the terminal UI does.
     pub parse_error_line: Option<usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The [`context::diagnostics_fingerprint`] the current `diagnostics` were
+    /// computed from. Validation is re-run only when this changes, so it happens
+    /// on an edit rather than on every frame — see that function for why.
+    diag_key: Option<u64>,
     /// The selected node's path (a sequence of indices into nested loop
     /// bodies). Empty = the synthetic `Begin` root.
     pub selection: Vec<usize>,
@@ -136,6 +140,7 @@ impl ReportEditor {
             parse_error: None,
             parse_error_line: None,
             diagnostics: Vec::new(),
+            diag_key: None,
             selection: Vec::new(),
             palette: None,
             undo: Vec::new(),
@@ -1290,19 +1295,38 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.ctx().request_repaint();
     }
 
-    // Recompute diagnostics against the current collections/envs each frame
-    // (cheap; keeps the Run gate and panel live as the bound collection changes).
-    ed.diagnostics = match &ed.flow {
-        Some(flow) => context::report_diagnostics(
-            &app.session.collections,
-            &app.session.global_envs,
-            app.session.active_env_id,
-            flow,
-            ed.report.path.as_deref(),
-            &app.strings,
-        ),
-        None => Vec::new(),
-    };
+    // Revalidate against the current collections/envs, but only when one of the
+    // inputs has actually changed. Doing it per frame re-ran a deep-cloning walk
+    // dozens of times a second and — because parts of it are driven by hash-set
+    // iteration — reshuffled the panel each time, so the warnings visibly
+    // flickered whenever the mouse moved (see `diagnostics_fingerprint`).
+    match &ed.flow {
+        Some(flow) => {
+            let key = context::diagnostics_fingerprint(
+                &app.session.collections,
+                &app.session.global_envs,
+                app.session.active_env_id,
+                flow,
+                ed.report.path.as_deref(),
+                &app.strings,
+            );
+            if ed.diag_key != Some(key) {
+                ed.diagnostics = context::report_diagnostics(
+                    &app.session.collections,
+                    &app.session.global_envs,
+                    app.session.active_env_id,
+                    flow,
+                    ed.report.path.as_deref(),
+                    &app.strings,
+                );
+                ed.diag_key = Some(key);
+            }
+        }
+        None => {
+            ed.diagnostics.clear();
+            ed.diag_key = None;
+        }
+    }
 
     // ── Header: name, dirty marker, Run / Save / Close ─────────────────────
     ui.horizontal(|ui| {
@@ -2577,15 +2601,22 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                         header_strip(ed, app, ui, &mut acts);
                         ui.add_space(4.0);
                         let mut lift = DragLift::default();
+                        let mut hovers: Vec<RowHover> = Vec::new();
                         for (i, row) in rows.iter().enumerate() {
                             let selected = row.path == ed.selection
                                 && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
                             let drop_pos = insert_pos_after(&rows, i);
-                            block_row(
+                            if let Some(h) = block_row(
                                 ed, app, ui, row, i, selected, &drop_pos, &titles, &mut lift,
                                 &mut acts,
-                            );
+                            ) {
+                                hovers.push(h);
+                            }
                         }
+                        // Now that every row has been measured, light the block
+                        // under the pointer and everything a drag would take
+                        // with it (see `paint_hover_group`).
+                        paint_hover_group(ui, &th, &hovers);
                         // A report with no steps is where every new report
                         // starts, and an empty gap between BEGIN and END says
                         // nothing about what to do next — the palette's own
@@ -2877,6 +2908,37 @@ fn dragged_chip(ctx: &egui::Context) -> Option<(Vec<usize>, DetachWhich)> {
 /// therefore lifts only itself; a loop lifts its whole body in one piece.
 fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
     row_path.starts_with(dragged)
+}
+
+/// How strongly a row is highlighted while the pointer rests on a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HoverTier {
+    /// The hovered block itself. A `FOR` loop is *two* rows at this tier — its
+    /// header and its `END` — because those are the two halves of one block, and
+    /// lighting only the half under the pointer made a loop look like it ended
+    /// somewhere it doesn't.
+    Block,
+    /// A row that isn't the block but travels with it: the body of a hovered
+    /// loop. Softer, because it answers a different question ("and this comes
+    /// too") from the block under the pointer.
+    CarriedAlong,
+}
+
+/// The highlight `row_path` earns while `hovered` is the block under the
+/// pointer, or `None` if it is unaffected.
+///
+/// Deliberately the same subtree rule as [`row_is_lifted`] — the highlight's
+/// whole promise is "this is what a drag would pick up", so if the two ever
+/// disagreed the preview would be a lie. A leaf therefore lights only itself; a
+/// loop lights its body and its `END` as well.
+fn hover_tier(hovered: &[usize], row_path: &[usize]) -> Option<HoverTier> {
+    if !row_is_lifted(hovered, row_path) {
+        None
+    } else if row_path.len() == hovered.len() {
+        Some(HoverTier::Block)
+    } else {
+        Some(HoverTier::CarriedAlong)
+    }
 }
 
 /// `rect` with the row's indent trimmed off its left edge: the block's own
@@ -3286,6 +3348,26 @@ fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
     }
 }
 
+/// A row's geometry and its reserved background slot, collected as the rows are
+/// laid out so the hover highlight can be painted once the whole pane has been
+/// walked and the block under the pointer is known.
+///
+/// The slot matters: the highlight has to sit *behind* the row's chips, but
+/// which rows light up isn't decided until every row has been measured (hovering
+/// a loop header lights rows that haven't been laid out yet). Reserving a shape
+/// index up-front and filling it in at the end gets both — a background that is
+/// genuinely in the background, with no frame of lag.
+struct RowHover {
+    path: Vec<usize>,
+    kind: RowKind,
+    /// The block's own bounds, with the indent trimmed off (see
+    /// [`indented_content`]) so the highlight hugs the block rather than
+    /// starting at the far-left margin.
+    rect: egui::Rect,
+    bg: egui::layers::ShapeIdx,
+    pointer_inside: bool,
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -3297,9 +3379,13 @@ fn block_row(
     titles: &[String],
     lift: &mut DragLift,
     acts: &mut Vec<Act>,
-) {
+) -> Option<RowHover> {
     let th = app.theme;
     let s = &app.strings;
+    // Reserved *before* any of the row's own content, so whatever the hover
+    // highlight later puts here is painted underneath the chips rather than over
+    // them. Filled in by `paint_hover_group` once every row has been laid out.
+    let bg_slot = ui.painter().add(egui::Shape::Noop);
     // Loaded environment names — the choices a BASELINE/COMPARISON dropdown
     // offers. Cheap to gather; only consulted by env-role chips.
     let env_choices: Vec<String> = app
@@ -3572,11 +3658,23 @@ fn block_row(
         // whole subtree under the pointer is applied once every row has been
         // painted (see `DragLift`), never from here.
         lift.add(layer_id, content, is_drag_head);
-        return;
+        return None;
     }
     let block = ui.vertical(block_body);
     let cluster = block.inner;
     let block_rect = block.response.rect;
+    // The block's own bounds (indent stripped), and whether the pointer is over
+    // them. `rect_contains_pointer` rather than an `interact` so this purely
+    // observational read never competes with the row's chips or its drop zones
+    // for the click.
+    let hover_rect = indented_content(block_rect, row.depth);
+    let hover = RowHover {
+        path: row.path.clone(),
+        kind: row.kind,
+        rect: hover_rect,
+        bg: bg_slot,
+        pointer_inside: ui.rect_contains_pointer(hover_rect),
+    };
 
     // ── Modifier drop zone: dropping a modifier chip onto a real node attaches
     // it. Only reacts to `Modifier` payloads, so it never competes with the base
@@ -3753,6 +3851,68 @@ fn block_row(
         paint_drop_silhouette(ui, origin, &dragged_block_shape(ui), clip, &th);
         ui.add_space(gap);
     }
+    Some(hover)
+}
+
+/// The block under the pointer, if any: the *last* matching row, so a nested row
+/// wins over the loop whose rect happens to reach it.
+///
+/// The synthetic `Begin` row is never a candidate. Its path is empty, which
+/// every other path starts with, so treating it as hoverable would light the
+/// entire report the moment the pointer crossed the top of the pane — and
+/// `Begin` isn't a block you can select or move anyway, so the highlight would
+/// be promising something that can't happen.
+fn hovered_block(rows: &[RowHover]) -> Option<&[usize]> {
+    rows.iter()
+        .rev()
+        .find(|r| r.pointer_inside && r.kind != RowKind::Begin)
+        .map(|r| r.path.as_slice())
+}
+
+/// Paint the hover highlight: a filled panel behind the block under the pointer,
+/// and a softer one behind everything that would travel with it.
+///
+/// Skipped entirely while something is being dragged. A drag already says what
+/// is in hand — the lifted subtree floats under the pointer and leaves dashed
+/// ghosts behind — and adding a second, differently-shaped highlight to that
+/// only muddled which of the two to read.
+fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
+    if drag_in_flight(ui.ctx()) {
+        return;
+    }
+    let Some(hovered) = hovered_block(rows) else {
+        return;
+    };
+    // Derived from the panel colour rather than fixed, so the highlight stays a
+    // gentle lift off the background on a light theme as well as a dark one.
+    let block = mix(th.panel, th.accent, 0.28);
+    let carried = mix(th.panel, th.accent, 0.12);
+    for row in rows {
+        let Some(tier) = hover_tier(hovered, &row.path) else {
+            continue;
+        };
+        let fill = match tier {
+            HoverTier::Block => block,
+            HoverTier::CarriedAlong => carried,
+        };
+        ui.painter().set(
+            row.bg,
+            egui::Shape::rect_filled(
+                row.rect.expand2(egui::vec2(4.0, 1.0)),
+                egui::CornerRadius::same(4),
+                fill,
+            ),
+        );
+    }
+}
+
+/// Whether anything at all is currently being dragged in the block editor — a
+/// palette block, a modifier clause or an existing row. Each travels as its own
+/// payload type, so all three have to be asked.
+fn drag_in_flight(ctx: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<DragItem>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<NodeKind>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<Modifier>(ctx)
 }
 
 /// Render the `WITH … END` fields of a report-request as a nested block under
@@ -8040,6 +8200,80 @@ mod tests {
             !row_is_lifted(&[2], &[20]),
             "prefix is index-wise, not textual"
         );
+    }
+
+    /// The hover highlight must promise exactly what a drag delivers, so it is
+    /// keyed off the same subtree rule — but split into two tiers so "this
+    /// block" and "and this comes with it" read differently.
+    #[test]
+    fn hover_lights_the_block_strongly_and_its_body_softly() {
+        // A leaf lights only itself.
+        assert_eq!(hover_tier(&[2], &[2]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2], &[1]), None);
+        assert_eq!(hover_tier(&[2], &[3]), None);
+
+        // A loop's body and its nested rows come along, one tier down.
+        assert_eq!(hover_tier(&[2], &[2, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[2, 1, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[1, 0]), None);
+        assert_eq!(hover_tier(&[2], &[20]), None);
+
+        // Hovering a row *inside* a loop lights that row, not the loop around
+        // it: dragging it out takes only itself.
+        assert_eq!(hover_tier(&[2, 1], &[2, 1]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2, 1], &[2]), None);
+        assert_eq!(hover_tier(&[2, 1], &[2, 0]), None);
+
+        // Every row the highlight touches is a row the drag would lift, and
+        // vice versa — the two must never disagree.
+        for path in [vec![2], vec![2, 0], vec![2, 1, 0], vec![3], vec![1, 0]] {
+            assert_eq!(
+                hover_tier(&[2], &path).is_some(),
+                row_is_lifted(&[2], &path),
+                "hover and lift disagree about {path:?}"
+            );
+        }
+    }
+
+    /// The block under the pointer is the innermost one: a `FOR` header and a
+    /// row in its body can both contain the pointer, and the body row is the one
+    /// the user is pointing at.
+    #[test]
+    fn hovered_block_prefers_the_innermost_row_and_ignores_begin() {
+        fn row(path: &[usize], kind: RowKind, inside: bool) -> RowHover {
+            RowHover {
+                path: path.to_vec(),
+                kind,
+                rect: egui::Rect::ZERO,
+                bg: egui::layers::ShapeIdx(0),
+                pointer_inside: inside,
+            }
+        }
+        let rows = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::LoopHead, true),
+            row(&[0, 0], RowKind::Leaf, true),
+            row(&[0], RowKind::LoopEnd, false),
+        ];
+        assert_eq!(hovered_block(&rows), Some([0, 0].as_slice()));
+
+        // Begin is never the answer, even when it is the only row the pointer is
+        // over — its empty path would light the whole report.
+        let only_begin = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::Leaf, false),
+        ];
+        assert_eq!(hovered_block(&only_begin), None);
+
+        // A loop's END stands in for the loop, so pointing at it lights the
+        // whole block.
+        let on_end = vec![
+            row(&[0], RowKind::LoopHead, false),
+            row(&[0, 0], RowKind::Leaf, false),
+            row(&[0], RowKind::LoopEnd, true),
+        ];
+        assert_eq!(hovered_block(&on_end), Some([0].as_slice()));
+        assert_eq!(hover_tier(&[0], &[0]), Some(HoverTier::Block));
     }
 
     #[test]

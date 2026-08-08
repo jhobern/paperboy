@@ -134,7 +134,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   kept as its original JSON rather than converted into an empty one, so
   converting can never cost you data.
 
+### Added
+
+- **Hovering a block in the visual report editor highlights it — and everything
+  that would move with it.** Pointing at a line lights that block, and pointing
+  at a `FOR` loop also lights its whole body and its `END`, so what a drag is
+  about to pick up is visible before the drag starts rather than only once the
+  block is in mid-air.
+
 ### Fixed
+
+- **The report validation panel no longer flickers when the mouse moves.** Two
+  separate causes: the warnings were re-derived on every frame (a full
+  revalidation, dozens of times a second, even though nothing had changed), and
+  the per-request variable warnings were emitted straight out of a hash set, so
+  each rebuild shuffled them into a different order. Validation is now re-run
+  only when the report, the requests it uses or the loaded environments actually
+  change, and those warnings come out in alphabetical order.
 
 - **`ENVS BASELINE(…) SHOW(Time)` now actually shows the baseline field.** The
   clause is meant to put the baseline's value beside the candidate's as

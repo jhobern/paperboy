@@ -190,6 +190,90 @@ pub fn report_diagnostics(
     validate::validate(flow, &ctx)
 }
 
+/// A hash of everything [`report_diagnostics`] reads, so a caller can tell
+/// whether re-running it could possibly produce a different answer.
+///
+/// Validation is not cheap — it deep-clones every request in the bound
+/// collection and walks the whole flow — and a GUI redraws on every mouse move,
+/// so a front-end that recomputed per frame would burn that cost dozens of times
+/// a second to produce byte-identical output. Worse, it *isn't* byte-identical:
+/// parts of the walk are driven by `HashSet`s whose iteration order differs
+/// between instances, so the panel's contents were reshuffled on every frame and
+/// a report with several warnings visibly flickered whenever the pointer moved.
+///
+/// **The contract:** this must hash every input `report_diagnostics` consults.
+/// Anything new that function starts reading has to be added here too, or the
+/// panel will go stale. It is deliberately the function immediately below it for
+/// that reason.
+///
+/// Requests are hashed field by field rather than through a serializer because
+/// this runs on every frame: hashing their raw strings is around seven times
+/// cheaper than the validation pass it guards, whereas serializing them to JSON
+/// first was *slower* than simply revalidating, which would have made the cache
+/// worse than no cache at all. The fields listed are every one that can hold a
+/// `{{variable}}`, a request name or a report/capture field name — the only
+/// things validation looks at. Environments contribute their variable *names*
+/// only: validation asks what is in scope, never what it is set to, and hashing
+/// values would invalidate the cache on every keystroke in the environment
+/// editor.
+pub fn diagnostics_fingerprint(
+    collections: &[Collection],
+    global_envs: &[Environment],
+    active_env_id: Option<u64>,
+    flow: &ReportFlow,
+    report_path: Option<&Path>,
+    strings: &crate::i18n::Strings,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    flow.to_text().hash(&mut h);
+    report_path.hash(&mut h);
+    active_env_id.hash(&mut h);
+    // The language decides the wording of every message, so a diagnostic set
+    // computed under one is not reusable under another.
+    (strings.diag_var_maybe_undefined.as_ptr() as usize).hash(&mut h);
+    for c in collections {
+        c.name.hash(&mut h);
+        c.path.hash(&mut h);
+        c.linked_env_id.hash(&mut h);
+        c.entries.len().hash(&mut h);
+        for e in &c.entries {
+            e.title.hash(&mut h);
+            e.method.hash(&mut h);
+            e.url.hash(&mut h);
+            e.body.hash(&mut h);
+            e.basic_auth.hash(&mut h);
+            for kv in e
+                .headers
+                .iter()
+                .chain(&e.queries)
+                .chain(&e.cookies)
+                .chain(&e.options)
+            {
+                kv.key.hash(&mut h);
+                kv.value.hash(&mut h);
+                kv.enabled.hash(&mut h);
+            }
+            for f in &e.form_fields {
+                f.key.hash(&mut h);
+                f.value.hash(&mut h);
+            }
+            for (k, v) in e.captures.iter().chain(&e.reports) {
+                k.hash(&mut h);
+                v.hash(&mut h);
+            }
+        }
+    }
+    for e in global_envs {
+        e.id.hash(&mut h);
+        e.name.hash(&mut h);
+        for v in &e.vars {
+            v.key.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// Assemble the fully-owned [`ReportRunInputs`] for `flow` (bound to a loaded
 /// collection). `Err` with a user-facing key when the flow isn't bound to a
 /// loaded collection. Mirrors the terminal UI's `build_report_run_inputs`.
@@ -257,4 +341,111 @@ pub fn report_run_inputs(
 pub enum RunInputError {
     /// The flow isn't bound to a currently-loaded collection.
     Unbound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hurl::{HurlEntry, KvRow};
+
+    fn strings() -> crate::i18n::Strings {
+        crate::i18n::Strings::for_language(&crate::i18n::Language::English)
+    }
+
+    fn entry() -> HurlEntry {
+        HurlEntry {
+            title: "Oauth".into(),
+            method: "POST".into(),
+            url: "https://api.example.com/token".into(),
+            ..Default::default()
+        }
+    }
+
+    fn fingerprint(cols: &[Collection], envs: &[Environment], flow: &ReportFlow) -> u64 {
+        diagnostics_fingerprint(cols, envs, None, flow, None, &strings())
+    }
+
+    /// The cache is only sound if the fingerprint moves whenever anything
+    /// validation reads moves. Each case here changes exactly one input and
+    /// asserts the key notices — miss one and the panel silently goes stale.
+    #[test]
+    fn fingerprint_notices_every_input_it_guards() {
+        let flow = crate::report::parse_flow("# collection: c\nREPORT REQUEST Oauth\n").unwrap();
+        let cols = vec![Collection::new("c".into(), vec![entry()])];
+        let envs: Vec<Environment> = Vec::new();
+        let base = fingerprint(&cols, &envs, &flow);
+
+        // Same inputs, same key — otherwise nothing is ever cached.
+        assert_eq!(base, fingerprint(&cols, &envs, &flow), "must be stable");
+
+        let mut cases: Vec<(&str, Collection)> = Vec::new();
+        let mut c = cols[0].clone();
+        c.entries[0].title = "Renamed".into();
+        cases.push(("title", c));
+        let mut c = cols[0].clone();
+        c.entries[0].url = "https://api.example.com/other".into();
+        cases.push(("url", c));
+        let mut c = cols[0].clone();
+        c.entries[0].method = "GET".into();
+        cases.push(("method", c));
+        let mut c = cols[0].clone();
+        c.entries[0].body = Some("{{tok}}".into());
+        cases.push(("body", c));
+        let mut c = cols[0].clone();
+        c.entries[0].headers.push(KvRow::new("A", "{{v}}"));
+        cases.push(("header", c));
+        let mut c = cols[0].clone();
+        c.entries[0]
+            .captures
+            .push(("cap".into(), "jsonpath \"$.a\"".into()));
+        cases.push(("capture", c));
+        let mut c = cols[0].clone();
+        c.entries[0]
+            .reports
+            .push(("F".into(), "jsonpath \"$.a\"".into()));
+        cases.push(("report field", c));
+        let mut c = cols[0].clone();
+        c.entries.push(entry());
+        cases.push(("entry count", c));
+        let mut c = cols[0].clone();
+        c.name = "other".into();
+        cases.push(("collection name", c));
+
+        for (what, c) in cases {
+            assert_ne!(
+                base,
+                fingerprint(&[c], &envs, &flow),
+                "changing the {what} must change the fingerprint"
+            );
+        }
+
+        // A different report is a different key.
+        let other = crate::report::parse_flow("# collection: c\nREPORT REQUEST Renamed\n").unwrap();
+        assert_ne!(base, fingerprint(&cols, &envs, &other), "flow");
+
+        // And so is an environment gaining a variable *name* …
+        let mut env = Environment {
+            id: 1,
+            name: "e".into(),
+            vars: Vec::new(),
+            path: None,
+            git_origin: None,
+        };
+        env.vars
+            .push(crate::environment::EnvVar::user("HOST".into(), "a".into()));
+        let with_env = vec![env.clone()];
+        let env_key = fingerprint(&cols, &with_env, &flow);
+        assert_ne!(base, env_key, "an env variable name must count");
+
+        // … but not that variable merely changing value: validation asks what is
+        // in scope, not what it is set to, so re-keying on every keystroke in the
+        // environment editor would throw the cache away for nothing.
+        let mut quiet = env;
+        quiet.vars[0] = crate::environment::EnvVar::user("HOST".into(), "b".into());
+        assert_eq!(
+            env_key,
+            fingerprint(&cols, &[quiet], &flow),
+            "a value change must not re-key"
+        );
+    }
 }
