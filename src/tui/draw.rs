@@ -17,6 +17,7 @@ use super::app::*;
 use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
+use super::postman::*;
 use super::remote::*;
 use super::theme::*;
 use std::sync::Arc;
@@ -3489,7 +3490,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             draw_menu_popup(f, s.file_save_menu, &labels, *sel, th, Some(app));
         }
         Overlay::FileLoadSource(kind, sel) => {
-            let items = file_load_source_items(s);
+            let items = file_load_source_items(*kind, s);
             let title = format!("{} {}", s.file_load_menu, kind.name(s));
             draw_menu_popup(f, &title, &items, *sel, th, Some(app));
         }
@@ -4444,6 +4445,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th, Some(app)),
         Overlay::RemoteGit(w) => draw_remote_wizard_with_hits(f, w, s, th, Some(app)),
+        Overlay::PostmanImport(w) => draw_postman_wizard(f, w, s, th),
         Overlay::GitSave(w) => draw_git_save_wizard_with_hits(f, w, s, th, Some(app)),
         Overlay::EnvPopup(popup) => draw_env_popup(f, app, popup, s, th),
         Overlay::EnvLinkPicker(picker) => draw_env_link_picker(f, app, picker, s, th),

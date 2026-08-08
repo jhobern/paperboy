@@ -1369,6 +1369,7 @@ impl TuiApp {
         match overlay {
             Overlay::Help(tab) => self.help_key_handler(key, tab),
             Overlay::RemoteGit(w) => self.on_key_remote(w, key),
+            Overlay::PostmanImport(w) => self.on_key_postman(w, key),
             Overlay::GitSave(w) => self.on_key_git_save(w, key),
             Overlay::EnvPopup(popup) => self.on_key_env_popup(popup, key),
             Overlay::EnvLinkPicker(picker) => self.on_key_env_link_picker(picker, key),
@@ -4038,6 +4039,12 @@ impl TuiApp {
 
     /// Second step of Load: `sel` is `0` for a local file, `1` for git.
     pub(crate) fn activate_file_load_source(&mut self, kind: FileKind, sel: usize) {
+        // Workspace has a third source (see `file_load_source_items`); it is
+        // handled first so the local/git pairing below stays a simple boolean.
+        if kind == FileKind::Workspace && sel == 2 {
+            self.open_postman_wizard();
+            return;
+        }
         let local = sel == 0;
         match (kind, local) {
             (FileKind::Collection, true) => self.open_browser(FileAction::OpenCollection),
@@ -4673,7 +4680,7 @@ impl TuiApp {
 
     fn file_load_source_key_handler(&mut self, key: KeyEvent, kind: FileKind, sel: usize) {
         let s = Strings::for_language(&self.language);
-        let items = file_load_source_items(&s);
+        let items = file_load_source_items(kind, &s);
         match key.code {
             // Left/Esc steps back to the kind list with this kind lit.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {

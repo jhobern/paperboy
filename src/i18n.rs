@@ -132,6 +132,7 @@ strings! {
     file_kind_report => "Report", "Rapport", "Rapport";
     file_source_local => "(L)ocal file…", "Fichier (l)ocal…", "(L)okal fil…";
     file_source_git => "From (G)it…", "Depuis (G)it…", "Fra (G)it…";
+    file_source_postman => "From (P)ostman…", "Depuis (P)ostman…", "Fra (P)ostman…";
     file_dest_save => "(S)ave", "(E)nregistrer", "(G)em";
     file_dest_save_as => "Save (A)s…", "Enregistrer s(o)us…", "Gem s(o)m…";
     file_dest_git => "To (G)it…", "Vers (G)it…", "Til Gi(t)…";
@@ -1024,6 +1025,52 @@ strings! {
     gui_git_tag => "Tag", "Étiquette", "Tag";
     gui_git_existing_branch => "Use an existing branch…", "Utiliser une branche existante…", "Brug en eksisterende gren…";
     gui_git_saved => "Saved to Git.", "Enregistré sur Git.", "Gemt til Git.";
+    // -- Postman bulk import ------------------------------------------------
+    postman_busy_listing => "Listing your Postman workspaces…", "Liste des espaces de travail Postman…", "Henter dine Postman-workspaces…";
+    postman_busy_planning => "Checking what that workspace holds…", "Vérification du contenu de cet espace de travail…", "Undersøger hvad dette workspace indeholder…";
+    postman_busy_downloading => "Downloading from Postman…", "Téléchargement depuis Postman…", "Henter fra Postman…";
+    postman_err_key_required => "A Postman API key is needed.", "Une clé d'API Postman est nécessaire.", "Der kræves en Postman-API-nøgle.";
+    postman_err_bad_workspace => "That is not a workspace id or a Postman workspace address.", "Ce n'est ni un identifiant d'espace de travail ni une adresse d'espace de travail Postman.", "Det er hverken et workspace-id eller en Postman-workspace-adresse.";
+    postman_err_dest_required => "Choose a folder to import into.", "Choisissez un dossier de destination.", "Vælg en mappe at importere til.";
+    postman_err_nothing_selected => "Choose collections, environments, or both.", "Choisissez les collections, les environnements, ou les deux.", "Vælg samlinger, miljøer eller begge dele.";
+    postman_err_no_workspace => "No workspace was chosen.", "Aucun espace de travail n'a été choisi.", "Der blev ikke valgt noget workspace.";
+    postman_err_no_workspaces => "This key can see no workspaces. A Postman API key carries its owner's own access, so a workspace missing here is one your Postman account is not a member of.", "Cette clé ne voit aucun espace de travail. Une clé d'API Postman porte les accès de son propriétaire : un espace de travail absent est un espace dont votre compte Postman n'est pas membre.", "Denne nøgle kan ikke se nogen workspaces. En Postman-API-nøgle bærer ejerens egen adgang, så et workspace der mangler her, er et, din Postman-konto ikke er medlem af.";
+    postman_err_worker_ended => "The import stopped unexpectedly.", "L'importation s'est arrêtée de façon inattendue.", "Importen stoppede uventet.";
+    postman_word_collection => "collection", "collection", "samling";
+    postman_word_collections => "collections", "collections", "samlinger";
+    postman_word_environment => "environment", "environnement", "miljø";
+    postman_word_environments => "environments", "environnements", "miljøer";
+    postman_unit_seconds => "seconds", "secondes", "sekunder";
+    postman_unit_minutes => "minutes", "minutes", "minutter";
+    postman_title => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
+    postman_key_label => "Postman API key", "Clé d'API Postman", "Postman-API-nøgle";
+    postman_key_hint => "Create one at https://go.postman.co/settings/me/api-keys — it is never written to disk.", "Créez-en une sur https://go.postman.co/settings/me/api-keys — elle n'est jamais écrite sur le disque.", "Opret en på https://go.postman.co/settings/me/api-keys — den skrives aldrig til disken.";
+    postman_workspace_label => "Workspace id or address (optional)", "Identifiant ou adresse de l'espace de travail (facultatif)", "Workspace-id eller -adresse (valgfrit)";
+    postman_workspace_hint => "Leave blank to choose from a list.", "Laissez vide pour choisir dans une liste.", "Lad stå tomt for at vælge fra en liste.";
+    postman_base_url_label => "API host (optional)", "Hôte de l'API (facultatif)", "API-vært (valgfrit)";
+    postman_base_url_hint => "EU Enterprise accounts use https://api.eu.postman.com", "Les comptes EU Enterprise utilisent https://api.eu.postman.com", "EU Enterprise-konti bruger https://api.eu.postman.com";
+    postman_pick_workspace => "Choose a workspace", "Choisissez un espace de travail", "Vælg et workspace";
+    postman_options_title => "What to import", "Que faut-il importer ?", "Hvad skal importeres";
+    postman_include_collections => "Collections", "Collections", "Samlinger";
+    postman_include_environments => "Environments", "Environnements", "Miljøer";
+    postman_dest_label => "Import into", "Importer dans", "Importér til";
+    postman_format_label => "Format", "Format", "Format";
+    postman_format_raw => "Postman JSON (keeps everything)", "JSON Postman (conserve tout)", "Postman-JSON (bevarer alt)";
+    postman_format_hurl => "Convert to Hurl (.hurl and .vars)", "Convertir en Hurl (.hurl et .vars)", "Konvertér til Hurl (.hurl og .vars)";
+    postman_format_hurl_note => "Hurl does not cover everything Postman does; anything dropped is listed in CONVERSION-NOTES.md.", "Hurl ne couvre pas tout ce que fait Postman ; ce qui est perdu est listé dans CONVERSION-NOTES.md.", "Hurl dækker ikke alt hvad Postman gør; alt der udelades, listes i CONVERSION-NOTES.md.";
+    postman_overwrite => "Replace the folder if it already exists", "Remplacer le dossier s'il existe déjà", "Erstat mappen hvis den allerede findes";
+    postman_confirm_title => "Ready to import", "Prêt à importer", "Klar til at importere";
+    postman_rate_limit_note => "Postman limits how fast its API may be called, so this is paced deliberately.", "Postman limite la vitesse d'appel de son API : le rythme est donc volontairement mesuré.", "Postman begrænser hvor hurtigt dets API må kaldes, så tempoet er bevidst afmålt.";
+    postman_estimate => "About", "Environ", "Cirka";
+    postman_budget_warning => "This would use a large share of this account's remaining monthly API budget.", "Cela consommerait une grande partie du budget d'API mensuel restant de ce compte.", "Dette ville bruge en stor del af kontoens resterende månedlige API-budget.";
+    postman_waiting_paced => "Pausing to stay within Postman's rate limit", "Pause pour respecter la limite de débit de Postman", "Pauser for at holde sig inden for Postmans hastighedsgrænse";
+    postman_waiting_limited => "Postman asked us to wait", "Postman nous a demandé d'attendre", "Postman bad os vente";
+    postman_remaining => "left", "restant", "tilbage";
+    postman_done_title => "Import complete", "Importation terminée", "Import fuldført";
+    postman_skipped => "could not be fetched and were skipped", "n'ont pas pu être récupérés et ont été ignorés", "kunne ikke hentes og blev sprunget over";
+    postman_notes_written => "Some things could not be converted to Hurl — see CONVERSION-NOTES.md in the imported folder.", "Certains éléments n'ont pas pu être convertis en Hurl — voir CONVERSION-NOTES.md dans le dossier importé.", "Nogle ting kunne ikke konverteres til Hurl — se CONVERSION-NOTES.md i den importerede mappe.";
+    postman_start => "Import", "Importer", "Importér";
+    postman_menu_item => "From Postman…", "Depuis Postman…", "Fra Postman…";
     gui_git_filter => "Filter", "Filtrer", "Filter";
     gui_git_load => "Load", "Charger", "Indlæs";
     gui_git_save => "Save", "Enregistrer", "Gem";
@@ -1159,6 +1206,13 @@ pub enum Status {
     /// The active collection has no remembered git origin, so "Save to Git"
     /// can't be opened.
     NoGitOrigin,
+    /// A Postman import converted to Hurl and had to leave something behind;
+    /// the details are in `CONVERSION-NOTES.md` in the imported folder.
+    PostmanNotes,
+    /// A Postman import finished, but this many items could not be fetched.
+    /// Reported rather than swallowed: a workspace that silently arrived two
+    /// collections short is worse than one that says so.
+    PostmanSkipped(usize),
     /// A collection (and optionally its environment) was successfully pushed
     /// to git.
     GitSaved,
@@ -1378,6 +1432,8 @@ impl Status {
             Status::ReportBound(name) => format!("{} {name}", s.report_bound_status),
             Status::ReportBindNoCollections => s.report_bind_no_collections.to_string(),
             Status::NoGitOrigin => s.git_no_origin.to_string(),
+            Status::PostmanNotes => s.postman_notes_written.to_string(),
+            Status::PostmanSkipped(n) => format!("{n} {}", s.postman_skipped),
             Status::GitSaved => s.git_save_success.to_string(),
             Status::WaitingSecrets(keys) => {
                 format!("{} {}", s.env_waiting_secrets, keys.join(", "))

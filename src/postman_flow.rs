@@ -1,0 +1,1048 @@
+//! The "import a Postman workspace" wizard, shared by both front-ends.
+//!
+//! [`crate::postman_api`] talks to Postman and [`crate::postman_import`] does
+//! the downloading; this module holds the *flow* around them — which step comes
+//! next, when a thread is spawned, what the user is asked before any of their
+//! monthly API budget is spent — so the terminal UI and the GUI cannot disagree
+//! about any of it. Each front-end supplies only presentation, exactly as with
+//! [`crate::remote_flow`] and [`crate::save_flow`].
+//!
+//! The import runs as **one** worker thread across the whole wizard rather than
+//! one per step. Postman's rate limits are learnt from the response headers of
+//! the listing calls, and a fresh importer for the download phase would throw
+//! that away and burst straight into a 429 — so the worker plans, parks on a
+//! channel while the user reads the estimate, and downloads on the same
+//! importer once they say go.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::i18n::Strings;
+use crate::postman_api::{PostmanClient, WorkspaceKind, WorkspaceSummary};
+use crate::postman_import::{
+    ImportFormat, ImportMsg, ImportOptions, ImportPlan, ImportSummary, Importer, ItemKind,
+    WaitReason, parse_workspace_ref,
+};
+
+/// Which step of the wizard the user is on.
+///
+/// [`Step::Failed`] carries its own message because every failure here is worth
+/// reading — a rejected key, a workspace with nothing in it, a destination that
+/// already exists — and none of them are recoverable by retrying blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The API key, and the optional escape hatches: a workspace id to skip the
+    /// listing entirely, and a base URL for tenants that aren't on
+    /// `api.postman.com`.
+    Connect,
+    /// Choose from the workspaces the key can see.
+    PickWorkspace,
+    /// What to download, in what format, and where to put it.
+    Options,
+    /// The plan: how many items, how long it will take, and whether it would
+    /// eat an uncomfortable share of the month's remaining API budget. Nothing
+    /// bulk has been fetched yet at this point, so backing out here is free.
+    Confirm,
+    /// Downloading. [`PostmanFlow::progress`] drives the bar and the ETA.
+    Downloading,
+    Done,
+    Failed(String),
+}
+
+/// What the flow is waiting on, so a busy screen can say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    ListingWorkspaces,
+    Planning,
+    Downloading,
+}
+
+impl Phase {
+    pub(crate) fn label(self, s: &Strings) -> &'static str {
+        match self {
+            Phase::ListingWorkspaces => s.postman_busy_listing,
+            Phase::Planning => s.postman_busy_planning,
+            Phase::Downloading => s.postman_busy_downloading,
+        }
+    }
+}
+
+/// Live download progress, kept up to date from the importer's message channel.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Progress {
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    /// The item currently being fetched, for a "3/60 · Billing API" line.
+    pub(crate) current: String,
+    /// What kind of thing `current` is, so the line can say "collection" or
+    /// "environment" rather than leaving the user to guess from the name.
+    pub(crate) current_kind: Option<ItemKind>,
+    /// Set while the importer is deliberately idle, so a UI that looks stalled
+    /// can explain itself instead of appearing hung.
+    pub(crate) waiting: Option<(WaitReason, u64)>,
+    started: Option<Instant>,
+}
+
+impl Progress {
+    /// Time remaining based on the rate actually achieved so far, rather than
+    /// the published one — a throttled account is slower than the estimate, and
+    /// that is exactly when an ETA matters.
+    pub(crate) fn eta(&self) -> Option<Duration> {
+        let started = self.started?;
+        if self.done == 0 || self.done >= self.total {
+            return None;
+        }
+        let elapsed = Instant::now().saturating_duration_since(started);
+        Some((elapsed / self.done as u32) * (self.total - self.done) as u32)
+    }
+
+    pub(crate) fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.done as f32 / self.total as f32
+    }
+}
+
+/// What the front-end must act on. Everything else the flow handles itself.
+#[derive(Debug)]
+pub(crate) enum PostmanEvent {
+    /// The import finished. `dest` holds the folder to open as a workspace.
+    Imported(Box<ImportSummary>),
+}
+
+/// A message from the worker thread. Progress arrives on its own channel; this
+/// one carries only the outcomes the flow's step depends on.
+enum Msg {
+    Workspaces(Result<Vec<WorkspaceSummary>, String>),
+    Planned(Box<ImportPlan>),
+    Finished(Box<ImportSummary>),
+    Failed(String),
+}
+
+pub(crate) struct PostmanFlow {
+    // -- User input, written directly by the front-ends -------------------
+    pub(crate) key: String,
+    /// Optional. A workspace id or the address of the workspace in Postman;
+    /// supplying one skips the listing step (and the API call it costs).
+    pub(crate) workspace_ref: String,
+    /// Optional. Blank means `api.postman.com`.
+    pub(crate) base_url: String,
+    /// Where the imported folder goes.
+    pub(crate) dest: String,
+    pub(crate) include_collections: bool,
+    pub(crate) include_environments: bool,
+    pub(crate) format: ImportFormat,
+    pub(crate) overwrite: bool,
+    /// Filter text for the workspace list.
+    pub(crate) filter: String,
+    /// Index into [`Self::visible_workspaces`].
+    pub(crate) selected: usize,
+
+    // -- Flow state -------------------------------------------------------
+    step: Step,
+    busy: Option<Phase>,
+    workspaces: Vec<WorkspaceSummary>,
+    chosen: Option<WorkspaceSummary>,
+    plan: Option<ImportPlan>,
+    progress: Progress,
+    /// Items that could not be fetched, accumulated as they are reported so the
+    /// running import can show them rather than only the final summary.
+    failures: Vec<(String, String)>,
+
+    // -- Worker -----------------------------------------------------------
+    rx: Option<Receiver<Msg>>,
+    progress_rx: Option<Receiver<ImportMsg>>,
+    /// Released to let the parked worker start downloading. Dropping it instead
+    /// is how a cancel at the confirmation step tells the worker to give up.
+    go: Option<Sender<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for PostmanFlow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PostmanFlow {
+    pub(crate) fn new() -> Self {
+        Self {
+            key: String::new(),
+            workspace_ref: String::new(),
+            base_url: String::new(),
+            dest: String::new(),
+            include_collections: true,
+            include_environments: true,
+            format: ImportFormat::default(),
+            overwrite: false,
+            filter: String::new(),
+            selected: 0,
+            step: Step::Connect,
+            busy: None,
+            workspaces: Vec::new(),
+            chosen: None,
+            plan: None,
+            progress: Progress::default(),
+            failures: Vec::new(),
+            rx: None,
+            progress_rx: None,
+            go: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Seed the key from `$POSTMAN_API_KEY`, as the headless import does, so
+    /// someone who already has it exported doesn't retype it.
+    pub(crate) fn with_env_key(mut self) -> Self {
+        if let Ok(k) = std::env::var("POSTMAN_API_KEY")
+            && !k.trim().is_empty()
+        {
+            self.key = k.trim().to_string();
+        }
+        self
+    }
+
+    // -- Inspection --------------------------------------------------------
+
+    pub(crate) fn step(&self) -> &Step {
+        &self.step
+    }
+
+    pub(crate) fn busy(&self) -> Option<Phase> {
+        self.busy
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        match &self.step {
+            Step::Failed(e) => Some(e.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn plan(&self) -> Option<&ImportPlan> {
+        self.plan.as_ref()
+    }
+
+    pub(crate) fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
+    pub(crate) fn failures(&self) -> &[(String, String)] {
+        &self.failures
+    }
+
+    pub(crate) fn workspaces(&self) -> &[WorkspaceSummary] {
+        &self.workspaces
+    }
+
+    /// The workspaces matching the filter, in display order. The filter is a
+    /// case-insensitive substring so a long list can be narrowed by typing,
+    /// matching how the git wizard filters files.
+    pub(crate) fn visible_workspaces(&self) -> Vec<&WorkspaceSummary> {
+        let needle = self.filter.trim().to_lowercase();
+        self.workspaces
+            .iter()
+            .filter(|w| needle.is_empty() || w.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    pub(crate) fn selected_workspace(&self) -> Option<&WorkspaceSummary> {
+        self.visible_workspaces().get(self.selected).copied()
+    }
+
+    /// The name of the workspace being imported, once one is settled on.
+    pub(crate) fn workspace_name(&self) -> &str {
+        self.chosen.as_ref().map(|w| w.name.as_str()).unwrap_or("")
+    }
+
+    pub(crate) fn dest_path(&self) -> PathBuf {
+        PathBuf::from(self.dest.trim())
+    }
+
+    fn options(&self) -> ImportOptions {
+        ImportOptions {
+            include_collections: self.include_collections,
+            include_environments: self.include_environments,
+            format: self.format,
+            overwrite: self.overwrite,
+        }
+    }
+
+    fn base_url_opt(&self) -> Option<String> {
+        let t = self.base_url.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+
+    // -- Advancing ---------------------------------------------------------
+
+    /// Leave the first step. With a workspace id already in hand this skips
+    /// straight to the options — the listing call costs a request on Postman's
+    /// tightest rate-limit bucket, so it isn't made when it isn't needed.
+    pub(crate) fn submit_connect(&mut self, s: &Strings) {
+        if self.key.trim().is_empty() {
+            self.step = Step::Failed(s.postman_err_key_required.to_string());
+            return;
+        }
+        let typed = self.workspace_ref.trim().to_string();
+        if !typed.is_empty() {
+            let Some(id) = parse_workspace_ref(&typed) else {
+                self.step = Step::Failed(s.postman_err_bad_workspace.to_string());
+                return;
+            };
+            // Nothing has been listed, so the name isn't known — the id stands
+            // in until the plan comes back with the real one.
+            self.chosen = Some(WorkspaceSummary {
+                id,
+                name: typed,
+                kind: WorkspaceKind::Other(String::new()),
+            });
+            self.step = Step::Options;
+            return;
+        }
+        self.start_listing();
+    }
+
+    fn start_listing(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        let key = self.key.trim().to_string();
+        let base = self.base_url_opt();
+        thread::spawn(move || {
+            let client = PostmanClient::new(key, base);
+            let kinds = WorkspaceKind::default_selection();
+            let msg = match client.list_workspaces(&kinds) {
+                Ok((mut ws, _rate)) => {
+                    ws.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    Msg::Workspaces(Ok(ws))
+                }
+                Err(e) => Msg::Workspaces(Err(e.to_string())),
+            };
+            let _ = tx.send(msg);
+        });
+        self.rx = Some(rx);
+        self.busy = Some(Phase::ListingWorkspaces);
+        self.step = Step::PickWorkspace;
+    }
+
+    /// Take the highlighted workspace and move on to the options. Returns
+    /// whether it advanced.
+    pub(crate) fn submit_workspace(&mut self) -> bool {
+        let Some(ws) = self.selected_workspace().cloned() else {
+            return false;
+        };
+        self.chosen = Some(ws);
+        self.step = Step::Options;
+        true
+    }
+
+    /// Leave the options and start the worker, which plans and then parks
+    /// waiting for [`Self::confirm`]. Returns whether it started.
+    pub(crate) fn submit_options(&mut self, s: &Strings) -> bool {
+        if self.dest.trim().is_empty() {
+            self.step = Step::Failed(s.postman_err_dest_required.to_string());
+            return false;
+        }
+        if !self.include_collections && !self.include_environments {
+            self.step = Step::Failed(s.postman_err_nothing_selected.to_string());
+            return false;
+        }
+        let Some(ws) = self.chosen.clone() else {
+            self.step = Step::Failed(s.postman_err_no_workspace.to_string());
+            return false;
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let key = self.key.trim().to_string();
+        let base = self.base_url_opt();
+        let options = self.options();
+        let dest = self.dest_path();
+        let cancel = Arc::clone(&self.cancel);
+        cancel.store(false, Ordering::Relaxed);
+
+        thread::spawn(move || {
+            let client = PostmanClient::new(key, base);
+            // One importer for the whole run: the pacer learns this account's
+            // real budget from the listing calls, and starting over for the
+            // download would throw that away and burst into a 429.
+            let mut importer = Importer::new(&client)
+                .with_progress(progress_tx)
+                .with_cancel(cancel);
+
+            let plan = match importer.plan(&ws.id, &ws.name, &options) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(Msg::Failed(e.to_string()));
+                    return;
+                }
+            };
+            if tx.send(Msg::Planned(Box::new(plan.clone()))).is_err() {
+                return; // the wizard was closed while planning
+            }
+
+            // Park until the user confirms. A dropped sender means they backed
+            // out, which is a clean exit, not a failure.
+            if go_rx.recv().is_err() {
+                return;
+            }
+
+            match importer.download(&plan, &dest, &options) {
+                Ok(summary) => {
+                    let _ = tx.send(Msg::Finished(Box::new(summary)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Failed(e.to_string()));
+                }
+            }
+        });
+
+        self.rx = Some(rx);
+        self.progress_rx = Some(progress_rx);
+        self.go = Some(go_tx);
+        self.busy = Some(Phase::Planning);
+        self.step = Step::Confirm;
+        true
+    }
+
+    /// Approve the plan and let the parked worker download. Returns whether it
+    /// started.
+    pub(crate) fn confirm(&mut self) -> bool {
+        let Some(plan) = self.plan.as_ref() else {
+            return false;
+        };
+        let total = plan.item_count();
+        let Some(go) = self.go.take() else {
+            return false;
+        };
+        if go.send(()).is_err() {
+            return false; // the worker is already gone
+        }
+        self.progress = Progress {
+            total,
+            started: Some(Instant::now()),
+            ..Progress::default()
+        };
+        self.busy = Some(Phase::Downloading);
+        self.step = Step::Downloading;
+        true
+    }
+
+    /// Ask the worker to stop. Safe at any point: before the download it drops
+    /// the go-ahead, during it sets the cancel flag the importer checks between
+    /// calls (and which makes it clean up its staging folder).
+    pub(crate) fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.go = None;
+    }
+
+    /// Go back to the workspace list, keeping it — the list belongs to the key
+    /// that fetched it, and that hasn't changed.
+    pub(crate) fn to_pick_workspace(&mut self) {
+        self.chosen = None;
+        self.plan = None;
+        self.step = Step::PickWorkspace;
+    }
+
+    /// Return to the first step to fix the key or the URL, discarding the
+    /// listing — a workspace list belongs to the key that fetched it.
+    pub(crate) fn back_to_connect(&mut self) {
+        self.cancel();
+        self.rx = None;
+        self.progress_rx = None;
+        self.busy = None;
+        self.workspaces.clear();
+        self.chosen = None;
+        self.plan = None;
+        self.selected = 0;
+        self.filter.clear();
+        self.step = Step::Connect;
+    }
+
+    /// Clear a failure without losing anything else, putting the user back on
+    /// the step the failure interrupted.
+    pub(crate) fn clear_error(&mut self, back_to: Step) {
+        if matches!(self.step, Step::Failed(_)) {
+            self.step = back_to;
+        }
+    }
+
+    pub(crate) fn fail(&mut self, message: String) {
+        self.busy = None;
+        self.rx = None;
+        self.progress_rx = None;
+        self.go = None;
+        self.step = Step::Failed(message);
+    }
+
+    // -- Polling -----------------------------------------------------------
+
+    /// Collect whatever the worker has produced. Call each tick (the terminal
+    /// UI) or each frame (the GUI).
+    pub(crate) fn poll(&mut self, s: &Strings) -> Option<PostmanEvent> {
+        self.drain_progress();
+
+        let result = self.rx.as_ref().map(Receiver::try_recv)?;
+        match result {
+            Ok(msg) => self.apply(msg, s),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                // The worker exits silently when the wizard cancels it, which
+                // is not a failure; anything else really is one.
+                self.rx = None;
+                if self.busy.is_some() && !self.cancel.load(Ordering::Relaxed) {
+                    self.fail(s.postman_err_worker_ended.to_string());
+                }
+                self.busy = None;
+                None
+            }
+        }
+    }
+
+    /// Fold every progress message that has arrived into [`Self::progress`].
+    /// Drained separately from the outcome channel so a slow front-end can
+    /// never fall behind the download.
+    fn drain_progress(&mut self) {
+        let Some(rx) = self.progress_rx.as_ref() else {
+            return;
+        };
+        // Collected first so `self` isn't borrowed while it is mutated.
+        let msgs: Vec<ImportMsg> = rx.try_iter().collect();
+        for msg in msgs {
+            match msg {
+                ImportMsg::Item {
+                    index,
+                    total,
+                    kind,
+                    name,
+                } => {
+                    // `index` is 1-based and marks the *start* of an item, so
+                    // the number finished is one fewer.
+                    self.progress.done = index.saturating_sub(1);
+                    self.progress.total = total;
+                    self.progress.current = name;
+                    self.progress.current_kind = Some(kind);
+                    self.progress.waiting = None;
+                }
+                ImportMsg::Waiting { reason, secs } => {
+                    self.progress.waiting = Some((reason, secs));
+                }
+                ImportMsg::ItemFailed { name, error } => {
+                    self.failures.push((name, error));
+                }
+                // The outcomes arrive on the other channel, where they can
+                // change the step; here they would only race with it.
+                ImportMsg::Listing
+                | ImportMsg::Planned(_)
+                | ImportMsg::Done(_)
+                | ImportMsg::Failed(_) => {}
+            }
+        }
+    }
+
+    /// Every transition the worker can cause, split out from [`Self::poll`] so
+    /// it can be tested without threads.
+    fn apply(&mut self, msg: Msg, s: &Strings) -> Option<PostmanEvent> {
+        match msg {
+            Msg::Workspaces(Ok(ws)) => {
+                self.busy = None;
+                self.rx = None;
+                if ws.is_empty() {
+                    // Not an error the user can fix by retrying: a Postman API
+                    // key carries its owner's own access and cannot be scoped,
+                    // so an empty list means an empty account.
+                    self.fail(s.postman_err_no_workspaces.to_string());
+                    return None;
+                }
+                self.workspaces = ws;
+                self.selected = 0;
+                None
+            }
+            Msg::Workspaces(Err(e)) => {
+                self.fail(e);
+                None
+            }
+            Msg::Planned(plan) => {
+                self.busy = None;
+                // The plan carries the workspace's real name, which is all the
+                // wizard had an id for when the user typed one in.
+                if let Some(chosen) = self.chosen.as_mut()
+                    && !plan.workspace_name.trim().is_empty()
+                {
+                    chosen.name = plan.workspace_name.clone();
+                }
+                self.plan = Some(*plan);
+                None
+            }
+            Msg::Finished(summary) => {
+                self.busy = None;
+                self.rx = None;
+                self.progress_rx = None;
+                self.progress.done = self.progress.total;
+                self.progress.waiting = None;
+                self.failures = summary.failures.clone();
+                self.step = Step::Done;
+                Some(PostmanEvent::Imported(summary))
+            }
+            Msg::Failed(e) => {
+                self.fail(e);
+                None
+            }
+        }
+    }
+}
+
+/// Test-only seeding, so a front-end's tests can put a flow on the step they
+/// care about without spawning threads or reaching a Postman API. Driving the
+/// real transitions is [`PostmanFlow`]'s own job and is tested here.
+#[cfg(test)]
+impl PostmanFlow {
+    pub(crate) fn seed_step(&mut self, step: Step) {
+        self.step = step;
+    }
+
+    pub(crate) fn seed_workspaces(&mut self, workspaces: Vec<WorkspaceSummary>) {
+        self.workspaces = workspaces;
+    }
+
+    pub(crate) fn seed_chosen(&mut self, workspace: WorkspaceSummary) {
+        self.chosen = Some(workspace);
+    }
+
+    pub(crate) fn seed_plan(&mut self, plan: ImportPlan) {
+        self.plan = Some(plan);
+    }
+
+    /// Deliver a worker outcome as though the background thread had sent it.
+    /// One method per outcome rather than one taking a `Msg`, so the message
+    /// type itself stays private to the flow.
+    pub(crate) fn deliver_workspaces(
+        &mut self,
+        result: Result<Vec<WorkspaceSummary>, String>,
+        s: &Strings,
+    ) -> Option<PostmanEvent> {
+        self.apply(Msg::Workspaces(result), s)
+    }
+
+    pub(crate) fn deliver_plan(&mut self, plan: ImportPlan, s: &Strings) -> Option<PostmanEvent> {
+        self.apply(Msg::Planned(Box::new(plan)), s)
+    }
+
+    pub(crate) fn deliver_summary(
+        &mut self,
+        summary: ImportSummary,
+        s: &Strings,
+    ) -> Option<PostmanEvent> {
+        self.apply(Msg::Finished(Box::new(summary)), s)
+    }
+
+    pub(crate) fn deliver_failure(&mut self, error: &str, s: &Strings) -> Option<PostmanEvent> {
+        self.apply(Msg::Failed(error.to_string()), s)
+    }
+}
+
+/// A default folder name for the imported workspace, so the destination field
+/// starts with something sensible rather than empty. Non-path characters are
+/// replaced rather than dropped, so two differently-named workspaces cannot
+/// collapse to the same folder.
+pub(crate) fn default_dest_name(workspace: &str) -> String {
+    let cleaned: String = workspace
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "Postman".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// A short "3 collections, 2 environments" line for the confirmation step.
+pub(crate) fn plan_summary(plan: &ImportPlan, s: &Strings) -> String {
+    format!(
+        "{} {} · {} {}",
+        plan.collections.len(),
+        s.postman_word_collections,
+        plan.environments.len(),
+        s.postman_word_environments
+    )
+}
+
+/// Round a duration to something worth reading aloud. An import is paced in
+/// whole seconds, so sub-second precision would be false precision.
+pub(crate) fn human_duration(d: Duration, s: &Strings) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{} {}", secs.max(1), s.postman_unit_seconds)
+    } else {
+        let mins = secs.div_ceil(60);
+        format!("{mins} {}", s.postman_unit_minutes)
+    }
+}
+
+/// The label for one item kind, for the progress line.
+pub(crate) fn item_kind_label(kind: ItemKind, s: &Strings) -> &'static str {
+    match kind {
+        ItemKind::Collection => s.postman_word_collection,
+        ItemKind::Environment => s.postman_word_environment,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Language;
+    use crate::postman_api::ItemSummary;
+
+    fn s() -> Strings {
+        Strings::for_language(&Language::English)
+    }
+
+    fn flow() -> PostmanFlow {
+        let mut f = PostmanFlow::new();
+        f.key = "PMAK-test".to_string();
+        f.dest = "/tmp/pb-import-test".to_string();
+        f
+    }
+
+    fn ws(name: &str, id: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: WorkspaceKind::Team,
+        }
+    }
+
+    fn plan_with(collections: usize, environments: usize) -> ImportPlan {
+        ImportPlan {
+            workspace_id: "ws".into(),
+            workspace_name: "Billing".into(),
+            collections: (0..collections)
+                .map(|i| ItemSummary {
+                    uid: format!("u{i}"),
+                    id: format!("i{i}"),
+                    name: format!("c{i}"),
+                })
+                .collect(),
+            environments: (0..environments)
+                .map(|i| ItemSummary {
+                    uid: format!("e{i}"),
+                    id: format!("e{i}"),
+                    name: format!("e{i}"),
+                })
+                .collect(),
+            remaining_month: None,
+        }
+    }
+
+    /// The key is the one thing the import cannot proceed without, and saying
+    /// so beats a rejected request several seconds later.
+    #[test]
+    fn connecting_without_a_key_is_refused_before_any_request() {
+        let mut f = PostmanFlow::new();
+        f.submit_connect(&s());
+        assert_eq!(f.error(), Some(s().postman_err_key_required));
+        assert!(f.rx.is_none(), "no worker was started");
+    }
+
+    /// Listing the workspaces costs a call on Postman's tightest rate-limit
+    /// bucket, so a user who already knows the workspace skips it entirely.
+    #[test]
+    fn a_supplied_workspace_id_skips_the_listing_step() {
+        let mut f = flow();
+        f.workspace_ref =
+            "https://go.postman.co/workspace/Team~11111111-2222-3333-4444-555555555555".to_string();
+        f.submit_connect(&s());
+        assert_eq!(*f.step(), Step::Options);
+        assert!(!f.is_busy(), "nothing was fetched");
+        assert_eq!(
+            f.chosen.as_ref().unwrap().id,
+            "11111111-2222-3333-4444-555555555555",
+            "the id was taken out of the pasted address"
+        );
+    }
+
+    /// Something that isn't an id or a Postman address is caught here rather
+    /// than becoming a confusing 404 later.
+    #[test]
+    fn an_unrecognisable_workspace_reference_is_reported() {
+        let mut f = flow();
+        f.workspace_ref = "the billing one".to_string();
+        f.submit_connect(&s());
+        assert_eq!(f.error(), Some(s().postman_err_bad_workspace));
+    }
+
+    /// A key with no workspaces is a dead end, not an empty list to scroll: a
+    /// Postman key carries its owner's own access and cannot be scoped.
+    #[test]
+    fn a_key_that_sees_no_workspaces_says_so() {
+        let mut f = flow();
+        f.busy = Some(Phase::ListingWorkspaces);
+        f.apply(Msg::Workspaces(Ok(Vec::new())), &s());
+        assert_eq!(f.error(), Some(s().postman_err_no_workspaces));
+    }
+
+    /// The filter narrows a long list, and the selection is read from the
+    /// filtered view — picking the third visible row must not import the third
+    /// row of the unfiltered one.
+    #[test]
+    fn the_selection_follows_the_filtered_list() {
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a"), ws("Billing", "b"), ws("Beta", "c")];
+        f.filter = "b".to_string();
+        assert_eq!(f.visible_workspaces().len(), 2);
+        f.selected = 1;
+        assert_eq!(f.selected_workspace().unwrap().id, "c");
+        assert!(f.submit_workspace());
+        assert_eq!(*f.step(), Step::Options);
+    }
+
+    /// Downloading neither collections nor environments would produce an empty
+    /// folder after spending API calls to find that out.
+    #[test]
+    fn importing_nothing_at_all_is_refused() {
+        let mut f = flow();
+        f.chosen = Some(ws("Billing", "b"));
+        f.include_collections = false;
+        f.include_environments = false;
+        assert!(!f.submit_options(&s()));
+        assert_eq!(f.error(), Some(s().postman_err_nothing_selected));
+    }
+
+    /// The download has to land somewhere, and the wizard is the place to say
+    /// so — not the importer, several seconds and several calls later.
+    #[test]
+    fn a_missing_destination_is_refused() {
+        let mut f = flow();
+        f.chosen = Some(ws("Billing", "b"));
+        f.dest = "   ".to_string();
+        assert!(!f.submit_options(&s()));
+        assert_eq!(f.error(), Some(s().postman_err_dest_required));
+    }
+
+    /// Nothing bulk is fetched until the user has seen the cost, so the plan
+    /// arrives at its own step with the download still parked.
+    #[test]
+    fn the_plan_is_shown_before_anything_is_downloaded() {
+        let mut f = flow();
+        f.chosen = Some(ws("Billing", "b"));
+        f.step = Step::Confirm;
+        f.busy = Some(Phase::Planning);
+        f.apply(Msg::Planned(Box::new(plan_with(3, 2))), &s());
+
+        assert_eq!(*f.step(), Step::Confirm);
+        assert!(!f.is_busy(), "the worker is parked, not working");
+        assert_eq!(f.plan().unwrap().item_count(), 5);
+        assert_eq!(
+            plan_summary(f.plan().unwrap(), &s()),
+            "3 collections · 2 environments"
+        );
+    }
+
+    /// A typed-in id means the name isn't known until the plan comes back with
+    /// it, so the wizard adopts the real one rather than showing a UUID.
+    #[test]
+    fn the_workspaces_real_name_replaces_a_typed_id() {
+        let mut f = flow();
+        f.chosen = Some(WorkspaceSummary {
+            id: "11111111-2222-3333-4444-555555555555".into(),
+            name: "11111111-2222-3333-4444-555555555555".into(),
+            kind: WorkspaceKind::Other(String::new()),
+        });
+        f.apply(Msg::Planned(Box::new(plan_with(1, 0))), &s());
+        assert_eq!(f.workspace_name(), "Billing");
+    }
+
+    /// Confirming with no plan — which a stray keypress could otherwise do —
+    /// must not start anything.
+    #[test]
+    fn confirming_without_a_plan_does_nothing() {
+        let mut f = flow();
+        assert!(!f.confirm());
+        assert_ne!(*f.step(), Step::Downloading);
+    }
+
+    /// Progress is folded from the importer's messages: `index` marks the item
+    /// being *started*, so the count finished is one behind it.
+    #[test]
+    fn progress_counts_finished_items_not_started_ones() {
+        let mut f = flow();
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+        tx.send(ImportMsg::Item {
+            index: 1,
+            total: 4,
+            kind: ItemKind::Collection,
+            name: "A".into(),
+        })
+        .unwrap();
+        f.drain_progress();
+        assert_eq!(f.progress().done, 0, "the first item has only just begun");
+        assert_eq!(f.progress().total, 4);
+        assert_eq!(f.progress().current, "A");
+
+        tx.send(ImportMsg::Item {
+            index: 4,
+            total: 4,
+            kind: ItemKind::Environment,
+            name: "D".into(),
+        })
+        .unwrap();
+        f.drain_progress();
+        assert_eq!(f.progress().done, 3);
+    }
+
+    /// A paced import spends most of its time deliberately idle. Saying so is
+    /// the difference between "working" and "hung".
+    #[test]
+    fn a_deliberate_wait_is_reported_rather_than_looking_hung() {
+        let mut f = flow();
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+        tx.send(ImportMsg::Waiting {
+            reason: WaitReason::RateLimited,
+            secs: 12,
+        })
+        .unwrap();
+        f.drain_progress();
+        assert_eq!(f.progress().waiting, Some((WaitReason::RateLimited, 12)));
+
+        // …and stops being reported the moment work resumes.
+        tx.send(ImportMsg::Item {
+            index: 2,
+            total: 4,
+            kind: ItemKind::Collection,
+            name: "B".into(),
+        })
+        .unwrap();
+        f.drain_progress();
+        assert_eq!(f.progress().waiting, None);
+    }
+
+    /// One item failing must not read as the whole import failing: the folder
+    /// is still produced, and the skipped items are listed.
+    #[test]
+    fn an_item_that_could_not_be_fetched_is_collected_not_fatal() {
+        let mut f = flow();
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+        tx.send(ImportMsg::ItemFailed {
+            name: "Broken".into(),
+            error: "404".into(),
+        })
+        .unwrap();
+        f.drain_progress();
+        assert_eq!(f.failures().len(), 1);
+        assert_ne!(*f.step(), Step::Failed("404".into()));
+    }
+
+    /// Finishing hands the summary out exactly once, for the front-end to open
+    /// the folder as a workspace.
+    #[test]
+    fn finishing_reports_the_summary_and_lands_on_done() {
+        let mut f = flow();
+        f.step = Step::Downloading;
+        f.busy = Some(Phase::Downloading);
+        let summary = ImportSummary {
+            dest: PathBuf::from("/tmp/x"),
+            workspace_name: "Billing".into(),
+            collections: 3,
+            environments: 2,
+            failures: Vec::new(),
+            converted_with_notes: false,
+            elapsed: Duration::from_secs(4),
+        };
+        let event = f.apply(Msg::Finished(Box::new(summary)), &s());
+        assert!(matches!(event, Some(PostmanEvent::Imported(_))));
+        assert_eq!(*f.step(), Step::Done);
+        assert!(!f.is_busy());
+    }
+
+    /// Going back to the key discards the workspaces fetched for the old one,
+    /// so a workspace can never be chosen from a list belonging to another key.
+    #[test]
+    fn going_back_to_the_key_discards_the_listing() {
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a")];
+        f.chosen = Some(ws("Alpha", "a"));
+        f.plan = Some(plan_with(1, 1));
+        f.back_to_connect();
+        assert_eq!(*f.step(), Step::Connect);
+        assert!(f.workspaces().is_empty());
+        assert!(f.plan().is_none());
+    }
+
+    /// The ETA is measured from the rate actually achieved, because a throttled
+    /// account is slower than the published rate — which is exactly when
+    /// someone wants to know how long is left.
+    #[test]
+    fn the_eta_extrapolates_from_the_measured_rate() {
+        let p = Progress {
+            done: 2,
+            total: 10,
+            started: Some(Instant::now() - Duration::from_secs(4)),
+            ..Progress::default()
+        };
+        let eta = p.eta().expect("two of ten done is enough to extrapolate");
+        // 2 items in 4s → 2s each → 8 left → ~16s.
+        assert!(
+            (14..=18).contains(&eta.as_secs()),
+            "unexpected eta: {}s",
+            eta.as_secs()
+        );
+        assert!((p.fraction() - 0.2).abs() < 0.001);
+    }
+
+    /// Nothing to extrapolate from yet, and nothing left to wait for, both mean
+    /// "no ETA" rather than a misleading zero.
+    #[test]
+    fn there_is_no_eta_before_the_first_item_or_after_the_last() {
+        let base = Progress {
+            total: 10,
+            started: Some(Instant::now()),
+            ..Progress::default()
+        };
+        assert_eq!(
+            Progress {
+                done: 0,
+                ..base.clone()
+            }
+            .eta(),
+            None
+        );
+        assert_eq!(Progress { done: 10, ..base }.eta(), None);
+    }
+
+    /// A workspace name becomes a folder name, so anything a path can't hold is
+    /// replaced rather than dropped — otherwise "A/B" and "AB" collide.
+    #[test]
+    fn the_default_folder_name_is_derived_from_the_workspace() {
+        assert_eq!(default_dest_name("Billing API"), "Billing API");
+        assert_eq!(default_dest_name("Team/Billing"), "Team-Billing");
+        assert_eq!(default_dest_name("   "), "Postman");
+    }
+
+    #[test]
+    fn durations_are_rounded_to_something_worth_reading() {
+        let s = s();
+        assert_eq!(human_duration(Duration::from_millis(200), &s), "1 seconds");
+        assert_eq!(human_duration(Duration::from_secs(45), &s), "45 seconds");
+        assert_eq!(human_duration(Duration::from_secs(61), &s), "2 minutes");
+    }
+}

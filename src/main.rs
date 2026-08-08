@@ -21,6 +21,7 @@ mod persistence;
 mod postman;
 mod postman_api;
 mod postman_cli;
+mod postman_flow;
 mod postman_import;
 mod remote_flow;
 mod report;

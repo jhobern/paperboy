@@ -19,7 +19,10 @@ use crate::request::{self, build_request_json};
 use super::editor::*;
 use super::git_save::*;
 use super::new_request::*;
+use super::postman::*;
 use super::remote::*;
+use crate::postman_flow::{PostmanEvent, Step};
+use crate::postman_import::{ImportFormat, ImportSummary};
 use crate::remote_flow::{FlowEvent, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use crate::save_flow::{SaveFlow, SaveSource, SaveTargetKind};
 use tui_panel_select::MultiSelectPanel;
@@ -467,6 +470,10 @@ pub(crate) enum Overlay {
     NewRequest(Box<NewReq>),
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
+    /// The "import a whole Postman workspace" wizard (File ▸ Load ▸ Workspace ▸
+    /// From Postman…). Its state machine is shared with the GUI — see
+    /// [`crate::postman_flow`].
+    PostmanImport(Box<PostmanWizard>),
     GitSave(Box<GitSaveWizard>),
     /// Dry-run preview for a report tab: the projected row count, a sample of
     /// Drill-down popup for a results grid cell: shows the selected cell's full
@@ -880,9 +887,18 @@ pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 5] {
     ]
 }
 
-/// The two "Load" source choices: a local file or a git remote.
-pub(crate) fn file_load_source_items(s: &Strings) -> [&'static str; 2] {
-    [s.file_source_local, s.file_source_git]
+/// The "Load" source choices for `kind`: a local file or a git remote, plus —
+/// for a Workspace — bulk import from Postman, which produces a whole folder
+/// of collections and environments and so has nowhere else to belong.
+pub(crate) fn file_load_source_items(kind: FileKind, s: &Strings) -> Vec<&'static str> {
+    match kind {
+        FileKind::Workspace => vec![
+            s.file_source_local,
+            s.file_source_git,
+            s.file_source_postman,
+        ],
+        _ => vec![s.file_source_local, s.file_source_git],
+    }
 }
 
 /// The "Save" destination choices for `kind`. Collections can be saved to
@@ -3521,6 +3537,164 @@ impl TuiApp {
         }
     }
 
+    /// Open the "import a whole Postman workspace" wizard.
+    pub(crate) fn open_postman_wizard(&mut self) {
+        self.overlay = Some(Overlay::PostmanImport(Box::new(PostmanWizard::new())));
+    }
+
+    /// Handle a key while the Postman import wizard is open.
+    ///
+    /// Everything that decides what happens next lives in
+    /// [`crate::postman_flow`]; this maps keys onto it and drives the editors.
+    pub(crate) fn on_key_postman(&mut self, mut w: Box<PostmanWizard>, key: KeyEvent) {
+        let s = Strings::for_language(&self.language);
+        w.remember_step();
+        match w.stage() {
+            PostmanStage::Connect => match key.code {
+                KeyCode::Esc => return,
+                KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 3,
+                KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 2) % 3,
+                KeyCode::Enter => {
+                    w.sync_fields();
+                    w.flow.submit_connect(&s);
+                    // A typed workspace id skips the listing and lands straight
+                    // on the options, which want a suggested destination.
+                    if matches!(w.flow.step(), Step::Options) {
+                        w.suggest_dest();
+                    }
+                }
+                _ => {
+                    let ed = match w.field {
+                        0 => &mut w.key,
+                        1 => &mut w.workspace_ref,
+                        _ => &mut w.base_url,
+                    };
+                    apply_edit_key(ed, key);
+                }
+            },
+            // Esc during a background call cancels the whole wizard: there is
+            // nothing partial to keep, and the worker cleans up after itself.
+            PostmanStage::Loading => {
+                if key.code == KeyCode::Esc {
+                    w.flow.cancel();
+                    return;
+                }
+            }
+            PostmanStage::PickWorkspace => {
+                let n = w.flow.visible_workspaces().len();
+                match key.code {
+                    KeyCode::Esc => {
+                        w.flow.back_to_connect();
+                    }
+                    KeyCode::Up => w.flow.selected = w.flow.selected.saturating_sub(1),
+                    KeyCode::Down if w.flow.selected + 1 < n => w.flow.selected += 1,
+                    KeyCode::Enter => {
+                        if w.flow.submit_workspace() {
+                            w.suggest_dest();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        w.flow.filter.pop();
+                        w.flow.selected = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        w.flow.filter.push(c);
+                        w.flow.selected = 0;
+                    }
+                    _ => {}
+                }
+            }
+            PostmanStage::Options => {
+                let on_dest = w.option_row == 0;
+                match key.code {
+                    KeyCode::Esc => {
+                        // Back to wherever the workspace came from: the list if
+                        // there is one, otherwise the key prompt.
+                        if w.flow.workspaces().is_empty() {
+                            w.flow.back_to_connect();
+                        } else {
+                            w.flow.to_pick_workspace();
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        w.option_row = (w.option_row + 1) % OPTION_ROWS;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        w.option_row = (w.option_row + OPTION_ROWS - 1) % OPTION_ROWS;
+                    }
+                    // Space toggles the row under the cursor, but only where a
+                    // row *is* a toggle — on the path field it must still type.
+                    KeyCode::Char(' ') if !on_dest => toggle_option_row(&mut w),
+                    KeyCode::Enter => {
+                        if w.option_row == OPTION_ROWS - 1 {
+                            w.sync_fields();
+                            w.flow.submit_options(&s);
+                        } else if !on_dest {
+                            toggle_option_row(&mut w);
+                        } else {
+                            w.option_row += 1;
+                        }
+                    }
+                    _ if on_dest => {
+                        apply_edit_key(&mut w.dest, key);
+                        w.flow.dest = w.dest.text();
+                    }
+                    _ => {}
+                }
+            }
+            PostmanStage::Confirm => match key.code {
+                KeyCode::Esc => {
+                    w.flow.cancel();
+                    return;
+                }
+                KeyCode::Enter => {
+                    w.flow.confirm();
+                }
+                _ => {}
+            },
+            PostmanStage::Downloading => {
+                if key.code == KeyCode::Esc {
+                    w.flow.cancel();
+                    return;
+                }
+            }
+            // The folder was already opened as a workspace by
+            // `apply_postman_event`; this screen is just the receipt.
+            PostmanStage::Done => return,
+            PostmanStage::Error => {
+                let back = w.before_error.clone();
+                w.flow.clear_error(back);
+            }
+        }
+        self.overlay = Some(Overlay::PostmanImport(w));
+    }
+
+    /// Poll the Postman wizard's worker (called each frame).
+    pub(crate) fn poll_postman_updates(&mut self) {
+        let Some(mut w) = take_overlay!(self, Overlay::PostmanImport(w) => w) else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        let event = w.flow.poll(&s);
+        self.overlay = Some(Overlay::PostmanImport(w));
+        if let Some(PostmanEvent::Imported(summary)) = event {
+            self.apply_postman_event(*summary);
+        }
+    }
+
+    /// A finished import: open the folder it produced as a Workspace, exactly
+    /// as if the user had browsed to it — the point of the whole feature.
+    pub(crate) fn apply_postman_event(&mut self, summary: ImportSummary) {
+        // Only one status line fits, so the more actionable of the two wins:
+        // missing data beats a note about data that was deliberately dropped.
+        if !summary.failures.is_empty() {
+            self.status = Some(Status::PostmanSkipped(summary.failures.len()));
+        } else if summary.converted_with_notes {
+            self.status = Some(Status::PostmanNotes);
+        }
+        self.confirm_workspace_root(summary.dest);
+    }
+
     pub(crate) fn open_remote_wizard(&mut self, kind: RemoteKind) {
         self.overlay = Some(Overlay::RemoteGit(Box::new(RemoteWizard::new(
             kind,
@@ -4268,5 +4442,22 @@ impl TuiApp {
             Pane::Main => self.main_panel.start_autoscroll(d),
             _ => self.resp_panel.start_autoscroll(d),
         }
+    }
+}
+
+/// Flip the toggle on the Options row under the cursor. Row 0 is the
+/// destination path, which is a text field rather than a toggle.
+fn toggle_option_row(w: &mut PostmanWizard) {
+    match w.option_row {
+        1 => w.flow.include_collections = !w.flow.include_collections,
+        2 => w.flow.include_environments = !w.flow.include_environments,
+        3 => {
+            w.flow.format = match w.flow.format {
+                ImportFormat::Raw => ImportFormat::Hurl,
+                ImportFormat::Hurl => ImportFormat::Raw,
+            }
+        }
+        4 => w.flow.overwrite = !w.flow.overwrite,
+        _ => {}
     }
 }

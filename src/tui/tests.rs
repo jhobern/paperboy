@@ -10,14 +10,16 @@ use crate::collection::Collection;
 use crate::git_remote::{RefKind, RemoteRefs};
 use crate::hurl::HurlEntry;
 use crate::hurl::KvRow;
-use crate::i18n::Language;
+use crate::i18n::{Language, Status, Strings};
 use crate::persistence::PersistedState;
 
 use crate::request::RequestView;
 
 use super::app::*;
+use super::editor::Editor;
 use super::git_save::*;
 use super::new_request::*;
+use super::postman::{PostmanStage, PostmanWizard};
 use super::remote::*;
 use crate::remote_flow::{
     FlowEvent, Phase, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
@@ -2873,7 +2875,8 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             .iter()
             .map(|it| it.label(&s))
             .collect::<Vec<_>>(),
-            file_load_source_items(&s).to_vec(),
+            file_load_source_items(FileKind::Collection, &s),
+            file_load_source_items(FileKind::Workspace, &s),
             file_save_dest_items(FileKind::Collection, &s),
             file_save_dest_items(FileKind::Environment, &s),
             file_save_dest_items(FileKind::Workspace, &s),
@@ -24355,4 +24358,318 @@ fn taking_an_overlay_that_does_not_match_leaves_it_open() {
     let got = take_overlay!(&mut app, Overlay::FileMenu(sel) => sel);
     assert_eq!(got, Some(0));
     assert!(app.overlay.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Postman bulk import wizard
+// ---------------------------------------------------------------------------
+//
+// The state machine itself lives in `crate::postman_flow` and is tested there;
+// these cover what the terminal adds on top — the menu route in, the key
+// mapping, and what happens to the app when an import lands.
+
+use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
+use crate::postman_flow::Step as PostmanStep;
+use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary};
+
+fn postman_wizard(app: &mut TuiApp) -> &mut PostmanWizard {
+    match app.overlay.as_mut() {
+        Some(Overlay::PostmanImport(w)) => w,
+        other => panic!(
+            "the Postman wizard is not open: {other:?}",
+            other = other.is_some()
+        ),
+    }
+}
+
+fn a_workspace(name: &str, id: &str) -> WorkspaceSummary {
+    WorkspaceSummary {
+        id: id.to_string(),
+        name: name.to_string(),
+        kind: WorkspaceKind::Team,
+    }
+}
+
+#[test]
+fn postman_is_a_third_source_for_a_workspace_and_only_for_a_workspace() {
+    let s = Strings::for_language(&Language::English);
+    // A collection can come from a file or from git; only a Workspace — which
+    // is a whole folder — can be bulk-imported from Postman.
+    assert_eq!(file_load_source_items(FileKind::Collection, &s).len(), 2);
+    let ws = file_load_source_items(FileKind::Workspace, &s);
+    assert_eq!(ws.len(), 3);
+    assert_eq!(ws[2], s.file_source_postman);
+}
+
+#[test]
+fn the_workspace_load_menu_opens_the_postman_wizard() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 2));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "the third source must open the Postman wizard"
+    );
+}
+
+#[test]
+fn the_connect_step_cycles_its_three_fields_and_types_into_the_focused_one() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    // Start from a known state: an API key may have been picked up from the
+    // environment, which would otherwise leak into the assertion below.
+    postman_wizard(&mut app).key = Editor::blank();
+
+    press(&mut app, KeyCode::Char('K'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('U'));
+    // A third Tab wraps back to the key rather than falling off the end.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('2'));
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key.text(), "K2");
+    assert_eq!(w.workspace_ref.text(), "W");
+    assert_eq!(w.base_url.text(), "U");
+}
+
+#[test]
+fn connecting_without_a_key_shows_the_error_and_dismissing_it_returns_to_connect() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
+
+    press(&mut app, KeyCode::Enter);
+    let s = Strings::for_language(&app.language);
+    assert_eq!(
+        postman_wizard(&mut app).flow.error(),
+        Some(s.postman_err_key_required)
+    );
+
+    // Any key clears it — and lands back on the step it interrupted, not on
+    // some default, so nothing already typed is lost.
+    press(&mut app, KeyCode::Char('x'));
+    let w = postman_wizard(&mut app);
+    assert!(w.flow.error().is_none());
+    assert_eq!(w.stage(), PostmanStage::Connect);
+}
+
+#[test]
+fn a_typed_workspace_id_skips_the_listing_and_suggests_a_destination() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-x", false);
+        w.workspace_ref = Editor::new("12345678-1234-1234-1234-123456789abc", false);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert!(
+        !w.dest.text().trim().is_empty(),
+        "the options step must arrive with a destination already filled in"
+    );
+}
+
+#[test]
+fn the_options_step_toggles_the_row_under_the_cursor_and_leaves_the_others_alone() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.dest = Editor::new("/tmp/x", false);
+    }
+
+    // Row 0 is the path field, so Space must type a space there, not toggle.
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(postman_wizard(&mut app).dest.text(), "/tmp/x ");
+
+    press(&mut app, KeyCode::Tab); // collections
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab); // environments
+    press(&mut app, KeyCode::Tab); // format
+    press(&mut app, KeyCode::Char(' '));
+
+    let w = postman_wizard(&mut app);
+    assert!(!w.flow.include_collections, "collections toggled off");
+    assert!(w.flow.include_environments, "environments left alone");
+    assert_eq!(w.flow.format, ImportFormat::Hurl, "format flipped to Hurl");
+    assert!(!w.flow.overwrite, "overwrite left alone");
+}
+
+#[test]
+fn leaving_the_options_goes_back_to_the_list_when_there_is_one_and_to_the_key_when_there_is_not() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    // No listing was ever fetched (the id was typed), so back means the key.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Connect);
+
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        postman_wizard(&mut app).stage(),
+        PostmanStage::PickWorkspace
+    );
+}
+
+#[test]
+fn the_workspace_list_filters_as_you_type_and_enter_takes_the_visible_row() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+            a_workspace("Gamma", "ws-g"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Char('e')); // matches "Beta" only
+    assert_eq!(postman_wizard(&mut app).flow.visible_workspaces().len(), 1);
+
+    press(&mut app, KeyCode::Enter);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(
+        w.flow.workspace_name(),
+        "Beta",
+        "Enter must take the row the filter is showing, not the unfiltered one"
+    );
+}
+
+#[test]
+fn a_finished_import_opens_the_folder_as_a_workspace() {
+    let root = temp_dir("postman_import").join("Imported");
+    std::fs::create_dir_all(root.join("Collections")).unwrap();
+
+    let mut app = TuiApp::default();
+    let before = app.collections.len();
+    app.apply_postman_event(ImportSummary {
+        dest: root.clone(),
+        workspace_name: "Alpha".to_string(),
+        collections: 2,
+        environments: 1,
+        failures: Vec::new(),
+        converted_with_notes: false,
+        elapsed: std::time::Duration::from_secs(1),
+    });
+
+    assert_eq!(app.collections.len(), before + 1, "a new tab was opened");
+    assert_eq!(
+        app.collections[app.active_tab].workspace_root.as_deref(),
+        Some(root.as_path()),
+        "the imported folder becomes the tab's workspace root"
+    );
+}
+
+#[test]
+fn items_that_could_not_be_fetched_are_reported_ahead_of_the_conversion_notes() {
+    let root = temp_dir("postman_status").join("Imported");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let summary = |failures: Vec<(String, String)>, notes: bool| ImportSummary {
+        dest: root.clone(),
+        workspace_name: "Alpha".to_string(),
+        collections: 1,
+        environments: 0,
+        failures,
+        converted_with_notes: notes,
+        elapsed: std::time::Duration::from_secs(1),
+    };
+
+    // Notes alone say so...
+    let mut app = TuiApp::default();
+    app.apply_postman_event(summary(Vec::new(), true));
+    assert!(matches!(app.status, Some(Status::PostmanNotes)));
+
+    // ...but missing data is the more urgent of the two, and only one status
+    // line fits, so it wins.
+    let mut app = TuiApp::default();
+    app.apply_postman_event(summary(
+        vec![("Billing API".to_string(), "404".to_string())],
+        true,
+    ));
+    assert!(matches!(app.status, Some(Status::PostmanSkipped(1))));
+}
+
+#[test]
+fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Confirm);
+    }
+    // No plan yet: the busy screen, not a confirmation of nothing.
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
+    // Enter here must not start anything — there is nothing to start.
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
+
+    postman_wizard(&mut app).flow.seed_plan(ImportPlan {
+        workspace_id: "ws-a".to_string(),
+        workspace_name: "Alpha".to_string(),
+        collections: Vec::new(),
+        environments: Vec::new(),
+        remaining_month: None,
+    });
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
+}
+
+#[test]
+fn every_step_of_the_postman_wizard_renders() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let plan = ImportPlan {
+        workspace_id: "ws-a".to_string(),
+        workspace_name: "Alpha".to_string(),
+        collections: Vec::new(),
+        environments: Vec::new(),
+        remaining_month: None,
+    };
+    let steps = [
+        PostmanStep::Connect,
+        PostmanStep::PickWorkspace,
+        PostmanStep::Options,
+        PostmanStep::Confirm,
+        PostmanStep::Downloading,
+        PostmanStep::Done,
+        PostmanStep::Failed("boom".to_string()),
+    ];
+    for step in steps {
+        let mut app = TuiApp::default();
+        app.open_postman_wizard();
+        {
+            let w = postman_wizard(&mut app);
+            w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+            w.flow.seed_workspaces(vec![a_workspace("Alpha", "ws-a")]);
+            w.flow.seed_plan(plan.clone());
+            w.flow.seed_step(step.clone());
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app))
+            .unwrap_or_else(|e| panic!("{step:?} failed to render: {e}"));
+    }
 }
