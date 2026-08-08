@@ -191,6 +191,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Stopping a report in the visual editor stops it now, not eventually.** Stop
+  raised the worker's cancel flag but kept hold of the run, so the button stayed
+  a Stop button — and the report stayed unrunnable — until the worker actually
+  wound down. Cancelling never aborts a request already in flight, and a
+  `PARALLEL` batch has a lot of them, so the wait could be a long one. The run
+  is now retired the moment you stop it and the next click starts a fresh one,
+  matching the terminal UI. Rows that had already come back are kept, so you can
+  still read, save or export a partial result.
+
 - **The report validation panel no longer flickers when the mouse moves.** Two
   separate causes: the warnings were re-derived on every frame (a full
   revalidation, dozens of times a second, even though nothing had changed), and

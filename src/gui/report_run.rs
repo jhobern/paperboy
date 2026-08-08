@@ -149,6 +149,13 @@ impl RunHandle {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// The shared cancel flag, so a test can watch it after the handle itself
+    /// has been dropped (which is exactly what stopping a run does).
+    #[cfg(test)]
+    pub(crate) fn cancel_flag_for_test(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
     /// Whether this run has been cancelled.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)

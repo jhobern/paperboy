@@ -381,10 +381,22 @@ impl ReportEditor {
     }
 
     /// Stop an in-flight run, retaining whatever partial grid has streamed in.
+    ///
+    /// The handle is retired *now* — cancelled and dropped, taking our end of
+    /// the channel with it — rather than left in place until the worker's `Done`
+    /// arrives. Cancelling only stops new requests being fired; an in-flight one
+    /// still has to finish, and a `PARALLEL` batch can take a while to wind
+    /// down, during which `is_running()` would keep reporting the run as live
+    /// and the Run button would stay a Stop button. Retiring immediately means
+    /// the very next click starts a fresh run. The detached worker keeps
+    /// draining in the background; its remaining messages land on a dropped
+    /// receiver and are ignored. Mirrors the TUI's `prepare_report_run`.
     fn stop_run(&mut self, app: &mut GuiApp) {
-        if let Some(h) = &self.run {
+        if let Some(h) = self.run.take() {
             h.cancel();
         }
+        // Clear streaming progress so no row is left rendering as "running".
+        // The partial grid in `self.result` is intentionally kept.
         self.progress = None;
         app.session.status = Some(Status::ReportRunStopped);
     }
@@ -9748,5 +9760,106 @@ mod dry_run_view_tests {
             "the preview should be on screen, not waiting in a view nobody is looking at"
         );
         assert!(ed.dry_run.is_some(), "and the preview itself is held");
+    }
+}
+
+#[cfg(test)]
+mod stop_run_tests {
+    use super::*;
+    use crate::gui::report_run::{RunUpdate, test_handle};
+    use crate::report::Report;
+    use crate::report::model::{ReportResult, ReportRow};
+    use crate::session::Session;
+
+    fn editor() -> (GuiApp, ReportEditor) {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::scratch("nightly"));
+        let ed = app.report_editor.take().expect("editor is open");
+        (app, ed)
+    }
+
+    fn result_with(cell: &str) -> ReportResult {
+        let mut res = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), cell.to_string());
+        res.rows.push(row);
+        res
+    }
+
+    /// Stopping used to only raise the cancel flag and leave the handle in
+    /// place, so `is_running()` stayed true — and the button stayed a Stop
+    /// button — until the worker's `Done` finally arrived. Cancelling doesn't
+    /// abort an in-flight request, and a `PARALLEL` batch can take a long time
+    /// to wind down, so the report was unrunnable for a while. The TUI retires
+    /// the run at once; so must this.
+    #[test]
+    fn stopping_frees_the_report_to_be_run_again_at_once() {
+        let (mut app, mut ed) = editor();
+        let (handle, tx) = test_handle();
+        ed.run = Some(handle);
+        assert!(ed.is_running(), "a live handle is a live run");
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            !ed.is_running(),
+            "the run is retired immediately, without waiting for the worker"
+        );
+        assert!(matches!(app.session.status, Some(Status::ReportRunStopped)));
+
+        // The worker is still alive and still winding down: it has not sent
+        // `Done`, and sending now must not resurrect the run.
+        assert!(
+            tx.send(RunUpdate::Done(ReportResult::default())).is_err(),
+            "our end of the channel went with the handle, so late updates \
+             land nowhere rather than being folded in"
+        );
+        assert!(!ed.is_running());
+    }
+
+    /// Retiring the handle must not take the partial grid with it: rows that
+    /// completed before the stop keep their real responses, and the user can
+    /// still read, save or export them.
+    #[test]
+    fn stopping_keeps_the_rows_that_already_arrived_but_clears_the_progress() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        ed.run = Some(handle);
+        ed.result = Some(result_with("200"));
+        ed.progress = Some(crate::gui::report_run::RunProgress {
+            states: vec![crate::gui::report_run::RowState::Running],
+            index: Default::default(),
+            done: 0,
+            total: 1,
+        });
+
+        ed.stop_run(&mut app);
+
+        assert_eq!(
+            ed.result.as_ref().map(|r| r.rows.len()),
+            Some(1),
+            "the partial grid survives the stop"
+        );
+        assert!(
+            ed.progress.is_none(),
+            "but no row is left rendering as still running"
+        );
+    }
+
+    /// The cancel flag still has to be raised, or the detached worker would
+    /// carry on firing requests at the network after the user stopped it.
+    #[test]
+    fn stopping_still_tells_the_worker_to_wind_down() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let flag = handle.cancel_flag_for_test();
+        ed.run = Some(handle);
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "dropping our end alone would not stop the worker: it watches the flag"
+        );
     }
 }
