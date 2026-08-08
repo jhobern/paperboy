@@ -23,7 +23,6 @@
 
 // Nothing drives this engine yet — the CLI and the two wizards come next.
 // Remove this once a front-end calls `Importer`.
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -247,27 +246,6 @@ impl ImportPlan {
     }
 }
 
-/// Live progress, from which a measured ETA can be derived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Progress {
-    pub done: usize,
-    pub total: usize,
-    pub elapsed: Duration,
-}
-
-impl Progress {
-    /// Time remaining based on the rate actually achieved so far, which
-    /// accounts for throttling the up-front estimate could not know about.
-    /// `None` until there is enough data to extrapolate from.
-    pub fn eta(&self) -> Option<Duration> {
-        if self.done == 0 || self.done >= self.total {
-            return None;
-        }
-        let per_item = self.elapsed / self.done as u32;
-        Some(per_item * (self.total - self.done) as u32)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Options, messages, results
 // ---------------------------------------------------------------------------
@@ -372,6 +350,9 @@ pub struct ImportSummary {
 }
 
 impl ImportSummary {
+    /// Test-only in this crate: the front-ends read `failures` directly, since
+    /// they need the count and the reasons rather than just a yes or no.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_complete(&self) -> bool {
         self.failures.is_empty()
     }
@@ -437,6 +418,9 @@ impl<'a> Importer<'a> {
         }
     }
 
+    /// Swap in a fake clock so the pacing waits can be asserted without a test
+    /// actually sleeping through them.
+    #[cfg(test)]
     pub fn with_clock(mut self, clock: &'a dyn Clock) -> Self {
         self.clock = clock;
         self
@@ -1309,32 +1293,6 @@ mod tests {
     fn monthly_budget_warning_is_silent_without_the_header() {
         let plan = plan_of(60, 5);
         assert!(!plan.strains_monthly_budget());
-    }
-
-    #[test]
-    fn measured_eta_extrapolates_from_progress() {
-        let p = Progress {
-            done: 10,
-            total: 50,
-            elapsed: Duration::from_secs(10),
-        };
-        assert_eq!(p.eta(), Some(Duration::from_secs(40)));
-    }
-
-    #[test]
-    fn measured_eta_is_unavailable_before_and_after() {
-        let none_yet = Progress {
-            done: 0,
-            total: 5,
-            elapsed: Duration::from_secs(1),
-        };
-        let all_done = Progress {
-            done: 5,
-            total: 5,
-            elapsed: Duration::from_secs(1),
-        };
-        assert_eq!(none_yet.eta(), None);
-        assert_eq!(all_done.eta(), None);
     }
 
     // -- planning ---------------------------------------------------------

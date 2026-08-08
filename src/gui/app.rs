@@ -15,7 +15,7 @@ use crate::session::Session;
 use super::report_editor::ReportOrigin;
 use super::theme::GuiTheme;
 use super::{
-    Focus, editor, environments, menu, remote, report_editor, reports, requests, response,
+    Focus, editor, environments, menu, postman, remote, report_editor, reports, requests, response,
 };
 
 /// Which section of the request editor (centre-top) is shown.
@@ -170,6 +170,7 @@ pub struct GuiApp {
     pub report_editor: Option<report_editor::ReportEditor>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
+    pub postman: super::postman::PostmanUi,
     /// An in-flight Workspace redownload (see [`Dialog::WorkspaceReload`]):
     /// the tab it will rebind, the file that was selected before (relative to
     /// the old, dead root) and the worker's result channel.
@@ -263,6 +264,7 @@ impl GuiApp {
             show_reports: false,
             report_editor: None,
             remote: super::remote::RemoteUi::default(),
+            postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
             logo: None,
             layout_dirty: false,
@@ -297,6 +299,7 @@ impl GuiApp {
             show_reports: false,
             report_editor: None,
             remote: super::remote::RemoteUi::default(),
+            postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
             logo: None,
             layout_dirty: false,
@@ -984,6 +987,7 @@ impl GuiApp {
 
         menu::show_dialog(self, &ctx);
         remote::show(self, &ctx);
+        postman::show(self, &ctx);
         self.poll_workspace_redownload();
         self.poll_workspace_reload_prompts();
         if self.workspace_redownload.is_some() {

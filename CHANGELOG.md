@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.0] - 2026-08-09
+
+### Added
+
+- **Import a whole Postman workspace from inside PaperBoy.** Until now this
+  was CLI-only; both front-ends now have a wizard for it. Give it a Postman API
+  key, pick a workspace from the list it fetches, choose what to bring across
+  and where to put it, and the imported folder opens as a workspace. In the
+  terminal it's **File ▸ Load ▸ Workspace ▸ From Postman…**; in the GUI it's
+  **Open from Git ▸ From Postman…** (beside the other whole-folder sources).
+
+- **The wizard says what an import will cost before it spends anything.**
+  Postman rate-limits its API, so the confirmation step lists what was found,
+  explains that the download is paced deliberately, estimates how long it will
+  take, and warns when the import would eat an uncomfortable share of the
+  account's remaining monthly API budget. Nothing is downloaded until that
+  question is answered, so backing out there is free.
+
+- **A live estimate while it runs.** The progress view counts items, names the
+  one in flight, and shows a remaining time extrapolated from the rate actually
+  being achieved rather than the published one — a throttled account is exactly
+  when an estimate is worth having. When the importer is deliberately idle it
+  says so, rather than looking hung.
+
+- **A workspace id can be given up front to skip the list.** Paste an id or a
+  Postman workspace address into the optional field on the first step and the
+  wizard goes straight to the options — that listing call sits on Postman's
+  tightest rate-limit bucket, so it isn't made when the answer is already
+  known. The workspace's real name is picked up later and used for the folder.
+
+- The wizard offers the same **convert-to-Hurl** option as
+  `--postman-format hurl`, so an import can drop Postman's JSON entirely.
+
+### Changed
+
+- The Postman import's state machine is now **shared between the terminal UI
+  and the GUI**, joining the git load and save flows. Every decision about what
+  an import does — validation, ordering, pacing, cancellation, what counts as a
+  failure — lives in one place, so the two front-ends cannot drift apart.
+
+
 ## [0.6.0] - 2026-08-08
 
 ### Added

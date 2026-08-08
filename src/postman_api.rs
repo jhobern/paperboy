@@ -23,7 +23,6 @@
 // Nothing consumes this module yet — it is the first piece of the Postman
 // bulk-import feature, and the import engine that calls it lands next. Remove
 // this once that engine exists.
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -37,6 +36,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.postman.com";
 /// [`DEFAULT_BASE_URL`]. Offered as a setting rather than auto-detected:
 /// there is no way to tell from an API key which one applies, and calling the
 /// wrong host simply fails to authenticate.
+/// Named for the doc comment on [`PostmanClient::new`] and the test that pins
+/// the URL building; users type this host into the wizard's "API host" field
+/// rather than picking it from a list.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const EU_BASE_URL: &str = "https://api.eu.postman.com";
 
 /// Minimum spacing between calls to the endpoints Postman rate-limits to

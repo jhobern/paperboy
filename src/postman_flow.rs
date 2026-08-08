@@ -1046,3 +1046,172 @@ mod tests {
         assert_eq!(human_duration(Duration::from_secs(61), &s), "2 minutes");
     }
 }
+
+/// An end-to-end run of the flow itself: real worker threads, real HTTP (to a
+/// throwaway loopback server), real pacing. The step-level tests above feed
+/// messages in by hand, which cannot catch the two things most likely to go
+/// wrong here — the worker parking between planning and downloading, and the
+/// progress channel being drained independently of the outcome one.
+#[cfg(test)]
+mod end_to_end {
+    use super::*;
+    use crate::i18n::Language;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// A minimal stand-in for the Postman API: enough of `/workspaces`,
+    /// `/collections` and `/environments` for a whole import to complete.
+    fn stub_api() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                // Drain the headers so the client isn't left waiting on us.
+                loop {
+                    let mut h = String::new();
+                    match reader.read_line(&mut h) {
+                        Ok(0) => break,
+                        Ok(_) if h.trim().is_empty() => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let body = if path.starts_with("/workspaces/") {
+                    r#"{"workspace":{"id":"ws-a","name":"Alpha","type":"team"}}"#.to_string()
+                } else if path.starts_with("/workspaces") {
+                    r#"{"workspaces":[{"id":"ws-a","name":"Alpha","type":"team"}]}"#.to_string()
+                } else if path.starts_with("/collections/") {
+                    r#"{"collection":{"info":{"name":"Billing","schema":"v2.1.0"},
+                        "item":[{"name":"Get","request":{"method":"GET","url":{"raw":"https://x.test/a"}}}]}}"#
+                        .to_string()
+                } else if path.starts_with("/collections") {
+                    r#"{"collections":[{"id":"c1","uid":"u-c1","name":"Billing"}],"meta":{"total":1}}"#
+                        .to_string()
+                } else if path.starts_with("/environments/") {
+                    r#"{"environment":{"id":"e1","name":"Staging",
+                        "values":[{"key":"HOST","value":"https://s.test","enabled":true}]}}"#
+                        .to_string()
+                } else if path.starts_with("/environments") {
+                    r#"{"environments":[{"id":"e1","uid":"u-e1","name":"Staging"}]}"#.to_string()
+                } else {
+                    r#"{"error":{"message":"no"}}"#.to_string()
+                };
+                let mut sock = stream;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Spin the flow like a front-end's event loop until `done` says so.
+    fn pump(
+        flow: &mut PostmanFlow,
+        s: &Strings,
+        done: impl Fn(&PostmanFlow) -> bool,
+    ) -> Option<PostmanEvent> {
+        for _ in 0..1200 {
+            let event = flow.poll(s);
+            if event.is_some() {
+                return event;
+            }
+            if done(flow) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("the flow never got there; step = {:?}", flow.step());
+    }
+
+    #[test]
+    fn a_whole_workspace_imports_end_to_end_and_converts_to_hurl() {
+        let s = Strings::for_language(&Language::English);
+        let base = stub_api();
+        let dest = std::env::temp_dir().join(format!("pb_flow_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+
+        let mut flow = PostmanFlow::new();
+        flow.key = "PMAK-stub".to_string();
+        flow.base_url = base;
+        flow.dest = dest.to_string_lossy().into_owned();
+        flow.format = ImportFormat::Hurl;
+
+        // Step 1: no workspace id, so the listing really is fetched.
+        flow.submit_connect(&s);
+        pump(&mut flow, &s, |f| !f.is_busy());
+        assert_eq!(flow.workspaces().len(), 1, "the listing arrived");
+
+        // Step 2, then step 3: plan, but download nothing yet.
+        assert!(flow.submit_workspace());
+        assert!(flow.submit_options(&s));
+        pump(&mut flow, &s, |f| f.plan().is_some());
+        let plan = flow.plan().expect("a plan").clone();
+        assert_eq!(plan.item_count(), 2, "one collection and one environment");
+        assert_eq!(
+            plan.workspace_name, "Alpha",
+            "the plan carries the workspace's real name"
+        );
+
+        // Nothing has been written yet: the worker is parked, which is the
+        // whole point of showing an estimate before spending the budget.
+        assert!(!dest.exists(), "planning must not touch the disk");
+
+        // Step 4: approve, and the *same* importer (with its learnt pacing)
+        // does the download.
+        assert!(flow.confirm());
+        let event = pump(&mut flow, &s, |_| false).expect("the import finished");
+        let PostmanEvent::Imported(summary) = event;
+
+        assert_eq!(summary.collections, 1);
+        assert_eq!(summary.environments, 1);
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(flow.step(), &Step::Done);
+        assert!(
+            dest.join("Collections/Billing.hurl").exists(),
+            "the collection was converted to Hurl, not left as JSON"
+        );
+        assert!(dest.join("Environments/Staging.vars").exists());
+        // Progress was reported, not just the final outcome.
+        assert_eq!(flow.progress().total, 2);
+        assert_eq!(flow.progress().done, 2);
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Backing out at the confirmation step must spend nothing further and
+    /// leave nothing on disk — the estimate exists so this is a real choice.
+    #[test]
+    fn cancelling_at_the_confirmation_downloads_nothing() {
+        let s = Strings::for_language(&Language::English);
+        let base = stub_api();
+        let dest = std::env::temp_dir().join(format!("pb_flow_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+
+        let mut flow = PostmanFlow::new();
+        flow.key = "PMAK-stub".to_string();
+        flow.base_url = base;
+        flow.dest = dest.to_string_lossy().into_owned();
+        // A supplied id skips the listing entirely — the call it would cost
+        // sits on Postman's tightest bucket.
+        flow.workspace_ref = "12345678-1234-1234-1234-123456789abc".to_string();
+        flow.submit_connect(&s);
+        assert_eq!(flow.step(), &Step::Options, "the listing was skipped");
+
+        assert!(flow.submit_options(&s));
+        pump(&mut flow, &s, |f| f.plan().is_some());
+        flow.cancel();
+
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!dest.exists(), "cancelling must leave nothing behind");
+    }
+}

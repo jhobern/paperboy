@@ -600,8 +600,25 @@ up-to-date list. Highlights:
 
 ## Importing a Postman workspace
 
-Bring a whole Postman workspace across in one command, rather than exporting
-each collection by hand:
+Bring a whole Postman workspace across at once, rather than exporting each
+collection by hand.
+
+**In the app**, it's **File ▸ Load ▸ Workspace ▸ From Postman…** in the terminal
+UI, and **Open from Git ▸ From Postman…** in the GUI. Give it your API key and
+it lists the workspaces the key can see; pick one, choose what to bring across
+and where to put it, and the imported folder opens as a workspace.
+
+Because Postman rate-limits its API, the wizard shows you what it found and
+roughly how long the download will take *before* downloading anything, so
+backing out costs nothing. While it runs it shows a remaining time worked out
+from the rate it is actually achieving, and says so explicitly when it is
+pausing to stay inside the limit.
+
+If you already know the workspace, paste its id — or its address in Postman —
+into the optional field on the first step and the wizard skips the listing
+entirely.
+
+**From the command line**, the same import runs headlessly:
 
 ```sh
 export POSTMAN_API_KEY='PMAK-…'

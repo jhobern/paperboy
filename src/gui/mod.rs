@@ -14,6 +14,7 @@ mod environments;
 mod filepick;
 mod icons;
 mod menu;
+mod postman;
 mod remote;
 mod report_editor;
 mod report_run;

@@ -280,6 +280,13 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
                 ui.close();
             }
         });
+        // A Postman import produces a whole folder of collections and
+        // environments, so it belongs beside the other Workspace sources.
+        if ui.button(app.strings.postman_menu_item).clicked() {
+            app.postman.open();
+            close_menu = true;
+            ui.close();
+        }
         ui.separator();
 
         ui.menu_button(app.strings.gui_menu_save, |ui| {
