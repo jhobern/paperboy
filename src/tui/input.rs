@@ -3661,6 +3661,7 @@ impl TuiApp {
                 }
                 self.finish_workspace_save(name);
             }
+            FileAction::PostmanDestChooseFolder => self.finish_postman_dest(dir, name),
             FileAction::SaveCollectionChooseFolder => {
                 let mut file = std::path::PathBuf::from(&name);
                 if file.extension().is_none() {
@@ -4185,13 +4186,16 @@ impl TuiApp {
             FileAction::SaveReportChooseFolder => s.save_report_folder,
             FileAction::NewReportChooseFolder => s.new_report_folder,
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
+            FileAction::PostmanDestChooseFolder => s.postman_dest_folder,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
             FileAction::PickReportNodeFolder => s.browser_hint_workspace,
-            FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
+            FileAction::SaveWorkspaceChooseFolder | FileAction::PostmanDestChooseFolder => {
+                s.browser_hint_workspace_save
+            }
             FileAction::MoveWorkspaceItemChooseFolder => s.browser_hint_workspace_move,
             FileAction::SaveCollectionChooseFolder
             | FileAction::SaveReportCsvChooseFolder
@@ -4257,6 +4261,13 @@ impl TuiApp {
                         .new_report_seed_dir
                         .as_ref()
                         .or(self.last_browse_dir.as_ref()),
+                    // Reopen where the wizard's current destination lives, so
+                    // browsing starts from the suggestion rather than wherever
+                    // the user last opened a file.
+                    FileAction::PostmanDestChooseFolder => self
+                        .postman_dest_seed_dir
+                        .as_ref()
+                        .or(self.last_browse_dir.as_ref()),
                     _ => self.last_browse_dir.as_ref(),
                 };
                 if let Some(dir) = reopen
@@ -4267,6 +4278,7 @@ impl TuiApp {
                 // The seed dir is one-shot — clear it so a later browser opened
                 // for a different action doesn't inherit it.
                 self.new_report_seed_dir = None;
+                self.postman_dest_seed_dir = None;
                 // Remember where the browser actually started so `^r` can jump
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
@@ -4290,6 +4302,11 @@ impl TuiApp {
                         // A brand-new report always starts from a fresh default
                         // name (never the active report's file name).
                         FileAction::NewReportChooseFolder => "report.trail".to_string(),
+                        FileAction::PostmanDestChooseFolder => self
+                            .parked_postman
+                            .as_ref()
+                            .map(|w| w.dest_folder_name())
+                            .unwrap_or_default(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
@@ -5363,6 +5380,10 @@ impl TuiApp {
                 // unchanged, rather than discarding it.
                 if let Some(form) = self.parked_wizard.take() {
                     self.overlay = Some(Overlay::NewRequest(form));
+                } else if let Some(w) = self.parked_postman.take() {
+                    // Cancelling the pick keeps the destination the wizard
+                    // already had, rather than clearing it.
+                    self.overlay = Some(Overlay::PostmanImport(w));
                 } else if action == FileAction::SaveWorkspaceChooseFolder {
                     self.cancel_workspace_save();
                 } else if action == FileAction::PickReportNodeFolder {
@@ -5411,6 +5432,7 @@ impl TuiApp {
                         | FileAction::SaveCollectionChooseFolder
                         | FileAction::MoveWorkspaceItemChooseFolder
                         | FileAction::NewReportChooseFolder
+                        | FileAction::PostmanDestChooseFolder
                 ) {
                     // A Workspace root/destination (or a collection save
                     // destination) must be a folder, not a file — Enter on a

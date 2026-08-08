@@ -775,7 +775,7 @@ mod tests {
                 w.flow.seed_step(step.clone());
             }
             let ctx = egui::Context::default();
-            ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
             assert!(
                 app.postman.is_open(),
                 "{step:?} closed the dialog without anything happening"
@@ -796,7 +796,7 @@ mod tests {
             w.flow.seed_step(Step::Confirm);
         }
         let ctx = egui::Context::default();
-        ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
         assert!(app.postman.is_open());
         assert!(app.postman.flow.as_ref().unwrap().flow.plan().is_none());
     }

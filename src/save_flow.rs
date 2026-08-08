@@ -619,33 +619,12 @@ impl SaveFlow {
         self.refs = refs;
     }
 
-    pub(crate) fn seed_refs(&mut self, branches: &[&str], tags: &[&str]) {
-        self.refs = RemoteRefs {
-            branches: branches.iter().map(|b| b.to_string()).collect(),
-            tags: tags.iter().map(|t| t.to_string()).collect(),
-        };
-    }
-
     pub(crate) fn seed_intent(&mut self, intent: TargetIntent) {
         self.intent = intent;
     }
 
     pub(crate) fn intent(&self) -> TargetIntent {
         self.intent
-    }
-
-    /// Deliver a push result as though the background worker had sent it.
-    pub(crate) fn deliver_push(
-        &mut self,
-        result: Result<String, SaveError>,
-        s: &Strings,
-    ) -> Option<SaveEvent> {
-        self.apply(SaveMsg::Pushed(result), s)
-    }
-
-    /// Deliver a ref listing as though the background worker had sent it.
-    pub(crate) fn deliver_refs(&mut self, result: Result<RemoteRefs, String>, s: &Strings) {
-        self.apply(SaveMsg::Refs(result), s);
     }
 }
 

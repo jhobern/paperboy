@@ -5,6 +5,8 @@
 //! the terminal's presentation of it: which step is on screen, the text editors
 //! with their cursors, and the highlighted row.
 
+use std::path::{Path, PathBuf};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
@@ -49,7 +51,10 @@ pub(crate) struct PostmanWizard {
     pub(crate) key: Editor,
     pub(crate) workspace_ref: Editor,
     pub(crate) base_url: Editor,
-    pub(crate) dest: Editor,
+    /// The import destination. Not an [`Editor`]: it is chosen in the file
+    /// browser (`FileAction::PostmanDestChooseFolder`) like every other
+    /// "save into a folder" in the app, never typed here.
+    pub(crate) dest: PathBuf,
     /// Connect step: 0 = key, 1 = workspace id, 2 = API host.
     pub(crate) field: u8,
     /// Options step: which row is focused (0 = destination, 1 = collections,
@@ -69,7 +74,7 @@ impl PostmanWizard {
             key: Editor::new(&flow.key, false),
             workspace_ref: Editor::blank(),
             base_url: Editor::blank(),
-            dest: Editor::blank(),
+            dest: PathBuf::new(),
             flow,
             field: 0,
             option_row: 0,
@@ -112,19 +117,40 @@ impl PostmanWizard {
         self.flow.key = self.key.text();
         self.flow.workspace_ref = self.workspace_ref.text();
         self.flow.base_url = self.base_url.text();
-        self.flow.dest = self.dest.text();
+        self.flow.dest = self.dest.to_string_lossy().into_owned();
     }
 
-    /// Fill the destination in from the chosen workspace's name, unless the
-    /// user has already typed one — a suggestion, never an override.
+    /// Fill the destination in from the chosen workspace's name, unless one has
+    /// already been picked — a suggestion, never an override.
     pub(crate) fn suggest_dest(&mut self) {
-        if !self.dest.text().trim().is_empty() {
+        if !self.dest.as_os_str().is_empty() {
             return;
         }
-        let base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let path = base.join(default_dest_name(self.flow.workspace_name()));
-        self.dest = Editor::new(&path.to_string_lossy(), false);
-        self.flow.dest = self.dest.text();
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.set_dest(base.join(default_dest_name(self.flow.workspace_name())));
+    }
+
+    /// Record a destination chosen in the browser, keeping `flow.dest` in step.
+    pub(crate) fn set_dest(&mut self, path: PathBuf) {
+        self.flow.dest = path.to_string_lossy().into_owned();
+        self.dest = path;
+    }
+
+    /// The leaf folder name to seed the browser's inline name editor with, so
+    /// reopening the picker offers back what is already chosen.
+    pub(crate) fn dest_folder_name(&self) -> String {
+        self.dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| default_dest_name(self.flow.workspace_name()))
+    }
+
+    /// Where the picker should open: the destination's parent, if it exists.
+    pub(crate) fn dest_parent(&self) -> Option<PathBuf> {
+        self.dest
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(Path::to_owned)
     }
 
     /// Remember where a failure came from, so the error screen can go back.
@@ -144,7 +170,7 @@ pub(crate) fn option_labels(w: &PostmanWizard, s: &Strings) -> Vec<String> {
         ImportFormat::Hurl => s.postman_format_hurl,
     };
     vec![
-        format!("{}: {}", s.postman_dest_label, w.dest.text()),
+        format!("{}: {}", s.postman_dest_label, w.dest.display()),
         format!(
             "{} {}",
             check(w.flow.include_collections),
@@ -328,7 +354,31 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         )),
         rows[1],
     );
-    render_line_field(f, rows[2], &w.dest, w.option_row == 0, false, th);
+    let dest = if w.dest.as_os_str().is_empty() {
+        s.postman_dest_unset.to_string()
+    } else {
+        w.dest.display().to_string()
+    };
+    let dest_style = if w.option_row == 0 {
+        Style::default()
+            .bg(th.accent)
+            .fg(th.bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.text)
+    };
+    // The "press Enter" affordance is the point of the row, so it keeps its
+    // width and the path gives way - elided from the LEFT, since the folder
+    // name at the end is what distinguishes one destination from another.
+    let browse = format!("  {}", s.postman_browse);
+    let room = (rows[2].width as usize).saturating_sub(browse.chars().count());
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!("{}{browse}", elide_left(&dest, room)),
+            dest_style,
+        )),
+        rows[2],
+    );
 
     let list_items: Vec<ListItem> = labels
         .iter()
@@ -353,7 +403,13 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         note.push_str(s.postman_format_hurl_note);
         note.push_str("  ·  ");
     }
-    note.push_str(s.git_connect_hint);
+    // What Enter does here depends on the row, so say which — a single hint
+    // could only be wrong on two rows out of three.
+    note.push_str(match w.option_row {
+        0 => s.postman_options_hint_dest,
+        r if r == OPTION_ROWS - 1 => s.postman_options_hint_import,
+        _ => s.postman_options_hint_toggle,
+    });
     f.render_widget(
         Paragraph::new(Line::styled(note, Style::default().fg(th.dim))).wrap(Wrap { trim: true }),
         rows[4],
@@ -530,4 +586,54 @@ fn draw_error(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: 
         Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
         rows[1],
     );
+}
+
+/// Shorten `text` to `width` columns by dropping characters from the FRONT and
+/// marking the cut with a leading ellipsis. Used for paths, where the tail (the
+/// folder being written) carries far more information than the root.
+fn elide_left(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_string();
+    }
+    // Below two columns there is no room for the marker plus any content, so
+    // return what fits rather than an ellipsis that says nothing.
+    if width < 2 {
+        return text.chars().skip(len - width).collect();
+    }
+    let kept: String = text.chars().skip(len - (width - 1)).collect();
+    format!("\u{2026}{kept}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elide_left;
+
+    #[test]
+    fn a_path_that_fits_is_left_alone() {
+        assert_eq!(elide_left("/tmp/Alpha", 20), "/tmp/Alpha");
+        assert_eq!(elide_left("/tmp/Alpha", 10), "/tmp/Alpha");
+    }
+
+    /// The folder name is the part that identifies the destination, so it is
+    /// the front of the path that goes.
+    #[test]
+    fn a_long_path_keeps_its_tail() {
+        assert_eq!(
+            elide_left("/home/someone/work/Alpha", 10),
+            "\u{2026}ork/Alpha"
+        );
+        // The result fills the space it was given, marker included.
+        assert_eq!(
+            elide_left("/home/someone/work/Alpha", 10).chars().count(),
+            10
+        );
+    }
+
+    /// A pathological width must not panic or produce a lone ellipsis.
+    #[test]
+    fn a_width_too_small_for_a_marker_still_returns_content() {
+        assert_eq!(elide_left("/tmp/Alpha", 1), "a");
+        assert_eq!(elide_left("/tmp/Alpha", 0), "");
+    }
 }

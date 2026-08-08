@@ -52,6 +52,12 @@ pub(crate) enum FileAction {
     /// permanently (see [`TuiApp::pending_workspace_save`]) — confirms on
     /// `Space` exactly like `OpenWorkspace`, then a name prompt follows.
     SaveWorkspaceChooseFolder,
+    /// Picking the PARENT FOLDER the Postman import will create its workspace
+    /// folder inside, with the folder's own name typed into the browser's
+    /// inline name editor — the same shape as `SaveWorkspaceChooseFolder`. The
+    /// wizard is parked in [`TuiApp::parked_postman`] meanwhile, since the
+    /// browser needs the overlay slot.
+    PostmanDestChooseFolder,
     /// Picking the DESTINATION FOLDER for a workspace file or folder being
     /// moved (see [`TuiApp::pending_workspace_move`]) — confirms on `Space`
     /// like the other folder pickers, since there is no name to type. The
@@ -119,6 +125,7 @@ impl FileAction {
                 | FileAction::SaveReportBaselineChooseFolder
                 | FileAction::SaveReportChooseFolder
                 | FileAction::NewReportChooseFolder
+                | FileAction::PostmanDestChooseFolder
         )
     }
 }
@@ -1209,6 +1216,12 @@ pub struct TuiApp {
     /// Restored (with the picked path applied, on success) once the browser
     /// closes. Runtime-only (not persisted).
     pub(crate) parked_wizard: Option<Box<NewReq>>,
+    /// The Postman import wizard, parked while its destination folder is picked
+    /// in the browser. Restored on both confirm and cancel, so browsing never
+    /// costs the key and options already typed.
+    pub(crate) parked_postman: Option<Box<PostmanWizard>>,
+    /// Where the destination picker should open, set just before it is.
+    pub(crate) postman_dest_seed_dir: Option<std::path::PathBuf>,
     /// The target `FOR … IN FILES/FOLDERS` node whose source folder is being
     /// chosen while a [`FileAction::PickReportNodeFolder`] browser is open:
     /// `(report id, node path)`. The chosen directory is written into that
@@ -1349,6 +1362,8 @@ impl Default for TuiApp {
             pending_workspace_transfer: None,
             closed_tabs: Vec::new(),
             parked_wizard: None,
+            parked_postman: None,
+            postman_dest_seed_dir: None,
             pending_node_folder: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
@@ -2178,6 +2193,10 @@ impl TuiApp {
             // folder as the move destination (handled in `input.rs`), so no
             // path ever arrives here.
             FileAction::MoveWorkspaceItemChooseFolder => {}
+            // Folder-only like the pickers above: the Postman destination is
+            // confirmed with `Space`, or with `Enter` on the inline folder-name
+            // field, both of which route through `finish_postman_dest`.
+            FileAction::PostmanDestChooseFolder => {}
             FileAction::OpenWorkspace => {}
             // Same as `OpenWorkspace` above: the destination folder is
             // confirmed with `Space`, handled directly in `input.rs` via
@@ -3640,12 +3659,14 @@ impl TuiApp {
                         } else if !on_dest {
                             toggle_option_row(&mut w);
                         } else {
-                            w.option_row += 1;
+                            // The destination is chosen in the file browser,
+                            // like every other "save into a folder" in the app;
+                            // typing a path by hand is not offered here because
+                            // it was the one place that asked the user to know
+                            // a path before seeing one.
+                            self.open_postman_dest_browser(w);
+                            return;
                         }
-                    }
-                    _ if on_dest => {
-                        apply_edit_key(&mut w.dest, key);
-                        w.flow.dest = w.dest.text();
                     }
                     _ => {}
                 }
@@ -3674,6 +3695,30 @@ impl TuiApp {
                 w.flow.clear_error(back);
             }
         }
+        self.overlay = Some(Overlay::PostmanImport(w));
+    }
+
+    /// Park the wizard and open the file browser on its destination folder.
+    /// The browser needs the overlay slot, so the wizard is stashed in
+    /// `parked_postman` and restored by `finish_postman_dest` (or by the
+    /// picker's Esc path) with everything else it holds intact.
+    fn open_postman_dest_browser(&mut self, w: Box<PostmanWizard>) {
+        self.postman_dest_seed_dir = w.dest_parent();
+        self.parked_postman = Some(w);
+        self.open_browser(FileAction::PostmanDestChooseFolder);
+    }
+
+    /// Take the folder chosen in the browser as the import destination and put
+    /// the wizard back on screen.
+    pub(crate) fn finish_postman_dest(&mut self, dir: std::path::PathBuf, name: String) {
+        let Some(mut w) = self.parked_postman.take() else {
+            return;
+        };
+        self.last_browse_dir = Some(dir.clone());
+        // The browser refuses to commit a blank name, so this always names a
+        // subfolder of the chosen parent — the import creates it, exactly as
+        // the workspace save does.
+        w.set_dest(dir.join(name.trim()));
         self.overlay = Some(Overlay::PostmanImport(w));
     }
 

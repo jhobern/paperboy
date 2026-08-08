@@ -19,7 +19,7 @@ use super::app::*;
 use super::editor::Editor;
 use super::git_save::*;
 use super::new_request::*;
-use super::postman::{PostmanStage, PostmanWizard};
+use super::postman::{OPTION_ROWS, PostmanStage, PostmanWizard};
 use super::remote::*;
 use crate::remote_flow::{
     FlowEvent, Phase, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
@@ -24768,7 +24768,7 @@ fn a_typed_workspace_id_skips_the_listing_and_suggests_a_destination() {
     let w = postman_wizard(&mut app);
     assert_eq!(w.stage(), PostmanStage::Options);
     assert!(
-        !w.dest.text().trim().is_empty(),
+        !w.dest.as_os_str().is_empty(),
         "the options step must arrive with a destination already filled in"
     );
 }
@@ -24781,12 +24781,17 @@ fn the_options_step_toggles_the_row_under_the_cursor_and_leaves_the_others_alone
         let w = postman_wizard(&mut app);
         w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
         w.flow.seed_step(PostmanStep::Options);
-        w.dest = Editor::new("/tmp/x", false);
+        w.set_dest(PathBuf::from("/tmp/x"));
     }
 
-    // Row 0 is the path field, so Space must type a space there, not toggle.
+    // Row 0 is the destination chooser, not a toggle: Space must leave every
+    // option exactly as it found them.
     press(&mut app, KeyCode::Char(' '));
-    assert_eq!(postman_wizard(&mut app).dest.text(), "/tmp/x ");
+    {
+        let w = postman_wizard(&mut app);
+        assert_eq!(w.dest, PathBuf::from("/tmp/x"), "destination unchanged");
+        assert!(w.flow.include_collections && w.flow.include_environments);
+    }
 
     press(&mut app, KeyCode::Tab); // collections
     press(&mut app, KeyCode::Char(' '));
@@ -24969,5 +24974,99 @@ fn every_step_of_the_postman_wizard_renders() {
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| super::draw::draw(f, &mut app))
             .unwrap_or_else(|e| panic!("{step:?} failed to render: {e}"));
+    }
+}
+
+/// The destination is chosen in the file browser, like every other "save into
+/// a folder" in the app — Enter on the row must open the picker, not step past
+/// it, and the parked wizard must come back with everything else intact.
+#[test]
+fn enter_on_the_destination_row_opens_the_file_browser() {
+    let dir = temp_dir("postman_dest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-x", false);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(dir.join("Alpha"));
+    }
+
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::PostmanDestChooseFolder, _))
+        ),
+        "Enter on the destination row must open the folder picker"
+    );
+    assert!(
+        app.parked_postman.is_some(),
+        "the wizard must be parked, not discarded"
+    );
+    // The picker offers back the folder name already chosen.
+    assert_eq!(app.browser_name.text(), "Alpha");
+
+    // Committing a folder name puts the wizard back with the new destination.
+    app.finish_postman_dest(dir.clone(), "Beta".to_string());
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.dest, dir.join("Beta"));
+    assert_eq!(w.flow.dest, dir.join("Beta").to_string_lossy());
+    assert_eq!(w.key.text(), "PMAK-x", "the typed key survived the detour");
+}
+
+/// Cancelling the picker must not cost the destination the wizard already had.
+#[test]
+fn cancelling_the_destination_picker_restores_the_wizard_unchanged() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(PathBuf::from("/tmp/Alpha"));
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.dest, PathBuf::from("/tmp/Alpha"));
+}
+
+/// The hint under the options has to describe what Enter does on the row the
+/// cursor is actually on — it used to claim "Enter connect" everywhere, which
+/// was wrong on every row.
+#[test]
+fn the_options_hint_describes_what_enter_does_on_the_current_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let hint_for = |row: usize| {
+        let mut app = TuiApp::default();
+        app.open_postman_wizard();
+        {
+            let w = postman_wizard(&mut app);
+            w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+            w.flow.seed_step(PostmanStep::Options);
+            w.set_dest(PathBuf::from("/tmp/Alpha"));
+            w.option_row = row;
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    assert!(hint_for(0).contains(s.postman_options_hint_dest));
+    assert!(hint_for(1).contains(s.postman_options_hint_toggle));
+    assert!(hint_for(OPTION_ROWS - 1).contains(s.postman_options_hint_import));
+    // The old, wrong hint is gone from every row.
+    for row in 0..OPTION_ROWS {
+        assert!(
+            !hint_for(row).contains(s.git_connect_hint),
+            "row {row} still shows the git connect hint"
+        );
     }
 }

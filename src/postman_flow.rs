@@ -620,33 +620,6 @@ impl PostmanFlow {
     pub(crate) fn seed_plan(&mut self, plan: ImportPlan) {
         self.plan = Some(plan);
     }
-
-    /// Deliver a worker outcome as though the background thread had sent it.
-    /// One method per outcome rather than one taking a `Msg`, so the message
-    /// type itself stays private to the flow.
-    pub(crate) fn deliver_workspaces(
-        &mut self,
-        result: Result<Vec<WorkspaceSummary>, String>,
-        s: &Strings,
-    ) -> Option<PostmanEvent> {
-        self.apply(Msg::Workspaces(result), s)
-    }
-
-    pub(crate) fn deliver_plan(&mut self, plan: ImportPlan, s: &Strings) -> Option<PostmanEvent> {
-        self.apply(Msg::Planned(Box::new(plan)), s)
-    }
-
-    pub(crate) fn deliver_summary(
-        &mut self,
-        summary: ImportSummary,
-        s: &Strings,
-    ) -> Option<PostmanEvent> {
-        self.apply(Msg::Finished(Box::new(summary)), s)
-    }
-
-    pub(crate) fn deliver_failure(&mut self, error: &str, s: &Strings) -> Option<PostmanEvent> {
-        self.apply(Msg::Failed(error.to_string()), s)
-    }
 }
 
 /// A default folder name for the imported workspace, so the destination field

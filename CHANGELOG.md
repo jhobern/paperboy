@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.7.1] - 2026-08-08
+
+### Changed
+
+- **The Postman wizard's destination is now chosen in the file browser**, in
+  the terminal UI, instead of being typed as a path. It was the only place in
+  PaperBoy that asked you to know a folder path before you had seen one; it now
+  opens the same picker as every other "save into a folder", seeded at the
+  suggested destination and offering the folder name back for editing.
+  Cancelling the picker leaves the wizard exactly as it was. (The GUI already
+  used the native folder picker.)
+
+### Fixed
+
+- **The hint under the Postman import options said "Enter connect"**, which was
+  true on none of the rows it appeared over — Enter actually chose a folder,
+  flipped a toggle, or started the import depending on where the cursor was.
+  The hint now describes the row the cursor is on.
+
+
 ## [0.7.0] - 2026-08-09
 
 ### Added

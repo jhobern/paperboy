@@ -1054,6 +1054,12 @@ strings! {
     postman_include_collections => "Collections", "Collections", "Samlinger";
     postman_include_environments => "Environments", "Environnements", "Miljøer";
     postman_dest_label => "Import into", "Importer dans", "Importér til";
+    postman_dest_unset => "(no folder chosen)", "(aucun dossier choisi)", "(ingen mappe valgt)";
+    postman_browse => "[Enter to choose…]", "[Entrée pour choisir…]", "[Enter for at vælge…]";
+    postman_dest_folder => "Import into", "Importer dans", "Importér til";
+    postman_options_hint_dest => "Tab move · Enter choose folder · Esc back", "Tab naviguer · Entrée choisir le dossier · Échap retour", "Tab flyt · Enter vælg mappe · Esc tilbage";
+    postman_options_hint_toggle => "Tab move · Space/Enter toggle · Esc back", "Tab naviguer · Espace/Entrée basculer · Échap retour", "Tab flyt · Mellemrum/Enter skift · Esc tilbage";
+    postman_options_hint_import => "Tab move · Enter import · Esc back", "Tab naviguer · Entrée importer · Échap retour", "Tab flyt · Enter importér · Esc tilbage";
     postman_format_label => "Format", "Format", "Format";
     postman_format_raw => "Postman JSON (keeps everything)", "JSON Postman (conserve tout)", "Postman-JSON (bevarer alt)";
     postman_format_hurl => "Convert to Hurl (.hurl and .vars)", "Convertir en Hurl (.hurl et .vars)", "Konvertér til Hurl (.hurl og .vars)";

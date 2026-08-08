@@ -599,6 +599,8 @@ impl RemoteFlow {
     }
 
     /// Pretend a ref listing arrived, for tests that start at the ref picker.
+    /// Only the GUI's tests need it; the terminal UI's use `seed_refs_from`.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub(crate) fn seed_refs(&mut self, branches: &[&str], tags: &[&str]) {
         self.refs = RemoteRefs {
             branches: branches.iter().map(|b| b.to_string()).collect(),

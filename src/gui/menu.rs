@@ -1321,7 +1321,8 @@ mod tests {
     }
 
     /// The declared output format leads the export dialog's filters, so the
-    /// default choice is the one the report asked for.    #[test]
+    /// default choice is the one the report asked for.
+    #[test]
     fn the_reports_own_output_format_leads_the_export_filters() {
         for (ext, expected) in [("xlsx", "Excel"), ("json", "JSON"), ("html", "HTML")] {
             let filters = report_result_filters(ext);
