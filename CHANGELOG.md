@@ -67,6 +67,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The dry-run preview now shows its grid the way the results view does.**
+  The preview wrapped every line, so a wide grid folded over several lines and
+  lost its column alignment. Only the prose around the grid wraps now; the grid
+  clips, and `←`/`→` scroll it sideways.
+
 - **The report results grid now scrolls sideways.** A report with more columns
   than fit on screen clipped the rest away with no way to reach them; the
   arrow keys now carry the view along with the cell cursor, so walking right

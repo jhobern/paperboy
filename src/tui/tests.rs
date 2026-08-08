@@ -20078,7 +20078,8 @@ fn dry_run_overlay_renders_grid_not_bindings_list() {
     // name like "Ping.HttpStatus") and two data rows.
     let th = app.theme();
     let s = crate::i18n::Strings::for_language(&Language::English);
-    let lines = p.lines(&s, &th);
+    let (head, grid, tail) = p.line_sections(&s, &th, 0);
+    let lines: Vec<_> = head.into_iter().chain(grid).chain(tail).collect();
     // Each ratatui `Line` is built from spans — join them to get readable text.
     let text_of = |l: &ratatui::text::Line| -> String {
         l.spans.iter().map(|sp| sp.content.to_string()).collect()
@@ -22783,6 +22784,78 @@ fn grid_col_at_x_accounts_for_the_horizontal_offset() {
     assert_eq!(grid_col_at_x(&widths, 2, true, 1), 1);
     // An out-of-range offset clamps rather than panicking.
     assert_eq!(grid_col_at_x(&widths, 0, false, 9), 2);
+}
+
+/// The dry-run preview used to run every one of its lines through the wrapper,
+/// so a wide grid folded over several lines and looked nothing like the real
+/// results view. Only the prose around the grid should wrap; the grid itself
+/// must clip and scroll sideways, as the real one does.
+#[test]
+fn the_dry_run_preview_grid_clips_and_scrolls_instead_of_wrapping() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ping".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ping".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR Iteration IN [\"alpha\", \"beta\"]\n    REPORT REQUEST Ping\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('d'));
+    assert!(app.reports[idx].dry_run.is_some(), "preview opened");
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut draw = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    let before = draw(&mut app);
+    assert!(
+        before.contains("Ping.HttpStatus"),
+        "the grid's first column shows: {before}"
+    );
+    // The wrap marker is what the old code left all over the grid.
+    let marker = super::draw::wrap_marker(&app.theme()).glyph.to_string();
+    let grid_row = before
+        .lines()
+        .find(|l| l.contains("Ping.HttpStatus"))
+        .unwrap()
+        .to_string();
+    assert!(
+        !grid_row.contains(&marker),
+        "the grid header must not be wrapped: {grid_row}"
+    );
+
+    // …and the columns past the right edge are reachable with Right.
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Right);
+    }
+    let after = draw(&mut app);
+    assert!(
+        app.reports[idx].results_col_offset > 0,
+        "Right must scroll the preview grid sideways"
+    );
+    assert!(
+        !after.contains("Ping.HttpStatus"),
+        "the first column has scrolled off: {after}"
+    );
+
+    // Left brings it back, and never scrolls past the start.
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Left);
+    }
+    assert_eq!(app.reports[idx].results_col_offset, 0);
 }
 
 /// The results grid clips rather than wraps, so columns past the right edge

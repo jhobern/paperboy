@@ -1630,13 +1630,32 @@ impl TuiApp {
                 // occupy the same place and the same keys scroll both.
                 self.reports[idx].view = ReportView::Results;
                 self.reports[idx].results_panel.set_scroll(0);
+                self.reports[idx].results_col_offset = 0;
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
         }
     }
 
-    /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.
-    /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
+    /// Scroll the dry-run preview's grid sideways by `dc` columns, clamped so
+    /// the leftmost column never goes past the last one. The preview has no
+    /// cell cursor to follow, so this is the only thing that moves its
+    /// viewport.
+    fn preview_scroll_cols(&mut self, dc: i32) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let Some(preview) = self.reports[idx].dry_run.as_ref() else {
+            return;
+        };
+        let ncols = preview.result.resolved_columns(&preview.header).len();
+        if ncols == 0 {
+            return;
+        }
+        let cur = self.reports[idx].results_col_offset as i32;
+        self.reports[idx].results_col_offset = (cur + dc).clamp(0, ncols as i32 - 1) as usize;
+    }
+
+    /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.    /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
     /// the data-row/column count so it never points outside the grid.
     pub(crate) fn result_cursor_move(&mut self, dr: i32, dc: i32) {
         let Some(idx) = self.active_report_index() else {
@@ -2129,6 +2148,27 @@ impl TuiApp {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A dry-run preview has no cell cursor, but its grid clips just like
+        // the real one — so Left/Right scroll it sideways directly, keeping the
+        // preview's off-screen columns reachable.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].view == ReportView::Results
+            && self.reports[idx].dry_run.is_some()
+            && !ctrl
+            && !shift
+        {
+            match key.code {
+                KeyCode::Left => {
+                    self.preview_scroll_cols(-1);
+                    return;
+                }
+                KeyCode::Right => {
+                    self.preview_scroll_cols(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // When the results grid is visible and has data, plain (unmodified)
         // arrow keys drive the cell cursor rather than cycling tabs or
         // scrolling the panel. Home/End also jump to the first/last data row.
@@ -2250,6 +2290,7 @@ impl TuiApp {
                     if self.reports[idx].dry_run.is_some() {
                         self.reports[idx].dry_run = None;
                         self.reports[idx].results_panel.set_scroll(0);
+                        self.reports[idx].results_col_offset = 0;
                     } else if self.reports[idx].view == ReportView::Nodes {
                         self.reports[idx].view = ReportView::Source;
                         self.reports[idx].editor_view = ReportView::Source;
@@ -2834,7 +2875,14 @@ fn relative_path(from_dir: &std::path::Path, to: &std::path::Path) -> Option<std
 use crate::report::dry_run::DryRunReport;
 
 impl DryRunReport {
-    /// Render the preview body as themed lines for the overlay draw pass.
+    /// Render the preview body as themed lines for the results pane, split
+    /// into `(head, grid, tail)`.
+    ///
+    /// The split exists because the two parts want opposite treatment: the
+    /// prose is a paragraph and must wrap or a long producer error is silently
+    /// cut off, while the grid is a grid and must *clip* — wrapping it folds
+    /// every row over several lines and destroys the column alignment, which
+    /// is why the preview used to look nothing like the real results view.
     ///
     /// Layout:
     /// 1. Preview-notice label (marks this as a dry run, not a real result).
@@ -2844,42 +2892,51 @@ impl DryRunReport {
     /// 4. Variable-availability warnings (if any) — yellow `!` prefix.
     /// 5. Producer/expansion errors (if any) — red `•` prefix.
     /// 6. "No problems found." when both 4 and 5 are empty.
-    pub(crate) fn lines(&self, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
+    ///
+    /// `col_offset` scrolls the grid sideways, exactly as in the Results view.
+    pub(crate) fn line_sections(
+        &self,
+        s: &Strings,
+        th: &Theme,
+        col_offset: usize,
+    ) -> (Vec<Line<'static>>, Vec<Line<'static>>, Vec<Line<'static>>) {
+        let mut head: Vec<Line<'static>> = Vec::new();
 
         // Dry-run notice: distinguish the preview grid from a real-run result.
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             s.report_dry_run_preview_notice.to_string(),
             Style::default().fg(th.dim),
         )));
-        lines.push(Line::from(""));
+        head.push(Line::from(""));
 
         // Row count.
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             format!("{} {}", s.report_dry_run_rows, self.rows),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(""));
+        head.push(Line::from(""));
 
         // Output grid — identical path to the Results view.
+        let mut grid: Vec<Line<'static>> = Vec::new();
         if self.rows == 0 {
-            lines.push(Line::from(Span::styled(
+            head.push(Line::from(Span::styled(
                 s.report_dry_run_no_rows.to_string(),
                 Style::default().fg(th.dim),
             )));
         } else {
             // Pass `None` for states (no streaming progress in a dry run) so
             // the grid renders without status icons, exactly like a finished run.
-            lines.extend(report_grid_lines(
+            grid.extend(report_grid_lines(
                 &self.result,
                 &self.header,
                 None,
                 th,
                 None,
-                0,
+                col_offset,
             ));
         }
 
+        let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(""));
 
         // Warnings and errors sections.
@@ -2921,7 +2978,7 @@ impl DryRunReport {
             }
         }
 
-        lines
+        (head, grid, lines)
     }
 }
 
@@ -3226,16 +3283,20 @@ fn draw_report_results(
     // projection and the real thing are read in the same place. It renders as
     // plain lines (notice, row count, grid, problems), so there is no sticky
     // header and no cell cursor over it.
-    // The results panel clips, which is right for a grid but would silently cut
-    // off a long producer error or binding line — so the preview's lines are
-    // pre-wrapped to the pane width with an explicit `↵` marker, keeping them
-    // readable as single logical lines (as the popup did).
+    // The prose around the grid — a long producer error or binding line —
+    // would be silently cut off by the clipping panel, so it is pre-wrapped to
+    // the pane width with an explicit `↵` marker. The *grid* is deliberately
+    // left alone: wrapping it folds each row over several lines and destroys
+    // the column alignment, so it clips and scrolls sideways exactly as the
+    // real results grid does.
     let preview_lines = app.reports[idx].dry_run.as_ref().map(|preview| {
-        crate::tui::draw::wrap_lines_with_marker(
-            preview.lines(s, th),
-            area.width.saturating_sub(2),
-            th,
-        )
+        let col_offset = app.reports[idx].results_col_offset;
+        let (head, grid, tail) = preview.line_sections(s, th, col_offset);
+        let width = area.width.saturating_sub(2);
+        let mut lines = crate::tui::draw::wrap_lines_with_marker(head, width, th);
+        lines.extend(grid);
+        lines.extend(crate::tui::draw::wrap_lines_with_marker(tail, width, th));
+        lines
     });
     if let Some(lines) = preview_lines {
         let title = format!("{} — {}", s.report_dry_run_title, s.report_dry_run_hint);

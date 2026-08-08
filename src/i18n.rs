@@ -593,7 +593,7 @@ strings! {
     report_dry_run_no_rows => "No rows would be produced.", "Aucune ligne ne serait produite.", "Ingen rækker ville blive produceret.";
     report_dry_run_problems_heading => "Problems", "Problèmes", "Problemer";
     report_dry_run_no_problems => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
-    report_dry_run_hint => "↑/↓ scroll · Esc close", "↑/↓ défiler · Échap fermer", "↑/↓ rul · Esc luk";
+    report_dry_run_hint => "↑/↓ scroll · ←/→ columns · Esc close", "↑/↓ défiler · ←/→ colonnes · Échap fermer", "↑/↓ rul · ←/→ kolonner · Esc luk";
     report_dry_run_preview_notice => "Dry run — loop bindings resolved; HTTP response fields blank", "Simulation — liaisons de boucle résolues ; champs de réponse HTTP vides", "Prøvekørsel — løkkebindinger løst; HTTP-svarfelter tomme";
     report_dry_run_warnings_heading => "Warnings", "Avertissements", "Advarsler";
     report_cell_popup_hint => "↑/↓ scroll · y copy · Esc close", "↑/↓ défiler · y copier · Échap fermer", "↑/↓ rul · y kopier · Esc luk";
