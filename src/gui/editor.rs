@@ -185,6 +185,10 @@ fn cached_code_job(
     // Both are hash maps/sets, so combine each entry order-independently.
     let mut refs = 0u64;
     for (k, info) in vars {
+        // Only the name and the kind, deliberately: the *editable* highlighter
+        // leaves `{{ VAR }}` in place and merely colours it, so the resolved
+        // value never reaches the buffer and hashing it would be dead cost.
+        // (`highlight_code`, which does substitute, is not cached through here.)
         refs ^= crate::gui::report_editor::fnv1a(
             k.as_bytes(),
             crate::gui::report_editor::FNV_OFFSET ^ info.kind as u64,
@@ -529,6 +533,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // be shown/coloured, and which keys the linked env shadows. Computed here
     // (before the entry is mutably borrowed by the section closure) and only
     // when the Code tab is active, since it borrows the whole collection.
+    //
+    // Deliberately rebuilt each frame rather than cached: measured at 39us for
+    // a 60-request collection against a 40-variable environment, and a cache
+    // key would have to walk the same entries and variables to notice a change,
+    // so it would cost about what it saved. The highlighter downstream *is*
+    // cached, which is where the frame time actually went.
     let (subst_vars, shadowed) = if section == EditorSection::Code {
         let env = app.session.effective_env(ci);
         (
@@ -1199,6 +1209,45 @@ mod highlight_cache_tests {
                 "disagreed on {text:?}"
             );
         }
+    }
+
+    /// The cache keys on a variable's name and kind but not its value, which is
+    /// only safe because the editable highlighter leaves the `{{ VAR }}` token
+    /// in the buffer rather than substituting into it. Pin that, so the key
+    /// would have to be widened if the Code view ever started substituting.
+    #[test]
+    fn the_editable_highlighter_shows_the_placeholder_not_the_value() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        let font = FontId::monospace(12.0);
+        let shadowed = HashSet::new();
+        let text = "GET {{ BASE }}/a";
+
+        let render = |shown: &str| {
+            let vars: HashMap<String, SubstInfo> = [(
+                "BASE".to_string(),
+                SubstInfo {
+                    shown: Some(shown.to_string()),
+                    kind: SubstKind::Literal,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut out = String::new();
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    out = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone()).text;
+                });
+            }
+            out
+        };
+
+        assert_eq!(
+            render("https://staging"),
+            text,
+            "the buffer keeps its placeholders; only their colour comes from the value"
+        );
+        assert_eq!(render("https://staging"), render("https://prod"));
     }
 
     /// The cached job must be the one the highlighter would have built, and must
