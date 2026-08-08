@@ -2273,7 +2273,8 @@ REQUEST A
 
     /// Every refusal has to distinguish "wrong kind of block" from "it's
     /// already there" — telling someone REPORT only goes on a request while
-    /// they hover a reported request is worse than saying nothing.    #[test]
+    /// they hover a reported request is worse than saying nothing.
+    #[test]
     fn a_duplicate_modifier_is_refused_as_a_duplicate_not_as_a_wrong_block() {
         let flow = parse_flow("REPORT REQUEST A\nREQUEST B\nREPORT TIER AS Plan\n")
             .expect("fixture parses");

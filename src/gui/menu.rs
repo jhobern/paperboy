@@ -796,7 +796,7 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
         if path.is_dir() {
             app.session.open_workspace(path.to_path_buf());
             app.focus = super::Focus::List;
-            app.report_editor = None;
+            app.close_report_editor();
             return Ok(());
         }
         return Err(app.strings.gui_not_a_folder.to_string());
@@ -1314,7 +1314,8 @@ mod tests {
     }
 
     /// The declared output format leads the export dialog's filters, so the
-    /// default choice is the one the report asked for.    #[test]
+    /// default choice is the one the report asked for.
+    #[test]
     fn the_reports_own_output_format_leads_the_export_filters() {
         for (ext, expected) in [("xlsx", "Excel"), ("json", "JSON"), ("html", "HTML")] {
             let filters = report_result_filters(ext);

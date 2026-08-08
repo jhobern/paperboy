@@ -1174,7 +1174,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             } else {
                 app.session.load_workspace_file(ci, path);
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.focus = super::Focus::List;
             app.session.save();
         }
@@ -1197,7 +1197,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 col.sync_folder_to_selected();
                 col.invalidate_request_json();
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.focus = super::Focus::List;
             app.session.save();
         }
@@ -1214,7 +1214,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 let n = app.session.collections[ci].entries.len();
                 app.session.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.session.save();
             app.run_active();
         }
@@ -1235,7 +1235,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             if reveal {
                 app.reveal_env = id;
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.session.save();
         }
         // Activating a file that isn't open yet has to open it first. An

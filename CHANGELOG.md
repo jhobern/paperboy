@@ -186,6 +186,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   only when the report, the requests it uses or the loaded environments actually
   change, and those warnings come out in alphabetical order.
 
+- **A running report is no longer cancelled by clicking a tab.** The report
+  editor is closed and rebuilt whenever you navigate — click a tab, open a
+  request, pick another file — and closing it dropped the run with it, which
+  cancelled the worker mid-flight and threw away every row it had already
+  collected. Runs now live alongside the editor rather than inside it: they keep
+  going while you are elsewhere, keep collecting rows, and are still there
+  (still streaming, if they haven't finished) when you come back. Two reports
+  can be in flight at once.
+
 - **`ENVS BASELINE(…) SHOW(Time)` now actually shows the baseline field.** The
   clause is meant to put the baseline's value beside the candidate's as
   `baseline.<request>.<field>`, but the copy could only see fields the rows

@@ -29,7 +29,7 @@ use crate::report::validate::{Diagnostic, Severity};
 use crate::tui::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
-use super::report_run::{self, RowState, RunHandle, RunProgress};
+use super::report_run::{self, ParkedRun, RowState, RunHandle, RunKey, RunProgress};
 use super::theme::GuiTheme;
 
 /// Which of the two editor views is shown.
@@ -156,6 +156,38 @@ impl ReportEditor {
         };
         ed.reparse();
         ed
+    }
+
+    /// What this editor's run is filed under while the editor isn't on screen.
+    pub fn run_key(&self) -> RunKey {
+        RunKey::of(&self.report)
+    }
+
+    /// Lift the run out of the editor so it can outlive it.
+    ///
+    /// Called when the editor is closed or replaced. Everything about a *run*
+    /// moves out; everything about the *view* (selection, palette, undo) goes
+    /// with the editor, because it is rebuilt from the report text anyway.
+    pub fn park_run(&mut self) -> ParkedRun {
+        ParkedRun {
+            result: self.result.take(),
+            progress: self.progress.take(),
+            run: self.run.take(),
+            results_exported: self.results_exported,
+        }
+    }
+
+    /// Take back a run parked earlier, so reopening a report shows the rows it
+    /// collected while you were elsewhere — and keeps streaming if it is still
+    /// going.
+    pub fn adopt_run(&mut self, parked: ParkedRun) {
+        self.result = parked.result;
+        self.progress = parked.progress;
+        self.run = parked.run;
+        self.results_exported = parked.results_exported;
+        if self.result.is_some() {
+            self.view = EditorView::Results;
+        }
     }
 
     /// The report file path this editor is bound to, if any.
@@ -1496,10 +1528,17 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         ed.undo();
     }
 
-    if !close {
+    if close {
+        // The editor goes, the run stays: closing the view must not cancel a
+        // report mid-flight or discard the rows it has already collected.
+        let key = ed.run_key();
+        let parked = ed.park_run();
+        if parked.is_worth_keeping() {
+            app.report_runs.insert(key, parked);
+        }
+    } else {
         app.report_editor = Some(ed);
     }
-    // (A dropped `ed` cancels any in-flight run via `RunHandle`'s `Drop`.)
 }
 
 /// The dry-run preview's contents: a notice that nothing was sent, the
@@ -9291,7 +9330,7 @@ mod results_render_tests {
         let (mut result, columns) = (first.0.clone(), first.1.clone());
         let mut a = Vec::new();
         let mut b = Vec::new();
-        let mut draw = |ctx: &egui::Context, result: &ReportResult, out: &mut Vec<f32>| {
+        let draw = |ctx: &egui::Context, result: &ReportResult, out: &mut Vec<f32>| {
             for _ in 0..2 {
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                     ui.set_max_width(4000.0);
