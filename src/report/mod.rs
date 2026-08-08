@@ -19,6 +19,7 @@ pub mod context;
 pub mod dry_run;
 pub mod edit;
 pub mod flow;
+pub mod image;
 pub mod indent;
 pub mod model;
 pub mod parser;

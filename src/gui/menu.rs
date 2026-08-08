@@ -195,18 +195,11 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
         file_menu(app, ui);
         settings_menu(app, ui);
         view_menu(app, ui);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(
-                    RichText::new(format!("{} {}", app.strings.gui_send, super::icons::PLAY))
-                        .color(app.theme.accent),
-                )
-                .on_hover_text(app.strings.gui_send_tooltip)
-                .clicked()
-            {
-                app.run_active();
-            }
-        });
+        // No Send button here. There used to be one pinned to the right of this
+        // bar, doing exactly what the Send beside the URL does (`run_active`) —
+        // but it was drawn unconditionally, so in the report editor or a
+        // workspace view it fired at whatever request happened to be selected
+        // off-screen. One Send, next to the request it sends.
     });
 }
 
@@ -807,7 +800,7 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
         if path.is_dir() {
             app.session.open_workspace(path.to_path_buf());
             app.focus = super::Focus::List;
-            app.report_editor = None;
+            app.close_report_editor();
             return Ok(());
         }
         return Err(app.strings.gui_not_a_folder.to_string());

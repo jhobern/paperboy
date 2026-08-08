@@ -57,6 +57,9 @@ pub struct VarsForm {
     /// emits two columns and so has no one name to give.
     alias: String,
     stats: Vec<(StatKind, bool)>,
+    /// An `IMAGE(…)` render hint the statement already carries. The form
+    /// doesn't expose it, but must not drop it when writing back.
+    image: Option<crate::report::flow::ImageSpec>,
 }
 
 impl VarsForm {
@@ -92,6 +95,7 @@ impl VarsForm {
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
+                image: self.image,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -105,6 +109,8 @@ pub struct ComputedForm {
     template: String,
     alias: String,
     stats: Vec<(StatKind, bool)>,
+    /// Preserved verbatim, as in [`VarsForm`].
+    image: Option<crate::report::flow::ImageSpec>,
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -382,12 +388,15 @@ fn build_vars(
     path: &[usize],
     node: &FlowNode,
 ) -> VarsForm {
-    let (chosen, alias, stats) = match node {
-        FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), String::new(), Vec::new()),
-        FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
-            (vec![var.clone()], name.clone(), stats.clone())
-        }
-        _ => (Vec::new(), String::new(), Vec::new()),
+    let (chosen, alias, stats, image) = match node {
+        FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), String::new(), Vec::new(), None),
+        FlowNode::Report(ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+        }) => (vec![var.clone()], name.clone(), stats.clone(), *image),
+        _ => (Vec::new(), String::new(), Vec::new(), None),
     };
     let entries = context::resolve_bound_collection(&app.session.collections, flow, report_path)
         .map(|ci| app.session.collections[ci].entries.as_slice())
@@ -413,6 +422,7 @@ fn build_vars(
             .iter()
             .map(|k| (*k, stats.contains(k)))
             .collect(),
+        image,
     }
 }
 
@@ -480,10 +490,12 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
             template,
             name,
             stats,
+            image,
         }) => Wizard::Computed(ComputedForm {
             path: path.to_vec(),
             template: template.clone(),
             alias: name.clone(),
+            image: *image,
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -513,8 +525,12 @@ pub fn open_with_field(ed: &mut ReportEditor, path: &[usize], index: Option<usiz
                 _ => None,
             })
     });
+    // The `IMAGE(…)` hint isn't edited here; `set_with_field` leaves the one
+    // already on the item alone, so the form has no need to carry it.
     let (index, name, query, stats) = match existing {
-        Some(WithItem::Field { name, query, stats }) => (index, name, query, stats),
+        Some(WithItem::Field {
+            name, query, stats, ..
+        }) => (index, name, query, stats),
         // Editing a non-field (bare `WITH RESPONSE`) or a stale index falls
         // through to a fresh append rather than silently doing nothing.
         _ => (None, String::new(), String::new(), Vec::new()),
@@ -1478,12 +1494,12 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             let path = f.path.clone();
             // Preserve the loop body and any WITH role globs; var/dir and the
             // PARALLEL toggle and degree are what this form edits.
-            let (body, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+            let (body, glob, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
                 Some(FlowNode::ForEach {
                     body,
-                    producer: Producer::Folders { roles, .. },
+                    producer: Producer::Folders { glob, roles, .. },
                     ..
-                }) => (body.clone(), roles.clone()),
+                }) => (body.clone(), glob.clone(), roles.clone()),
                 _ => return,
             };
             let parallel = parallel_spec(f.parallel, &f.degree);
@@ -1495,6 +1511,7 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 }),
                 producer: Producer::Folders {
                     dir: f.dir.clone(),
+                    glob,
                     roles,
                 },
                 body,
@@ -1524,6 +1541,7 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
+                image: f.image,
             });
             ed.wizard_apply(app, &path, node);
         }
@@ -1646,6 +1664,7 @@ mod tests {
             other: String::new(),
             alias: "Plan".into(),
             stats: StatKind::CHOOSABLE.iter().map(|k| (*k, false)).collect(),
+            image: None,
         };
         assert!(
             matches!(
@@ -1672,6 +1691,7 @@ mod tests {
             other: "  RUNTIME_ONLY ".into(),
             alias: String::new(),
             stats: Vec::new(),
+            image: None,
         };
         assert!(
             matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["RUNTIME_ONLY".to_string()]),

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::flow::Header;
+use super::flow::{Header, ImageSpec};
 
 /// The reserved column name that carries the ENVS comparison target (the
 /// environment name for the row). Excluded from the row *key* (it is the
@@ -66,6 +66,34 @@ pub struct ReportResult {
     /// columns at render time (a `columns:` directive's own `STATISTICS(…)`
     /// takes precedence for a column that carries both). Empty by default.
     pub column_stats: std::collections::HashMap<String, Vec<StatKind>>,
+    /// `IMAGE[(…)]` render hints requested per output-column *header* by a
+    /// `REPORT … AS <header> IMAGE(…)` statement or a `WITH` field, merged into
+    /// the resolved columns the same way `column_stats` is (a `columns:`
+    /// directive's own inline `IMAGE(…)` wins). Empty by default.
+    pub column_images: std::collections::HashMap<String, ImageSpec>,
+    /// Resolved picture bytes for `IMAGE` columns, keyed by `(row index within
+    /// [`rows`](Self::rows), output-column header)`.
+    ///
+    /// Filled during the **run**, not the write: [`super::writer::ReportWriter`]
+    /// is a pure `(&ReportResult, &Header) -> Vec<u8>` function with no IO, and
+    /// keeping it that way is what makes every writer trivially testable. The
+    /// run already has the network, the `# root:` base directory and the
+    /// `PARALLEL` workers, so resolution belongs there.
+    pub images: std::collections::HashMap<(usize, String), ImageData>,
+}
+
+/// One resolved picture: the raw encoded bytes plus the format sniffed from
+/// them. Kept as encoded bytes (rather than decoded pixels) because both
+/// writers embed the original file — xlsx stores it in `xl/media/`, HTML
+/// base64-encodes it into a `data:` URI — so decoding would only lose fidelity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    /// The MIME type sniffed from the leading magic bytes (`image/jpeg`, …).
+    pub mime: String,
+    /// Natural pixel size, used to scale proportionally when the `IMAGE` clause
+    /// fixes only one dimension.
+    pub natural: (u32, u32),
 }
 
 impl ReportResult {
@@ -91,6 +119,7 @@ impl ReportResult {
                     header: k.clone(),
                     sources: vec![k.clone()],
                     stats: Vec::new(),
+                    image: None,
                 })
                 .collect(),
         };
@@ -102,6 +131,18 @@ impl ReportResult {
                     && let Some(stats) = self.column_stats.get(&col.header)
                 {
                     col.stats = stats.clone();
+                }
+            }
+        }
+        // Likewise for `IMAGE(…)` hints, and on the same precedence rule: an
+        // inline hint in the `columns:` directive is the more specific
+        // statement of intent, so it is never overridden.
+        if !self.column_images.is_empty() {
+            for col in &mut columns {
+                if col.image.is_none()
+                    && let Some(img) = self.column_images.get(&col.header)
+                {
+                    col.image = Some(*img);
                 }
             }
         }
@@ -444,6 +485,11 @@ pub struct OutputColumn {
     pub sources: Vec<String>,
     /// Summary statistics to append after the data rows (empty = none).
     pub stats: Vec<StatKind>,
+    /// An `IMAGE[(…)]` render hint: writers that can show pictures draw this
+    /// column's cell *value* as one. The value itself is untouched, so a writer
+    /// that can't (CSV, JSON) simply writes the text. `None` = an ordinary text
+    /// column.
+    pub image: Option<ImageSpec>,
 }
 
 impl OutputColumn {
@@ -489,9 +535,10 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
             if part.is_empty() {
                 return None;
             }
-            // Peel off an optional trailing `STATISTICS(…)` clause first, then
-            // the optional ` AS <name>` rename, leaving just the sources.
-            let (part, stats) = split_statistics(part);
+            // Peel off the optional trailing `STATISTICS(…)` and `IMAGE(…)`
+            // clauses first (in either written order), then the optional
+            // ` AS <name>` rename, leaving just the sources.
+            let (part, stats, image) = split_column_clauses(part);
             let (sources_part, header) = split_as(part);
             let sources: Vec<String> = sources_part
                 .split('|')
@@ -506,9 +553,116 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
                 header,
                 sources,
                 stats,
+                image,
             })
         })
         .collect()
+}
+
+/// Peel both optional trailing clauses -- `STATISTICS(…)` and `IMAGE[(…)]` --
+/// off a column-spec, in whichever order they were written.
+///
+/// They are peeled in a loop rather than in a fixed sequence because neither
+/// order is more natural than the other, and a report that stops working
+/// because two independent clauses were typed the "wrong" way round is exactly
+/// the kind of arbitrary rule this language avoids.
+pub(crate) fn split_column_clauses(part: &str) -> (&str, Vec<StatKind>, Option<ImageSpec>) {
+    let mut rest = part;
+    let mut stats = Vec::new();
+    let mut image = None;
+    loop {
+        // Both peelers return only the text *before* the clause they found, so
+        // they have to be applied right-to-left or the outer one would throw the
+        // inner one away. The longer remainder is the clause that starts later,
+        // and so is the one to take this time round.
+        let (sr, s) = split_statistics(rest);
+        let (ir, im) = split_image(rest);
+        let take_stats = !s.is_empty() && (im.is_none() || sr.len() > ir.len());
+        let take_image = im.is_some() && (s.is_empty() || ir.len() > sr.len());
+        if take_stats {
+            stats = s;
+            rest = sr;
+        } else if take_image {
+            image = im;
+            rest = ir;
+        } else {
+            return (rest, stats, image);
+        }
+    }
+}
+
+/// Peel a trailing `IMAGE` / `IMAGE(opt, …)` clause (case-insensitive,
+/// whole-word, outside quotes) off a column-spec, returning
+/// `(remainder, spec)`. Unrecognised options inside the parentheses are
+/// dropped, exactly as unknown statistic keywords are: a typo narrows what the
+/// clause does, it never fails the whole report.
+pub(crate) fn split_image(part: &str) -> (&str, Option<ImageSpec>) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b'i' || c == b'I')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 5)
+                .is_some_and(|w| w.eq_ignore_ascii_case("image"))
+            // Whole word: `IMAGES` or `IMAGE_URL` is a column name, not a clause.
+            && part
+                .as_bytes()
+                .get(i + 5)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        {
+            let after = part[i + 5..].trim_start();
+            if let Some(inner) = after.strip_prefix('(') {
+                if let Some(close) = inner.find(')') {
+                    return (
+                        part[..i].trim_end(),
+                        Some(parse_image_opts(&inner[..close])),
+                    );
+                }
+                // An unclosed `(` isn't a clause; leave the text alone.
+            } else {
+                // The bare keyword, with defaults.
+                return (part[..i].trim_end(), Some(ImageSpec::default()));
+            }
+        }
+        i += 1;
+    }
+    (part, None)
+}
+
+/// Parse the inside of an `IMAGE(…)` clause: `HEIGHT n`, `WIDTH n`, `FIT`,
+/// comma-separated and case-insensitive.
+fn parse_image_opts(inner: &str) -> ImageSpec {
+    let mut spec = ImageSpec::default();
+    for opt in inner.split(',') {
+        let opt = opt.trim();
+        if opt.eq_ignore_ascii_case("fit") {
+            spec.fit = true;
+            continue;
+        }
+        let mut parts = opt.split_whitespace();
+        let (Some(key), Some(val)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(n) = val.parse::<u32>() else { continue };
+        if n == 0 {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("height") {
+            spec.height = Some(n);
+        } else if key.eq_ignore_ascii_case("width") {
+            spec.width = Some(n);
+        }
+    }
+    spec
 }
 
 /// Peel a trailing `STATISTICS(stat, …)` clause (case-insensitive, whole-word,
@@ -696,6 +850,7 @@ mod tests {
             header: "Status".into(),
             sources: vec!["a.status".into(), "b.status".into()],
             stats: Vec::new(),
+            image: None,
         };
         let r = row(&[("a.status", ""), ("b.status", "ok")], &[], None);
         assert_eq!(col.value(&r, "-"), "ok");
@@ -707,6 +862,7 @@ mod tests {
             header: "Name".into(),
             sources: vec!["FILE".into()],
             stats: Vec::new(),
+            image: None,
         };
         let r = row(&[], &[("FILE", "a.jpg")], None);
         assert_eq!(col.value(&r, "∅"), "a.jpg");
@@ -720,6 +876,7 @@ mod tests {
             header: "Env".into(),
             sources: vec![TARGET_COLUMN.to_string()],
             stats: Vec::new(),
+            image: None,
         };
         let r = row(&[], &[], Some("staging-au"));
         assert_eq!(col.value(&r, "-"), "staging-au");
@@ -740,6 +897,159 @@ mod tests {
         assert_eq!(cols[0].header, "Pretty time");
         assert_eq!(cols[0].sources, vec!["proc.Time"]);
         assert_eq!(cols[0].stats, vec![StatKind::Mean]);
+    }
+
+    #[test]
+    fn parse_columns_reads_image_clause_in_either_order() {
+        use crate::report::flow::ImageSpec;
+        // The `columns:` directive is a second, independent spelling of the same
+        // clauses, so it has to accept everything the flow parser does.
+        let cols = parse_columns(
+            "face.Frame AS Face IMAGE, Doc IMAGE(HEIGHT 110), Sig IMAGE(WIDTH 200, HEIGHT 100), Thumb IMAGE(FIT), Time STATISTICS(MEAN) IMAGE(HEIGHT 20), Other IMAGE(HEIGHT 20) STATISTICS(MEAN)",
+        );
+        assert_eq!(cols[0].header, "Face");
+        assert_eq!(cols[0].sources, vec!["face.Frame"]);
+        assert_eq!(cols[0].image, Some(ImageSpec::default()));
+        assert_eq!(
+            cols[1].image,
+            Some(ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            cols[2].image,
+            Some(ImageSpec {
+                width: Some(200),
+                height: Some(100),
+                fit: false
+            })
+        );
+        assert_eq!(
+            cols[3].image,
+            Some(ImageSpec {
+                fit: true,
+                ..Default::default()
+            })
+        );
+        for c in &cols[4..6] {
+            assert_eq!(c.stats, vec![StatKind::Mean], "{}", c.header);
+            assert_eq!(
+                c.image,
+                Some(ImageSpec {
+                    height: Some(20),
+                    ..Default::default()
+                }),
+                "{}",
+                c.header
+            );
+        }
+    }
+
+    /// A column with no `IMAGE` clause must stay a plain text column — the
+    /// clause is opt-in per column, never inherited from a neighbour.
+    #[test]
+    fn parse_columns_leaves_other_columns_without_an_image() {
+        let cols = parse_columns("Face IMAGE, Time");
+        assert!(cols[0].image.is_some());
+        assert_eq!(cols[1].image, None);
+    }
+
+    /// The flow's `IMAGE` clauses reach the resolved columns, but an inline
+    /// `columns:` entry for the same header wins — the same precedence the
+    /// `STATISTICS` clause already has.
+    #[test]
+    fn resolved_columns_merge_flow_images_and_inline_wins() {
+        use crate::report::flow::ImageSpec;
+        let mut res = ReportResult::default();
+        res.rows = vec![row(&[("Face", "a.png"), ("Doc", "b.png")], &[], None)];
+        res.column_order = vec!["Face".to_string(), "Doc".to_string()];
+        res.column_images.insert(
+            "Face".to_string(),
+            ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            },
+        );
+        res.column_images.insert(
+            "Doc".to_string(),
+            ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            },
+        );
+        let header = Header {
+            lines: vec![crate::report::flow::HeaderLine::Directive {
+                key: "columns".to_string(),
+                value: "Face, Doc IMAGE(HEIGHT 40)".to_string(),
+            }],
+        };
+        let cols = res.resolved_columns(&header);
+        assert_eq!(
+            cols[0].image,
+            Some(ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            }),
+            "a column with no inline clause takes the flow's"
+        );
+        assert_eq!(
+            cols[1].image,
+            Some(ImageSpec {
+                height: Some(40),
+                ..Default::default()
+            }),
+            "an inline IMAGE(…) overrides the flow's"
+        );
+    }
+
+    #[test]
+    fn image_spec_scales_proportionally_from_one_dimension() {
+        use crate::report::flow::{DEFAULT_IMAGE_HEIGHT, ImageSpec};
+        let natural = (400, 200);
+        // Height only: width follows the aspect ratio, and vice versa.
+        assert_eq!(
+            ImageSpec {
+                height: Some(100),
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            Some((200.0, 100.0))
+        );
+        assert_eq!(
+            ImageSpec {
+                width: Some(100),
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            Some((100.0, 50.0))
+        );
+        // Both given: the aspect ratio is deliberately not preserved — the
+        // report asked for an exact box.
+        assert_eq!(
+            ImageSpec {
+                width: Some(100),
+                height: Some(100),
+                fit: false
+            }
+            .scaled_size(natural),
+            Some((100.0, 100.0))
+        );
+        // Neither: the default height, scaled proportionally.
+        let h = DEFAULT_IMAGE_HEIGHT as f64;
+        assert_eq!(
+            ImageSpec::default().scaled_size(natural),
+            Some((h * 2.0, h))
+        );
+        // FIT hands sizing to the writer, so there is no box to compute.
+        assert_eq!(
+            ImageSpec {
+                fit: true,
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            None
+        );
     }
 
     #[test]

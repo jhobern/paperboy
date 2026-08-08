@@ -705,7 +705,7 @@ fn resolve_entry_by_name<'a>(
 /// so they must be treated as defined inside the loop body.
 fn producer_static_named_fields(producer: &Producer) -> Vec<String> {
     match producer {
-        Producer::Folders { roles, .. } => roles.iter().map(|(r, _)| r.clone()).collect(),
+        Producer::Folders { roles, .. } => roles.iter().map(|r| r.name.clone()).collect(),
         // ZIP/CONCAT: union the named fields from all sub-producers.
         Producer::Zip(ps) | Producer::Concat(ps) => {
             ps.iter().flat_map(producer_static_named_fields).collect()
@@ -730,7 +730,14 @@ fn warn_if_vars_undefined(
         return; // unresolvable — structural check already warned
     };
     let refs = crate::request::entry_referenced_keys(entry);
-    for var in &refs {
+    // Sorted, because `entry_referenced_keys` hands back a `HashSet` and its
+    // iteration order differs from one instance to the next. Emitting warnings
+    // straight out of it made the validation panel's contents reshuffle every
+    // time it was rebuilt, so a request with several unset variables flickered.
+    // Alphabetical is also simply the more useful order to read them in.
+    let mut refs: Vec<&String> = refs.iter().collect();
+    refs.sort();
+    for var in refs {
         if !defined.contains(var.as_str()) {
             diags.push(Diagnostic::warning(fill(
                 ctx.strings.diag_var_maybe_undefined,
@@ -848,6 +855,55 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    /// The variable-availability warnings come out of a `HashSet`, whose
+    /// iteration order differs between instances. Emitting them in that order
+    /// meant the validation panel — which is rebuilt whenever its inputs change
+    /// — reshuffled its contents each time, so a request with several unset
+    /// variables flickered. They must come out sorted, every time.
+    #[test]
+    fn variable_warnings_come_out_in_a_stable_order() {
+        use crate::hurl::HurlEntry;
+        let entry = HurlEntry {
+            title: "req".into(),
+            method: "GET".into(),
+            url: "http://x/{{alpha}}/{{bravo}}?q={{charlie}}".into(),
+            body: Some("{\"d\":\"{{delta}}\",\"e\":\"{{echo}}\",\"f\":\"{{foxtrot}}\"}".into()),
+            ..Default::default()
+        };
+        let entries = [entry];
+        let titles = vec!["req".to_string()];
+        let flow = parse_flow("# collection: c\nREQUEST req\n").expect("parses");
+        let run = || {
+            let ctx = Context {
+                request_titles: Some(&titles),
+                request_entries: Some(&entries),
+                base_var_names: Some(&[]),
+                ..Default::default()
+            };
+            validate(&flow, &ctx)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning)
+                .map(|d| d.message)
+                // The flow emits no columns, which earns a warning of its own -
+                // not what this test is about.
+                .filter(|m| m.contains("{{"))
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        assert_eq!(first.len(), 6, "one warning per variable: {first:?}");
+        // The order is not merely repeatable, it is alphabetical - so it also
+        // stays put as unrelated variables are added and removed.
+        let order: Vec<&str> = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"].into();
+        for (msg, name) in first.iter().zip(&order) {
+            assert!(msg.contains(name), "expected {name} in {msg}");
+        }
+        // A fresh `HashSet` is built on every call, so repeating the walk is
+        // what would shake out an order that depends on it.
+        for i in 0..50 {
+            assert_eq!(first, run(), "run {i} produced a different order");
+        }
     }
 
     fn errors(src: &str, titles: Option<&[String]>, envs: Option<&[String]>) -> Vec<String> {

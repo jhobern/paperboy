@@ -29,7 +29,7 @@ use crate::report::validate::{Diagnostic, Severity};
 use crate::tui::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
-use super::report_run::{self, RowState, RunHandle, RunProgress};
+use super::report_run::{self, ParkedRun, RowState, RunHandle, RunKey, RunProgress};
 use super::theme::GuiTheme;
 
 /// Which of the two editor views is shown.
@@ -64,6 +64,10 @@ pub struct ReportEditor {
     /// that line the way the terminal UI does.
     pub parse_error_line: Option<usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The [`context::diagnostics_fingerprint`] the current `diagnostics` were
+    /// computed from. Validation is re-run only when this changes, so it happens
+    /// on an edit rather than on every frame — see that function for why.
+    diag_key: Option<u64>,
     /// The selected node's path (a sequence of indices into nested loop
     /// bodies). Empty = the synthetic `Begin` root.
     pub selection: Vec<usize>,
@@ -157,6 +161,7 @@ impl ReportEditor {
             parse_error: None,
             parse_error_line: None,
             diagnostics: Vec::new(),
+            diag_key: None,
             selection: Vec::new(),
             palette: None,
             undo: Vec::new(),
@@ -173,6 +178,38 @@ impl ReportEditor {
         };
         ed.reparse();
         ed
+    }
+
+    /// What this editor's run is filed under while the editor isn't on screen.
+    pub fn run_key(&self) -> RunKey {
+        RunKey::of(&self.report)
+    }
+
+    /// Lift the run out of the editor so it can outlive it.
+    ///
+    /// Called when the editor is closed or replaced. Everything about a *run*
+    /// moves out; everything about the *view* (selection, palette, undo) goes
+    /// with the editor, because it is rebuilt from the report text anyway.
+    pub fn park_run(&mut self) -> ParkedRun {
+        ParkedRun {
+            result: self.result.take(),
+            progress: self.progress.take(),
+            run: self.run.take(),
+            results_exported: self.results_exported,
+        }
+    }
+
+    /// Take back a run parked earlier, so reopening a report shows the rows it
+    /// collected while you were elsewhere — and keeps streaming if it is still
+    /// going.
+    pub fn adopt_run(&mut self, parked: ParkedRun) {
+        self.result = parked.result;
+        self.progress = parked.progress;
+        self.run = parked.run;
+        self.results_exported = parked.results_exported;
+        if self.result.is_some() {
+            self.view = EditorView::Results;
+        }
     }
 
     /// The report file path this editor is bound to, if any.
@@ -366,10 +403,22 @@ impl ReportEditor {
     }
 
     /// Stop an in-flight run, retaining whatever partial grid has streamed in.
+    ///
+    /// The handle is retired *now* — cancelled and dropped, taking our end of
+    /// the channel with it — rather than left in place until the worker's `Done`
+    /// arrives. Cancelling only stops new requests being fired; an in-flight one
+    /// still has to finish, and a `PARALLEL` batch can take a while to wind
+    /// down, during which `is_running()` would keep reporting the run as live
+    /// and the Run button would stay a Stop button. Retiring immediately means
+    /// the very next click starts a fresh run. The detached worker keeps
+    /// draining in the background; its remaining messages land on a dropped
+    /// receiver and are ignored. Mirrors the TUI's `prepare_report_run`.
     fn stop_run(&mut self, app: &mut GuiApp) {
-        if let Some(h) = &self.run {
+        if let Some(h) = self.run.take() {
             h.cancel();
         }
+        // Clear streaming progress so no row is left rendering as "running".
+        // The partial grid in `self.result` is intentionally kept.
         self.progress = None;
         app.session.status = Some(Status::ReportRunStopped);
     }
@@ -791,17 +840,19 @@ fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
             glob: Some(glob.clone().unwrap_or_default()),
             tail: String::new(),
         },
-        // A `FOLDERS` loop's `WITH role="glob"` list is several named globs
-        // rather than one, so it stays in the wizard and is shown as the tail.
-        Producer::Folders { dir, roles } => LoopEdit {
+        // `FOLDERS` takes the same `MATCH` glob as `FILES` (matching the folder
+        // name, and recursing when it contains `**`), so it gets the same box.
+        // Its `WITH role="glob"` list is several named globs rather than one, so
+        // that part stays in the wizard and is shown as the tail.
+        Producer::Folders { dir, glob, roles } => LoopEdit {
             var,
             keyword: "IN FOLDERS".to_string(),
             dir: Some((dir.clone(), false)),
-            glob: None,
+            glob: Some(glob.clone().unwrap_or_default()),
             tail: if roles.is_empty() {
                 String::new()
             } else {
-                let rs: Vec<String> = roles.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+                let rs: Vec<String> = roles.iter().map(role_label).collect();
                 format!("WITH {}", rs.join(", "))
             },
         },
@@ -826,6 +877,14 @@ fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
 
 /// A producer with no single path, rendered as the label the loop head used to
 /// carry. Mirrors `flow::producer_text`, which is private to the model.
+/// A single `WITH` role binding as it is written in the source, so the chip's
+/// tail reads back exactly what the file says — including the `?` that marks a
+/// role as optional.
+fn role_label(r: &crate::report::flow::RoleBinding) -> String {
+    let opt = if r.optional { "?" } else { "" };
+    format!("{}=\"{}\"{opt}", r.name, r.glob)
+}
+
 fn producer_label(p: &crate::report::flow::Producer) -> String {
     use crate::report::flow::{Element, Producer};
     fn element(e: &Element) -> String {
@@ -855,7 +914,10 @@ fn producer_label(p: &crate::report::flow::Producer) -> String {
             Some(g) => format!("FILES \"{dir}\" MATCH \"{g}\""),
             None => format!("FILES \"{dir}\""),
         },
-        Producer::Folders { dir, .. } => format!("FOLDERS \"{dir}\""),
+        Producer::Folders { dir, glob, .. } => match glob {
+            Some(g) => format!("FOLDERS \"{dir}\" MATCH \"{g}\""),
+            None => format!("FOLDERS \"{dir}\""),
+        },
         Producer::Tuples { path } => format!("TUPLES FROM \"{path}\""),
     }
 }
@@ -997,6 +1059,7 @@ fn build_node_chips(
             template,
             name,
             stats,
+            ..
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -1276,6 +1339,14 @@ enum Act {
         path: Vec<usize>,
         index: usize,
     },
+    /// Attach `STATISTICS(…)` to the `WITH` field at `index` of the report
+    /// request at `path` — the drop a `WITH` field row accepts. Its own action
+    /// rather than an [`Act::AttachMod`] because a field is addressed by
+    /// (path, index) and isn't a `FlowNode` a modifier can be attached to.
+    AttachWithStats {
+        path: Vec<usize>,
+        index: usize,
+    },
     /// A header-strip chip committed a `# key: value` directive; `None` removes
     /// the directive (see [`edit::set_header`]).
     SetHeader {
@@ -1322,19 +1393,38 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.ctx().request_repaint();
     }
 
-    // Recompute diagnostics against the current collections/envs each frame
-    // (cheap; keeps the Run gate and panel live as the bound collection changes).
-    ed.diagnostics = match &ed.flow {
-        Some(flow) => context::report_diagnostics(
-            &app.session.collections,
-            &app.session.global_envs,
-            app.session.active_env_id,
-            flow,
-            ed.report.path.as_deref(),
-            &app.strings,
-        ),
-        None => Vec::new(),
-    };
+    // Revalidate against the current collections/envs, but only when one of the
+    // inputs has actually changed. Doing it per frame re-ran a deep-cloning walk
+    // dozens of times a second and — because parts of it are driven by hash-set
+    // iteration — reshuffled the panel each time, so the warnings visibly
+    // flickered whenever the mouse moved (see `diagnostics_fingerprint`).
+    match &ed.flow {
+        Some(flow) => {
+            let key = context::diagnostics_fingerprint(
+                &app.session.collections,
+                &app.session.global_envs,
+                app.session.active_env_id,
+                flow,
+                ed.report.path.as_deref(),
+                &app.strings,
+            );
+            if ed.diag_key != Some(key) {
+                ed.diagnostics = context::report_diagnostics(
+                    &app.session.collections,
+                    &app.session.global_envs,
+                    app.session.active_env_id,
+                    flow,
+                    ed.report.path.as_deref(),
+                    &app.strings,
+                );
+                ed.diag_key = Some(key);
+            }
+        }
+        None => {
+            ed.diagnostics.clear();
+            ed.diag_key = None;
+        }
+    }
 
     // ── Header: name, dirty marker, Run / Save / Close ─────────────────────
     ui.horizontal(|ui| {
@@ -1507,10 +1597,17 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         None => {}
     }
 
-    if !close {
+    if close {
+        // The editor goes, the run stays: closing the view must not cancel a
+        // report mid-flight or discard the rows it has already collected.
+        let key = ed.run_key();
+        let parked = ed.park_run();
+        if parked.is_worth_keeping() {
+            app.report_runs.insert(key, parked);
+        }
+    } else {
         app.report_editor = Some(ed);
     }
-    // (A dropped `ed` cancels any in-flight run via `RunHandle`'s `Drop`.)
 }
 
 /// The dry-run preview's contents: a notice that nothing was sent, the
@@ -1667,6 +1764,72 @@ fn highlight_job(
         }
     }
     job
+}
+
+/// [`highlight_job`], reused between frames while nothing it depends on has
+/// changed.
+///
+/// `TextEdit` asks its layouter for a job on every frame, and building one
+/// re-tokenises the whole document — around 270µs for a 200-line report, on
+/// every frame, whether or not a key was pressed. Cloning a cached job costs a
+/// fraction of that, and handing it to `layout_job` as before leaves egui's own
+/// galley cache in charge of the actual text layout (which is what keeps this
+/// correct across a font or scale change).
+#[allow(clippy::too_many_arguments)]
+fn cached_highlight_job(
+    ui: &egui::Ui,
+    id: egui::Id,
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    th: &GuiTheme,
+    font: egui::FontId,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let key = highlight_key(text, ctx, spec, &font, wrap_width);
+    if let Some((cached_key, job)) = ui.data(|d| d.get_temp::<(u64, egui::text::LayoutJob)>(id))
+        && cached_key == key
+    {
+        return job;
+    }
+    let job = highlight_job(text, ctx, spec, th, font, wrap_width);
+    ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
+    job
+}
+
+/// Everything [`highlight_job`] reads, in one number.
+///
+/// **Maintenance:** anything the highlighter starts colouring by has to be
+/// added here, or the colours will stop following it.
+fn highlight_key(
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    font: &egui::FontId,
+    wrap_width: f32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The document itself dominates, so it is hashed with the cheap mixer
+    // rather than a SipHash pass over every byte.
+    fnv1a(text.as_bytes(), FNV_OFFSET).hash(&mut h);
+    ctx.error_line.hash(&mut h);
+    ctx.collection_resolves.hash(&mut h);
+    // Both name sets are hash sets, so their iteration order is not stable:
+    // combine each name's hash with `^` so the key depends on the membership
+    // and not on the order it comes out in.
+    let mut names = 0u64;
+    for e in &ctx.loaded_envs {
+        names ^= fnv1a(e.as_bytes(), FNV_OFFSET);
+    }
+    for r in &ctx.request_names {
+        names ^= fnv1a(r.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    }
+    names.hash(&mut h);
+    spec.hash(&mut h);
+    font.size.to_bits().hash(&mut h);
+    wrap_width.to_bits().hash(&mut h);
+    h.finish()
 }
 
 /// The byte offset of char index `at` in `text` (clamped to the end).
@@ -1846,12 +2009,13 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let hl = highlight_ctx(ed, app);
     let spec = app.session.active_theme_spec();
     let th = app.theme;
-    // The layout job is rebuilt on every keystroke, so egui's galley cache is
-    // what keeps this cheap: an unchanged job hashes to the same key and the
-    // laid-out text is reused.
+    // `TextEdit` asks for a job every frame; re-tokenising the whole document
+    // that often is the expensive part, so it is cached and egui's galley cache
+    // still handles the layout itself.
+    let job_id = egui::Id::new("report_source_highlight");
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let job = highlight_job(buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        let job = cached_highlight_job(ui, job_id, buf.as_str(), &hl, &spec, &th, font, wrap_width);
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
     egui::ScrollArea::vertical()
@@ -2330,9 +2494,104 @@ fn fitted_column_widths(
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
     let icon_w = if show_icons { 18.0 + SPACING_X } else { 0.0 };
-    let natural = natural_column_widths(ui, result, columns);
+    let natural = cached_natural_widths(ui, result, columns);
     let avail = (ui.available_width() - icon_w).max(0.0);
+    // Fitting is pure arithmetic over the naturals, so it stays uncached and
+    // the grid still follows the window as it is dragged.
     fit_column_widths(&natural, avail, SPACING_X)
+}
+
+/// [`natural_column_widths`], reused between frames while nothing it depends on
+/// has changed.
+///
+/// Measuring is not cheap — a `String` per cell, a text layout per column, and
+/// a full pass over the summary rows — and the grid is redrawn on every frame,
+/// including the ones where all that happened was the mouse moving. The widths
+/// only depend on the values, the columns and the font, so they are kept in
+/// egui's own per-frame memory (rather than on `ReportEditor`) because the grid
+/// is drawn by free functions that are also called from the dry-run preview and
+/// from tests.
+fn cached_natural_widths(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> Vec<f32> {
+    let key = widths_fingerprint(ui, result, columns);
+    let id = egui::Id::new("report_grid_widths");
+    if let Some((cached_key, widths)) = ui.data(|d| d.get_temp::<(u64, Vec<f32>)>(id))
+        && cached_key == key
+    {
+        return widths;
+    }
+    let widths = natural_column_widths(ui, result, columns);
+    ui.data_mut(|d| d.insert_temp(id, (key, widths.clone())));
+    widths
+}
+
+/// FNV-1a's starting value.
+pub(super) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, continuing from `seed`.
+///
+/// Used instead of a `DefaultHasher` per cell in [`widths_fingerprint`]: the
+/// fingerprint runs over every cell of the table on every frame, and building a
+/// SipHash state for each of tens of thousands of cells costs more than hashing
+/// their bytes does. This is not a hash anyone attacks — it guards a cache of
+/// column widths — so the cheap mixing function is the right one.
+pub(super) fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = seed;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Everything [`natural_column_widths`] reads, in one number.
+///
+/// This hashes the cell *text* rather than something cheaper like the row
+/// count, because a streaming run replaces rows in place: the grid is built as
+/// a skeleton of empty rows and each one is overwritten as its result arrives,
+/// so a key that only counted rows would pin the columns at the width of an
+/// empty table for the whole run. Hashing the text is still far less work than
+/// laying it out — no allocation, one pass — which is what makes the cache
+/// worth having rather than a second copy of the same cost.
+///
+/// **Maintenance:** anything `natural_column_widths` starts reading has to be
+/// added here too, or the widths will stop following it.
+fn widths_fingerprint(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The font decides how wide any of it renders.
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    font.size.to_bits().hash(&mut h);
+    format!("{:?}", font.family).hash(&mut h);
+    result.no_match_marker.hash(&mut h);
+    for col in columns {
+        col.header.hash(&mut h);
+        // A column's own definition decides what it pulls out of each row, and
+        // its statistics decide whether there are summary rows to measure.
+        format!("{:?}", col.stats).hash(&mut h);
+        format!("{:?}", col.sources).hash(&mut h);
+    }
+    result.rows.len().hash(&mut h);
+    for row in &result.rows {
+        // `cells` and `vars` are hash maps, so their iteration order changes
+        // from run to run. Combining each entry's hash with `^` makes the
+        // fingerprint depend on the contents and not on the order they come
+        // out in — the same trap that made the validation panel flicker.
+        let mut cells = 0u64;
+        for (k, v) in row.cells.iter().chain(&row.vars) {
+            cells ^= fnv1a(k.as_bytes(), fnv1a(v.as_bytes(), FNV_OFFSET));
+        }
+        cells.hash(&mut h);
+        row.target.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Lay a cell's content out in a slot exactly `w` wide.
@@ -2368,6 +2627,10 @@ fn natural_column_widths(
     columns: &[crate::report::model::OutputColumn],
 ) -> Vec<f32> {
     let font = egui::TextStyle::Body.resolve(ui.style());
+    // Computed once, not once per column: `summary_rows` walks every row of
+    // every column, so calling it inside the per-column loop below made finding
+    // the widths quadratic in the number of columns.
+    let summary = result.summary_rows(columns);
     // Leave room for the cell's own padding so text isn't flush against the
     // next column.
     let pad = 6.0;
@@ -2397,7 +2660,7 @@ fn natural_column_widths(
                     &col.value(row, &result.no_match_marker),
                 )));
             }
-            for srow in result.summary_rows(columns) {
+            for srow in &summary {
                 consider(truncate_cell(&flatten_cell(&srow.text_cell(c))));
             }
             measure(&col.header).max(measure(&longest))
@@ -2626,15 +2889,22 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                         header_strip(ed, app, ui, &mut acts);
                         ui.add_space(4.0);
                         let mut lift = DragLift::default();
+                        let mut hovers: Vec<RowHover> = Vec::new();
                         for (i, row) in rows.iter().enumerate() {
                             let selected = row.path == ed.selection
                                 && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
                             let drop_pos = insert_pos_after(&rows, i);
-                            block_row(
+                            if let Some(h) = block_row(
                                 ed, app, ui, row, i, selected, &drop_pos, &titles, &mut lift,
                                 &mut acts,
-                            );
+                            ) {
+                                hovers.push(h);
+                            }
                         }
+                        // Now that every row has been measured, light the block
+                        // under the pointer and everything a drag would take
+                        // with it (see `paint_hover_group`).
+                        paint_hover_group(ui, &th, &hovers);
                         // A report with no steps is where every new report
                         // starts, and an empty gap between BEGIN and END says
                         // nothing about what to do next — the palette's own
@@ -2926,6 +3196,37 @@ fn dragged_chip(ctx: &egui::Context) -> Option<(Vec<usize>, DetachWhich)> {
 /// therefore lifts only itself; a loop lifts its whole body in one piece.
 fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
     row_path.starts_with(dragged)
+}
+
+/// How strongly a row is highlighted while the pointer rests on a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HoverTier {
+    /// The hovered block itself. A `FOR` loop is *two* rows at this tier — its
+    /// header and its `END` — because those are the two halves of one block, and
+    /// lighting only the half under the pointer made a loop look like it ended
+    /// somewhere it doesn't.
+    Block,
+    /// A row that isn't the block but travels with it: the body of a hovered
+    /// loop. Softer, because it answers a different question ("and this comes
+    /// too") from the block under the pointer.
+    CarriedAlong,
+}
+
+/// The highlight `row_path` earns while `hovered` is the block under the
+/// pointer, or `None` if it is unaffected.
+///
+/// Deliberately the same subtree rule as [`row_is_lifted`] — the highlight's
+/// whole promise is "this is what a drag would pick up", so if the two ever
+/// disagreed the preview would be a lie. A leaf therefore lights only itself; a
+/// loop lights its body and its `END` as well.
+fn hover_tier(hovered: &[usize], row_path: &[usize]) -> Option<HoverTier> {
+    if !row_is_lifted(hovered, row_path) {
+        None
+    } else if row_path.len() == hovered.len() {
+        Some(HoverTier::Block)
+    } else {
+        Some(HoverTier::CarriedAlong)
+    }
 }
 
 /// `rect` with the row's indent trimmed off its left edge: the block's own
@@ -3335,6 +3636,26 @@ fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
     }
 }
 
+/// A row's geometry and its reserved background slot, collected as the rows are
+/// laid out so the hover highlight can be painted once the whole pane has been
+/// walked and the block under the pointer is known.
+///
+/// The slot matters: the highlight has to sit *behind* the row's chips, but
+/// which rows light up isn't decided until every row has been measured (hovering
+/// a loop header lights rows that haven't been laid out yet). Reserving a shape
+/// index up-front and filling it in at the end gets both — a background that is
+/// genuinely in the background, with no frame of lag.
+struct RowHover {
+    path: Vec<usize>,
+    kind: RowKind,
+    /// The block's own bounds, with the indent trimmed off (see
+    /// [`indented_content`]) so the highlight hugs the block rather than
+    /// starting at the far-left margin.
+    rect: egui::Rect,
+    bg: egui::layers::ShapeIdx,
+    pointer_inside: bool,
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -3346,9 +3667,13 @@ fn block_row(
     titles: &[String],
     lift: &mut DragLift,
     acts: &mut Vec<Act>,
-) {
+) -> Option<RowHover> {
     let th = app.theme;
     let s = &app.strings;
+    // Reserved *before* any of the row's own content, so whatever the hover
+    // highlight later puts here is painted underneath the chips rather than over
+    // them. Filled in by `paint_hover_group` once every row has been laid out.
+    let bg_slot = ui.painter().add(egui::Shape::Noop);
     // Loaded environment names — the choices a BASELINE/COMPARISON dropdown
     // offers. Cheap to gather; only consulted by env-role chips.
     let env_choices: Vec<String> = app
@@ -3621,11 +3946,23 @@ fn block_row(
         // whole subtree under the pointer is applied once every row has been
         // painted (see `DragLift`), never from here.
         lift.add(layer_id, content, is_drag_head);
-        return;
+        return None;
     }
     let block = ui.vertical(block_body);
     let cluster = block.inner;
     let block_rect = block.response.rect;
+    // The block's own bounds (indent stripped), and whether the pointer is over
+    // them. `rect_contains_pointer` rather than an `interact` so this purely
+    // observational read never competes with the row's chips or its drop zones
+    // for the click.
+    let hover_rect = indented_content(block_rect, row.depth);
+    let hover = RowHover {
+        path: row.path.clone(),
+        kind: row.kind,
+        rect: hover_rect,
+        bg: bg_slot,
+        pointer_inside: ui.rect_contains_pointer(hover_rect),
+    };
 
     // ── Modifier drop zone: dropping a modifier chip onto a real node attaches
     // it. Only reacts to `Modifier` payloads, so it never competes with the base
@@ -3802,6 +4139,68 @@ fn block_row(
         paint_drop_silhouette(ui, origin, &dragged_block_shape(ui), clip, &th);
         ui.add_space(gap);
     }
+    Some(hover)
+}
+
+/// The block under the pointer, if any: the *last* matching row, so a nested row
+/// wins over the loop whose rect happens to reach it.
+///
+/// The synthetic `Begin` row is never a candidate. Its path is empty, which
+/// every other path starts with, so treating it as hoverable would light the
+/// entire report the moment the pointer crossed the top of the pane — and
+/// `Begin` isn't a block you can select or move anyway, so the highlight would
+/// be promising something that can't happen.
+fn hovered_block(rows: &[RowHover]) -> Option<&[usize]> {
+    rows.iter()
+        .rev()
+        .find(|r| r.pointer_inside && r.kind != RowKind::Begin)
+        .map(|r| r.path.as_slice())
+}
+
+/// Paint the hover highlight: a filled panel behind the block under the pointer,
+/// and a softer one behind everything that would travel with it.
+///
+/// Skipped entirely while something is being dragged. A drag already says what
+/// is in hand — the lifted subtree floats under the pointer and leaves dashed
+/// ghosts behind — and adding a second, differently-shaped highlight to that
+/// only muddled which of the two to read.
+fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
+    if drag_in_flight(ui.ctx()) {
+        return;
+    }
+    let Some(hovered) = hovered_block(rows) else {
+        return;
+    };
+    // Derived from the panel colour rather than fixed, so the highlight stays a
+    // gentle lift off the background on a light theme as well as a dark one.
+    let block = mix(th.panel, th.accent, 0.28);
+    let carried = mix(th.panel, th.accent, 0.12);
+    for row in rows {
+        let Some(tier) = hover_tier(hovered, &row.path) else {
+            continue;
+        };
+        let fill = match tier {
+            HoverTier::Block => block,
+            HoverTier::CarriedAlong => carried,
+        };
+        ui.painter().set(
+            row.bg,
+            egui::Shape::rect_filled(
+                row.rect.expand2(egui::vec2(4.0, 1.0)),
+                egui::CornerRadius::same(4),
+                fill,
+            ),
+        );
+    }
+}
+
+/// Whether anything at all is currently being dragged in the block editor — a
+/// palette block, a modifier clause or an existing row. Each travels as its own
+/// payload type, so all three have to be asked.
+fn drag_in_flight(ctx: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<DragItem>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<NodeKind>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<Modifier>(ctx)
 }
 
 /// Render the `WITH … END` fields of a report-request as a nested block under
@@ -3829,7 +4228,9 @@ fn with_block(
                     // The field's own STATISTICS(…) belongs on its row: leaving
                     // it out made a clause that is plainly there in the source
                     // invisible in the block editor.
-                    WithItem::Field { name, query, stats } => {
+                    WithItem::Field {
+                        name, query, stats, ..
+                    } => {
                         let mut t = format!("{name}: {query}");
                         if !stats.is_empty() {
                             t.push_str(&format!(
@@ -3869,6 +4270,58 @@ fn with_block(
                 // item is edited/removed via its `×` only.
                 if lbl.clicked() && matches!(item, WithItem::Field { .. }) {
                     acts.push(Act::EditWith {
+                        path: path.to_vec(),
+                        index: i,
+                    });
+                }
+                // A `WITH` field is a report column with a name of its own, so
+                // it is what a `STATISTICS` clause attaches to — the request
+                // line above has no single column to summarise. The row is
+                // therefore its own drop target: without one the clause bounced
+                // off every part of a `WITH` block, and there was no way at all
+                // to add a summary to a field by dragging.
+                let zone = egui::Rect::from_x_y_ranges(
+                    lbl.rect.left()..=ui.max_rect().right(),
+                    lbl.rect.y_range(),
+                );
+                let zresp = ui.interact(
+                    zone,
+                    ui.id().with(("pt_withstats", path, i)),
+                    egui::Sense::hover(),
+                );
+                if let Some(m) = zresp.dnd_hover_payload::<Modifier>() {
+                    let ok = *m == Modifier::Statistics && edit::with_stats_applies(items, i);
+                    ui.painter().rect_stroke(
+                        zone.expand(2.0),
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(2.0, if ok { th.accent } else { th.err }),
+                        egui::StrokeKind::Outside,
+                    );
+                    // The refusals a field row can give differ from a node's, so
+                    // they are spelled out here rather than through
+                    // `Modifier::reject_reason` (which only speaks about nodes).
+                    if !ok {
+                        let why = if *m != Modifier::Statistics {
+                            s.mod_reject_with_field
+                        } else {
+                            s.mod_reject_present
+                        };
+                        egui::Tooltip::always_open(
+                            ui.ctx().clone(),
+                            ui.layer_id(),
+                            ui.id().with(("pt_withwhy", path, i)),
+                            egui::PopupAnchor::Pointer,
+                        )
+                        .show(|ui| {
+                            ui.colored_label(th.err, why);
+                        });
+                    }
+                }
+                if let Some(m) = release_payload::<Modifier>(&zresp)
+                    && *m == Modifier::Statistics
+                    && edit::with_stats_applies(items, i)
+                {
+                    acts.push(Act::AttachWithStats {
                         path: path.to_vec(),
                         index: i,
                     });
@@ -6153,6 +6606,12 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 });
                 ed.selection = path;
             }
+            Act::AttachWithStats { path, index } => {
+                ed.edit_flow(|flow| {
+                    edit::attach_with_stats(flow, &path, index);
+                });
+                ed.selection = path;
+            }
         }
     }
     sync_back(ed, app);
@@ -8108,6 +8567,80 @@ mod tests {
         );
     }
 
+    /// The hover highlight must promise exactly what a drag delivers, so it is
+    /// keyed off the same subtree rule — but split into two tiers so "this
+    /// block" and "and this comes with it" read differently.
+    #[test]
+    fn hover_lights_the_block_strongly_and_its_body_softly() {
+        // A leaf lights only itself.
+        assert_eq!(hover_tier(&[2], &[2]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2], &[1]), None);
+        assert_eq!(hover_tier(&[2], &[3]), None);
+
+        // A loop's body and its nested rows come along, one tier down.
+        assert_eq!(hover_tier(&[2], &[2, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[2, 1, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[1, 0]), None);
+        assert_eq!(hover_tier(&[2], &[20]), None);
+
+        // Hovering a row *inside* a loop lights that row, not the loop around
+        // it: dragging it out takes only itself.
+        assert_eq!(hover_tier(&[2, 1], &[2, 1]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2, 1], &[2]), None);
+        assert_eq!(hover_tier(&[2, 1], &[2, 0]), None);
+
+        // Every row the highlight touches is a row the drag would lift, and
+        // vice versa — the two must never disagree.
+        for path in [vec![2], vec![2, 0], vec![2, 1, 0], vec![3], vec![1, 0]] {
+            assert_eq!(
+                hover_tier(&[2], &path).is_some(),
+                row_is_lifted(&[2], &path),
+                "hover and lift disagree about {path:?}"
+            );
+        }
+    }
+
+    /// The block under the pointer is the innermost one: a `FOR` header and a
+    /// row in its body can both contain the pointer, and the body row is the one
+    /// the user is pointing at.
+    #[test]
+    fn hovered_block_prefers_the_innermost_row_and_ignores_begin() {
+        fn row(path: &[usize], kind: RowKind, inside: bool) -> RowHover {
+            RowHover {
+                path: path.to_vec(),
+                kind,
+                rect: egui::Rect::ZERO,
+                bg: egui::layers::ShapeIdx(0),
+                pointer_inside: inside,
+            }
+        }
+        let rows = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::LoopHead, true),
+            row(&[0, 0], RowKind::Leaf, true),
+            row(&[0], RowKind::LoopEnd, false),
+        ];
+        assert_eq!(hovered_block(&rows), Some([0, 0].as_slice()));
+
+        // Begin is never the answer, even when it is the only row the pointer is
+        // over — its empty path would light the whole report.
+        let only_begin = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::Leaf, false),
+        ];
+        assert_eq!(hovered_block(&only_begin), None);
+
+        // A loop's END stands in for the loop, so pointing at it lights the
+        // whole block.
+        let on_end = vec![
+            row(&[0], RowKind::LoopHead, false),
+            row(&[0, 0], RowKind::Leaf, false),
+            row(&[0], RowKind::LoopEnd, true),
+        ];
+        assert_eq!(hovered_block(&on_end), Some([0].as_slice()));
+        assert_eq!(hover_tier(&[0], &[0]), Some(HoverTier::Block));
+    }
+
     #[test]
     fn origin_ghost_paints_without_panicking() {
         let ctx = egui::Context::default();
@@ -8596,13 +9129,27 @@ mod loop_chip_tests {
     }
 
     /// A `FOLDERS … WITH role="glob"` list is several named globs rather than
-    /// one, so it stays with the wizard and is shown as plain text.
+    /// one, so it stays with the wizard and is shown as plain text. Its single
+    /// `MATCH` glob, however, is the same one box `FILES` gets -- offered empty
+    /// when the loop has none, so the way to narrow the walk is visible.
     #[test]
     fn a_folders_loops_role_list_is_left_as_text_beside_its_editable_folder() {
         let l = loop_edit("FOR d IN FOLDERS \"envs\" WITH req=\"*.hurl\"\n  REQUEST A\nEND\n");
         assert_eq!(l.dir, Some(("envs".to_string(), false)));
-        assert_eq!(l.glob, None);
+        assert_eq!(l.glob, Some(String::new()));
         assert_eq!(l.tail, "WITH req=\"*.hurl\"");
+    }
+
+    /// A recursive, filtered `FOLDERS` walk: the `MATCH` glob fills the same box
+    /// `FILES` uses, and an optional role keeps its `?` in the tail so the chip
+    /// reads back exactly what the file says.
+    #[test]
+    fn a_folders_loop_shows_its_match_glob_in_the_glob_box() {
+        let l = loop_edit(
+            "FOR d IN FOLDERS \"cases\" MATCH \"**/case_*\" WITH front=\"*f.jpg\", back=\"*b.jpg\"?\n  REQUEST A\nEND\n",
+        );
+        assert_eq!(l.glob, Some("**/case_*".to_string()));
+        assert_eq!(l.tail, "WITH front=\"*f.jpg\", back=\"*b.jpg\"?");
     }
 
     /// A pattern that binds more than one name has no single thing a box could
@@ -8920,6 +9467,7 @@ mod results_render_tests {
                 header: h.to_string(),
                 sources: vec![h.to_string()],
                 stats: Vec::new(),
+                image: None,
             })
             .collect();
         let mut result = ReportResult::default();
@@ -8931,6 +9479,232 @@ mod results_render_tests {
             result.rows.push(row);
         }
         (result, columns)
+    }
+
+    /// The source editor asks its layouter for a job on every frame, so the job
+    /// is cached — but it has to follow every input the highlighter colours by.
+    #[test]
+    fn the_highlight_key_notices_every_input_it_guards() {
+        use crate::tui::report_highlight::HlCtx;
+        let text = "REPORT REQUEST login AS l\n";
+        let ctx = HlCtx {
+            error_line: None,
+            collection_resolves: true,
+            loaded_envs: ["dev".to_string()].into_iter().collect(),
+            request_names: ["login".to_string()].into_iter().collect(),
+        };
+        let spec = crate::theme::default_preset();
+        let font = egui::FontId::monospace(12.0);
+        let key = |t: &str, c: &HlCtx, s: &crate::theme::ThemeSpec, f: &egui::FontId, w: f32| {
+            super::highlight_key(t, c, s, f, w)
+        };
+        let base = key(text, &ctx, &spec, &font, 800.0);
+
+        assert_ne!(
+            base,
+            key("REPORT REQUEST logout AS l\n", &ctx, &spec, &font, 800.0),
+            "the source text"
+        );
+
+        let mut c = ctx.clone();
+        c.error_line = Some(1);
+        assert_ne!(base, key(text, &c, &spec, &font, 800.0), "the error line");
+
+        c.error_line = None;
+        c.collection_resolves = false;
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "whether the collection binds — it is what makes a name green"
+        );
+
+        c.collection_resolves = true;
+        c.request_names = ["other".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which requests exist"
+        );
+
+        c.request_names = ctx.request_names.clone();
+        c.loaded_envs = ["prod".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which environments are loaded"
+        );
+
+        let other_theme = crate::theme::preset_for_language(&crate::i18n::Language::French);
+        assert_ne!(
+            base,
+            key(text, &ctx, &other_theme, &font, 800.0),
+            "the theme, which is where every colour comes from"
+        );
+
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &egui::FontId::monospace(18.0), 800.0),
+            "the font size"
+        );
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &font, 400.0),
+            "the wrap width, which the job carries"
+        );
+
+        // Two contexts holding the same names in a different insertion order are
+        // the same context: both are hash sets, and iterating one straight into
+        // the hasher is what made the validation panel flicker.
+        let mut same = ctx.clone();
+        same.request_names.insert("zzz".to_string());
+        same.request_names.remove("zzz");
+        assert_eq!(
+            base,
+            key(text, &same, &spec, &font, 800.0),
+            "the same set is the same key"
+        );
+    }
+
+    /// Render the grid twice in one context, so the second pass sees whatever
+    /// the first left in egui's memory, and report the widths each time.
+    fn widths_across_two_frames(
+        first: &(ReportResult, Vec<OutputColumn>),
+        then: impl FnOnce(&mut ReportResult),
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ctx = egui::Context::default();
+        let (mut result, columns) = (first.0.clone(), first.1.clone());
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let draw = |ctx: &egui::Context, result: &ReportResult, out: &mut Vec<f32>| {
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_max_width(4000.0);
+                    ui.set_min_width(4000.0);
+                    // The *natural* widths are what is cached; fitting them to
+                    // the window is pure arithmetic on top.
+                    *out = super::cached_natural_widths(ui, result, &columns);
+                });
+            }
+        };
+        draw(&ctx, &result, &mut a);
+        then(&mut result);
+        draw(&ctx, &result, &mut b);
+        (a, b)
+    }
+
+    /// The widths are cached between frames, and a streaming run replaces its
+    /// rows **in place** — the grid starts as a skeleton of empty rows that are
+    /// overwritten as results arrive. A cache keyed on anything less than the
+    /// cell text would therefore pin the columns at the width of an empty table
+    /// for the whole run.
+    #[test]
+    fn cached_widths_follow_a_row_that_is_filled_in_place() {
+        let empty = fixture(&["Result"], &[""], 4);
+        let (before, after) = widths_across_two_frames(&empty, |result| {
+            for row in &mut result.rows {
+                row.cells.insert(
+                    "Result".to_string(),
+                    "a much longer value than the header".to_string(),
+                );
+            }
+        });
+        assert!(
+            after[0] > before[0] + 20.0,
+            "the column grew for the arriving values: {before:?} then {after:?}"
+        );
+    }
+
+    /// The same table two frames running must measure the same, or the columns
+    /// would twitch as the mouse moves.
+    #[test]
+    fn cached_widths_are_stable_when_nothing_changes() {
+        let table = fixture(&["A", "B"], &["one", "two"], 5);
+        let (before, after) = widths_across_two_frames(&table, |_| {});
+        assert_eq!(before, after);
+    }
+
+    /// The fingerprint is hand-maintained, so it gets the same contract test the
+    /// validation cache has: it must move for every input the measurement reads.
+    #[test]
+    fn the_width_fingerprint_notices_every_input_it_guards() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (base_res, base_cols) = fixture(&["A"], &["one"], 2);
+            let base = super::widths_fingerprint(ui, &base_res, &base_cols);
+
+            let mut r = base_res.clone();
+            r.rows[0]
+                .cells
+                .insert("A".to_string(), "changed".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a cell's text"
+            );
+
+            let mut r = base_res.clone();
+            r.rows.push(ReportRow::default());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a new row"
+            );
+
+            let mut r = base_res.clone();
+            r.no_match_marker = "\u{2014}".to_string();
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the no-match marker, which is what an empty cell renders as"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].target = Some("staging".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the row's ENVS target"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].vars.insert("v".to_string(), "x".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a variable a columns: directive could show"
+            );
+
+            let (_, wider) = fixture(&["A Much Longer Header"], &["one"], 2);
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &wider),
+                "the column header"
+            );
+
+            let mut cols = base_cols.clone();
+            cols[0].stats = vec![crate::report::model::StatKind::Count];
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &cols),
+                "statistics, which add summary rows to measure"
+            );
+
+            // Two rows whose cells were inserted in a different order are the
+            // same table, and must not look like a change: `cells` is a hash
+            // map, and iterating one straight into the hasher is exactly what
+            // made the validation panel flicker.
+            let (a, cols2) = fixture(&["A", "B"], &["one", "two"], 1);
+            let mut b = ReportResult::default();
+            let mut row = ReportRow::default();
+            row.cells.insert("B".to_string(), "two".to_string());
+            row.cells.insert("A".to_string(), "one".to_string());
+            b.rows.push(row);
+            assert_eq!(
+                super::widths_fingerprint(ui, &a, &cols2),
+                super::widths_fingerprint(ui, &b, &cols2),
+                "insertion order is not a difference"
+            );
+        });
     }
 
     /// The widths the grid would give `columns` in a window `avail` wide, and
@@ -9243,5 +10017,106 @@ mod toolbar_commit_tests {
             ed.report.text
         );
         assert!(ed.view == EditorView::Results, "and the button still acted");
+    }
+}
+
+#[cfg(test)]
+mod stop_run_tests {
+    use super::*;
+    use crate::gui::report_run::{RunUpdate, test_handle};
+    use crate::report::Report;
+    use crate::report::model::{ReportResult, ReportRow};
+    use crate::session::Session;
+
+    fn editor() -> (GuiApp, ReportEditor) {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::scratch("nightly"));
+        let ed = app.report_editor.take().expect("editor is open");
+        (app, ed)
+    }
+
+    fn result_with(cell: &str) -> ReportResult {
+        let mut res = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), cell.to_string());
+        res.rows.push(row);
+        res
+    }
+
+    /// Stopping used to only raise the cancel flag and leave the handle in
+    /// place, so `is_running()` stayed true — and the button stayed a Stop
+    /// button — until the worker's `Done` finally arrived. Cancelling doesn't
+    /// abort an in-flight request, and a `PARALLEL` batch can take a long time
+    /// to wind down, so the report was unrunnable for a while. The TUI retires
+    /// the run at once; so must this.
+    #[test]
+    fn stopping_frees_the_report_to_be_run_again_at_once() {
+        let (mut app, mut ed) = editor();
+        let (handle, tx) = test_handle();
+        ed.run = Some(handle);
+        assert!(ed.is_running(), "a live handle is a live run");
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            !ed.is_running(),
+            "the run is retired immediately, without waiting for the worker"
+        );
+        assert!(matches!(app.session.status, Some(Status::ReportRunStopped)));
+
+        // The worker is still alive and still winding down: it has not sent
+        // `Done`, and sending now must not resurrect the run.
+        assert!(
+            tx.send(RunUpdate::Done(ReportResult::default())).is_err(),
+            "our end of the channel went with the handle, so late updates \
+             land nowhere rather than being folded in"
+        );
+        assert!(!ed.is_running());
+    }
+
+    /// Retiring the handle must not take the partial grid with it: rows that
+    /// completed before the stop keep their real responses, and the user can
+    /// still read, save or export them.
+    #[test]
+    fn stopping_keeps_the_rows_that_already_arrived_but_clears_the_progress() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        ed.run = Some(handle);
+        ed.result = Some(result_with("200"));
+        ed.progress = Some(crate::gui::report_run::RunProgress {
+            states: vec![crate::gui::report_run::RowState::Running],
+            index: Default::default(),
+            done: 0,
+            total: 1,
+        });
+
+        ed.stop_run(&mut app);
+
+        assert_eq!(
+            ed.result.as_ref().map(|r| r.rows.len()),
+            Some(1),
+            "the partial grid survives the stop"
+        );
+        assert!(
+            ed.progress.is_none(),
+            "but no row is left rendering as still running"
+        );
+    }
+
+    /// The cancel flag still has to be raised, or the detached worker would
+    /// carry on firing requests at the network after the user stopped it.
+    #[test]
+    fn stopping_still_tells_the_worker_to_wind_down() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let flag = handle.cancel_flag_for_test();
+        ed.run = Some(handle);
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "dropping our end alone would not stop the worker: it watches the flag"
+        );
     }
 }

@@ -451,7 +451,9 @@ fn draw_report_node_request_overlay(
             }
             FormRow::With(wi) => {
                 let text = match form.with.get(wi) {
-                    Some(crate::report::flow::WithItem::Field { name, query, stats }) => {
+                    Some(crate::report::flow::WithItem::Field {
+                        name, query, stats, ..
+                    }) => {
                         let stats = if stats.is_empty() {
                             String::new()
                         } else {
@@ -4045,6 +4047,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             "REPORT COL AS N STATISTICS(MEAN)",
                             s.help_grammar_statistics,
                         ),
+                        ("REPORT COL AS N IMAGE(HEIGHT 110)", s.help_grammar_image),
                         ("WITH Name: query [STATISTICS]", s.help_grammar_with),
                         ("Result", s.help_grammar_result),
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
@@ -4060,7 +4063,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("LIST NAME = SRC", s.help_grammar_list),
                         ("[ \"a\", (\"x\",\"y\") ]", s.help_grammar_list_literal),
                         ("FILES \"dir\" [MATCH \"g\"]", s.help_grammar_files),
-                        ("FOLDERS \"dir\" [WITH r=\"g\"]", s.help_grammar_folders),
+                        (
+                            "FOLDERS \"dir\" [MATCH \"g\"] [WITH r=\"g\"[?]]",
+                            s.help_grammar_folders,
+                        ),
                         ("TUPLES FROM \"data.csv\"", s.help_grammar_tuples),
                         ("ZIP(a, b, …)", s.help_grammar_zip),
                         ("CONCAT(a, b, …)", s.help_grammar_concat),

@@ -359,6 +359,7 @@ impl NodeKind {
                 template: "value".into(),
                 name: "column".into(),
                 stats: Vec::new(),
+                image: None,
             }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
@@ -377,6 +378,7 @@ impl NodeKind {
                 pattern: Pattern::single("FOLDER"),
                 producer: Producer::Folders {
                     dir: String::new(),
+                    glob: None,
                     roles: Vec::new(),
                 },
                 body: Vec::new(),
@@ -673,8 +675,8 @@ pub(crate) fn vars_in_scope(
                     push(name, &mut out);
                 }
                 if let Producer::Folders { roles, .. } = producer {
-                    for (role, _) in roles {
-                        push(role, &mut out);
+                    for role in roles {
+                        push(&role.name, &mut out);
                     }
                 }
                 nodes = body;
@@ -792,6 +794,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     name: "field".into(),
                     query: "HttpStatus".into(),
                     stats: Vec::new(),
+                    image: None,
                 });
             }
         }
@@ -805,6 +808,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     var,
                     name: "name".into(),
                     stats: Vec::new(),
+                    image: None,
                 });
             }
             _ => {}
@@ -841,6 +845,40 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
         },
     }
     true
+}
+
+/// Attach `STATISTICS(COUNT)` to the `WITH` field at `index` of the report
+/// request at `path`, returning whether anything changed.
+///
+/// A `WITH` field is a report column in its own right — it has a name, and the
+/// grammar lets it carry its own `STATISTICS(…)` — but it is not a `FlowNode`,
+/// so [`attach_modifier`] (which addresses nodes by path) can't reach it. That
+/// left the block editor able to *show* a field's `STATISTICS` while giving no
+/// way to add one: the clause bounced off the `WITH` row, and dropping it on the
+/// request line above attaches to nothing, because a request's columns are named
+/// by its fields rather than by the request.
+///
+/// `COUNT` is the seed for the same reason it is in [`attach_to_node`]: it is
+/// the one statistic that means something for a text column as well as a numeric
+/// one. The field wizard refines it.
+pub(crate) fn attach_with_stats(flow: &mut ReportFlow, path: &[usize], index: usize) -> bool {
+    let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path) else {
+        return false;
+    };
+    match with.get_mut(index) {
+        Some(WithItem::Field { stats, .. }) if stats.is_empty() => {
+            *stats = vec![StatKind::Count];
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether [`attach_with_stats`] would do anything — i.e. whether the `WITH`
+/// item at `index` is a named field that hasn't already got a `STATISTICS`
+/// clause. Drives the drop highlight, so the preview and the drop agree.
+pub(crate) fn with_stats_applies(with: &[WithItem], index: usize) -> bool {
+    matches!(with.get(index), Some(WithItem::Field { stats, .. }) if stats.is_empty())
 }
 
 /// Report the variable a `SET` assignment at `path` defines: insert a
@@ -1078,7 +1116,7 @@ pub(crate) fn set_loop_glob(flow: &mut ReportFlow, path: &[usize], text: &str) -
     let t = text.trim();
     match node_at_mut(flow, path) {
         Some(FlowNode::ForEach {
-            producer: Producer::Files { glob, .. },
+            producer: Producer::Files { glob, .. } | Producer::Folders { glob, .. },
             ..
         }) => {
             let next = (!t.is_empty()).then(|| t.to_string());
@@ -1156,6 +1194,7 @@ pub(crate) fn add_with_field(
             name: name.to_string(),
             query: query.to_string(),
             stats,
+            image: None,
         });
         Some(with.len() - 1)
     } else {
@@ -1179,6 +1218,9 @@ pub(crate) fn set_with_field(
             name: n,
             query: q,
             stats: st,
+            // The form doesn't edit the `IMAGE(…)` hint, so it is left alone
+            // rather than being cleared by an unrelated rename.
+            image: _,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
@@ -1432,6 +1474,7 @@ impl CarriedMod {
                         var,
                         name: name.clone(),
                         stats: Vec::new(),
+                        image: None,
                     });
                 }
                 _ => {}
@@ -2178,6 +2221,56 @@ REQUEST A
         );
     }
 
+    /// A `WITH` field is the report column a request actually names, so it is
+    /// what STATISTICS attaches to — the request line above summarises nothing.
+    /// The block editor could show a field's STATISTICS but had no way to add
+    /// one, because a field isn't a node a modifier can be dropped on.
+    #[test]
+    fn statistics_attaches_to_a_with_field() {
+        let mut flow =
+            parse_flow("REPORT REQUEST svc WITH\n    Elapsed: Time\n    RESPONSE RAW\nEND\n")
+                .expect("fixture parses");
+        // The request line itself still refuses it: its columns are its fields.
+        assert!(
+            !attach_modifier(&mut flow, &[0], Modifier::Statistics),
+            "a report request names no single column"
+        );
+
+        assert!(
+            with_stats_applies(with_of(&flow), 0),
+            "a named field takes it"
+        );
+        assert!(attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            flow.to_text().contains("Elapsed: Time STATISTICS(COUNT)"),
+            "the clause lands on the field: {}",
+            flow.to_text()
+        );
+
+        // Only once, and never on a bare `WITH RESPONSE` item (which has no name
+        // to put a column under) or a field that isn't there.
+        assert!(!with_stats_applies(with_of(&flow), 0), "already has one");
+        assert!(!attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            !with_stats_applies(with_of(&flow), 1),
+            "RESPONSE RAW is not a column"
+        );
+        assert!(!attach_with_stats(&mut flow, &[0], 1));
+        assert!(!attach_with_stats(&mut flow, &[0], 9), "no such field");
+
+        // And it round-trips back through the parser as a field clause.
+        let again = parse_flow(&flow.to_text()).expect("reparses");
+        assert_eq!(again.to_text(), flow.to_text());
+    }
+
+    /// The `WITH` items of the report request at the root of `flow`.
+    fn with_of(flow: &ReportFlow) -> &[WithItem] {
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { with, .. }) => with,
+            other => panic!("expected a report request, got {other:?}"),
+        }
+    }
+
     /// Every refusal has to distinguish "wrong kind of block" from "it's
     /// already there" — telling someone REPORT only goes on a request while
     /// they hover a reported request is worse than saying nothing.
@@ -2657,7 +2750,9 @@ REQUEST A
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
                 assert!(matches!(
                     &with[0],
-                    WithItem::Field { name, query, stats }
+                    WithItem::Field {
+                        name, query, stats, ..
+                    }
                         if name == "Code"
                             && query == "HttpStatus"
                             && stats == &[StatKind::Count, StatKind::Mean]

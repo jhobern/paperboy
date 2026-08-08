@@ -159,13 +159,62 @@ pub enum ReportStmt {
         var: String,
         name: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
     },
-    /// `REPORT "<template>" AS <name> [STATISTICS(…)]` — a computed column.
+    /// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE(…)]` — a computed
+    /// column.
     Computed {
         template: String,
         name: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
     },
+}
+
+/// An `IMAGE[(HEIGHT n | WIDTH n | FIT, …)]` clause on a column.
+///
+/// This is a **render hint, never a value**: the cell's text stays exactly what
+/// it was (a path, a URL, a base64 blob), and `IMAGE` only tells a writer that
+/// can show pictures to draw that value as one. That is what keeps CSV and JSON
+/// exports lossless, keeps baseline comparison textual, and lets a format with
+/// no picture support degrade to the text automatically rather than needing a
+/// fallback rule of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageSpec {
+    /// Target height in pixels. With no `width`, the picture scales
+    /// proportionally to this height.
+    pub height: Option<u32>,
+    /// Target width in pixels. With no `height`, the picture scales
+    /// proportionally to this width.
+    pub width: Option<u32>,
+    /// `FIT`: size the picture to the cell rather than to a fixed box.
+    pub fit: bool,
+}
+
+/// The height, in pixels, an `IMAGE` column's pictures are drawn at when the
+/// clause names no size. Chosen to match the row height the reports this
+/// feature was built for use, so a bare `IMAGE` produces a usable report.
+pub const DEFAULT_IMAGE_HEIGHT: u32 = 110;
+
+impl ImageSpec {
+    /// The `(width, height)` box to scale a picture of `(w, h)` natural pixels
+    /// into, preserving aspect ratio unless both dimensions were given.
+    /// `None` for a `FIT` spec, whose sizing is the writer's business.
+    pub fn scaled_size(&self, natural: (u32, u32)) -> Option<(f64, f64)> {
+        if self.fit {
+            return None;
+        }
+        let (nw, nh) = (natural.0.max(1) as f64, natural.1.max(1) as f64);
+        Some(match (self.width, self.height) {
+            (Some(w), Some(h)) => (w as f64, h as f64),
+            (Some(w), None) => (w as f64, w as f64 * nh / nw),
+            (None, Some(h)) => (h as f64 * nw / nh, h as f64),
+            (None, None) => {
+                let h = DEFAULT_IMAGE_HEIGHT as f64;
+                (h * nw / nh, h)
+            }
+        })
+    }
 }
 
 /// An item inside a `REPORT REQUEST … WITH … END` block.
@@ -181,6 +230,7 @@ pub enum WithItem {
         name: String,
         query: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
     },
 }
 
@@ -198,10 +248,14 @@ pub enum Producer {
     List(Vec<Element>),
     /// `FILES "dir" [MATCH "glob"]`.
     Files { dir: String, glob: Option<String> },
-    /// `FOLDERS "dir" [WITH role="glob", …]`.
+    /// `FOLDERS "dir" [MATCH "glob"] [WITH role="glob"[?], …]`.
+    ///
+    /// `glob` filters subfolder *names* the way `FILES … MATCH` filters file
+    /// names, and likewise recurses when it contains `**`.
     Folders {
         dir: String,
-        roles: Vec<(String, String)>,
+        glob: Option<String>,
+        roles: Vec<RoleBinding>,
     },
     /// `TUPLES FROM "file"`.
     Tuples { path: String },
@@ -212,6 +266,35 @@ pub enum Producer {
     Concat(Vec<Producer>),
     /// A previously declared `LIST` referenced by name.
     Named(String),
+}
+
+/// One `FOLDERS … WITH role="glob"` binding: the role name, the glob that picks
+/// its file inside each folder, and whether the role is **optional**.
+///
+/// A required role must match exactly one file. An optional role (written with a
+/// trailing `?`) may match none — it then binds the empty string, so a group
+/// missing a genuinely optional input (a document with no back side, a folder
+/// with no expected-result file) still produces a row instead of failing the
+/// run. Matching *more* than one file is an error either way: ambiguity is never
+/// silently resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleBinding {
+    pub name: String,
+    pub glob: String,
+    pub optional: bool,
+}
+
+#[cfg(test)]
+impl RoleBinding {
+    /// A required role (the default form) -- a test convenience, since the
+    /// parser and the editors always build the struct literally.
+    pub fn required(name: impl Into<String>, glob: impl Into<String>) -> Self {
+        RoleBinding {
+            name: name.into(),
+            glob: glob.into(),
+            optional: false,
+        }
+    }
 }
 
 /// One element of a list literal: a scalar or a tuple.
@@ -348,6 +431,53 @@ impl ReportFlow {
         let mut out = std::collections::HashMap::new();
         collect_column_stats(&self.nodes, &mut out);
         out
+    }
+
+    /// Collect the per-column `IMAGE[(…)]` render hints requested anywhere in
+    /// the flow, keyed by output-column header, exactly as
+    /// [`column_stats`](Self::column_stats) does for statistics — the two
+    /// clauses attach at the same three places and are resolved the same way.
+    pub fn column_images(&self) -> std::collections::HashMap<String, ImageSpec> {
+        let mut out = std::collections::HashMap::new();
+        collect_column_images(&self.nodes, &mut out);
+        out
+    }
+}
+
+fn collect_column_images(
+    nodes: &[FlowNode],
+    out: &mut std::collections::HashMap<String, ImageSpec>,
+) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, image, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, image, .. }) => {
+                if let Some(img) = image {
+                    out.insert(name.clone(), *img);
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        image: Some(img),
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"), *img);
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_images(body, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -492,9 +622,19 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                         WithItem::ResponseFmt(fmt) => {
                             let _ = writeln!(out, "RESPONSE {}", fmt_text(*fmt));
                         }
-                        WithItem::Field { name, query, stats } => {
-                            let _ =
-                                writeln!(out, "{}: {query}{}", name_text(name), stats_text(stats));
+                        WithItem::Field {
+                            name,
+                            query,
+                            stats,
+                            image,
+                        } => {
+                            let _ = writeln!(
+                                out,
+                                "{}: {query}{}{}",
+                                name_text(name),
+                                stats_text(stats),
+                                image_text(image.as_ref())
+                            );
                         }
                     }
                 }
@@ -509,25 +649,33 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 let _ = writeln!(out, "REPORT ({})", vars.join(", "));
             }
         }
-        ReportStmt::VarAs { var, name, stats } => {
+        ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+        } => {
             let _ = writeln!(
                 out,
-                "REPORT {var} AS {}{}",
+                "REPORT {var} AS {}{}{}",
                 name_text(name),
-                stats_text(stats)
+                stats_text(stats),
+                image_text(image.as_ref())
             );
         }
         ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {} AS {}{}",
+                "REPORT {} AS {}{}{}",
                 quote(template),
                 name_text(name),
-                stats_text(stats)
+                stats_text(stats),
+                image_text(image.as_ref())
             );
         }
     }
@@ -541,6 +689,30 @@ fn stats_text(stats: &[StatKind]) -> String {
     }
     let list: Vec<&str> = stats.iter().map(|s| s.keyword()).collect();
     format!(" STATISTICS({})", list.join(", "))
+}
+
+/// Render an `IMAGE[(…)]` clause (with a leading space), or the empty string
+/// when the column carries none. A spec with no options round-trips as the bare
+/// keyword rather than `IMAGE()`, which is how it is written.
+pub(crate) fn image_text(image: Option<&ImageSpec>) -> String {
+    let Some(img) = image else {
+        return String::new();
+    };
+    let mut opts: Vec<String> = Vec::new();
+    if img.fit {
+        opts.push("FIT".to_string());
+    }
+    if let Some(w) = img.width {
+        opts.push(format!("WIDTH {w}"));
+    }
+    if let Some(h) = img.height {
+        opts.push(format!("HEIGHT {h}"));
+    }
+    if opts.is_empty() {
+        " IMAGE".to_string()
+    } else {
+        format!(" IMAGE({})", opts.join(", "))
+    }
 }
 
 fn fmt_text(fmt: ResponseFmt) -> &'static str {
@@ -578,16 +750,22 @@ fn producer_text(p: &Producer) -> String {
             Some(g) => format!("FILES {} MATCH {}", quote(dir), quote(g)),
             None => format!("FILES {}", quote(dir)),
         },
-        Producer::Folders { dir, roles } => {
-            if roles.is_empty() {
-                format!("FOLDERS {}", quote(dir))
-            } else {
+        Producer::Folders { dir, glob, roles } => {
+            let mut out = format!("FOLDERS {}", quote(dir));
+            if let Some(g) = glob {
+                out.push_str(&format!(" MATCH {}", quote(g)));
+            }
+            if !roles.is_empty() {
                 let rs: Vec<String> = roles
                     .iter()
-                    .map(|(k, v)| format!("{k}={}", quote(v)))
+                    .map(|r| {
+                        let opt = if r.optional { "?" } else { "" };
+                        format!("{}={}{opt}", r.name, quote(&r.glob))
+                    })
                     .collect();
-                format!("FOLDERS {} WITH {}", quote(dir), rs.join(", "))
+                out.push_str(&format!(" WITH {}", rs.join(", ")));
             }
+            out
         }
         Producer::Tuples { path } => format!("TUPLES FROM {}", quote(path)),
         Producer::Zip(ps) => {
@@ -807,15 +985,30 @@ fn report_label(stmt: &ReportStmt) -> String {
                 format!("REPORT ({})", vars.join(", "))
             }
         }
-        ReportStmt::VarAs { var, name, stats } => {
-            format!("REPORT {var} AS {name}{}", stats_text(stats))
+        ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+        } => {
+            format!(
+                "REPORT {var} AS {name}{}{}",
+                stats_text(stats),
+                image_text(image.as_ref())
+            )
         }
         ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
         } => {
-            format!("REPORT {} AS {name}{}", quote(template), stats_text(stats))
+            format!(
+                "REPORT {} AS {name}{}{}",
+                quote(template),
+                stats_text(stats),
+                image_text(image.as_ref())
+            )
         }
     }
 }

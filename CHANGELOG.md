@@ -8,6 +8,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.8.0] - 2026-08-08
+
+### Added
+
+- **PaperTrail columns can hold pictures (`IMAGE`).** A column whose value is a
+  picture *source* — an image URL the response handed back, a path on disk, a
+  `data:` URI or a bare base64 blob — can be marked `IMAGE`, and every export
+  that can show a picture draws it instead of the text:
+
+  ```
+  REPORT REQUEST face AS f WITH
+      Frame: jsonpath "$.best_frame.url" IMAGE(HEIGHT 110)
+      Score: jsonpath "$.best_frame.score"
+  END
+  ```
+
+  The clause goes wherever `STATISTICS(…)` goes — on a `REPORT … AS …`, on a
+  computed column, on a `WITH` field, or inline in `# columns:` — and takes
+  `HEIGHT n`, `WIDTH n` (either alone scales proportionally, both together fix
+  the box) or `FIT` to size to the cell. With no options a picture is drawn
+  110 px high.
+
+  `IMAGE` is a **render hint, never a value**: the cell keeps its text. That is
+  what keeps the CSV and JSON exports byte-for-byte what they were, keeps
+  baseline snapshots textual, and lets a format that can't show pictures fall
+  back to the text with no rule of its own. The **xlsx** export embeds the
+  picture (widening the column and heightening the row to fit) and keeps the
+  source as its alt text; **HTML** inlines it as a `data:` URI so the export
+  stays a single self-contained file.
+
+  Where the picture comes from is worked out from the **value's shape**, so one
+  clause covers every case and a report never has to declare which kind it
+  meant. A value that can't be turned into a picture leaves the cell as text and
+  records a note — a broken thumbnail must never fail a report. `IMAGE` columns
+  are left out of baseline/`ENVS` comparison, because picture URLs are usually
+  signed and expiring and diffing them would flag every row while burying the
+  changes that matter. A **dry run** still resolves local paths and `data:`
+  URIs, but never fetches a URL: a run that reports "no requests sent" must not
+  quietly have made a hundred GETs.
+
+- **PaperTrail `FOLDERS` loops can now walk a nested tree.** `FOR CASE IN
+  FOLDERS "inputs" MATCH "**/case_*"` takes the same `MATCH` glob `FILES`
+  already took: it filters folder **names**, and recurses through the tree when
+  the glob contains `**` (a bare `MATCH "**"` filters nothing and simply visits
+  every folder at every depth). Previously `FOLDERS` could only see the
+  immediate children of one directory, so an input set laid out as
+  `<type>/<batch>/<case>/` — the shape most test corpora actually have — had to
+  be flattened by hand before a report could be run over it.
+
+  Because a recursive walk necessarily passes through container folders that
+  hold no case files, such a folder is now **skipped** rather than failing the
+  run: a recursive walk *searches* a tree for the folders that fit the shape.
+  A flat `FOLDERS "cases"` walk still *enumerates* a set you named, so there a
+  mis-shaped member remains a loud error, exactly as before.
+
+  In both editors the glob box that `FILES` loops offer is now offered for
+  `FOLDERS` loops too, so the way to narrow (or deepen) the walk is visible
+  rather than something you have to know to type.
+
+- **`FOLDERS … WITH` roles can be marked optional** with a trailing `?`:
+  `WITH front="*_front.*", back="*_back.*"?`. An optional role that matches no
+  file binds the empty string instead of failing the run, so a genuinely
+  optional input — a document with no back side, a case with no expected-result
+  file — no longer forces you to either split the corpus in two or drop the
+  role entirely. Matching *more* than one file stays an error whether or not
+  the role is optional: PaperTrail will not pick one of two candidates for you,
+  because the choice would silently depend on directory order.
+
+
 ## [0.7.3] - 2026-08-08
 
 ### Added
@@ -148,7 +217,97 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   kept as its original JSON rather than converted into an empty one, so
   converting can never cost you data.
 
+### Added
+
+- **Hovering a block in the visual report editor highlights it — and everything
+  that would move with it.** Pointing at a line lights that block, and pointing
+  at a `FOR` loop also lights its whole body and its `END`, so what a drag is
+  about to pick up is visible before the drag starts rather than only once the
+  block is in mid-air.
+
+- **`STATISTICS` can be dropped onto a `WITH` field.** A request's `WITH` fields
+  are the columns it actually produces, and the grammar has always allowed a
+  summary on one — but the block editor had nowhere to drop it, because a field
+  isn't a block. Each field row is now its own drop target, and the request line
+  above it explains why it refuses (it names no single column of its own).
+
+### Changed
+
+- **The visual report editor's Send button is gone from the menu bar.** It ran
+  whatever request was selected in the active collection — the same thing the
+  Send button beside the URL does — but it was drawn on every screen, including
+  ones with no request in sight, so it could fire at something off-screen. The
+  keyboard shortcuts it advertised now appear on the real Send button.
+
+- **Key/value tables give their Description column room to be read.** The key
+  and value columns between them claimed the entire width, leaving the note a
+  sliver a word wouldn't fit in; all three now take a share. The column titles
+  also sit where the fields below them will be even when the table is empty, so
+  adding the first row no longer makes the headings jump apart.
+
+- **The workspace tree and the results grid are no longer rebuilt on every
+  frame.** Drawing the workspace list re-read the whole folder tree off disk —
+  a recursive directory scan sixty times a second, so simply moving the mouse
+  over a workspace was continuous filesystem I/O. Drawing a results grid
+  re-measured every cell in the table to size its columns, and computed the
+  `STATISTICS` summary rows once *per column* while doing it. Both now reuse
+  their last answer until something they depend on actually changes: about 8×
+  less work for the tree and 6× for the grid, and more on a large workspace or
+  a long report.
+
+  The tree is re-read whenever PaperBoy itself creates, moves or deletes a
+  file, and otherwise at most a few times a second, so a change made outside
+  PaperBoy (another editor, a `git pull`) still appears without a refresh.
+
+- **Syntax highlighting is no longer recomputed on every frame.** Both the
+  PaperTrail source editor and the request Code view re-ran their highlighter
+  over the entire buffer each frame — every keyword, `{{ VAR }}` and error line
+  re-classified sixty times a second for text that hadn't changed. Each now
+  keeps its last colouring and rebuilds only when something it depends on
+  moves: the text, the error line, the loaded environments, the request names,
+  the theme, the font size or the wrap width.
+
+  The Code view was additionally running a *second*, complete highlighting pass
+  purely to find out which kinds of substitution appeared in the buffer, so it
+  could label the legend beneath it — and threw the coloured result away. That
+  pass is now a plain scan that only answers that question.
+
 ### Fixed
+
+- **Stopping a report in the visual editor stops it now, not eventually.** Stop
+  raised the worker's cancel flag but kept hold of the run, so the button stayed
+  a Stop button — and the report stayed unrunnable — until the worker actually
+  wound down. Cancelling never aborts a request already in flight, and a
+  `PARALLEL` batch has a lot of them, so the wait could be a long one. The run
+  is now retired the moment you stop it and the next click starts a fresh one,
+  matching the terminal UI. Rows that had already come back are kept, so you can
+  still read, save or export a partial result.
+
+- **The report validation panel no longer flickers when the mouse moves.** Two
+  separate causes: the warnings were re-derived on every frame (a full
+  revalidation, dozens of times a second, even though nothing had changed), and
+  the per-request variable warnings were emitted straight out of a hash set, so
+  each rebuild shuffled them into a different order. Validation is now re-run
+  only when the report, the requests it uses or the loaded environments actually
+  change, and those warnings come out in alphabetical order.
+
+- **A running report is no longer cancelled by clicking a tab.** The report
+  editor is closed and rebuilt whenever you navigate — click a tab, open a
+  request, pick another file — and closing it dropped the run with it, which
+  cancelled the worker mid-flight and threw away every row it had already
+  collected. Runs now live alongside the editor rather than inside it: they keep
+  going while you are elsewhere, keep collecting rows, and are still there
+  (still streaming, if they haven't finished) when you come back. Two reports
+  can be in flight at once.
+
+- **`ENVS BASELINE(…) SHOW(Time)` now actually shows the baseline field.** The
+  clause is meant to put the baseline's value beside the candidate's as
+  `baseline.<request>.<field>`, but the copy could only see fields the rows
+  already carried — and an intrinsic like `Time` is suppressed on any request
+  that declares its own `[Reports]`/`WITH` fields. The result was that the
+  documented example produced no baseline column at all, in the results grid or
+  in any export. Naming an intrinsic in a baseline `SHOW(…)` now keeps it on the
+  rows, exactly as naming it in the request's own `SHOW(…)` does.
 
 - **The dry-run preview now shows its grid the way the results view does.**
   The preview wrapped every line, so a wide grid folded over several lines and

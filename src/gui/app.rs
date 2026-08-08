@@ -168,6 +168,15 @@ pub struct GuiApp {
     /// if any. Opened from the reports list or a Workspace tree `.trail` file;
     /// takes over the centre pane while present. See [`report_editor`].
     pub report_editor: Option<report_editor::ReportEditor>,
+    /// Report runs that currently have no editor on screen, by
+    /// [`RunKey`](super::report_run::RunKey).
+    ///
+    /// The editor is a view that gets dropped and rebuilt whenever the user
+    /// clicks a tab or opens another file; a run must survive that, both because
+    /// dropping its handle cancels the worker and because the rows it has
+    /// already collected are the whole point of having run it.
+    pub report_runs:
+        std::collections::HashMap<super::report_run::RunKey, super::report_run::ParkedRun>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
     pub postman: super::postman::PostmanUi,
@@ -263,6 +272,7 @@ impl GuiApp {
             code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,
+            report_runs: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
             postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
@@ -298,6 +308,7 @@ impl GuiApp {
             code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,
+            report_runs: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
             postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
@@ -376,6 +387,45 @@ impl GuiApp {
         }
     }
 
+    /// Close the report editor, keeping its run alive.
+    ///
+    /// Every path that takes the editor off screen goes through here rather
+    /// than assigning `None`, because assigning `None` drops the
+    /// [`RunHandle`](super::report_run::RunHandle) — which cancels the worker
+    /// and throws away the rows it had already collected.
+    pub fn close_report_editor(&mut self) {
+        let Some(mut ed) = self.report_editor.take() else {
+            return;
+        };
+        let key = ed.run_key();
+        let parked = ed.park_run();
+        if parked.is_worth_keeping() {
+            self.report_runs.insert(key, parked);
+        } else {
+            self.report_runs.remove(&key);
+        }
+    }
+
+    /// Keep every parked run moving, and repaint while any is still going.
+    ///
+    /// A run that nobody is looking at still has to fold its streamed rows into
+    /// its grid, so that coming back to it shows where it actually got to
+    /// rather than where it was when you left.
+    fn poll_parked_runs(&mut self, ctx: &egui::Context) {
+        // The run being shown is polled by the editor itself.
+        let showing = self.report_editor.as_ref().map(|e| e.run_key());
+        let mut live = false;
+        for (key, parked) in self.report_runs.iter_mut() {
+            if Some(key) == showing.as_ref() {
+                continue;
+            }
+            live |= parked.pump();
+        }
+        if live {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+
     /// Open `report` in the block editor, restoring the panel sizes the user
     /// last dragged it to.
     ///
@@ -390,6 +440,11 @@ impl GuiApp {
         }
         if let Some(w) = self.session.gui.report_palette_width {
             ed.palette_w = w;
+        }
+        // Whatever was open keeps its run, and this report takes back its own.
+        self.close_report_editor();
+        if let Some(parked) = self.report_runs.remove(&ed.run_key()) {
+            ed.adopt_run(parked);
         }
         self.report_editor = Some(ed);
     }
@@ -739,7 +794,7 @@ impl GuiApp {
                         .as_ref()
                         .is_some_and(|e| e.is_workspace())
                     {
-                        self.report_editor = None;
+                        self.close_report_editor();
                     }
                     self.session.save();
                 }
@@ -867,6 +922,7 @@ impl GuiApp {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
+        self.poll_parked_runs(&ctx);
         self.handle_global_keys(&ctx);
         self.intercept_close(&ctx);
 
@@ -1293,5 +1349,136 @@ mod tests {
             "a clean session must never have its quit interrupted"
         );
         assert!(app.dialog.is_none());
+    }
+}
+
+#[cfg(test)]
+mod report_run_persistence_tests {
+    use super::*;
+    use crate::gui::report_editor::ReportOrigin;
+    use crate::gui::report_run::{RunKey, RunUpdate};
+    use crate::report::Report;
+    use crate::report::model::{ReportResult, ReportRow};
+    use crate::session::Session;
+
+    fn app() -> GuiApp {
+        GuiApp::for_test(Session::default())
+    }
+
+    fn report(name: &str) -> Report {
+        let mut r = Report::scratch(name);
+        r.path = Some(std::path::PathBuf::from(format!("/tmp/{name}.trail")));
+        r
+    }
+
+    fn result_with(cell: &str) -> ReportResult {
+        let mut res = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), cell.to_string());
+        res.rows.push(row);
+        res
+    }
+
+    /// Clicking a tab used to close a Workspace report editor, and closing it
+    /// dropped the `RunHandle` — which cancels the worker. A report you left for
+    /// a moment came back cancelled and empty. The run has to outlive the view.
+    #[test]
+    fn closing_the_editor_neither_cancels_the_run_nor_loses_the_rows() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        let ed = app.report_editor.as_mut().expect("editor is open");
+        ed.result = Some(result_with("first"));
+        ed.run = Some(handle);
+
+        app.close_report_editor();
+        assert!(app.report_editor.is_none(), "the view is gone");
+
+        let parked = app
+            .report_runs
+            .get(&RunKey::Path("/tmp/nightly.trail".into()))
+            .expect("but the run was kept");
+        assert!(
+            !parked.run.as_ref().expect("still holding it").cancelled(),
+            "the worker keeps going: dropping the handle is what cancels it"
+        );
+        assert_eq!(parked.result.as_ref().expect("rows kept").rows.len(), 1);
+    }
+
+    /// …and coming back to the report picks it up where it got to, rather than
+    /// showing an empty grid.
+    #[test]
+    fn reopening_a_report_takes_its_run_back() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let (handle, tx) = crate::gui::report_run::test_handle();
+        let ed = app.report_editor.as_mut().expect("editor is open");
+        ed.result = Some(result_with("first"));
+        ed.run = Some(handle);
+        app.close_report_editor();
+
+        // A row arrives while nobody is looking, and the parked run folds it in.
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), "second".to_string());
+        tx.send(RunUpdate::Row(Box::new(row)))
+            .expect("worker sends");
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_parked_runs(ui.ctx())
+        });
+
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let ed = app.report_editor.as_ref().expect("editor is back");
+        assert!(ed.run.is_some(), "still streaming");
+        assert!(ed.result.is_some(), "and showing what it collected");
+        assert!(
+            !app.report_runs
+                .contains_key(&RunKey::Path("/tmp/nightly.trail".into())),
+            "the run is held in one place at a time, not two"
+        );
+    }
+
+    /// A report is loaded afresh from disk each time it is opened from a
+    /// Workspace tree, so its `id` differs on the way back in — the run has to
+    /// be filed under something that survives, which is the path.
+    #[test]
+    fn a_reloaded_report_is_recognised_as_the_same_one() {
+        let a = report("nightly");
+        let b = report("nightly");
+        assert_ne!(a.id, b.id, "a fresh load really does mint a new id");
+        assert_eq!(RunKey::of(&a), RunKey::of(&b), "but it is the same report");
+
+        // An unsaved scratch report has no path to be known by, so it falls back
+        // to the id it keeps for as long as the session holds it.
+        let scratch = Report::scratch("untitled");
+        assert_eq!(RunKey::of(&scratch), RunKey::Id(scratch.id));
+    }
+
+    /// Opening a *different* report parks the first one's run rather than
+    /// cancelling it, so two reports can be in flight at once.
+    #[test]
+    fn opening_another_report_leaves_the_first_one_running() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("first"));
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().unwrap().run = Some(handle);
+
+        app.open_report_editor(ReportOrigin::Workspace, report("second"));
+        let parked = app
+            .report_runs
+            .get(&RunKey::Path("/tmp/first.trail".into()))
+            .expect("the first run was parked");
+        assert!(!parked.run.as_ref().unwrap().cancelled());
+    }
+
+    /// An editor with nothing to keep leaves nothing behind — the parking area
+    /// is for runs, not for every report ever opened.
+    #[test]
+    fn closing_an_editor_that_never_ran_parks_nothing() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("idle"));
+        app.close_report_editor();
+        assert!(app.report_runs.is_empty());
     }
 }

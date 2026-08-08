@@ -46,7 +46,7 @@ use crate::hurl::{EntryOutcome, RunOutput};
 
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleRef, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
 use super::model::{ReportResult, ReportRow};
 use super::producers::{self, ProducerItem};
@@ -67,6 +67,16 @@ pub trait EntryRunner: Sync {
     /// interpreter only ever passes single-entry `base`s, so `entries` holds one
     /// [`EntryOutcome`] on success.
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput;
+
+    /// Whether this runner sends nothing over the network. A dry run answers
+    /// `true`, which also suppresses the convenience fetch an `IMAGE` column
+    /// does for an `http(s)` value — a "no requests sent" run that quietly made
+    /// a hundred GETs would be lying. Local paths and `data:` URIs still
+    /// resolve, so a dry run of a file-driven image report still shows its
+    /// pictures.
+    fn offline(&self) -> bool {
+        false
+    }
 }
 
 /// Production [`EntryRunner`]: routes each send through
@@ -92,6 +102,10 @@ impl EntryRunner for LiveRunner {
 pub struct DryRunner;
 
 impl EntryRunner for DryRunner {
+    fn offline(&self) -> bool {
+        true
+    }
+
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
             entries: vec![EntryOutcome {
@@ -210,6 +224,9 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
+    ex.baseline_show = super::compare::comparison_roles(flow)
+        .map(|r| r.baseline_show)
+        .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
     // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
@@ -226,6 +243,8 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         no_match_marker,
         errors: ex.errors,
         column_stats: flow.column_stats(),
+        column_images: flow.column_images(),
+        images: HashMap::new(),
     }
 }
 
@@ -255,6 +274,43 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
                 .push(format!("baseline {}: {e}", path.display())),
         }
     }
+    resolve_images(result, flow, ctx);
+}
+
+/// Resolve every `IMAGE` column's cell value to picture bytes, filling
+/// [`ReportResult::images`].
+///
+/// Done here, after the comparison collapse, because that is the point at which
+/// the row set and the resolved columns are final — resolving earlier would
+/// fetch pictures for baseline rows that are about to be folded away.
+///
+/// Failures are recorded as run *notes*, never errors: a report whose subject is
+/// an API run must not fail because an illustration beside it was unreachable.
+/// The cell simply stays as its text, which is what CSV and JSON would have
+/// written anyway.
+fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    let columns = result.resolved_columns(&flow.header);
+    let image_columns: Vec<&super::model::OutputColumn> =
+        columns.iter().filter(|c| c.image.is_some()).collect();
+    if image_columns.is_empty() {
+        return;
+    }
+    let mut resolver = super::image::ImageResolver::new();
+    resolver.offline = ctx.runner.offline();
+    let mut images = HashMap::new();
+    for (r, row) in result.rows.iter().enumerate() {
+        for col in &image_columns {
+            let value = col.value(row, &result.no_match_marker);
+            if value.is_empty() || value == result.no_match_marker {
+                continue;
+            }
+            if let Some(img) = resolver.resolve(&value, ctx.root.as_deref()) {
+                images.insert((r, col.header.clone()), img);
+            }
+        }
+    }
+    result.images = images;
+    result.errors.extend(resolver.notes);
 }
 
 /// Mutable interpreter state threaded through the walk.
@@ -294,6 +350,15 @@ struct Exec<'a> {
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
+    /// Field names from the flow's `ENVS BASELINE(…) SHOW(…)` clause. These
+    /// count as explicitly-shown fields for *every* request in the run, because
+    /// the finalize-phase copy that produces `baseline.<alias>.<field>` can only
+    /// see fields the rows actually carry — and intrinsics like `Time` are
+    /// suppressed by default on any request that declares its own fields. Without
+    /// this the documented `BASELINE("prod") SHOW(Time)` example emits nothing at
+    /// all. It is a flow-wide property, so it is seeded once and inherited by
+    /// every forked iteration.
+    baseline_show: Vec<String>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -311,6 +376,7 @@ struct ExecState {
     target: Option<String>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
+    baseline_show: Vec<String>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -335,6 +401,7 @@ impl<'a> Exec<'a> {
             broadcast: HashMap::new(),
             column_order: Vec::new(),
             errors: Vec::new(),
+            baseline_show: Vec::new(),
         }
     }
 
@@ -351,6 +418,7 @@ impl<'a> Exec<'a> {
             target: self.target.clone(),
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
+            baseline_show: self.baseline_show.clone(),
         }
     }
 
@@ -369,6 +437,7 @@ impl<'a> Exec<'a> {
             broadcast: state.broadcast,
             column_order: Vec::new(),
             errors: Vec::new(),
+            baseline_show: state.baseline_show,
         }
     }
 
@@ -770,8 +839,12 @@ impl<'a> Exec<'a> {
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
                 // [Reports] and WITH fields are always kept; intrinsics survive
-                // only when SHOW explicitly lists them.
-                !INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
+                // only when SHOW explicitly lists them — either the statement's
+                // own SHOW, or the loop-level `ENVS BASELINE(…) SHOW(…)`, whose
+                // whole purpose is to put that field beside its baseline copy.
+                !INTRINSIC_FIELDS.contains(&suffix)
+                    || show.iter().any(|s| s == suffix)
+                    || self.baseline_show.iter().any(|s| s == suffix)
             });
         } else {
             // Bare request: intrinsics are kept, except the opt-in ones.  The
@@ -780,9 +853,17 @@ impl<'a> Exec<'a> {
             // when SHOW asks for it.  Everything else on a bare request is
             // already present, so SHOW is otherwise a no-op for inclusion; only
             // HIDE can narrow the output further.
+            //
+            // A loop-level `ENVS BASELINE(…) SHOW(…)` counts as asking, exactly
+            // as it does in the declared-fields branch above: its whole purpose
+            // is to put that field beside its baseline copy, and the copy is
+            // made in the finalize phase from the cell that has to still be
+            // here for it to find.
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
-                !OPT_IN_INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
+                !OPT_IN_INTRINSIC_FIELDS.contains(&suffix)
+                    || show.iter().any(|s| s == suffix)
+                    || self.baseline_show.iter().any(|s| s == suffix)
             });
         }
 
@@ -1062,15 +1143,30 @@ impl<'a> Exec<'a> {
                     .map(|p| ProducerItem::scalar(p.to_string_lossy().into_owned()))
                     .collect())
             }
-            Producer::Folders { dir, roles } => {
+            Producer::Folders { dir, glob, roles } => {
                 let dir = producers::resolve_path(root, &self.subst_unquoted(dir));
-                let roles: Vec<(String, String)> = roles
+                let glob = glob.as_ref().map(|g| self.subst_unquoted(g));
+                let roles: Vec<RoleBinding> = roles
                     .iter()
-                    .map(|(r, g)| (r.clone(), self.subst_unquoted(g)))
+                    .map(|r| RoleBinding {
+                        name: r.name.clone(),
+                        glob: self.subst_unquoted(&r.glob),
+                        optional: r.optional,
+                    })
                     .collect();
+                // A recursive walk searches a tree, so the intermediate folders
+                // it must visit simply aren't results; a flat walk enumerates a
+                // known set, so a mis-shaped member stays a loud failure.
+                let on_missing = if glob.as_deref().is_some_and(|g| g.contains("**")) {
+                    producers::Missing::Skip
+                } else {
+                    producers::Missing::Error
+                };
                 let mut items = Vec::new();
-                for folder in producers::list_folders(&dir)? {
-                    let named = producers::folder_roles(&folder, &roles)?;
+                for folder in producers::list_folders(&dir, glob.as_deref())? {
+                    let Some(named) = producers::folder_roles(&folder, &roles, on_missing)? else {
+                        continue;
+                    };
                     items.push(ProducerItem {
                         values: vec![folder.to_string_lossy().into_owned()],
                         named,
@@ -1642,6 +1738,7 @@ mod tests {
             header: "m".into(),
             sources: vec!["process.missing".into()],
             stats: Vec::new(),
+            image: None,
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }
@@ -2156,6 +2253,95 @@ mod tests {
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
         assert!(res.rows[0].cells.get("FILE").unwrap().ends_with("a.jpg"));
         assert_eq!(fake.call_count(), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// End-to-end: a recursive `FOLDERS … MATCH "**"` walk with roles yields one
+    /// row per *case* folder, wherever it sits in the tree, and silently passes
+    /// over the intermediate container folders that carry no role files. Without
+    /// the skip, every `<type>`/`<batch>` folder on the way down would fail the
+    /// run for a role that was never meant to match there.
+    #[test]
+    fn recursive_folders_loop_skips_containers_and_binds_roles() {
+        let d = tmpdir("folders_rec");
+        for case in ["passports/june/case_1", "licences/case_2"] {
+            let c = d.join(case);
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("scan_front.jpg"), "x").unwrap();
+        }
+        // One case also has a back image; the other doesn't, which is exactly
+        // what the optional role is for.
+        std::fs::write(d.join("licences/case_2/scan_back.jpg"), "x").unwrap();
+
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" MATCH \"**\" WITH front=\"*_front.jpg\", back=\"*_back.jpg\"?\n    REPORT REQUEST up\n    REPORT (CASE)\n    REPORT \"{{front}}\" AS Front\n    REPORT \"{{back}}\" AS Back\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
+        // Sorted by full path, so `licences/case_2` comes first.
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Front")
+                .unwrap()
+                .ends_with("scan_front.jpg")
+        );
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Back")
+                .unwrap()
+                .ends_with("scan_back.jpg")
+        );
+        // The case with no back image still produced a row, with an empty cell.
+        assert_eq!(res.rows[1].cells.get("Back").unwrap(), "");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A *flat* `FOLDERS` walk enumerates a known set, so a member missing a
+    /// required role is still a loud failure rather than a quiet omission.
+    #[test]
+    fn flat_folders_loop_still_fails_on_a_missing_required_role() {
+        let d = tmpdir("folders_flat");
+        std::fs::create_dir_all(d.join("case_1")).unwrap();
+        let fake = Fake::new(&[]);
+        let entries: [HurlEntry; 0] = [];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" WITH front=\"*_front.jpg\"\n    REPORT (CASE)\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.rows.is_empty());
+        assert!(
+            res.errors.iter().any(|e| e.contains("front")),
+            "{:?}",
+            res.errors
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -3293,6 +3479,180 @@ mod tests {
         assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
         // Intrinsic first, then [Reports], then WITH.
         assert_eq!(res.column_order, vec!["r.Response", "r.A", "r.B"]);
+    }
+
+    /// End-to-end: a file-driven report whose column carries `IMAGE` resolves
+    /// each row's value into [`ReportResult::images`], keyed by `(row, header)`,
+    /// while the cell text is left exactly as produced.
+    #[test]
+    fn an_image_column_resolves_local_files_during_the_run() {
+        let dir = tmpdir("images");
+        let png = crate::report::image::tests::png_1x1();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        std::fs::write(dir.join("b.png"), &png).unwrap();
+        // A third value that is not a picture at all: it must leave the cell as
+        // text and note the problem, never fail the report.
+        std::fs::write(dir.join("c.png"), b"not an image").unwrap();
+
+        let flow = parse_flow(
+            "FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame IMAGE(HEIGHT 60)\nEND\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        assert_eq!(res.rows.len(), 3);
+        let row_of = |name: &str| {
+            res.rows
+                .iter()
+                .position(|r| r.cells.get("Frame").is_some_and(|v| v.ends_with(name)))
+                .unwrap_or_else(|| panic!("row for {name}"))
+        };
+        for name in ["a.png", "b.png"] {
+            let img = res
+                .images
+                .get(&(row_of(name), "Frame".to_string()))
+                .unwrap_or_else(|| panic!("resolved {name}"));
+            assert_eq!(img.mime, "image/png");
+            assert_eq!(img.bytes, png);
+        }
+        assert!(
+            !res.images
+                .contains_key(&(row_of("c.png"), "Frame".to_string())),
+            "a non-picture value resolves to nothing"
+        );
+        assert!(
+            !res.rows[row_of("c.png")].cells["Frame"].is_empty(),
+            "and its cell keeps its text"
+        );
+        assert!(
+            res.errors.iter().any(|e| e.contains("c.png")),
+            "with a note saying why: {:?}",
+            res.errors
+        );
+        // The clause reaches the resolved columns, so a writer can size the box.
+        let cols = res.resolved_columns(&flow.header);
+        assert_eq!(
+            cols[0].image.and_then(|i| i.height),
+            Some(60),
+            "the IMAGE clause reaches the output column"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A column *without* `IMAGE` is never resolved, however picture-like its
+    /// values look — the clause is the only thing that turns text into a
+    /// picture, so a report never pays for IO it didn't ask for.
+    #[test]
+    fn a_column_without_the_clause_resolves_no_images() {
+        let dir = tmpdir("noimages");
+        std::fs::write(dir.join("a.png"), crate::report::image::tests::png_1x1()).unwrap();
+        let flow =
+            parse_flow("FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame\nEND\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.images.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same, for a **bare** request and one of the opt-in timing
+    /// intrinsics. A bare request suppresses `TimeSetup` unless SHOW asks for
+    /// it, and a loop-level `BASELINE(…) SHOW(…)` is just as much an ask: it
+    /// exists precisely to put that field beside its baseline copy. Without
+    /// this the documented clause silently produces no baseline column, which
+    /// is the bug `baseline_show` was added to fix — reintroduced for the
+    /// opt-in fields.
+    #[test]
+    fn baseline_show_surfaces_an_opt_in_intrinsic_on_a_bare_request() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let src = "FOR T IN ENVS BASELINE(\"prod\") SHOW(TimeSetup), COMPARISON(\"staging\")\n    REPORT REQUEST r AS proc\nEND\n";
+        let res = run(
+            src,
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert!(
+            cells.contains_key("proc.TimeSetup"),
+            "the SHOWn field has to survive the opt-in filter: {:?}",
+            cells.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cells.contains_key("baseline.proc.TimeSetup"),
+            "and the baseline copy has something to copy from: {:?}",
+            cells.keys().collect::<Vec<_>>()
+        );
+        // The other opt-in intrinsics stay out of the way.
+        assert!(!cells.contains_key("proc.TimeWait"));
+    }
+
+    /// `BASELINE(…) SHOW(Time)` on the loop must surface the intrinsic even
+    /// though the request declares its own `[Reports]` field (which normally
+    /// suppresses intrinsics): otherwise the finalize-phase copy has no
+    /// `<alias>.Time` cell to work from and the clause silently does nothing.
+    /// This is the documented tutorial example (§10.2).
+    #[test]
+    fn baseline_show_surfaces_the_intrinsic_on_a_request_with_declared_fields() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("A", "jsonpath \"$.a\"")])];
+        let src = "FOR T IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"staging\")\n    REPORT REQUEST r AS proc\nEND\n";
+        let res = run(
+            src,
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("proc.Time"), Some(&"7".to_string()));
+        assert_eq!(cells.get("baseline.proc.Time"), Some(&"7".to_string()));
+        // The other intrinsics stay suppressed - only the SHOWn one comes back.
+        assert_eq!(cells.get("proc.HttpStatus"), None);
+        assert_eq!(cells.get("proc.Response"), None);
+        // And it must reach the rendered columns, not just the row model.
+        let flow = parse_flow(src).unwrap();
+        let cols = res.resolved_columns(&flow.header);
+        let headers: Vec<&str> = cols.iter().map(|c| c.header.as_str()).collect();
+        assert!(
+            headers.contains(&"baseline.proc.Time"),
+            "columns were {headers:?}"
+        );
     }
 
     #[test]

@@ -10,12 +10,41 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 /// Filesystem entries recurse at most this many levels deep below the
 /// workspace root, as a defensive guard against pathological symlink loops.
 const MAX_DEPTH: usize = 32;
+
+/// Bumped every time PaperBoy itself changes the shape of a workspace tree.
+///
+/// [`Collection::ws_rows`](crate::collection::Collection::ws_rows) reuses a
+/// scan for a short while rather than reading the disk on every frame, but
+/// PaperBoy's *own* edits have to show up at once — creating a file and then
+/// not finding it in the tree is a bug, not a stale cache. So the write helpers
+/// here announce themselves, and a cache taken at an older generation is
+/// discarded on the spot.
+///
+/// It is a plain counter rather than a set of invalidated paths because the
+/// question a cache asks is only ever "is what I have still the latest?", and
+/// because a missed bump is merely slow (the scan's own expiry catches it)
+/// rather than wrong.
+static TREE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current tree generation; store it beside a cached scan and re-read when
+/// it no longer matches.
+pub fn tree_generation() -> u64 {
+    TREE_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Announce that the workspace tree has changed, so any cached scan is dropped
+/// at the next redraw. Called by the write helpers below; call it directly
+/// after writing a workspace file by some other route.
+pub fn note_tree_changed() {
+    TREE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 /// One row of a flattened, depth-first workspace file tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +172,7 @@ pub fn create_item(
     if kind == NewItemKind::Folder {
         std::fs::create_dir_all(&full)
             .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+        note_tree_changed();
         return Ok(full);
     }
     let stem = full
@@ -151,6 +181,7 @@ pub fn create_item(
         .unwrap_or_else(|| name.to_string());
     std::fs::write(&full, kind.starter(&stem))
         .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+    note_tree_changed();
     Ok(full)
 }
 
@@ -190,6 +221,7 @@ pub fn move_item(root: &Path, src: &Path, dest_dir: &Path) -> Result<PathBuf, Mo
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| MoveError::Io(format!("{}: {e}", dest_dir.display())))?;
     std::fs::rename(src, &dest).map_err(|e| MoveError::Io(format!("{}: {e}", dest.display())))?;
+    note_tree_changed();
     Ok(dest)
 }
 
