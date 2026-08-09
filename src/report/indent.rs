@@ -62,6 +62,75 @@ pub fn matching_opener_indent<S: AsRef<str>>(lines_above: &[S]) -> Option<String
     None
 }
 
+/// Why a [`reformat`] didn't happen.
+pub enum ReformatError {
+    /// The source doesn't parse, so its block structure isn't known. Re-indenting
+    /// guesswork is worse than leaving a broken file alone — fix the syntax first.
+    Unparseable(String),
+    /// Re-indenting changed what the script *means*. This should be impossible
+    /// (only leading whitespace is touched), so it indicates a bug rather than
+    /// anything the user did — but it is checked, because silently rewriting a
+    /// script into a different one is the worst outcome this feature could have.
+    WouldChangeMeaning,
+}
+
+/// Re-indent a whole PaperTrail script so every line sits at its true block
+/// depth, four spaces per level.
+///
+/// **Only leading whitespace changes.** Comments, blank lines, spacing within a
+/// statement and the order of everything are preserved exactly, which is what
+/// makes this safe to run over a file you didn't write. That rules out the
+/// obvious implementation — parse to a [`ReportFlow`](crate::report::flow::ReportFlow)
+/// and call `to_text()` — because the AST has nowhere to put a body comment, so
+/// round-tripping through it deletes them.
+///
+/// The result is verified by re-parsing it and comparing the AST to the
+/// original's, so a reformat can never change what a script does.
+///
+/// Returns `Ok(None)` when the text is already correctly indented, so callers
+/// can skip the undo entry and the dirty mark.
+pub fn reformat(src: &str) -> Result<Option<String>, ReformatError> {
+    let before = crate::report::parser::parse_flow(src)
+        .map_err(|e| ReformatError::Unparseable(e.message))?;
+
+    let mut out = String::with_capacity(src.len());
+    let mut depth = 0usize;
+    for line in src.lines() {
+        let body = line.trim();
+        if body.is_empty() {
+            // A blank line stays blank rather than keeping stale indentation.
+            out.push('\n');
+            continue;
+        }
+        // `END` closes the block it sits in, so it dedents *before* it is placed.
+        if is_end_line(body) {
+            depth = depth.saturating_sub(1);
+        }
+        for _ in 0..depth {
+            out.push_str(INDENT_UNIT);
+        }
+        out.push_str(body);
+        out.push('\n');
+        if opens_block(body) {
+            depth += 1;
+        }
+    }
+    // `str::lines` drops the final newline; put one back only if there was one.
+    if !src.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+
+    if out == src {
+        return Ok(None);
+    }
+    let after =
+        crate::report::parser::parse_flow(&out).map_err(|_| ReformatError::WouldChangeMeaning)?;
+    if after != before {
+        return Err(ReformatError::WouldChangeMeaning);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +197,77 @@ mod tests {
     fn an_unbalanced_end_has_no_opener() {
         assert_eq!(matching_opener_indent::<&str>(&[]), None);
         assert_eq!(matching_opener_indent(&["REQUEST a", "END"]), None);
+    }
+
+    /// The case that prompted the feature: wrapping an existing block in a new
+    /// outer loop leaves every line of the old body one level short.
+    #[test]
+    fn reformat_reindents_a_newly_wrapped_block() {
+        let src = "# collection: c\n\nFOR T IN FILES \"*.txt\"\nFOR F IN FILES \"*.png\"\nREQUEST a\nEND\nEND\n";
+        let out = reformat(src).ok().flatten().expect("reindented");
+        assert_eq!(
+            out,
+            "# collection: c\n\nFOR T IN FILES \"*.txt\"\n    FOR F IN FILES \"*.png\"\n        REQUEST a\n    END\nEND\n"
+        );
+    }
+
+    /// Body comments and blank lines are the reason this doesn't round-trip
+    /// through the AST: the flow has nowhere to keep them, so `to_text()` would
+    /// silently delete every one.
+    #[test]
+    fn reformat_keeps_comments_and_blank_lines() {
+        let src =
+            "# collection: c\n\nFOR T IN FILES \"*.txt\"\n# why we do this\n\nREQUEST a\nEND\n";
+        let out = reformat(src).ok().flatten().expect("reindented");
+        assert!(
+            out.contains("    # why we do this"),
+            "comment kept: {out:?}"
+        );
+        assert!(out.contains("\n\n"), "blank line kept: {out:?}");
+    }
+
+    /// A `WITH` block nests like a loop does.
+    #[test]
+    fn reformat_indents_a_with_block() {
+        let src =
+            "# collection: c\n\nREPORT REQUEST proc AS p WITH\nframe: jsonpath \"$.a\"\nEND\n";
+        let out = reformat(src).ok().flatten().expect("reindented");
+        assert!(out.contains("    frame: jsonpath"), "{out:?}");
+    }
+
+    /// Already-tidy text reports "nothing to do" rather than a no-op edit, so it
+    /// costs no undo entry and no dirty mark.
+    #[test]
+    fn reformat_of_tidy_text_changes_nothing() {
+        let src = "# collection: c\n\nFOR T IN FILES \"*.txt\"\n    REQUEST a\nEND\n";
+        assert!(matches!(reformat(src), Ok(None)));
+    }
+
+    /// Without a parse there is no block structure to indent to, and guessing at
+    /// a broken file is worse than leaving it alone.
+    #[test]
+    fn reformat_refuses_source_that_does_not_parse() {
+        assert!(matches!(
+            reformat("# collection: c\nFOR X IN\n"),
+            Err(ReformatError::Unparseable(_))
+        ));
+    }
+
+    /// Only leading whitespace moves — nothing inside a statement is touched,
+    /// including a quoted string that happens to look like indentation.
+    #[test]
+    fn reformat_does_not_touch_the_inside_of_a_statement() {
+        let src = "# collection: c\n\nFOR T IN FILES \"a   b\"\nREQUEST \"x  y\"\nEND\n";
+        let out = reformat(src).ok().flatten().expect("reindented");
+        assert!(out.contains("FILES \"a   b\""), "{out:?}");
+        assert!(out.contains("REQUEST \"x  y\""), "{out:?}");
+    }
+
+    /// A file with no trailing newline doesn't silently gain one.
+    #[test]
+    fn reformat_preserves_a_missing_final_newline() {
+        let src = "# collection: c\n\nFOR T IN FILES \"*.txt\"\nREQUEST a\nEND";
+        let out = reformat(src).ok().flatten().expect("reindented");
+        assert!(!out.ends_with('\n'), "{out:?}");
     }
 }

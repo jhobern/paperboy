@@ -33,7 +33,7 @@ use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::flow::Header;
 use crate::report::indent::{
-    INDENT_UNIT, indent_for_new_line, is_end_line, matching_opener_indent,
+    INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
 };
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
 use crate::report::run::{
@@ -1852,6 +1852,39 @@ impl TuiApp {
     /// come from the last run, so a report must have been run first; otherwise
     /// a hint is shown. A parse error (which can't normally coexist with a
     /// result) falls back to that hint too.
+    /// Re-indent the whole report source to its true block depth.
+    ///
+    /// Useful after a structural edit that changes nesting — wrapping an
+    /// existing block in a new outer loop leaves its whole body one level short,
+    /// and re-indenting it by hand in the source view is tedious.
+    ///
+    /// Only leading whitespace moves (see [`crate::report::indent::reformat`]),
+    /// so comments and blank lines survive; a script that doesn't parse is left
+    /// alone rather than guessed at.
+    pub(crate) fn reformat_active_report(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        match crate::report::indent::reformat(&self.reports[idx].report.text) {
+            Ok(Some(text)) => {
+                self.reports[idx].set_text_undoable(text);
+                self.revalidate_report(idx);
+                self.save_state();
+                self.status = Some(Status::ReportReformatted);
+            }
+            Ok(None) => self.status = Some(Status::ReportAlreadyTidy),
+            Err(ReformatError::Unparseable(msg)) => {
+                self.status = Some(Status::ReportReformatFailed(msg));
+            }
+            Err(ReformatError::WouldChangeMeaning) => {
+                let s = Strings::for_language(&self.language);
+                self.status = Some(Status::ReportReformatFailed(
+                    s.report_reformat_unsafe.to_string(),
+                ));
+            }
+        }
+    }
+
     pub(crate) fn open_report_columns(&mut self) {
         let Some(idx) = self.active_report_index() else {
             return;
@@ -2318,6 +2351,9 @@ impl TuiApp {
             KeyCode::Char('b') => self.open_report_bind(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
+            // Reformat: re-indent the source to its real block depth. Shift+F
+            // because a bare `f` already opens the File menu.
+            KeyCode::Char('F') => self.reformat_active_report(),
             // Tab moves focus. A standalone report has a single (full-screen)
             // body, so Tab is inert. An embedded report shares its tab with the
             // collection tree, so Tab rotates focus back to that tree (and on
@@ -4116,12 +4152,13 @@ fn draw_report_source(
         s.report_hint_leave.to_string()
     } else {
         let mut hint = format!(
-            "{} · {} · {} · {} · {}",
+            "{} · {} · {} · {} · {} · {}",
             s.report_hint_edit,
             s.report_hint_run,
             s.report_hint_dry,
             s.report_hint_bind,
-            s.report_hint_nodes
+            s.report_hint_nodes,
+            s.report_hint_format
         );
         // Once a run has produced a grid, advertise `v` as the source↔output
         // swap (the discoverable replacement for the old Tab-into-results).

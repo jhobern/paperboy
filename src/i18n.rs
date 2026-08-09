@@ -590,6 +590,7 @@ strings! {
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "Enter nodes", "Entrée nœuds", "Enter noder";
+    report_hint_format => "F reindent", "F réindenter", "F genindryk";
     report_hint_view => "v output", "v sortie", "v output";
     gui_report_dry_run => "Dry run", "Simulation", "Prøvekørsel";
     gui_report_dry_run_tooltip => "Preview the rows this report would produce — loops expanded and variables resolved, but no requests sent.", "Prévisualiser les lignes que ce rapport produirait — boucles développées et variables résolues, mais aucune requête envoyée.", "Forhåndsvis de rækker denne rapport ville producere — løkker udvidet og variabler løst, men ingen anmodninger sendt.";
@@ -666,7 +667,13 @@ strings! {
     report_node_folder_pick => "Choose loop folder", "Choisir le dossier de la boucle", "Vælg løkkemappe";
     report_header_root_pick => "Choose report root folder", "Choisir le dossier racine du rapport", "Vælg rapportens rodmappe";
     report_header_baseline_pick => "Choose baseline file", "Choisir le fichier de référence", "Vælg baseline-fil";
-    report_settings_heading => "Settings", "Réglages", "Indstillinger";
+    gui_report_reindent => "Reindent", "Réindenter", "Genindryk";
+    gui_report_reindent_help => "Re-indent every line to its block depth. Only whitespace changes — comments and blank lines are kept.", "Réindenter chaque ligne selon sa profondeur de bloc. Seuls les espaces changent : les commentaires et les lignes vides sont conservés.", "Genindryk hver linje til dens blokdybde. Kun mellemrum ændres — kommentarer og tomme linjer bevares.";
+    report_reformat_unsafe => "Reformatting would have changed what the report does, so nothing was changed", "Le reformatage aurait modifié le comportement du rapport ; rien n'a été changé", "Omformatering ville have ændret, hvad rapporten gør, så intet blev ændret";
+    report_reformatted => "Report reindented", "Rapport réindenté", "Rapport genindrykket";
+    report_already_tidy => "The report is already correctly indented", "Le rapport est déjà correctement indenté", "Rapporten er allerede korrekt indrykket";
+    report_reformat_failed_prefix => "Can't reindent:", "Réindentation impossible :", "Kan ikke genindrykke:";
+    report_settings_heading => "Report Settings", "Réglages du rapport", "Rapportindstillinger";
     report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
     report_settings_all_set => "Every report setting is already set", "Tous les réglages du rapport sont déjà définis", "Alle rapportindstillinger er allerede sat";
     report_setting_no_choices => "Nothing to choose from — load an environment first, or press e to type a name", "Rien à choisir — chargez d'abord un environnement, ou appuyez sur e pour saisir un nom", "Intet at vælge imellem — indlæs først et miljø, eller tryk e for at skrive et navn";
@@ -1383,6 +1390,13 @@ pub enum Status {
     /// Enter was pressed on a settings row whose picker has nothing to offer —
     /// only reachable for `environment:` with no environments loaded.
     ReportSettingNoChoices,
+    /// The report source was re-indented.
+    ReportReformatted,
+    /// Reformat was asked for on a report that is already correctly indented.
+    ReportAlreadyTidy,
+    /// Reformat declined; holds the reason (a parse error, or the safety check
+    /// that compares the re-indented AST with the original's).
+    ReportReformatFailed(String),
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
     /// A report's last run was saved as a `.baseline` snapshot; holds its path.
@@ -1562,6 +1576,11 @@ impl Status {
             Status::ReportRunBlocked(reason) => reason.clone(),
             Status::ReportNodeUndone(msg) => msg.clone(),
             Status::ReportNodeNothingToUndo(msg) => msg.clone(),
+            Status::ReportReformatted => s.report_reformatted.to_string(),
+            Status::ReportAlreadyTidy => s.report_already_tidy.to_string(),
+            Status::ReportReformatFailed(why) => {
+                format!("{} {why}", s.report_reformat_failed_prefix)
+            }
             Status::ReportSettingsAllSet => s.report_settings_all_set.to_string(),
             Status::ReportSettingNoChoices => s.report_setting_no_choices.to_string(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),

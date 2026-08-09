@@ -25837,3 +25837,47 @@ fn the_validation_panel_stops_growing_at_its_cap() {
     // Five content rows plus the two borders.
     assert_eq!(validation_panel_rows(&mut app, 90, 40), 7);
 }
+
+/// `F` re-indents the whole source. The case that prompted it: an existing
+/// block gets wrapped in a new outer loop, leaving its body one level short.
+#[test]
+fn shift_f_reindents_the_report_source() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n\nFOR T IN FILES \"*.txt\"\nFOR F IN FILES \"*.png\"\nREQUEST upload\nEND\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Esc); // node editor -> source
+    press(&mut app, KeyCode::Char('F'));
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nFOR T IN FILES \"*.txt\"\n    FOR F IN FILES \"*.png\"\n        REQUEST upload\n    END\nEND\n"
+    );
+}
+
+/// It is one undo step, not one per line.
+#[test]
+fn a_reindent_can_be_undone_in_one_step() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = "# collection: api\n\nFOR T IN FILES \"*.txt\"\nREQUEST upload\nEND\n".to_string();
+    app.reports[idx].report.set_text(&before);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('F'));
+    assert_ne!(app.reports[idx].report.text, before, "reindented");
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(app.reports[idx].report.text, before);
+}
+
+/// A script that doesn't parse has no known block structure, so it is left
+/// exactly as it was rather than guessed at.
+#[test]
+fn a_reindent_leaves_unparseable_source_alone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = "# collection: api\n\n      FOR X IN\n".to_string();
+    app.reports[idx].report.set_text(&before);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('F'));
+    assert_eq!(app.reports[idx].report.text, before);
+    assert!(matches!(app.status, Some(Status::ReportReformatFailed(_))));
+}

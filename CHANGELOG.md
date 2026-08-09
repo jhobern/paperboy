@@ -94,6 +94,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
   excluded from a comparison run's compared fields, since they always differ.
 
+- **Reindent a PaperTrail script (`F` in the TUI, *Reindent* in the GUI).** Wrap
+  an existing block in a new outer loop and its whole body is suddenly one level
+  short; this puts every line back at its real block depth, four spaces a level.
+
+  **Only leading whitespace changes** — comments, blank lines and the spacing
+  inside a statement are preserved exactly, so it is safe to run over a file you
+  didn't write. (That rules out the obvious implementation of parsing to a flow
+  and re-serializing it: the AST has nowhere to keep a body comment, so a
+  round-trip through it deletes them.) The result is verified by re-parsing it
+  and comparing against the original, so reindenting can never change what a
+  report does; a script that doesn't parse is left alone rather than guessed at,
+  and it is a single undo step.
+
 ### Fixed
 
 - **The TUI's report node editor can now edit the report's settings.** The

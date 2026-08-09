@@ -21,7 +21,7 @@ use crate::report::edit::{
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::indent::{
-    INDENT_UNIT, indent_for_new_line, is_end_line, matching_opener_indent,
+    INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
 };
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
@@ -259,6 +259,25 @@ impl ReportEditor {
         if new_text != self.report.text {
             self.undo.push(self.report.text.clone());
             self.set_text(new_text);
+        }
+    }
+
+    /// Re-indent the source to its true block depth, as one undo step.
+    ///
+    /// Deliberately *not* routed through [`Self::edit_flow`]: that re-serializes
+    /// the AST, which has nowhere to keep a body comment, so it would quietly
+    /// delete them. [`indent::reformat`] only moves leading whitespace.
+    /// `Ok(true)` when the text moved, `Ok(false)` when it was already tidy.
+    /// The caller turns the outcome into a status so the message can be
+    /// translated against the live language.
+    fn reformat(&mut self) -> Result<bool, ReformatError> {
+        match crate::report::indent::reformat(&self.report.text)? {
+            Some(text) => {
+                self.undo.push(self.report.text.clone());
+                self.set_text(text);
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -1494,7 +1513,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         });
     });
 
-    // View toggle (Blocks | Source | Results).
+    // View toggle (Blocks | Source | Results) plus the reindent button.
+    let mut reindent = false;
     ui.horizontal(|ui| {
         if super::widgets::selectable(
             ui,
@@ -1523,8 +1543,30 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         {
             ed.view = EditorView::Results;
         }
+        // Re-indent the source to its real block depth. Lives beside the view
+        // toggle rather than inside the source view because it is about the
+        // document, not about one way of looking at it.
+        ui.separator();
+        if ui
+            .button(app.strings.gui_report_reindent)
+            .on_hover_text(app.strings.gui_report_reindent_help)
+            .clicked()
+        {
+            reindent = true;
+        }
     });
     ui.separator();
+
+    if reindent {
+        app.session.status = Some(match ed.reformat() {
+            Ok(true) => Status::ReportReformatted,
+            Ok(false) => Status::ReportAlreadyTidy,
+            Err(ReformatError::Unparseable(msg)) => Status::ReportReformatFailed(msg),
+            Err(ReformatError::WouldChangeMeaning) => {
+                Status::ReportReformatFailed(app.strings.report_reformat_unsafe.to_string())
+            }
+        });
+    }
 
     match ed.view {
         EditorView::Source => source_view(&mut ed, app, ui),
@@ -9717,6 +9759,33 @@ mod results_render_tests {
 #[cfg(test)]
 mod dry_run_view_tests {
     use super::{EditorView, ReportEditor, ReportOrigin};
+
+    /// The reindent button re-indents as a single undo step, and — unlike every
+    /// other editor action — must not round-trip through the AST, because the
+    /// flow has nowhere to keep a body comment.
+    #[test]
+    fn reindenting_is_one_undo_step_and_keeps_body_comments() {
+        let before = "# collection: c\n\nFOR T IN FILES \"*.txt\"\n# keep me\nREQUEST a\nEND\n";
+        let report = crate::report::Report::from_text("r", before);
+        let mut ed = ReportEditor::new(ReportOrigin::Session(0), report);
+
+        assert!(matches!(ed.reformat(), Ok(true)), "text moved");
+        assert!(
+            ed.report.text.contains("    # keep me"),
+            "the comment is kept and indented: {:?}",
+            ed.report.text
+        );
+        assert!(
+            ed.report.text.contains("    REQUEST a"),
+            "the body is indented: {:?}",
+            ed.report.text
+        );
+
+        // Already tidy the second time, so it costs no further undo entry.
+        assert!(matches!(ed.reformat(), Ok(false)));
+        ed.undo();
+        assert_eq!(ed.report.text, before, "one undo restores the original");
+    }
 
     /// The Dry run button lives on the toolbar, which is above every view, but
     /// the preview is drawn by the Results view. Pressing it from Blocks (where
