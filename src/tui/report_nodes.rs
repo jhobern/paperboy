@@ -639,13 +639,19 @@ impl ListForm {
 }
 
 /// One row of the [`WithFieldForm`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WithFieldRow {
     /// The column name (`WITH name: …`), editable inline.
     Name,
     /// The Hurl query the column's value comes from, editable inline.
     Query,
-    /// One `STATISTICS(…)` checkbox (index into [`StatKind::CHOOSABLE`]).
+    /// The `STATISTICS(…)` on/off toggle. The individual statistic checkboxes
+    /// only exist while it is on: most columns want no summary at all, and a
+    /// permanently-showing list of six checkboxes buried the two rows that
+    /// every field actually needs.
+    Stats,
+    /// One `STATISTICS(…)` checkbox (index into [`StatKind::CHOOSABLE`]). Only
+    /// present while [`WithFieldRow::Stats`] is on.
     Stat(usize),
 }
 
@@ -668,6 +674,18 @@ pub(crate) struct WithFieldForm {
     /// `(stat, ticked)` over [`StatKind::CHOOSABLE`], in that order. None
     /// ticked ⇒ no `STATISTICS(…)` clause.
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// Whether the field carries a `STATISTICS(…)` clause at all — the state of
+    /// the [`WithFieldRow::Stats`] toggle, which is what reveals the individual
+    /// checkboxes. Held rather than derived from `stats` so that unticking the
+    /// last statistic doesn't collapse the list out from under the user; the
+    /// two are kept in step by the toggle (see the key handler).
+    pub(crate) stats_on: bool,
+    /// Where Enter/Esc return to: `true` when this form was opened as a
+    /// sub-form of the request form (so it hands back there), `false` when it
+    /// was opened straight from a `WITH` row of the node outline, where the
+    /// only sensible thing to return to is the outline itself. Getting this
+    /// wrong dumped the user into a request form they never asked for.
+    pub(crate) return_to_request: bool,
     /// An `IMAGE(…)` render hint the field already carries; preserved verbatim
     /// (the form doesn't expose it, but must not drop it).
     pub(crate) image: Option<ImageSpec>,
@@ -681,6 +699,7 @@ impl WithFieldForm {
         path: Vec<usize>,
         index: Option<usize>,
         existing: Option<&WithItem>,
+        return_to_request: bool,
     ) -> Self {
         let (name, query, stats, image) = match existing {
             Some(WithItem::Field {
@@ -700,18 +719,47 @@ impl WithFieldForm {
             index,
             name,
             query,
+            stats_on: !stats.is_empty(),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
                 .collect(),
+            return_to_request,
             selected: 0,
         }
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<WithFieldRow> {
-        let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query];
-        rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
+        let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats];
+        if self.stats_on {
+            rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
+        }
         rows
+    }
+
+    /// Flip the `STATISTICS(…)` clause on or off, keeping the checkboxes in
+    /// step with it: turning it on with nothing ticked seeds `COUNT` (the one
+    /// statistic that means something for a text column as well as a numeric
+    /// one, as elsewhere in the editors), and turning it off clears the ticks,
+    /// so a hidden list can never still be contributing a clause.
+    fn toggle_stats(&mut self) {
+        self.stats_on = !self.stats_on;
+        if self.stats_on {
+            if !self.stats.iter().any(|(_, on)| *on) {
+                let seed = self
+                    .stats
+                    .iter()
+                    .position(|(k, _)| *k == StatKind::Count)
+                    .unwrap_or(0);
+                if let Some((_, on)) = self.stats.get_mut(seed) {
+                    *on = true;
+                }
+            }
+        } else {
+            for (_, on) in &mut self.stats {
+                *on = false;
+            }
+        }
     }
 
     fn last_row(&self) -> usize {
@@ -2054,9 +2102,10 @@ impl TuiApp {
     }
 
     /// Key handling for the `WITH` field form ([`Overlay::ReportNodeWithField`]).
-    /// ↑/↓ (or Tab) move; the Name/Query rows take typed text; stat rows toggle
-    /// with Space/`x`; Enter applies and reopens the request form; Esc cancels
-    /// back to it, so the sub-form always returns where it came from.
+    /// ↑/↓ (or Tab) move; the Name/Query rows take typed text; the statistics
+    /// toggle and the stat rows it reveals toggle with Space/`x`; Enter applies
+    /// and Esc cancels, both returning where the form was opened from — the
+    /// request form when it is a sub-form of one, the node outline otherwise.
     pub(crate) fn report_node_with_field_key_handler(
         &mut self,
         key: KeyEvent,
@@ -2076,13 +2125,23 @@ impl TuiApp {
                 keep(self, form);
             }
             KeyCode::Enter => {
-                let (report_id, path) = (form.report_id, form.path.clone());
-                self.apply_report_node_with_field(*form);
-                self.reopen_report_node_request(report_id, &path);
+                let (report_id, path, back) =
+                    (form.report_id, form.path.clone(), form.return_to_request);
+                let written = self.apply_report_node_with_field(*form);
+                self.close_report_node_with_field(report_id, &path, back);
+                // Applying replaces the whole request node, so the shared
+                // `select_node_path` puts the cursor on the request line. That
+                // was invisible while the form always handed back to the
+                // request form; now that it closes to the outline, the cursor
+                // has to stay on the field the user was editing.
+                if !back && let Some(wi) = written {
+                    self.select_with_row(report_id, &path, wi);
+                }
             }
             KeyCode::Esc => {
-                let (report_id, path) = (form.report_id, form.path.clone());
-                self.reopen_report_node_request(report_id, &path);
+                let (report_id, path, back) =
+                    (form.report_id, form.path.clone(), form.return_to_request);
+                self.close_report_node_with_field(report_id, &path, back);
             }
             _ => {
                 let rows = form.visible_rows();
@@ -2113,6 +2172,12 @@ impl TuiApp {
                         }
                         keep(self, form);
                     }
+                    Some(WithFieldRow::Stats) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                            form.toggle_stats();
+                        }
+                        keep(self, form);
+                    }
                     Some(WithFieldRow::Stat(si)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some((_, on)) = form.stats.get_mut(si)
@@ -2131,16 +2196,13 @@ impl TuiApp {
     /// block — replacing the field at `index`, or appending when it is `None`.
     /// A blank name is a no-op (an unnamed column can't be serialized), which
     /// is also how "cancel by clearing the name" behaves.
-    pub(crate) fn apply_report_node_with_field(&mut self, form: WithFieldForm) {
-        let Some(idx) = self.report_index_by_id(form.report_id) else {
-            return;
-        };
-        let Some(item) = form.item() else {
-            return;
-        };
-        let Ok(flow) = self.reports[idx].report.flow() else {
-            return;
-        };
+    ///
+    /// Returns the `with` index it wrote, so the caller can leave the outline
+    /// cursor on the field the user just edited.
+    pub(crate) fn apply_report_node_with_field(&mut self, form: WithFieldForm) -> Option<usize> {
+        let idx = self.report_index_by_id(form.report_id)?;
+        let item = form.item()?;
+        let flow = self.reports[idx].report.flow().ok()?;
         let Some(FlowNode::Report(ReportStmt::Request {
             name,
             alias,
@@ -2150,13 +2212,19 @@ impl TuiApp {
             with,
         })) = node_at(&flow, &form.path)
         else {
-            return;
+            return None;
         };
         let mut with = with.clone();
-        match form.index {
-            Some(i) if i < with.len() => with[i] = item,
-            _ => with.push(item),
-        }
+        let written = match form.index {
+            Some(i) if i < with.len() => {
+                with[i] = item;
+                i
+            }
+            _ => {
+                with.push(item);
+                with.len() - 1
+            }
+        };
         let node = FlowNode::Report(ReportStmt::Request {
             name: name.clone(),
             alias: alias.clone(),
@@ -2166,6 +2234,21 @@ impl TuiApp {
             with,
         });
         self.apply_node_replace(idx, &form.path, node);
+        Some(written)
+    }
+
+    /// Dismiss the `WITH` field form, returning where it was opened from:
+    /// the request form when it was a sub-form of one, otherwise simply closing
+    /// to the node outline. Closing to the outline is the whole point of the
+    /// flag — opened from a `WITH` row (or its "add a field" row), the form
+    /// used to hand the user a request form they had never asked for and then
+    /// made them dismiss that too.
+    fn close_report_node_with_field(&mut self, report_id: u64, path: &[usize], to_request: bool) {
+        if to_request {
+            self.reopen_report_node_request(report_id, path);
+        } else {
+            self.overlay = None;
+        }
     }
 
     /// Reopen the request form for the node at `path` after a `WITH` sub-form
@@ -2713,6 +2796,7 @@ impl TuiApp {
                                 form.path.clone(),
                                 Some(wi),
                                 existing.as_ref(),
+                                true,
                             );
                             // The parent form is applied first so the rows the
                             // user already changed aren't lost behind the
@@ -2731,8 +2815,13 @@ impl TuiApp {
                     },
                     Some(FormRow::AddWith) => {
                         if matches!(key.code, KeyCode::Char(' ')) {
-                            let sub =
-                                WithFieldForm::build(form.report_id, form.path.clone(), None, None);
+                            let sub = WithFieldForm::build(
+                                form.report_id,
+                                form.path.clone(),
+                                None,
+                                None,
+                                true,
+                            );
                             self.apply_report_node_request(*form);
                             self.overlay = Some(Overlay::ReportNodeWithField(Box::new(sub)));
                         } else {
@@ -2775,7 +2864,8 @@ impl TuiApp {
 
     /// The `WITH` field index a row edits: the field itself, or a fresh one for
     /// the block's add row. `None` for anything that isn't an editable `WITH`
-    /// row (the block's `END`, or a plain flow row).
+    /// row (a comment inside the block, the block's `END`, or a plain flow
+    /// row).
     fn with_row_index(&self, row: &NodeRow) -> Option<usize> {
         match row.kind {
             RowKind::WithField(i) => Some(i),
@@ -2801,6 +2891,7 @@ impl TuiApp {
             path.to_vec(),
             existing.is_some().then_some(wi),
             existing.as_ref(),
+            false,
         );
         self.overlay = Some(Overlay::ReportNodeWithField(Box::new(form)));
     }
@@ -3003,7 +3094,7 @@ impl TuiApp {
         // Deleting on a `WITH` row removes that one field, not the request that
         // owns it — they share a path, so this branch is what keeps Delete from
         // taking the whole block with it.
-        if let RowKind::WithField(wi) = row.kind {
+        if let Some(wi) = row.kind.with_item() {
             let path = row.path.clone();
             {
                 let rt = &mut self.reports[idx];
@@ -3061,7 +3152,7 @@ impl TuiApp {
         }
         // Reordering a `WITH` field reorders a report column, so it stays within
         // its own block rather than moving the request among its siblings.
-        if let RowKind::WithField(wi) = row.kind {
+        if let Some(wi) = row.kind.with_item() {
             self.move_with_field(idx, &row.path.clone(), wi, up);
             return;
         }
@@ -3134,6 +3225,24 @@ impl TuiApp {
 
     /// Move the node-view selection onto the row addressing `path` (the head
     /// row of a loop, or the leaf), clamping if it no longer exists.
+    /// Put the outline cursor on the `WITH` row at index `wi` of the request at
+    /// `path`. A no-op when the row has gone (the field was removed, or the
+    /// block collapsed), leaving the cursor wherever the caller left it.
+    fn select_with_row(&mut self, report_id: u64, path: &[usize], wi: usize) {
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return;
+        };
+        if let Some(at) = rows
+            .iter()
+            .position(|r| r.path == path && r.kind.with_item() == Some(wi))
+        {
+            self.reports[idx].node_selected = at;
+        }
+    }
+
     fn select_node_path(&mut self, idx: usize, path: &[usize]) {
         let Ok(rows) = self.report_node_rows(idx) else {
             return;
@@ -3381,6 +3490,7 @@ fn render_node_row(
         // Dimmed: it is in the file, but it isn't a statement.
         RowKind::Comment => (row.label.clone(), th.dim, false),
         RowKind::WithField(_) => (row.label.clone(), th.text, false),
+        RowKind::WithComment(_) => (row.label.clone(), th.dim, false),
         // The affordance that answers "how do I add a column here?" — dimmed
         // like the settings section's own add row, since it isn't source.
         RowKind::WithAdd => (format!("+ {}", s.report_with_add_row), th.dim, false),

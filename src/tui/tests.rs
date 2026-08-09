@@ -26029,6 +26029,67 @@ fn a_comment_is_a_row_in_the_outline() {
     assert_eq!(comment.label, "# a note about upload");
 }
 
+/// The same guarantee one level down: a commented-out column inside a `WITH`
+/// block used to be dropped on the floor by the parser, so editing the request
+/// from the node editor silently deleted it.
+#[test]
+fn a_structural_edit_keeps_a_commented_out_with_field() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(concat!(
+        "# collection: api\n\n",
+        "REPORT REQUEST upload AS u WITH\n",
+        "    Score: jsonpath \"$.score\"\n",
+        "    #    Frame: jsonpath \"$.frame\"\n",
+        "    Verdict: jsonpath \"$.verdict\"\n",
+        "END\n",
+        "REQUEST upload\n",
+    ));
+    app.revalidate_report(idx);
+
+    // Any structural edit will do; deleting the trailing node is the simplest.
+    let rows = app.report_node_rows(idx).expect("rows");
+    app.reports[idx].node_selected = rows.len() - 1;
+    press(&mut app, KeyCode::Delete);
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("#    Frame: jsonpath \"$.frame\""),
+        "the commented-out field survived: {text:?}"
+    );
+}
+
+/// …and it is visible in the outline, dimmed, so it can be found again to
+/// uncomment — but it is not offered to the field editor, since there is no
+/// field there to edit.
+#[test]
+fn a_with_comment_is_a_row_in_the_outline_but_not_a_field() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(concat!(
+        "# collection: api\n\n",
+        "REPORT REQUEST upload AS u WITH\n",
+        "    Score: jsonpath \"$.score\"\n",
+        "    #    Frame: jsonpath \"$.frame\"\n",
+        "END\n",
+    ));
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let pos = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithComment(1))
+        .expect("the commented field is a row");
+    assert!(
+        rows[pos].label.contains("Frame"),
+        "it shows what was commented out: {:?}",
+        rows[pos].label
+    );
+    app.reports[idx].node_selected = pos;
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !matches!(&app.overlay, Some(Overlay::ReportNodeWithField(_))),
+        "there is no field to edit on a comment"
+    );
+}
+
 /// The reported gap: the language allowed extra `# collection: … AS alias`
 /// lines but the node editor showed only one collection, so a helper was
 /// invisible and unreachable from the outline.
@@ -26128,4 +26189,150 @@ fn a_helper_request_reads_as_known_in_the_outline() {
         .expect("row");
     assert_eq!(row.req_ok, Some(false), "{:?}", row.label);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reported bug: opening the field editor from the outline's "add a field"
+/// row and then pressing Enter or Esc dropped the user into the *request* form
+/// — a wizard they had never asked for and then had to dismiss as well. It only
+/// hands back to the request form when it was opened as a sub-form of one.
+#[test]
+fn the_with_field_editor_closes_to_the_outline_when_opened_from_it() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let src =
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n";
+    for close in [KeyCode::Enter, KeyCode::Esc] {
+        app.reports[idx].report.set_text(src);
+        app.revalidate_report(idx);
+        let rows = app.report_node_rows(idx).expect("rows");
+        let at = rows
+            .iter()
+            .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+            .expect("add row");
+        app.reports[idx].node_selected = at;
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::ReportNodeWithField(_))),
+            "the add row opens the field editor"
+        );
+        press(&mut app, close);
+        assert!(
+            app.overlay.is_none(),
+            "{close:?} closes to the outline, not to another wizard"
+        );
+    }
+
+    // …but a field editor opened from the request form still returns there,
+    // which is what makes the request form usable as a hub.
+    app.reports[idx].report.set_text(src);
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::Leaf)
+        .expect("the request row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_ref() else {
+        panic!("the request row opens the request form");
+    };
+    let add = form
+        .visible_rows()
+        .iter()
+        .position(|r| matches!(r, super::report_nodes::FormRow::AddWith))
+        .expect("add-WITH row");
+    if let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_mut() {
+        form.selected = add;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeRequest(_))),
+        "a sub-form of the request form hands back to it"
+    );
+}
+
+/// The statistics checklist is six rows that most fields don't want, so it is
+/// folded behind a toggle. Turning it on seeds `COUNT` (the one statistic that
+/// means something for a text column too) and turning it off clears the ticks,
+/// so a collapsed list can never still be writing a clause.
+#[test]
+fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
+    use crate::tui::report_nodes::WithFieldRow;
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("expected the field editor");
+    };
+    assert_eq!(
+        form.visible_rows(),
+        vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats],
+        "a field with no STATISTICS shows the toggle only"
+    );
+
+    // Space on the toggle reveals the checklist with COUNT seeded.
+    let toggle = 2;
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = toggle;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        form.visible_rows().len() > 3,
+        "the checklist appears while the toggle is on"
+    );
+    assert_eq!(
+        form.stats
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>(),
+        vec![crate::report::model::StatKind::Count],
+        "turning it on seeds COUNT"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("STATISTICS(COUNT)"),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // Toggling back off clears the ticks, so the clause goes away entirely
+    // rather than lingering out of sight.
+    assert_eq!(
+        app.reports[idx].node_selected, at,
+        "applying leaves the cursor on the field just edited, not on the request"
+    );
+    press(&mut app, KeyCode::Enter);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = toggle;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert_eq!(
+        form.visible_rows(),
+        vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats],
+        "the checklist collapses again"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("STATISTICS"),
+        "no hidden clause survives: {}",
+        app.reports[idx].report.text
+    );
 }

@@ -711,10 +711,11 @@ strings! {
     report_node_list_add => "+ Add a value", "+ Ajouter une valeur", "+ Tilføj en værdi";
     report_node_with_add => "+ Add a WITH field", "+ Ajouter un champ WITH", "+ Tilføj et WITH-felt";
     report_node_with_title => "Configure WITH field", "Configurer le champ WITH", "Konfigurer WITH-felt";
-    report_node_with_hint => "↑↓ move · type name/query · Space toggle stat · Enter apply · Esc back", "↑↓ déplacer · saisir nom/requête · Espace bascule stat · Entrée appliquer · Échap retour", "↑↓ flyt · skriv navn/forespørgsel · Mellemrum skift statistik · Enter anvend · Esc tilbage";
+    report_node_with_hint => "↑↓ move · type name/query · Space toggle · Enter apply · Esc cancel", "↑↓ déplacer · saisir nom/requête · Espace basculer · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv navn/forespørgsel · Mellemrum skift · Enter anvend · Esc annullér";
     report_node_with_name_label => "Column name", "Nom de la colonne", "Kolonnenavn";
     report_node_with_query_label => "Query", "Requête", "Forespørgsel";
     report_node_with_stats_label => "STATISTICS", "STATISTICS", "STATISTICS";
+    report_node_with_stats_toggle => "Summary statistics", "Statistiques de synthèse", "Opsummerende statistik";
     report_node_with_query_none => "whole response", "réponse entière", "hele svaret";
     report_node_parallel_degree_label => "Max at once", "Maximum simultané", "Maks. samtidige";
     report_node_parallel_degree_none => "no limit", "sans limite", "ingen grænse";

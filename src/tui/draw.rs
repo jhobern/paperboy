@@ -898,6 +898,20 @@ fn draw_report_node_with_field_overlay(
                 }
                 Line::from(Span::styled(text, base))
             }
+            // The toggle sits flush left and the checkboxes it reveals are
+            // indented under it, so the list reads as its contents rather than
+            // as six more peers of Column name and Query.
+            WithFieldRow::Stats => {
+                let mark = if form.stats_on {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{mark} {}", s.report_node_with_stats_toggle),
+                    base,
+                ))
+            }
             WithFieldRow::Stat(si) => {
                 let (kind, on) = form.stats[si];
                 let mark = if on {
@@ -913,11 +927,7 @@ fn draw_report_node_with_field_overlay(
                     Style::default().fg(th.dim)
                 };
                 Line::from(Span::styled(
-                    format!(
-                        "  {mark} {}({})",
-                        s.report_node_with_stats_label,
-                        kind.keyword()
-                    ),
+                    format!("    {mark} {}", kind.keyword()),
                     style,
                 ))
             }
