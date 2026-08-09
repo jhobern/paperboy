@@ -1040,7 +1040,7 @@ fn build_node_chips(
             if !show.is_empty() {
                 chips.push(
                     Chip::modifier(
-                        format!("SHOW({})", show.join(", ")),
+                        format!("SHOW({})", crate::report::flow::show_text(show)),
                         th.ok,
                         DetachWhich::Show,
                     )
@@ -1185,7 +1185,7 @@ fn build_node_chips(
                 if !baseline_show.is_empty() {
                     chips.push(
                         Chip::modifier(
-                            format!("SHOW({})", baseline_show.join(", ")),
+                            format!("SHOW({})", crate::report::flow::show_text(baseline_show)),
                             th.ok,
                             DetachWhich::BaselineShow,
                         )
@@ -1435,7 +1435,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
     let th = app.theme;
     let mut close = false;
-    ed.pending_toolbar = None;
+    // NB: `pending_toolbar` is *not* cleared here. It is always taken at the end
+    // of the frame that set it, so there is nothing stale to clear -- but a
+    // shortcut or menu entry outside the editor (Ctrl+S, File > Save > Report)
+    // sets it *before* this runs, and clearing would swallow that request.
 
     // Fold any streamed run updates into the grid, and keep repainting while a
     // run is live so the grid fills in real time.
@@ -1662,9 +1665,20 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
     }
 
-    // Global keys: Ctrl+Z undo (both views); Delete on the blocks view is
-    // handled inside `blocks_view` so it doesn't fire while typing.
-    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+    // Global keys: Ctrl+Z undoes the last *structural* edit; Delete on the
+    // blocks view is handled inside `blocks_view` so it doesn't fire while
+    // typing.
+    //
+    // The source view is deliberately excluded: egui's `TextEdit` has an undoer
+    // of its own that no one can turn off, so running this stack there meant
+    // both fired at once and the widget wrote its own history straight back
+    // over the editor's — the change appeared to vanish for a frame and then
+    // came back with the caret moved. Text editing is exactly what the widget's
+    // undoer is for (it undoes by typed word, not by whole snapshot), so in
+    // that view it is left to do the job alone.
+    if ed.view != EditorView::Source
+        && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z))
+    {
         ed.undo();
     }
 
@@ -2105,6 +2119,7 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .max_height(edit_h)
         .show(ui, |ui| {
+            let te_id = ui.id().with("trail_source");
             let mut text = ed.report.text.clone();
             // The code-editing keys are intercepted *before* the widget sees
             // them: egui would insert a bare newline or a literal tab, so the
@@ -2112,7 +2127,6 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
             // perform the edit (caret included) ourselves. Modified variants are
             // left alone — Ctrl/Cmd+Enter runs the report, and Shift+Enter stays
             // a plain-newline escape hatch.
-            let te_id = ui.id().with("trail_source");
             // Only intercept when there is a live cursor to work from: with no
             // stored state we have no idea where the newline goes, so the key
             // is left for egui rather than consumed and dropped on the floor.
@@ -6845,6 +6859,33 @@ fn sync_back(ed: &ReportEditor, app: &mut GuiApp) {
         r.text = ed.report.text.clone();
         r.name = ed.report.name.clone();
     }
+}
+
+/// Queue the toolbar's Save action, so a keyboard shortcut or a menu entry
+/// saves by exactly the same path the toolbar button does (the editor is taken
+/// out of the app while it draws, so saving can only happen from inside its own
+/// frame).
+pub(super) fn request_save(ed: &mut ReportEditor) {
+    ed.pending_toolbar = Some(ToolbarAct::Save);
+}
+
+/// Save the open report to an explicit `path` (the "Save report as" path taken
+/// by the File menu), adopting that path so later saves go straight there.
+pub(super) fn save_report_to(app: &mut GuiApp, path: &std::path::Path) -> Result<(), String> {
+    let Some(mut ed) = app.report_editor.take() else {
+        return Err(app.strings.gui_nothing_to_save.to_string());
+    };
+    let res = ed.report.save_local(path);
+    if res.is_ok() {
+        sync_back(&ed, app);
+        if let ReportOrigin::Session(i) = ed.origin
+            && let Some(r) = app.session.reports.get_mut(i)
+        {
+            r.path = Some(path.to_string_lossy().into_owned());
+        }
+    }
+    app.report_editor = Some(ed);
+    res
 }
 
 /// Save the report: to disk when it has a path, and always back into the session.

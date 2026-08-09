@@ -257,6 +257,11 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
                 close_menu = true;
                 ui.close();
             }
+            if ui.button(app.strings.file_kind_report).clicked() {
+                open_via_picker(app, OpenKind::Report);
+                close_menu = true;
+                ui.close();
+            }
         });
         ui.menu_button(app.strings.gui_menu_open_git, |ui| {
             if ui
@@ -290,6 +295,19 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             }
             if ui.button(app.strings.gui_menu_item_response).clicked() {
                 save_via_picker(app, SaveKind::Response);
+                close_menu = true;
+                ui.close();
+            }
+            // Only saveable while a report is open in the editor -- the same
+            // condition the "Save to git > Report" entry uses.
+            if ui
+                .add_enabled(
+                    app.report_editor.is_some(),
+                    egui::Button::new(app.strings.file_kind_report),
+                )
+                .clicked()
+            {
+                save_via_picker(app, SaveKind::Report);
                 close_menu = true;
                 ui.close();
             }
@@ -752,6 +770,7 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
         OpenKind::Collection => app.strings.gui_open_collection_title,
         OpenKind::Environment => app.strings.gui_open_environment_title,
         OpenKind::Workspace => app.strings.gui_open_workspace_title,
+        OpenKind::Report => app.strings.gui_open_report_title,
     };
     let picker_kind = match kind {
         OpenKind::Environment => PickerKind::Environment,
@@ -776,6 +795,14 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
                     app.strings.gui_filter_environments,
                     &["vars", "env", "json"],
                 ),
+                (app.strings.gui_filter_all, &["*"]),
+            ],
+        ),
+        OpenKind::Report => super::filepick::pick_file(
+            title,
+            dir.as_deref(),
+            &[
+                (app.strings.gui_filter_reports, &["trail"]),
                 (app.strings.gui_filter_all, &["*"]),
             ],
         ),
@@ -809,6 +836,39 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("{} {e}", app.strings.gui_could_not_read))?;
     let name = file_stem(&path_str);
+    // A report opens into the report editor rather than a tab. It also joins
+    // the session's report list, so it is listed beside the others, survives a
+    // restart, and its edits are saved back to the file it came from.
+    if kind == OpenKind::Report {
+        let report = crate::report::Report::load_local(path)?;
+        let existing = app
+            .session
+            .reports
+            .iter()
+            .position(|r| r.path.as_deref() == Some(&path_str));
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                app.session
+                    .reports
+                    .push(crate::persistence::PersistedReport {
+                        name: report.name.clone(),
+                        text: report.text.clone(),
+                        path: Some(path_str.clone()),
+                        git_origin: None,
+                        workspace_root: None,
+                        embedded_active: true,
+                    });
+                app.session.reports.len() - 1
+            }
+        };
+        app.open_report_editor(
+            crate::gui::report_editor::ReportOrigin::Session(idx),
+            report,
+        );
+        app.focus = super::Focus::Main;
+        return Ok(());
+    }
     let ok = match kind {
         OpenKind::Collection => {
             app.session
@@ -818,7 +878,7 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
             .session
             .load_environment_text(name, &content, Some(path.to_path_buf()), None)
             .is_some(),
-        OpenKind::Workspace => unreachable!(),
+        OpenKind::Workspace | OpenKind::Report => unreachable!(),
     };
     if ok {
         Ok(())
@@ -864,6 +924,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Response => app.strings.gui_save_response_title,
         SaveKind::ReportResults => app.strings.gui_save_results_title,
         SaveKind::ReportBaseline => app.strings.gui_save_baseline_title,
+        SaveKind::Report => app.strings.gui_save_report_title,
     };
     // Seed the dialog from any remembered path (collections/environments) and a
     // sensible default filename.
@@ -904,6 +965,19 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             .map(|e| crate::report::writer::export_path(&e.report, "baseline"))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        // A report saves as its own `.trail` source, seeded from the file it was
+        // loaded from so "Save report" over an opened file re-offers that file.
+        SaveKind::Report => app
+            .report_editor
+            .as_ref()
+            .and_then(|e| e.report.path.clone())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                app.report_editor
+                    .as_ref()
+                    .map(|e| format!("{}.trail", e.report.name))
+                    .unwrap_or_default()
+            }),
         SaveKind::Response => String::new(),
     };
     let picker_kind = match kind {
@@ -923,6 +997,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             SaveKind::Response => "response.txt".into(),
             SaveKind::ReportResults => "results.csv".into(),
             SaveKind::ReportBaseline => "report.baseline".into(),
+            SaveKind::Report => "report.trail".into(),
         });
     let result_filters = report_result_filters(
         std::path::Path::new(&current)
@@ -935,6 +1010,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Environment(_) => &[("Vars", &["vars"]), ("All files", &["*"])],
         SaveKind::ReportResults => &result_filters,
         SaveKind::ReportBaseline => &[("Baseline", &["baseline"]), ("All files", &["*"])],
+        SaveKind::Report => &[("PaperTrail", &["trail"]), ("All files", &["*"])],
         SaveKind::Response => &[("All files", &["*"])],
     };
     let Some(path) = super::filepick::save_file(title, dir.as_deref(), &default_name, filters)
@@ -958,6 +1034,11 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
     if matches!(kind, SaveKind::ReportBaseline) {
         return save_report_baseline(app, path);
     }
+    if matches!(kind, SaveKind::Report) {
+        super::report_editor::save_report_to(app, path)?;
+        app.session.save();
+        return Ok(());
+    }
     let content = match kind {
         SaveKind::Collection => Some(app.session.collections[app.active_ci()].to_hurl()),
         SaveKind::Environment(id) => app
@@ -967,7 +1048,7 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
             .find(|e| e.id == id)
             .map(|e| e.to_vars_text()),
         SaveKind::Response => Some(app.session.response.lock().unwrap().body.to_string()),
-        SaveKind::ReportResults | SaveKind::ReportBaseline => None,
+        SaveKind::ReportResults | SaveKind::ReportBaseline | SaveKind::Report => None,
     };
     let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
@@ -985,7 +1066,10 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
                 e.path = Some(path.to_path_buf());
             }
         }
-        SaveKind::Response | SaveKind::ReportResults | SaveKind::ReportBaseline => {}
+        SaveKind::Response
+        | SaveKind::ReportResults
+        | SaveKind::ReportBaseline
+        | SaveKind::Report => {}
     }
     app.session.save();
     Ok(())
@@ -1306,6 +1390,73 @@ mod tests {
         );
         // The run is on disk now, so a rerun needn't warn about losing it.
         assert!(app.report_editor.as_ref().unwrap().results_exported);
+    }
+
+    /// Opening a report from disk must put it in the editor *and* in the
+    /// session's report list, so it is listed beside the others and survives a
+    /// restart -- the thing that makes it a real tab rather than a scratch view.
+    #[test]
+    fn opening_a_report_file_loads_it_into_the_editor_and_the_session() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("pb_gui_open_rep_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nightly.trail");
+        std::fs::write(&path, "# name: nightly\nREPORT smoke\n").unwrap();
+
+        let res = apply_open(&mut app, OpenKind::Report, &path);
+        // Opening the same file twice must reuse its tab rather than stack up
+        // duplicates that would then disagree about the file's contents.
+        let again = apply_open(&mut app, OpenKind::Report, &path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(res.is_ok() && again.is_ok(), "{res:?} {again:?}");
+        let ed = app.report_editor.as_ref().expect("editor must be open");
+        assert_eq!(ed.report.name, "nightly");
+        assert_eq!(app.session.reports.len(), 1);
+        assert_eq!(
+            app.session.reports[0].path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+    }
+
+    /// Saving a report writes its source and adopts the path, so the next
+    /// Ctrl+S goes straight to the same file instead of asking again.
+    #[test]
+    fn saving_a_report_writes_its_source_and_adopts_the_path() {
+        let mut app = app();
+        let mut report = crate::report::Report::scratch("r");
+        report.text = "# name: r\nREPORT smoke\n".into();
+        app.report_editor = Some(crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            report,
+        ));
+        app.session
+            .reports
+            .push(crate::persistence::PersistedReport {
+                name: "r".into(),
+                text: String::new(),
+                path: None,
+                git_origin: None,
+                workspace_root: None,
+                embedded_active: true,
+            });
+
+        let dir = std::env::temp_dir().join(format!("pb_gui_save_rep_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.trail");
+        let saved = apply_save(&mut app, SaveKind::Report, &path);
+        let text = std::fs::read_to_string(&path);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(saved.is_ok(), "saving should succeed: {saved:?}");
+        assert_eq!(text.unwrap(), "# name: r\nREPORT smoke\n");
+        let ed = app.report_editor.as_ref().unwrap();
+        assert_eq!(ed.report.path.as_deref(), Some(path.as_path()));
+        assert!(!ed.report.dirty);
+        assert_eq!(
+            app.session.reports[0].path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
     }
 
     /// With nothing to snapshot the button reports why rather than writing an

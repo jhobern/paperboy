@@ -55,6 +55,35 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   one settings row per declared label class with an "add label class" entry
   beside "add helper collection".
 
+- **Ground-truth scores are summarised as accuracy and confusion matrices.** A
+  report scored with `TRUTH` now reports how well it did, not just cell by cell:
+  a per-column *compared / incorrect / accuracy* summary, plus a confusion
+  matrix whenever a `# labels:` setting declares the axis. The figures reach
+  every format from one shared model, so no two views can disagree: footer rows
+  in CSV and the live grids, a `metrics` object in JSON, metric cards and a
+  heat-mapped matrix in HTML, and a second *Metrics* worksheet in xlsx.
+
+  The denominator counts only rows that were actually compared, so adding
+  unchecked rows can't inflate an accuracy, and a report that scored nothing
+  says so rather than claiming 0%. Values the labels don't declare get their own
+  axis entry rather than being dropped, so the matrix always adds up to the
+  accuracy printed beside it.
+
+- **A `SHOW(…)` field can carry its own `STATISTICS(…)`.** Writing
+  `SHOW(Time STATISTICS(MEAN, MAX), Status)` attaches summary rows to a column
+  where it is named, on both `REPORT REQUEST … SHOW(…)` and
+  `BASELINE(…) SHOW(…)`. Previously the only way to add a statistic to a shown
+  column was the `# columns:` directive — which is an exhaustive whitelist, so
+  naming one column there hid every other one. Baseline statistics apply to
+  every `baseline.<alias>.<field>` column the comparison produces.
+
+- **The GUI's File menu opens and saves reports, and Ctrl+S saves.** *Open ▸
+  Report* loads a `.trail` file into the editor and lists it beside the session's
+  other reports (reopening the same file reuses its tab); *Save ▸ Report* writes
+  the source back out and adopts the path. **Ctrl+S** saves whatever is in
+  front of you — the open report, otherwise the active collection — writing
+  straight to its file when it has one, and only asking where when it doesn't.
+
 - **PaperTrail columns can hold pictures (`IMAGE`).** A column whose value is a
   picture *source* — an image URL the response handed back, a path on disk, a
   `data:` URI or a bare base64 blob — can be marked `IMAGE`, and every export
@@ -166,6 +195,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   carried no heading to explain what the directives above the report were.
 
 ### Fixed
+
+- **Live summary statistics no longer count rows that haven't run yet.** The
+  results grid fills in a skeleton row per pending request, whose `Time` and
+  `Status` are numerically zero rather than empty — so a `STATISTICS(MEAN)` on
+  `Time` was dragged toward zero and only became correct once the last row
+  landed. Pending rows are now excluded from every summary figure, so a running
+  report's statistics describe the rows it has actually finished.
+
+- **Ctrl+Z in the GUI report source editor really undoes.** The edit appeared to
+  flash away and the cursor jumped, but the text came back: the editor ran its
+  own undo stack over the same buffer as egui's `TextEdit`, whose built-in
+  undoer (which can't be turned off) wrote its history back within the frame.
+  The source view now uses egui's undo alone; the editor's own stack still
+  serves the structural blocks view, where there is no `TextEdit` to argue with.
 
 - `FOR ROW IN TUPLES FROM "manifest.csv"` — the documented way to read a
   manifest's columns by name — no longer reports a destructuring mismatch. It

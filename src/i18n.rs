@@ -914,6 +914,9 @@ strings! {
     gui_could_not_parse => "Could not parse that file.", "Impossible d'analyser ce fichier.", "Kunne ikke fortolke den fil.";
     gui_could_not_read => "Could not read file:", "Impossible de lire le fichier\u{a0}:", "Kunne ikke læse filen:";
     gui_could_not_write => "Could not write file:", "Impossible d'écrire le fichier\u{a0}:", "Kunne ikke skrive filen:";
+    gui_open_report_title => "Open report", "Ouvrir un rapport", "Åbn rapport";
+    gui_save_report_title => "Save report", "Enregistrer le rapport", "Gem rapport";
+    gui_filter_reports => "PaperTrail reports", "Rapports PaperTrail", "PaperTrail-rapporter";
     gui_save_collection_title => "Save collection", "Enregistrer la collection", "Gem samling";
     gui_save_environment_title => "Save environment", "Enregistrer l'environnement", "Gem miljø";
     gui_save_response_title => "Save response", "Enregistrer la réponse", "Gem svar";
