@@ -277,6 +277,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+        timing_columns: ex.timing_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
         images: HashMap::new(),
@@ -382,6 +383,9 @@ struct Exec<'a> {
     broadcast: HashMap<String, String>,
     /// Produced column keys in first-seen order (the default column order).
     column_order: Vec<String>,
+    /// Produced column keys whose value came from a *timing* intrinsic, however
+    /// the column is named — see [`ReportResult::timing_columns`].
+    timing_columns: Vec<String>,
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
@@ -419,6 +423,7 @@ struct ExecState {
 struct IterOut {
     rows: Vec<ReportRow>,
     columns: Vec<String>,
+    timing_columns: Vec<String>,
     errors: Vec<String>,
 }
 
@@ -435,6 +440,7 @@ impl<'a> Exec<'a> {
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
+            timing_columns: Vec::new(),
             errors: Vec::new(),
             baseline_show: Vec::new(),
         }
@@ -471,6 +477,7 @@ impl<'a> Exec<'a> {
             target_env: state.target_env,
             broadcast: state.broadcast,
             column_order: Vec::new(),
+            timing_columns: Vec::new(),
             errors: Vec::new(),
             baseline_show: state.baseline_show,
         }
@@ -554,6 +561,14 @@ impl<'a> Exec<'a> {
     fn note_column(&mut self, key: &str) {
         if !self.column_order.iter().any(|c| c == key) {
             self.column_order.push(key.to_string());
+        }
+    }
+
+    /// Record that `key` holds a timing measurement, so the comparison phase can
+    /// leave it out of the diff no matter what the column is called.
+    fn note_timing_column(&mut self, key: &str) {
+        if !self.timing_columns.iter().any(|c| c == key) {
+            self.timing_columns.push(key.to_string());
         }
     }
 
@@ -844,7 +859,8 @@ impl<'a> Exec<'a> {
             // counterpart to renaming an intrinsic in the `columns:` directive.
             // `Response` uses the format-resolved body so it honours RESPONSE
             // RAW/PRETTY. Anything else is a Hurl query evaluated by `eval_field`.
-            let value = match query.trim() {
+            let query = query.trim();
+            let value = match query {
                 "HttpStatus" => eo.status.to_string(),
                 "Time" => eo.duration_ms.to_string(),
                 "TimeSetup" => eo.setup_ms.to_string(),
@@ -855,7 +871,17 @@ impl<'a> Exec<'a> {
                 "Response" => response.clone(),
                 q => eval_field(q, &eo).unwrap_or_default(),
             };
-            cells.push((format!("{alias}.{fname}"), value));
+            let key = format!("{alias}.{fname}");
+            // A field that aliases a timing intrinsic is still a *time*, so the
+            // comparison phase has to know. It can't tell from the column name
+            // — that is the user's, not the intrinsic's — and a renamed time
+            // differs on every single run, so without this every row of a
+            // comparison report reads as changed. See
+            // [`ReportResult::timing_columns`].
+            if TIMING_INTRINSIC_FIELDS.contains(&query) {
+                self.note_timing_column(&key);
+            }
+            cells.push((key, value));
         }
 
         // Column selection is applied to the fully-built `cells` list.
@@ -962,6 +988,7 @@ impl<'a> Exec<'a> {
             IterOut {
                 rows,
                 columns: sub.column_order,
+                timing_columns: sub.timing_columns,
                 errors: sub.errors,
             }
         };
@@ -1023,6 +1050,7 @@ impl<'a> Exec<'a> {
             IterOut {
                 rows,
                 columns: sub.column_order,
+                timing_columns: sub.timing_columns,
                 errors: sub.errors,
             }
         };
@@ -1111,6 +1139,9 @@ impl<'a> Exec<'a> {
         for out in outs {
             for c in &out.columns {
                 self.note_column(c);
+            }
+            for c in &out.timing_columns {
+                self.note_timing_column(c);
             }
             self.errors.extend(out.errors);
             rows.extend(out.rows);
@@ -1277,6 +1308,14 @@ fn asserts_summary(eo: &EntryOutcome) -> String {
 /// names it. Unlike the rest, these are diagnostic detail rather than part of
 /// the default shape of a report, so they stay out of the way until asked for.
 pub(crate) const OPT_IN_INTRINSIC_FIELDS: [&str; 3] = ["TimeSetup", "TimeWait", "TimeDownload"];
+
+/// The intrinsics that measure *elapsed time*. They are the ones no two runs
+/// ever agree on, so they are excluded from comparison diffs — both under their
+/// own names (by [`crate::report::compare`]) and under any name a `[Reports]`
+/// or `WITH` field aliases them to (recorded per run in
+/// [`crate::report::model::ReportResult::timing_columns`]).
+pub(crate) const TIMING_INTRINSIC_FIELDS: [&str; 4] =
+    ["Time", "TimeSetup", "TimeWait", "TimeDownload"];
 
 pub(crate) const INTRINSIC_FIELDS: [&str; 8] = [
     "HttpStatus",
@@ -3883,5 +3922,108 @@ mod helper_collection_tests {
             entries: vec![e("login")],
         }];
         assert!(resolve_qualified(&primary, &helpers, "auth/login").is_some());
+    }
+}
+
+/// A `WITH` field (or a `[Reports]` field) may alias a timing intrinsic under a
+/// name of its own. The run records those columns so the comparison phase can
+/// leave them out of the diff — see
+/// [`crate::report::model::ReportResult::timing_columns`].
+#[cfg(test)]
+mod timing_column_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Timed(Mutex<Vec<u64>>);
+    impl EntryRunner for Timed {
+        fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+            // A different duration on each call, which is what makes an
+            // unexcluded time column differ on every comparison.
+            let mut n = self.0.lock().unwrap();
+            let ms = 100 + n.len() as u64;
+            n.push(ms);
+            RunOutput {
+                entries: vec![EntryOutcome {
+                    method: base.method.clone(),
+                    url: base.url.clone(),
+                    status: 200,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                    body: "{\"verdict\":\"CLEAR\"}".into(),
+                    raw_body: "{\"verdict\":\"CLEAR\"}".into(),
+                    asserts: Vec::new(),
+                    captures: Vec::new(),
+                    duration_ms: ms,
+                    setup_ms: 1,
+                    wait_ms: 2,
+                    download_ms: 3,
+                    ok: true,
+                    error: None,
+                }],
+                error: None,
+            }
+        }
+    }
+
+    fn run(src: &str) -> ReportResult {
+        let flow = crate::report::parser::parse_flow(src).expect("parses");
+        let entries = [HurlEntry {
+            title: "face".into(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        }];
+        let runner = Timed(Mutex::new(Vec::new()));
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_with_field_aliasing_a_time_is_recorded_as_a_timing_column() {
+        let result = run(concat!(
+            "# collection: ./api.hurl\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    \"Response Time\": Time STATISTICS(MEAN, MEDIAN)\n",
+            "    Setup: TimeSetup\n",
+            "    Verdict: jsonpath \"$.verdict\"\n",
+            "END\n",
+        ));
+        let mut cols: Vec<&str> = result.timing_columns.iter().map(String::as_str).collect();
+        cols.sort();
+        assert_eq!(
+            cols,
+            vec!["f.Response Time", "f.Setup"],
+            "both aliased times are recorded, and nothing else is"
+        );
+        // The values really are the timings, not something that merely looks
+        // like one.
+        assert_eq!(result.rows[0].cells["f.Response Time"], "100");
+        assert_eq!(result.rows[0].cells["f.Setup"], "1");
+    }
+
+    /// Only the *timing* intrinsics. A renamed status is a genuine difference
+    /// when it differs, so it stays in the diff.
+    #[test]
+    fn a_renamed_status_is_not_a_timing_column() {
+        let result = run(concat!(
+            "# collection: ./api.hurl\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    Status: HttpStatus\n",
+            "    Body: Response\n",
+            "END\n",
+        ));
+        assert!(
+            result.timing_columns.is_empty(),
+            "{:?}",
+            result.timing_columns
+        );
     }
 }

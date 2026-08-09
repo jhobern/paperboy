@@ -153,7 +153,7 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         result.column_order.insert(0, RESULT_COLUMN.to_string());
     }
 
-    let excluded: HashSet<String> = result.column_images.keys().cloned().collect();
+    let excluded = excluded_keys(result);
     let rows = std::mem::take(&mut result.rows);
 
     let mut baseline_by_key: HashMap<Vec<String>, ReportRow> = HashMap::new();
@@ -231,6 +231,23 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     }
 
     result.rows = out;
+}
+
+/// The cell keys a diff must ignore, whatever their names: `IMAGE` columns
+/// (whose values are picture sources — typically signed, timestamped URLs that
+/// differ on every run) and timing columns (see
+/// [`ReportResult::timing_columns`]).
+///
+/// Both are exclusions of *provenance*, not of name, which is why they are read
+/// off the result rather than matched against a list here the way the intrinsics
+/// under their own names are in [`comparable_keys`].
+pub(super) fn excluded_keys(result: &ReportResult) -> HashSet<String> {
+    result
+        .column_images
+        .keys()
+        .chain(&result.timing_columns)
+        .cloned()
+        .collect()
 }
 
 /// Compare `cand` against its `baseline`, returning the `Result` cell: a
@@ -357,6 +374,82 @@ mod tests {
             comparisons: comparisons.iter().map(|s| s.to_string()).collect(),
             baseline_show: show.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// The reported bug: a `WITH` field that aliases the `Time` intrinsic under
+    /// a friendlier name (`"Response Time": Time STATISTICS(MEAN, MEDIAN)`)
+    /// produced a column whose *name* is not an intrinsic, so it was diffed —
+    /// and a time never repeats, so every row of the report read as changed.
+    /// The exclusion has to follow where the value came from, not what it is
+    /// called.
+    #[test]
+    fn a_renamed_time_column_is_not_a_difference() {
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "CLEAR")],
+                ),
+            ],
+            ..Default::default()
+        };
+        // Without the provenance record the two times are simply two differing
+        // cells, so this is the control: the row reads as changed.
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert!(
+            result.rows[0].cells[RESULT_COLUMN].contains("Response Time"),
+            "control: an unrecorded column is compared"
+        );
+
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "CLEAR")],
+                ),
+            ],
+            timing_columns: ["f.Response Time".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert_eq!(
+            result.rows[0].cells[RESULT_COLUMN], MATCH,
+            "a renamed time is excluded like the intrinsic it came from"
+        );
+
+        // …but only that column: a real difference beside it still reports.
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "NOT_CLEAR")],
+                ),
+            ],
+            timing_columns: ["f.Response Time".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        let verdict = &result.rows[0].cells[RESULT_COLUMN];
+        assert!(verdict.contains("overall"), "{verdict}");
+        assert!(!verdict.contains("Response Time"), "{verdict}");
     }
 
     #[test]

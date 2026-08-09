@@ -130,10 +130,10 @@ pub fn apply(result: &mut ReportResult, baseline: &Baseline) {
             .or_insert_with(|| br.to_row());
     }
 
-    // `IMAGE` columns are excluded from the diff: their values are picture
-    // sources (often signed, timestamped URLs), which differ on every run and
-    // would swamp the verdict with meaningless changes.
-    let excluded: HashSet<String> = result.column_images.keys().cloned().collect();
+    // `IMAGE` and timing columns are excluded from the diff: a picture source
+    // is usually a signed, timestamped URL and a time never repeats, so both
+    // differ on every run and would swamp the verdict with meaningless changes.
+    let excluded = compare::excluded_keys(result);
 
     // Diff each produced row against its snapshot sibling.
     let mut matched: HashSet<Vec<String>> = HashSet::new();

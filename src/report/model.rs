@@ -71,6 +71,17 @@ pub struct ReportResult {
     /// the resolved columns the same way `column_stats` is (a `columns:`
     /// directive's own inline `IMAGE(…)` wins). Empty by default.
     pub column_images: std::collections::HashMap<String, ImageSpec>,
+    /// Produced column keys whose value is an *elapsed time* — every column
+    /// sourced from the `Time`/`TimeSetup`/`TimeWait`/`TimeDownload` intrinsics,
+    /// including a `[Reports]` or `WITH` field that aliases one under a name of
+    /// its own (`"Response Time": Time`).
+    ///
+    /// Comparison excludes these from the diff. It can't do that on the column
+    /// *name* alone, the way it does for the intrinsics under their own names:
+    /// the name of an aliased column is the user's, and carries no hint of what
+    /// it holds. Left uncaught, a renamed time made every row of a comparison
+    /// report read as changed, because a time never repeats.
+    pub timing_columns: std::collections::HashSet<String>,
     /// Resolved picture bytes for `IMAGE` columns, keyed by `(row index within
     /// [`rows`](Self::rows), output-column header)`.
     ///
