@@ -343,7 +343,10 @@ fn apply(
             if cancelled {
                 return None;
             }
+            let mut skeleton = skeleton;
             let total = skeleton.rows.len();
+            // Outstanding until each row streams in — see `ReportResult::pending`.
+            skeleton.pending = (0..total).collect();
             let index = skeleton
                 .rows
                 .iter()
@@ -382,6 +385,7 @@ fn apply(
                 && ri < res.rows.len()
             {
                 res.rows[ri] = *row;
+                res.pending.remove(&ri);
                 if prog.states[ri] != RowState::Finished {
                     prog.states[ri] = RowState::Finished;
                     prog.done += 1;

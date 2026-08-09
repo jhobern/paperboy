@@ -133,8 +133,10 @@ impl ReportWriter for CsvWriter {
             push_record(&mut out, cells.iter().map(String::as_str));
         }
 
-        // Appended statistics summary rows (empty when no column requested any).
-        for srow in result.summary_rows(&columns) {
+        // Appended statistics and ground-truth metric rows (empty when the
+        // report asked for neither). CSV has one table and no header block, so
+        // the metrics can only live in the footer.
+        for srow in result.footer_rows(&columns, header) {
             let cells: Vec<String> = (0..columns.len()).map(|c| srow.text_cell(c)).collect();
             push_record(&mut out, cells.iter().map(String::as_str));
         }
@@ -173,7 +175,7 @@ impl ReportWriter for JsonWriter {
         // Appended statistics summary rows, keyed like the data rows (the row's
         // label lands in the first column). Omitted entirely when none exist.
         let summary: Vec<serde_json::Value> = result
-            .summary_rows(&columns)
+            .footer_rows(&columns, header)
             .iter()
             .map(|srow| {
                 let mut obj = serde_json::Map::new();
@@ -191,8 +193,52 @@ impl ReportWriter for JsonWriter {
                 .unwrap()
                 .insert("summary".to_string(), serde_json::Value::Array(summary));
         }
+        // The metrics also go out structured, not just as footer text: JSON is
+        // the format a dashboard or a CI gate reads, and re-parsing "95.9%" out
+        // of a summary row would be a silly thing to make anyone do.
+        if let Some(metrics) = result.metrics(&columns, header) {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("metrics".to_string(), metrics_json(&metrics));
+        }
         serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())
     }
+}
+
+/// The `metrics` object of the JSON export: the same figures the footer rows
+/// carry, but as numbers a dashboard or a CI gate can read without parsing
+/// "95.9%" back out of a string.
+fn metrics_json(metrics: &super::metrics::Metrics) -> serde_json::Value {
+    let column = |m: &super::metrics::ColumnMetrics| {
+        let mut obj = serde_json::json!({
+            "column": m.header,
+            "total": m.total,
+            "compared": m.compared,
+            "correct": m.correct,
+            "incorrect": m.incorrect,
+            "accuracy": m.accuracy(),
+        });
+        if let Some(matrix) = &m.matrix {
+            obj.as_object_mut().unwrap().insert(
+                "confusion".to_string(),
+                serde_json::json!({
+                    "axis": matrix.axis,
+                    // Rows are the truth, columns the value the run produced.
+                    "counts": matrix.counts,
+                }),
+            );
+        }
+        obj
+    };
+    let mut doc = serde_json::json!({
+        "columns": metrics.columns.iter().map(column).collect::<Vec<_>>(),
+    });
+    if let Some(overall) = &metrics.overall {
+        doc.as_object_mut()
+            .unwrap()
+            .insert("overall".to_string(), column(overall));
+    }
+    doc
 }
 
 /// Writes a report as a self-contained `.html` file: a single styled `<table>`
@@ -224,8 +270,38 @@ impl ReportWriter for HtmlWriter {
              td.pass{background:#c6efce}\n\
              td.fail{background:#ffc7ce}\n\
              td.warn{background:#ffeb9c}\n\
-             </style>\n</head>\n<body>\n<table>\n",
+             .metrics{display:flex;flex-wrap:wrap;gap:.75rem;margin:0 0 1rem}\n\
+             .card{border:1px solid #ccc;border-radius:6px;padding:.5rem .9rem;background:#fafafa}\n\
+             .card .k{display:block;font-size:12px;color:#666;text-transform:uppercase;\
+             letter-spacing:.04em}\n\
+             .card .v{display:block;font-size:20px;font-weight:600}\n\
+             .matrix{margin:0 0 1.25rem}\n\
+             .matrix h2{font-size:14px;font-weight:600;margin:0 0 .35rem}\n\
+             .matrix table{width:auto;min-width:0;font-size:13px}\n\
+             .matrix th,.matrix td{text-align:center;white-space:nowrap}\n\
+             .matrix thead th{position:static;background:#fafafa;color:#222;font-weight:600}\n\
+             .matrix th.axis{background:#fafafa;color:#222;text-align:right;font-weight:600}\n\
+             .matrix td.cell{color:#12305a}\n\
+             .matrix td.hot{color:#fff}\n\
+             .matrix caption{caption-side:bottom;font-size:12px;color:#666;padding-top:.3rem;\
+             text-align:left}\n\
+             </style>\n</head>\n<body>\n",
         );
+        // Ground-truth metrics go *above* the table, as cards and a matrix:
+        // HTML has a header block, and a reader who wants to know whether the
+        // run was any good should not have to scroll 500 rows to find out. The
+        // flat formats put the same figures in the footer instead, so no
+        // document ever states them twice.
+        let metrics = result.metrics(&columns, header);
+        if let Some(metrics) = &metrics {
+            push_metric_cards(&mut out, metrics);
+            for m in &metrics.columns {
+                if let Some(matrix) = &m.matrix {
+                    push_confusion_matrix(&mut out, &m.header, matrix);
+                }
+            }
+        }
+        out.push_str("<table>\n");
         // Sized columns, so the browser doesn't squeeze a short column to a few
         // characters and hyphenate its header (see `html_column_widths`). The
         // table is `table-layout:fixed`, which is what makes these binding
@@ -286,6 +362,111 @@ impl ReportWriter for HtmlWriter {
         out.push_str("</table>\n</body>\n</html>\n");
         Ok(out.into_bytes())
     }
+}
+
+/// The metric cards drawn above the table: one group per ground-truthed column
+/// (plus the row roll-up), each stating what was compared, how much of it was
+/// wrong, and the resulting accuracy.
+fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
+    use super::metrics::{ACCURACY_LABEL, COMPARED_LABEL, INCORRECT_LABEL};
+    fn card(out: &mut String, k: &str, v: &str) {
+        out.push_str("<div class=\"card\"><span class=\"k\">");
+        push_escaped(out, k);
+        out.push_str("</span><span class=\"v\">");
+        push_escaped(out, v);
+        out.push_str("</span></div>");
+    }
+    // The roll-up first when there is one: with several truth-bearing columns
+    // it is the figure that answers "did this run pass?", and the per-column
+    // breakdown is the follow-up question.
+    let groups = metrics
+        .overall
+        .iter()
+        .chain(metrics.columns.iter())
+        .collect::<Vec<_>>();
+    for m in groups {
+        out.push_str("<div class=\"metrics\">");
+        card(
+            out,
+            &format!("{} — {COMPARED_LABEL}", m.header),
+            &format!("{} of {}", m.compared, m.total),
+        );
+        card(out, INCORRECT_LABEL, &m.incorrect.to_string());
+        card(
+            out,
+            ACCURACY_LABEL,
+            m.accuracy_text().as_deref().unwrap_or("\u{2014}"),
+        );
+        out.push_str("</div>\n");
+    }
+}
+
+/// A confusion matrix as a heatmap: truth down the side, the value the run
+/// produced across the top.
+///
+/// Shaded in a single hue rather than a green-to-red scale, because the
+/// diagonal is not "good" in every matrix — for a rare-event detector the
+/// interesting cells are off it — and a colour scheme that pre-judges which
+/// cells are the bad ones is a scheme that misleads on exactly those reports.
+/// The count is always printed, so the shading only ever ranks what the reader
+/// can already read (and the report stays legible in greyscale, to a
+/// colour-blind reader, and on a printout).
+fn push_confusion_matrix(out: &mut String, column: &str, matrix: &super::metrics::ConfusionMatrix) {
+    let max = matrix.max();
+    out.push_str("<div class=\"matrix\"><h2>");
+    push_escaped(out, column);
+    out.push_str("</h2>\n<table><caption>");
+    // A perfect matrix says so in words: leaving the reader to verify that
+    // every off-diagonal cell is a zero is work a caption can do for them.
+    let clean = if matrix.is_diagonal() {
+        " Every scored row matched its ground truth."
+    } else {
+        ""
+    };
+    push_escaped(
+        out,
+        &format!(
+            "Rows: ground truth. Columns: reported value. {} scored row(s).{clean}",
+            matrix.total()
+        ),
+    );
+    out.push_str("</caption>\n<thead><tr><th class=\"axis\"></th>");
+    for label in &matrix.axis {
+        out.push_str("<th>");
+        push_escaped(out, label);
+        out.push_str("</th>");
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for (t, label) in matrix.axis.iter().enumerate() {
+        out.push_str("<tr><th class=\"axis\">");
+        push_escaped(out, label);
+        out.push_str("</th>");
+        for p in 0..matrix.axis.len() {
+            let n = matrix.counts[t][p];
+            let (bg, hot) = heat_shade(n, max);
+            out.push_str(&format!(
+                "<td class=\"cell{}\" style=\"background:{bg}\">{n}</td>",
+                if hot { " hot" } else { "" }
+            ));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</tbody></table></div>\n");
+}
+
+/// The background for a heatmap cell holding `n` of a maximum `max`, and
+/// whether the text on it needs to flip to white. A blue ramp: colour-blind
+/// safe at both ends, and distinct from the green/amber/red the *data* cells
+/// use for pass/changed/fail, so nobody reads a busy matrix cell as a failure.
+fn heat_shade(n: usize, max: usize) -> (String, bool) {
+    if n == 0 || max == 0 {
+        return ("#ffffff".to_string(), false);
+    }
+    let f = n as f64 / max as f64;
+    // Interpolate from a very pale blue to a deep one.
+    let lerp = |from: f64, to: f64| (from + (to - from) * f).round() as u32;
+    let (r, g, b) = (lerp(234.0, 8.0), lerp(242.0, 48.0), lerp(252.0, 107.0));
+    (format!("#{r:02x}{g:02x}{b:02x}"), f > 0.55)
 }
 
 /// Append an `<img>` for a resolved picture, sized per the column's `IMAGE`
@@ -537,8 +718,104 @@ impl ReportWriter for XlsxWriter {
             }
         }
 
+        // Ground-truth metrics get a sheet of their own rather than more footer
+        // rows: a confusion matrix is a second table with its own axes, and
+        // pasting it under a filtered data table would put it inside the
+        // filter's range — where sorting the report would scramble it.
+        if let Some(metrics) = result.metrics(&columns, header) {
+            write_metrics_sheet(&mut workbook, &metrics)?;
+        }
+
         workbook.save_to_buffer().map_err(|e| e.to_string())
     }
+}
+
+/// The `Metrics` worksheet: the accuracy figures, then one confusion matrix per
+/// ground-truthed column that declared a label vocabulary.
+fn write_metrics_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    metrics: &super::metrics::Metrics,
+) -> Result<(), String> {
+    use super::metrics::{ACCURACY_LABEL, COMPARED_LABEL, INCORRECT_LABEL};
+    use rust_xlsxwriter::{Color, Format, FormatAlign};
+
+    let head = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0x33_3333))
+        .set_font_color(Color::White);
+    let label = Format::new().set_bold();
+    let axis = Format::new().set_bold().set_align(FormatAlign::Right);
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Metrics").map_err(|e| e.to_string())?;
+    sheet.set_column_width(0, 28.0).map_err(|e| e.to_string())?;
+
+    let mut r: u32 = 0;
+    let put = |sheet: &mut rust_xlsxwriter::Worksheet,
+               row: u32,
+               col: u16,
+               text: &str,
+               fmt: &Format|
+     -> Result<(), String> {
+        sheet
+            .write_string_with_format(row, col, text, fmt)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    for (c, h) in ["Column", COMPARED_LABEL, INCORRECT_LABEL, ACCURACY_LABEL]
+        .iter()
+        .enumerate()
+    {
+        put(sheet, r, c as u16, h, &head)?;
+    }
+    r += 1;
+    for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+        put(sheet, r, 0, &m.header, &label)?;
+        put(
+            sheet,
+            r,
+            1,
+            &format!("{} of {}", m.compared, m.total),
+            &Format::new(),
+        )?;
+        sheet
+            .write_number(r, 2, m.incorrect as f64)
+            .map_err(|e| e.to_string())?;
+        // Written as a real percentage, not the "95.9%" string the flat
+        // formats show, so the cell can be charted or thresholded.
+        if let Some(a) = m.accuracy() {
+            sheet
+                .write_number_with_format(r, 3, a, &Format::new().set_num_format("0.0%"))
+                .map_err(|e| e.to_string())?;
+        }
+        r += 1;
+    }
+
+    for m in &metrics.columns {
+        let Some(matrix) = &m.matrix else { continue };
+        r += 2;
+        put(
+            sheet,
+            r,
+            0,
+            &format!("{} — truth (down) by reported value (across)", m.header),
+            &label,
+        )?;
+        r += 1;
+        for (c, a) in matrix.axis.iter().enumerate() {
+            put(sheet, r, c as u16 + 1, a, &head)?;
+        }
+        r += 1;
+        for (t, a) in matrix.axis.iter().enumerate() {
+            put(sheet, r, 0, a, &axis)?;
+            for (p, n) in matrix.counts[t].iter().enumerate() {
+                sheet
+                    .write_number(r, p as u16 + 1, *n as f64)
+                    .map_err(|e| e.to_string())?;
+            }
+            r += 1;
+        }
+    }
+    Ok(())
 }
 
 /// A background tint for a colour-coded cell.
@@ -797,14 +1074,14 @@ fn xlsx_stat_formula(
     let letter = col_letter(col);
     // Data occupies A1-style rows 2..=nrows+1 (row 1 is the header).
     let range = format!("{letter}2:{letter}{}", nrows + 1);
-    if v.stat == StatKind::Distribution {
+    if v.stat == Some(StatKind::Distribution) {
         let crit = v.match_value.as_deref().unwrap_or("").replace('"', "\"\"");
         return Some(format!("=COUNTIF({range},\"{crit}\")"));
     }
     if !v.numeric {
         return None;
     }
-    let f = match v.stat {
+    let f = match v.stat? {
         StatKind::Mean => format!("=AVERAGE({range})"),
         StatKind::Median => format!("=MEDIAN({range})"),
         StatKind::Sum => format!("=SUM({range})"),
@@ -1325,6 +1602,133 @@ mod tests {
                 value: spec.into(),
             }],
         }
+    }
+
+    /// A ground-truthed result: three scored rows (one wrong) and one row
+    /// nobody labelled, with a declared vocabulary so a matrix is produced.
+    fn truth_result() -> (ReportResult, Header) {
+        use crate::report::model::Verdict;
+        let mut res = ReportResult {
+            column_order: vec!["Correct".into(), "Name".into(), "Verdict".into()],
+            rows: vec![
+                row(&[
+                    ("Name", "a"),
+                    ("Verdict", "Low Risk"),
+                    ("Correct", "correct"),
+                ]),
+                row(&[
+                    ("Name", "b"),
+                    ("Verdict", "High Risk"),
+                    ("Correct", "correct"),
+                ]),
+                row(&[
+                    ("Name", "c"),
+                    ("Verdict", "Low Risk"),
+                    ("Correct", "incorrect"),
+                ]),
+                row(&[("Name", "d"), ("Verdict", "Low Risk")]),
+            ],
+            ..Default::default()
+        };
+        res.column_truths
+            .insert("Verdict".into(), "{{ expected }}".into());
+        for (r, (v, t)) in [
+            (Verdict::Correct, "real"),
+            (Verdict::Correct, "fake"),
+            (Verdict::Incorrect, "fake"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            res.verdicts.insert((r, "Verdict".into()), v);
+            res.truths.insert((r, "Verdict".into()), t.into());
+        }
+        let header = Header {
+            lines: vec![
+                super::super::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Pass = pass, real, low risk".into(),
+                },
+                super::super::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Fail = fail, fake, high risk".into(),
+                },
+            ],
+        };
+        (res, header)
+    }
+
+    /// CSV has one table and no header block, so the metrics ride in the
+    /// footer — and a report with no `TRUTH` gains nothing at all.
+    #[test]
+    fn csv_appends_the_ground_truth_metrics_to_the_footer() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(CsvWriter.write(&res, &header).unwrap()).unwrap();
+        // Roll-up under `Correct`, per-column figure under `Verdict`, and the
+        // row's label in the first column that had nothing of its own.
+        assert!(
+            out.contains("3 of 4,Compared,3 of 4"),
+            "compared row: {out}"
+        );
+        assert!(out.contains("66.7%,Accuracy,66.7%"), "accuracy row: {out}");
+        // Nothing is appended to a report that never declared a truth.
+        let plain = String::from_utf8(
+            CsvWriter
+                .write(&stats_result(), &Header::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!plain.contains("Accuracy"), "{plain}");
+    }
+
+    /// HTML states the figures once, above the table, and draws the matrix in
+    /// the declared axis order. Nothing it emits reaches out to the network.
+    #[test]
+    fn html_draws_metric_cards_and_a_confusion_matrix() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(out.contains("class=\"metrics\""), "cards: {out}");
+        assert!(out.contains("66.7%"), "accuracy card: {out}");
+        assert!(out.contains("class=\"matrix\""), "matrix: {out}");
+        let pass = out.find("Pass").expect("Pass axis label");
+        let fail = out.find("Fail").expect("Fail axis label");
+        assert!(pass < fail, "the axis keeps its declared order");
+        assert!(
+            !out.contains("<tfoot"),
+            "the metrics are not also repeated in the footer: {out}"
+        );
+        assert!(
+            !out.contains("http://") && !out.contains("https://"),
+            "the export stays self-contained"
+        );
+    }
+
+    /// JSON carries the metrics structured, so a CI gate doesn't have to parse
+    /// "66.7%" back out of a string.
+    #[test]
+    fn json_exports_the_metrics_as_numbers() {
+        let (res, header) = truth_result();
+        let out = JsonWriter.write(&res, &header).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let col = &doc["metrics"]["columns"][0];
+        assert_eq!(col["column"], "Verdict");
+        assert_eq!(col["compared"], 3);
+        assert_eq!(col["incorrect"], 1);
+        assert!((col["accuracy"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(col["confusion"]["axis"][0], "Pass");
+        // Truth down, prediction across: the one wrong row is a Fail read as a Pass.
+        assert_eq!(col["confusion"]["counts"][1][0], 1);
+        assert_eq!(doc["metrics"]["overall"]["correct"], 2);
+    }
+
+    /// A matrix only exists where a vocabulary was declared: without one there
+    /// is no meaningful axis order, and a matrix of whatever turned up is noise.
+    #[test]
+    fn no_labels_directive_means_no_matrix_but_still_metrics() {
+        let (res, _) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(out.contains("class=\"metrics\""), "figures still shown");
+        assert!(!out.contains("class=\"matrix\""), "but no matrix: {out}");
     }
 
     fn stats_result() -> ReportResult {

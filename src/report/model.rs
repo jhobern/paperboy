@@ -54,6 +54,16 @@ pub struct ReportResult {
     pub rows: Vec<ReportRow>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
+    /// Row indices whose result hasn't streamed in yet — the skeleton slots a
+    /// live run has not reached.
+    ///
+    /// A skeleton row is produced by a *dry* pass, so its intrinsics are
+    /// placeholders (`Time` is 0, `status` is 0). Left in, they drag a live
+    /// `STATISTICS(MEAN)` down towards zero and the reader watches a statistic
+    /// that is simply wrong slowly become right, which is worse than showing
+    /// nothing. Set by whichever front-end is streaming the run and cleared as
+    /// each row lands; always empty for a finished run.
+    pub pending: std::collections::HashSet<usize>,
     /// The table-wide marker rendered for a cell that resolved to nothing (the
     /// effective `PRELUDE_NO_MATCH_MARKER`, empty by default). Applied once, at
     /// render time, by [`OutputColumn::value`].
@@ -186,6 +196,18 @@ impl ReportResult {
                 {
                     col.stats = stats.clone();
                 }
+                // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
+                // statically: the comparison produces one `baseline.<alias>.f`
+                // per alias that emits `f`, and the aliases are only known once
+                // the run has produced rows. It is recorded as `baseline.*.f`
+                // and matched here by prefix and suffix.
+                if col.stats.is_empty()
+                    && let Some(rest) = col.header.strip_prefix("baseline.")
+                    && let Some((_, field)) = rest.rsplit_once('.')
+                    && let Some(stats) = self.column_stats.get(&format!("baseline.*.{field}"))
+                {
+                    col.stats = stats.clone();
+                }
             }
         }
         // Likewise for `IMAGE(…)` hints, and on the same precedence rule: an
@@ -219,6 +241,34 @@ impl ReportResult {
     /// per distinct value carrying its count. The leading (first-column) cell of
     /// each row holds the row's label unless the first column itself carries the
     /// statistic's value. Returns an empty vec when no column requested stats.
+    /// The complete footer of the table: the `STATISTICS` rows followed by the
+    /// ground-truth metric rows.
+    ///
+    /// This is what a *flat* renderer wants — CSV, JSON and the two live grids
+    /// have one table and nowhere else to put a figure. Formats with a header
+    /// block (HTML, xlsx) draw the metrics as cards or on their own sheet
+    /// instead and use [`Self::summary_rows`] for the footer, so the same
+    /// number is never printed twice in one document.
+    pub fn footer_rows(&self, columns: &[OutputColumn], header: &Header) -> Vec<SummaryRow> {
+        let mut rows = self.summary_rows(columns);
+        if let Some(metrics) = self.metrics(columns, header) {
+            rows.extend(metrics.summary_rows(columns));
+        }
+        rows
+    }
+
+    /// The ground-truth metrics of this run, or `None` when it has no `TRUTH`
+    /// column. The label vocabulary comes from the report's `# labels:`
+    /// directives, which is why this needs the header.
+    pub fn metrics(
+        &self,
+        columns: &[OutputColumn],
+        header: &Header,
+    ) -> Option<super::metrics::Metrics> {
+        let labels = super::labels::LabelMap::parse(&header.labels());
+        super::metrics::Metrics::compute(self, columns, &labels)
+    }
+
     pub fn summary_rows(&self, columns: &[OutputColumn]) -> Vec<SummaryRow> {
         if columns.iter().all(|c| c.stats.is_empty()) {
             return Vec::new();
@@ -228,7 +278,9 @@ impl ReportResult {
         let column_values = |col: &OutputColumn| -> Vec<String> {
             self.rows
                 .iter()
-                .map(|row| col.value(row, &self.no_match_marker))
+                .enumerate()
+                .filter(|(i, _)| !self.pending.contains(i))
+                .map(|(_, row)| col.value(row, &self.no_match_marker))
                 .filter(|v| !v.trim().is_empty() && *v != self.no_match_marker)
                 .collect()
         };
@@ -251,7 +303,7 @@ impl ReportResult {
                 if let Some(text) = compute_stat(stat, &values) {
                     cells[ci] = Some(StatValue {
                         text,
-                        stat,
+                        stat: Some(stat),
                         numeric,
                         match_value: None,
                     });
@@ -273,7 +325,7 @@ impl ReportResult {
                 let mut cells = vec![None; columns.len()];
                 cells[ci] = Some(StatValue {
                     text: count.to_string(),
-                    stat: StatKind::Distribution,
+                    stat: Some(StatKind::Distribution),
                     numeric: true,
                     match_value: Some(value.clone()),
                 });
@@ -394,7 +446,10 @@ impl StatKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatValue {
     pub text: String,
-    pub stat: StatKind,
+    /// The statistic behind the value, or `None` for a footer figure that no
+    /// spreadsheet formula could recompute (a ground-truth metric), which is
+    /// therefore written as plain text.
+    pub stat: Option<StatKind>,
     pub numeric: bool,
     pub match_value: Option<String>,
 }
@@ -1270,6 +1325,54 @@ mod tests {
         assert_eq!(get("Max").as_deref(), Some("300"));
         // Population std dev of {100,200,300} = ~81.6497.
         assert!(get("Std dev").unwrap().starts_with("81.6"));
+    }
+
+    /// A live run's statistics measure only the rows that have actually come
+    /// back: the skeleton fills the rest with dry placeholders (`Time` 0), and
+    /// averaging those in makes the figure wrong in a way that slowly corrects
+    /// itself — which is worse than showing nothing.
+    /// `BASELINE(…) SHOW(Time STATISTICS(MEAN))` summarises the copied baseline
+    /// column, whose real name (`baseline.<alias>.Time`) only exists once the
+    /// run has produced rows — so it is matched by suffix.
+    #[test]
+    fn baseline_show_statistics_reach_the_column_they_name() {
+        let mut res = ReportResult::default();
+        res.note_column("proc.Time");
+        res.note_column("baseline.proc.Time");
+        res.column_stats
+            .insert("baseline.*.Time".to_string(), vec![StatKind::Mean]);
+        let cols = res.resolved_columns(&Header::default());
+        let baseline_col = cols
+            .iter()
+            .find(|c| c.header == "baseline.proc.Time")
+            .expect("the copied baseline column");
+        assert_eq!(baseline_col.stats, vec![StatKind::Mean]);
+        // The candidate's own column is untouched: the clause named the
+        // baseline's.
+        let own = cols.iter().find(|c| c.header == "proc.Time").unwrap();
+        assert!(own.stats.is_empty());
+    }
+
+    #[test]
+    fn statistics_skip_rows_still_waiting_on_their_result() {
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Time", "100")], &[], None),
+            row(&[("Time", "200")], &[], None),
+            row(&[("Time", "0")], &[], None),
+            row(&[("Time", "0")], &[], None),
+        ];
+        res.pending = [2, 3].into_iter().collect();
+        let cols = parse_columns("Time STATISTICS(MEAN, COUNT)");
+        let summary = res.summary_rows(&cols);
+        let get = |label: &str| {
+            summary
+                .iter()
+                .find(|r| r.label == label)
+                .map(|r| r.text_cell(0))
+        };
+        assert_eq!(get("Count").as_deref(), Some("2"), "only the finished rows");
+        assert_eq!(get("Mean").as_deref(), Some("150"));
     }
 
     #[test]

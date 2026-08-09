@@ -22,6 +22,7 @@ pub mod flow;
 pub mod image;
 pub mod indent;
 pub mod labels;
+pub mod metrics;
 pub mod model;
 pub mod parser;
 pub mod producers;

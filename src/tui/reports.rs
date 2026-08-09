@@ -1289,6 +1289,11 @@ impl TuiApp {
                     .map(|(i, row)| (row.path.clone(), i))
                     .collect();
                 let rt = &mut self.reports[idx];
+                // Every slot is outstanding until its row streams in, so a live
+                // `STATISTICS(…)` measures what has actually run rather than the
+                // dry placeholders (`Time` 0, `status` 0) filling the rest.
+                let mut result = result;
+                result.pending = (0..n).collect();
                 rt.result = Some(result);
                 // A real run supersedes the projection it was previewing.
                 rt.dry_run = None;
@@ -1350,6 +1355,7 @@ impl TuiApp {
                     && ri < result.rows.len()
                 {
                     result.rows[ri] = *row;
+                    result.pending.remove(&ri);
                     if prog.states[ri] != RowState::Finished {
                         prog.states[ri] = RowState::Finished;
                         prog.done += 1;

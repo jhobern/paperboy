@@ -47,7 +47,7 @@ use crate::hurl::{EntryOutcome, RunOutput};
 use super::compare::{CORRECT_COLUMN, RESULT_COLUMN};
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleBinding, RoleRef, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
 use super::model::{ReportResult, ReportRow, Verdict};
 use super::producers::{self, ProducerItem};
@@ -285,6 +285,9 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         images: HashMap::new(),
         verdicts: HashMap::new(),
         truths: HashMap::new(),
+        // A completed run has nothing outstanding; only a streaming front-end
+        // populates this, for the skeleton it is filling in.
+        pending: std::collections::HashSet::new(),
     }
 }
 
@@ -865,7 +868,7 @@ impl<'a> Exec<'a> {
         name: &str,
         alias: Option<&str>,
         response_fmt: Option<ResponseFmt>,
-        show: &[String],
+        show: &[ShowField],
         hide: &[String],
         with: &[WithItem],
     ) -> Vec<(String, String)> {
@@ -998,7 +1001,7 @@ impl<'a> Exec<'a> {
                 // own SHOW, or the loop-level `ENVS BASELINE(…) SHOW(…)`, whose
                 // whole purpose is to put that field beside its baseline copy.
                 !INTRINSIC_FIELDS.contains(&suffix)
-                    || show.iter().any(|s| s == suffix)
+                    || show.iter().any(|s| s.name() == suffix)
                     || self.baseline_show.iter().any(|s| s == suffix)
             });
         } else {
@@ -1017,7 +1020,7 @@ impl<'a> Exec<'a> {
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
                 !OPT_IN_INTRINSIC_FIELDS.contains(&suffix)
-                    || show.iter().any(|s| s == suffix)
+                    || show.iter().any(|s| s.name() == suffix)
                     || self.baseline_show.iter().any(|s| s == suffix)
             });
         }

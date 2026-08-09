@@ -115,6 +115,29 @@ impl LabelMap {
         self.lookup.get(&canon(value)).copied()
     }
 
+    /// The canonical labels, in declaration order.
+    ///
+    /// This is also the axis order of a confusion matrix: the classes are a
+    /// `Vec` and not a set precisely so that the order the author wrote them in
+    /// is the order the matrix reads in.
+    pub fn classes(&self) -> &[String] {
+        &self.classes
+    }
+
+    /// How `value` should be displayed and counted: its class's canonical label
+    /// when it has one, otherwise the value's own canonical form.
+    ///
+    /// A value in no declared class is deliberately kept as itself rather than
+    /// lumped into an "other" bucket — an answer nobody expected is exactly
+    /// what the reader most needs to see, and hiding it would make a confusion
+    /// matrix lie about what happened.
+    pub fn label_of(&self, value: &str) -> String {
+        match self.class_of(value) {
+            Some(i) => self.classes[i].clone(),
+            None => canon(value),
+        }
+    }
+
     /// Whether two values mean the same thing: the same class, or — when
     /// neither is classified — the same text ignoring case and surrounding or
     /// repeated whitespace.
@@ -166,6 +189,8 @@ mod tests {
             "Fail = fail, reject, high risk, fake",
         ]);
         assert!(map.same("fail", "High Risk"), "and the second class holds");
+        assert_eq!(map.classes(), ["Pass".to_string(), "Fail".to_string()]);
+        assert_eq!(map.label_of("REJECT"), "Fail", "counted under its class");
         assert!(
             map.same("Low Risk", "real"),
             "an engine verdict matches a folder label through the class"
@@ -190,6 +215,11 @@ mod tests {
     fn undeclared_values_compare_as_themselves() {
         let map = LabelMap::parse(&[]);
         assert_eq!(map.class_of("approved"), None);
+        assert_eq!(
+            map.label_of("Approved"),
+            "approved",
+            "an unclassified value counts as itself"
+        );
         assert!(map.same(" APPROVED ", "approved"));
         assert!(!map.same("approved", "declined"));
     }
