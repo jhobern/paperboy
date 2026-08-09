@@ -14,10 +14,10 @@ use crate::i18n::Status;
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
-    self, CarriedMod, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier,
-    attach_to_node, carry_modifier, detach_modifier, flatten, insert_node, insert_pos_after,
-    move_node, node_at, remove_node, replace_node, report_assignment, request_node,
-    set_request_name, transfer_modifier,
+    self, CarriedMod, DetachWhich, HEADER_PLACEHOLDER, HeaderKind, HeaderSpec, InsertPos, Modifier,
+    NodeKind, RowKind, attach_modifier, attach_to_node, carry_modifier, detach_modifier, flatten,
+    header_specs, insert_node, insert_pos_after, move_node, node_at, remove_node, replace_node,
+    report_assignment, request_node, set_request_name, transfer_modifier,
 };
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::indent::{
@@ -4361,95 +4361,6 @@ fn with_block(
 /// space (the report already fills / overflows the viewport — the last row's own
 /// insert strip covers appending in that case).
 
-/// A header directive rendered in the settings strip: how to edit it and what
-/// its hover help says.
-struct HeaderSpec {
-    key: &'static str,
-    /// `true` for the directives worth showing even when unset (as a prompt),
-    /// rather than hiding them behind the add-setting menu.
-    always_shown: bool,
-    /// `true` when leaving this unset actually stops the report running, so the
-    /// prompt is drawn in the error colour. Only `collection:` qualifies:
-    /// everything else either has a working default (`output:` falls back to
-    /// `csv`, `root:` to the report's folder) or is simply absent.
-    required: bool,
-    kind: HeaderKind,
-}
-
-/// How one header directive is edited.
-enum HeaderKind {
-    /// Pick from the open collections.
-    Collection,
-    /// Pick from the loaded global environments.
-    Environment,
-    /// Pick one of the writers PaperTrail can produce.
-    ///
-    /// `# output:` names a *format*, never a filename — the runner derives the
-    /// file from the report's own name (only the CLI's `-o` flag takes a path),
-    /// and `output_extension_from_header` rejects anything that isn't one of
-    /// [`crate::report::writer::OUTPUT_EXTENSIONS`]. So this is a closed list,
-    /// and offering a free-text field with a file browser (as this first did)
-    /// only invited values the report would refuse to run with.
-    Format,
-    /// A path, typed or chosen with the file picker.
-    Path,
-    /// Free text (the `columns:` list).
-    Text,
-}
-
-fn header_specs() -> [HeaderSpec; 6] {
-    [
-        HeaderSpec {
-            key: "collection",
-            always_shown: true,
-            required: true,
-            kind: HeaderKind::Collection,
-        },
-        HeaderSpec {
-            key: "output",
-            always_shown: true,
-            required: false,
-            kind: HeaderKind::Format,
-        },
-        HeaderSpec {
-            key: "environment",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Environment,
-        },
-        HeaderSpec {
-            key: "root",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Path,
-        },
-        HeaderSpec {
-            key: "baseline",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Path,
-        },
-        HeaderSpec {
-            key: "columns",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Text,
-        },
-    ]
-}
-
-/// The hover help for a header directive.
-fn header_help(key: &str, s: &crate::i18n::Strings) -> &'static str {
-    match key {
-        "collection" => s.chip_help_hdr_collection,
-        "output" => s.chip_help_hdr_output,
-        "environment" => s.chip_help_hdr_environment,
-        "root" => s.chip_help_hdr_root,
-        "baseline" => s.chip_help_hdr_baseline,
-        _ => s.chip_help_hdr_columns,
-    }
-}
-
 /// One option in the `collection:` dropdown.
 ///
 /// The label and the stored value are deliberately different things. What gets
@@ -4833,12 +4744,12 @@ fn header_add_menu(
     missing: &[&HeaderSpec],
     acts: &mut Vec<Act>,
 ) {
-    let label = format!("{}  {}", super::icons::PLUS, s.gui_report_add_setting);
+    let label = format!("{}  {}", super::icons::PLUS, s.report_add_setting);
     ui.menu_button(label, |ui| {
         for spec in missing {
             if ui
                 .button(spec.key.to_uppercase())
-                .on_hover_text(header_help(spec.key, s))
+                .on_hover_text(edit::header_help(spec.key, s))
                 .clicked()
             {
                 // Seed with a placeholder so the chip appears; the user
@@ -4846,25 +4757,14 @@ fn header_add_menu(
                 // would immediately be dropped again by `set_header`.
                 acts.push(Act::SetHeader {
                     key: spec.key,
-                    value: Some(header_placeholder(spec)),
+                    value: Some(HEADER_PLACEHOLDER.to_string()),
                 });
                 ui.close();
             }
         }
     })
     .response
-    .on_hover_text(s.gui_report_settings_help);
-}
-
-/// The value a freshly-added optional directive starts at.
-///
-/// Always `?`, the "present but not filled in yet" sentinel every editor here
-/// already understands (it renders as the unset prompt). It must not be the
-/// empty string: `set_header` treats an empty value as *remove this directive*,
-/// so an empty placeholder made picking a setting from the add menu do nothing
-/// at all — which is exactly what `columns:` used to do.
-fn header_placeholder(_spec: &HeaderSpec) -> String {
-    "?".to_string()
+    .on_hover_text(s.report_settings_help);
 }
 
 /// One chip in the header strip: an uppercase key label plus its editor.
@@ -4925,7 +4825,7 @@ fn header_chip(
                     // A collection is stored as a path but shown by name, so
                     // the closed text has to be derived rather than echoed.
                     let shown = if unset {
-                        s.gui_report_setting_unset.to_string()
+                        s.report_setting_unset.to_string()
                     } else if matches!(spec.kind, HeaderKind::Collection) {
                         collection_label(std::path::Path::new(value))
                     } else {
@@ -4966,14 +4866,14 @@ fn header_chip(
                         });
                     }
                 }
-                HeaderKind::Path | HeaderKind::Text => {
+                HeaderKind::Folder | HeaderKind::File | HeaderKind::Text => {
                     let current = if value == "?" { "" } else { value };
                     let id = ui.make_persistent_id(("pt_hdr_text", key));
                     if let Some(text) = inline_text_edit(
                         ui,
                         id,
                         current,
-                        s.gui_report_setting_unset,
+                        s.report_setting_unset,
                         "",
                         150.0,
                         FIELD_MAX_WIDTH,
@@ -4984,7 +4884,7 @@ fn header_chip(
                             value: Some(text),
                         });
                     }
-                    if matches!(spec.kind, HeaderKind::Path)
+                    if spec.kind.is_path()
                         && ui
                             .small_button(super::icons::FOLDER)
                             .on_hover_text(s.gui_report_browse)
@@ -5013,7 +4913,7 @@ fn header_chip(
         });
     });
     if ui.ctx().dragged_id().is_none() {
-        scope.response.on_hover_text(header_help(key, s));
+        scope.response.on_hover_text(edit::header_help(key, s));
     }
 }
 
@@ -5034,7 +4934,7 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) 
                 .and_then(|p| p.parent())
                 .map(std::path::Path::to_path_buf)
         });
-    let title = header_help(key, &app.strings);
+    let title = edit::header_help(key, &app.strings);
     // Only `root:` and `baseline:` are paths — `output:` names a format and is
     // picked from a list, so it never reaches here.
     let picked = match key {
@@ -7462,7 +7362,10 @@ mod tests {
 
         // Each directive explains itself in its own words.
         let s = Strings::for_language(&Language::English);
-        let helps: Vec<&str> = specs.iter().map(|sp| header_help(sp.key, &s)).collect();
+        let helps: Vec<&str> = specs
+            .iter()
+            .map(|sp| crate::report::edit::header_help(sp.key, &s))
+            .collect();
         for (i, h) in helps.iter().enumerate() {
             assert!(!h.is_empty(), "{} has help", specs[i].key);
             assert!(
@@ -7478,13 +7381,12 @@ mod tests {
     /// became unaddable.
     #[test]
     fn every_addable_setting_starts_at_a_value_that_survives_being_set() {
-        for spec in header_specs().iter().filter(|sp| !sp.always_shown) {
-            assert!(
-                !header_placeholder(spec).is_empty(),
-                "{} would be dropped again the moment it was added",
-                spec.key
-            );
-        }
+        assert!(
+            !crate::report::edit::HEADER_PLACEHOLDER.is_empty(),
+            "an added setting would be dropped again the moment it was added"
+        );
+        // And there is something to add in the first place.
+        assert!(header_specs().iter().any(|sp| !sp.always_shown));
     }
 
     /// `# output:` names a format from a closed list — the runner derives the
@@ -7526,7 +7428,7 @@ mod tests {
         // No path-valued setting claims `output`, so the browse button is gone.
         let paths: Vec<&str> = header_specs()
             .iter()
-            .filter(|sp| matches!(sp.kind, HeaderKind::Path))
+            .filter(|sp| sp.kind.is_path())
             .map(|sp| sp.key)
             .collect();
         assert_eq!(paths, ["root", "baseline"]);
@@ -7555,7 +7457,7 @@ mod tests {
             })
             .collect();
         assert!(
-            painted.contains(s.gui_report_add_setting),
+            painted.contains(s.report_add_setting),
             "the button is labelled, not a bare glyph (painted: {painted:?})"
         );
 
@@ -7564,9 +7466,9 @@ mod tests {
         for lang in [Language::English, Language::French, Language::Danish] {
             let s = Strings::for_language(&lang);
             assert!(
-                s.gui_report_add_setting.split_whitespace().count() >= 3,
+                s.report_add_setting.split_whitespace().count() >= 3,
                 "{lang:?} label {:?} names what it adds",
-                s.gui_report_add_setting
+                s.report_add_setting
             );
         }
     }
@@ -7921,7 +7823,7 @@ mod tests {
 
         let button = texts
             .iter()
-            .find(|(t, _)| t.contains(s.gui_report_add_setting))
+            .find(|(t, _)| t.contains(s.report_add_setting))
             .map(|(_, r)| *r)
             .expect("the add button is drawn while settings are still missing");
         let collection = texts
@@ -7950,9 +7852,7 @@ mod tests {
             600.0,
         );
         assert!(
-            !full
-                .iter()
-                .any(|(t, _)| t.contains(s.gui_report_add_setting)),
+            !full.iter().any(|(t, _)| t.contains(s.report_add_setting)),
             "nothing is missing, so nothing offers to add it"
         );
     }

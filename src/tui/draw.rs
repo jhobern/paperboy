@@ -1297,6 +1297,56 @@ fn draw_report_bind_overlay(
     }
 }
 
+/// Draw the node editor's settings menu ([`Overlay::ReportSettingMenu`]): the
+/// list of report-header directives left to add, or the values one of them can
+/// take. Deliberately the same shape as the node palette beside it — both are
+/// "pick one of these" and there is no reason for them to look different.
+fn draw_report_setting_menu_overlay(
+    f: &mut Frame,
+    menu: &super::report_nodes::SettingMenu,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    let title = format!("{}  ({})", menu.title(s), s.report_setting_menu_hint);
+    let n = menu.options.len().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, opt) in menu.options.iter().enumerate().skip(scroll).take(inner_h) {
+        let style = if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        lines.push(Line::from(Span::styled(opt.clone(), style)));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..menu.options.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+}
+
 /// Draw the node editor's insert / request-pick palette
 /// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
 /// adding, request titles when choosing a request name.
@@ -4264,6 +4314,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th, Some(app));
+        }
+        Overlay::ReportSettingMenu(menu) => {
+            draw_report_setting_menu_overlay(f, menu, s, th, Some(app));
         }
         Overlay::ReportNodeRequest(form) => {
             draw_report_node_request_overlay(f, form, s, th, Some(app));

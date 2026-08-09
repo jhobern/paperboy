@@ -1130,6 +1130,134 @@ pub(crate) fn set_loop_glob(flow: &mut ReportFlow, path: &[usize], text: &str) -
     }
 }
 
+// ---------------------------------------------------------------------------
+// The report's header directives, as an editable list
+// ---------------------------------------------------------------------------
+
+/// A header directive as the editors present it: which of the `# key: value`
+/// lines exist, how each one is edited, and whether it is worth showing when
+/// unset.
+///
+/// Lives here rather than in either front-end because *both* editors offer the
+/// same settings over the same directives, and when this table lived only in
+/// the GUI the terminal UI silently fell behind it — it could bind a collection
+/// and nothing else. One table, and a directive added to the language shows up
+/// in both editors or neither.
+pub(crate) struct HeaderSpec {
+    pub(crate) key: &'static str,
+    /// `true` for the directives worth showing even when unset (as a prompt),
+    /// rather than hiding them behind the "add setting" menu.
+    pub(crate) always_shown: bool,
+    /// `true` when leaving this unset actually stops the report running, so the
+    /// prompt is drawn in the error colour. Only `collection:` qualifies:
+    /// everything else either has a working default (`output:` falls back to
+    /// `csv`, `root:` to the report's folder) or is simply absent.
+    pub(crate) required: bool,
+    pub(crate) kind: HeaderKind,
+}
+
+/// How one header directive is edited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeaderKind {
+    /// Pick from the open collections.
+    Collection,
+    /// Pick from the loaded global environments.
+    Environment,
+    /// Pick one of the writers PaperTrail can produce.
+    ///
+    /// `# output:` names a *format*, never a filename — the runner derives the
+    /// file from the report's own name (only the CLI's `-o` flag takes a path),
+    /// and `output_extension_from_header` rejects anything that isn't one of
+    /// [`crate::report::writer::OUTPUT_EXTENSIONS`]. So this is a closed list,
+    /// and offering a free-text field with a file browser (as this first did)
+    /// only invited values the report would refuse to run with.
+    Format,
+    /// A folder, typed or chosen with the file picker.
+    Folder,
+    /// A file, typed or chosen with the file picker.
+    File,
+    /// Free text (the `columns:` list).
+    Text,
+}
+
+impl HeaderKind {
+    /// Whether this directive's value is a filesystem path — the two that are
+    /// get a file/folder browser as well as a text field.
+    pub(crate) fn is_path(self) -> bool {
+        matches!(self, HeaderKind::Folder | HeaderKind::File)
+    }
+}
+
+/// Every header directive the editors offer, in the order they are shown.
+pub(crate) fn header_specs() -> [HeaderSpec; 6] {
+    [
+        HeaderSpec {
+            key: "collection",
+            always_shown: true,
+            required: true,
+            kind: HeaderKind::Collection,
+        },
+        HeaderSpec {
+            key: "output",
+            always_shown: true,
+            required: false,
+            kind: HeaderKind::Format,
+        },
+        HeaderSpec {
+            key: "environment",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Environment,
+        },
+        HeaderSpec {
+            key: "root",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Folder,
+        },
+        HeaderSpec {
+            key: "baseline",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::File,
+        },
+        HeaderSpec {
+            key: "columns",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Text,
+        },
+    ]
+}
+
+/// The explanation of what one header directive does — the GUI's hover help and
+/// the terminal UI's status line, from one place so the two say the same thing.
+pub(crate) fn header_help(key: &str, s: &Strings) -> &'static str {
+    match key {
+        "collection" => s.chip_help_hdr_collection,
+        "output" => s.chip_help_hdr_output,
+        "environment" => s.chip_help_hdr_environment,
+        "root" => s.chip_help_hdr_root,
+        "baseline" => s.chip_help_hdr_baseline,
+        _ => s.chip_help_hdr_columns,
+    }
+}
+
+/// The value a freshly-added optional directive starts at.
+///
+/// Always `?`, the "present but not filled in yet" sentinel every editor here
+/// already understands (it renders as the unset prompt). It must not be the
+/// empty string: [`set_header`] treats an empty value as *remove this
+/// directive*, so an empty placeholder made picking a setting from the add menu
+/// do nothing at all — which is exactly what `columns:` used to do.
+pub(crate) const HEADER_PLACEHOLDER: &str = "?";
+
+/// Whether a directive's stored value counts as "not filled in yet" — either
+/// absent altogether or still holding the [`HEADER_PLACEHOLDER`] sentinel.
+pub(crate) fn header_unset(value: &str) -> bool {
+    value.is_empty() || value == HEADER_PLACEHOLDER
+}
+
 /// Set the `# key: value` header directive, or remove it entirely when `value`
 /// is `None` (or blank).
 ///

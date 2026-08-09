@@ -21,7 +21,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, PromptKind, TuiApp};
+use super::app::{
+    FileAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, PromptKind, TuiApp,
+};
 use super::draw::panel;
 use super::editor::Editor;
 use super::new_request::draw_scrollbar;
@@ -39,9 +41,9 @@ use crate::report::model::StatKind;
 // one implementation. Re-export it under the historical names so this file's
 // TUI-specific rendering / key handling / overlays read unchanged.
 pub(crate) use crate::report::edit::{
-    InsertPos, NodeKind, NodeRow, RowKind, flatten, insert_node, insert_pos_after,
-    loop_producer_dir, loop_producer_dir_mut, move_node, node_at, node_at_mut, parse_one_node,
-    remove_node, replace_node, request_node,
+    HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind, flatten, header_specs,
+    header_unset, insert_node, insert_pos_after, loop_producer_dir, loop_producer_dir_mut,
+    move_node, node_at, node_at_mut, parse_one_node, remove_node, replace_node, request_node,
 };
 
 /// The two-step insert/pick palette overlay ([`Overlay::ReportNodeMenu`]).
@@ -1272,6 +1274,11 @@ impl TuiApp {
         let Ok(rows) = self.report_node_rows(idx) else {
             return false;
         };
+        // The cursor may be up in the settings section, which is indexed
+        // separately and answers to its own keys.
+        if let Some(sel) = self.reports[idx].node_setting {
+            return self.on_key_report_settings(key, idx, sel);
+        }
         let last = rows.len().saturating_sub(1);
         let sel = self.reports[idx].node_selected.min(last);
         self.reports[idx].node_selected = sel;
@@ -1289,12 +1296,28 @@ impl TuiApp {
             KeyCode::Char('K') => self.move_selected_node(idx, true),
             KeyCode::Char('J') => self.move_selected_node(idx, false),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.reports[idx].node_selected = sel.saturating_sub(1);
+                if sel == 0 {
+                    // Off the top of the flow and into the settings above it,
+                    // landing on their last row so the two sections arrow
+                    // through as one list.
+                    let n = self.setting_row_count(idx);
+                    if n > 0 {
+                        self.reports[idx].node_setting = Some(n - 1);
+                    }
+                } else {
+                    self.reports[idx].node_selected = sel - 1;
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.reports[idx].node_selected = (sel + 1).min(last);
             }
-            KeyCode::Home => self.reports[idx].node_selected = 0,
+            KeyCode::Home => {
+                // Home is the top of the *pane*, which is the first setting.
+                self.reports[idx].node_selected = 0;
+                if self.setting_row_count(idx) > 0 {
+                    self.reports[idx].node_setting = Some(0);
+                }
+            }
             KeyCode::End => self.reports[idx].node_selected = last,
             KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
             // Enter opens the friendly, structured "configure this node" form
@@ -3024,17 +3047,89 @@ pub(crate) fn draw_report_nodes(
         .min(rows.len().saturating_sub(1));
     app.reports[idx].node_selected = sel;
 
-    let h = inner.height as usize;
+    // The report's own settings are drawn as leading lines of this same list,
+    // above `BEGIN`, exactly where the graphical editor's settings strip sits:
+    // they describe the whole report rather than running as a step.
+    //
+    // They scroll *with* the outline rather than being pinned above it. A pinned
+    // strip would have to win its rows off a pane that is already the smallest
+    // thing on screen — and when there was no room for it, it would vanish while
+    // the cursor could still be moved onto it. One list has one cursor and one
+    // scroll offset, so whatever is selected is always on screen.
+    let settings = app.report_setting_rows(idx);
+    let add_row = !app.missing_report_settings(idx).is_empty();
+    let set_sel = app.reports[idx].node_setting;
     let w = inner.width as usize;
-    let first = if sel >= h { sel + 1 - h } else { 0 };
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(h)
-        .map(|(i, row)| render_node_row(row, i == sel, w, s, th))
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    let key_w = settings.iter().map(|r| r.key.len()).max().unwrap_or(0);
+
+    // Line 0 is the "Settings" heading; then one line per directive; then the
+    // optional "add a setting" row; then a rule; then the flow.
+    let head_lines = if settings.is_empty() {
+        0
+    } else {
+        1 + settings.len() + usize::from(add_row) + 1
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(head_lines + rows.len());
+    // Which mouse target each line carries, parallel to `lines`.
+    let mut targets: Vec<Option<MouseHitTarget>> = Vec::with_capacity(head_lines + rows.len());
+    if !settings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            s.report_settings_heading.to_string(),
+            Style::default().fg(th.dim).add_modifier(Modifier::BOLD),
+        )));
+        targets.push(None);
+        for (i, row) in settings.iter().enumerate() {
+            lines.push(render_setting_row(row, key_w, set_sel == Some(i), w, s, th));
+            targets.push(Some(MouseHitTarget::ReportSettingRow(i)));
+        }
+        if add_row {
+            let i = settings.len();
+            let style = if set_sel == Some(i) {
+                Style::default()
+                    .fg(th.bg)
+                    .bg(th.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.dim)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  + {}", s.report_setting_add_row),
+                style,
+            )));
+            targets.push(Some(MouseHitTarget::ReportSettingRow(i)));
+        }
+        // A rule between the settings and the flow, so the outline still reads
+        // as starting at BEGIN rather than continuing the list of settings.
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w),
+            Style::default().fg(th.dim),
+        )));
+        targets.push(None);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        lines.push(render_node_row(
+            row,
+            i == sel && set_sel.is_none(),
+            w,
+            s,
+            th,
+        ));
+        targets.push(Some(MouseHitTarget::ReportNodeRow(i)));
+    }
+
+    // Scroll so the cursor — wherever it is in the combined list — is visible.
+    let cursor = match set_sel {
+        Some(i) => 1 + i,
+        None => head_lines + sel,
+    };
+    let h = inner.height as usize;
+    let total = lines.len();
+    let first = if cursor >= h { cursor + 1 - h } else { 0 };
+
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(first).take(h).collect::<Vec<_>>()),
+        inner,
+    );
     app.push_mouse_hit(
         MouseLayer::Base,
         inner,
@@ -3042,23 +3137,86 @@ pub(crate) fn draw_report_nodes(
             crate::tui::reports::ReportPane::Source,
         )),
     );
-    for row in first..rows.len().min(first + h) {
-        app.push_mouse_hit(
-            MouseLayer::Base,
-            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
-            MouseHitTarget::ReportNodeRow(row),
-        );
+    for (line, target) in targets.iter().enumerate().skip(first).take(h) {
+        if let Some(target) = target {
+            app.push_mouse_hit(
+                MouseLayer::Base,
+                Rect::new(inner.x, inner.y + (line - first) as u16, inner.width, 1),
+                *target,
+            );
+        }
     }
 
-    if rows.len() > h {
+    if total > h {
         let bar = Rect {
             x: area.x + area.width - 1,
             y: inner.y,
             width: 1,
             height: inner.height,
         };
-        draw_scrollbar(f, bar, rows.len(), h, first, th);
+        draw_scrollbar(f, bar, total, h, first, th);
     }
+}
+
+/// One settings row: `KEY  value`, with the key dimmed like a label and the
+/// value carrying the colour. An unset **required** directive (only
+/// `collection:`) is drawn in the error colour, because it is the one thing
+/// standing between the report and a run and should look like it.
+fn render_setting_row(
+    row: &SettingRow,
+    key_w: usize,
+    selected: bool,
+    width: usize,
+    s: &Strings,
+    th: &Theme,
+) -> Line<'static> {
+    let unset = row.unset();
+    let (value, value_colour) = if unset {
+        (
+            s.report_setting_unset.to_string(),
+            if row.required { th.err } else { th.dim },
+        )
+    } else {
+        (row.value.clone(), th.text)
+    };
+    let key_colour = if unset && row.required {
+        th.err
+    } else {
+        th.dim
+    };
+    let text = format!(
+        "  {:<key_w$}  {value}",
+        row.key.to_uppercase(),
+        key_w = key_w
+    );
+    let text = truncate_to_width(&text, width);
+    if selected {
+        return Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Split back at the value so the key and the value can be coloured apart
+    // without laying the string out twice.
+    let head_len = 2 + key_w + 2;
+    let (head, tail) = text.split_at(head_len.min(text.len()));
+    Line::from(vec![
+        Span::styled(head.to_string(), Style::default().fg(key_colour)),
+        Span::styled(tail.to_string(), Style::default().fg(value_colour)),
+    ])
+}
+
+/// Cut `text` to `width` display columns, marking the cut with an ellipsis.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn render_node_row(
@@ -3181,5 +3339,421 @@ mod tests {
         form.toggle_file(0);
         assert!(!form.entries[0].file);
         assert_eq!(form.entries[0].name, "prod");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The settings section: the report's `# key: value` header directives
+// ---------------------------------------------------------------------------
+//
+// The flow below `BEGIN` says what the report *does*; these say what it does it
+// *to* — which collection, which environment, where relative paths resolve,
+// what the output is written as. The graphical editor has always shown them as
+// a strip of chips above the blocks; the terminal editor could only bind a
+// collection (`b`), so every other directive had to be typed into the raw
+// source. This section closes that gap, and shares the GUI's directive table
+// (`report::edit::header_specs`) so neither editor can quietly fall behind the
+// other again.
+//
+// It reuses the outline's own four keys rather than inventing a second
+// vocabulary for the same pane: Enter configures, `e` edits as raw text,
+// Delete removes, `a` adds.
+
+/// One row of the node editor's settings section.
+pub(crate) struct SettingRow {
+    pub(crate) key: &'static str,
+    pub(crate) kind: HeaderKind,
+    pub(crate) required: bool,
+    /// The directive's stored value; empty when the directive is absent, or the
+    /// [`HEADER_PLACEHOLDER`] sentinel when it was added but not filled in.
+    pub(crate) value: String,
+}
+
+impl SettingRow {
+    /// Whether this directive is still waiting for a value.
+    pub(crate) fn unset(&self) -> bool {
+        header_unset(&self.value)
+    }
+}
+
+impl TuiApp {
+    /// The settings rows shown above the flow: every always-shown directive
+    /// plus whichever optional ones the report actually sets.
+    ///
+    /// Returns an empty list when the flow doesn't parse — the node editor
+    /// shows a parse error in place of everything in that case, and a settings
+    /// strip floating above the error would just be a second thing to read.
+    pub(crate) fn report_setting_rows(&self, idx: usize) -> Vec<SettingRow> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        header_specs()
+            .into_iter()
+            .filter_map(|spec| {
+                let value = flow.header.get(spec.key).unwrap_or_default().to_string();
+                (spec.always_shown || !value.is_empty()).then_some(SettingRow {
+                    key: spec.key,
+                    kind: spec.kind,
+                    required: spec.required,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    /// The optional directives this report doesn't have yet — the contents of
+    /// the "add setting" menu, and (when empty) the reason that row isn't
+    /// drawn at all.
+    pub(crate) fn missing_report_settings(&self, idx: usize) -> Vec<&'static str> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        header_specs()
+            .into_iter()
+            .filter(|spec| {
+                !spec.always_shown && flow.header.get(spec.key).unwrap_or_default().is_empty()
+            })
+            .map(|spec| spec.key)
+            .collect()
+    }
+
+    /// How many rows the settings section offers the cursor: the visible
+    /// directives, plus the trailing "add setting" row when there is anything
+    /// left to add.
+    pub(crate) fn setting_row_count(&self, idx: usize) -> usize {
+        let rows = self.report_setting_rows(idx).len();
+        rows + usize::from(!self.missing_report_settings(idx).is_empty())
+    }
+
+    /// Whether the cursor is on the trailing "add setting" row rather than on a
+    /// directive.
+    fn on_add_setting_row(&self, idx: usize, sel: usize) -> bool {
+        sel >= self.report_setting_rows(idx).len()
+    }
+
+    /// Handle a key while the node editor's cursor is in the settings section.
+    /// Returns `true` when the key was consumed.
+    ///
+    /// Moving down off the last row (or up off the first flow row, handled by
+    /// the caller) crosses between the two sections, so the whole pane still
+    /// feels like one list to arrow through even though the two halves are
+    /// indexed separately.
+    fn on_key_report_settings(&mut self, key: KeyEvent, idx: usize, sel: usize) -> bool {
+        let last = self.setting_row_count(idx).saturating_sub(1);
+        let sel = sel.min(last);
+        self.reports[idx].node_setting = Some(sel);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reports[idx].node_setting = Some(sel.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if sel >= last {
+                    // Off the bottom of the settings and into the flow.
+                    self.reports[idx].node_setting = None;
+                    self.reports[idx].node_selected = 0;
+                } else {
+                    self.reports[idx].node_setting = Some(sel + 1);
+                }
+            }
+            KeyCode::Home => self.reports[idx].node_setting = Some(0),
+            KeyCode::End => {
+                // End belongs to the flow (the outline is the long list), so it
+                // leaves the settings entirely.
+                self.reports[idx].node_setting = None;
+                let rows = self.report_node_rows(idx).map(|r| r.len()).unwrap_or(1);
+                self.reports[idx].node_selected = rows.saturating_sub(1);
+            }
+            KeyCode::Enter => self.configure_selected_setting(idx, sel),
+            KeyCode::Char('e') => self.edit_selected_setting_raw(idx, sel),
+            KeyCode::Delete | KeyCode::Backspace => self.clear_selected_setting(idx, sel),
+            KeyCode::Char('a') | KeyCode::Insert => self.open_add_setting_menu(idx),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Enter on a settings row: open the editor that suits the directive — a
+    /// picker for the ones with a closed set of answers, a file browser for the
+    /// two that name paths, a text prompt for the rest.
+    fn configure_selected_setting(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            self.open_add_setting_menu(idx);
+            return;
+        }
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        let (key, kind) = (row.key, row.kind);
+        match kind {
+            // The collection picker already exists (`b`), lists exactly the
+            // right things and writes the reference in the right form, so Enter
+            // here is that same picker rather than a second one beside it.
+            HeaderKind::Collection => self.open_report_bind(),
+            HeaderKind::Environment | HeaderKind::Format => {
+                self.open_setting_value_menu(idx, key, kind)
+            }
+            HeaderKind::Folder | HeaderKind::File => self.open_setting_path_browser(idx, key, kind),
+            HeaderKind::Text => self.open_setting_text_prompt(idx, sel),
+        }
+    }
+
+    /// `e` on a settings row: edit the directive's stored value as raw text,
+    /// whatever its kind. The escape hatch that matches the outline's own `e`,
+    /// and the only way to type a value the pickers can't offer — a collection
+    /// that isn't open, an environment that only exists on another machine.
+    fn edit_selected_setting_raw(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            self.open_add_setting_menu(idx);
+            return;
+        }
+        self.open_setting_text_prompt(idx, sel);
+    }
+
+    /// Seed and open the text prompt for the settings row at `sel`.
+    fn open_setting_text_prompt(&mut self, idx: usize, sel: usize) {
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        // The placeholder is a "not filled in yet" marker, not a value anyone
+        // meant to edit, so the prompt opens empty rather than with a `?` to
+        // delete first.
+        let seed = if row.unset() {
+            String::new()
+        } else {
+            row.value.clone()
+        };
+        let key = row.key;
+        let report_id = self.reports[idx].report.id;
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::ReportHeaderValue { report_id, key },
+            editor: Editor::new(&seed, false),
+            title: key.to_uppercase(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Delete on a settings row: remove the directive. An always-shown one
+    /// (`collection:`, `output:`) stays on screen as its unset prompt; the rest
+    /// go back to the add menu.
+    fn clear_selected_setting(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            return;
+        }
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        let key = row.key;
+        self.apply_report_setting(idx, key, None);
+        // Removing an optional directive shortens the list under the cursor.
+        let last = self.setting_row_count(idx).saturating_sub(1);
+        self.reports[idx].node_setting = Some(sel.min(last));
+    }
+
+    /// Write (or, with `None`, remove) a header directive on the report at
+    /// `idx`, re-serializing through the same undoable path every structural
+    /// node edit uses — so Ctrl+Z takes a settings change back too.
+    pub(crate) fn apply_report_setting(&mut self, idx: usize, key: &str, value: Option<&str>) {
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            if !crate::report::edit::set_header(&mut flow, key, value) {
+                return;
+            }
+            let text = flow.to_text();
+            rt.set_text_undoable(text);
+        }
+        self.revalidate_report(idx);
+        self.save_state();
+    }
+}
+
+/// The settings menu overlay ([`Overlay::ReportSettingMenu`]) — one list, two
+/// jobs, because they are the same interaction: choose one of a short list of
+/// names and something happens to the header.
+pub(crate) struct SettingMenu {
+    pub(crate) step: SettingMenuStep,
+    /// What the rows say.
+    pub(crate) options: Vec<String>,
+    pub(crate) selected: usize,
+    /// The report being edited (by id so a tab reorder can't misroute it).
+    pub(crate) report_id: u64,
+}
+
+/// Which job a [`SettingMenu`] is doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SettingMenuStep {
+    /// Adding one of the not-yet-present optional directives; the options are
+    /// directive keys.
+    AddSetting,
+    /// Choosing the value of `key`; the options are the values themselves.
+    PickValue { key: &'static str },
+}
+
+impl SettingMenu {
+    /// The overlay title for the current job.
+    pub(crate) fn title(&self, s: &Strings) -> String {
+        match self.step {
+            SettingMenuStep::AddSetting => s.report_add_setting.to_string(),
+            SettingMenuStep::PickValue { key } => key.to_uppercase(),
+        }
+    }
+}
+
+impl TuiApp {
+    /// `a` on the settings section: offer the optional directives this report
+    /// doesn't have yet. A no-op with a status when they are all present —
+    /// better than an empty menu that looks broken.
+    fn open_add_setting_menu(&mut self, idx: usize) {
+        let missing = self.missing_report_settings(idx);
+        if missing.is_empty() {
+            self.status = Some(Status::ReportSettingsAllSet);
+            return;
+        }
+        self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+            step: SettingMenuStep::AddSetting,
+            options: missing.iter().map(|k| k.to_uppercase()).collect(),
+            selected: 0,
+            report_id: self.reports[idx].report.id,
+        })));
+    }
+
+    /// Enter on a directive whose answers are a closed list: the output formats
+    /// PaperTrail can write, or the environments actually loaded.
+    fn open_setting_value_menu(&mut self, idx: usize, key: &'static str, kind: HeaderKind) {
+        let options: Vec<String> = match kind {
+            HeaderKind::Format => crate::report::writer::OUTPUT_EXTENSIONS
+                .iter()
+                .map(|e| e.to_string())
+                .collect(),
+            _ => self.global_envs.iter().map(|e| e.name.clone()).collect(),
+        };
+        if options.is_empty() {
+            // Only reachable for environments: there is nothing to choose from
+            // until one is loaded. `e` still types a name by hand, which is the
+            // right answer for an environment that lives on another machine.
+            self.status = Some(Status::ReportSettingNoChoices);
+            return;
+        }
+        let current = self
+            .report_setting_rows(idx)
+            .into_iter()
+            .find(|r| r.key == key)
+            .map(|r| r.value)
+            .unwrap_or_default();
+        let selected = options.iter().position(|o| *o == current).unwrap_or(0);
+        self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+            step: SettingMenuStep::PickValue { key },
+            options,
+            selected,
+            report_id: self.reports[idx].report.id,
+        })));
+    }
+
+    /// Enter on `root:` or `baseline:`: browse for the folder / file, rather
+    /// than making the user type a path they can't check.
+    fn open_setting_path_browser(&mut self, idx: usize, key: &'static str, kind: HeaderKind) {
+        self.pending_header_path = Some((self.reports[idx].report.id, key));
+        // Seed the browser at the report's own folder: a report's root and its
+        // baseline almost always live beside it.
+        if let Some(dir) = self.active_report_base_dir() {
+            self.last_browse_dir = Some(dir);
+        }
+        self.open_browser(match kind {
+            HeaderKind::Folder => FileAction::PickReportHeaderFolder,
+            _ => FileAction::PickReportHeaderFile,
+        });
+    }
+
+    /// Store a browsed path (or a typed one) into the parked header directive,
+    /// relative to the report when that is shorter — a report and the files it
+    /// names usually travel together, so an absolute path would break the
+    /// moment the pair moved. Mirrors the GUI's `pick_header_file`.
+    pub(crate) fn commit_report_header_path(&mut self, path: &str) {
+        let Some((report_id, key)) = self.pending_header_path.take() else {
+            return;
+        };
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let value = self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.path.as_deref())
+            .and_then(|p| p.parent())
+            .and_then(|base| std::path::Path::new(path).strip_prefix(base).ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        self.apply_report_setting(idx, key, Some(&value));
+    }
+
+    /// Key handling for [`Overlay::ReportSettingMenu`]. ↑/↓ (and `j`/`k`,
+    /// Home/End) move; Enter applies; anything else cancels — the same shape as
+    /// every other list overlay here.
+    pub(crate) fn report_setting_menu_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut menu: Box<SettingMenu>,
+    ) {
+        let last = menu.options.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.selected = menu.selected.saturating_sub(1);
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(last);
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Home => {
+                menu.selected = 0;
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::End => {
+                menu.selected = last;
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Enter => self.apply_setting_menu(*menu),
+            // Esc / q / anything else: cancel (the overlay was already taken).
+            _ => {}
+        }
+    }
+
+    fn apply_setting_menu(&mut self, menu: SettingMenu) {
+        let Some(idx) = self.report_index_by_id(menu.report_id) else {
+            return;
+        };
+        let Some(choice) = menu.options.get(menu.selected).cloned() else {
+            return;
+        };
+        match menu.step {
+            SettingMenuStep::AddSetting => {
+                // Seeded with the placeholder so the row appears at once; an
+                // empty value would be read as "remove this directive" and the
+                // menu would appear to do nothing.
+                let key = menu.options[menu.selected].to_ascii_lowercase();
+                let Some(spec) = header_specs().into_iter().find(|s| s.key == key) else {
+                    return;
+                };
+                self.apply_report_setting(idx, spec.key, Some(HEADER_PLACEHOLDER));
+                // Put the cursor on the row that just appeared and open its
+                // editor, so adding a setting and filling it in is one gesture.
+                let rows = self.report_setting_rows(idx);
+                if let Some(pos) = rows.iter().position(|r| r.key == spec.key) {
+                    self.reports[idx].node_setting = Some(pos);
+                    self.configure_selected_setting(idx, pos);
+                }
+            }
+            SettingMenuStep::PickValue { key } => {
+                self.apply_report_setting(idx, key, Some(&choice))
+            }
+        }
     }
 }

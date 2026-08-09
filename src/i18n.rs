@@ -328,6 +328,7 @@ strings! {
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
     move_workspace_item => "Move — Choose Destination Folder", "Déplacer — Choisir le dossier de destination", "Flyt — Vælg destinationsmappe";
+    browser_hint_header_folder => "Enter open folder · Space choose as report root · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme racine du rapport · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som rapportrod · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     browser_hint_node_folder => "Enter open folder · Space choose this folder · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir ce dossier · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg denne mappe · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     browser_hint_workspace_move => "Enter open folder · Space move here · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace déplacer ici · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum flyt hertil · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
@@ -663,6 +664,13 @@ strings! {
     report_node_undone => "Undid last node change", "Dernière modification de nœud annulée", "Fortrød sidste nodeændring";
     report_node_undo_empty => "Nothing to undo", "Rien à annuler", "Intet at fortryde";
     report_node_folder_pick => "Choose loop folder", "Choisir le dossier de la boucle", "Vælg løkkemappe";
+    report_header_root_pick => "Choose report root folder", "Choisir le dossier racine du rapport", "Vælg rapportens rodmappe";
+    report_header_baseline_pick => "Choose baseline file", "Choisir le fichier de référence", "Vælg baseline-fil";
+    report_settings_heading => "Settings", "Réglages", "Indstillinger";
+    report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
+    report_settings_all_set => "Every report setting is already set", "Tous les réglages du rapport sont déjà définis", "Alle rapportindstillinger er allerede sat";
+    report_setting_no_choices => "Nothing to choose from — load an environment first, or press e to type a name", "Rien à choisir — chargez d'abord un environnement, ou appuyez sur e pour saisir un nom", "Intet at vælge imellem — indlæs først et miljø, eller tryk e for at skrive et navn";
+    report_setting_menu_hint => "↑↓ move · Enter choose · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
     report_node_request_hint => "↑↓ move · Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
@@ -959,10 +967,10 @@ strings! {
     chip_help_hdr_root => "ROOT — the folder that relative file paths in this report are resolved against. Defaults to the report's own folder.", "ROOT — le dossier auquel les chemins relatifs de ce rapport se rapportent. Par défaut, le dossier du rapport.", "ROOT — mappen som relative filstier i denne rapport slås op i forhold til. Som standard rapportens egen mappe.";
     chip_help_hdr_baseline => "BASELINE — a saved run (`.baseline`) to diff this run against, filling the Result column. Ignored when the flow already compares environments.", "BASELINE — une exécution enregistrée (`.baseline`) à comparer à celle-ci, pour remplir la colonne Résultat. Ignoré si le flux compare déjà des environnements.", "BASELINE — en gemt kørsel (`.baseline`) at sammenligne denne med, som udfylder Resultat-kolonnen. Ignoreres, hvis flowet allerede sammenligner miljøer.";
     chip_help_hdr_columns => "COLUMNS — the column order of the results grid, as a comma-separated list of names. Unnamed columns follow in the order they are reported.", "COLUMNS — l'ordre des colonnes de la grille de résultats, sous forme de liste de noms séparés par des virgules. Les colonnes non citées suivent dans leur ordre d'apparition.", "COLUMNS — kolonnerækkefølgen i resultatgitteret, som en kommasepareret liste af navne. Unævnte kolonner følger i den rækkefølge, de rapporteres.";
-    gui_report_settings_help => "Report settings — these apply to the whole report rather than running as a step, so they sit above BEGIN and can't be reordered or dragged.", "Réglages du rapport — ils s'appliquent à l'ensemble du rapport au lieu de s'exécuter comme une étape ; ils se placent donc au-dessus de BEGIN et ne peuvent être ni réordonnés ni déplacés.", "Rapportindstillinger — de gælder hele rapporten i stedet for at køre som et trin, så de ligger over BEGIN og kan ikke omarrangeres eller trækkes.";
+    report_settings_help => "Report settings — these apply to the whole report rather than running as a step, so they sit above BEGIN and can't be reordered or dragged.", "Réglages du rapport — ils s'appliquent à l'ensemble du rapport au lieu de s'exécuter comme une étape ; ils se placent donc au-dessus de BEGIN et ne peuvent être ni réordonnés ni déplacés.", "Rapportindstillinger — de gælder hele rapporten i stedet for at køre som et trin, så de ligger over BEGIN og kan ikke omarrangeres eller trækkes.";
     gui_report_empty_flow => "No steps yet — drag a block here from the palette.", "Aucune étape pour l'instant — glissez un bloc ici depuis la palette.", "Ingen trin endnu — træk en blok herind fra paletten.";
-    gui_report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
-    gui_report_setting_unset => "not set", "non défini", "ikke sat";
+    report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
+    report_setting_unset => "not set", "non défini", "ikke sat";
     gui_report_ws_collections => "In this workspace", "Dans cet espace de travail", "I dette arbejdsområde";
     gui_report_other_collections => "Open elsewhere", "Ouvertes ailleurs", "Åbne andre steder";
     gui_report_show_all_collections => "Show collections outside this workspace", "Afficher les collections hors de cet espace de travail", "Vis samlinger uden for dette arbejdsområde";
@@ -1369,6 +1377,12 @@ pub enum Status {
     ReportNodeUndone(String),
     /// Ctrl+Z was pressed in the node editor with an empty undo stack.
     ReportNodeNothingToUndo(String),
+    /// `a` was pressed on the node editor's settings section when every
+    /// optional header directive is already present.
+    ReportSettingsAllSet,
+    /// Enter was pressed on a settings row whose picker has nothing to offer —
+    /// only reachable for `environment:` with no environments loaded.
+    ReportSettingNoChoices,
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
     /// A report's last run was saved as a `.baseline` snapshot; holds its path.
@@ -1548,6 +1562,8 @@ impl Status {
             Status::ReportRunBlocked(reason) => reason.clone(),
             Status::ReportNodeUndone(msg) => msg.clone(),
             Status::ReportNodeNothingToUndo(msg) => msg.clone(),
+            Status::ReportSettingsAllSet => s.report_settings_all_set.to_string(),
+            Status::ReportSettingNoChoices => s.report_setting_no_choices.to_string(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
             Status::ReportBaselineSaved(path) => {
                 format!("{} {path}", s.report_baseline_saved_prefix)

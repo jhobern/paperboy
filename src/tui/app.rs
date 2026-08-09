@@ -108,6 +108,15 @@ pub(crate) enum FileAction {
     /// [`TuiApp::pending_node_folder`] (`FileAction` stays `Copy`, so the node
     /// path can't live in the variant).
     PickReportNodeFolder,
+    /// Picking the FOLDER for a report's `# root:` header directive from the
+    /// node editor's settings section. Confirms on `Space` (the current
+    /// directory) like the other folder pickers; the target report and
+    /// directive are parked in [`TuiApp::pending_header_path`].
+    PickReportHeaderFolder,
+    /// Picking the FILE for a report's `# baseline:` header directive from the
+    /// node editor's settings section — a plain file pick (Enter on the file),
+    /// parked the same way as `PickReportHeaderFolder`.
+    PickReportHeaderFile,
 }
 
 impl FileAction {
@@ -173,6 +182,16 @@ pub(crate) enum PromptKind {
     ReportNodeLine {
         report_id: u64,
         path: Vec<usize>,
+    },
+    /// Typing the value of one report-header directive in the node editor's
+    /// settings section — `columns:`, a path, or any directive being edited as
+    /// raw text with `e`. Committing writes `# <key>: <text>` (an empty commit
+    /// removes the directive, matching Delete on the row). Addressed by
+    /// `report_id` rather than tab index so a tab reorder can't misroute it,
+    /// exactly like [`PromptKind::ReportNodeLine`].
+    ReportHeaderValue {
+        report_id: u64,
+        key: &'static str,
     },
 }
 
@@ -512,6 +531,14 @@ pub(crate) enum Overlay {
     /// collection. Opened with `a` (add) or `Enter`/`e` (edit a request node) in
     /// the node view. See [`crate::tui::report_nodes::NodeMenu`].
     ReportNodeMenu(Box<crate::tui::report_nodes::NodeMenu>),
+    /// The node editor's **settings** menu ([`Overlay::ReportSettingMenu`]): a
+    /// one-step list that either adds a report-header directive (`a` on the
+    /// settings section) or picks the value of one that has a closed set of
+    /// answers — the output format, or one of the loaded environments. The
+    /// directives whose values are open-ended use a text prompt instead, and
+    /// `collection:` reuses the existing bind picker.
+    /// See [`crate::tui::report_nodes::SettingMenu`].
+    ReportSettingMenu(Box<crate::tui::report_nodes::SettingMenu>),
     /// The structured node editor's reported-request detail form
     /// ([`Overlay::ReportNodeRequest`]): configures a `REPORT REQUEST` node's
     /// response format, `AS` alias and `SHOW(…)` field checklist. Opened with
@@ -727,6 +754,8 @@ pub(crate) enum MouseHitTarget {
     RunRequest,
     ReportResultsCell,
     ReportNodeRow(usize),
+    /// A row of the node editor's report-settings section, above the outline.
+    ReportSettingRow(usize),
     OverlayRow(usize),
     ConfirmChoice(usize),
     HelpTab(usize),
@@ -762,9 +791,9 @@ impl MouseHitTarget {
             MouseHitTarget::ReportResultsCell => Some(MouseScrollTarget::ReportPane(
                 crate::tui::reports::ReportPane::Results,
             )),
-            MouseHitTarget::ReportNodeRow(_) => Some(MouseScrollTarget::ReportPane(
-                crate::tui::reports::ReportPane::Source,
-            )),
+            MouseHitTarget::ReportNodeRow(_) | MouseHitTarget::ReportSettingRow(_) => Some(
+                MouseScrollTarget::ReportPane(crate::tui::reports::ReportPane::Source),
+            ),
             MouseHitTarget::OverlayRow(_) | MouseHitTarget::ConfirmChoice(_) => {
                 Some(MouseScrollTarget::OverlayList)
             }
@@ -1227,6 +1256,11 @@ pub struct TuiApp {
     /// `(report id, node path)`. The chosen directory is written into that
     /// loop's producer `dir` on `Space`. Runtime-only (not persisted).
     pub(crate) pending_node_folder: Option<(u64, Vec<usize>)>,
+    /// The report id and header-directive key a `root:` / `baseline:` file
+    /// browser is picking for, parked while the browser owns the overlay slot
+    /// (`FileAction` is `Copy`, so the key can't live in the variant — the same
+    /// reason [`TuiApp::pending_node_folder`] exists).
+    pub(crate) pending_header_path: Option<(u64, &'static str)>,
     /// The inline filename editor shown at the bottom of a "save to folder"
     /// browser (the two `*ChooseFolder` [`FileAction`]s): the file name for a
     /// collection, or the workspace's own subfolder name. Seeded with a
@@ -1372,6 +1406,7 @@ impl Default for TuiApp {
             parked_postman: None,
             postman_dest_seed_dir: None,
             pending_node_folder: None,
+            pending_header_path: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             browser_filter_on: true,
@@ -1908,6 +1943,16 @@ impl TuiApp {
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
+            PromptKind::ReportHeaderValue { report_id, key } => {
+                if let Some(idx) = self.report_index_by_id(report_id) {
+                    // An empty commit means "remove it", the same as Delete on
+                    // the row — otherwise clearing the field would write back
+                    // the `?` placeholder and look like nothing happened.
+                    let text = text.trim().to_string();
+                    let value = (!text.is_empty()).then_some(text);
+                    self.apply_report_setting(idx, key, value.as_deref());
+                }
+            }
         }
     }
 
@@ -2255,6 +2300,11 @@ impl TuiApp {
             // confirmed with `Space` in `input.rs`
             // (`commit_report_node_folder`), so a file-Enter never reaches here.
             FileAction::PickReportNodeFolder => {}
+            // Like the loop's source folder: `root:` is confirmed with `Space`
+            // in `input.rs`, so a file-Enter never reaches here.
+            FileAction::PickReportHeaderFolder => {}
+            // `baseline:` is a *file* pick, so Enter on the file does land here.
+            FileAction::PickReportHeaderFile => self.commit_report_header_path(path),
         }
     }
 

@@ -96,6 +96,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The TUI's report node editor can now edit the report's settings.** The
+  outline gained a Settings section above the flow, listing every header
+  directive the language has — `collection`, `output`, `environment`, `root`,
+  `baseline` and `columns` — driven by the same four keys as the flow below it
+  (Enter configure, `e` edit as text, Delete clear, `a` add). Previously only
+  the collection could be bound from the outline and everything else meant
+  dropping back to the raw source. The directive table now lives in the shared
+  core rather than in the GUI, so the two editors can't drift apart again.
+
+- **The report Validation panel was stuck one row tall.** It was sized by
+  counting diagnostics, but a parse error is a single diagnostic a whole
+  sentence long — so in the one state where you most need to read the message it
+  got one row and clipped the rest. The panel is now sized to the text it
+  actually draws, wrapping included, and capped at five rows so it can't take
+  over the editor above it. Anything past the cap still scrolls.
+
 - **The `../` row ignored the file browser's filter.** Typing to narrow a picker
   left the parent entry pinned to the top of the results — the one row that
   never matched what you'd asked for. It is now filtered on the name it shows,

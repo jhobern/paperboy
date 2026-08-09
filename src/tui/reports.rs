@@ -177,6 +177,16 @@ pub(crate) struct ReportTab {
     /// flattened node rows; clamped on draw). Structural edits move it to track
     /// the affected node.
     pub(crate) node_selected: usize,
+    /// Where the node editor's cursor is when it sits in the **settings**
+    /// section above the flow rather than in the outline below it: `Some(i)`
+    /// selects the i-th settings row (the trailing "add setting" row included),
+    /// `None` means the cursor is on `node_selected` in the flow.
+    ///
+    /// Two indices rather than one combined one because everything structural —
+    /// insert positions, node paths, the undo snapshots — is expressed in flow
+    /// row numbers. Folding the settings in would have shifted every one of
+    /// them by a count that changes as settings are added and removed.
+    pub(crate) node_setting: Option<usize>,
     /// Undo stack for the structured node editor. Every structural node edit
     /// snapshots the pre-edit source text + node selection here (via
     /// [`ReportTab::set_text_undoable`]) so **Ctrl+Z** can restore the previous
@@ -374,6 +384,7 @@ impl ReportTab {
             view: ReportView::Source,
             editor_view: ReportView::Source,
             node_selected: 0,
+            node_setting: None,
             node_undo: Vec::new(),
             result: None,
             dry_run: None,
@@ -3234,22 +3245,11 @@ pub(crate) fn draw_report_content(
         return;
     }
 
-    // Number of validation rows to reserve at the bottom. Grow with the number
-    // of problems so a long list is visible at once (mirrors the GUI's enlarged,
-    // drag-resizable validation panel), but always keep several rows of the
-    // source above — and the panel scrolls, so any overflow is still reachable.
-    let diag_count = {
-        let rt = &app.reports[idx];
-        if rt.parse_error.is_some() {
-            1
-        } else {
-            rt.diagnostics.len().max(1)
-        }
-    };
-    // Leave at least ~5 rows for the source plus the 4-row binding block; within
-    // that budget show up to 16 validation rows before falling back to scroll.
-    let diag_room = area.height.saturating_sub(4 + 5).max(4);
-    let diag_h = (diag_count as u16 + 2).min(diag_room).min(16);
+    // The validation panel is sized to the text it actually draws — wrapped, so
+    // a single long parse error gets the rows it needs — and capped so it can
+    // never take over the pane. It scrolls, so anything past the cap is still
+    // reachable.
+    let diag_h = validation_height(&app.reports[idx], s, th, area);
 
     let rows = Layout::vertical([
         Constraint::Min(3),
@@ -4212,6 +4212,73 @@ fn draw_report_source(
     );
 }
 
+/// The validation panel's content: the parse error if the source doesn't parse,
+/// else one line per diagnostic, else the "no problems" note.
+///
+/// Split out of the draw so [`draw_report_content`] can measure it — the panel
+/// soft-wraps, so how *tall* it needs to be is a question about the wrapped
+/// text, not about how many diagnostics there are.
+fn report_validation_lines(rt: &ReportTab, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
+    if let Some(err) = &rt.parse_error {
+        return vec![Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(th.err),
+        ))];
+    }
+    if rt.diagnostics.is_empty() {
+        return vec![Line::from(Span::styled(
+            s.report_no_diagnostics,
+            Style::default().fg(th.ok),
+        ))];
+    }
+    rt.diagnostics
+        .iter()
+        .map(|d| {
+            let (icon, colour) = match d.severity {
+                Severity::Error => ("✗ ", th.err),
+                Severity::Warning => ("! ", th.pending),
+            };
+            Line::from(vec![
+                Span::styled(icon, Style::default().fg(colour)),
+                Span::styled(d.message.clone(), Style::default().fg(th.text)),
+            ])
+        })
+        .collect()
+}
+
+/// The most rows of validation text to show before the panel starts scrolling.
+///
+/// Small on purpose: the panel sits under the editor, so every row it takes is
+/// a row of the report you can no longer see. Five is enough to take in a
+/// handful of problems at a glance; past that the list is something you scroll
+/// through deliberately rather than something you want permanently covering the
+/// thing you're fixing.
+const VALIDATION_MAX_ROWS: u16 = 5;
+
+/// How tall the validation panel should be drawn, borders included.
+///
+/// Measured from the **wrapped** text rather than the number of diagnostics,
+/// which is what a parse error needs: there is only ever one of those, but it
+/// is a sentence long and used to be given a single row and then clipped —
+/// so the panel was stuck one row tall in exactly the state you most need to
+/// read it.
+fn validation_height(rt: &ReportTab, s: &Strings, th: &Theme, area: Rect) -> u16 {
+    let lines = report_validation_lines(rt, s, th);
+    // Same width the panel itself will wrap to (the block's borders take two).
+    let width = area.width.saturating_sub(2) as usize;
+    let rows = if width == 0 {
+        lines.len() as u16
+    } else {
+        let mut probe = MultiSelectPanel::new();
+        probe.set_styled_content(&lines, width);
+        probe.total_rows().min(u16::MAX as u32) as u16
+    };
+    // Always keep a workable editor above: the binding block is 4 rows and the
+    // editor wants at least 5, so the panel only grows into whatever is left.
+    let room = area.height.saturating_sub(4 + 5).max(3);
+    (rows + 2).min(room).min(VALIDATION_MAX_ROWS + 2).max(3)
+}
+
 fn draw_report_validation(
     f: &mut Frame,
     area: Rect,
@@ -4220,34 +4287,7 @@ fn draw_report_validation(
     s: &Strings,
     th: &Theme,
 ) {
-    let lines: Vec<Line<'static>> = {
-        let rt = &app.reports[idx];
-        if let Some(err) = &rt.parse_error {
-            vec![Line::from(Span::styled(
-                err.clone(),
-                Style::default().fg(th.err),
-            ))]
-        } else if rt.diagnostics.is_empty() {
-            vec![Line::from(Span::styled(
-                s.report_no_diagnostics,
-                Style::default().fg(th.ok),
-            ))]
-        } else {
-            rt.diagnostics
-                .iter()
-                .map(|d| {
-                    let (icon, colour) = match d.severity {
-                        Severity::Error => ("✗ ", th.err),
-                        Severity::Warning => ("! ", th.pending),
-                    };
-                    Line::from(vec![
-                        Span::styled(icon, Style::default().fg(colour)),
-                        Span::styled(d.message.clone(), Style::default().fg(th.text)),
-                    ])
-                })
-                .collect()
-        }
-    };
+    let lines = report_validation_lines(&app.reports[idx], s, th);
     let block = panel(s.report_validation_heading.to_string(), false, th);
     let (inner, bar) = draw_report_panel(
         f,

@@ -226,7 +226,8 @@ impl TuiApp {
         let row_activation = match target {
             MouseHitTarget::SelectListRow(_)
             | MouseHitTarget::SelectGlobalEnvRow(_)
-            | MouseHitTarget::ReportNodeRow(_) => self.mouse_row_activation(target),
+            | MouseHitTarget::ReportNodeRow(_)
+            | MouseHitTarget::ReportSettingRow(_) => self.mouse_row_activation(target),
             _ => {
                 self.last_mouse_row = None;
                 false
@@ -274,10 +275,24 @@ impl TuiApp {
                 true
             }
             MouseHitTarget::ReportResultsCell => self.on_mouse_results_cell_click(point.x, point.y),
+            MouseHitTarget::ReportSettingRow(row) => {
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.node_setting = Some(row);
+                    }
+                    if row_activation {
+                        self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
+                    } else {
+                        keep_mouse_hits = true;
+                    }
+                }
+                true
+            }
             MouseHitTarget::ReportNodeRow(row) => {
                 if let Some(idx) = self.active_report_index() {
                     if let Some(rt) = self.reports.get_mut(idx) {
                         rt.node_selected = row;
+                        rt.node_setting = None;
                     }
                     if row_activation {
                         self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
@@ -504,6 +519,7 @@ impl TuiApp {
             Some(Overlay::ReportColumns(picker)) => picker.selected = row,
             Some(Overlay::ReportBind(picker)) => picker.selected = row,
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
+            Some(Overlay::ReportSettingMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
             Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
             Some(Overlay::ReportNodeFiles(form)) => form.selected = row,
@@ -1486,6 +1502,7 @@ impl TuiApp {
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
+            Overlay::ReportSettingMenu(menu) => self.report_setting_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
             Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
             Overlay::ReportNodeFiles(form) => self.report_node_files_key_handler(key, form),
@@ -4186,6 +4203,8 @@ impl TuiApp {
             FileAction::SaveReportChooseFolder => s.save_report_folder,
             FileAction::NewReportChooseFolder => s.new_report_folder,
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
+            FileAction::PickReportHeaderFolder => s.report_header_root_pick,
+            FileAction::PickReportHeaderFile => s.report_header_baseline_pick,
             FileAction::PostmanDestChooseFolder => s.postman_dest_folder,
             _ => s.browser_select_file,
         }
@@ -4196,6 +4215,9 @@ impl TuiApp {
             // directory) but not its meaning — this folder becomes a loop's
             // source, not a Workspace root.
             FileAction::PickReportNodeFolder => s.browser_hint_node_folder,
+            // `root:` names a folder (Space confirms the current one);
+            // `baseline:` names a file, so it uses the ordinary file hint.
+            FileAction::PickReportHeaderFolder => s.browser_hint_header_folder,
             FileAction::SaveWorkspaceChooseFolder | FileAction::PostmanDestChooseFolder => {
                 s.browser_hint_workspace_save
             }
@@ -5422,6 +5444,12 @@ impl TuiApp {
                     self.overlay = Some(Overlay::PostmanImport(w));
                 } else if action == FileAction::SaveWorkspaceChooseFolder {
                     self.cancel_workspace_save();
+                } else if matches!(
+                    action,
+                    FileAction::PickReportHeaderFolder | FileAction::PickReportHeaderFile
+                ) {
+                    // Abandon the pick; the directive keeps its current value.
+                    self.pending_header_path = None;
                 } else if action == FileAction::PickReportNodeFolder {
                     // Abandon the folder pick; the node keeps its current dir.
                     self.pending_node_folder = None;
@@ -5519,6 +5547,13 @@ impl TuiApp {
                 let dir = ex.cwd().clone();
                 self.overlay = None;
                 self.finish_workspace_item_move(dir);
+            }
+            KeyCode::Char(' ') if action == FileAction::PickReportHeaderFolder => {
+                // Confirm the current directory as the report's `# root:`.
+                let dir = ex.cwd().clone();
+                self.last_browse_dir = Some(dir.clone());
+                self.commit_report_header_path(&dir.to_string_lossy());
+                self.save_state();
             }
             KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
                 // Confirm the current directory as the loop's source folder,
@@ -6368,6 +6403,7 @@ fn browser_confirms_on_space(action: FileAction) -> bool {
         FileAction::OpenWorkspace
             | FileAction::MoveWorkspaceItemChooseFolder
             | FileAction::PickReportNodeFolder
+            | FileAction::PickReportHeaderFolder
     )
 }
 

@@ -25548,3 +25548,292 @@ fn an_empty_filtered_list_still_shows_the_folder_and_the_keys() {
         "the filtered-out rows are gone:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The node editor's report-settings section
+// ---------------------------------------------------------------------------
+
+/// Every header directive the language has is reachable from the terminal
+/// node editor, not just `collection:`. This is the gap that prompted the
+/// section: the GUI has edited all six from its settings strip since it was
+/// built, while the TUI could only bind a collection and left the rest to be
+/// typed into the raw source.
+#[test]
+fn the_node_editor_offers_every_header_directive_the_gui_does() {
+    let (app, idx) = node_show_app(&["status"]);
+    let shown: Vec<&str> = app.report_setting_rows(idx).iter().map(|r| r.key).collect();
+    let addable = app.missing_report_settings(idx);
+    let reachable: Vec<&str> = shown
+        .iter()
+        .copied()
+        .chain(addable.iter().copied())
+        .collect();
+
+    for spec in crate::report::edit::header_specs() {
+        assert!(
+            reachable.contains(&spec.key),
+            "{} is not reachable from the node editor: shown {shown:?}, addable {addable:?}",
+            spec.key
+        );
+    }
+    // The two that always show are the two that always show in the GUI.
+    assert_eq!(shown, vec!["collection", "output"]);
+}
+
+/// The cursor arrows out of the settings into the flow and back, so the pane
+/// reads as one list even though the two halves are indexed separately.
+#[test]
+fn the_settings_and_the_flow_arrow_through_as_one_list() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    // Opening the node editor starts in the flow.
+    assert_eq!(app.reports[idx].node_setting, None);
+
+    // Up off BEGIN lands on the last settings row (the "add setting" row).
+    press(&mut app, KeyCode::Up);
+    let last = app.setting_row_count(idx) - 1;
+    assert_eq!(app.reports[idx].node_setting, Some(last));
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.reports[idx].node_setting, Some(last - 1));
+
+    // Home goes to the top of the pane, which is the first setting.
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.reports[idx].node_setting, Some(0));
+    // …and Up at the top stays put rather than wrapping.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.reports[idx].node_setting, Some(0));
+
+    // Down through the settings and out the bottom, back onto BEGIN.
+    for _ in 0..=last {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(app.reports[idx].node_setting, None);
+    assert_eq!(app.reports[idx].node_selected, 0);
+}
+
+/// Enter on a closed-list directive opens a picker, and choosing writes the
+/// directive into the report's source.
+#[test]
+fn picking_an_output_format_writes_the_directive() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Home);
+    // Row 1 is `output`.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::ReportSettingMenu(m)) => {
+            assert!(m.options.iter().any(|o| o == "xlsx"), "{:?}", m.options);
+        }
+        _ => panic!("Enter on OUTPUT opens the format picker"),
+    }
+    // Walk to xlsx and choose it.
+    while !matches!(&app.overlay, Some(Overlay::ReportSettingMenu(m))
+        if m.options[m.selected] == "xlsx")
+    {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert!(
+        app.reports[idx].report.text.contains("output: xlsx"),
+        "{}",
+        app.reports[idx].report.text
+    );
+}
+
+/// `a` adds one of the directives that isn't set yet, and lands the cursor on
+/// the new row with its editor already open — adding a setting and filling it
+/// in is one gesture, not two.
+#[test]
+fn adding_a_setting_opens_its_editor_on_the_new_row() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Char('a'));
+    // Choose COLUMNS (free text, so it opens the prompt rather than a picker).
+    while !matches!(&app.overlay, Some(Overlay::ReportSettingMenu(m))
+        if m.options[m.selected] == "COLUMNS")
+    {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    // The row exists…
+    let rows = app.report_setting_rows(idx);
+    let pos = rows.iter().position(|r| r.key == "columns");
+    assert!(pos.is_some(), "the added directive shows as a row");
+    assert_eq!(
+        app.reports[idx].node_setting, pos,
+        "cursor is on the new row"
+    );
+    // …and it reads as unset rather than showing the `?` sentinel as a value.
+    assert!(rows[pos.unwrap()].unset());
+    // …and its editor is open, seeded empty rather than with the placeholder.
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, editor, .. }) => {
+            assert!(matches!(
+                kind,
+                PromptKind::ReportHeaderValue { key: "columns", .. }
+            ));
+            assert_eq!(editor.text(), "", "the `?` sentinel isn't offered to edit");
+        }
+        _ => panic!("adding a free-text setting opens its prompt"),
+    }
+
+    // Committing writes it.
+    for c in "Name,Status".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx]
+            .report
+            .text
+            .contains("columns: Name,Status"),
+        "{}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Delete clears a directive, and an empty commit does the same — otherwise
+/// clearing the field would write back the `?` placeholder and look like
+/// nothing had happened.
+#[test]
+fn a_setting_can_be_cleared_from_the_row_or_from_its_prompt() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.apply_report_setting(idx, "columns", Some("Name"));
+    assert!(app.reports[idx].report.text.contains("columns: Name"));
+
+    let pos = app
+        .report_setting_rows(idx)
+        .iter()
+        .position(|r| r.key == "columns")
+        .unwrap();
+    app.reports[idx].node_setting = Some(pos);
+    press(&mut app, KeyCode::Delete);
+    assert!(
+        !app.reports[idx].report.text.contains("columns:"),
+        "Delete removes the directive: {}",
+        app.reports[idx].report.text
+    );
+
+    // Again, this time via an empty commit in the prompt.
+    app.apply_report_setting(idx, "columns", Some("Name"));
+    let pos = app
+        .report_setting_rows(idx)
+        .iter()
+        .position(|r| r.key == "columns")
+        .unwrap();
+    app.reports[idx].node_setting = Some(pos);
+    press(&mut app, KeyCode::Char('e'));
+    // Clear the seeded text, then commit.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("columns:"),
+        "an empty commit removes it too: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A settings change goes onto the node editor's undo stack, like every other
+/// edit made in this pane.
+#[test]
+fn a_settings_change_can_be_undone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = app.reports[idx].report.text.clone();
+    app.apply_report_setting(idx, "output", Some("xlsx"));
+    assert_ne!(app.reports[idx].report.text, before);
+
+    app.reports[idx].node_setting = None;
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].report.text, before,
+        "Ctrl+Z takes a settings change back"
+    );
+}
+
+/// The section draws above the flow, showing what each directive is set to and
+/// prompting for the one that blocks the run.
+#[test]
+fn the_settings_section_draws_above_the_flow() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, idx) = node_show_app(&["status"]);
+    let s = Strings::for_language(&Language::English);
+    app.apply_report_setting(idx, "collection", None);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(text.contains(s.report_settings_heading), "{text}");
+    assert!(text.contains("COLLECTION"), "{text}");
+    assert!(text.contains("OUTPUT"), "{text}");
+    // The unset required directive prompts rather than showing blank.
+    assert!(text.contains(s.report_setting_unset), "{text}");
+    assert!(text.contains(s.report_setting_add_row), "{text}");
+    // The settings come before BEGIN, not after it.
+    let settings_at = text.find(s.report_settings_heading).unwrap();
+    let begin_at = text.find(s.report_node_begin).unwrap();
+    assert!(
+        settings_at < begin_at,
+        "settings sit above the flow:\n{text}"
+    );
+}
+
+/// Draws a report tab and returns the number of rows the Validation panel
+/// occupies, borders included.
+fn validation_panel_rows(app: &mut TuiApp, width: u16, height: u16) -> usize {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    let lines: Vec<&str> = text.lines().collect();
+    let top = lines
+        .iter()
+        .position(|l| l.contains("Validation"))
+        .expect("validation panel drawn");
+    let bottom = lines[top + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('└'))
+        .expect("validation panel closed")
+        + top
+        + 1;
+    bottom - top + 1
+}
+
+/// A parse error is a single diagnostic but a whole sentence of text. Sizing the
+/// panel by counting diagnostics gave it one row and clipped the rest, which is
+/// the one state where you most need to read the message — so the panel is sized
+/// from the wrapped text instead.
+#[test]
+fn a_wrapping_parse_error_gets_the_rows_it_needs() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload\nFOR EACH OF THE MANY THINGS IN THE VERY LONG LIST OF THINGS DO SOMETHING\n",
+    );
+    app.revalidate_report(idx);
+    // Narrow enough that the message has to wrap several times.
+    assert!(validation_panel_rows(&mut app, 46, 40) > 3);
+}
+
+/// ...but it can never take over the pane: past the cap the panel scrolls.
+#[test]
+fn the_validation_panel_stops_growing_at_its_cap() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let mut text = String::from("# collection: api\n");
+    for i in 0..30 {
+        text.push_str(&format!("REPORT REQUEST missing{i}\n"));
+    }
+    app.reports[idx].report.set_text(&text);
+    app.revalidate_report(idx);
+    assert!(
+        app.reports[idx].diagnostics.len() > 10,
+        "expected plenty of diagnostics, got {}",
+        app.reports[idx].diagnostics.len()
+    );
+    // Five content rows plus the two borders.
+    assert_eq!(validation_panel_rows(&mut app, 90, 40), 7);
+}
