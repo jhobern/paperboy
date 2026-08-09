@@ -898,6 +898,21 @@ fn draw_report_node_with_field_overlay(
                 }
                 Line::from(Span::styled(text, base))
             }
+            // Blank is the normal case — most columns have nothing to be
+            // scored against — so an empty row says so rather than showing an
+            // unexplained gap.
+            WithFieldRow::Truth => {
+                let shown = if form.truth.trim().is_empty() && !is_sel {
+                    s.report_node_with_truth_none.to_string()
+                } else {
+                    form.truth.clone()
+                };
+                let mut text = format!("{}: {shown}", s.report_node_with_truth_label);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(text, base))
+            }
             // The toggle sits flush left and the checkboxes it reveals are
             // indented under it, so the list reads as its contents rather than
             // as six more peers of Column name and Query.

@@ -15,7 +15,7 @@ use crate::report::flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, Pattern,
     Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
-use crate::report::model::StatKind;
+use crate::report::model::{ColumnClauses, StatKind};
 
 /*
 GRAMMAR:
@@ -401,14 +401,15 @@ fn report_vars(i: &str) -> IResult<&str, ReportStmt> {
 fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
     let (i, template) = string_lit(i)?;
     let (i, name) = preceded(kw("AS"), str_or_word)(i)?;
-    let (i, (stats, image)) = column_clauses(i)?;
+    let (i, clauses) = column_clauses(i)?;
     Ok((
         i,
         ReportStmt::Computed {
             template,
             name,
-            stats,
-            image,
+            stats: clauses.stats,
+            image: clauses.image,
+            truth: clauses.truth,
         },
     ))
 }
@@ -421,15 +422,26 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
 fn report_single(i: &str) -> IResult<&str, ReportStmt> {
     let (i, var) = ident(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
-    let (i, (stats, image)) = column_clauses(i)?;
+    let (
+        i,
+        ColumnClauses {
+            stats,
+            image,
+            truth,
+        },
+    ) = column_clauses(i)?;
     Ok((
         i,
-        match (alias, stats.is_empty() && image.is_none()) {
+        match (
+            alias,
+            stats.is_empty() && image.is_none() && truth.is_none(),
+        ) {
             (Some(name), _) => ReportStmt::VarAs {
                 var,
                 name,
                 stats,
                 image,
+                truth,
             },
             // A bare `REPORT X` is a plain variable column, but one carrying a
             // clause needs a named column to hang the clause on, so the
@@ -441,6 +453,7 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
                     name,
                     stats,
                     image,
+                    truth,
                 }
             }
             (None, true) => ReportStmt::Vars(vec![var]),
@@ -448,27 +461,40 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
     ))
 }
 
-/// The optional trailing column clauses -- `STATISTICS(…)` and `IMAGE[(…)]` --
-/// in either order, since neither is more natural than the other.
-fn column_clauses(i: &str) -> IResult<&str, (Vec<StatKind>, Option<ImageSpec>)> {
+/// The optional trailing column clauses -- `STATISTICS(…)`, `IMAGE[(…)]` and
+/// `TRUTH "…"` -- in any order, since none is more natural than another.
+fn column_clauses(i: &str) -> IResult<&str, ColumnClauses> {
+    let mut out = ColumnClauses::default();
     let mut rest = i;
-    let mut stats = Vec::new();
-    let mut image = None;
     loop {
         if let Ok((r, s)) = statistics_clause(rest) {
-            stats = s;
+            out.stats = s;
             rest = r;
             continue;
         }
-        if image.is_none()
+        if out.image.is_none()
             && let Ok((r, im)) = image_clause(rest)
         {
-            image = Some(im);
+            out.image = Some(im);
             rest = r;
             continue;
         }
-        return Ok((rest, (stats, image)));
+        if out.truth.is_none()
+            && let Ok((r, t)) = truth_clause(rest)
+        {
+            out.truth = Some(t);
+            rest = r;
+            continue;
+        }
+        return Ok((rest, out));
     }
+}
+
+/// `TRUTH "<template>"` -- the column's expected value, interpolated per row.
+/// The argument is a mandatory string literal (see
+/// [`crate::report::model::split_truth`] for why it may not be bare).
+fn truth_clause(i: &str) -> IResult<&str, String> {
+    preceded(kw("TRUTH"), string_lit)(i)
 }
 
 /// `IMAGE` / `IMAGE(HEIGHT n | WIDTH n | FIT, …)` -- the render hint that makes
@@ -598,7 +624,7 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
     // directive uses), leaving the bare query. It has to be done textually
     // here rather than with a combinator because the query itself runs to the
     // end of the line and may contain almost anything.
-    let (query, stats, image) = crate::report::model::split_column_clauses(rest);
+    let (query, clauses) = crate::report::model::split_column_clauses(rest);
     let query = query.trim();
     if query.is_empty() {
         return Err(perr(i));
@@ -608,8 +634,9 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
         WithItem::Field {
             name,
             query: query.to_string(),
-            stats,
-            image,
+            stats: clauses.stats,
+            image: clauses.image,
+            truth: clauses.truth,
         },
     ))
 }
@@ -1786,6 +1813,99 @@ REPORT Thumb AS Small IMAGE(FIT)
         ] {
             assert!(parse_flow(src).is_err(), "{src} should not parse");
         }
+    }
+
+    /// A `TRUTH` clause is data, not an assertion, so it has to survive a
+    /// round-trip through the editors untouched and reach `column_truths`.
+    #[test]
+    fn truth_clause_parses_and_round_trips_on_every_column_form() {
+        for (src, key) in [
+            (
+                "REPORT Verdict AS Result TRUTH \"{{ expected }}\"\n",
+                "Result",
+            ),
+            (
+                "REPORT \"{{ a }}/{{ b }}\" AS Ratio TRUTH \"1/2\"\n",
+                "Ratio",
+            ),
+            (
+                "REPORT REQUEST face WITH\n    Verdict: jsonpath \"$.verdict\" TRUTH \"{{ expected }}\"\nEND\n",
+                "face.Verdict",
+            ),
+        ] {
+            let flow = assert_round_trips(src);
+            assert!(
+                flow.column_truths().contains_key(key),
+                "{src} should record a truth for {key}"
+            );
+        }
+    }
+
+    /// The three trailing clauses are independent, so any order has to parse;
+    /// serialization then normalises them to one order.
+    #[test]
+    fn truth_parses_in_any_clause_order_and_normalises() {
+        for src in [
+            "REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) TRUTH \"{{ e }}\"\n",
+            "REPORT V AS Verdict TRUTH \"{{ e }}\" IMAGE(HEIGHT 60) STATISTICS(COUNT)\n",
+            "REPORT V AS Verdict IMAGE(HEIGHT 60) TRUTH \"{{ e }}\" STATISTICS(COUNT)\n",
+        ] {
+            let flow = parse_flow(src).expect("parse");
+            assert_eq!(
+                flow.column_truths().get("Verdict").map(String::as_str),
+                Some("{{ e }}"),
+                "{src}"
+            );
+            assert_eq!(
+                flow.to_text(),
+                "REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) TRUTH \"{{ e }}\"\n",
+                "every order serializes the same way"
+            );
+        }
+    }
+
+    /// The template is arbitrary text, so words that happen to be clause
+    /// keywords inside it must stay part of the value, and an escaped quote
+    /// must not end it early.
+    #[test]
+    fn truth_template_may_contain_clause_keywords_and_escaped_quotes() {
+        let flow = parse_flow("REPORT V AS Verdict TRUTH \"IMAGE STATISTICS\"\n").expect("parse");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("IMAGE STATISTICS"),
+            "keywords inside the quotes are just text"
+        );
+        assert!(
+            flow.column_images().is_empty(),
+            "no IMAGE clause was written"
+        );
+
+        let flow =
+            assert_round_trips("REPORT V AS Verdict TRUTH \"say \\\"hi\\\"\" STATISTICS(COUNT)\n");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("say \"hi\""),
+            "an escaped quote is part of the template"
+        );
+        assert_eq!(
+            flow.column_stats().get("Verdict"),
+            Some(&vec![StatKind::Count]),
+            "the clause after it is still found"
+        );
+    }
+
+    /// `TRUTH` needs a quoted argument; without one it is ordinary text, so the
+    /// user sees what they typed rather than losing it to a silent no-op.
+    #[test]
+    fn truth_without_a_quoted_argument_is_not_a_clause() {
+        let flow = parse_flow("REPORT V AS Verdict TRUTH pass\n");
+        assert!(
+            flow.is_err() || flow.unwrap().column_truths().is_empty(),
+            "an unquoted TRUTH never becomes a clause"
+        );
+        // A column whose name merely starts with the word is untouched.
+        let flow = parse_flow("REPORT V AS Truthy\n").expect("parse");
+        assert!(flow.column_truths().is_empty());
     }
 
     #[test]

@@ -44,11 +44,12 @@ use crate::environment::substitute;
 use crate::hurl::HurlEntry;
 use crate::hurl::{EntryOutcome, RunOutput};
 
+use super::compare::{CORRECT_COLUMN, RESULT_COLUMN};
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
     ResponseFmt, RoleBinding, RoleRef, WithItem,
 };
-use super::model::{ReportResult, ReportRow};
+use super::model::{ReportResult, ReportRow, Verdict};
 use super::producers::{self, ProducerItem};
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
@@ -280,7 +281,10 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         timing_columns: ex.timing_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
+        column_truths: flow.column_truths(),
         images: HashMap::new(),
+        verdicts: HashMap::new(),
+        truths: HashMap::new(),
     }
 }
 
@@ -310,7 +314,94 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
                 .push(format!("baseline {}: {e}", path.display())),
         }
     }
+    resolve_truths(result, flow);
     resolve_images(result, flow, ctx);
+}
+
+/// Score every `TRUTH` column against its ground truth, filling
+/// [`ReportResult::verdicts`] and [`ReportResult::truths`].
+///
+/// Placed after the comparison collapse for the same reason
+/// [`resolve_images`] is — that is where the row set is final — and *before*
+/// it, so that a picture is fetched for the rows a reader will actually score.
+///
+/// The truth is a template, interpolated against the row's own variable
+/// snapshot: the label almost always arrives as a loop binding (a `TUPLES FROM
+/// "labels.csv"` field, a `FOLDERS` name), so it differs per row and there is
+/// nothing to resolve until the row exists. A template that still holds an
+/// unresolved `{{ … }}` after substitution names something that was not in
+/// scope; that row is `Untested` rather than wrong, because the report has no
+/// ground truth for it — not because the answer was bad.
+fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
+    let columns = result.resolved_columns(&flow.header);
+    let truth_columns: Vec<&super::model::OutputColumn> =
+        columns.iter().filter(|c| c.truth.is_some()).collect();
+    if truth_columns.is_empty() {
+        return;
+    }
+    let labels = super::labels::LabelMap::parse(&flow.header.labels());
+    let mut verdicts = HashMap::new();
+    let mut truths = HashMap::new();
+    for (r, row) in result.rows.iter().enumerate() {
+        // Cells underneath, variables on top: a reported column is visible to a
+        // truth template too, but a loop binding of the same name is the more
+        // local thing and wins.
+        let mut scope = row.cells.clone();
+        scope.extend(row.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for col in &truth_columns {
+            let Some(template) = col.truth.as_deref() else {
+                continue;
+            };
+            let expected = substitute(template, &scope);
+            let verdict = if expected.trim().is_empty() || expected.contains("{{") {
+                Verdict::Untested
+            } else if labels.same(&expected, &col.value(row, &result.no_match_marker)) {
+                Verdict::Correct
+            } else {
+                Verdict::Incorrect
+            };
+            if verdict != Verdict::Untested {
+                truths.insert((r, col.header.clone()), expected);
+            }
+            verdicts.insert((r, col.header.clone()), verdict);
+        }
+    }
+    // The reserved `Correct` column: the row's verdict at a glance, so a
+    // ground-truthed report is readable in CSV — which has no colour — and
+    // sortable in a spreadsheet. Placed after the comparison's `Result` when
+    // there is one, so the two verdict columns read together at the left.
+    if !verdicts.is_empty() && !result.column_order.iter().any(|c| c == CORRECT_COLUMN) {
+        let at = usize::from(
+            result
+                .column_order
+                .first()
+                .is_some_and(|c| c == RESULT_COLUMN),
+        );
+        result.column_order.insert(at, CORRECT_COLUMN.to_string());
+    }
+    for (r, row) in result.rows.iter_mut().enumerate() {
+        // A row can carry several ground-truthed columns. The roll-up favours
+        // the bad news: one wrong answer makes the row wrong, however many
+        // other columns were right.
+        let mut roll: Option<Verdict> = None;
+        for col in &truth_columns {
+            match verdicts.get(&(r, col.header.clone())) {
+                Some(Verdict::Incorrect) => {
+                    roll = Some(Verdict::Incorrect);
+                    break;
+                }
+                Some(Verdict::Correct) => roll = Some(Verdict::Correct),
+                Some(Verdict::Untested) => roll = roll.or(Some(Verdict::Untested)),
+                None => {}
+            }
+        }
+        if let Some(v) = roll {
+            row.cells
+                .insert(CORRECT_COLUMN.to_string(), v.as_str().to_string());
+        }
+    }
+    result.verdicts = verdicts;
+    result.truths = truths;
 }
 
 /// Resolve every `IMAGE` column's cell value to picture bytes, filling
@@ -1155,6 +1246,16 @@ impl<'a> Exec<'a> {
     fn check_arity(&mut self, pattern: &Pattern, item: &ProducerItem) {
         let want = pattern.binders.len();
         let got = item.values.len();
+        // A single binder over an item that also carries *named* fields is the
+        // documented `TUPLES FROM "manifest.csv"` idiom (`FOR ROW IN TUPLES …`,
+        // reading the columns as `{{ front }}`, `{{ expected }}`, …): the row
+        // is deliberately taken whole rather than destructured, and the header
+        // names are the interface. Counting that as a mismatch put one error on
+        // the run for every row of the manifest — the loudest possible
+        // complaint about the usage the cookbook recommends.
+        if want == 1 && !item.named.is_empty() {
+            return;
+        }
         let ok = if pattern.rest {
             want <= got
         } else {
@@ -1817,6 +1918,7 @@ mod tests {
             sources: vec!["process.missing".into()],
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }
@@ -3639,6 +3741,202 @@ mod tests {
             "the IMAGE clause reaches the output column"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end ground truth: each row's `TRUTH` template is interpolated
+    /// against that row's own variables, compared through the declared label
+    /// classes, and scored into [`ReportResult::verdicts`] — while the cell
+    /// text of both the answer and the truth is left exactly as written.
+    #[test]
+    fn a_truth_column_scores_each_row_through_the_label_classes() {
+        let dir = tmpdir("truth");
+        std::fs::write(
+            dir.join("labels.csv"),
+            "answer,expected\nLow Risk,real\nLow Risk,fake\nHigh Risk,\n",
+        )
+        .unwrap();
+        let flow = parse_flow(
+            "# labels: Pass = pass, real, low risk\n             # labels: Fail = fail, fake, high risk\n             FOR ROW IN TUPLES FROM \"labels.csv\"\n             \x20   REPORT \"{{ answer }}\" AS Verdict TRUTH \"{{ expected }}\"\n             END\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        assert_eq!(res.rows.len(), 3);
+        let verdict = |r: usize| res.verdicts.get(&(r, "Verdict".to_string())).copied();
+        assert_eq!(
+            verdict(0),
+            Some(Verdict::Correct),
+            "`Low Risk` and `real` are the same class"
+        );
+        assert_eq!(verdict(1), Some(Verdict::Incorrect));
+        assert_eq!(
+            verdict(2),
+            Some(Verdict::Untested),
+            "a blank ground truth is never scored as a pass"
+        );
+        assert_eq!(
+            res.truths
+                .get(&(0, "Verdict".to_string()))
+                .map(String::as_str),
+            Some("real"),
+            "the resolved truth is kept beside the verdict"
+        );
+        assert!(
+            !res.truths.contains_key(&(2, "Verdict".to_string())),
+            "an untested row has no truth to record"
+        );
+        assert_eq!(
+            res.rows[0].cells.get("Verdict").map(String::as_str),
+            Some("Low Risk"),
+            "scoring never rewrites the reported value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reserved `Correct` column summarises the row, so a ground-truthed
+    /// report is readable in CSV (which has no colour) and sortable in a
+    /// spreadsheet. The roll-up favours the bad news.
+    #[test]
+    fn the_correct_column_rolls_up_a_row_and_favours_the_bad_news() {
+        let flow =
+            parse_flow("REPORT \"yes\" AS A TRUTH \"yes\"\nREPORT \"yes\" AS B TRUTH \"no\"\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.rows[0].cells.get(CORRECT_COLUMN).map(String::as_str),
+            Some("incorrect"),
+            "one wrong column makes the row wrong"
+        );
+        assert_eq!(
+            res.column_order.first().map(String::as_str),
+            Some(CORRECT_COLUMN),
+            "and the column leads the table"
+        );
+    }
+
+    /// `FOR ROW IN TUPLES FROM "manifest.csv"` is the documented way to read a
+    /// manifest's columns by name, so it must not be reported as a
+    /// destructuring mismatch — that put one error on the run per manifest row.
+    #[test]
+    fn a_single_binder_over_a_named_manifest_row_is_not_an_arity_mismatch() {
+        let dir = tmpdir("tuplearity");
+        std::fs::write(dir.join("m.csv"), "answer,expected\nyes,yes\n").unwrap();
+        let flow =
+            parse_flow("FOR ROW IN TUPLES FROM \"m.csv\"\n    REPORT \"{{ answer }}\" AS A\nEND\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows[0].cells.get("A").map(String::as_str), Some("yes"));
+
+        // A pattern that really does destructure is still checked.
+        let flow = parse_flow("FOR (a, b, c) IN TUPLES FROM \"m.csv\"\n    REPORT a\nEND\n")
+            .expect("flow parses");
+        let res = run_flow(&flow, &ctx);
+        assert!(
+            res.errors.iter().any(|e| e.contains("binds 3")),
+            "{:?}",
+            res.errors
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A truth naming something that was never in scope leaves the row
+    /// `Untested`: the report has no ground truth for it, which is not the same
+    /// as the answer being wrong.
+    #[test]
+    fn a_truth_referencing_an_unknown_variable_is_untested() {
+        let flow =
+            parse_flow("REPORT \"yes\" AS Verdict TRUTH \"{{ nowhere }}\"\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.verdicts.get(&(0, "Verdict".to_string())).copied(),
+            Some(Verdict::Untested)
+        );
+    }
+
+    /// Without `# labels:` the comparison still works, folding case and
+    /// surrounding space only — so the directive is optional rather than
+    /// boilerplate.
+    #[test]
+    fn a_truth_without_declared_labels_compares_literally() {
+        let flow = parse_flow(
+            "APPROVED = approved\nREPORT \" Approved \" AS Verdict TRUTH \"{{ APPROVED }}\"\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.verdicts.get(&(0, "Verdict".to_string())).copied(),
+            Some(Verdict::Correct)
+        );
+    }
+
+    /// A report with no `TRUTH` clause anywhere scores nothing at all, so every
+    /// existing report is byte-identical.
+    #[test]
+    fn a_report_without_a_truth_clause_records_no_verdicts() {
+        let flow = parse_flow("REPORT \"yes\" AS Verdict\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.verdicts.is_empty() && res.truths.is_empty());
     }
 
     /// A column *without* `IMAGE` is never resolved, however picture-like its

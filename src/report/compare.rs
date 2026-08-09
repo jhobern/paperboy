@@ -32,6 +32,15 @@ use super::model::{ReportResult, ReportRow};
 /// comparison run; rename it in `columns:` like any column (`Result AS …`).
 pub const RESULT_COLUMN: &str = "Result";
 
+/// The reserved column holding a row's ground-truth verdict (see
+/// [`crate::report::model::Verdict`]), inserted by the run's finalize phase for
+/// a report that declares any `TRUTH "…"` column.
+///
+/// Reserved and English for the same reason [`RESULT_COLUMN`] is: it is report
+/// *data* — read by scripts, diffed between runs, sorted in a spreadsheet — and
+/// not UI chrome that follows the interface language.
+pub const CORRECT_COLUMN: &str = "Correct";
+
 /// `Result` value when the candidate matches the baseline on every compared
 /// field. A descriptive phrase (rather than a bare "OK") so a matching row is
 /// self-explanatory in an exported CSV/JSON. Kept a plain data constant like

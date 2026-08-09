@@ -372,6 +372,9 @@ pub(crate) struct VarsForm {
     /// An `IMAGE(…)` render hint the statement already carries. The form
     /// doesn't expose it, but must not silently drop it when writing back.
     pub(crate) image: Option<ImageSpec>,
+    /// A `TRUTH "…"` clause the statement already carries, preserved for the
+    /// same reason as [`Self::image`].
+    pub(crate) truth: Option<String>,
     pub(crate) selected: usize,
 }
 
@@ -386,6 +389,7 @@ impl VarsForm {
         alias: Option<String>,
         stats: &[StatKind],
         image: Option<ImageSpec>,
+        truth: Option<String>,
         in_scope: Vec<String>,
     ) -> Self {
         let mut names = in_scope;
@@ -396,6 +400,7 @@ impl VarsForm {
         }
         VarsForm {
             image,
+            truth,
             report_id,
             path,
             vars: names
@@ -462,6 +467,7 @@ impl VarsForm {
         // anything else is the plain variable list.
         if rest.is_empty() && (!alias.is_empty() || !stats.is_empty() || self.image.is_some()) {
             return Some(FlowNode::Report(ReportStmt::VarAs {
+                truth: self.truth.clone(),
                 var: first.clone(),
                 // `STATISTICS` needs a column to attach to, so an unnamed one
                 // falls back to the variable's own name.
@@ -506,6 +512,8 @@ pub(crate) struct ComputedForm {
     /// An `IMAGE(…)` render hint the statement already carries; preserved
     /// verbatim, as in [`VarsForm`].
     pub(crate) image: Option<ImageSpec>,
+    /// A `TRUTH "…"` clause, preserved verbatim, as in [`VarsForm`].
+    pub(crate) truth: Option<String>,
     pub(crate) selected: usize,
 }
 
@@ -530,6 +538,7 @@ impl ComputedForm {
             return None;
         }
         Some(FlowNode::Report(ReportStmt::Computed {
+            truth: self.truth.clone(),
             template: template.to_string(),
             name: alias.to_string(),
             stats: self
@@ -645,6 +654,10 @@ pub(crate) enum WithFieldRow {
     Name,
     /// The Hurl query the column's value comes from, editable inline.
     Query,
+    /// The `TRUTH "…"` ground-truth template, editable inline. A plain text row
+    /// rather than a toggle: it is a value, usually a `{{ … }}` reference to a
+    /// label the loop bound, and blank means the column isn't scored.
+    Truth,
     /// The `STATISTICS(…)` on/off toggle. The individual statistic checkboxes
     /// only exist while it is on: most columns want no summary at all, and a
     /// permanently-showing list of six checkboxes buried the two rows that
@@ -689,6 +702,9 @@ pub(crate) struct WithFieldForm {
     /// An `IMAGE(…)` render hint the field already carries; preserved verbatim
     /// (the form doesn't expose it, but must not drop it).
     pub(crate) image: Option<ImageSpec>,
+    /// The `TRUTH "…"` ground-truth template, as edited: empty when the field
+    /// carries no clause.
+    pub(crate) truth: String,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -701,19 +717,27 @@ impl WithFieldForm {
         existing: Option<&WithItem>,
         return_to_request: bool,
     ) -> Self {
-        let (name, query, stats, image) = match existing {
+        let (name, query, stats, image, truth) = match existing {
             Some(WithItem::Field {
                 name,
                 query,
                 stats,
                 image,
-            }) => (name.clone(), query.clone(), stats.clone(), *image),
+                truth,
+            }) => (
+                name.clone(),
+                query.clone(),
+                stats.clone(),
+                *image,
+                truth.clone(),
+            ),
             // A bare `WITH RESPONSE` isn't a named field, so editing it falls
             // through to a fresh one rather than silently rewriting it.
-            _ => (String::new(), String::new(), Vec::new(), None),
+            _ => (String::new(), String::new(), Vec::new(), None, None),
         };
         WithFieldForm {
             image,
+            truth: truth.unwrap_or_default(),
             report_id,
             path,
             index,
@@ -730,7 +754,12 @@ impl WithFieldForm {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<WithFieldRow> {
-        let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats];
+        let mut rows = vec![
+            WithFieldRow::Name,
+            WithFieldRow::Query,
+            WithFieldRow::Truth,
+            WithFieldRow::Stats,
+        ];
         if self.stats_on {
             rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
         }
@@ -783,6 +812,9 @@ impl WithFieldForm {
                 .map(|(k, _)| *k)
                 .collect(),
             image: self.image,
+            // Blank means no clause at all, so clearing the row removes it
+            // rather than writing an empty ground truth nothing can match.
+            truth: Some(self.truth.trim().to_string()).filter(|t| !t.is_empty()),
         })
     }
 }
@@ -1697,14 +1729,23 @@ impl TuiApp {
         let Some((report_id, path, node)) = self.selected_node(idx) else {
             return false;
         };
-        let (chosen, alias, stats, image) = match &node {
-            FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), None, Vec::new(), None),
+        let (chosen, alias, stats, image, truth) = match &node {
+            FlowNode::Report(ReportStmt::Vars(vars)) => {
+                (vars.clone(), None, Vec::new(), None, None)
+            }
             FlowNode::Report(ReportStmt::VarAs {
                 var,
                 name,
                 stats,
                 image,
-            }) => (vec![var.clone()], Some(name.clone()), stats.clone(), *image),
+                truth,
+            }) => (
+                vec![var.clone()],
+                Some(name.clone()),
+                stats.clone(),
+                *image,
+                truth.clone(),
+            ),
             _ => return false,
         };
         // The candidate list needs the bound collection to include the captures
@@ -1719,7 +1760,7 @@ impl TuiApp {
             Err(_) => Vec::new(),
         };
         self.overlay = Some(Overlay::ReportNodeVars(Box::new(VarsForm::build(
-            report_id, path, &chosen, alias, &stats, image, in_scope,
+            report_id, path, &chosen, alias, &stats, image, truth, in_scope,
         ))));
         true
     }
@@ -1816,6 +1857,7 @@ impl TuiApp {
             name,
             stats,
             image,
+            truth,
         }) = node
         else {
             return false;
@@ -1826,6 +1868,7 @@ impl TuiApp {
             template,
             alias: name,
             image,
+            truth,
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -2167,6 +2210,16 @@ impl TuiApp {
                             KeyCode::Char(c) => form.query.push(c),
                             KeyCode::Backspace => {
                                 form.query.pop();
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    Some(WithFieldRow::Truth) => {
+                        match key.code {
+                            KeyCode::Char(c) => form.truth.push(c),
+                            KeyCode::Backspace => {
+                                form.truth.pop();
                             }
                             _ => {}
                         }
@@ -3661,11 +3714,12 @@ impl TuiApp {
         header_specs()
             .into_iter()
             .flat_map(|spec| {
-                // `collection:` repeats: one row for the primary and one for
-                // each aliased helper, so a helper can be seen and edited here
-                // rather than only in the raw source.
-                let values = if spec.key == "collection" {
-                    let all = flow.header.get_all("collection");
+                // A repeatable directive gets one row per occurrence —
+                // `collection:` for each aliased helper, `labels:` for each
+                // class — so they can be seen and edited here rather than only
+                // in the raw source.
+                let values = if spec.repeatable {
+                    let all = flow.header.get_all(spec.key);
                     if all.is_empty() {
                         vec![String::new()]
                     } else {
@@ -3926,6 +3980,18 @@ impl TuiApp {
         // unlike the one-shot directives it is never "already set".
         let mut options: Vec<String> = missing.iter().map(|k| k.to_uppercase()).collect();
         options.push(s.report_add_helper_collection.to_string());
+        // A second label class is offered the same way: `labels:` repeats, so
+        // once one is set the one-shot "add setting" entry is gone and there
+        // would otherwise be no way to declare the other half of the
+        // vocabulary without editing the source.
+        if self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.flow().ok())
+            .is_some_and(|f| !f.header.labels().is_empty())
+        {
+            options.push(s.report_add_label_class.to_string());
+        }
         self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
             step: SettingMenuStep::AddSetting,
             options,
@@ -3951,6 +4017,28 @@ impl TuiApp {
         if let Some(pos) = rows
             .iter()
             .position(|r| r.key == "collection" && r.occurrence == occurrence)
+        {
+            self.reports[idx].node_setting = Some(pos);
+            self.open_setting_text_prompt(idx, pos);
+        }
+    }
+
+    /// Add another `# labels:` line — one more class of the answers the report
+    /// scores.
+    ///
+    /// Seeded and opened for typing exactly like a helper collection: a class
+    /// is a name and a list of spellings on one line (`Pass = pass, ok, real`),
+    /// which only the text prompt can express.
+    fn add_label_class(&mut self, idx: usize) {
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let occurrence = flow.header.labels().len();
+        self.apply_report_setting(idx, "labels", occurrence, Some(HEADER_PLACEHOLDER));
+        let rows = self.report_setting_rows(idx);
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| r.key == "labels" && r.occurrence == occurrence)
         {
             self.reports[idx].node_setting = Some(pos);
             self.open_setting_text_prompt(idx, pos);
@@ -4079,6 +4167,10 @@ impl TuiApp {
                 let s = Strings::for_language(&self.language);
                 if choice == s.report_add_helper_collection {
                     self.add_helper_collection(idx);
+                    return;
+                }
+                if choice == s.report_add_label_class {
+                    self.add_label_class(idx);
                     return;
                 }
                 let key = menu.options[menu.selected].to_ascii_lowercase();

@@ -122,6 +122,17 @@ impl Header {
     pub fn output(&self) -> Option<&str> {
         self.get("output")
     }
+    /// The declared label classes (`labels:` directives), one per line, in the
+    /// order written — which is also the order a confusion matrix's axes take.
+    ///
+    /// Repeatable, like `collection:`: each line declares one canonical label
+    /// and its synonyms (`Pass = pass, ok, low risk`). Parsing them into a
+    /// lookup is [`crate::report::labels::LabelMap`]'s job; the header only
+    /// hands back the raw text, so a half-typed line in an editor is still
+    /// round-tripped rather than dropped.
+    pub fn labels(&self) -> Vec<&str> {
+        self.get_all("labels")
+    }
     pub fn columns(&self) -> Option<&str> {
         self.get("columns")
     }
@@ -237,6 +248,7 @@ pub enum ReportStmt {
         name: String,
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
+        truth: Option<String>,
     },
     /// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE(…)]` — a computed
     /// column.
@@ -245,6 +257,7 @@ pub enum ReportStmt {
         name: String,
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
+        truth: Option<String>,
     },
 }
 
@@ -308,6 +321,7 @@ pub enum WithItem {
         query: String,
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
+        truth: Option<String>,
     },
     /// A whole-line `#` comment written inside the block, kept so that
     /// commenting a field out doesn't destroy it the next time an editor
@@ -526,6 +540,22 @@ impl ReportFlow {
         collect_column_images(&self.nodes, &mut out);
         out
     }
+
+    /// Collect the per-column `TRUTH "<template>"` clauses declared anywhere in
+    /// the flow, keyed by output-column header, exactly as
+    /// [`column_images`](Self::column_images) does — the three clauses attach at
+    /// the same three places and are resolved the same way.
+    ///
+    /// The value is the **unevaluated template**. It is interpolated per row,
+    /// after the run, against that row's variable snapshot: a ground truth is by
+    /// definition something known before the request was sent, so it is read
+    /// from the loop that chose the input (a labels manifest, a folder name),
+    /// never from the response it is judging.
+    pub fn column_truths(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        collect_column_truths(&self.nodes, &mut out);
+        out
+    }
 }
 
 fn collect_column_images(
@@ -559,6 +589,40 @@ fn collect_column_images(
             }
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 collect_column_images(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_column_truths(nodes: &[FlowNode], out: &mut std::collections::HashMap<String, String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, truth, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, truth, .. }) => {
+                if let Some(t) = truth {
+                    out.insert(name.clone(), t.clone());
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        truth: Some(t),
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"), t.clone());
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_truths(body, out);
             }
             _ => {}
         }
@@ -724,13 +788,15 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             name,
             stats,
             image,
+            truth,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {var} AS {}{}{}",
+                "REPORT {var} AS {}{}{}{}",
                 name_text(name),
                 stats_text(stats),
-                image_text(image.as_ref())
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref())
             );
         }
         ReportStmt::Computed {
@@ -738,14 +804,16 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             name,
             stats,
             image,
+            truth,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {} AS {}{}{}",
+                "REPORT {} AS {}{}{}{}",
                 quote(template),
                 name_text(name),
                 stats_text(stats),
-                image_text(image.as_ref())
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref())
             );
         }
     }
@@ -765,11 +833,13 @@ pub(crate) fn with_item_text(item: &WithItem) -> String {
             query,
             stats,
             image,
+            truth,
         } => format!(
-            "{}: {query}{}{}",
+            "{}: {query}{}{}{}",
             name_text(name),
             stats_text(stats),
-            image_text(image.as_ref())
+            image_text(image.as_ref()),
+            truth_text(truth.as_deref())
         ),
     }
 }
@@ -803,6 +873,20 @@ pub(crate) fn image_text(image: Option<&ImageSpec>) -> String {
         " IMAGE".to_string()
     } else {
         format!(" IMAGE({})", opts.join(", "))
+    }
+}
+
+/// Render a `TRUTH "<template>"` clause (with a leading space), or the empty
+/// string when the column declares no ground truth.
+///
+/// The template is re-quoted rather than written verbatim because it is a
+/// string literal in the grammar: a truth of `{{ expected }}` and one of
+/// `pass` are both perfectly ordinary values, and only the quotes tell them
+/// apart from the keywords around them.
+pub(crate) fn truth_text(truth: Option<&str>) -> String {
+    match truth {
+        Some(t) => format!(" TRUTH {}", quote(t)),
+        None => String::new(),
     }
 }
 
@@ -1082,11 +1166,13 @@ fn report_label(stmt: &ReportStmt) -> String {
             name,
             stats,
             image,
+            truth,
         } => {
             format!(
-                "REPORT {var} AS {name}{}{}",
+                "REPORT {var} AS {name}{}{}{}",
                 stats_text(stats),
-                image_text(image.as_ref())
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref())
             )
         }
         ReportStmt::Computed {
@@ -1094,12 +1180,14 @@ fn report_label(stmt: &ReportStmt) -> String {
             name,
             stats,
             image,
+            truth,
         } => {
             format!(
-                "REPORT {} AS {name}{}{}",
+                "REPORT {} AS {name}{}{}{}",
                 quote(template),
                 stats_text(stats),
-                image_text(image.as_ref())
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref())
             )
         }
     }

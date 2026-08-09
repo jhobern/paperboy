@@ -71,6 +71,9 @@ pub struct ReportResult {
     /// the resolved columns the same way `column_stats` is (a `columns:`
     /// directive's own inline `IMAGE(…)` wins). Empty by default.
     pub column_images: std::collections::HashMap<String, ImageSpec>,
+    /// `TRUTH "…"` templates requested per output-column *header*, merged into
+    /// the resolved columns exactly as `column_images` is. Empty by default.
+    pub column_truths: std::collections::HashMap<String, String>,
     /// Produced column keys whose value is an *elapsed time* — every column
     /// sourced from the `Time`/`TimeSetup`/`TimeWait`/`TimeDownload` intrinsics,
     /// including a `[Reports]` or `WITH` field that aliases one under a name of
@@ -91,6 +94,45 @@ pub struct ReportResult {
     /// run already has the network, the `# root:` base directory and the
     /// `PARALLEL` workers, so resolution belongs there.
     pub images: std::collections::HashMap<(usize, String), ImageData>,
+    /// How each ground-truthed cell scored, keyed like [`images`](Self::images)
+    /// by `(row index, output-column header)`. Filled during the run's finalize
+    /// phase for every column carrying a `TRUTH "…"` clause; empty otherwise, so
+    /// a report that declares no ground truth is unchanged in every writer.
+    pub verdicts: std::collections::HashMap<(usize, String), Verdict>,
+    /// The ground-truth value each verdict was reached against — the `TRUTH`
+    /// template with this row's variables substituted in. Kept beside the
+    /// verdict so a summary (accuracy, confusion matrix) never has to
+    /// re-interpolate, and so the reader can be shown what was expected.
+    pub truths: std::collections::HashMap<(usize, String), String>,
+}
+
+/// How one ground-truthed cell scored.
+///
+/// Deliberately three-valued. A row whose ground truth is missing or blank is
+/// `Untested`, not a pass: scoring an unlabelled row as correct would inflate
+/// every accuracy figure by exactly the rows nobody has checked, which is the
+/// one number a reader must be able to trust.
+///
+/// A verdict never fails a run. Ground truth is *data* about the answer, not an
+/// assertion about it — `[Asserts]` is where a run says something went wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Correct,
+    Incorrect,
+    Untested,
+}
+
+impl Verdict {
+    /// The reserved `Correct` column's cell text. English, like the other
+    /// reserved column values (`Result`, `TARGET`): these are report *data*,
+    /// read by scripts and diffed between runs, not UI chrome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Correct => "correct",
+            Verdict::Incorrect => "incorrect",
+            Verdict::Untested => "untested",
+        }
+    }
 }
 
 /// One resolved picture: the raw encoded bytes plus the format sniffed from
@@ -131,6 +173,7 @@ impl ReportResult {
                     sources: vec![k.clone()],
                     stats: Vec::new(),
                     image: None,
+                    truth: None,
                 })
                 .collect(),
         };
@@ -154,6 +197,16 @@ impl ReportResult {
                     && let Some(img) = self.column_images.get(&col.header)
                 {
                     col.image = Some(*img);
+                }
+            }
+        }
+        // And for `TRUTH "…"`, on the same precedence rule.
+        if !self.column_truths.is_empty() {
+            for col in &mut columns {
+                if col.truth.is_none()
+                    && let Some(t) = self.column_truths.get(&col.header)
+                {
+                    col.truth = Some(t.clone());
                 }
             }
         }
@@ -501,6 +554,13 @@ pub struct OutputColumn {
     /// that can't (CSV, JSON) simply writes the text. `None` = an ordinary text
     /// column.
     pub image: Option<ImageSpec>,
+    /// A `TRUTH "<template>"` clause: the column declares what the *correct*
+    /// value was, so a run can report whether the system under test was right
+    /// rather than merely whether it changed. The template is interpolated per
+    /// row after the run (see [`crate::report::flow::ReportFlow::column_truths`]);
+    /// the verdicts land in [`ReportResult::verdicts`]. `None` = a column with
+    /// no expected answer, which is every column in an ordinary report.
+    pub truth: Option<String>,
 }
 
 impl OutputColumn {
@@ -549,7 +609,12 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
             // Peel off the optional trailing `STATISTICS(…)` and `IMAGE(…)`
             // clauses first (in either written order), then the optional
             // ` AS <name>` rename, leaving just the sources.
-            let (part, stats, image) = split_column_clauses(part);
+            let (part, clauses) = split_column_clauses(part);
+            let ColumnClauses {
+                stats,
+                image,
+                truth,
+            } = clauses;
             let (sources_part, header) = split_as(part);
             let sources: Vec<String> = sources_part
                 .split('|')
@@ -565,41 +630,142 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
                 sources,
                 stats,
                 image,
+                truth,
             })
         })
         .collect()
 }
 
-/// Peel both optional trailing clauses -- `STATISTICS(…)` and `IMAGE[(…)]` --
-/// off a column-spec, in whichever order they were written.
+/// The optional trailing clauses a column spec may carry, in any order:
+/// `STATISTICS(…)`, `IMAGE[(…)]` and `TRUTH "<template>"`.
 ///
-/// They are peeled in a loop rather than in a fixed sequence because neither
-/// order is more natural than the other, and a report that stops working
-/// because two independent clauses were typed the "wrong" way round is exactly
-/// the kind of arbitrary rule this language avoids.
-pub(crate) fn split_column_clauses(part: &str) -> (&str, Vec<StatKind>, Option<ImageSpec>) {
+/// A struct rather than a tuple because there are now three of them and the
+/// same set attaches at four different places (a `columns:` spec, a `WITH`
+/// field, `REPORT … AS`, `REPORT "…" AS`) — a positional triple read the same
+/// way in four files is a bug waiting for the fourth clause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ColumnClauses {
+    pub stats: Vec<StatKind>,
+    pub image: Option<ImageSpec>,
+    pub truth: Option<String>,
+}
+
+/// Peel every optional trailing clause -- `STATISTICS(…)`, `IMAGE[(…)]` and
+/// `TRUTH "…"` -- off a column-spec, in whichever order they were written.
+///
+/// They are peeled in a loop rather than in a fixed sequence because no order
+/// is more natural than another, and a report that stops working because two
+/// independent clauses were typed the "wrong" way round is exactly the kind of
+/// arbitrary rule this language avoids.
+pub(crate) fn split_column_clauses(part: &str) -> (&str, ColumnClauses) {
     let mut rest = part;
-    let mut stats = Vec::new();
-    let mut image = None;
+    let mut out = ColumnClauses::default();
     loop {
-        // Both peelers return only the text *before* the clause they found, so
-        // they have to be applied right-to-left or the outer one would throw the
-        // inner one away. The longer remainder is the clause that starts later,
-        // and so is the one to take this time round.
+        // Each peeler returns only the text *before* the clause it found, so
+        // they have to be applied right-to-left or an outer one would throw an
+        // inner one away. The longest remainder is the clause that starts
+        // latest, and so is the one to take this time round.
         let (sr, s) = split_statistics(rest);
         let (ir, im) = split_image(rest);
-        let take_stats = !s.is_empty() && (im.is_none() || sr.len() > ir.len());
-        let take_image = im.is_some() && (s.is_empty() || ir.len() > sr.len());
-        if take_stats {
-            stats = s;
-            rest = sr;
-        } else if take_image {
-            image = im;
-            rest = ir;
-        } else {
-            return (rest, stats, image);
+        let (tr, tv) = split_truth(rest);
+        let cands = [
+            (!s.is_empty(), sr.len()),
+            (im.is_some(), ir.len()),
+            (tv.is_some(), tr.len()),
+        ];
+        let latest = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, (found, _))| *found)
+            .max_by_key(|(_, (_, len))| *len)
+            .map(|(i, _)| i);
+        match latest {
+            Some(0) => {
+                out.stats = s;
+                rest = sr;
+            }
+            Some(1) => {
+                out.image = im;
+                rest = ir;
+            }
+            Some(2) => {
+                out.truth = tv;
+                rest = tr;
+            }
+            _ => return (rest, out),
         }
     }
+}
+
+/// Peel a trailing `TRUTH "<template>"` clause (case-insensitive, whole-word,
+/// outside quotes) off a column-spec, returning `(remainder, template)`.
+///
+/// The argument is required and must be quoted: a ground truth is a *value*,
+/// and an unquoted one would be indistinguishable from the column name or
+/// keyword beside it (`TRUTH pass` vs `TRUTH PASS`). A `TRUTH` with nothing
+/// parseable after it is left in the text, where it becomes a visible part of
+/// the column source rather than a silently ignored clause.
+pub(crate) fn split_truth(part: &str) -> (&str, Option<String>) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b't' || c == b'T')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 5)
+                .is_some_and(|w| w.eq_ignore_ascii_case("truth"))
+            // Whole word: a column called `TRUTHY` is not a clause.
+            && part
+                .as_bytes()
+                .get(i + 5)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            && let Some(template) = quoted_arg(part[i + 5..].trim_start())
+        {
+            return (part[..i].trim_end(), Some(template));
+        }
+        i += 1;
+    }
+    (part, None)
+}
+
+/// Read a `"…"` string literal at the start of `text`, honouring the `\"`
+/// escape the serializer writes, and return its *content*. `None` when the text
+/// does not start with a quote or the quote is never closed.
+fn quoted_arg(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in chars {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
 }
 
 /// Peel a trailing `IMAGE` / `IMAGE(opt, …)` clause (case-insensitive,
@@ -613,6 +779,13 @@ pub(crate) fn split_image(part: &str) -> (&str, Option<ImageSpec>) {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
         if c == b'"' {
             in_quote = !in_quote;
             i += 1;
@@ -686,6 +859,13 @@ pub(crate) fn split_statistics(part: &str) -> (&str, Vec<StatKind>) {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
         if c == b'"' {
             in_quote = !in_quote;
             i += 1;
@@ -862,6 +1042,7 @@ mod tests {
             sources: vec!["a.status".into(), "b.status".into()],
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         let r = row(&[("a.status", ""), ("b.status", "ok")], &[], None);
         assert_eq!(col.value(&r, "-"), "ok");
@@ -874,6 +1055,7 @@ mod tests {
             sources: vec!["FILE".into()],
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         let r = row(&[], &[("FILE", "a.jpg")], None);
         assert_eq!(col.value(&r, "∅"), "a.jpg");
@@ -888,6 +1070,7 @@ mod tests {
             sources: vec![TARGET_COLUMN.to_string()],
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         let r = row(&[], &[], Some("staging-au"));
         assert_eq!(col.value(&r, "-"), "staging-au");

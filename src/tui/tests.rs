@@ -25580,6 +25580,33 @@ fn the_node_editor_offers_every_header_directive_the_gui_does() {
     assert_eq!(shown, vec!["collection", "output"]);
 }
 
+/// `# labels:` repeats — a vocabulary is nearly always at least two classes —
+/// so every declared class gets its own settings row, and another can be added
+/// once the first is set (the one-shot "add setting" entry is gone by then).
+#[test]
+fn every_declared_label_class_gets_its_own_settings_row() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n# labels: Pass = ok, real\n# labels: Fail = no, fake\nREQUEST upload\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_setting_rows(idx);
+    let labels: Vec<&crate::tui::report_nodes::SettingRow> =
+        rows.iter().filter(|r| r.key == "labels").collect();
+    assert_eq!(labels.len(), 2, "one row per class");
+    assert_eq!(labels[0].occurrence, 0);
+    assert_eq!(labels[1].occurrence, 1);
+    assert!(
+        labels[1].value.contains("Fail"),
+        "each row shows its own class: {:?}",
+        labels[1].value
+    );
+    assert!(
+        !app.missing_report_settings(idx).contains(&"labels"),
+        "an already-declared repeatable directive isn't offered as missing"
+    );
+}
+
 /// The cursor arrows out of the settings into the flow and back, so the pane
 /// reads as one list even though the two halves are indexed separately.
 #[test]
@@ -26251,6 +26278,75 @@ fn the_with_field_editor_closes_to_the_outline_when_opened_from_it() {
     );
 }
 
+/// A `WITH` field's ground truth is editable in the field form, and a field
+/// that already carries one round-trips it — the editors must never quietly
+/// drop a clause they can see.
+#[test]
+fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
+    use crate::tui::report_nodes::WithFieldRow;
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let open_field = |app: &mut crate::tui::app::TuiApp| {
+        let rows = app.report_node_rows(idx).expect("rows");
+        let at = rows
+            .iter()
+            .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+            .expect("the field row");
+        app.reports[idx].node_selected = at;
+        press(app, KeyCode::Enter);
+    };
+
+    open_field(&mut app);
+    let truth_row = {
+        let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+            panic!("expected the field editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == WithFieldRow::Truth)
+            .expect("a ground-truth row")
+    };
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+    }
+    for c in "{{ e }}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("TRUTH \"{{ e }}\""),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // Re-opening shows it, and applying without touching it leaves it alone.
+    open_field(&mut app);
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("expected the field editor");
+    };
+    assert_eq!(form.truth, "{{ e }}");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.reports[idx].report.text.contains("TRUTH \"{{ e }}\""));
+
+    // Clearing the row removes the clause rather than writing an empty one.
+    open_field(&mut app);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+        for _ in 0.."{{ e }}".len() {
+            form.truth.pop();
+        }
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("TRUTH"),
+        "no empty clause is left behind: {}",
+        app.reports[idx].report.text
+    );
+}
+
 /// The statistics checklist is six rows that most fields don't want, so it is
 /// folded behind a toggle. Turning it on seeds `COUNT` (the one statistic that
 /// means something for a text column too) and turning it off clears the ticks,
@@ -26276,12 +26372,17 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
     };
     assert_eq!(
         form.visible_rows(),
-        vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats],
+        vec![
+            WithFieldRow::Name,
+            WithFieldRow::Query,
+            WithFieldRow::Truth,
+            WithFieldRow::Stats
+        ],
         "a field with no STATISTICS shows the toggle only"
     );
 
     // Space on the toggle reveals the checklist with COUNT seeded.
-    let toggle = 2;
+    let toggle = 3;
     if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
         form.selected = toggle;
     }
@@ -26290,7 +26391,7 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
         panic!("still in the field editor");
     };
     assert!(
-        form.visible_rows().len() > 3,
+        form.visible_rows().len() > 4,
         "the checklist appears while the toggle is on"
     );
     assert_eq!(
@@ -26326,7 +26427,12 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
     };
     assert_eq!(
         form.visible_rows(),
-        vec![WithFieldRow::Name, WithFieldRow::Query, WithFieldRow::Stats],
+        vec![
+            WithFieldRow::Name,
+            WithFieldRow::Query,
+            WithFieldRow::Truth,
+            WithFieldRow::Stats
+        ],
         "the checklist collapses again"
     );
     press(&mut app, KeyCode::Enter);

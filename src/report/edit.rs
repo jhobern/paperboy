@@ -486,6 +486,7 @@ impl NodeKind {
                 name: "column".into(),
                 stats: Vec::new(),
                 image: None,
+                truth: None,
             }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
@@ -921,6 +922,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     query: "HttpStatus".into(),
                     stats: Vec::new(),
                     image: None,
+                    truth: None,
                 });
             }
         }
@@ -935,6 +937,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     name: "name".into(),
                     stats: Vec::new(),
                     image: None,
+                    truth: None,
                 });
             }
             _ => {}
@@ -1280,6 +1283,11 @@ pub(crate) struct HeaderSpec {
     /// `csv`, `root:` to the report's folder) or is simply absent.
     pub(crate) required: bool,
     pub(crate) kind: HeaderKind,
+    /// `true` when the directive may appear more than once (`collection:` for
+    /// helper collections, `labels:` for label classes). The editors show one
+    /// row per occurrence and offer an "add another" entry; every other
+    /// directive has exactly one row.
+    pub(crate) repeatable: bool,
 }
 
 /// How one header directive is edited.
@@ -1315,34 +1323,39 @@ impl HeaderKind {
 }
 
 /// Every header directive the editors offer, in the order they are shown.
-pub(crate) fn header_specs() -> [HeaderSpec; 6] {
+pub(crate) fn header_specs() -> [HeaderSpec; 7] {
     [
         HeaderSpec {
             key: "collection",
             always_shown: true,
             required: true,
             kind: HeaderKind::Collection,
+            repeatable: true,
         },
         HeaderSpec {
             key: "output",
+            repeatable: false,
             always_shown: true,
             required: false,
             kind: HeaderKind::Format,
         },
         HeaderSpec {
             key: "environment",
+            repeatable: false,
             always_shown: false,
             required: false,
             kind: HeaderKind::Environment,
         },
         HeaderSpec {
             key: "root",
+            repeatable: false,
             always_shown: false,
             required: false,
             kind: HeaderKind::Folder,
         },
         HeaderSpec {
             key: "baseline",
+            repeatable: false,
             always_shown: false,
             required: false,
             kind: HeaderKind::File,
@@ -1352,6 +1365,15 @@ pub(crate) fn header_specs() -> [HeaderSpec; 6] {
             always_shown: false,
             required: false,
             kind: HeaderKind::Text,
+            repeatable: false,
+        },
+        // Ground truth's vocabulary: one line per label class, so it repeats.
+        HeaderSpec {
+            key: "labels",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Text,
+            repeatable: true,
         },
     ]
 }
@@ -1365,6 +1387,7 @@ pub(crate) fn header_help(key: &str, s: &Strings) -> &'static str {
         "environment" => s.chip_help_hdr_environment,
         "root" => s.chip_help_hdr_root,
         "baseline" => s.chip_help_hdr_baseline,
+        "labels" => s.chip_help_hdr_labels,
         _ => s.chip_help_hdr_columns,
     }
 }
@@ -1471,6 +1494,7 @@ pub(crate) fn add_with_field(
             query: query.to_string(),
             stats,
             image: None,
+            truth: None,
         });
         Some(with.len() - 1)
     } else {
@@ -1497,6 +1521,7 @@ pub(crate) fn set_with_field(
             // The form doesn't edit the `IMAGE(…)` hint, so it is left alone
             // rather than being cleared by an unrelated rename.
             image: _,
+            truth: _,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
@@ -1751,6 +1776,7 @@ impl CarriedMod {
                         name: name.clone(),
                         stats: Vec::new(),
                         image: None,
+                        truth: None,
                     });
                 }
                 _ => {}

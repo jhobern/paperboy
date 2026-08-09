@@ -8,9 +8,9 @@
 //! ([`ReportResult::no_match_marker`]), so what a run writes matches exactly
 //! what the TUI grid shows (both read the same columns).
 
-use super::compare::{MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN};
+use super::compare::{CORRECT_COLUMN, MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN};
 use super::flow::Header;
-use super::model::{OutputColumn, ReportResult};
+use super::model::{OutputColumn, ReportResult, Verdict};
 
 /// Serializes a run result to a concrete output format (bytes, so a binary
 /// format like `.xlsx` fits the same interface). Fallible because a binary
@@ -246,7 +246,7 @@ impl ReportWriter for HtmlWriter {
             out.push_str("<tr>");
             for c in &columns {
                 let value = c.value(row, &result.no_match_marker);
-                let class = match cell_tint(&c.header, &value) {
+                let class = match run_cell_tint(result, r, &c.header, &value) {
                     Some(Tint::Green) => " class=\"pass\"",
                     Some(Tint::Red) => " class=\"fail\"",
                     Some(Tint::Amber) => " class=\"warn\"",
@@ -438,7 +438,7 @@ impl ReportWriter for XlsxWriter {
             }
             for (col, c) in columns.iter().enumerate() {
                 let value = c.value(row, &result.no_match_marker);
-                let fmt = match cell_tint(&c.header, &value) {
+                let fmt = match run_cell_tint(result, r, &c.header, &value) {
                     Some(Tint::Green) => &green,
                     Some(Tint::Red) => &red,
                     Some(Tint::Amber) => &amber,
@@ -689,6 +689,36 @@ fn html_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<us
         .into_iter()
         .map(|w| w.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
         .collect()
+}
+
+/// The colour tint for a cell of a *run*, which is [`cell_tint`] with ground
+/// truth layered over it.
+///
+/// A ground-truthed cell is tinted by whether it is **right**, not by what it
+/// says: an engine that answers `fail` where the truth is `fail` is a green
+/// cell, even though `cell_tint`'s word list would call it red. That is the
+/// whole point of declaring a truth — without this the colours would go on
+/// reporting the sentiment of the word rather than the quality of the answer.
+///
+/// `Untested` is left plain, deliberately: a row nobody has labelled must not
+/// borrow the appearance of one that passed.
+fn run_cell_tint(result: &ReportResult, r: usize, header: &str, value: &str) -> Option<Tint> {
+    if let Some(v) = result.verdicts.get(&(r, header.to_string())) {
+        return match v {
+            Verdict::Correct => Some(Tint::Green),
+            Verdict::Incorrect => Some(Tint::Red),
+            Verdict::Untested => None,
+        };
+    }
+    // The roll-up column holds the verdict as text, so it tints the same way.
+    if header == CORRECT_COLUMN {
+        return match value.trim() {
+            v if v == Verdict::Correct.as_str() => Some(Tint::Green),
+            v if v == Verdict::Incorrect.as_str() => Some(Tint::Red),
+            _ => None,
+        };
+    }
+    cell_tint(header, value)
 }
 
 /// The colour tint for a cell, or `None` to leave it plain. Recognises the
@@ -1146,6 +1176,7 @@ mod tests {
             sources: vec!["Time".into()],
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         let res = ReportResult {
             no_match_marker: "-".into(),
@@ -1482,6 +1513,53 @@ mod tests {
         // And the workbook still writes, with one picture rather than two.
         let bytes = XlsxWriter.write(&res, &header).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("xl/media/image2"));
+    }
+
+    /// A ground-truthed cell is coloured by whether it is right, overriding the
+    /// word-sentiment heuristic: an engine that correctly answers `fail` is a
+    /// green cell, and one that wrongly answers `pass` is a red one.
+    #[test]
+    fn a_verdict_tints_a_cell_by_correctness_not_by_its_wording() {
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Verdict", "fail"), ("Correct", "correct")]),
+            row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            row(&[("Verdict", "pass"), ("Correct", "untested")]),
+        ];
+        res.column_order = vec!["Correct".to_string(), "Verdict".to_string()];
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.verdicts
+            .insert((2, "Verdict".into()), Verdict::Untested);
+
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Verdict", "fail"),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Verdict", "pass"),
+            Some(Tint::Red)
+        ));
+        assert!(
+            run_cell_tint(&res, 2, "Verdict", "pass").is_none(),
+            "an untested row never borrows the look of a passing one"
+        );
+        // The roll-up column tints from its own text.
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Correct", "correct"),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Correct", "incorrect"),
+            Some(Tint::Red)
+        ));
+        // A report with no ground truth is tinted exactly as before.
+        let plain = ReportResult::default();
+        assert!(matches!(
+            run_cell_tint(&plain, 0, "Verdict", "fail"),
+            Some(Tint::Red)
+        ));
     }
 
     #[test]

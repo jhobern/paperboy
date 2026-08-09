@@ -12,6 +12,49 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **PaperTrail reports can be scored against a ground truth (`TRUTH`).** A
+  column can name the answer it *should* have given, and the report says whether
+  it was right:
+
+  ```
+  # labels: Pass = pass, ok, low risk, real
+  # labels: Fail = fail, reject, high risk, fake
+
+  FOR ROW IN TUPLES FROM "labels.csv"
+      REPORT REQUEST classify AS c WITH
+          Verdict: jsonpath "$.decision" TRUTH "{{ expected }}"
+      END
+  END
+  ```
+
+  The clause goes wherever `STATISTICS(…)` and `IMAGE(…)` go — on a
+  `REPORT … AS …`, on a computed column or on a `WITH` field — and the three may
+  be written in any order. The template is interpolated **per row**, because the
+  label almost always arrives as a loop binding: a named field of a
+  `TUPLES FROM "labels.csv"` manifest, or the folder name a `FOLDERS` loop is
+  standing in. Nothing new has to be read from disk — the producers that already
+  bring in the files bring in their labels too.
+
+  The optional, repeatable `# labels:` setting declares the vocabulary once, so a
+  truth file that says `real` and an engine that answers `Low Risk` match without
+  a line of translation in the flow. Without it, values still compare as
+  themselves, ignoring case and surrounding space.
+
+  Each scored cell is tinted by whether it is **right** rather than by what it
+  says — an engine that correctly answers `fail` is a green cell — and a
+  reserved `Correct` column (`correct` / `incorrect` / `untested`) summarises
+  each row for CSV, which has no colour, and for sorting in a spreadsheet.
+
+  A ground truth is **data, not an assertion**: a mismatch never fails a run,
+  never sets an exit code and never emits a diagnostic — `[Asserts]` is where a
+  run says something went wrong. A row whose label is missing or blank reads
+  `untested` and is never scored as a pass, so the figures can't be inflated by
+  exactly the rows nobody has checked.
+
+  Both editors support it: a **Ground truth** row in the `WITH` field form, and
+  one settings row per declared label class with an "add label class" entry
+  beside "add helper collection".
+
 - **PaperTrail columns can hold pictures (`IMAGE`).** A column whose value is a
   picture *source* — an image URL the response handed back, a path on disk, a
   `data:` URI or a bare base64 blob — can be marked `IMAGE`, and every export
@@ -123,6 +166,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   carried no heading to explain what the directives above the report were.
 
 ### Fixed
+
+- `FOR ROW IN TUPLES FROM "manifest.csv"` — the documented way to read a
+  manifest's columns by name — no longer reports a destructuring mismatch. It
+  put one error on the run for every row of the manifest, which was the loudest
+  possible complaint about the usage the cookbook recommends. A pattern that
+  really does destructure is still checked.
 
 - **A commented-out column inside a `WITH` block is no longer destroyed by the
   editors.** Comments survived everywhere else in a report, but a `WITH` block

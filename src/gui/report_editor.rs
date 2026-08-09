@@ -4882,7 +4882,14 @@ fn settings_panel(
             .collect();
         // The add menu is always drawn now: a helper collection can always be
         // added, since `collection:` repeats and so is never "already set".
-        header_add_menu(ui, s, &missing, value_of("collection").len().max(1), acts);
+        header_add_menu(
+            ui,
+            s,
+            &missing,
+            value_of("collection").len().max(1),
+            value_of("labels").len(),
+            acts,
+        );
     });
 }
 
@@ -4912,6 +4919,7 @@ fn header_add_menu(
     s: &crate::i18n::Strings,
     missing: &[&HeaderSpec],
     next_collection: usize,
+    next_label: usize,
     acts: &mut Vec<Act>,
 ) {
     let label = format!("{}  {}", super::icons::PLUS, s.report_add_setting);
@@ -4943,6 +4951,22 @@ fn header_add_menu(
             acts.push(Act::SetHeader {
                 key: "collection",
                 occurrence: next_collection,
+                value: Some(HEADER_PLACEHOLDER.to_string()),
+            });
+            ui.close();
+        }
+        // Likewise a further label class, once the first has been added: the
+        // vocabulary a report scores against is nearly always at least two
+        // classes, and the one-shot entry above is gone after the first.
+        if next_label > 0
+            && ui
+                .button(s.report_add_label_class)
+                .on_hover_text(edit::header_help("labels", s))
+                .clicked()
+        {
+            acts.push(Act::SetHeader {
+                key: "labels",
+                occurrence: next_label,
                 value: Some(HEADER_PLACEHOLDER.to_string()),
             });
             ui.close();
@@ -7604,11 +7628,11 @@ mod tests {
 
     #[test]
     fn the_settings_strip_covers_every_header_directive_the_language_has() {
-        // The parser exposes exactly these six directives; if one is added there
+        // The parser exposes exactly these directives; if one is added there
         // and not here, the GUI would quietly be unable to set it.
         let flow = crate::report::parse_flow(
             "# collection: c.hurl\n# output: o.csv\n# environment: dev\n# root: /r\n\
-             # baseline: b.baseline\n# columns: a,b\nREQUEST login\n",
+             # baseline: b.baseline\n# columns: a,b\n# labels: Pass = ok\nREQUEST login\n",
         )
         .expect("fixture parses");
         let specs = header_specs();
@@ -7727,7 +7751,7 @@ mod tests {
 
         let out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut acts = Vec::new();
-            header_add_menu(ui, &s, &missing, 1, &mut acts);
+            header_add_menu(ui, &s, &missing, 1, 0, &mut acts);
         });
         let painted: String = out
             .shapes
@@ -9701,6 +9725,7 @@ mod results_render_tests {
                 sources: vec![h.to_string()],
                 stats: Vec::new(),
                 image: None,
+                truth: None,
             })
             .collect();
         let mut result = ReportResult::default();

@@ -60,6 +60,8 @@ pub struct VarsForm {
     /// An `IMAGE(…)` render hint the statement already carries. The form
     /// doesn't expose it, but must not drop it when writing back.
     image: Option<crate::report::flow::ImageSpec>,
+    /// A `TRUTH "…"` clause, preserved for the same reason as [`Self::image`].
+    truth: Option<String>,
 }
 
 impl VarsForm {
@@ -96,6 +98,7 @@ impl VarsForm {
                     .map(|(k, _)| *k)
                     .collect(),
                 image: self.image,
+                truth: self.truth.clone(),
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -111,6 +114,8 @@ pub struct ComputedForm {
     stats: Vec<(StatKind, bool)>,
     /// Preserved verbatim, as in [`VarsForm`].
     image: Option<crate::report::flow::ImageSpec>,
+    /// Preserved verbatim, as in [`VarsForm`].
+    truth: Option<String>,
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -388,15 +393,24 @@ fn build_vars(
     path: &[usize],
     node: &FlowNode,
 ) -> VarsForm {
-    let (chosen, alias, stats, image) = match node {
-        FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), String::new(), Vec::new(), None),
+    let (chosen, alias, stats, image, truth) = match node {
+        FlowNode::Report(ReportStmt::Vars(vars)) => {
+            (vars.clone(), String::new(), Vec::new(), None, None)
+        }
         FlowNode::Report(ReportStmt::VarAs {
             var,
             name,
             stats,
             image,
-        }) => (vec![var.clone()], name.clone(), stats.clone(), *image),
-        _ => (Vec::new(), String::new(), Vec::new(), None),
+            truth,
+        }) => (
+            vec![var.clone()],
+            name.clone(),
+            stats.clone(),
+            *image,
+            truth.clone(),
+        ),
+        _ => (Vec::new(), String::new(), Vec::new(), None, None),
     };
     let entries = context::resolve_bound_collection(&app.session.collections, flow, report_path)
         .map(|ci| app.session.collections[ci].entries.as_slice())
@@ -423,6 +437,7 @@ fn build_vars(
             .map(|k| (*k, stats.contains(k)))
             .collect(),
         image,
+        truth,
     }
 }
 
@@ -491,11 +506,13 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
             name,
             stats,
             image,
+            truth,
         }) => Wizard::Computed(ComputedForm {
             path: path.to_vec(),
             template: template.clone(),
             alias: name.clone(),
             image: *image,
+            truth: truth.clone(),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -1542,6 +1559,7 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                     .map(|(k, _)| *k)
                     .collect(),
                 image: f.image,
+                truth: f.truth.clone(),
             });
             ed.wizard_apply(app, &path, node);
         }
@@ -1665,6 +1683,7 @@ mod tests {
             alias: "Plan".into(),
             stats: StatKind::CHOOSABLE.iter().map(|k| (*k, false)).collect(),
             image: None,
+            truth: None,
         };
         assert!(
             matches!(
@@ -1692,6 +1711,7 @@ mod tests {
             alias: String::new(),
             stats: Vec::new(),
             image: None,
+            truth: None,
         };
         assert!(
             matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["RUNTIME_ONLY".to_string()]),

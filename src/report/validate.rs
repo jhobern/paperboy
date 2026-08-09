@@ -169,6 +169,31 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
             }
         }
     }
+    // Ground truth: the `# labels:` vocabulary and the `TRUTH` clauses that use
+    // it. None of these block a run — a report that scores nothing still runs
+    // and still produces its table — but each one is a silent no-op otherwise,
+    // and a silently unscored column is exactly what ground truth exists to
+    // stop happening.
+    let labels = super::labels::LabelMap::parse(&flow.header.labels());
+    for line in labels.malformed() {
+        diags.push(Diagnostic::warning(fill(s.diag_labels_malformed, &[line])));
+    }
+    for (synonym, kept, asked) in labels.conflicts() {
+        diags.push(Diagnostic::warning(fill(
+            s.diag_labels_conflict,
+            &[synonym, kept, asked, kept],
+        )));
+    }
+    let images = flow.column_images();
+    for (header, template) in flow.column_truths() {
+        if template.trim().is_empty() {
+            diags.push(Diagnostic::warning(fill(s.diag_truth_empty, &[&header])));
+        }
+        if images.contains_key(&header) {
+            diags.push(Diagnostic::warning(fill(s.diag_truth_on_image, &[&header])));
+        }
+    }
+
     // An optional `# environment:` names a single already-loaded environment to
     // use as the report's base variable layer (the plain, no-comparison run).
     // Like an `ENVS` loop, the environment must be loaded — flag it when it
@@ -1201,6 +1226,48 @@ mod tests {
                 "format {fmt} should be accepted"
             );
         }
+    }
+
+    /// Ground truth never blocks a run — a report that scores nothing still
+    /// produces its table — but every silent no-op is pointed out.
+    #[test]
+    fn ground_truth_mistakes_warn_without_blocking_the_run() {
+        let t = titles();
+        let warn = |src: &str| -> Vec<String> {
+            diags_for(src, Some(&t), None)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning)
+                .map(|d| d.message)
+                .collect()
+        };
+        let said = |ws: &[String], needle: &str| {
+            ws.iter()
+                .any(|m| m.to_lowercase().contains(&needle.to_lowercase()))
+        };
+
+        let ws = warn("# collection: ./c.hurl\n# labels: nonsense\nREQUEST Oauth\n");
+        assert!(said(&ws, "declares nothing"), "{ws:?}");
+
+        let ws = warn(
+            "# collection: ./c.hurl\n# labels: Pass = ok, maybe\n# labels: Fail = maybe\nREQUEST Oauth\n",
+        );
+        assert!(said(&ws, "claimed by both"), "{ws:?}");
+
+        let ws = warn("# collection: ./c.hurl\nREPORT \"a\" AS V TRUTH \"\"\n");
+        assert!(said(&ws, "empty ground truth"), "{ws:?}");
+
+        let ws =
+            warn("# collection: ./c.hurl\nREPORT \"a\" AS V IMAGE(HEIGHT 40) TRUTH \"{{ e }}\"\n");
+        assert!(said(&ws, "shown as a picture"), "{ws:?}");
+
+        // None of them is an error, and a well-formed one says nothing at all.
+        let src = "# collection: ./c.hurl\n# labels: Pass = ok, real\nREPORT \"a\" AS V TRUTH \"{{ e }}\"\n";
+        assert!(errors(src, Some(&t), None).is_empty());
+        let ws = warn(src);
+        assert!(
+            !said(&ws, "ground truth") && !said(&ws, "label"),
+            "a correct ground truth is silent: {ws:?}"
+        );
     }
 
     #[test]
