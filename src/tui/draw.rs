@@ -3421,6 +3421,46 @@ pub(crate) fn draw_footer(
     );
 }
 
+/// Draw a browser's file list into `area`.
+///
+/// Normally this is just the `ratatui_explorer` widget, but that widget calls
+/// `FileExplorer::current()` — an unguarded `files[selected]` — while
+/// rendering, so it **panics on an empty list**. Since a type-to-filter query
+/// now narrows the `../` row away like any other, "matched nothing" is a state
+/// the user can reach by typing, and it has to draw. The placeholder rebuilds
+/// the explorer's own frame (accent border, panel fill, cwd on top, the action
+/// label and keys along the bottom) so only the rows change: the keys that get
+/// you out of an empty list are exactly the ones you need to still be able to
+/// read.
+fn draw_browser_list(
+    f: &mut Frame,
+    app: &TuiApp,
+    ex: &ratatui_explorer::FileExplorer,
+    area: Rect,
+    s: &Strings,
+    th: &Theme,
+) {
+    if !ex.files().is_empty() {
+        ex.widget().render_ref(area, f.buffer_mut());
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.accent))
+        .style(Style::default().bg(th.panel))
+        .title(Line::from(ex.cwd().display().to_string()))
+        .title_bottom(Line::from(app.browser_hint_line.clone()));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            s.browser_no_matches,
+            Style::default().fg(th.dim).add_modifier(Modifier::ITALIC),
+        )))
+        .block(block)
+        .style(Style::default().bg(th.panel)),
+        area,
+    );
+}
+
 /// Render the report-export format strip (`CSV JSON HTML XLSX`) into `row`,
 /// highlighting the format that matches `filename`'s extension (an unknown or
 /// absent extension highlights CSV, the writer's fallback). Cycled with ↑/↓
@@ -4406,7 +4446,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 }
                 heights.push(Constraint::Length(3));
                 let rows = Layout::vertical(heights).split(area);
-                ex.widget().render_ref(rows[0], f.buffer_mut());
+                draw_browser_list(f, app, ex, rows[0], s, th);
                 let mut next = 1;
                 if show_query {
                     draw_browser_filter_strip(f, rows[next], &app.browser_query, s, th);
@@ -4453,11 +4493,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // what) rather than mysteriously short.
                 let rows =
                     Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-                ex.widget().render_ref(rows[0], f.buffer_mut());
+                draw_browser_list(f, app, ex, rows[0], s, th);
                 register_browser_hits(app, ex, rows[0]);
                 draw_browser_filter_strip(f, rows[1], &app.browser_query, s, th);
             } else {
-                ex.widget().render_ref(area, f.buffer_mut());
+                draw_browser_list(f, app, ex, area, s, th);
                 register_browser_hits(app, ex, area);
             }
         }

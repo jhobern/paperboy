@@ -339,6 +339,7 @@ strings! {
     browser_foldername_label => "Folder name", "Nom du dossier", "Mappenavn";
     browser_name_hint => "Enter save · Esc back to list", "Entrée enregistrer · Échap retour à la liste", "Enter gem · Esc tilbage til listen";
     browser_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    browser_no_matches => "No matching files", "Aucun fichier correspondant", "Ingen matchende filer";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
     git_workspace_storage_q => "Workspace downloaded. Keep it in a temporary folder, or save it to a permanent location now?", "Workspace téléchargé. Le garder dans un dossier temporaire, ou l'enregistrer dans un emplacement permanent maintenant ?", "Workspace downloadet. Behold den i en midlertidig mappe, eller gem den på en permanent placering nu?";

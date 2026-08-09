@@ -96,6 +96,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The `../` row ignored the file browser's filter.** Typing to narrow a picker
+  left the parent entry pinned to the top of the results — the one row that
+  never matched what you'd asked for. It is now filtered on the name it shows,
+  so `..` or `.` keeps it and anything else drops it. A query that matches
+  nothing at all draws a "No matching files" box that keeps the folder name and
+  the key hints, and Backspace, Esc and ← still get you out of it.
+
 - **Typing in a report block and pressing Run threw the typing away.** The
   header's buttons acted before the blocks below them were redrawn, so an
   inline field that had not yet been committed — it commits when it loses

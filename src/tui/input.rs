@@ -4211,6 +4211,7 @@ impl TuiApp {
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
+        self.browser_hint_line = hint.clone();
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -5249,7 +5250,14 @@ impl TuiApp {
         }
         let _ = ex.set_filter_map(move |file| {
             if file.is_dir && file.name == "../" {
-                return Some(file);
+                // The way out is narrowed by the query like everything else,
+                // but matched on what it is *shown* as: its path is the parent
+                // directory, whose real name has nothing to do with the ".."
+                // being typed at. Hiding it strands nobody — Left still
+                // ascends, Backspace trims the query and Esc clears it — and
+                // leaving it pinned to the top of a filtered list made it the
+                // one row that never answered the question you asked.
+                return (query.is_empty() || "../".contains(&query)).then_some(file);
             }
             if !file.is_dir && filter_on && !browser_keep_file(action, &file) {
                 return None;
@@ -5420,6 +5428,13 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                // A query can now match nothing at all — `../` no longer
+                // survives every filter — and `current()` indexes the list, so
+                // there is nothing here to open.
+                if ex.files().is_empty() {
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
                 let on_parent_row = ex.cwd().parent() == Some(ex.current().path.as_path());
                 if ex.current().is_dir && on_parent_row {
                     // The "../" row goes UP, which isn't a descent. Enter
@@ -5539,8 +5554,13 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
             _ => {
-                // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …).
-                let _ = ex.handle(&Event::Key(key));
+                // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …). Skipped
+                // on an empty list: the explorer's own handlers index it
+                // unguarded (`% files.len()`, `files.len() - 1`), so a Down on
+                // a filter that matched nothing would panic.
+                if !ex.files().is_empty() {
+                    let _ = ex.handle(&Event::Key(key));
+                }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
         }

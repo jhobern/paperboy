@@ -1248,6 +1248,13 @@ pub struct TuiApp {
     /// of the extension filter. Backspace trims it, Esc clears it (then cancels
     /// on a second press), and it resets whenever the browser opens. Runtime-only.
     pub(crate) browser_query: String,
+    /// The `label  ·  keys` line drawn along the bottom border of the file
+    /// browser. Built once in `open_browser` (where the action's label and hint
+    /// are chosen) and baked into the explorer's own theme — kept here as well
+    /// so the "no matches" placeholder, which replaces the explorer widget
+    /// entirely when a filter empties the list, can draw the same frame instead
+    /// of a bare box that loses the keys just when they're most needed.
+    pub(crate) browser_hint_line: String,
     /// Which pane focus returns to when the New/Edit Request wizard closes
     /// (whether saved or cancelled). Opening the wizard temporarily moves
     /// focus onto the Main panel so the request preview shows behind it, but
@@ -1369,6 +1376,7 @@ impl Default for TuiApp {
             browser_name_focused: false,
             browser_filter_on: true,
             browser_query: String::new(),
+            browser_hint_line: String::new(),
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
             workspace_redownload_rx: None,

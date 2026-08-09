@@ -9186,10 +9186,12 @@ fn load_browser_type_to_filter_narrows_by_name() {
         !shown.iter().any(|n| n == "sub/"),
         "non-matching folder hidden: {shown:?}"
     );
-    // …but never the way back out.
+    // …and "au" doesn't match "../" either, so the way out goes too rather
+    // than sitting at the top of the list as the one row you didn't ask for.
+    // Left and Esc still get you out — pinned by the tests below.
     assert!(
-        shown.iter().any(|n| n == "../"),
-        "the parent entry is always reachable: {shown:?}"
+        !shown.iter().any(|n| n == "../"),
+        "the parent entry is filtered like everything else: {shown:?}"
     );
 
     // Backspace widens the query back to "a": now all three files match.
@@ -25156,8 +25158,8 @@ fn folder_pickers_filter_by_typing_too() {
             "non-matching folder hidden for {action:?}: {shown:?}"
         );
         assert!(
-            shown.iter().any(|n| n == "../"),
-            "the way out survives the filter for {action:?}: {shown:?}"
+            !shown.iter().any(|n| n == "../"),
+            "the parent entry is filtered too for {action:?}: {shown:?}"
         );
     }
 }
@@ -25334,4 +25336,215 @@ fn the_filter_strip_is_drawn_in_every_picker_shape() {
             "{action:?} lost the list:\n{text}"
         );
     }
+}
+
+/// The way out is filtered on what it is *displayed* as. A `../` row's `path`
+/// is the parent directory, so matching on the path would keep it for a query
+/// like "home" — a name the user can't even see on that row — and drop it for
+/// "..", the one thing it plainly reads as.
+#[test]
+fn the_parent_row_is_matched_on_the_name_it_shows() {
+    let dir = temp_dir("dotdotmatch");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    // "." is part of "../", so the row stays.
+    press(&mut app, KeyCode::Char('.'));
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "a matching query keeps the parent row: {:?}",
+        names(&app)
+    );
+    press(&mut app, KeyCode::Char('.'));
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "\"..\" matches too: {:?}",
+        names(&app)
+    );
+
+    // The parent of a temp dir is somewhere under /tmp, but no part of that
+    // real path may be used to keep the row alive.
+    let parent_name = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .expect("temp dir has a named parent");
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    for c in parent_name.chars().take(4) {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(
+        !names(&app).iter().any(|n| n == "../"),
+        "the parent's real name must not match the \"../\" row: {:?}",
+        names(&app)
+    );
+}
+
+/// Filtering the parent row means a query can now match *nothing*, leaving the
+/// list empty. `ratatui_explorer` indexes that list unguarded — `current()` is
+/// `files[selected]`, `Down` is `% files.len()`, `End` is `len() - 1` — so
+/// every key that used to be safe because `../` was always there has to be
+/// proven safe now that it isn't.
+#[test]
+fn an_empty_filtered_list_survives_every_key() {
+    let dir = temp_dir("emptyfilter");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    std::fs::write(dir.join("beta.hurl"), "GET https://x\n").unwrap();
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenCollection,
+        FileAction::SaveWorkspaceChooseFolder,
+        FileAction::PickFormFile(0),
+    ] {
+        let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+        app.open_browser(action);
+        for c in "zzq".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let empty = match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().is_empty(),
+            _ => panic!("browser not open for {action:?}"),
+        };
+        assert!(empty, "\"zzq\" should match nothing for {action:?}");
+
+        // None of these may panic, and none may close the picker.
+        for key in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::End,
+            KeyCode::Home,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Enter,
+            KeyCode::Right,
+        ] {
+            press(&mut app, key);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Browser(..))),
+                "{key:?} closed the picker for {action:?}"
+            );
+        }
+
+        // It must also draw without panicking.
+        {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        }
+    }
+}
+
+/// …and the escape routes out of an empty list all still work, which is the
+/// safety property the old "`../` is exempt from the filter" rule used to
+/// guarantee for free.
+#[test]
+fn an_empty_filtered_list_can_still_be_escaped() {
+    let dir = temp_dir("emptyescape");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+    let filter_to_nothing = || {
+        let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+        app.open_browser(FileAction::PickReportNodeFolder);
+        for c in "zzq".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app
+    };
+
+    // Backspace trims the query until things match again.
+    let mut app = filter_to_nothing();
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    assert_eq!(app.browser_query, "");
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "the parent row comes back once the query is gone: {:?}",
+        names(&app)
+    );
+
+    // Esc clears the query in one go, without closing the picker.
+    let mut app = filter_to_nothing();
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.browser_query, "");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Browser(..))),
+        "the first Esc only clears the query"
+    );
+    assert!(names(&app).iter().any(|n| n == "alpha/"));
+
+    // Left still climbs out, even with nothing on screen to climb from.
+    let mut app = filter_to_nothing();
+    press(&mut app, KeyCode::Left);
+    let cwd = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex.cwd().to_path_buf(),
+        _ => panic!("browser not open"),
+    };
+    assert_eq!(
+        Some(cwd.as_path()),
+        dir.parent(),
+        "Left ascends out of an empty filtered list"
+    );
+    assert_eq!(app.browser_query, "", "ascending clears the query");
+}
+
+/// An empty filtered list draws a "no matches" placeholder that keeps the
+/// picker's own frame — the folder on top and the key hints along the bottom.
+/// Those hints are the way out of the state, so losing them here would be the
+/// worst possible moment for the box to go blank.
+#[test]
+fn an_empty_filtered_list_still_shows_the_folder_and_the_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = temp_dir("emptydraw");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    for c in "zzq".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let mut term = Terminal::new(TestBackend::new(110, 26)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains(s.browser_no_matches),
+        "the placeholder explains why the box is empty:\n{text}"
+    );
+    // The bottom border shows the action label and as much of the key hint as
+    // fits the box, so match the start of each rather than the whole line.
+    assert!(
+        text.contains(s.report_node_folder_pick.trim_end_matches('…')),
+        "the picker still names itself:\n{text}"
+    );
+    let hint_head: String = s.browser_hint_node_folder.chars().take(20).collect();
+    assert!(
+        text.contains(&hint_head),
+        "the keys that get you out are still on the border:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{}zzq", s.browser_filter_label)),
+        "the filter strip still names the query:\n{text}"
+    );
+    // No stale rows left behind from before the query narrowed things away.
+    assert!(
+        !text.contains("alpha/"),
+        "the filtered-out rows are gone:\n{text}"
+    );
 }
