@@ -137,14 +137,23 @@ pub fn apply(result: &mut ReportResult, baseline: &Baseline) {
 
     // Diff each produced row against its snapshot sibling.
     let mut matched: HashSet<Vec<String>> = HashSet::new();
-    for row in &mut result.rows {
+    let mut baseline_rows: HashMap<usize, ReportRow> = HashMap::new();
+    for (i, row) in result.rows.iter_mut().enumerate() {
         let base = base_by_key.get(row.key.as_slice());
         if base.is_some() {
             matched.insert(row.key.clone());
         }
+        // As in `compare::apply`: a ground-truthed report keeps the snapshot
+        // row so the `Trend` can score what the baseline itself answered.
+        if result.track_baseline
+            && let Some(base) = base
+        {
+            baseline_rows.insert(i, (*base).clone());
+        }
         let verdict = compare::compute_result(base, row, &excluded);
         row.cells.insert(RESULT_COLUMN.to_string(), verdict);
     }
+    result.baseline_rows.extend(baseline_rows);
 
     // A snapshot key the current run never produced still emits a row (its
     // stored values), flagged — in snapshot order, deduped by key.

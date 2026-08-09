@@ -69,6 +69,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   axis entry rather than being dropped, so the matrix always adds up to the
   accuracy printed beside it.
 
+- **A comparison says which way each row moved (`Trend`).** This is the feature
+  the ground truth was for: *a change towards the truth is good, a change away
+  from it is bad.* A report that has both a `TRUTH` column and a comparison
+  (`BASELINE`/`COMPARISON` roles or a `# baseline:` snapshot) grows a reserved
+  `Trend` column reading `unchanged`, `fixed`, `regressed` or `still wrong`.
+
+  It is additive: the existing `Result` column still holds the structural diff,
+  so a row is routinely `Result: changed` *and* `Trend: fixed` — which is the
+  useful reading, not a contradiction. Two rows that changed identically as far
+  as `Result` is concerned are told apart by `Trend` alone. The row roll-up
+  favours the bad news (one regressed column makes the row a regression), and
+  `still wrong` is deliberately distinct from `regressed`: it is failing, but it
+  is not *new*.
+
+  Reports with no truth, or no comparison, are unchanged — no column appears.
+
 - **A `SHOW(…)` field can carry its own `STATISTICS(…)`.** Writing
   `SHOW(Time STATISTICS(MEAN, MAX), Status)` attaches summary rows to a column
   where it is named, on both `REPORT REQUEST … SHOW(…)` and

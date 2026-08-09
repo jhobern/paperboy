@@ -32,6 +32,12 @@ use super::model::{ReportResult, ReportRow};
 /// comparison run; rename it in `columns:` like any column (`Result AS …`).
 pub const RESULT_COLUMN: &str = "Result";
 
+/// The reserved column holding a row's [`Trend`](crate::report::model::Trend):
+/// how its ground-truth verdict moved relative to the baseline. Inserted by the
+/// finalize phase only for a report that has *both* a truth and a comparison —
+/// there is nothing to trend against otherwise.
+pub const TREND_COLUMN: &str = "Trend";
+
 /// The reserved column holding a row's ground-truth verdict (see
 /// [`crate::report::model::Verdict`]), inserted by the run's finalize phase for
 /// a report that declares any `TRUTH "…"` column.
@@ -209,6 +215,15 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
                 let verdict = compute_result(baseline, &cand, &excluded);
                 cand.cells.insert(RESULT_COLUMN.to_string(), verdict);
+                // Keep the baseline row alive past this collapse when the
+                // report scores a ground truth: the `Trend` needs to know
+                // whether the baseline's own answer was right, and this is the
+                // last point at which that row exists.
+                if result.track_baseline
+                    && let Some(base) = baseline
+                {
+                    result.baseline_rows.insert(out.len(), (*base).clone());
+                }
                 // Copy baseline cells for each SHOW field, but only for aliases
                 // where the candidate row already emits that field.  This avoids
                 // inventing columns for requests that don't report the field at all.

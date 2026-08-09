@@ -8,9 +8,11 @@
 //! ([`ReportResult::no_match_marker`]), so what a run writes matches exactly
 //! what the TUI grid shows (both read the same columns).
 
-use super::compare::{CORRECT_COLUMN, MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN};
+use super::compare::{
+    CORRECT_COLUMN, MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN, TREND_COLUMN,
+};
 use super::flow::Header;
-use super::model::{OutputColumn, ReportResult, Verdict};
+use super::model::{OutputColumn, ReportResult, Trend, Verdict};
 
 /// Serializes a run result to a concrete output format (bytes, so a binary
 /// format like `.xlsx` fits the same interface). Fallible because a binary
@@ -985,6 +987,21 @@ fn run_cell_tint(result: &ReportResult, r: usize, header: &str, value: &str) -> 
             Verdict::Correct => Some(Tint::Green),
             Verdict::Incorrect => Some(Tint::Red),
             Verdict::Untested => None,
+        };
+    }
+    // The `Trend` column is tinted by the *direction*, which is a different
+    // question from the one the cells answer: a scored cell is already coloured
+    // by whether *this* run got it right, so trending it again would only ever
+    // repeat that colour (a `fixed` cell is correct, a `regressed` one is not).
+    // `unchanged` is left plain -- "still right" is the expected case, and
+    // colouring it would drown the two rows a reader is actually looking for.
+    if header == TREND_COLUMN {
+        return match value.trim() {
+            v if v == Trend::Fixed.as_str() => Some(Tint::Green),
+            v if v == Trend::Regressed.as_str() || v == Trend::StillWrong.as_str() => {
+                Some(Tint::Red)
+            }
+            _ => None,
         };
     }
     // The roll-up column holds the verdict as text, so it tints the same way.
@@ -1964,6 +1981,54 @@ mod tests {
             run_cell_tint(&plain, 0, "Verdict", "fail"),
             Some(Tint::Red)
         ));
+    }
+
+    /// The `Trend` column is tinted by the direction of travel, and a scored
+    /// cell keeps the colour of its *own* verdict: a comparison must not repaint
+    /// a correct answer just because it was also correct last time.
+    #[test]
+    fn the_trend_column_tints_by_direction_and_leaves_scored_cells_alone() {
+        use crate::report::model::Trend;
+
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Verdict", "fail"), ("Trend", "fixed")]),
+            row(&[("Verdict", "pass"), ("Trend", "regressed")]),
+            row(&[("Verdict", "fail"), ("Trend", "unchanged")]),
+        ];
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.verdicts.insert((2, "Verdict".into()), Verdict::Correct);
+        res.trends.insert((0, "Verdict".into()), Trend::Fixed);
+        res.trends.insert((1, "Verdict".into()), Trend::Regressed);
+        res.trends.insert((2, "Verdict".into()), Trend::Unchanged);
+
+        assert!(
+            matches!(run_cell_tint(&res, 2, "Verdict", "fail"), Some(Tint::Green)),
+            "an unchanged-but-correct answer stays green, exactly as it is \
+             without a comparison"
+        );
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Trend", Trend::Fixed.as_str()),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Trend", Trend::Regressed.as_str()),
+            Some(Tint::Red)
+        ));
+        assert!(
+            matches!(
+                run_cell_tint(&res, 1, "Trend", Trend::StillWrong.as_str()),
+                Some(Tint::Red)
+            ),
+            "`still wrong` is not new, but it is still wrong"
+        );
+        assert!(
+            run_cell_tint(&res, 2, "Trend", Trend::Unchanged.as_str()).is_none(),
+            "`unchanged` is the expected case; colouring it would drown the rows \
+             a reader is looking for"
+        );
     }
 
     #[test]

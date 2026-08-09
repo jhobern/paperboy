@@ -114,6 +114,93 @@ pub struct ReportResult {
     /// verdict so a summary (accuracy, confusion matrix) never has to
     /// re-interpolate, and so the reader can be shown what was expected.
     pub truths: std::collections::HashMap<(usize, String), String>,
+    /// The baseline row each compared row was scored against, kept alive past
+    /// the comparison collapse and keyed by the *collapsed* row index.
+    ///
+    /// A comparison folds the baseline row into its candidate and drops it, so
+    /// by the time truths are scored the baseline's own answers are gone —
+    /// which is exactly what a [`Trend`] needs ("was it right *before*?"). The
+    /// whole row is kept rather than the truth columns alone because the
+    /// collapse runs before the columns are resolved and so cannot know which
+    /// cells will matter. Only populated when the report declares a truth
+    /// ([`track_baseline`](Self::track_baseline)), so a report without one
+    /// carries no extra rows and is unchanged.
+    pub baseline_rows: std::collections::HashMap<usize, ReportRow>,
+    /// Whether the comparison should record
+    /// [`baseline_rows`](Self::baseline_rows). Set by the run's finalize phase
+    /// before the collapse, because only it can see both the flow's truths and
+    /// the rows.
+    pub track_baseline: bool,
+    /// How each ground-truthed cell moved relative to the baseline, keyed like
+    /// [`verdicts`](Self::verdicts). Only present for a report that has both a
+    /// truth and a comparison, and only for cells scored on *both* sides.
+    pub trends: std::collections::HashMap<(usize, String), Trend>,
+}
+
+/// How one ground-truthed cell moved between the baseline and the candidate —
+/// the second-order verdict that makes a comparison readable: *a change towards
+/// the truth is good, a change away from it is bad*.
+///
+/// Additive to [`Verdict`] and to the comparison's own `Result`, never a
+/// replacement: a row is routinely `Result: changed` *and* `Trend: fixed`, which
+/// is the useful reading rather than a contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trend {
+    /// Right before, right now.
+    Unchanged,
+    /// Wrong before, right now.
+    Fixed,
+    /// Right before, wrong now — the one every reader is looking for.
+    Regressed,
+    /// Wrong before, wrong now. Failing, but not *new*: CI cares about the
+    /// difference, and so does anyone deciding whether to ship.
+    StillWrong,
+}
+
+impl Trend {
+    /// The reserved `Trend` column's cell text, English and lower-case like
+    /// every other reserved value for the same reason: report data, not chrome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trend::Unchanged => "unchanged",
+            Trend::Fixed => "fixed",
+            Trend::Regressed => "regressed",
+            Trend::StillWrong => "still wrong",
+        }
+    }
+
+    /// The second-order verdict for a cell scored on both sides.
+    ///
+    /// `None` when either side is [`Verdict::Untested`]: with no ground truth
+    /// for the row there is no "towards" or "away from" to report, and guessing
+    /// one would put a colour on the rows nobody has checked.
+    pub fn of(baseline: Verdict, candidate: Verdict) -> Option<Trend> {
+        match (baseline, candidate) {
+            (Verdict::Untested, _) | (_, Verdict::Untested) => None,
+            (Verdict::Correct, Verdict::Correct) => Some(Trend::Unchanged),
+            (Verdict::Incorrect, Verdict::Correct) => Some(Trend::Fixed),
+            (Verdict::Correct, Verdict::Incorrect) => Some(Trend::Regressed),
+            (Verdict::Incorrect, Verdict::Incorrect) => Some(Trend::StillWrong),
+        }
+    }
+
+    /// How bad this trend is, for the row roll-up. The roll-up favours the bad
+    /// news: a row with one regressed column and one fixed column is
+    /// `regressed`, because a mixed row needs a human and the column exists to
+    /// be sorted and filtered by.
+    fn severity(self) -> u8 {
+        match self {
+            Trend::Unchanged => 0,
+            Trend::Fixed => 1,
+            Trend::StillWrong => 2,
+            Trend::Regressed => 3,
+        }
+    }
+
+    /// The row roll-up over every scored column's trend.
+    pub fn rollup(trends: impl IntoIterator<Item = Trend>) -> Option<Trend> {
+        trends.into_iter().max_by_key(|t| t.severity())
+    }
 }
 
 /// How one ground-truthed cell scored.

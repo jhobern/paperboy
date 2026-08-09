@@ -44,12 +44,12 @@ use crate::environment::substitute;
 use crate::hurl::HurlEntry;
 use crate::hurl::{EntryOutcome, RunOutput};
 
-use super::compare::{CORRECT_COLUMN, RESULT_COLUMN};
+use super::compare::{CORRECT_COLUMN, RESULT_COLUMN, TREND_COLUMN};
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
     ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
-use super::model::{ReportResult, ReportRow, Verdict};
+use super::model::{ReportResult, ReportRow, Trend, Verdict};
 use super::producers::{self, ProducerItem};
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
@@ -288,6 +288,9 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         // A completed run has nothing outstanding; only a streaming front-end
         // populates this, for the skeleton it is filling in.
         pending: std::collections::HashSet::new(),
+        baseline_rows: HashMap::new(),
+        track_baseline: false,
+        trends: HashMap::new(),
     }
 }
 
@@ -296,6 +299,13 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
 /// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
 pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    // Decided *before* the collapse, because the collapse is the only moment at
+    // which both sides of a comparison exist: a truth-bearing report needs the
+    // baseline row kept so `Trend` can ask what the baseline itself answered.
+    result.track_baseline = result
+        .resolved_columns(&flow.header)
+        .iter()
+        .any(|c| c.truth.is_some());
     if let Some(roles) = super::compare::comparison_roles(flow) {
         super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
@@ -345,6 +355,7 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
     let labels = super::labels::LabelMap::parse(&flow.header.labels());
     let mut verdicts = HashMap::new();
     let mut truths = HashMap::new();
+    let mut trends = HashMap::new();
     for (r, row) in result.rows.iter().enumerate() {
         // Cells underneath, variables on top: a reported column is visible to a
         // truth template too, but a loop binding of the same name is the more
@@ -356,13 +367,26 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
                 continue;
             };
             let expected = substitute(template, &scope);
-            let verdict = if expected.trim().is_empty() || expected.contains("{{") {
-                Verdict::Untested
-            } else if labels.same(&expected, &col.value(row, &result.no_match_marker)) {
-                Verdict::Correct
-            } else {
-                Verdict::Incorrect
+            let untested = expected.trim().is_empty() || expected.contains("{{");
+            let score = |answer: &str| {
+                if untested {
+                    Verdict::Untested
+                } else if labels.same(&expected, answer) {
+                    Verdict::Correct
+                } else {
+                    Verdict::Incorrect
+                }
             };
+            let verdict = score(&col.value(row, &result.no_match_marker));
+            // The same ground truth scores the baseline's answer, because the
+            // truth belongs to the *row* (the manifest line, the folder), not
+            // to the target that answered it. Only the answer differs.
+            if let Some(base) = result.baseline_rows.get(&r)
+                && let Some(t) =
+                    Trend::of(score(&col.value(base, &result.no_match_marker)), verdict)
+            {
+                trends.insert((r, col.header.clone()), t);
+            }
             if verdict != Verdict::Untested {
                 truths.insert((r, col.header.clone()), expected);
             }
@@ -381,6 +405,16 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
                 .is_some_and(|c| c == RESULT_COLUMN),
         );
         result.column_order.insert(at, CORRECT_COLUMN.to_string());
+    }
+    // `Trend` sits immediately after `Correct`, so the verdict columns read
+    // together at the left: what the answer was, and which way it moved.
+    if !trends.is_empty() && !result.column_order.iter().any(|c| c == TREND_COLUMN) {
+        let at = result
+            .column_order
+            .iter()
+            .position(|c| c == CORRECT_COLUMN)
+            .map_or(0, |i| i + 1);
+        result.column_order.insert(at, TREND_COLUMN.to_string());
     }
     for (r, row) in result.rows.iter_mut().enumerate() {
         // A row can carry several ground-truthed columns. The roll-up favours
@@ -402,9 +436,21 @@ fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
             row.cells
                 .insert(CORRECT_COLUMN.to_string(), v.as_str().to_string());
         }
+        // The row's trend, favouring the bad news for the same reason the
+        // verdict roll-up does: one regressed column makes the row a
+        // regression, however many others improved.
+        if let Some(t) = Trend::rollup(
+            truth_columns
+                .iter()
+                .filter_map(|col| trends.get(&(r, col.header.clone())).copied()),
+        ) {
+            row.cells
+                .insert(TREND_COLUMN.to_string(), t.as_str().to_string());
+        }
     }
     result.verdicts = verdicts;
     result.truths = truths;
+    result.trends = trends;
 }
 
 /// Resolve every `IMAGE` column's cell value to picture bytes, filling
@@ -3804,6 +3850,181 @@ mod tests {
             "scoring never rewrites the reported value"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of the whole ground-truth feature: in a comparison, a change
+    /// *towards* the truth is good and a change *away* from it is bad. Both
+    /// rows below read `changed` in `Result` — structurally they are the same
+    /// event — and only `Trend` tells them apart.
+    #[test]
+    fn a_comparison_trends_each_row_towards_or_away_from_its_truth() {
+        struct EchoEnv;
+        impl EntryRunner for EchoEnv {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let v = vars.get("VERDICT").cloned().unwrap_or_default();
+                let body = format!("{{\"overall\":\"{v}\"}}");
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: body.clone(),
+                        raw_body: body,
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+
+        let dir = tmpdir("trend");
+        // Row `a` is what staging got right and prod got wrong; row `b` is the
+        // opposite. Same run, same diff, opposite meanings.
+        std::fs::write(dir.join("truth.csv"), "name,expected\na,REVIEW\nb,CLEAR\n").unwrap();
+        let entries = [entry("proc", &[])];
+        let flow = parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    FOR ROW IN TUPLES FROM \"truth.csv\"\n        REPORT REQUEST proc WITH\n            overall: jsonpath \"$.overall\" TRUTH \"{{ expected }}\"\n        END\n    END\nEND\n",
+        )
+        .expect("flow parses");
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: [
+                (
+                    "prod".to_string(),
+                    [("VERDICT".to_string(), "CLEAR".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                (
+                    "staging".to_string(),
+                    [("VERDICT".to_string(), "REVIEW".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            root: Some(dir.clone()),
+            runner: &EchoEnv,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(res.rows.len(), 2, "one candidate row per manifest line");
+        let trend = |r: usize| res.rows[r].cells.get(TREND_COLUMN).map(String::as_str);
+        assert_eq!(
+            trend(0),
+            Some(Trend::Fixed.as_str()),
+            "prod answered CLEAR where the truth is REVIEW; staging got it right"
+        );
+        assert_eq!(
+            trend(1),
+            Some(Trend::Regressed.as_str()),
+            "and the other way round on the second row"
+        );
+        assert_eq!(
+            res.trends.get(&(0, "proc.overall".to_string())).copied(),
+            Some(Trend::Fixed),
+            "the per-cell trend is recorded too, for tinting the cell itself"
+        );
+        // Structurally the two rows are the same event, which is exactly why
+        // `Trend` has to be a column of its own rather than a reading of
+        // `Result`.
+        for r in &res.rows {
+            assert!(
+                r.cells
+                    .get(crate::report::compare::RESULT_COLUMN)
+                    .is_some_and(|v| v.contains("overall")),
+                "both rows report the same structural change"
+            );
+        }
+        let at = |c: &str| res.column_order.iter().position(|x| x == c);
+        assert_eq!(
+            at(TREND_COLUMN)
+                .zip(at(CORRECT_COLUMN))
+                .map(|(t, c)| t == c + 1),
+            Some(true),
+            "Trend sits right after Correct: {:?}",
+            res.column_order
+        );
+    }
+
+    /// The `# baseline:` snapshot path has to trend too: "is it better than last
+    /// week's run?" is the same question as "is it better than prod?", and a
+    /// reader must not have to know which mechanism produced the comparison.
+    #[test]
+    fn a_snapshot_comparison_trends_against_what_the_snapshot_answered() {
+        let dir = tmpdir("trend_snap");
+        std::fs::write(dir.join("truth.csv"), "name,expected\na,yes\nb,no\n").unwrap();
+        let body = "FOR ROW IN TUPLES FROM \"truth.csv\"\n    REPORT \"{{ ANSWER }}\" AS Verdict TRUTH \"{{ expected }}\"\nEND\n";
+        let fake = Fake::new(&[]);
+        let mut ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: [("ANSWER".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            sink: None,
+        };
+        // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
+        let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
+        let snap = dir.join("prev.baseline");
+        super::super::baseline::Baseline::from_result(&first)
+            .save(&snap)
+            .unwrap();
+
+        // This run answers `no` everywhere, so each row moves the opposite way.
+        ctx.base_vars = [("ANSWER".to_string(), "no".to_string())]
+            .into_iter()
+            .collect();
+        let src = format!("# baseline: prev.baseline\n{body}");
+        let res = run_flow(&parse_flow(&src).expect("flow parses"), &ctx);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(res.errors.is_empty(), "snapshot loaded: {:?}", res.errors);
+        let trend = |r: usize| res.rows[r].cells.get(TREND_COLUMN).map(String::as_str);
+        assert_eq!(trend(0), Some(Trend::Regressed.as_str()));
+        assert_eq!(trend(1), Some(Trend::Fixed.as_str()));
+    }
+
+    /// A report with a truth but no comparison has nothing to trend against, so
+    /// the column must not appear at all -- an empty `Trend` column on every row
+    /// of an ordinary run would be pure noise.
+    #[test]
+    fn a_truth_without_a_comparison_produces_no_trend_column() {
+        let flow = parse_flow("REPORT \"yes\" AS A TRUTH \"yes\"\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(
+            !res.column_order.iter().any(|c| c == TREND_COLUMN),
+            "no comparison, no Trend: {:?}",
+            res.column_order
+        );
+        assert!(res.trends.is_empty());
     }
 
     /// The reserved `Correct` column summarises the row, so a ground-truthed
