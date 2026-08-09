@@ -487,6 +487,7 @@ impl NodeKind {
                 stats: Vec::new(),
                 image: None,
                 truth: None,
+                detail: false,
             }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
@@ -923,6 +924,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     stats: Vec::new(),
                     image: None,
                     truth: None,
+                    detail: false,
                 });
             }
         }
@@ -938,6 +940,7 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     stats: Vec::new(),
                     image: None,
                     truth: None,
+                    detail: false,
                 });
             }
             _ => {}
@@ -1495,6 +1498,7 @@ pub(crate) fn add_with_field(
             stats,
             image: None,
             truth: None,
+            detail: false,
         });
         Some(with.len() - 1)
     } else {
@@ -1518,10 +1522,12 @@ pub(crate) fn set_with_field(
             name: n,
             query: q,
             stats: st,
-            // The form doesn't edit the `IMAGE(…)` hint, so it is left alone
-            // rather than being cleared by an unrelated rename.
+            // The form doesn't edit the `IMAGE(…)`/`TRUTH`/`DETAIL` clauses, so
+            // they are left alone rather than being cleared by an unrelated
+            // rename.
             image: _,
             truth: _,
+            detail: _,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
@@ -1777,6 +1783,7 @@ impl CarriedMod {
                         stats: Vec::new(),
                         image: None,
                         truth: None,
+                        detail: false,
                     });
                 }
                 _ => {}

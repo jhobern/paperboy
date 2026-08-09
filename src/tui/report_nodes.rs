@@ -388,6 +388,8 @@ pub(crate) struct VarsForm {
     /// A `TRUTH "…"` clause the statement already carries, preserved for the
     /// same reason as [`Self::image`].
     pub(crate) truth: Option<String>,
+    /// A `DETAIL` placement flag, preserved for the same reason again.
+    pub(crate) detail: bool,
     pub(crate) selected: usize,
 }
 
@@ -403,6 +405,7 @@ impl VarsForm {
         stats: &[StatKind],
         image: Option<ImageSpec>,
         truth: Option<String>,
+        detail: bool,
         in_scope: Vec<String>,
     ) -> Self {
         let mut names = in_scope;
@@ -414,6 +417,7 @@ impl VarsForm {
         VarsForm {
             image,
             truth,
+            detail,
             report_id,
             path,
             vars: names
@@ -481,6 +485,7 @@ impl VarsForm {
         if rest.is_empty() && (!alias.is_empty() || !stats.is_empty() || self.image.is_some()) {
             return Some(FlowNode::Report(ReportStmt::VarAs {
                 truth: self.truth.clone(),
+                detail: self.detail,
                 var: first.clone(),
                 // `STATISTICS` needs a column to attach to, so an unnamed one
                 // falls back to the variable's own name.
@@ -527,6 +532,8 @@ pub(crate) struct ComputedForm {
     pub(crate) image: Option<ImageSpec>,
     /// A `TRUTH "…"` clause, preserved verbatim, as in [`VarsForm`].
     pub(crate) truth: Option<String>,
+    /// A `DETAIL` placement flag, preserved verbatim, as in [`VarsForm`].
+    pub(crate) detail: bool,
     pub(crate) selected: usize,
 }
 
@@ -552,6 +559,7 @@ impl ComputedForm {
         }
         Some(FlowNode::Report(ReportStmt::Computed {
             truth: self.truth.clone(),
+            detail: self.detail,
             template: template.to_string(),
             name: alias.to_string(),
             stats: self
@@ -718,6 +726,9 @@ pub(crate) struct WithFieldForm {
     /// The `TRUTH "…"` ground-truth template, as edited: empty when the field
     /// carries no clause.
     pub(crate) truth: String,
+    /// A `DETAIL` placement flag the field already carries; preserved verbatim,
+    /// like [`Self::image`].
+    pub(crate) detail: bool,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -730,26 +741,29 @@ impl WithFieldForm {
         existing: Option<&WithItem>,
         return_to_request: bool,
     ) -> Self {
-        let (name, query, stats, image, truth) = match existing {
+        let (name, query, stats, image, truth, detail) = match existing {
             Some(WithItem::Field {
                 name,
                 query,
                 stats,
                 image,
                 truth,
+                detail,
             }) => (
                 name.clone(),
                 query.clone(),
                 stats.clone(),
                 *image,
                 truth.clone(),
+                *detail,
             ),
             // A bare `WITH RESPONSE` isn't a named field, so editing it falls
             // through to a fresh one rather than silently rewriting it.
-            _ => (String::new(), String::new(), Vec::new(), None, None),
+            _ => (String::new(), String::new(), Vec::new(), None, None, false),
         };
         WithFieldForm {
             image,
+            detail,
             truth: truth.unwrap_or_default(),
             report_id,
             path,
@@ -825,6 +839,7 @@ impl WithFieldForm {
                 .map(|(k, _)| *k)
                 .collect(),
             image: self.image,
+            detail: self.detail,
             // Blank means no clause at all, so clearing the row removes it
             // rather than writing an empty ground truth nothing can match.
             truth: Some(self.truth.trim().to_string()).filter(|t| !t.is_empty()),
@@ -1754,9 +1769,9 @@ impl TuiApp {
         let Some((report_id, path, node)) = self.selected_node(idx) else {
             return false;
         };
-        let (chosen, alias, stats, image, truth) = match &node {
+        let (chosen, alias, stats, image, truth, detail) = match &node {
             FlowNode::Report(ReportStmt::Vars(vars)) => {
-                (vars.clone(), None, Vec::new(), None, None)
+                (vars.clone(), None, Vec::new(), None, None, false)
             }
             FlowNode::Report(ReportStmt::VarAs {
                 var,
@@ -1764,12 +1779,14 @@ impl TuiApp {
                 stats,
                 image,
                 truth,
+                detail,
             }) => (
                 vec![var.clone()],
                 Some(name.clone()),
                 stats.clone(),
                 *image,
                 truth.clone(),
+                *detail,
             ),
             _ => return false,
         };
@@ -1785,7 +1802,7 @@ impl TuiApp {
             Err(_) => Vec::new(),
         };
         self.overlay = Some(Overlay::ReportNodeVars(Box::new(VarsForm::build(
-            report_id, path, &chosen, alias, &stats, image, truth, in_scope,
+            report_id, path, &chosen, alias, &stats, image, truth, detail, in_scope,
         ))));
         true
     }
@@ -1883,6 +1900,7 @@ impl TuiApp {
             stats,
             image,
             truth,
+            detail,
         }) = node
         else {
             return false;
@@ -1893,6 +1911,7 @@ impl TuiApp {
             template,
             alias: name,
             image,
+            detail,
             truth,
             stats: StatKind::CHOOSABLE
                 .iter()

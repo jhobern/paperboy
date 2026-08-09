@@ -410,6 +410,7 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
             stats: clauses.stats,
             image: clauses.image,
             truth: clauses.truth,
+            detail: clauses.detail,
         },
     ))
 }
@@ -428,13 +429,14 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
             stats,
             image,
             truth,
+            detail,
         },
     ) = column_clauses(i)?;
     Ok((
         i,
         match (
             alias,
-            stats.is_empty() && image.is_none() && truth.is_none(),
+            stats.is_empty() && image.is_none() && truth.is_none() && !detail,
         ) {
             (Some(name), _) => ReportStmt::VarAs {
                 var,
@@ -442,6 +444,7 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
                 stats,
                 image,
                 truth,
+                detail,
             },
             // A bare `REPORT X` is a plain variable column, but one carrying a
             // clause needs a named column to hang the clause on, so the
@@ -454,6 +457,7 @@ fn report_single(i: &str) -> IResult<&str, ReportStmt> {
                     stats,
                     image,
                     truth,
+                    detail,
                 }
             }
             (None, true) => ReportStmt::Vars(vec![var]),
@@ -486,8 +490,23 @@ fn column_clauses(i: &str) -> IResult<&str, ColumnClauses> {
             rest = r;
             continue;
         }
+        if !out.detail
+            && let Ok((r, _)) = detail_clause(rest)
+        {
+            out.detail = true;
+            rest = r;
+            continue;
+        }
         return Ok((rest, out));
     }
+}
+
+/// `DETAIL` -- the placement flag that moves a column out of the table and into
+/// its row's drill-down. A bare keyword: it says *where* the column goes, and
+/// there is only one other place for it to be.
+fn detail_clause(i: &str) -> IResult<&str, ()> {
+    let (i, _) = kw("DETAIL")(i)?;
+    Ok((i, ()))
 }
 
 /// `TRUTH "<template>"` -- the column's expected value, interpolated per row.
@@ -652,6 +671,7 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
             stats: clauses.stats,
             image: clauses.image,
             truth: clauses.truth,
+            detail: clauses.detail,
         },
     ))
 }
@@ -1875,6 +1895,45 @@ REPORT Thumb AS Small IMAGE(FIT)
                 "{src} should record a truth for {key}"
             );
         }
+    }
+
+    /// `DETAIL` is placement, not content, so like `TRUTH` it has to survive a
+    /// round-trip untouched and reach `column_details` from every column form.
+    #[test]
+    fn detail_flag_parses_and_round_trips_on_every_column_form() {
+        for (src, key) in [
+            ("REPORT Raw AS Payload DETAIL\n", "Payload"),
+            ("REPORT \"{{ a }}/{{ b }}\" AS Ratio DETAIL\n", "Ratio"),
+            (
+                "REPORT REQUEST face WITH\n    Body: jsonpath \"$.body\" DETAIL\nEND\n",
+                "face.Body",
+            ),
+        ] {
+            let flow = assert_round_trips(src);
+            assert!(
+                flow.column_details().contains(key),
+                "{src} should mark {key} as a detail column"
+            );
+        }
+    }
+
+    /// `DETAIL` serializes last, so it must still parse when written before the
+    /// other clauses, and a column source ending in the word must be left alone.
+    #[test]
+    fn detail_parses_in_any_order_and_only_as_a_trailing_keyword() {
+        let flow = parse_flow("REPORT V AS Verdict DETAIL TRUTH \"{{ e }}\"\n").expect("parse");
+        assert!(flow.column_details().contains("Verdict"));
+        assert_eq!(
+            flow.to_text(),
+            "REPORT V AS Verdict TRUTH \"{{ e }}\" DETAIL\n",
+            "every order serializes the same way"
+        );
+
+        let flow = parse_flow("REPORT \"level of DETAIL\" AS Note\n").expect("parse");
+        assert!(
+            flow.column_details().is_empty(),
+            "the word inside the quoted template is just text"
+        );
     }
 
     /// The three trailing clauses are independent, so any order has to parse;

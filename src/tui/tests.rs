@@ -26347,6 +26347,31 @@ fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
     );
 }
 
+/// `DETAIL` has no widget in the field editor -- it is placement, decided in
+/// the source -- so the editor's job is simply not to eat it when the user
+/// applies an unrelated change.
+#[test]
+fn the_with_field_editor_preserves_a_detail_flag_it_cannot_show() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\" DETAIL\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("DETAIL"),
+        "the flag survives a round-trip through the editor: {}",
+        app.reports[idx].report.text
+    );
+}
+
 /// The statistics checklist is six rows that most fields don't want, so it is
 /// folded behind a toggle. Turning it on seeds `COUNT` (the one statistic that
 /// means something for a text column too) and turning it off clears the ticks,

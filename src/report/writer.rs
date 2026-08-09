@@ -1471,6 +1471,7 @@ mod tests {
             stats: Vec::new(),
             image: None,
             truth: None,
+            detail: false,
         };
         let res = ReportResult {
             no_match_marker: "-".into(),

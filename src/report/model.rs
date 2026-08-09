@@ -84,6 +84,9 @@ pub struct ReportResult {
     /// `TRUTH "…"` templates requested per output-column *header*, merged into
     /// the resolved columns exactly as `column_images` is. Empty by default.
     pub column_truths: std::collections::HashMap<String, String>,
+    /// Output-column headers flagged `DETAIL`, merged into the resolved columns
+    /// exactly as `column_truths` is. Empty by default.
+    pub column_details: std::collections::HashSet<String>,
     /// Produced column keys whose value is an *elapsed time* — every column
     /// sourced from the `Time`/`TimeSetup`/`TimeWait`/`TimeDownload` intrinsics,
     /// including a `[Reports]` or `WITH` field that aliases one under a name of
@@ -271,6 +274,7 @@ impl ReportResult {
                     stats: Vec::new(),
                     image: None,
                     truth: None,
+                    detail: false,
                 })
                 .collect(),
         };
@@ -317,6 +321,14 @@ impl ReportResult {
                 {
                     col.truth = Some(t.clone());
                 }
+            }
+        }
+        // `DETAIL` is a flag rather than a value, so "the directive already said
+        // so" is the whole precedence rule: a `columns:` spec can add the flag,
+        // never take it away.
+        if !self.column_details.is_empty() {
+            for col in &mut columns {
+                col.detail = col.detail || self.column_details.contains(&col.header);
             }
         }
         columns
@@ -703,6 +715,11 @@ pub struct OutputColumn {
     /// the verdicts land in [`ReportResult::verdicts`]. `None` = a column with
     /// no expected answer, which is every column in an ordinary report.
     pub truth: Option<String>,
+    /// A `DETAIL` flag: the column belongs in its row's drill-down rather than
+    /// in the table. Placement only — the column is still exported, compared and
+    /// snapshotted like any other, which is what lets a format with no
+    /// drill-down (CSV, JSON) ignore the flag without losing data.
+    pub detail: bool,
 }
 
 impl OutputColumn {
@@ -756,6 +773,7 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
                 stats,
                 image,
                 truth,
+                detail,
             } = clauses;
             let (sources_part, header) = split_as(part);
             let sources: Vec<String> = sources_part
@@ -773,6 +791,7 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
                 stats,
                 image,
                 truth,
+                detail,
             })
         })
         .collect()
@@ -790,6 +809,7 @@ pub(crate) struct ColumnClauses {
     pub stats: Vec<StatKind>,
     pub image: Option<ImageSpec>,
     pub truth: Option<String>,
+    pub detail: bool,
 }
 
 /// Peel every optional trailing clause -- `STATISTICS(…)`, `IMAGE[(…)]` and
@@ -810,10 +830,12 @@ pub(crate) fn split_column_clauses(part: &str) -> (&str, ColumnClauses) {
         let (sr, s) = split_statistics(rest);
         let (ir, im) = split_image(rest);
         let (tr, tv) = split_truth(rest);
+        let (dr, dv) = split_detail(rest);
         let cands = [
             (!s.is_empty(), sr.len()),
             (im.is_some(), ir.len()),
             (tv.is_some(), tr.len()),
+            (dv, dr.len()),
         ];
         let latest = cands
             .iter()
@@ -834,9 +856,56 @@ pub(crate) fn split_column_clauses(part: &str) -> (&str, ColumnClauses) {
                 out.truth = tv;
                 rest = tr;
             }
+            Some(3) => {
+                out.detail = true;
+                rest = dr;
+            }
             _ => return (rest, out),
         }
     }
+}
+
+/// Peel a trailing bare `DETAIL` flag (case-insensitive, whole-word, outside
+/// quotes) off a column-spec, returning `(remainder, found)`.
+///
+/// Whole-word and outside quotes for the same reasons as its siblings: a column
+/// genuinely called `Detail` or `DETAILS`, or a template that contains the word,
+/// must not lose text to the flag.
+pub(crate) fn split_detail(part: &str) -> (&str, bool) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b'd' || c == b'D')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 6)
+                .is_some_and(|w| w.eq_ignore_ascii_case("detail"))
+            && part
+                .as_bytes()
+                .get(i + 6)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            // The flag takes no argument, so anything after it belongs to
+            // another clause -- and a bare word after it means this `DETAIL`
+            // was part of the column source, not a clause on it.
+            && part[i + 6..].trim_start().is_empty()
+        {
+            return (part[..i].trim_end(), true);
+        }
+        i += 1;
+    }
+    (part, false)
 }
 
 /// Peel a trailing `TRUTH "<template>"` clause (case-insensitive, whole-word,
@@ -1114,6 +1183,47 @@ fn unquote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The flag takes no argument, so it can only be recognised as the last
+    /// thing on the line -- otherwise a column source that merely ends in the
+    /// word, or mentions it inside quotes, would lose text.
+    #[test]
+    fn split_detail_only_takes_a_trailing_bare_keyword() {
+        assert_eq!(
+            split_detail("jsonpath \"$.a\" DETAIL"),
+            ("jsonpath \"$.a\"", true)
+        );
+        assert_eq!(
+            split_detail("jsonpath \"$.a\" detail  "),
+            ("jsonpath \"$.a\"", true)
+        );
+        // Not a clause: something follows it, it is inside quotes, or it is
+        // glued to a longer word.
+        for src in [
+            "jsonpath \"$.a\" DETAIL EXTRA",
+            "jsonpath \"$.DETAIL\"",
+            "jsonpath \"$.a\" DETAILS",
+        ] {
+            assert_eq!(split_detail(src), (src, false), "{src}");
+        }
+    }
+
+    /// A `columns:` header can only *add* the flag: the two spellings are
+    /// independent, and letting the header silently un-detail a column would
+    /// make the source line a lie.
+    #[test]
+    fn column_detail_from_the_flow_survives_a_columns_header() {
+        let mut res = ReportResult::default();
+        res.column_details.insert("Payload".into());
+        let header = Header {
+            lines: vec![crate::report::flow::HeaderLine::Directive {
+                key: "columns".to_string(),
+                value: "Payload, Name DETAIL".to_string(),
+            }],
+        };
+        let cols = res.resolved_columns(&header);
+        assert!(cols.iter().all(|c| c.detail), "both are detail columns");
+    }
+
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
             cells: cells
@@ -1185,6 +1295,7 @@ mod tests {
             stats: Vec::new(),
             image: None,
             truth: None,
+            detail: false,
         };
         let r = row(&[("a.status", ""), ("b.status", "ok")], &[], None);
         assert_eq!(col.value(&r, "-"), "ok");
@@ -1198,6 +1309,7 @@ mod tests {
             stats: Vec::new(),
             image: None,
             truth: None,
+            detail: false,
         };
         let r = row(&[], &[("FILE", "a.jpg")], None);
         assert_eq!(col.value(&r, "∅"), "a.jpg");
@@ -1213,6 +1325,7 @@ mod tests {
             stats: Vec::new(),
             image: None,
             truth: None,
+            detail: false,
         };
         let r = row(&[], &[], Some("staging-au"));
         assert_eq!(col.value(&r, "-"), "staging-au");

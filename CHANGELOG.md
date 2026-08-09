@@ -12,6 +12,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Columns can be marked as supporting evidence with `DETAIL`.** A bare
+  `DETAIL` flag, alongside `STATISTICS(…)`, `IMAGE(…)` and `TRUTH "…"` on any
+  named column, says the column is worth keeping but not worth a slot in the
+  main grid:
+
+  ```
+  REPORT REQUEST classify AS c WITH
+      Verdict: jsonpath "$.decision" TRUTH "{{ expected }}"
+      Payload: jsonpath "$.raw" DETAIL
+  END
+  ```
+
+  It is *placement*, not content: a `DETAIL` column is still exported to CSV and
+  JSON, still compared, and still stored in a baseline snapshot. Writers that
+  have somewhere to put it use it; the rest ignore it.
+
 - **PaperTrail reports can be scored against a ground truth (`TRUTH`).** A
   column can name the answer it *should* have given, and the report says whether
   it was right:

@@ -249,6 +249,7 @@ pub enum ReportStmt {
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
         truth: Option<String>,
+        detail: bool,
     },
     /// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE(…)]` — a computed
     /// column.
@@ -258,6 +259,7 @@ pub enum ReportStmt {
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
         truth: Option<String>,
+        detail: bool,
     },
 }
 
@@ -322,6 +324,7 @@ pub enum WithItem {
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
         truth: Option<String>,
+        detail: bool,
     },
     /// A whole-line `#` comment written inside the block, kept so that
     /// commenting a field out doesn't destroy it the next time an editor
@@ -623,6 +626,20 @@ impl ReportFlow {
         collect_column_truths(&self.nodes, &mut out);
         out
     }
+
+    /// The columns flagged `DETAIL` — shown in a row's drill-down rather than
+    /// in the table itself.
+    ///
+    /// Like `IMAGE`, this is *placement*, not content: a `DETAIL` column is
+    /// still a full column of the model, so it is exported to CSV and JSON,
+    /// compared, and stored in a baseline snapshot. Only the renderers that
+    /// have somewhere else to put it treat it differently, which is what lets
+    /// every other format ignore the flag without losing data.
+    pub fn column_details(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        collect_column_details(&self.nodes, &mut out);
+        out
+    }
 }
 
 fn collect_column_images(
@@ -656,6 +673,40 @@ fn collect_column_images(
             }
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 collect_column_images(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_column_details(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, detail, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, detail, .. }) => {
+                if *detail {
+                    out.insert(name.clone());
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        detail: true,
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"));
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_details(body, out);
             }
             _ => {}
         }
@@ -884,14 +935,16 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             stats,
             image,
             truth,
+            detail,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {var} AS {}{}{}{}",
+                "REPORT {var} AS {}{}{}{}{}",
                 name_text(name),
                 stats_text(stats),
                 image_text(image.as_ref()),
-                truth_text(truth.as_deref())
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             );
         }
         ReportStmt::Computed {
@@ -900,15 +953,17 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             stats,
             image,
             truth,
+            detail,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {} AS {}{}{}{}",
+                "REPORT {} AS {}{}{}{}{}",
                 quote(template),
                 name_text(name),
                 stats_text(stats),
                 image_text(image.as_ref()),
-                truth_text(truth.as_deref())
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             );
         }
     }
@@ -929,13 +984,26 @@ pub(crate) fn with_item_text(item: &WithItem) -> String {
             stats,
             image,
             truth,
+            detail,
         } => format!(
-            "{}: {query}{}{}{}",
+            "{}: {query}{}{}{}{}",
             name_text(name),
             stats_text(stats),
             image_text(image.as_ref()),
-            truth_text(truth.as_deref())
+            truth_text(truth.as_deref()),
+            detail_text(*detail)
         ),
+    }
+}
+
+/// Render the `DETAIL` flag (with a leading space), or the empty string. A bare
+/// keyword with no argument, because it says *where* a column goes and there is
+/// only one other place for it to be.
+pub(crate) fn detail_text(detail: bool) -> String {
+    if detail {
+        " DETAIL".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -1262,12 +1330,14 @@ fn report_label(stmt: &ReportStmt) -> String {
             stats,
             image,
             truth,
+            detail,
         } => {
             format!(
-                "REPORT {var} AS {name}{}{}{}",
+                "REPORT {var} AS {name}{}{}{}{}",
                 stats_text(stats),
                 image_text(image.as_ref()),
-                truth_text(truth.as_deref())
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             )
         }
         ReportStmt::Computed {
@@ -1276,13 +1346,15 @@ fn report_label(stmt: &ReportStmt) -> String {
             stats,
             image,
             truth,
+            detail,
         } => {
             format!(
-                "REPORT {} AS {name}{}{}{}",
+                "REPORT {} AS {name}{}{}{}{}",
                 quote(template),
                 stats_text(stats),
                 image_text(image.as_ref()),
-                truth_text(truth.as_deref())
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             )
         }
     }

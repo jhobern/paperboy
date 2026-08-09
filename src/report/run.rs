@@ -282,6 +282,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
         column_truths: flow.column_truths(),
+        column_details: flow.column_details(),
         images: HashMap::new(),
         verdicts: HashMap::new(),
         truths: HashMap::new(),
@@ -1968,6 +1969,7 @@ mod tests {
             stats: Vec::new(),
             image: None,
             truth: None,
+            detail: false,
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }

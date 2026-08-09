@@ -9767,6 +9767,7 @@ mod results_render_tests {
                 stats: Vec::new(),
                 image: None,
                 truth: None,
+                detail: false,
             })
             .collect();
         let mut result = ReportResult::default();
