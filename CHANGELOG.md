@@ -28,6 +28,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   JSON, still compared, and still stored in a baseline snapshot. Writers that
   have somewhere to put it use it; the rest ignore it.
 
+- **The HTML export is interactive.** Clicking a row (or pressing Enter/Space on
+  it) opens a drill-down panel holding the row's pictures at full size, its
+  `DETAIL` columns pretty-printed, and — when the run compared against a
+  baseline — a field-by-field diff of whichever of them are JSON on both sides,
+  with the fields that moved highlighted. Lists of `{key, value}` objects are
+  aligned by their `key` rather than by position, so a response whose checks
+  come back in a different order no longer reads as "everything changed".
+
+  Above the table there is a filter toolbar — **All**, **Differences**,
+  **Incorrect**, **Regressions**, each offered only when the report has rows in
+  that class — a live text search, and clickable confusion-matrix cells that
+  narrow the table to exactly the rows a cell counted.
+
+  The file is still a single self-contained document with no external references
+  of any kind, and with scripting disabled it renders every panel expanded
+  rather than losing them.
+
+- **xlsx groups `DETAIL` columns.** They move to the right of the summary
+  columns and are written as a collapsed outline group — the spreadsheet idiom
+  for the same idea as the HTML drill-down.
+
 - **PaperTrail reports can be scored against a ground truth (`TRUTH`).** A
   column can name the answer it *should* have given, and the report says whether
   it was right:

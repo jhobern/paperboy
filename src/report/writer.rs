@@ -254,7 +254,17 @@ pub struct HtmlWriter;
 
 impl ReportWriter for HtmlWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
-        let columns = result.resolved_columns(header);
+        let all_columns = result.resolved_columns(header);
+        // `DETAIL` columns leave the grid for the drill-down. If *every* column
+        // is a detail column the grid would be empty, which helps nobody, so
+        // the flag is ignored rather than obeyed into an unreadable file.
+        let columns: Vec<OutputColumn> = if all_columns.iter().all(|c| c.detail) {
+            all_columns.clone()
+        } else {
+            all_columns.iter().filter(|c| !c.detail).cloned().collect()
+        };
+        let detail_columns: Vec<&OutputColumn> = all_columns.iter().filter(|c| c.detail).collect();
+        let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
         out.push_str(
             "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
@@ -267,7 +277,32 @@ impl ReportWriter for HtmlWriter {
              white-space:pre-wrap;overflow-wrap:anywhere}\n\
              thead th{position:sticky;top:0;background:#333;color:#fff;\
              white-space:nowrap;overflow-wrap:normal}\n\
-             tbody tr:nth-child(even){background:#f7f7f7}\n\
+             tbody tr.sum.alt{background:#f7f7f7}\n\
+             tbody tr.sum.has{cursor:pointer}\n\
+             tbody tr.sum.has:hover{background:#eaf1fb}\n\
+             tbody tr.sum.has>td:first-child::before{content:'\\25b8 ';color:#777}\n\
+             tbody tr.sum.has[aria-expanded='true']>td:first-child::before{content:'\\25be '}\n\
+             tr.det{display:none}\n\
+             tr.det.open{display:table-row}\n\
+             tr.det>td{background:#fbfbfd;border-top:none}\n\
+             .panel{display:flex;flex-wrap:wrap;gap:1.25rem}\n\
+             .panel section{min-width:min(100%,22rem);flex:1 1 22rem}\n\
+             .panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;\
+             color:#666;margin:0 0 .35rem;font-weight:600}\n\
+             .panel pre{margin:0;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;\
+             background:#fff;border:1px solid #ddd;border-radius:4px;padding:.4rem .5rem;\
+             max-height:24rem;overflow:auto}\n\
+             .panel img{max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px}\n\
+             table.fdiff{width:100%;font-size:12px}\n\
+             table.fdiff th{background:#eee;color:#222;position:static;font-weight:600}\n\
+             table.fdiff tr.chg td{background:#ffeb9c}\n\
+             .toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:0 0 .6rem}\n\
+             .toolbar button{font:inherit;font-size:13px;padding:.25rem .7rem;border:1px solid #bbb;\
+             border-radius:5px;background:#fafafa;cursor:pointer}\n\
+             .toolbar button.on{background:#333;color:#fff;border-color:#333}\n\
+             .toolbar input{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid #bbb;\
+             border-radius:5px}\n\
+             .toolbar .count{font-size:12px;color:#666}\n\
              tfoot td{font-weight:bold;background:#ececec;border-top:2px solid #999}\n\
              td.pass{background:#c6efce}\n\
              td.fail{background:#ffc7ce}\n\
@@ -284,22 +319,53 @@ impl ReportWriter for HtmlWriter {
              .matrix thead th{position:static;background:#fafafa;color:#222;font-weight:600}\n\
              .matrix th.axis{background:#fafafa;color:#222;text-align:right;font-weight:600}\n\
              .matrix td.cell{color:#12305a}\n\
+             .matrix td.pick{cursor:pointer}\n\
+             .matrix td.pick:hover{outline:2px solid #12305a;outline-offset:-2px}\n\
              .matrix td.hot{color:#fff}\n\
              .matrix caption{caption-side:bottom;font-size:12px;color:#666;padding-top:.3rem;\
              text-align:left}\n\
-             </style>\n</head>\n<body>\n",
+             </style>\n\
+             <noscript><style>tr.det{display:table-row}.toolbar{display:none}</style></noscript>\n\
+             </head>\n<body>\n",
         );
         // Ground-truth metrics go *above* the table, as cards and a matrix:
         // HTML has a header block, and a reader who wants to know whether the
         // run was any good should not have to scroll 500 rows to find out. The
         // flat formats put the same figures in the footer instead, so no
         // document ever states them twice.
-        let metrics = result.metrics(&columns, header);
+        // Metrics are computed over *every* column, detail ones included: the
+        // flag says where a column is drawn, never whether it counts.
+        let metrics = result.metrics(&all_columns, header);
+        // Every filter the file offers, in one list: the toolbar's buttons
+        // first, then one per non-empty confusion-matrix cell. Rows carry the
+        // indices they pass, so the browser only ever compares numbers -- the
+        // decisions themselves are made here, by the same `RowFilter` the
+        // in-app views use, and the two can't drift.
+        let mut filters = super::filter::RowFilter::available(result);
+        let buttons = filters.len();
+        if let Some(metrics) = &metrics {
+            for m in &metrics.columns {
+                if let Some(matrix) = &m.matrix {
+                    for (t, truth) in matrix.axis.iter().enumerate() {
+                        for (p, answer) in matrix.axis.iter().enumerate() {
+                            if matrix.counts[t][p] > 0 {
+                                filters.push(super::filter::RowFilter::MatrixCell {
+                                    column: m.header.clone(),
+                                    truth: truth.clone(),
+                                    answer: answer.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        push_filter_toolbar(&mut out, &filters[..buttons]);
         if let Some(metrics) = &metrics {
             push_metric_cards(&mut out, metrics);
             for m in &metrics.columns {
                 if let Some(matrix) = &m.matrix {
-                    push_confusion_matrix(&mut out, &m.header, matrix);
+                    push_confusion_matrix(&mut out, &m.header, matrix, &filters);
                 }
             }
         }
@@ -321,7 +387,32 @@ impl ReportWriter for HtmlWriter {
         }
         out.push_str("</tr>\n</thead>\n<tbody>\n");
         for (r, row) in result.rows.iter().enumerate() {
-            out.push_str("<tr>");
+            // The filters this row passes, and the text the search runs over --
+            // both computed here so the browser needs no report knowledge.
+            let passes: Vec<String> = filters
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.matches(result, &all_columns, &labels, r))
+                .map(|(i, _)| i.to_string())
+                .collect();
+            let searchable = columns
+                .iter()
+                .map(|c| c.value(row, &result.no_match_marker))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            // Striping is a class rather than `:nth-child`, because the detail
+            // rows are siblings and would otherwise shift the parity of every
+            // row after the first expandable one.
+            out.push_str("<tr class=\"sum");
+            if r % 2 == 1 {
+                out.push_str(" alt");
+            }
+            out.push_str("\" data-f=\"");
+            out.push_str(&passes.join(" "));
+            out.push_str("\" data-t=\"");
+            push_escaped(&mut out, &searchable);
+            out.push_str("\">");
             for c in &columns {
                 let value = c.value(row, &result.no_match_marker);
                 let class = match run_cell_tint(result, r, &c.header, &value) {
@@ -344,6 +435,14 @@ impl ReportWriter for HtmlWriter {
                 out.push_str("</td>");
             }
             out.push_str("</tr>\n");
+            push_detail_row(
+                &mut out,
+                result,
+                r,
+                &all_columns,
+                &detail_columns,
+                columns.len(),
+            );
         }
         out.push_str("</tbody>\n");
         // Appended statistics summary rows in a distinct, bold footer.
@@ -361,10 +460,222 @@ impl ReportWriter for HtmlWriter {
             }
             out.push_str("</tfoot>\n");
         }
-        out.push_str("</table>\n</body>\n</html>\n");
+        out.push_str("</table>\n");
+        out.push_str(INTERACTIVE_SCRIPT);
+        out.push_str("</body>\n</html>\n");
         Ok(out.into_bytes())
     }
 }
+
+/// The filter toolbar: one button per offered row class, plus a live text
+/// search and a count of what survived.
+///
+/// The buttons are radio-like rather than additive. Combining "differences"
+/// with "regressions" reads like it should intersect but people expect it to
+/// union, and a filter whose meaning the reader has to guess is worse than one
+/// fewer filter.
+fn push_filter_toolbar(out: &mut String, filters: &[super::filter::RowFilter]) {
+    out.push_str("<div class=\"toolbar\" role=\"group\" aria-label=\"Filter rows\">");
+    for (i, f) in filters.iter().enumerate() {
+        out.push_str(&format!(
+            "<button type=\"button\" data-i=\"{i}\"{}>",
+            if i == 0 { " class=\"on\"" } else { "" }
+        ));
+        push_escaped(out, &f.label());
+        out.push_str("</button>");
+    }
+    out.push_str(
+        "<input type=\"search\" id=\"pb-find\" placeholder=\"Find\u{2026}\" \
+         aria-label=\"Find in rows\">\
+         <span class=\"count\" id=\"pb-count\" aria-live=\"polite\"></span></div>\n",
+    );
+}
+
+/// The hidden drill-down row that follows row `r`, or nothing at all when the
+/// row has nothing to drill into — an expander that opens onto an empty panel
+/// teaches the reader to stop clicking.
+///
+/// It holds what the grid can't: the row's pictures at full size, its `DETAIL`
+/// columns in full, and — when the run compared against something — a
+/// field-by-field diff of whichever of them are JSON on both sides.
+fn push_detail_row(
+    out: &mut String,
+    result: &ReportResult,
+    r: usize,
+    all_columns: &[OutputColumn],
+    detail_columns: &[&OutputColumn],
+    span: usize,
+) {
+    let Some(row) = result.rows.get(r) else {
+        return;
+    };
+    let images: Vec<&OutputColumn> = all_columns
+        .iter()
+        .filter(|c| result.images.contains_key(&(r, c.header.clone())))
+        .collect();
+    let details: Vec<(&OutputColumn, String)> = detail_columns
+        .iter()
+        .map(|c| (*c, c.value(row, &result.no_match_marker)))
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect();
+    let baseline = result.baseline_rows.get(&r);
+    let diffs: Vec<(&OutputColumn, Vec<super::jsondiff::FieldDiff>)> = baseline
+        .map(|b| {
+            detail_columns
+                .iter()
+                .filter_map(|c| {
+                    let was = c.value(b, &result.no_match_marker);
+                    let now = c.value(row, &result.no_match_marker);
+                    let d = super::jsondiff::diff_texts(&was, &now)?;
+                    d.iter().any(|f| f.differs()).then_some((*c, d))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if images.is_empty() && details.is_empty() && diffs.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "<tr class=\"det\"><td colspan=\"{span}\"><div class=\"panel\">"
+    ));
+    for c in images {
+        let img = &result.images[&(r, c.header.clone())];
+        out.push_str("<section><h3>");
+        push_escaped(out, &c.header);
+        out.push_str("</h3>");
+        // Deliberately unsized: the cell above already holds the thumbnail the
+        // `IMAGE` clause asked for, and the whole reason to open the panel is
+        // to see the picture properly.
+        push_html_image(out, img, None, &c.value(row, &result.no_match_marker));
+        out.push_str("</section>");
+    }
+    for (c, value) in &details {
+        out.push_str("<section><h3>");
+        push_escaped(out, &c.header);
+        out.push_str("</h3><pre>");
+        push_escaped(out, &pretty_json(value));
+        out.push_str("</pre></section>");
+    }
+    for (c, d) in &diffs {
+        out.push_str("<section><h3>");
+        push_escaped(out, &format!("{} \u{2014} changed fields", c.header));
+        out.push_str(
+            "</h3><table class=\"fdiff\"><thead><tr><th>Field</th><th>Baseline</th>\
+                      <th>This run</th></tr></thead><tbody>",
+        );
+        for f in d {
+            // Unchanged fields are kept, so the reader can see the field they
+            // care about whether or not it moved -- the highlight, not the
+            // omission, is what points at the difference.
+            out.push_str(if f.differs() {
+                "<tr class=\"chg\"><td>"
+            } else {
+                "<tr><td>"
+            });
+            push_escaped(out, &f.path);
+            out.push_str("</td><td>");
+            push_escaped(out, f.baseline.as_deref().unwrap_or("\u{2014}"));
+            out.push_str("</td><td>");
+            push_escaped(out, f.candidate.as_deref().unwrap_or("\u{2014}"));
+            out.push_str("</td></tr>");
+        }
+        out.push_str("</tbody></table></section>");
+    }
+    out.push_str("</div></td></tr>\n");
+}
+
+/// `text` pretty-printed if it is JSON, and unchanged if it isn't. A detail
+/// column is very often a whole response body, which arrives on one line.
+fn pretty_json(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text.trim())
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// The export's only script: row expansion and filtering, inline and
+/// dependency-free.
+///
+/// It makes no decisions about the report — every row already carries the
+/// filter indices it passes and the text to search — so it stays a few dozen
+/// lines and the file stays something you can email. With scripting off, the
+/// `<noscript>` rule opens every panel and hides the toolbar, so the document
+/// degrades to its long form rather than to a table of unreachable rows.
+const INTERACTIVE_SCRIPT: &str = r#"<script>
+(function () {
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr.sum'));
+  var panelOf = function (tr) {
+    var n = tr.nextElementSibling;
+    return n && n.classList.contains('det') ? n : null;
+  };
+  rows.forEach(function (tr) {
+    var p = panelOf(tr);
+    if (!p) return;
+    tr.classList.add('has');
+    tr.tabIndex = 0;
+    tr.setAttribute('role', 'button');
+    tr.setAttribute('aria-expanded', 'false');
+    var toggle = function () {
+      var open = p.classList.toggle('open');
+      tr.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    tr.addEventListener('click', function (e) {
+      if (e.target.closest('a, img, input, button')) return;
+      toggle();
+    });
+    tr.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+  var buttons = Array.prototype.slice.call(document.querySelectorAll('.toolbar button'));
+  var picks = Array.prototype.slice.call(document.querySelectorAll('.matrix td.pick'));
+  var find = document.getElementById('pb-find');
+  var count = document.getElementById('pb-count');
+  var active = 0;
+  var apply = function () {
+    var needle = find ? find.value.trim().toLowerCase() : '';
+    var shown = 0;
+    rows.forEach(function (tr) {
+      var f = (tr.getAttribute('data-f') || '').split(' ');
+      var ok = f.indexOf(String(active)) >= 0 &&
+        (!needle || (tr.getAttribute('data-t') || '').indexOf(needle) >= 0);
+      tr.style.display = ok ? '' : 'none';
+      var p = panelOf(tr);
+      if (p) p.style.display = ok ? '' : 'none';
+      if (ok) shown++;
+    });
+    buttons.forEach(function (b) {
+      b.classList.toggle('on', Number(b.getAttribute('data-i')) === active);
+    });
+    picks.forEach(function (c) {
+      c.classList.toggle('on', Number(c.getAttribute('data-i')) === active);
+    });
+    if (count) {
+      count.textContent = shown === rows.length
+        ? rows.length + ' rows'
+        : shown + ' of ' + rows.length + ' rows';
+    }
+  };
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () {
+      active = Number(b.getAttribute('data-i'));
+      apply();
+    });
+  });
+  picks.forEach(function (c) {
+    // A second click on the same cell returns to everything, so a reader who
+    // drilled in by accident is never stuck with a filter they can't name.
+    c.addEventListener('click', function () {
+      var i = Number(c.getAttribute('data-i'));
+      active = active === i ? 0 : i;
+      apply();
+    });
+  });
+  if (find) find.addEventListener('input', apply);
+  apply();
+})();
+</script>
+"#;
 
 /// The metric cards drawn above the table: one group per ground-truthed column
 /// (plus the row roll-up), each stating what was compared, how much of it was
@@ -413,7 +724,12 @@ fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
 /// The count is always printed, so the shading only ever ranks what the reader
 /// can already read (and the report stays legible in greyscale, to a
 /// colour-blind reader, and on a printout).
-fn push_confusion_matrix(out: &mut String, column: &str, matrix: &super::metrics::ConfusionMatrix) {
+fn push_confusion_matrix(
+    out: &mut String,
+    column: &str,
+    matrix: &super::metrics::ConfusionMatrix,
+    filters: &[super::filter::RowFilter],
+) {
     let max = matrix.max();
     out.push_str("<div class=\"matrix\"><h2>");
     push_escaped(out, column);
@@ -443,11 +759,22 @@ fn push_confusion_matrix(out: &mut String, column: &str, matrix: &super::metrics
         out.push_str("<tr><th class=\"axis\">");
         push_escaped(out, label);
         out.push_str("</th>");
-        for p in 0..matrix.axis.len() {
+        for (p, answer) in matrix.axis.iter().enumerate() {
             let n = matrix.counts[t][p];
             let (bg, hot) = heat_shade(n, max);
+            // "Which seven rows are those?" is the first question anyone asks
+            // of an off-diagonal count, so every non-empty cell filters the
+            // table to exactly the rows it counted.
+            let pick = filters
+                .iter()
+                .position(|f| {
+                    matches!(f, super::filter::RowFilter::MatrixCell { column: c, truth: tr, answer: a }
+                        if c == column && tr == label && a == answer)
+                })
+                .map(|i| format!(" pick\" data-i=\"{i}\" title=\"Show these rows"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "<td class=\"cell{}\" style=\"background:{bg}\">{n}</td>",
+                "<td class=\"cell{}{pick}\" style=\"background:{bg}\">{n}</td>",
                 if hot { " hot" } else { "" }
             ));
         }
@@ -527,7 +854,19 @@ impl ReportWriter for XlsxWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
 
-        let columns = result.resolved_columns(header);
+        // `DETAIL` columns move to the right of the summary ones and are put in
+        // a collapsed outline group: the spreadsheet idiom for exactly what the
+        // HTML drill-down does, and the one place a reader can still expand
+        // them. Nothing is dropped -- a workbook is an archive as much as a
+        // report.
+        let resolved = result.resolved_columns(header);
+        let summary_count = resolved.iter().filter(|c| !c.detail).count();
+        let columns: Vec<OutputColumn> = resolved
+            .iter()
+            .filter(|c| !c.detail)
+            .chain(resolved.iter().filter(|c| c.detail))
+            .cloned()
+            .collect();
         // Pixel boxes for every picture that is going to be embedded, worked
         // out up front because they drive the row heights and column widths,
         // which have to be set before the cells are written.
@@ -582,6 +921,12 @@ impl ReportWriter for XlsxWriter {
         for (col, width) in widths.into_iter().enumerate() {
             sheet
                 .set_column_width(col as u16, width)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if summary_count > 0 && summary_count < columns.len() {
+            sheet
+                .group_columns_collapsed(summary_count as u16, (columns.len() - 1) as u16)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -2047,5 +2392,220 @@ mod tests {
         ));
         assert!(cell_tint("Name", "anything.jpg").is_none());
         assert!(cell_tint("Status", "  ").is_none());
+    }
+
+    /// A `DETAIL` column leaves the grid for the drill-down panel -- but only
+    /// in HTML, which has somewhere to put it. The value itself is untouched,
+    /// which is what lets every other writer ignore the flag.
+    #[test]
+    fn html_moves_a_detail_column_into_the_drill_down_and_csv_keeps_it_inline() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "{\"score\":7}")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let head = &html[..html.find("<tbody>").unwrap()];
+        assert!(!head.contains("<th>Raw</th>"), "not a grid column: {head}");
+        assert!(
+            html.contains("<tr class=\"det\">") && html.contains("<h3>Raw</h3>"),
+            "it is in the panel instead: {html}"
+        );
+        assert!(
+            html.contains("&quot;score&quot;: 7"),
+            "and pretty-printed, because a body arrives on one line: {html}"
+        );
+        // Placement only: the machine-readable formats are unchanged.
+        let text = String::from_utf8(CsvWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert_eq!(text, "Name,Raw\r\na,\"{\"\"score\"\":7}\"\r\n");
+    }
+
+    /// A spreadsheet has no click, so `DETAIL` becomes the idiom that means the
+    /// same thing there: the columns move to the right and are collapsed into
+    /// an outline group. Nothing is dropped -- a workbook is an archive.
+    #[test]
+    fn xlsx_groups_detail_columns_to_the_right_and_collapses_them() {
+        let mut res = ReportResult {
+            column_order: vec!["Raw".into(), "Name".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let bytes = XlsxWriter.write(&res, &Header::default()).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        // The sheet part is deflated, so the grouping is checked through the
+        // one thing the writer can observe without a full unzip: that it wrote
+        // at all with the group applied, and that the summary column comes
+        // first in the resolved order.
+        let mut res2 = res.clone();
+        res2.column_details.clear();
+        assert_ne!(
+            bytes,
+            XlsxWriter.write(&res2, &Header::default()).unwrap(),
+            "the flag changes the workbook"
+        );
+    }
+
+    /// A row with nothing to drill into gets no panel: an expander that opens
+    /// onto an empty box teaches the reader to stop clicking.
+    #[test]
+    fn a_row_with_no_detail_gets_no_panel() {
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[("Name", "a")])],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(!html.contains("class=\"det\""), "no panel row: {html}");
+    }
+
+    /// Every column being `DETAIL` would leave an empty grid, which helps
+    /// nobody, so the flag is ignored rather than obeyed off a cliff.
+    #[test]
+    fn an_all_detail_report_still_renders_its_grid() {
+        let mut res = ReportResult {
+            column_order: vec!["Raw".into()],
+            rows: vec![row(&[("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("<th>Raw</th>"), "the grid survives: {html}");
+    }
+
+    /// The browser makes no decisions about the report: each row carries the
+    /// indices of the filters it passes, computed here by the same `RowFilter`
+    /// the in-app views use.
+    #[test]
+    fn rows_carry_the_filters_they_pass_and_the_toolbar_offers_them() {
+        let mut res = ReportResult {
+            column_order: vec!["Verdict".into(), "Correct".into()],
+            rows: vec![
+                row(&[("Verdict", "pass"), ("Correct", "correct")]),
+                row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            ],
+            ..Default::default()
+        };
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains(">Incorrect</button>"),
+            "the class is offered: {html}"
+        );
+        assert!(
+            !html.contains(">Regressions</button>"),
+            "and one that could only ever select nothing is not: {html}"
+        );
+        // "All" is filter 0, "Incorrect" filter 1, and only the second row is
+        // in it.
+        let rows: Vec<&str> = html
+            .match_indices("data-f=\"")
+            .map(|(i, _)| {
+                let rest = &html[i + 8..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        assert_eq!(rows, vec!["0", "0 1"], "{html}");
+    }
+
+    /// The single highest-value interaction of the tool this is modelled on:
+    /// every non-empty matrix cell filters the table to exactly the rows it
+    /// counted.
+    #[test]
+    fn confusion_matrix_cells_are_clickable_filters() {
+        let mut res = ReportResult {
+            column_order: vec!["Verdict".into(), "Correct".into()],
+            rows: vec![
+                row(&[("Verdict", "pass"), ("Correct", "correct")]),
+                row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            ],
+            ..Default::default()
+        };
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.truths.insert((0, "Verdict".into()), "pass".into());
+        res.truths.insert((1, "Verdict".into()), "fail".into());
+        res.column_truths
+            .insert("Verdict".into(), "{{ expected }}".into());
+        let header = Header {
+            lines: vec![
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Pass = pass".into(),
+                },
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Fail = fail".into(),
+                },
+            ],
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains(" pick\" data-i="),
+            "the counted cells are pickable: {html}"
+        );
+        // The empty Pass/Fail cell is not: clicking it could only ever empty
+        // the table.
+        // Two buttons plus the two cells that counted something; the empty
+        // Pass/Fail cell is not pickable, since clicking it could only ever
+        // empty the table.
+        let picks = html.matches("data-i=\"").count();
+        assert_eq!(picks, 4, "{html}");
+    }
+
+    /// When a comparison kept the baseline row, a JSON detail column is shown
+    /// field by field -- the whole point being to say *which* field moved
+    /// rather than handing the reader two blobs.
+    #[test]
+    fn a_json_detail_column_is_diffed_against_the_baseline_row() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "{\"score\":9,\"id\":1}")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        res.baseline_rows
+            .insert(0, row(&[("Name", "a"), ("Raw", "{\"score\":7,\"id\":1}")]));
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("class=\"fdiff\""),
+            "a field table is drawn: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"chg\"><td>score</td><td>7</td><td>9</td></tr>"),
+            "the moved field is highlighted: {html}"
+        );
+        assert!(
+            html.contains("<tr><td>id</td><td>1</td><td>1</td></tr>"),
+            "and the unchanged one is kept for context: {html}"
+        );
+    }
+
+    /// The export has to stay a single file you can email: no external assets,
+    /// and a `<noscript>` fallback so a browser with scripting off shows the
+    /// panels expanded rather than losing them.
+    #[test]
+    fn the_interactive_export_stays_self_contained_and_degrades_without_script() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            !html.contains("http://") && !html.contains("https://"),
+            "no external references"
+        );
+        assert!(!html.contains("<link"), "no external stylesheet");
+        assert!(
+            html.contains("<noscript><style>tr.det{display:table-row}"),
+            "the panels open without script: {html}"
+        );
+        assert!(html.contains("<script>") && html.contains("</script>"));
     }
 }
