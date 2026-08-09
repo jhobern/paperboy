@@ -102,6 +102,61 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   so unsaved edits are seen; otherwise it is read from disk. A `git:` helper
   must be opened first, since validating a report should not do network I/O.
 
+### Changed
+
+- **Summary statistics are behind a toggle in the TUI's `WITH` field editor.**
+  The six `STATISTICS(…)` choices used to be listed unconditionally, which made
+  the wizard mostly a wall of checkboxes for the common case of a plain column.
+  There is now a *Summary statistics* switch, and the choices only appear while
+  it is on. Turning it on seeds `COUNT` so the clause is never empty, and
+  turning it off clears the ticks — a hidden list can't leave a clause behind.
+
+- **A hovered tile in the GUI block editor recolours itself.** The hover
+  highlight used to be a band painted *behind* the row, which was easy to miss
+  on a densely packed row. The tiles that a drag would carry now deepen their
+  own fill and outline as well, so what is about to move is obvious before the
+  mouse button goes down. The tile keeps its own colour — only the intensity
+  changes — and the label is untouched.
+
+- **The GUI's *Report Settings* panel fills the pane and says what it is.** It
+  was laid out in a fixed-width box with a wide empty margin to its right, and
+  carried no heading to explain what the directives above the report were.
+
+### Fixed
+
+- **A commented-out column inside a `WITH` block is no longer destroyed by the
+  editors.** Comments survived everywhere else in a report, but a `WITH` block
+  had nowhere in the syntax tree to keep one, so commenting a column out and
+  then touching that request from either editor silently deleted the line. A
+  commented `WITH` field is now kept verbatim, in place, and shown dimmed in the
+  outline so it can be found again to uncomment. It is not offered to the field
+  editor, since there is no field there to edit.
+
+- **A renamed timing column no longer makes every row of a comparison
+  differ.** Timing intrinsics were excluded from baseline and `ENVS`
+  comparisons by *column name*, so `"Response Time": Time STATISTICS(MEAN)` in
+  a `WITH` block produced a column whose name is not an intrinsic and was
+  compared — and an elapsed time never repeats, so every row read as changed
+  and buried the differences that mattered. Timing columns are now recorded by
+  **provenance** when the report runs: `Time`, `TimeSetup`, `TimeWait` and
+  `TimeDownload` are left out of the diff under any name. Non-timing intrinsics
+  are unaffected — a renamed `Status` still shows when it changes.
+
+- **The TUI `WITH` field wizard closes back to where it was opened from.**
+  Pressing Enter or Escape in the wizard reached from *+ add a field* in the
+  outline dropped you into the full request form, which then had to be closed
+  as well. It also left the cursor on the request line rather than the field
+  that had just been edited.
+
+- **HTML exports no longer squeeze their columns.** The table was laid out at
+  `width:100%`, so a browser narrowed every column to fit the page and then
+  broke text inside words — an `Environment` header came out as "Enviro" /
+  "ment" with every value under it wrapped. Columns are now sized to their
+  content the same way the xlsx export sizes them (clamped to a readable range,
+  so one enormous JSON body can't push everything else off the page), headers
+  are never broken mid-word, and a wide report scrolls sideways instead of
+  being crushed.
+
 
 ## [0.7.3] - 2026-08-08
 

@@ -559,6 +559,12 @@ struct Chip {
     /// never drawn joined to something that has left its slot.
     join_prev: bool,
     join_next: bool,
+    /// This chip's row is the one under the pointer, or travels with it. Drawn
+    /// in a stronger version of its own colour — see [`chip_colors`]. Set by
+    /// the row loop from *last* frame's hover group, because which rows light
+    /// up isn't known until every row has been measured (see
+    /// [`paint_hover_group`]).
+    hovered: bool,
 }
 
 impl Chip {
@@ -705,6 +711,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
@@ -718,6 +725,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     /// The request base chip, whose name is picked from an inline dropdown.
@@ -734,6 +742,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     /// A `BASELINE`/`COMPARISON` chip carrying a single-environment dropdown.
@@ -755,6 +764,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     /// An `AS <alias>` chip whose alias is edited inline. `detach` is `Some(As)`
@@ -773,6 +783,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     /// A `FOR` loop head whose variable, folder and glob are edited inline.
@@ -788,6 +799,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
     /// A `PARALLEL` chip whose concurrency limit is edited inline.
@@ -802,6 +814,7 @@ impl Chip {
             tethered: false,
             join_prev: false,
             join_next: false,
+            hovered: false,
         }
     }
 }
@@ -3804,6 +3817,12 @@ fn block_row(
             let node = ed.flow.as_ref().and_then(|f| node_at(f, p))?;
             Some((p.clone(), *w, carry_modifier(node, *w)?))
         });
+    // Whether this row is in last frame's hover group, which is what colours
+    // its chips (see `hover_group_id`). `END` is excluded: it is the tail of
+    // the loop above it, and lighting it as a chip of its own made a loop look
+    // like it had a second, separate block at the bottom.
+    let hover_lit = row.kind != RowKind::LoopEnd
+        && hovered_last_frame(ui).is_some_and(|h| hover_tier(&h, &row.path).is_some());
     // The gap this row opened for a hovering modifier, decided by last frame's
     // drop zone (see `mod_ghost_id`).
     let mod_ghost: Option<(usize, String, f32)> = ui
@@ -3846,12 +3865,24 @@ fn block_row(
                 // The GUI never asks for expanded `WITH` rows (it draws each
                 // field as a chip on the request's own row), so these are
                 // unreachable here — see `flatten_expanded`.
-                RowKind::WithField(_) | RowKind::WithAdd | RowKind::WithEnd => {}
+                RowKind::WithField(_)
+                | RowKind::WithComment(_)
+                | RowKind::WithAdd
+                | RowKind::WithEnd => {}
                 RowKind::Leaf | RowKind::LoopHead | RowKind::Comment => {
                     let mut chips = node
                         .as_ref()
                         .map(|n| node_chips(n, row.req_ok, &th, s))
                         .unwrap_or_default();
+                    // Deepen the whole row's chips while it is in the hover
+                    // group, so what a drag would pick up is legible even on a
+                    // row whose chips leave almost none of the panel behind
+                    // them showing.
+                    if hover_lit {
+                        for chip in &mut chips {
+                            chip.hovered = true;
+                        }
+                    }
                     // Merge each tethered chip into one pill with the chip it
                     // qualifies (see `link_tethers`) — except where the two are
                     // about to stop being neighbours, because either half is in
@@ -4240,10 +4271,16 @@ fn hovered_block(rows: &[RowHover]) -> Option<&[usize]> {
 /// ghosts behind — and adding a second, differently-shaped highlight to that
 /// only muddled which of the two to read.
 fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
-    if drag_in_flight(ui.ctx()) {
-        return;
-    }
-    let Some(hovered) = hovered_block(rows) else {
+    let hovered = (!drag_in_flight(ui.ctx()))
+        .then(|| hovered_block(rows))
+        .flatten();
+    // Hand the group to the next frame, where the chips are drawn: a chip is
+    // painted long before the pane has been measured, so it can't ask which row
+    // is hovered — see `hover_group_id`. Written unconditionally, `None`
+    // included, or the chips would stay lit after the pointer left.
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(hover_group_id(), hovered.map(<[usize]>::to_vec)));
+    let Some(hovered) = hovered else {
         return;
     };
     // Derived from the panel colour rather than fixed, so the highlight stays a
@@ -4267,6 +4304,22 @@ fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
             ),
         );
     }
+}
+
+/// The ctx-data key the hover group is parked under for the next frame.
+///
+/// Same one-frame hand-off as [`mod_ghost_id`], and for the same reason: which
+/// rows are in the group isn't known until every row has been laid out, but the
+/// chips have to be coloured while they are drawn. A single frame's lag on a
+/// pointer that stays put for many is invisible.
+fn hover_group_id() -> egui::Id {
+    egui::Id::new("pt_hovergroup")
+}
+
+/// The hover group last frame settled on, for a row that needs to colour its
+/// chips before this frame's group is known.
+fn hovered_last_frame(ui: &egui::Ui) -> Option<Vec<usize>> {
+    ui.ctx().data(|d| d.get_temp(hover_group_id())).flatten()
 }
 
 /// Whether anything at all is currently being dragged in the block editor — a
@@ -4294,7 +4347,6 @@ fn with_block(
     acts: &mut Vec<Act>,
 ) -> egui::Rect {
     let field_indent = (depth as f32 + 1.0) * INDENT_STEP;
-    let tint = chip_tint(th, th.subst);
     ui.vertical(|ui| {
         for (i, item) in items.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -4326,6 +4378,15 @@ fn with_block(
                             crate::report::flow::ResponseFmt::Pretty => "PRETTY",
                         }
                     ),
+                    WithItem::Comment(text) => format!("#{text}"),
+                };
+                // A commented-out line reads as a comment, not as a field it
+                // isn't: dimmed like a `FlowNode::Comment` block. It keeps its
+                // `×` so it can be deleted, but has no wizard.
+                let tint = if matches!(item, WithItem::Comment(_)) {
+                    chip_tint(th, th.dim)
+                } else {
+                    chip_tint(th, th.subst)
                 };
                 let lbl = chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
                     let lbl = ui.add(
@@ -4763,6 +4824,15 @@ fn settings_panel(
 ) {
     let specs = header_specs();
     settings_frame(th).show(ui, |ui| {
+        // A heading, because the frame alone only said "these are grouped", not
+        // what the group *is*. The same words the TUI's panel uses.
+        ui.label(
+            RichText::new(s.report_settings_heading)
+                .color(th.dim)
+                .small()
+                .strong(),
+        )
+        .on_hover_text(s.report_settings_help);
         // One setting per line, each starting at the same left edge as `BEGIN`
         // below. Laying them out in a row instead left them ragged — a combo
         // chip and a text chip are different widths and sit differently in a
@@ -4816,20 +4886,18 @@ fn settings_panel(
     });
 }
 
-/// How wide the settings panel is drawn.
+/// How wide the settings panel is drawn: the full width of the editor pane.
 ///
-/// Deliberately fixed rather than shrink-wrapped: the contents change width
-/// constantly (picking a longer collection name, adding a setting, clearing
-/// one) and a panel that resized with them would make the whole view twitch
-/// every time a dropdown was used. It still yields to a narrow editor pane so
-/// the panel can never overflow its column.
-///
-/// Wide enough for a realistic collection or baseline name to sit in its
-/// dropdown unabbreviated: these are file names, and truncating them to
-/// `billing-servi…` defeats the point of showing names instead of paths.
+/// Not shrink-wrapped to its contents, which change width constantly (picking a
+/// longer collection name, adding a setting, clearing one) — a panel that
+/// resized with them would make the whole view twitch every time a dropdown was
+/// used. Filling the pane is just as stable and doesn't leave the panel
+/// stranded in a sea of empty space, which made it read as a stray tooltip
+/// rather than as the report's own settings. It also gives a long collection
+/// path or output name room to sit unabbreviated, instead of being truncated to
+/// `billing-servi…` in a box that had space to spare beside it.
 fn settings_width(ui: &egui::Ui) -> f32 {
-    const SETTINGS_W: f32 = 460.0;
-    SETTINGS_W.min(ui.available_width())
+    ui.available_width()
 }
 
 /// The menu offering the optional directives that aren't set yet.
@@ -5514,6 +5582,11 @@ fn chip_shell<R>(
 /// the same thing, but only one of them fills the window with colour.
 const CHIP_FILL_MIX: f32 = 0.05;
 const CHIP_STROKE_MIX: f32 = 0.16;
+/// The same two mixes for a chip in the hover group. The fill carries the
+/// change (a chip is mostly fill); the stroke follows so the edge doesn't
+/// disappear into the stronger fill behind it.
+const CHIP_FILL_MIX_HOVER: f32 = 0.32;
+const CHIP_STROKE_MIX_HOVER: f32 = 0.55;
 const CHIP_TEXT_MIX: f32 = 0.45;
 
 /// The width of the category rule down a chip's leading edge.
@@ -5558,7 +5631,15 @@ fn chip_tint(th: &GuiTheme, color: Color32) -> ChipTint {
     }
 }
 
-/// The colours for a chip, honouring the selected-base highlight.
+/// The colours for a chip, honouring the selected-base highlight and the hover
+/// group.
+///
+/// Hovering deepens the chip's *own* colour rather than tinting it towards a
+/// single highlight hue: the colour is what says which kind of block this is, so
+/// a highlight that overwrote it would cost more than it gave. The panel behind
+/// the row says the same thing, but on a row whose chips cover most of their
+/// width there is barely any panel left to see — which is exactly the row where
+/// knowing what a drag would pick up matters most.
 fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
     let mut tint = if chip.is_base && selected {
         // Keep the stroke *width* identical to the unselected state (only the
@@ -5571,6 +5652,17 @@ fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
             stroke: egui::Stroke::new(1.0, th.select_fg),
             text: th.select_fg,
             rule: None,
+        }
+    } else if chip.hovered {
+        ChipTint {
+            fill: mix(th.panel, chip.color, CHIP_FILL_MIX_HOVER),
+            stroke: egui::Stroke::new(1.0, mix(th.panel, chip.color, CHIP_STROKE_MIX_HOVER)),
+            // The label is left alone: it is already at full contrast, and
+            // pushing it further only made hovered text look bolder than its
+            // neighbours, which reads as a different *kind* of chip rather than
+            // as the same chip highlighted.
+            text: mix(th.text, chip.color, CHIP_TEXT_MIX),
+            rule: Some(chip.color),
         }
     } else {
         chip_tint(th, chip.color)
@@ -8048,8 +8140,10 @@ mod tests {
         );
     }
 
-    /// The panel keeps its width whatever it happens to contain: a box that
-    /// grew and shrank as dropdowns were used would make the view twitch.
+    /// The panel spans the editor pane and keeps that width whatever it happens
+    /// to contain: a box that grew and shrank as dropdowns were used would make
+    /// the view twitch, and one sized to its contents left the settings adrift
+    /// in empty space with their own values truncated beside it.
     #[test]
     fn the_settings_panel_keeps_its_width_whatever_it_holds() {
         let ctx = egui::Context::default();
@@ -8075,12 +8169,17 @@ mod tests {
             bare.width(),
             full.width()
         );
+        assert!(
+            bare.width() > 500.0,
+            "the panel fills the 600px pane rather than sitting in a corner of it, got {}",
+            bare.width()
+        );
 
-        // It still yields to a column narrower than its fixed width, so the
-        // panel never forces a wide editor pane. It can only give back what its
-        // contents don't need: a dropdown has a minimum width of its own, which
-        // is the floor here, so the test asserts it shrank rather than naming a
-        // width the chips can't actually reach.
+        // It still yields to a narrow column, so the panel never forces a wide
+        // editor pane. It can only give back what its contents don't need: a
+        // dropdown has a minimum width of its own, which is the floor here, so
+        // the test asserts it shrank rather than naming a width the chips can't
+        // actually reach.
         let (narrow, _) = run_settings_panel(&ctx, &[("collection", "c.hurl")], 120.0);
         assert!(
             narrow.width() < bare.width(),
@@ -8088,6 +8187,47 @@ mod tests {
             narrow.width(),
             bare.width()
         );
+    }
+
+    /// The hover highlight paints a panel *behind* the row, which a row whose
+    /// chips cover most of its width almost entirely hides — so the chips
+    /// themselves deepen too. Their own colour is kept: it is what says which
+    /// kind of block this is.
+    #[test]
+    fn a_hovered_chip_deepens_its_own_colour() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let mut chip = Chip::base("REQUEST login".into(), th.accent);
+        let plain = chip_colors(&th, &chip, false);
+        chip.hovered = true;
+        let lit = chip_colors(&th, &chip, false);
+
+        // Deeper, not merely different: the fill has moved further from the
+        // panel colour it started at.
+        let dist = |c: Color32| {
+            let d = |a: u8, b: u8| (a as f32 - b as f32).abs();
+            d(c.r(), th.panel.r()) + d(c.g(), th.panel.g()) + d(c.b(), th.panel.b())
+        };
+        assert!(
+            dist(lit.fill) > dist(plain.fill) + 1.0,
+            "hovered fill {:?} is no deeper than {:?} against panel {:?}",
+            lit.fill,
+            plain.fill,
+            th.panel
+        );
+        assert!(
+            dist(lit.stroke.color) > dist(plain.stroke.color) + 1.0,
+            "the edge follows the fill so it doesn't vanish into it"
+        );
+        assert_eq!(
+            lit.text, plain.text,
+            "the label is left alone — a bolder-looking label reads as a different kind of chip"
+        );
+        assert_eq!(lit.rule, plain.rule, "the colour rule still identifies it");
+
+        // Selection still wins on the base chip: a chip can be both, and
+        // selection is the one the user set deliberately.
+        let sel = chip_colors(&th, &chip, true);
+        assert_eq!(sel.fill, th.select_bg);
     }
 
     /// The key label in a combo-box setting is centred against the combo, not
