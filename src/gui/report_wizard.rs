@@ -18,7 +18,7 @@ use crate::report::context;
 use crate::report::edit::node_at;
 use crate::report::flow::{
     EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef,
-    WithItem,
+    ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -192,6 +192,10 @@ pub struct RequestForm {
     alias: String,
     /// The `SHOW(…)` checklist: `(field, included)`. All ticked ⇒ no clause.
     fields: Vec<(String, bool)>,
+    /// Any `STATISTICS(…)` the `SHOW(…)` fields carried. The checklist has no
+    /// row for them; they are kept so applying the form can't delete a clause
+    /// the user wrote in the source.
+    show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// The `HIDE(…)` checklist over the same field list: `(field, hidden)`.
     /// None ticked ⇒ no clause. `HIDE` subtracts from whatever `SHOW` selected,
     /// so both lists cover the same names.
@@ -204,7 +208,7 @@ impl RequestForm {
     /// The `SHOW(…)` list for the ticked rows; empty when the ticked set is
     /// exactly what the request emits without a clause — every field except the
     /// opt-in timing intrinsics (⇒ no clause).
-    fn show(&self) -> Vec<String> {
+    fn show(&self) -> Vec<ShowField> {
         if self
             .fields
             .iter()
@@ -215,7 +219,12 @@ impl RequestForm {
         self.fields
             .iter()
             .filter(|(_, on)| *on)
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| ShowField {
+                field: n.clone(),
+                // Carried through, never edited: the checklist has no row for a
+                // `STATISTICS(…)` clause, and editing must not delete one.
+                stats: self.show_stats.get(n).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -281,6 +290,9 @@ pub struct EnvsForm {
     /// `baseline_show` means "no SHOW clause", which is NOT the same as "show
     /// everything" — so nothing is ticked by default.
     baseline_show_fields: Vec<(String, bool)>,
+    /// Any `STATISTICS(…)` on the `BASELINE(…) SHOW(…)` fields, carried through
+    /// untouched for the same reason as [`RequestForm::show_stats`].
+    show_stats: std::collections::HashMap<String, Vec<StatKind>>,
 }
 
 impl EnvsForm {
@@ -300,11 +312,14 @@ impl EnvsForm {
     /// means "copy nothing across", which is the language's default, so there
     /// is no ambiguity with the request-level `SHOW` where empty means "show
     /// everything".
-    fn selected_baseline_show(&self) -> Vec<String> {
+    fn selected_baseline_show(&self) -> Vec<ShowField> {
         self.baseline_show_fields
             .iter()
             .filter(|(_, on)| *on)
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| ShowField {
+                field: n.clone(),
+                stats: self.show_stats.get(n).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -750,7 +765,7 @@ fn build_request(
         }
     }
     for f in &show {
-        push(f, &mut names);
+        push(f.name(), &mut names);
     }
     // A HIDE entry naming a field nothing else knows about still has to appear
     // in the checklist, or applying the form would silently drop it.
@@ -765,7 +780,7 @@ fn build_request(
         .iter()
         .map(|n| {
             let on = (all && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&n.as_str()))
-                || show.iter().any(|s| s == n);
+                || show.iter().any(|s| s.name() == n);
             (n.clone(), on)
         })
         .collect();
@@ -782,6 +797,11 @@ fn build_request(
         response,
         alias: alias.unwrap_or_default(),
         fields,
+        show_stats: show
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect(),
         hide_fields,
         with,
     }
@@ -863,6 +883,11 @@ fn build_envs(
     EnvsForm {
         path,
         var,
+        show_stats: baseline_show
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect(),
         compare,
         parallel: parallel.is_some(),
         degree: degree_text(&parallel),
@@ -1651,6 +1676,7 @@ mod tests {
         EnvsForm {
             path: vec![0],
             var: "TARGET".into(),
+            show_stats: Default::default(),
             compare: true,
             parallel: false,
             degree: String::new(),
@@ -1748,6 +1774,27 @@ mod tests {
             baseline_show,
             vec!["Time".to_string(), "Response".to_string()],
             "the ticked fields become the SHOW list, in the checklist's own order"
+        );
+    }
+
+    /// The checklist has no widget for a `STATISTICS(...)` clause, so it must
+    /// carry one through untouched -- ticking a box in a form that never showed
+    /// the clause must not silently delete it from the source.
+    #[test]
+    fn editing_the_baseline_checklist_keeps_a_show_field_s_statistics_clause() {
+        let mut form = compare_form(vec![("Time".into(), true), ("Status".into(), true)]);
+        form.show_stats.insert("Time".into(), vec![StatKind::Mean]);
+        let Some(EnvClause::Roles { baseline_show, .. }) = form.clause() else {
+            panic!("a compare form describes a Roles clause")
+        };
+        let time = baseline_show
+            .iter()
+            .find(|f| f.field == "Time")
+            .expect("Time stays in the SHOW list");
+        assert_eq!(
+            time.stats,
+            vec![StatKind::Mean],
+            "its STATISTICS clause survives the round trip: {baseline_show:?}"
         );
     }
 

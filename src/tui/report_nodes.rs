@@ -31,7 +31,7 @@ use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
     Element, EnvClause, FlowNode, ImageSpec, ParallelSpec, Pattern, Producer, ReportStmt,
-    ResponseFmt, RoleBinding, RoleRef, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -139,6 +139,10 @@ pub(crate) struct RequestForm {
     pub(crate) alias: String,
     /// The `SHOW(…)` field checklist.
     pub(crate) fields: Vec<ShowRow>,
+    /// Any `STATISTICS(…)` the `SHOW(…)` fields carried, kept so editing the
+    /// checklist can't silently delete a clause the form has no row for — the
+    /// same carry-through rule the `IMAGE`/`TRUTH` clauses get.
+    pub(crate) show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
@@ -167,7 +171,7 @@ impl RequestForm {
         report: bool,
         alias: Option<String>,
         response: Option<ResponseFmt>,
-        current_show: &[String],
+        current_show: &[ShowField],
         report_fields: &[String],
         with: Vec<WithItem>,
         hide: Vec<String>,
@@ -196,7 +200,7 @@ impl RequestForm {
         }
         // Preserve any unknown SHOW entry so applying can't drop it.
         for f in current_show {
-            push(f, &mut names);
+            push(f.name(), &mut names);
         }
         // A `HIDE` entry naming something no request offers is kept too, for
         // the same reason: applying must not drop what the user wrote.
@@ -212,7 +216,7 @@ impl RequestForm {
             .map(|name| {
                 let included = (all
                     && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&name.as_str()))
-                    || current_show.iter().any(|s| s == name);
+                    || current_show.iter().any(|s| s.name() == name);
                 ShowRow {
                     name: name.clone(),
                     included,
@@ -232,6 +236,12 @@ impl RequestForm {
             request,
             titles,
             report,
+            // Carried, never edited: the checklist has no row for a statistic.
+            show_stats: current_show
+                .iter()
+                .filter(|f| !f.stats.is_empty())
+                .map(|f| (f.field.clone(), f.stats.clone()))
+                .collect(),
             response,
             alias: alias.unwrap_or_default(),
             fields,
@@ -277,7 +287,7 @@ impl RequestForm {
     /// field except the opt-in timing intrinsics — it returns empty (⇒ no
     /// `SHOW` clause), so leaving the form as it opened removes any existing
     /// clause rather than freezing the current selection into one.
-    fn show(&self) -> Vec<String> {
+    fn show(&self) -> Vec<ShowField> {
         if self.fields.iter().all(|r| {
             r.included != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&r.name.as_str())
         }) {
@@ -286,7 +296,10 @@ impl RequestForm {
         self.fields
             .iter()
             .filter(|r| r.included)
-            .map(|r| r.name.clone())
+            .map(|r| ShowField {
+                field: r.name.clone(),
+                stats: self.show_stats.get(&r.name).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -873,6 +886,9 @@ pub(crate) struct EnvsForm {
     /// Seeded from the report directory plus any snapshot paths already in the
     /// clause, so an existing `FILE(…)` value is always in the cycle.
     pub(crate) snapshots: Vec<String>,
+    /// Any `STATISTICS(…)` the `BASELINE(…) SHOW(…)` fields carried — carried
+    /// through untouched, like [`RequestForm::show_stats`].
+    pub(crate) show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
     /// `PARALLEL(n)`'s max-concurrency as typed text, so the row can be left
@@ -955,10 +971,15 @@ impl EnvsForm {
             .into_iter()
             .map(|(name, included)| ShowRow { name, included })
             .collect();
-        for name in &baseline_show_names {
-            if !baseline_show.iter().any(|r| &r.name == name) {
+        let show_stats: std::collections::HashMap<String, Vec<StatKind>> = baseline_show_names
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect();
+        for f in &baseline_show_names {
+            if !baseline_show.iter().any(|r| r.name == f.field) {
                 baseline_show.push(ShowRow {
-                    name: name.clone(),
+                    name: f.field.clone(),
                     included: true,
                 });
             }
@@ -967,6 +988,7 @@ impl EnvsForm {
             report_id,
             path,
             var,
+            show_stats,
             compare,
             parallel: parallel.is_some(),
             degree: parallel
@@ -1006,11 +1028,14 @@ impl EnvsForm {
     }
 
     /// The ticked `BASELINE(…) SHOW(…)` fields, in checklist order.
-    fn selected_baseline_show(&self) -> Vec<String> {
+    fn selected_baseline_show(&self) -> Vec<ShowField> {
         self.baseline_show
             .iter()
             .filter(|r| r.included)
-            .map(|r| r.name.clone())
+            .map(|r| ShowField {
+                field: r.name.clone(),
+                stats: self.show_stats.get(&r.name).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 

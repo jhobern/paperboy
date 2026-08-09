@@ -20,7 +20,7 @@
 use crate::i18n::Strings;
 use crate::report::flow::{
     Binder, EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow,
-    ReportStmt, ResponseFmt, RoleRef, WithItem,
+    ReportStmt, ResponseFmt, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 use crate::report::parse_flow;
@@ -833,7 +833,7 @@ pub(crate) fn vars_in_scope(
 pub(crate) fn baseline_show_choices(
     entries: &[crate::hurl::HurlEntry],
     body: &[FlowNode],
-    selected: &[String],
+    selected: &[ShowField],
 ) -> Vec<(String, bool)> {
     let mut names: Vec<String> = Vec::new();
     let push = |n: &str, names: &mut Vec<String>| {
@@ -852,11 +852,11 @@ pub(crate) fn baseline_show_choices(
         }
     }
     for f in selected {
-        push(f, &mut names);
+        push(f.name(), &mut names);
     }
     names
         .iter()
-        .map(|n| (n.clone(), selected.iter().any(|sel| sel == n)))
+        .map(|n| (n.clone(), selected.iter().any(|sel| sel.name() == n)))
         .collect()
 }
 
@@ -1574,9 +1574,9 @@ pub(crate) enum CarriedMod {
     /// this one always has room at the destination.
     With(WithItem),
     Response(ResponseFmt),
-    Show(Vec<String>),
+    Show(Vec<ShowField>),
     Hide(Vec<String>),
-    BaselineShow(Vec<String>),
+    BaselineShow(Vec<ShowField>),
     Role {
         baseline: bool,
         role: RoleRef,

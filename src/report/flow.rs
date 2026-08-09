@@ -229,7 +229,7 @@ pub enum ReportStmt {
         /// `[Reports]`/`WITH` field names) are emitted, in listed order — so a
         /// noisy `Response` (e.g. a base64 blob) can be dropped. Empty = no
         /// `SHOW` clause, i.e. emit every field (the default).
-        show: Vec<String>,
+        show: Vec<ShowField>,
         /// `HIDE(a, b, …)`: remove these field suffixes from the final output
         /// after all other selection rules have been applied. Takes effect in
         /// every branch (SHOW, WITH-restricted, and default). Cannot overlap
@@ -468,6 +468,73 @@ impl RoleRef {
     }
 }
 
+/// One field of a `SHOW(…)` clause: the field suffix, plus the optional
+/// `STATISTICS(…)` to summarise the column it produces.
+///
+/// The statistics live on the field rather than in the `# columns:` header
+/// because that header is an *exhaustive* whitelist — asking for a mean there
+/// means restating every other column you still wanted. A clause written where
+/// the column is declared also survives the column set changing around it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShowField {
+    pub field: String,
+    pub stats: Vec<StatKind>,
+}
+
+impl ShowField {
+    /// The field name, for the selection logic (which cares only about which
+    /// suffixes were named).
+    pub fn name(&self) -> &str {
+        &self.field
+    }
+
+    /// The clause as written, e.g. `Time STATISTICS(MEAN)`.
+    pub fn to_text(&self) -> String {
+        format!("{}{}", self.field, stats_text(&self.stats))
+    }
+}
+
+impl From<&str> for ShowField {
+    fn from(field: &str) -> Self {
+        ShowField {
+            field: field.to_string(),
+            stats: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for ShowField {
+    fn from(field: String) -> Self {
+        ShowField {
+            field,
+            stats: Vec::new(),
+        }
+    }
+}
+
+impl PartialEq<str> for ShowField {
+    fn eq(&self, other: &str) -> bool {
+        self.field == other
+    }
+}
+
+/// A field with no statistics is just its name, so a caller (and a test) can
+/// compare against a plain string list without unpacking the struct.
+impl PartialEq<String> for ShowField {
+    fn eq(&self, other: &String) -> bool {
+        self.stats.is_empty() && &self.field == other
+    }
+}
+
+/// Render a `SHOW(…)` field list back to source.
+pub(crate) fn show_text(fields: &[ShowField]) -> String {
+    fields
+        .iter()
+        .map(ShowField::to_text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The environment clause of `FOR … IN ENVS …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvClause {
@@ -484,7 +551,7 @@ pub enum EnvClause {
     Roles {
         baseline: Vec<RoleRef>,
         comparisons: Vec<RoleRef>,
-        baseline_show: Vec<String>,
+        baseline_show: Vec<ShowField>,
     },
 }
 
@@ -646,11 +713,22 @@ fn collect_column_stats(
             // request's leaf name. Compute that key statically so the stats
             // attach at render time just like a `REPORT … STATISTICS(…)`.
             FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
+                name,
+                alias,
+                with,
+                show,
+                ..
             }) => {
                 let a = alias
                     .clone()
                     .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                // A `SHOW(field STATISTICS(…))` names the same `alias.field`
+                // column a `WITH` field would.
+                for f in show {
+                    if !f.stats.is_empty() {
+                        out.insert(format!("{a}.{}", f.field), f.stats.clone());
+                    }
+                }
                 for item in with {
                     if let WithItem::Field {
                         name: fname, stats, ..
@@ -661,7 +739,24 @@ fn collect_column_stats(
                     }
                 }
             }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            // `BASELINE(…) SHOW(field STATISTICS(…))` summarises the copied
+            // baseline column, which the comparison names
+            // `baseline.<alias>.<field>` — one per alias that emits the field,
+            // and those aliases aren't known until the run produces them. The
+            // key is therefore matched by suffix at render time (see
+            // `ReportResult::resolved_columns`), recorded here under the bare
+            // field with a `baseline.` marker prefix.
+            FlowNode::ForEnvs { body, clause, .. } => {
+                if let EnvClause::Roles { baseline_show, .. } = clause {
+                    for f in baseline_show {
+                        if !f.stats.is_empty() {
+                            out.insert(format!("baseline.*.{}", f.field), f.stats.clone());
+                        }
+                    }
+                }
+                collect_column_stats(body, out);
+            }
+            FlowNode::ForEach { body, .. } => {
                 collect_column_stats(body, out);
             }
             _ => {}
@@ -758,7 +853,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }
             if !show.is_empty() {
-                let _ = write!(out, " SHOW({})", show.join(", "));
+                let _ = write!(out, " SHOW({})", show_text(show));
             }
             if !hide.is_empty() {
                 let _ = write!(out, " HIDE({})", hide.join(", "));
@@ -982,7 +1077,7 @@ fn env_clause_text(c: &EnvClause) -> String {
                 let names: Vec<String> = baseline.iter().map(role_ref_text).collect();
                 let mut token = format!("BASELINE({})", names.join(", "));
                 if !baseline_show.is_empty() {
-                    token.push_str(&format!(" SHOW({})", baseline_show.join(", ")));
+                    token.push_str(&format!(" SHOW({})", show_text(baseline_show)));
                 }
                 parts.push(token);
             }
@@ -1087,7 +1182,7 @@ impl FlowNode {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
                 }
                 if !show.is_empty() {
-                    let _ = write!(out, " SHOW({})", show.join(", "));
+                    let _ = write!(out, " SHOW({})", show_text(show));
                 }
                 if !hide.is_empty() {
                     let _ = write!(out, " HIDE({})", hide.join(", "));
@@ -1144,7 +1239,7 @@ fn report_label(stmt: &ReportStmt) -> String {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }
             if !show.is_empty() {
-                let _ = write!(out, " SHOW({})", show.join(", "));
+                let _ = write!(out, " SHOW({})", show_text(show));
             }
             if !hide.is_empty() {
                 let _ = write!(out, " HIDE({})", hide.join(", "));

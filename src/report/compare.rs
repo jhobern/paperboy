@@ -135,9 +135,12 @@ fn collect_roles(
                             comparisons.push(name);
                         }
                     }
+                    // Only the names travel here: any `STATISTICS(…)` a field
+                    // carries is a *render* hint, collected with the rest of
+                    // the flow's column statistics, not part of the copy rule.
                     for field in s {
-                        if !baseline_show.contains(field) {
-                            baseline_show.push(field.clone());
+                        if !baseline_show.contains(&field.field) {
+                            baseline_show.push(field.field.clone());
                         }
                     }
                 }

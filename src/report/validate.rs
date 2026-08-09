@@ -17,7 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::flow::{EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef};
+use super::flow::{
+    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, ShowField,
+};
 use crate::i18n::{Strings, fill};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,7 +345,7 @@ fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
 /// never false-warns on a real `[Reports]` field we can't see.
 fn check_show_fields(
     name: &str,
-    show: &[String],
+    show: &[ShowField],
     with: &[super::flow::WithItem],
     ctx: &Context,
     diags: &mut Vec<Diagnostic>,
@@ -365,8 +367,9 @@ fn check_show_fields(
         })
         .collect();
     for field in show {
-        let known = super::run::INTRINSIC_FIELDS.contains(&field.as_str())
-            || with_fields.contains(&field.as_str())
+        let field = field.name();
+        let known = super::run::INTRINSIC_FIELDS.contains(&field)
+            || with_fields.contains(&field)
             || report_fields.iter().any(|f| f == field);
         if !known {
             diags.push(Diagnostic::warning(fill(
@@ -381,12 +384,13 @@ fn check_show_fields(
 /// clauses are contradictory (SHOW keeps, HIDE removes) and no ordering of
 /// evaluation resolves the conflict sensibly.
 fn check_show_hide_overlap(
-    show: &[String],
+    show: &[ShowField],
     hide: &[String],
     s: &Strings,
     diags: &mut Vec<Diagnostic>,
 ) {
     for field in show {
+        let field = field.name();
         if hide.iter().any(|h| h == field) {
             diags.push(Diagnostic::error(fill(s.diag_show_hide_conflict, &[field])));
         }

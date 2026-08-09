@@ -13,7 +13,7 @@ use nom::{
 
 use crate::report::flow::{
     Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, Pattern,
-    Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, WithItem,
+    Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::{ColumnClauses, StatKind};
 
@@ -562,9 +562,24 @@ fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
     ))(i)
 }
 
-/// `SHOW(a, b, …)` — at least one field (empty is a parse error).
-fn show_clause(i: &str) -> IResult<&str, Vec<String>> {
-    preceded(kw("SHOW"), paren_list1(ident))(i)
+/// `SHOW(a, b STATISTICS(MEAN), …)` — at least one field (empty is a parse
+/// error). Each field may carry its own `STATISTICS(…)`, which summarises the
+/// column that field produces.
+fn show_clause(i: &str) -> IResult<&str, Vec<ShowField>> {
+    preceded(kw("SHOW"), paren_list1(show_field))(i)
+}
+
+/// One `SHOW(…)` field: a name and an optional `STATISTICS(…)` clause.
+fn show_field(i: &str) -> IResult<&str, ShowField> {
+    let (i, field) = ident(i)?;
+    let (i, stats) = opt(statistics_clause)(i)?;
+    Ok((
+        i,
+        ShowField {
+            field,
+            stats: stats.unwrap_or_default(),
+        },
+    ))
 }
 
 /// `HIDE(a, b, …)` — at least one field (empty is a parse error).
@@ -846,7 +861,7 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
 /// live env name or a `FILE("…")` snapshot.  `SHOW` after `COMPARISON` is a
 /// hard parse error (returned as `nom::Err::Failure`) so it can't be silently
 /// swallowed by the surrounding `alt`.
-fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<String>)> {
+fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<ShowField>)> {
     let (i, is_baseline) = alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON"))))(i)?;
     let (i, refs) = paren_list1(role_ref)(i)?;
     // SHOW(…) is only legal on a BASELINE role.  If we see SHOW after a
@@ -1667,6 +1682,27 @@ mod tests {
         } else {
             panic!("expected ForEnvs roles with SHOW");
         }
+        // A SHOW field may carry its own STATISTICS(…), which is how a column
+        // gets a summary without restating every other column in `# columns:`.
+        assert_round_trips(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time STATISTICS(MEAN, MEDIAN)), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        );
+        let f = parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time STATISTICS(MEAN)), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        )
+        .unwrap();
+        let FlowNode::ForEnvs {
+            clause: EnvClause::Roles { baseline_show, .. },
+            ..
+        } = &f.nodes[0]
+        else {
+            panic!("expected ForEnvs roles with SHOW");
+        };
+        assert_eq!(baseline_show[0].field, "Time");
+        assert_eq!(baseline_show[0].stats, vec![StatKind::Mean]);
+        // The same clause works on a REPORT statement's own SHOW.
+        assert_round_trips("REPORT REQUEST r SHOW(status, Time STATISTICS(MEAN))\n");
+
         // Multiple SHOW fields also round-trip.
         assert_round_trips(
             "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time, HttpStatus), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
