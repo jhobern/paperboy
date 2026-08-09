@@ -61,11 +61,49 @@ pub(crate) enum RowKind {
     LoopHead,
     /// The synthetic `END` closing a loop.
     LoopEnd,
+    /// One field of an expanded `REPORT REQUEST … WITH … END` block, at this
+    /// index into the request's `with` list. `path` addresses the *request*, not
+    /// the field, so anything acting on a `WITH` row must branch on this kind
+    /// rather than treating the path as a node to delete or move.
+    WithField(usize),
+    /// The "add a field" affordance at the end of an expanded `WITH` block.
+    WithAdd,
+    /// The synthetic `END` closing an expanded `WITH` block.
+    WithEnd,
+}
+
+impl RowKind {
+    /// Whether this row belongs to an expanded `WITH` block rather than being a
+    /// flow node in its own right.
+    pub(crate) fn is_with(self) -> bool {
+        matches!(
+            self,
+            RowKind::WithField(_) | RowKind::WithAdd | RowKind::WithEnd
+        )
+    }
 }
 
 /// Flatten a flow into the display rows, tagging request rows with whether they
 /// resolve (via `resolves`). Row 0 is the `Begin` root.
+///
+/// `WITH` blocks stay collapsed to a single `… WITH …` row — see
+/// [`flatten_expanded`] for the form that opens them up.
 pub(crate) fn flatten(flow: &ReportFlow, resolves: &impl Fn(&str) -> bool) -> Vec<NodeRow> {
+    flatten_expanded(flow, resolves, false)
+}
+
+/// As [`flatten`], but with `expand_with` a `REPORT REQUEST … WITH` block is
+/// opened out: the request row, one [`RowKind::WithField`] row per field, an
+/// [`RowKind::WithAdd`] row, and a closing [`RowKind::WithEnd`].
+///
+/// It is opt-in because the two front-ends show `WITH` differently — the GUI
+/// draws each field as a chip on the request's own row, so expanding would
+/// double it up, while the TUI outline has no room for chips and needs the rows.
+pub(crate) fn flatten_expanded(
+    flow: &ReportFlow,
+    resolves: &impl Fn(&str) -> bool,
+    expand_with: bool,
+) -> Vec<NodeRow> {
     let mut rows = vec![NodeRow {
         depth: 0,
         label: String::new(),
@@ -74,8 +112,29 @@ pub(crate) fn flatten(flow: &ReportFlow, resolves: &impl Fn(&str) -> bool) -> Ve
         req_ok: None,
     }];
     let mut prefix = Vec::new();
-    push_nodes(&flow.nodes, &mut prefix, 1, resolves, &mut rows);
+    push_nodes(
+        &flow.nodes,
+        &mut prefix,
+        1,
+        resolves,
+        expand_with,
+        &mut rows,
+    );
     rows
+}
+
+/// The `WITH` fields of a report-request node, or `None` for anything else.
+pub(crate) fn node_with_items(node: &FlowNode) -> Option<&[WithItem]> {
+    match node {
+        FlowNode::Report(ReportStmt::Request { with, .. }) => Some(with),
+        _ => None,
+    }
+}
+
+/// The row label for one `WITH` item — the same text it is written with in
+/// source, so the outline and the source view read alike.
+pub(crate) fn with_item_label(item: &WithItem) -> String {
+    crate::report::flow::with_item_text(item)
 }
 
 fn push_nodes(
@@ -83,6 +142,7 @@ fn push_nodes(
     prefix: &mut Vec<usize>,
     depth: usize,
     resolves: &impl Fn(&str) -> bool,
+    expand_with: bool,
     rows: &mut Vec<NodeRow>,
 ) {
     for (i, node) in nodes.iter().enumerate() {
@@ -96,7 +156,7 @@ fn push_nodes(
                 path: prefix.clone(),
                 req_ok,
             });
-            push_nodes(body, prefix, depth + 1, resolves, rows);
+            push_nodes(body, prefix, depth + 1, resolves, expand_with, rows);
             rows.push(NodeRow {
                 depth,
                 label: String::new(),
@@ -105,13 +165,47 @@ fn push_nodes(
                 req_ok: None,
             });
         } else {
+            let with = expand_with
+                .then(|| node_with_items(node))
+                .flatten()
+                .filter(|w| !w.is_empty());
             rows.push(NodeRow {
                 depth,
-                label: node.label(),
+                // Expanded, the head loses its "…" placeholder: the fields it
+                // stood for are the rows immediately below.
+                label: match with {
+                    Some(_) => format!("{} WITH", node.header_line()),
+                    None => node.label(),
+                },
                 kind: RowKind::Leaf,
                 path: prefix.clone(),
                 req_ok,
             });
+            if let Some(with) = with {
+                for (wi, item) in with.iter().enumerate() {
+                    rows.push(NodeRow {
+                        depth: depth + 1,
+                        label: with_item_label(item),
+                        kind: RowKind::WithField(wi),
+                        path: prefix.clone(),
+                        req_ok: None,
+                    });
+                }
+                rows.push(NodeRow {
+                    depth: depth + 1,
+                    label: String::new(),
+                    kind: RowKind::WithAdd,
+                    path: prefix.clone(),
+                    req_ok: None,
+                });
+                rows.push(NodeRow {
+                    depth,
+                    label: String::new(),
+                    kind: RowKind::WithEnd,
+                    path: prefix.clone(),
+                    req_ok: None,
+                });
+            }
         }
         prefix.pop();
     }
@@ -149,7 +243,14 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
             parent: row.path.clone(),
             index: 0,
         },
-        RowKind::Leaf | RowKind::LoopEnd => {
+        // A `WITH` row isn't a flow node, but a flow insert asked for from one
+        // still has to land *somewhere* sensible: after the request that owns
+        // the block, which is where the whole `WITH … END` ends on screen.
+        RowKind::Leaf
+        | RowKind::LoopEnd
+        | RowKind::WithField(_)
+        | RowKind::WithAdd
+        | RowKind::WithEnd => {
             let (last, rest) = row.path.split_last().unwrap_or((&0, &[]));
             InsertPos {
                 parent: rest.to_vec(),

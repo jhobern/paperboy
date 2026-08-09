@@ -25881,3 +25881,109 @@ fn a_reindent_leaves_unparseable_source_alone() {
     assert_eq!(app.reports[idx].report.text, before);
     assert!(matches!(app.status, Some(Status::ReportReformatFailed(_))));
 }
+
+/// The outline used to collapse a whole `WITH` block to "… WITH …", so its
+/// fields were invisible and there was no way in to add one.
+#[test]
+fn a_with_block_shows_its_fields_as_rows() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert!(
+        labels.contains(&"frame: jsonpath \"$.a\""),
+        "fields are rows: {labels:?}"
+    );
+    assert!(labels.contains(&"score: jsonpath \"$.b\""), "{labels:?}");
+    // The head drops its "…" placeholder, since the fields it stood for are
+    // now the rows below it.
+    assert!(
+        labels.contains(&"REPORT REQUEST upload AS u WITH"),
+        "{labels:?}"
+    );
+    // And the block is closed, like a loop's.
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == crate::tui::report_nodes::RowKind::WithEnd)
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+    );
+}
+
+/// Delete on a field removes that field. The field and the request share a
+/// path, so without a branch this would take the whole request with it.
+#[test]
+fn deleting_a_with_field_leaves_the_request_alone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithField(0))
+        .expect("first field");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Delete);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("REPORT REQUEST upload AS u WITH"), "{text:?}");
+    assert!(!text.contains("frame:"), "the field went: {text:?}");
+    assert!(text.contains("score:"), "its sibling stayed: {text:?}");
+}
+
+/// Shift+Up on a field reorders the column within its block rather than moving
+/// the request among its siblings.
+#[test]
+fn a_with_field_reorders_within_its_own_block() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREQUEST upload\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithField(1))
+        .expect("second field");
+    app.reports[idx].node_selected = at;
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    let text = &app.reports[idx].report.text;
+    let frame = text.find("frame:").expect("frame present");
+    let score = text.find("score:").expect("score present");
+    assert!(score < frame, "score moved above frame: {text:?}");
+    let req = text.find("REQUEST upload").expect("request present");
+    assert!(
+        req < text.find("REPORT REQUEST").expect("report request present"),
+        "the request itself didn't move: {text:?}"
+    );
+}
+
+/// The add row is the discoverable way in: it opens the field editor with a
+/// fresh field rather than editing an existing one.
+#[test]
+fn the_add_row_opens_an_empty_with_field_editor() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+        .expect("add row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::ReportNodeWithField(form)) => {
+            assert!(form.index.is_none(), "a new field, not an edit of field 0");
+        }
+        _ => panic!("expected the WITH field editor"),
+    }
+}

@@ -618,25 +618,8 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 out.push_str(" WITH\n");
                 for item in with {
                     indent(out, depth + 1);
-                    match item {
-                        WithItem::ResponseFmt(fmt) => {
-                            let _ = writeln!(out, "RESPONSE {}", fmt_text(*fmt));
-                        }
-                        WithItem::Field {
-                            name,
-                            query,
-                            stats,
-                            image,
-                        } => {
-                            let _ = writeln!(
-                                out,
-                                "{}: {query}{}{}",
-                                name_text(name),
-                                stats_text(stats),
-                                image_text(image.as_ref())
-                            );
-                        }
-                    }
+                    out.push_str(&with_item_text(item));
+                    out.push('\n');
                 }
                 indent(out, depth);
                 out.push_str("END\n");
@@ -683,6 +666,26 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
 
 /// Render a `STATISTICS(…)` clause (with a leading space) for a report
 /// statement, or the empty string when no statistics are requested.
+/// One `WITH` item as it is written inside the block (no indentation, no
+/// newline). Shared with the node editor so an outline row and the source line
+/// it stands for can't drift apart.
+pub(crate) fn with_item_text(item: &WithItem) -> String {
+    match item {
+        WithItem::ResponseFmt(fmt) => format!("RESPONSE {}", fmt_text(*fmt)),
+        WithItem::Field {
+            name,
+            query,
+            stats,
+            image,
+        } => format!(
+            "{}: {query}{}{}",
+            name_text(name),
+            stats_text(stats),
+            image_text(image.as_ref())
+        ),
+    }
+}
+
 fn stats_text(stats: &[StatKind]) -> String {
     if stats.is_empty() {
         return String::new();

@@ -41,9 +41,10 @@ use crate::report::model::StatKind;
 // one implementation. Re-export it under the historical names so this file's
 // TUI-specific rendering / key handling / overlays read unchanged.
 pub(crate) use crate::report::edit::{
-    HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind, flatten, header_specs,
-    header_unset, insert_node, insert_pos_after, loop_producer_dir, loop_producer_dir_mut,
-    move_node, node_at, node_at_mut, parse_one_node, remove_node, replace_node, request_node,
+    DetachWhich, HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind,
+    detach_modifier, flatten_expanded, header_specs, header_unset, insert_node, insert_pos_after,
+    loop_producer_dir, loop_producer_dir_mut, move_node, node_at, node_at_mut, node_with_items,
+    parse_one_node, remove_node, replace_node, request_node,
 };
 
 /// The two-step insert/pick palette overlay ([`Overlay::ReportNodeMenu`]).
@@ -1245,7 +1246,9 @@ impl TuiApp {
             .map(|ci| self.collections[ci].entries.as_slice())
             .unwrap_or(&[]);
         let resolves = |name: &str| crate::report::run::resolve_title(entries, name).is_some();
-        Ok(flatten(&flow, &resolves))
+        // Expanded: the TUI outline has no room for the GUI's per-field chips,
+        // so a `WITH` block's fields are rows of their own.
+        Ok(flatten_expanded(&flow, &resolves, true))
     }
 
     /// The bound collection's request titles (for the request picker), empty
@@ -1319,7 +1322,17 @@ impl TuiApp {
                 }
             }
             KeyCode::End => self.reports[idx].node_selected = last,
-            KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
+            KeyCode::Char('a') | KeyCode::Insert => {
+                // Inside a `WITH` block, "add" means another field of that
+                // block — asking for a flow node there would land it after the
+                // request, which is never what the cursor position implied.
+                match rows.get(sel).map(|r| (r.kind, r.path.clone())) {
+                    Some((k, path)) if k.is_with() => {
+                        self.open_with_field_editor(idx, &path, usize::MAX)
+                    }
+                    _ => self.open_report_node_menu(idx),
+                }
+            }
             // Enter opens the friendly, structured "configure this node" form
             // (its shape depends on the node kind — request options, a loop's
             // folder, …). `e` is the raw escape hatch that edits the node's
@@ -1456,6 +1469,17 @@ impl TuiApp {
         let Some(row) = rows.get(sel) else { return };
         if row.kind == RowKind::Begin {
             self.open_report_node_menu(idx);
+            return;
+        }
+        // A `WITH` row configures its own field. Its `END` has nothing to
+        // configure, and must not fall through to the request's form — that
+        // would make the block's last row silently edit the request instead.
+        if let Some(wi) = self.with_row_index(row) {
+            let path = row.path.clone();
+            self.open_with_field_editor(idx, &path, wi);
+            return;
+        }
+        if row.kind == RowKind::WithEnd {
             return;
         }
         let path = row.path.clone();
@@ -2730,8 +2754,85 @@ impl TuiApp {
             self.open_report_node_menu(idx);
             return;
         }
+        // A `WITH` row addresses a field of the request at `row.path`, not a
+        // node, so it opens the field editor rather than the line prompt (there
+        // is no single-line source form for one field of a block).
+        if let Some(wi) = self.with_row_index(row) {
+            self.open_with_field_editor(idx, &row.path, wi);
+            return;
+        }
+        if row.kind == RowKind::WithEnd {
+            return;
+        }
         let path = row.path.clone();
         self.open_report_node_line_prompt(idx, &path);
+    }
+
+    /// The `WITH` field index a row edits: the field itself, or a fresh one for
+    /// the block's add row. `None` for anything that isn't an editable `WITH`
+    /// row (the block's `END`, or a plain flow row).
+    fn with_row_index(&self, row: &NodeRow) -> Option<usize> {
+        match row.kind {
+            RowKind::WithField(i) => Some(i),
+            RowKind::WithAdd => Some(usize::MAX),
+            _ => None,
+        }
+    }
+
+    /// Open the `WITH` field editor for field `wi` of the request at `path`.
+    /// `usize::MAX` means "a new field", which is how the add row and `a` ask
+    /// for one.
+    fn open_with_field_editor(&mut self, idx: usize, path: &[usize], wi: usize) {
+        let report_id = self.reports[idx].report.id;
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let existing = node_at(&flow, path)
+            .and_then(node_with_items)
+            .and_then(|w| w.get(wi))
+            .cloned();
+        let form = WithFieldForm::build(
+            report_id,
+            path.to_vec(),
+            existing.is_some().then_some(wi),
+            existing.as_ref(),
+        );
+        self.overlay = Some(Overlay::ReportNodeWithField(Box::new(form)));
+    }
+
+    /// Swap the `WITH` field at `wi` with its neighbour, reordering the report
+    /// column it defines.
+    fn move_with_field(&mut self, idx: usize, path: &[usize], wi: usize, up: bool) {
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            let Some(FlowNode::Report(ReportStmt::Request { with, .. })) =
+                node_at_mut(&mut flow, path)
+            else {
+                return;
+            };
+            let other = if up {
+                match wi.checked_sub(1) {
+                    Some(o) => o,
+                    None => return, // already first
+                }
+            } else if wi + 1 < with.len() {
+                wi + 1
+            } else {
+                return; // already last
+            };
+            with.swap(wi, other);
+            let text = flow.to_text();
+            rt.set_text_undoable(text);
+            // Follow the field: the cursor is on a row number, and the field
+            // just moved one row against the direction of travel.
+            let sel = rt.node_selected;
+            rt.node_selected = if up { sel.saturating_sub(1) } else { sel + 1 };
+        }
+        self.revalidate_report(idx);
+        self.save_state();
     }
 
     /// Open the single-line "edit as source" prompt for the node at `path`.
@@ -2894,6 +2995,37 @@ impl TuiApp {
         if row.kind == RowKind::Begin {
             return; // the root can't be deleted
         }
+        // Deleting on a `WITH` row removes that one field, not the request that
+        // owns it — they share a path, so this branch is what keeps Delete from
+        // taking the whole block with it.
+        if let RowKind::WithField(wi) = row.kind {
+            let path = row.path.clone();
+            {
+                let rt = &mut self.reports[idx];
+                let Ok(mut flow) = rt.report.flow() else {
+                    return;
+                };
+                // Bounds are checked here rather than from the return value:
+                // `detach_modifier`'s bool answers "would this leave a statement
+                // that stands on its own", not "did anything change", and for a
+                // WITH field it is always false.
+                if node_at(&flow, &path)
+                    .and_then(node_with_items)
+                    .is_none_or(|w| wi >= w.len())
+                {
+                    return;
+                }
+                detach_modifier(&mut flow, &path, DetachWhich::With(wi));
+                let text = flow.to_text();
+                rt.set_text_undoable(text);
+            }
+            self.revalidate_report(idx);
+            self.save_state();
+            return;
+        }
+        if row.kind.is_with() {
+            return; // the add row and the block's END aren't deletable
+        }
         let path = row.path.clone();
         {
             let rt = &mut self.reports[idx];
@@ -2920,6 +3052,15 @@ impl TuiApp {
             .min(rows.len().saturating_sub(1));
         let Some(row) = rows.get(sel) else { return };
         if row.kind == RowKind::Begin {
+            return;
+        }
+        // Reordering a `WITH` field reorders a report column, so it stays within
+        // its own block rather than moving the request among its siblings.
+        if let RowKind::WithField(wi) = row.kind {
+            self.move_with_field(idx, &row.path.clone(), wi, up);
+            return;
+        }
+        if row.kind.is_with() {
             return;
         }
         let path = row.path.clone();
@@ -2994,7 +3135,7 @@ impl TuiApp {
         };
         let target = rows
             .iter()
-            .position(|r| r.path == path && r.kind != RowKind::LoopEnd)
+            .position(|r| r.path == path && r.kind != RowKind::LoopEnd && !r.kind.is_with())
             .unwrap_or_else(|| rows.len().saturating_sub(1));
         self.reports[idx].node_selected = target;
     }
@@ -3232,6 +3373,11 @@ fn render_node_row(
         RowKind::LoopHead => (row.label.clone(), th.accent, false),
         RowKind::LoopEnd => ("END".to_string(), th.accent, false),
         RowKind::Leaf => (row.label.clone(), th.text, false),
+        RowKind::WithField(_) => (row.label.clone(), th.text, false),
+        // The affordance that answers "how do I add a column here?" — dimmed
+        // like the settings section's own add row, since it isn't source.
+        RowKind::WithAdd => (format!("+ {}", s.report_with_add_row), th.dim, false),
+        RowKind::WithEnd => ("END".to_string(), th.accent, false),
     };
     // Request rows recolour by whether the name resolves (green / amber),
     // matching the source view's highlighting.

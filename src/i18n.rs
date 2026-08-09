@@ -673,6 +673,7 @@ strings! {
     report_reformatted => "Report reindented", "Rapport réindenté", "Rapport genindrykket";
     report_already_tidy => "The report is already correctly indented", "Le rapport est déjà correctement indenté", "Rapporten er allerede korrekt indrykket";
     report_reformat_failed_prefix => "Can't reindent:", "Réindentation impossible :", "Kan ikke genindrykke:";
+    report_with_add_row => "add a field…", "ajouter un champ…", "tilføj et felt…";
     report_settings_heading => "Report Settings", "Réglages du rapport", "Rapportindstillinger";
     report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
     report_settings_all_set => "Every report setting is already set", "Tous les réglages du rapport sont déjà définis", "Alle rapportindstillinger er allerede sat";

@@ -107,6 +107,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   report does; a script that doesn't parse is left alone rather than guessed at,
   and it is a single undo step.
 
+- **`WITH` blocks open out in the TUI node editor.** A
+  `REPORT REQUEST … WITH … END` used to collapse to a single `… WITH …` row, so
+  its fields were invisible from the outline and there was no obvious way to add
+  one. Each field is now a row of its own, under the request and above the
+  block's `END`, with an `add a field…` row at the end: Enter edits a field,
+  Delete removes just that field, Shift+↑/↓ reorders the column within its
+  block, and `a` anywhere in the block adds another.
+
 ### Fixed
 
 - **The TUI's report node editor can now edit the report's settings.** The

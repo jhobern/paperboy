@@ -3814,6 +3814,10 @@ fn block_row(
                 // title-casing it would make the two views disagree about what
                 // is actually in the file.
                 RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent, s.chip_help_end),
+                // The GUI never asks for expanded `WITH` rows (it draws each
+                // field as a chip on the request's own row), so these are
+                // unreachable here — see `flatten_expanded`.
+                RowKind::WithField(_) | RowKind::WithAdd | RowKind::WithEnd => {}
                 RowKind::Leaf | RowKind::LoopHead => {
                     let mut chips = node
                         .as_ref()
