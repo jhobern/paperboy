@@ -69,6 +69,11 @@ pub(crate) enum RowKind {
     /// the field, so anything acting on a `WITH` row must branch on this kind
     /// rather than treating the path as a node to delete or move.
     WithField(usize),
+    /// A `# …` comment line *inside* an expanded `WITH` block, at this index
+    /// into the request's `with` list. Separate from [`RowKind::WithField`] so
+    /// it can be drawn dimmed and kept out of the field editor, but it indexes
+    /// the same list, so deleting and reordering treat the two alike.
+    WithComment(usize),
     /// The "add a field" affordance at the end of an expanded `WITH` block.
     WithAdd,
     /// The synthetic `END` closing an expanded `WITH` block.
@@ -81,8 +86,17 @@ impl RowKind {
     pub(crate) fn is_with(self) -> bool {
         matches!(
             self,
-            RowKind::WithField(_) | RowKind::WithAdd | RowKind::WithEnd
+            RowKind::WithField(_) | RowKind::WithComment(_) | RowKind::WithAdd | RowKind::WithEnd
         )
+    }
+
+    /// The index into the request's `with` list this row stands for, for the
+    /// rows that address one item (a field or a comment).
+    pub(crate) fn with_item(self) -> Option<usize> {
+        match self {
+            RowKind::WithField(i) | RowKind::WithComment(i) => Some(i),
+            _ => None,
+        }
     }
 }
 
@@ -192,7 +206,10 @@ fn push_nodes(
                     rows.push(NodeRow {
                         depth: depth + 1,
                         label: with_item_label(item),
-                        kind: RowKind::WithField(wi),
+                        kind: match item {
+                            WithItem::Comment(_) => RowKind::WithComment(wi),
+                            _ => RowKind::WithField(wi),
+                        },
                         path: prefix.clone(),
                         req_ok: None,
                     });
@@ -256,6 +273,7 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
         | RowKind::Comment
         | RowKind::LoopEnd
         | RowKind::WithField(_)
+        | RowKind::WithComment(_)
         | RowKind::WithAdd
         | RowKind::WithEnd => {
             let (last, rest) = row.path.split_last().unwrap_or((&0, &[]));

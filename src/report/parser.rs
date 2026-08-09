@@ -224,8 +224,9 @@ fn node_or_comment(i: &str) -> IResult<&str, FlowNode> {
 }
 
 /// Skip any run of blank space, newlines and whole-line `#` comments. Only used
-/// where a comment has nowhere to live (inside a `WITH` block, and by
-/// `opens_block`); statement bodies use `multispace0` + `node_or_comment`.
+/// where a comment has nowhere to live (by `opens_block`, which is a lookahead
+/// and keeps nothing); statement bodies use `multispace0` + `node_or_comment`,
+/// and `WITH` blocks `multispace0` + `with_item_or_comment`.
 fn trivia(i: &str) -> IResult<&str, ()> {
     value(
         (),
@@ -547,15 +548,28 @@ fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
 
 /// `WITH <item>* END`.
 ///
-/// Known gap: a comment *inside* a `WITH` block is still dropped, because
-/// `WithItem` has no comment variant. Comments elsewhere in the body are kept
-/// (see `comment_node`); commenting out a single field here and re-editing the
-/// request will lose that line.
+/// Items are parsed with `multispace0` + [`with_item_or_comment`] rather than
+/// `trivia`, so a comment inside the block keeps its place among the fields
+/// instead of being skipped as whitespace — commenting a field out and then
+/// editing the request elsewhere must not delete the commented line.
 fn with_block(i: &str) -> IResult<&str, Vec<WithItem>> {
     let (i, _) = kw("WITH")(i)?;
-    let (i, items) = many0(preceded(trivia, with_item))(i)?;
-    let (i, _) = preceded(trivia, kw("END"))(i)?;
+    let (i, items) = many0(preceded(multispace0, with_item_or_comment))(i)?;
+    let (i, _) = preceded(multispace0, kw("END"))(i)?;
     Ok((i, items))
+}
+
+/// A `WITH` item or a whole-line comment between items. Comments are tried
+/// first: a `#` can't start any real item, and a field would otherwise swallow
+/// the line as a name.
+fn with_item_or_comment(i: &str) -> IResult<&str, WithItem> {
+    alt((with_comment, with_item))(i)
+}
+
+fn with_comment(i: &str) -> IResult<&str, WithItem> {
+    map(preceded(char('#'), not_line_ending), |text: &str| {
+        WithItem::Comment(text.to_string())
+    })(i)
 }
 
 fn with_item(i: &str) -> IResult<&str, WithItem> {
@@ -993,6 +1007,63 @@ mod tests {
             flow.to_text()
         );
     }
+    /// The same gap, one level down: a `WITH` block is the one place a comment
+    /// still had nowhere to live, so commenting a column out and then touching
+    /// the request from an editor deleted the line. The `#` is re-indented to
+    /// the block's own depth on the way out — the *text* after it is verbatim.
+    #[test]
+    fn a_commented_out_with_field_survives_a_round_trip() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    Score: jsonpath \"$.score\"\n",
+            "    #    Frame: jsonpath \"$.frame\" IMAGE(HEIGHT 110)\n",
+            "    Verdict: jsonpath \"$.verdict\"\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src, "round-trips byte for byte");
+    }
+
+    /// A comment keeps its place among the fields rather than being hoisted or
+    /// sunk, which is the whole point: `# Frame:` above `Verdict:` means the
+    /// column that *was* there, not a note about the block.
+    #[test]
+    fn a_with_comment_keeps_its_position_among_the_fields() {
+        let flow = parse_flow(concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    a: HttpStatus\n",
+            "#    b: Time\n",
+            "    c: Response\n",
+            "END\n",
+        ))
+        .expect("parses");
+        let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = flow.nodes.first() else {
+            panic!("expected a report request, got {:?}", flow.nodes);
+        };
+        let kinds: Vec<_> = with
+            .iter()
+            .map(|w| matches!(w, WithItem::Comment(_)))
+            .collect();
+        assert_eq!(kinds, vec![false, true, false]);
+    }
+
+    /// A comment on the last line of the block still belongs to it, rather than
+    /// being swallowed by whatever skips whitespace before `END`.
+    #[test]
+    fn a_with_comment_just_above_end_is_kept() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    a: HttpStatus\n",
+            "    #    b: Time\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src);
+    }
+
     use crate::report::flow::{
         Binder, Element, EnvClause, FlowNode, ParallelSpec, Producer, ReportStmt, RoleRef, WithItem,
     };

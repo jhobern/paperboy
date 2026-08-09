@@ -309,6 +309,11 @@ pub enum WithItem {
         stats: Vec<StatKind>,
         image: Option<ImageSpec>,
     },
+    /// A whole-line `#` comment written inside the block, kept so that
+    /// commenting a field out doesn't destroy it the next time an editor
+    /// re-serializes the flow. The text is stored exactly as written after the
+    /// `#`, like [`FlowNode::Comment`].
+    Comment(String),
 }
 
 /// How a reported response body is rendered.
@@ -754,6 +759,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
 pub(crate) fn with_item_text(item: &WithItem) -> String {
     match item {
         WithItem::ResponseFmt(fmt) => format!("RESPONSE {}", fmt_text(*fmt)),
+        WithItem::Comment(text) => format!("#{text}"),
         WithItem::Field {
             name,
             query,
