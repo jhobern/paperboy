@@ -28,6 +28,43 @@ pub struct Header {
     pub lines: Vec<HeaderLine>,
 }
 
+/// One declared collection: a reference plus, for a helper, the alias its
+/// requests are addressed through (`alias/request`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionRef<'a> {
+    pub reference: &'a str,
+    pub alias: Option<&'a str>,
+}
+
+/// Split `<ref> [AS <alias>]`.
+///
+/// The keyword is matched case-insensitively and only when it stands alone as
+/// the second-to-last whitespace-separated word, so a path that merely contains
+/// "as" (`./as-built/api.hurl`, `git:origin/as.hurl`) is not mangled. The alias
+/// is returned unvalidated — checking it is an identifier, is present on every
+/// helper and absent on the primary is validation's job, which can report a
+/// useful message rather than silently treating the line as a plain path.
+pub fn split_collection_ref(value: &str) -> (&str, Option<&str>) {
+    let value = value.trim();
+    let mut it = value.rsplitn(2, char::is_whitespace);
+    let (Some(last), Some(head)) = (it.next(), it.next()) else {
+        return (value, None);
+    };
+    let head = head.trim_end();
+    if head
+        .rsplit(char::is_whitespace)
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+        && !last.is_empty()
+    {
+        let reference = head[..head.len() - 2].trim_end();
+        if !reference.is_empty() {
+            return (reference, Some(last));
+        }
+    }
+    (value, None)
+}
+
 /// One line of the header: either a recognised `# key: value` directive or a
 /// free-form `#` comment (preserved as-is).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +84,40 @@ impl Header {
         })
     }
 
+    /// Every value of the directives named `key`, in the order they were
+    /// written. Repeatable directives (`collection:`) need all of them; `get`
+    /// only ever sees the first.
+    pub fn get_all(&self, key: &str) -> Vec<&str> {
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                HeaderLine::Directive { key: k, value } if k.eq_ignore_ascii_case(key) => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The bound collection reference (`collection:` directive), required for a
-    /// runnable flow.
+    /// runnable flow. This is the *primary* collection: the first one declared,
+    /// with any `AS alias` suffix stripped. Helper collections are `collections()`.
     pub fn collection(&self) -> Option<&str> {
-        self.get("collection")
+        self.get("collection").map(|v| split_collection_ref(v).0)
+    }
+
+    /// Every declared collection, in directive order, primary first.
+    ///
+    /// The primary carries no alias; each helper must (that is enforced by
+    /// validation, not here, so the editors can still show a half-typed line).
+    pub fn collections(&self) -> Vec<CollectionRef<'_>> {
+        self.get_all("collection")
+            .into_iter()
+            .map(|v| {
+                let (reference, alias) = split_collection_ref(v);
+                CollectionRef { reference, alias }
+            })
+            .collect()
     }
     pub fn output(&self) -> Option<&str> {
         self.get("output")

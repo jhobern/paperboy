@@ -162,8 +162,14 @@ pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 /// environments an `ENVS` loop may select, the report file's directory (for
 /// resolving relative producer paths), and the runner.
 pub struct RunContext<'a> {
-    /// The bound collection's entries, resolved by title (see [`resolve_title`]).
+    /// The *primary* collection's entries, resolved by title (see
+    /// [`resolve_title`]).
     pub entries: &'a [HurlEntry],
+    /// Aliased helper collections declared by extra `# collection: … AS x`
+    /// directives. Their requests are addressed `alias/name` (see
+    /// [`resolve_qualified`]) so a report can call a request that deliberately
+    /// isn't part of the API collection under test.
+    pub helpers: &'a [HelperCollection],
     /// Global + pinned environment variables, already merged (pinned wins). The
     /// lowest layer of the variable precedence stack.
     pub base_vars: HashMap<String, String>,
@@ -179,6 +185,35 @@ pub struct RunContext<'a> {
     /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
     /// front-end wants each row as it completes to fill a live grid.
     pub sink: Option<&'a RowSink<'a>>,
+}
+
+/// A helper collection loaded for a report, under the alias its requests are
+/// addressed through.
+#[derive(Debug, Clone, Default)]
+pub struct HelperCollection {
+    pub alias: String,
+    pub entries: Vec<HurlEntry>,
+}
+
+/// Resolve a request name that may be alias-qualified.
+///
+/// A leading `alias/` segment is only treated as an alias when that alias is
+/// actually declared — `/` is also the virtual-folder separator inside a title,
+/// so an undeclared prefix must still fall through to a normal title lookup.
+/// (A declared alias that collides with a top-level folder is rejected by
+/// validation rather than resolved by precedence: PaperTrail never picks
+/// silently between two readings of a name.)
+pub fn resolve_qualified<'a>(
+    entries: &'a [HurlEntry],
+    helpers: &'a [HelperCollection],
+    name: &str,
+) -> Option<&'a HurlEntry> {
+    if let Some((alias, rest)) = name.split_once('/')
+        && let Some(h) = helpers.iter().find(|h| h.alias == alias)
+    {
+        return resolve_title(&h.entries, rest);
+    }
+    resolve_title(entries, name)
 }
 
 /// Resolve a request `name` against the bound collection's entries, mirroring
@@ -639,7 +674,7 @@ impl<'a> Exec<'a> {
     /// forward. Records an error (but does not abort) if the name is unresolved
     /// or the send fails.
     fn run_request(&mut self, name: &str) -> Option<EntryOutcome> {
-        let base = match resolve_title(self.ctx.entries, name) {
+        let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
@@ -733,7 +768,7 @@ impl<'a> Exec<'a> {
             .unwrap_or_else(|| leaf(name).to_string());
         let mut cells: Vec<(String, String)> = Vec::new();
 
-        let base = match resolve_title(self.ctx.entries, name) {
+        let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
@@ -1504,6 +1539,7 @@ mod tests {
         let flow = parse_flow(src).expect("flow parses");
         let ctx = RunContext {
             entries,
+            helpers: &[],
             base_vars: base_vars
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1893,6 +1929,7 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
@@ -1965,6 +2002,7 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
@@ -2037,6 +2075,7 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
@@ -2157,6 +2196,7 @@ mod tests {
         let flow = parse_flow(src).expect("flow parses");
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
@@ -2246,6 +2286,7 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(d.clone()),
@@ -2290,6 +2331,7 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(d.clone()),
@@ -2332,6 +2374,7 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(d.clone()),
@@ -2450,6 +2493,7 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: [
                 (
@@ -2541,6 +2585,7 @@ mod tests {
         // First run (VERDICT=CLEAR) → save as a `.baseline` snapshot.
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
                 .into_iter()
                 .collect(),
@@ -2558,6 +2603,7 @@ mod tests {
         let flow2 = parse_flow(&format!("# baseline: proc.baseline\n{flow_src}")).unwrap();
         let ctx2 = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "REVIEW".to_string())]
                 .into_iter()
                 .collect(),
@@ -2639,6 +2685,7 @@ mod tests {
         let base_flow = parse_flow(body_src).unwrap();
         let base_ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
                 .into_iter()
                 .collect(),
@@ -2659,6 +2706,7 @@ mod tests {
         let cmp_flow = parse_flow(&cmp_src).unwrap();
         let cmp_ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: [(
                 "staging".to_string(),
@@ -2746,6 +2794,7 @@ mod tests {
         let flow = parse_flow(flow_src).unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
@@ -2780,6 +2829,7 @@ mod tests {
         let flow = parse_flow("# baseline: nope.baseline\nREPORT REQUEST proc\n").unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(std::env::temp_dir()),
@@ -3504,6 +3554,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let ctx = RunContext {
             entries: &[],
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
@@ -3564,6 +3615,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let ctx = RunContext {
             entries: &[],
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
@@ -3683,5 +3735,153 @@ mod tests {
         assert!(cells.contains_key("r.Response"));
         assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
         assert_eq!(res.column_order, vec!["r.Response", "r.B"]);
+    }
+}
+
+#[cfg(test)]
+mod helper_collection_tests {
+    use super::*;
+    use crate::report::flow::split_collection_ref;
+
+    fn e(title: &str) -> HurlEntry {
+        HurlEntry {
+            title: title.to_string(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_alias_is_split_off_the_reference() {
+        assert_eq!(
+            split_collection_ref("./helpers.hurl AS helpers"),
+            ("./helpers.hurl", Some("helpers"))
+        );
+        assert_eq!(
+            split_collection_ref("git:origin/qa/shared.hurl as shared"),
+            ("git:origin/qa/shared.hurl", Some("shared"))
+        );
+    }
+
+    /// A path that merely *contains* "as" is not an alias declaration — the
+    /// keyword has to stand alone as its own word.
+    #[test]
+    fn a_path_containing_as_is_left_alone() {
+        assert_eq!(
+            split_collection_ref("./as-built/api.hurl"),
+            ("./as-built/api.hurl", None)
+        );
+        assert_eq!(
+            split_collection_ref("./my report.hurl"),
+            ("./my report.hurl", None)
+        );
+    }
+
+    #[test]
+    fn collections_lists_the_primary_first_then_helpers() {
+        let flow = crate::report::parser::parse_flow(
+            "# collection: ./api.hurl\n# collection: ./helpers.hurl AS h\n\nREQUEST a\n",
+        )
+        .expect("parses");
+        let cols = flow.header.collections();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(
+            cols[0],
+            crate::report::flow::CollectionRef {
+                reference: "./api.hurl",
+                alias: None
+            }
+        );
+        assert_eq!(cols[1].alias, Some("h"));
+        // `collection()` still answers with the primary, alias stripped.
+        assert_eq!(flow.header.collection(), Some("./api.hurl"));
+    }
+
+    #[test]
+    fn a_qualified_name_resolves_within_its_helper() {
+        let primary = [e("upload")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("fetch_frame")],
+        }];
+        assert_eq!(
+            resolve_qualified(&primary, &helpers, "h/fetch_frame").map(|e| &e.title),
+            Some(&"fetch_frame".to_string())
+        );
+        // Without the alias it isn't reachable — helpers are opt-in by name.
+        assert!(resolve_qualified(&primary, &helpers, "fetch_frame").is_none());
+        assert!(resolve_qualified(&primary, &helpers, "upload").is_some());
+    }
+
+    /// End to end: a report that calls a helper request produces its row, with
+    /// the helper's entry actually sent.
+    #[test]
+    fn a_flow_runs_a_request_from_a_helper_collection() {
+        use std::sync::Mutex;
+        struct Recorder(Mutex<Vec<String>>);
+        impl EntryRunner for Recorder {
+            fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+                self.0.lock().unwrap().push(base.title.clone());
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: String::new(),
+                        raw_body: String::new(),
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+        let flow = crate::report::parser::parse_flow(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREPORT REQUEST h/fetch_frame\n",
+        )
+        .expect("parses");
+        let primary = [e("upload")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("fetch_frame")],
+        }];
+        let runner = Recorder(Mutex::new(Vec::new()));
+        let ctx = RunContext {
+            entries: &primary,
+            helpers: &helpers,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            sink: None,
+        };
+        let result = run_flow(&flow, &ctx);
+        assert_eq!(
+            *runner.0.lock().unwrap(),
+            vec!["fetch_frame".to_string()],
+            "the helper's own entry was sent"
+        );
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    /// `/` is also the virtual-folder separator, so a prefix that isn't a
+    /// declared alias must still be read as part of a title.
+    #[test]
+    fn an_undeclared_prefix_is_still_a_folder_path() {
+        let primary = [e("auth/login")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("login")],
+        }];
+        assert!(resolve_qualified(&primary, &helpers, "auth/login").is_some());
     }
 }

@@ -182,6 +182,15 @@ pub fn run(
         })
         .collect();
     let env_names: Vec<String> = named_envs.keys().cloned().collect();
+    // The headless runner has nothing open, so every helper collection is read
+    // from disk relative to the report.
+    let cli_strings = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+    let (helpers, helper_errors) = crate::report::context::load_helpers(
+        &[],
+        &flow,
+        Some(std::path::Path::new(&report_path)),
+        &cli_strings,
+    );
     // Relative producer paths (and the `# baseline:` snapshot) resolve against
     // `# root:` if set, else the report file's own directory (`report_dir`,
     // computed above). Computed here so validation's baseline-existence check
@@ -216,9 +225,11 @@ pub fn run(
         base_var_names: Some(&base_var_names_owned),
         all_env_var_names: Some(&all_env_var_names_owned),
         request_entries: Some(&entries),
+        helpers: &helpers,
+        helper_errors: &helper_errors,
         // The headless runner has no language setting of its own — its output
         // is read by scripts and CI logs, which is English territory.
-        strings: &crate::i18n::Strings::for_language(&crate::i18n::Language::English),
+        strings: &cli_strings,
     };
     let diags = validate(&flow, &ctx);
     let has_error = diags.iter().any(|d| d.severity == Severity::Error);
@@ -265,6 +276,7 @@ pub fn run(
     let result = if dry_run {
         let ctx = RunContext {
             entries: &entries,
+            helpers: &helpers,
             base_vars,
             named_envs,
             root,
@@ -282,6 +294,7 @@ pub fn run(
         let total = {
             let ctx = RunContext {
                 entries: &entries,
+                helpers: &helpers,
                 base_vars: base_vars.clone(),
                 named_envs: named_envs.clone(),
                 root: root.clone(),
@@ -306,6 +319,7 @@ pub fn run(
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &helpers,
             base_vars,
             named_envs,
             root,

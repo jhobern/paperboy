@@ -76,6 +76,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the role is optional: PaperTrail will not pick one of two candidates for you,
   because the choice would silently depend on directory order.
 
+- **A report can pull requests from more than one collection.** `# collection:`
+  is now repeatable, and every collection after the first must be given a name:
+
+  ```
+  # collection: ./face.hurl
+  # collection: ./shared/auth.hurl AS auth
+
+  REQUEST auth/login
+  REPORT REQUEST verify AS v
+  ```
+
+  Requests in a helper are referred to as `alias/request` everywhere a request
+  name is accepted. The alias is **required** rather than optional so a bare
+  name always means the report's own collection: a name can never quietly
+  change which request it runs because a helper was added, and a helper's
+  request can never be reached by accident. For the same reason an alias that
+  collides with a top-level virtual folder is an error rather than a precedence
+  rule — PaperTrail does not pick between two readings of a name.
+
+  Both editors list the helpers in *Report Settings* (add, rename the alias,
+  re-point the file, remove — the primary collection stays put), and every
+  request picker, completion and validity tint offers and resolves the
+  qualified names. A helper that is already open as a tab is read from the tab,
+  so unsaved edits are seen; otherwise it is read from disk. A `git:` helper
+  must be opened first, since validating a report should not do network I/O.
+
 
 ## [0.7.3] - 2026-08-08
 

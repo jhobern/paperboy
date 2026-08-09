@@ -676,7 +676,6 @@ strings! {
     report_with_add_row => "add a field…", "ajouter un champ…", "tilføj et felt…";
     report_settings_heading => "Report Settings", "Réglages du rapport", "Rapportindstillinger";
     report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
-    report_settings_all_set => "Every report setting is already set", "Tous les réglages du rapport sont déjà définis", "Alle rapportindstillinger er allerede sat";
     report_setting_no_choices => "Nothing to choose from — load an environment first, or press e to type a name", "Rien à choisir — chargez d'abord un environnement, ou appuyez sur e pour saisir un nom", "Intet at vælge imellem — indlæs først et miljø, eller tryk e for at skrive et navn";
     report_setting_menu_hint => "↑↓ move · Enter choose · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
@@ -1171,6 +1170,16 @@ strings! {
     diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
     diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
     diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
+    report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
+    report_alias_unset => "alias", "alias", "alias";
+    report_helper_collection_help => "Another collection whose requests this report can call, written 'path AS alias'. Its requests are then used as 'alias/request'. Handy for a request that supports the report but isn't part of the API being tested — it stays out of Run All.", "Une autre collection dont ce rapport peut appeler les requêtes, écrite 'chemin AS alias'. Ses requêtes s'utilisent alors comme 'alias/requête'. Pratique pour une requête qui sert au rapport sans faire partie de l'API testée : elle reste hors de « Tout exécuter ».", "En anden samling, hvis forespørgsler denne rapport kan kalde, skrevet 'sti AS alias'. Dens forespørgsler bruges så som 'alias/forespørgsel'. Nyttigt til en forespørgsel, der understøtter rapporten uden at være en del af den API, der testes — den holdes uden for Kør alle.";
+    diag_collection_primary_alias => "The first '# collection:' is the report's own collection, so it takes no 'AS' alias. Aliases name the extra helper collections below it.", "La première '# collection:' est la collection du rapport : elle ne prend pas d'alias 'AS'. Les alias nomment les collections d'appoint qui la suivent.", "Den første '# collection:' er rapportens egen samling og tager derfor ikke et 'AS'-alias. Aliasser navngiver de ekstra hjælpesamlinger under den.";
+    diag_collection_alias_missing => "Helper collection '{}' needs an alias: write '# collection: {0} AS name'. Its requests are then used as 'name/request'.", "La collection d'appoint '{}' a besoin d'un alias : écrivez '# collection: {0} AS nom'. Ses requêtes s'utilisent alors comme 'nom/requête'.", "Hjælpesamlingen '{}' mangler et alias: skriv '# collection: {0} AS navn'. Dens forespørgsler bruges så som 'navn/forespørgsel'.";
+    diag_collection_alias_invalid => "'{}' is not a usable collection alias. Use letters, digits and underscores, starting with a letter or underscore.", "'{}' n'est pas un alias de collection utilisable. Utilisez des lettres, des chiffres et des tirets bas, en commençant par une lettre ou un tiret bas.", "'{}' kan ikke bruges som samlingsalias. Brug bogstaver, tal og understregninger, og begynd med et bogstav eller en understregning.";
+    diag_collection_alias_duplicate => "Two helper collections are both called '{}'. Give each one its own alias so 'alias/request' names exactly one request.", "Deux collections d'appoint s'appellent '{}'. Donnez à chacune son propre alias pour que 'alias/requête' désigne une seule requête.", "To hjælpesamlinger hedder begge '{}'. Giv hver sit eget alias, så 'alias/forespørgsel' peger på præcis én forespørgsel.";
+    diag_collection_alias_shadows_folder => "The alias '{}' is also a folder in the bound collection, so '{0}/…' could mean either. Rename the alias.", "L'alias '{}' est aussi un dossier de la collection liée : '{0}/…' devient ambigu. Renommez l'alias.", "Aliasset '{}' er også en mappe i den bundne samling, så '{0}/…' kan betyde begge dele. Omdøb aliasset.";
+    diag_collection_helper_not_open => "it lives on a git remote, so open it as a collection first", "elle se trouve sur un dépôt git distant : ouvrez-la d'abord comme collection", "den ligger på en git-fjernserver, så åbn den som samling først";
+    diag_collection_helper_unreadable => "Helper collection '{}' could not be read: {}", "Impossible de lire la collection d'appoint '{}' : {}", "Hjælpesamlingen '{}' kunne ikke læses: {}";
     diag_request_not_found => "Request '{}' was not found in the bound collection.", "La requête '{}' est introuvable dans la collection liée.", "Forespørgslen '{}' blev ikke fundet i den bundne samling.";
     diag_request_ambiguous_leaf => "Request '{}' is ambiguous — {} requests end with that name; qualify it with its folder path.", "La requête '{}' est ambiguë — {} requêtes se terminent par ce nom\u{a0}; qualifiez-la avec son chemin de dossier.", "Forespørgslen '{}' er tvetydig — {} forespørgsler slutter med det navn; kvalificér den med dens mappesti.";
     diag_envs_empty => "This ENVS loop has no environments to run over.", "Cette boucle ENVS n'a aucun environnement à parcourir.", "Denne ENVS-løkke har ingen miljøer at køre over.";
@@ -1388,7 +1397,6 @@ pub enum Status {
     ReportNodeNothingToUndo(String),
     /// `a` was pressed on the node editor's settings section when every
     /// optional header directive is already present.
-    ReportSettingsAllSet,
     /// Enter was pressed on a settings row whose picker has nothing to offer —
     /// only reachable for `environment:` with no environments loaded.
     ReportSettingNoChoices,
@@ -1583,7 +1591,6 @@ impl Status {
             Status::ReportReformatFailed(why) => {
                 format!("{} {why}", s.report_reformat_failed_prefix)
             }
-            Status::ReportSettingsAllSet => s.report_settings_all_set.to_string(),
             Status::ReportSettingNoChoices => s.report_setting_no_choices.to_string(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
             Status::ReportBaselineSaved(path) => {

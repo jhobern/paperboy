@@ -142,6 +142,13 @@ pub(crate) struct ReportTab {
     pub(crate) report: Report,
     /// Validation diagnostics (errors + warnings) from the last revalidation.
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// The report's aliased helper collections, loaded at the last revalidation.
+    ///
+    /// Cached rather than loaded on demand because loading reads files from
+    /// disk, and the pickers, completion and known/unknown tinting that need it
+    /// all run while drawing. Refreshed by `revalidate_report`, which already
+    /// fires on every change that could affect it.
+    pub(crate) helpers: Vec<crate::report::run::HelperCollection>,
     /// Parser error message, if the source doesn't currently parse (shown in
     /// place of `diagnostics`, which can't be computed without a parse tree).
     pub(crate) parse_error: Option<String>,
@@ -375,6 +382,7 @@ impl ReportTab {
         Self {
             report,
             diagnostics: Vec::new(),
+            helpers: Vec::new(),
             parse_error: None,
             parse_error_line: None,
             editor: None,
@@ -868,12 +876,12 @@ impl TuiApp {
         // Compute the parse-error / diagnostics up front so the immutable reads
         // of `self.collections` / `self.global_envs` don't overlap the mutable
         // borrow of `self.reports[idx]` that stores the result.
-        let (parse_error, parse_error_line, diagnostics) = {
+        let (parse_error, parse_error_line, diagnostics, helpers) = {
             let Some(rt) = self.reports.get(idx) else {
                 return;
             };
             match rt.report.flow() {
-                Err(e) => (Some(e.to_string()), Some(e.line), Vec::new()),
+                Err(e) => (Some(e.to_string()), Some(e.line), Vec::new(), Vec::new()),
                 Ok(flow) => {
                     // The full validation-context assembly (bound collection,
                     // request titles / [Reports] fields, env names + variable
@@ -887,7 +895,13 @@ impl TuiApp {
                         rt.report.path.as_deref(),
                         &crate::i18n::Strings::for_language(&self.language),
                     );
-                    (None, None, diags)
+                    let (helpers, _) = crate::report::context::load_helpers(
+                        &self.collections,
+                        &flow,
+                        rt.report.path.as_deref(),
+                        &crate::i18n::Strings::for_language(&self.language),
+                    );
+                    (None, None, diags, helpers)
                 }
             }
         };
@@ -895,6 +909,7 @@ impl TuiApp {
             rt.parse_error = parse_error;
             rt.parse_error_line = parse_error_line;
             rt.diagnostics = diagnostics;
+            rt.helpers = helpers;
         }
     }
 
@@ -963,6 +978,7 @@ impl TuiApp {
         let inputs = self.build_report_run_inputs(idx)?;
         let ctx = RunContext {
             entries: &inputs.entries,
+            helpers: &inputs.helpers,
             base_vars: inputs.base_vars,
             named_envs: inputs.named_envs,
             root: inputs.root,
@@ -1118,6 +1134,7 @@ impl TuiApp {
             let ReportRunInputs {
                 flow,
                 entries,
+                helpers,
                 base_vars,
                 named_envs,
                 root,
@@ -1133,6 +1150,7 @@ impl TuiApp {
             let skeleton = {
                 let dry_ctx = RunContext {
                     entries: &entries,
+                    helpers: &helpers,
                     base_vars: base_vars.clone(),
                     named_envs: named_envs.clone(),
                     root: root.clone(),
@@ -1180,6 +1198,7 @@ impl TuiApp {
             };
             let ctx = RunContext {
                 entries: &entries,
+                helpers: &helpers,
                 base_vars,
                 named_envs,
                 root,
@@ -2603,9 +2622,19 @@ impl TuiApp {
         }
         // Request names on a REQUEST / REPORT REQUEST line (bare or quoted).
         if let Some(partial) = request_name_partial(line) {
-            let ci = self.resolve_bound_collection(&rt.report)?;
-            let titles = self.collections[ci].entries.iter().map(|e| e.title.clone());
-            return complete_name(&partial, titles, false);
+            let entries = self
+                .resolve_bound_collection(&rt.report)
+                .map(|ci| self.collections[ci].entries.as_slice())
+                .unwrap_or(&[]);
+            // Qualified names, so a helper completes as `alias/request` — the
+            // only form that resolves. Matching stays a plain prefix match on
+            // that whole string: the alias has to be typed to reach a helper,
+            // which is deliberate, since the ghost can only ever *extend* what
+            // has been typed and could not insert an alias in front of it.
+            let names = crate::report::context::request_choices(entries, &rt.helpers)
+                .into_iter()
+                .map(|c| c.qualified);
+            return complete_name(&partial, names, false);
         }
         // Environment names on a FOR … ENVS clause (always quoted).
         if let Some(partial) = env_name_partial(line) {

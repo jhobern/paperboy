@@ -80,6 +80,15 @@ pub struct Context<'a> {
     /// it runs. `None` (unbound collection) skips the variable-availability
     /// check entirely.
     pub request_entries: Option<&'a [crate::hurl::HurlEntry]>,
+    /// Aliased helper collections declared by extra `# collection: … AS x`
+    /// directives, already loaded. Names resolve within one of these only when
+    /// written `alias/name`, exactly as at run time — validation must agree with
+    /// [`super::run::resolve_qualified`] or a report passes here and fails there.
+    pub helpers: &'a [super::run::HelperCollection],
+    /// Helper collections that were declared but couldn't be read, as
+    /// `(reference, reason)`. Flagged on the directive so it's a validation
+    /// error rather than a surprise mid-run.
+    pub helper_errors: &'a [(String, String)],
     /// The language to phrase diagnostics in. They are user-facing text like
     /// any other, so they live in the `i18n` table rather than as literals
     /// here — a validation message is often the only thing standing between a
@@ -99,6 +108,8 @@ impl Default for Context<'_> {
             base_var_names: None,
             all_env_var_names: None,
             request_entries: None,
+            helpers: &[],
+            helper_errors: &[],
             strings: Strings::english(),
         }
     }
@@ -124,6 +135,7 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error(s.diag_collection_unset)),
         Some(_) => {}
     }
+    check_collection_directives(flow, ctx, &mut diags);
     if let Some(out) = flow.header.output() {
         let out = out.trim();
         if !out.is_empty()
@@ -314,25 +326,12 @@ fn check_show_fields(
     if show.is_empty() {
         return;
     }
-    let Some(entries) = ctx.request_fields else {
+    // An unresolved name is already reported by `check_request_name`, so bail
+    // quietly here.
+    let Some(report_fields) = declared_report_fields(name, ctx) else {
         return;
     };
-    // Resolve the request's `[Reports]` field names: exact full-title, then a
-    // unique leaf match (mirroring `check_request_name`). An unresolved name is
-    // already reported by `check_request_name`, so bail quietly here.
-    let by_exact = entries.iter().find(|(t, _)| t == name);
-    let resolved = by_exact.or_else(|| {
-        let mut leaves = entries
-            .iter()
-            .filter(|(t, _)| t.rsplit('/').next() == Some(name));
-        match (leaves.next(), leaves.next()) {
-            (Some(hit), None) => Some(hit),
-            _ => None,
-        }
-    });
-    let Some((_, report_fields)) = resolved else {
-        return;
-    };
+    let report_fields = &report_fields;
     let with_fields: Vec<&str> = with
         .iter()
         .filter_map(|w| match w {
@@ -383,19 +382,10 @@ fn check_hide_fields(
     if hide.is_empty() {
         return;
     }
-    let Some(entries) = ctx.request_fields else {
+    let Some(report_fields) = declared_report_fields(name, ctx) else {
         return;
     };
-    let by_exact = entries.iter().find(|(t, _)| t == name);
-    let resolved = by_exact.or_else(|| {
-        let mut leaves = entries
-            .iter()
-            .filter(|(t, _)| t.rsplit('/').next() == Some(name));
-        match (leaves.next(), leaves.next()) {
-            (Some(hit), None) => Some(hit),
-            _ => None,
-        }
-    });
+    let resolved = Some((String::new(), report_fields));
     let Some((_, report_fields)) = resolved else {
         return;
     };
@@ -421,10 +411,103 @@ fn check_hide_fields(
 
 /// Resolve a request name against the bound collection's titles: exact
 /// full-title → unique leaf name → error. Skipped when no collection is bound.
+/// Split a `alias/name` reference when `alias` is a *declared* helper. Returns
+/// the helper and the name within it. A `/` that isn't a declared alias is left
+/// alone — it is far more likely a virtual-folder path.
+fn split_helper<'a>(
+    name: &'a str,
+    ctx: &'a Context,
+) -> Option<(&'a super::run::HelperCollection, &'a str)> {
+    let (alias, rest) = name.split_once('/')?;
+    ctx.helpers
+        .iter()
+        .find(|h| h.alias == alias)
+        .map(|h| (h, rest))
+}
+
+/// The `# collection:` directives: exactly one primary (unaliased, first), every
+/// helper aliased, aliases distinct identifiers that don't collide with a
+/// top-level virtual folder, and every declared helper actually loadable.
+fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+    let refs = flow.header.collections();
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, c) in refs.iter().enumerate() {
+        if i == 0 {
+            // The primary is *the* collection under test, not a helper; an alias
+            // on it would suggest its requests are addressed `alias/name`, which
+            // they aren't.
+            if c.alias.is_some() {
+                diags.push(Diagnostic::error(s.diag_collection_primary_alias));
+            }
+            continue;
+        }
+        let Some(alias) = c.alias else {
+            diags.push(Diagnostic::error(fill(
+                s.diag_collection_alias_missing,
+                &[c.reference],
+            )));
+            continue;
+        };
+        if !crate::report::parser::is_ident(alias) {
+            diags.push(Diagnostic::error(fill(
+                s.diag_collection_alias_invalid,
+                &[alias],
+            )));
+            continue;
+        }
+        if seen.contains(&alias) {
+            diags.push(Diagnostic::error(fill(
+                s.diag_collection_alias_duplicate,
+                &[alias],
+            )));
+            continue;
+        }
+        seen.push(alias);
+        // `/` is also the virtual-folder separator, so an alias sharing a name
+        // with a top-level folder makes `folder/request` ambiguous. PaperTrail
+        // never picks silently between two readings of a name, so this is an
+        // error rather than a precedence rule.
+        if let Some(titles) = ctx.request_titles
+            && titles
+                .iter()
+                .any(|t| t.split('/').next() == Some(alias) && t.contains('/'))
+        {
+            diags.push(Diagnostic::error(fill(
+                s.diag_collection_alias_shadows_folder,
+                &[alias],
+            )));
+        }
+    }
+    for (reference, reason) in ctx.helper_errors {
+        diags.push(Diagnostic::error(fill(
+            s.diag_collection_helper_unreadable,
+            &[reference, reason],
+        )));
+    }
+}
+
 fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    if let Some((helper, rest)) = split_helper(name, ctx) {
+        let titles: Vec<String> = helper.entries.iter().map(|e| e.title.clone()).collect();
+        check_name_in(rest, &titles, name, ctx, diags);
+        return;
+    }
     let Some(titles) = ctx.request_titles else {
         return;
     };
+    check_name_in(name, titles, name, ctx, diags);
+}
+
+/// The shared exact-title → unique-leaf → error ladder. `shown` is the name as
+/// the user wrote it (alias included), so a diagnostic quotes their own text.
+fn check_name_in(
+    name: &str,
+    titles: &[String],
+    shown: &str,
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
     let exact = titles.iter().filter(|t| t.as_str() == name).count();
     if exact == 1 {
         return;
@@ -432,7 +515,7 @@ fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     if exact > 1 {
         diags.push(Diagnostic::error(fill(
             ctx.strings.diag_request_ambiguous_title,
-            &[name, &exact.to_string()],
+            &[shown, &exact.to_string()],
         )));
         return;
     }
@@ -445,11 +528,11 @@ fn check_request_name(name: &str, ctx: &Context, diags: &mut Vec<Diagnostic>) {
         1 => {}
         0 => diags.push(Diagnostic::error(fill(
             ctx.strings.diag_request_not_found,
-            &[name],
+            &[shown],
         ))),
         n => diags.push(Diagnostic::error(fill(
             ctx.strings.diag_request_ambiguous_leaf,
-            &[name, &n.to_string()],
+            &[shown, &n.to_string()],
         ))),
     }
 }
@@ -679,6 +762,40 @@ fn initial_defined_vars(ctx: &Context) -> HashSet<String> {
 /// as [`check_request_name`] — returning the first matching entry, or `None`
 /// for an ambiguous/missing name (those cases are already reported by the
 /// structural walk; here we silently skip to avoid double-reporting).
+/// The `[Reports]` field names a request can declare, alias-aware: exact full
+/// title, then a unique leaf match, within the collection the name addresses.
+fn declared_report_fields(name: &str, ctx: &Context) -> Option<Vec<String>> {
+    if let Some((helper, rest)) = split_helper(name, ctx) {
+        return resolve_entry_by_name(&helper.entries, rest)
+            .map(|e| e.reports.iter().map(|(n, _)| n.clone()).collect());
+    }
+    let entries = ctx.request_fields?;
+    let by_exact = entries.iter().find(|(t, _)| t == name);
+    by_exact
+        .or_else(|| {
+            let mut leaves = entries
+                .iter()
+                .filter(|(t, _)| t.rsplit('/').next() == Some(name));
+            match (leaves.next(), leaves.next()) {
+                (Some(hit), None) => Some(hit),
+                _ => None,
+            }
+        })
+        .map(|(_, f)| f.clone())
+}
+
+/// The entry a name addresses, alias-aware — the validation-side twin of
+/// [`super::run::resolve_qualified`].
+fn resolve_entry_qualified<'a>(
+    name: &'a str,
+    ctx: &'a Context,
+) -> Option<&'a crate::hurl::HurlEntry> {
+    if let Some((helper, rest)) = split_helper(name, ctx) {
+        return resolve_entry_by_name(&helper.entries, rest);
+    }
+    resolve_entry_by_name(ctx.request_entries?, name)
+}
+
 fn resolve_entry_by_name<'a>(
     entries: &'a [crate::hurl::HurlEntry],
     name: &str,
@@ -725,10 +842,10 @@ fn warn_if_vars_undefined(
     defined: &HashSet<String>,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let Some(entries) = ctx.request_entries else {
+    if ctx.request_entries.is_none() {
         return;
-    };
-    let Some(entry) = resolve_entry_by_name(entries, name) else {
+    }
+    let Some(entry) = resolve_entry_qualified(name, ctx) else {
         return; // unresolvable — structural check already warned
     };
     let refs = crate::request::entry_referenced_keys(entry);
@@ -752,10 +869,10 @@ fn warn_if_vars_undefined(
 /// Thread the capture names of a successfully-resolved request into `defined`
 /// so that subsequent requests in the same block can use them.
 fn add_entry_captures(name: &str, ctx: &Context, defined: &mut HashSet<String>) {
-    let Some(entries) = ctx.request_entries else {
+    if ctx.request_entries.is_none() {
         return;
-    };
-    let Some(entry) = resolve_entry_by_name(entries, name) else {
+    }
+    let Some(entry) = resolve_entry_qualified(name, ctx) else {
         return;
     };
     for (cap_name, _) in &entry.captures {
@@ -1758,6 +1875,150 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("TOKEN") && w.contains("After")),
             "TOKEN IS captured by the time After runs: {warns_before:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod helper_collection_validation_tests {
+    use super::*;
+    use crate::hurl::HurlEntry;
+    use crate::report::parser::parse_flow;
+    use crate::report::run::HelperCollection;
+
+    fn entry(title: &str) -> HurlEntry {
+        HurlEntry {
+            title: title.to_string(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        }
+    }
+
+    fn check(src: &str, titles: &[&str], helpers: &[HelperCollection]) -> Vec<String> {
+        let flow = parse_flow(src).expect("parses");
+        let titles: Vec<String> = titles.iter().map(|t| t.to_string()).collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            helpers,
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    fn helper(alias: &str, titles: &[&str]) -> HelperCollection {
+        HelperCollection {
+            alias: alias.into(),
+            entries: titles.iter().map(|t| entry(t)).collect(),
+        }
+    }
+
+    /// The point of the feature: a request that deliberately isn't in the
+    /// collection under test still validates when addressed through its alias.
+    #[test]
+    fn a_helper_request_validates_through_its_alias() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST h/fetch_frame\n",
+            &["upload"],
+            &[helper("h", &["fetch_frame"])],
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// …and validation agrees with `resolve_qualified`: a helper request named
+    /// without its alias is an error here, because it would fail at run time.
+    #[test]
+    fn a_helper_request_without_its_alias_is_an_error() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST fetch_frame\n",
+            &["upload"],
+            &[helper("h", &["fetch_frame"])],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("fetch_frame"));
+    }
+
+    #[test]
+    fn a_missing_name_inside_a_helper_is_reported_with_the_alias() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST h/nope\n",
+            &["upload"],
+            &[helper("h", &["fetch_frame"])],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("h/nope"), "{errs:?}");
+    }
+
+    #[test]
+    fn the_primary_collection_takes_no_alias() {
+        let errs = check(
+            "# collection: ./api.hurl AS main\n\nREQUEST upload\n",
+            &["upload"],
+            &[],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    #[test]
+    fn a_helper_must_be_aliased() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./h.hurl\n\nREQUEST upload\n",
+            &["upload"],
+            &[],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("./h.hurl"), "{errs:?}");
+    }
+
+    #[test]
+    fn two_helpers_cannot_share_an_alias() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./a.hurl AS h\n# collection: ./b.hurl AS h\n\nREQUEST upload\n",
+            &["upload"],
+            &[helper("h", &["x"])],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// An alias that is also a top-level folder makes `folder/request`
+    /// ambiguous, and PaperTrail never picks silently between two readings.
+    #[test]
+    fn an_alias_may_not_shadow_a_virtual_folder() {
+        let errs = check(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS auth\n\nREQUEST upload\n",
+            &["auth/login", "upload"],
+            &[helper("auth", &["x"])],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("auth"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_unreadable_helper_is_an_error_on_the_directive() {
+        let flow = parse_flow(
+            "# collection: ./api.hurl\n# collection: ./gone.hurl AS h\n\nREQUEST upload\n",
+        )
+        .expect("parses");
+        let titles = vec!["upload".to_string()];
+        let errors = vec![("./gone.hurl".to_string(), "no such file".to_string())];
+        let ctx = Context {
+            request_titles: Some(&titles),
+            helper_errors: &errors,
+            ..Default::default()
+        };
+        let errs: Vec<String> = validate(&flow, &ctx)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("./gone.hurl") && e.contains("no such file")),
+            "{errs:?}"
         );
     }
 }

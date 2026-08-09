@@ -192,6 +192,11 @@ pub(crate) enum PromptKind {
     ReportHeaderValue {
         report_id: u64,
         key: &'static str,
+        /// Which occurrence of `key` is being edited — see
+        /// [`crate::tui::report_nodes::SettingRow::occurrence`]. `collection:`
+        /// repeats, so this is what keeps a helper row from overwriting the
+        /// primary collection.
+        occurrence: usize,
     },
 }
 
@@ -1943,14 +1948,18 @@ impl TuiApp {
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
-            PromptKind::ReportHeaderValue { report_id, key } => {
+            PromptKind::ReportHeaderValue {
+                report_id,
+                key,
+                occurrence,
+            } => {
                 if let Some(idx) = self.report_index_by_id(report_id) {
                     // An empty commit means "remove it", the same as Delete on
                     // the row — otherwise clearing the field would write back
                     // the `?` placeholder and look like nothing happened.
                     let text = text.trim().to_string();
                     let value = (!text.is_empty()).then_some(text);
-                    self.apply_report_setting(idx, key, value.as_deref());
+                    self.apply_report_setting(idx, key, occurrence, value.as_deref());
                 }
             }
         }

@@ -1366,21 +1366,35 @@ pub(crate) fn header_unset(value: &str) -> bool {
     value.is_empty() || value == HEADER_PLACEHOLDER
 }
 
-/// Set the `# key: value` header directive, or remove it entirely when `value`
-/// is `None` (or blank).
+/// The `n`th (0-based) occurrence of a repeatable directive, as `set_header_nth`
+/// and the editors index them.
+fn nth_directive(flow: &ReportFlow, key: &str, n: usize) -> Option<usize> {
+    flow.header
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| matches!(l, HeaderLine::Directive { key: k, .. } if k.eq_ignore_ascii_case(key)))
+        .map(|(i, _)| i)
+        .nth(n)
+}
+
+/// Set, change or clear the `n`th occurrence of a repeatable directive.
 ///
-/// A directive that already exists is edited in place so the user's own
-/// ordering and any interleaved comments survive; a new one is inserted after
-/// the last existing directive rather than appended, which keeps the directives
-/// together above any trailing comment block.
+/// Indexing matters because `# collection:` repeats: always editing the first
+/// match would silently rewrite the primary collection when the user meant to
+/// edit a helper. Clearing (`None`) removes that one line, so removing helper 1
+/// of 3 leaves the other two alone.
 ///
-/// Returns `true` when the header actually changed.
-pub(crate) fn set_header(flow: &mut ReportFlow, key: &str, value: Option<&str>) -> bool {
+/// Returns `true` when the header actually changed. A request to set an
+/// occurrence that doesn't exist yet appends one, so `n == count` adds.
+pub(crate) fn set_header_nth(
+    flow: &mut ReportFlow,
+    key: &str,
+    n: usize,
+    value: Option<&str>,
+) -> bool {
     let value = value.map(str::trim).filter(|v| !v.is_empty());
-    let existing = flow.header.lines.iter().position(
-        |l| matches!(l, HeaderLine::Directive { key: k, .. } if k.eq_ignore_ascii_case(key)),
-    );
-    match (existing, value) {
+    match (nth_directive(flow, key, n), value) {
         (Some(i), Some(v)) => {
             let HeaderLine::Directive { value: old, .. } = &mut flow.header.lines[i] else {
                 return false;
@@ -1395,24 +1409,32 @@ pub(crate) fn set_header(flow: &mut ReportFlow, key: &str, value: Option<&str>) 
             flow.header.lines.remove(i);
             true
         }
-        (None, Some(v)) => {
-            let at = flow
-                .header
-                .lines
-                .iter()
-                .rposition(|l| matches!(l, HeaderLine::Directive { .. }))
-                .map_or(0, |i| i + 1);
-            flow.header.lines.insert(
-                at,
-                HeaderLine::Directive {
-                    key: key.to_string(),
-                    value: v.to_string(),
-                },
-            );
-            true
-        }
+        (None, Some(v)) => add_header(flow, key, v),
         (None, None) => false,
     }
+}
+
+/// Append another occurrence of a repeatable directive, after the last existing
+/// directive so the header stays one block above any trailing comments.
+pub(crate) fn add_header(flow: &mut ReportFlow, key: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let at = flow
+        .header
+        .lines
+        .iter()
+        .rposition(|l| matches!(l, HeaderLine::Directive { .. }))
+        .map_or(0, |i| i + 1);
+    flow.header.lines.insert(
+        at,
+        HeaderLine::Directive {
+            key: key.to_string(),
+            value: value.to_string(),
+        },
+    );
+    true
 }
 
 /// Append a new `WITH` field (a `name: query` column) to the report-request at
@@ -2262,12 +2284,12 @@ REQUEST A
         );
 
         // Editing in place keeps the directive where the user put it.
-        assert!(set_header(&mut f, "collection", Some("other.hurl")));
+        assert!(set_header_nth(&mut f, "collection", 0, Some("other.hurl")));
         assert!(f.to_text().contains("# collection: other.hurl"));
         assert_eq!(f.header.collection(), Some("other.hurl"));
 
         // A new directive lands with the others, not at the top of the file.
-        assert!(set_header(&mut f, "output", Some("out.csv")));
+        assert!(set_header_nth(&mut f, "output", 0, Some("out.csv")));
         assert_eq!(f.header.output(), Some("out.csv"));
         let text = f.to_text();
         assert!(
@@ -2277,17 +2299,17 @@ REQUEST A
 
         // Setting the same value again is not a change, so it can't push a
         // pointless undo entry or mark the report dirty.
-        assert!(!set_header(&mut f, "output", Some("out.csv")));
+        assert!(!set_header_nth(&mut f, "output", 0, Some("out.csv")));
 
         // Clearing removes the line rather than leaving `# output:` empty,
         // which the parser would read as a directive set to the empty string.
-        assert!(set_header(&mut f, "output", None));
+        assert!(set_header_nth(&mut f, "output", 0, None));
         assert_eq!(f.header.output(), None);
         assert!(!f.to_text().contains("# output"));
-        assert!(!set_header(&mut f, "output", None));
+        assert!(!set_header_nth(&mut f, "output", 0, None));
 
         // Blank input means "unset", not "set to nothing".
-        assert!(!set_header(&mut f, "root", Some("   ")));
+        assert!(!set_header_nth(&mut f, "root", 0, Some("   ")));
         assert_eq!(f.header.root(), None);
     }
 
@@ -2301,7 +2323,7 @@ REQUEST A
 REQUEST A
 ",
         );
-        assert!(set_header(&mut f, "environment", Some("dev")));
+        assert!(set_header_nth(&mut f, "environment", 0, Some("dev")));
         let text = f.to_text();
         assert!(text.contains("# a note to self"), "{text:?}");
         assert!(
@@ -3013,5 +3035,78 @@ REQUEST A
         let mut g = flow("REPORT userId\n");
         assert_eq!(add_with_field(&mut g, &[0], "X", "Y", Vec::new()), None);
         assert!(!set_with_field(&mut g, &[0], 0, "X", "Y", Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod repeatable_header_tests {
+    use super::*;
+    use crate::report::parser::parse_flow;
+
+    fn flow(src: &str) -> ReportFlow {
+        parse_flow(src).expect("parses")
+    }
+
+    /// The bug `set_header_nth` exists to avoid: editing helper 1 must not
+    /// rewrite the primary collection.
+    #[test]
+    fn editing_a_helper_leaves_the_primary_collection_alone() {
+        let mut f = flow("# collection: ./api.hurl\n# collection: ./a.hurl AS a\n\nREQUEST x\n");
+        assert!(set_header_nth(
+            &mut f,
+            "collection",
+            1,
+            Some("./b.hurl AS b")
+        ));
+        let all = f.header.get_all("collection");
+        assert_eq!(all, vec!["./api.hurl", "./b.hurl AS b"]);
+    }
+
+    #[test]
+    fn clearing_one_helper_keeps_the_others() {
+        let mut f = flow(
+            "# collection: ./api.hurl\n# collection: ./a.hurl AS a\n# collection: ./b.hurl AS b\n\nREQUEST x\n",
+        );
+        assert!(set_header_nth(&mut f, "collection", 1, None));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./api.hurl", "./b.hurl AS b"]
+        );
+    }
+
+    /// Setting an occurrence that doesn't exist yet appends one, which is how
+    /// the editors' "add a helper collection" works.
+    #[test]
+    fn setting_past_the_end_appends_another_directive() {
+        let mut f = flow("# collection: ./api.hurl\n\nREQUEST x\n");
+        assert!(set_header_nth(
+            &mut f,
+            "collection",
+            1,
+            Some("./h.hurl AS h")
+        ));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./api.hurl", "./h.hurl AS h"]
+        );
+        // And it lands in the header block, above the flow.
+        assert!(
+            f.to_text()
+                .starts_with("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n"),
+            "{:?}",
+            f.to_text()
+        );
+    }
+
+    /// `set_header` keeps its old first-match-wins meaning for the directives
+    /// that only ever appear once.
+    #[test]
+    fn set_header_still_edits_the_first_occurrence() {
+        let mut f = flow("# collection: ./api.hurl\n# collection: ./a.hurl AS a\n\nREQUEST x\n");
+        assert!(set_header_nth(&mut f, "collection", 0, Some("./new.hurl")));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./new.hurl", "./a.hurl AS a"]
+        );
     }
 }

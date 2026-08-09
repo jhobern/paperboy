@@ -1245,7 +1245,9 @@ impl TuiApp {
             .resolve_bound_collection(&rt.report)
             .map(|ci| self.collections[ci].entries.as_slice())
             .unwrap_or(&[]);
-        let resolves = |name: &str| crate::report::run::resolve_title(entries, name).is_some();
+        let helpers = rt.helpers.as_slice();
+        let resolves =
+            |name: &str| crate::report::run::resolve_qualified(entries, helpers, name).is_some();
         // Expanded: the TUI outline has no room for the GUI's per-field chips,
         // so a `WITH` block's fields are rows of their own.
         Ok(flatten_expanded(&flow, &resolves, true))
@@ -1257,15 +1259,17 @@ impl TuiApp {
         let Some(idx) = self.report_index_by_id(report_id) else {
             return Vec::new();
         };
-        self.resolve_bound_collection(&self.reports[idx].report)
-            .map(|ci| {
-                self.collections[ci]
-                    .entries
-                    .iter()
-                    .map(|e| e.title.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let entries = self
+            .resolve_bound_collection(&self.reports[idx].report)
+            .map(|ci| self.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+        // Qualified, so a helper's request is offered in the form the source
+        // must contain — and so cycling can find the current value's position
+        // when a node already names one.
+        crate::report::context::request_choices(entries, &self.reports[idx].helpers)
+            .into_iter()
+            .map(|c| c.qualified)
+            .collect()
     }
 
     /// Handle a key in the structured node editor. Returns `true` when the key
@@ -1603,10 +1607,11 @@ impl TuiApp {
             return Vec::new();
         };
         let rt = &self.reports[idx];
-        let Some(ci) = self.resolve_bound_collection(&rt.report) else {
-            return Vec::new();
-        };
-        crate::report::run::resolve_title(&self.collections[ci].entries, name)
+        let entries = self
+            .resolve_bound_collection(&rt.report)
+            .map(|ci| self.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+        crate::report::run::resolve_qualified(entries, &rt.helpers, name)
             .map(|e| e.reports.iter().map(|(f, _)| f.clone()).collect())
             .unwrap_or_default()
     }
@@ -3512,6 +3517,11 @@ pub(crate) struct SettingRow {
     pub(crate) key: &'static str,
     pub(crate) kind: HeaderKind,
     pub(crate) required: bool,
+    /// Which occurrence of `key` this row edits. Always 0 except for
+    /// `collection:`, which repeats: occurrence 0 is the primary collection and
+    /// each one after it is an aliased helper (`path AS alias`). Without this
+    /// every helper row would write back over the primary.
+    pub(crate) occurrence: usize,
     /// The directive's stored value; empty when the directive is absent, or the
     /// [`HEADER_PLACEHOLDER`] sentinel when it was added but not filled in.
     pub(crate) value: String,
@@ -3540,14 +3550,32 @@ impl TuiApp {
         };
         header_specs()
             .into_iter()
-            .filter_map(|spec| {
-                let value = flow.header.get(spec.key).unwrap_or_default().to_string();
-                (spec.always_shown || !value.is_empty()).then_some(SettingRow {
-                    key: spec.key,
-                    kind: spec.kind,
-                    required: spec.required,
-                    value,
-                })
+            .flat_map(|spec| {
+                // `collection:` repeats: one row for the primary and one for
+                // each aliased helper, so a helper can be seen and edited here
+                // rather than only in the raw source.
+                let values = if spec.key == "collection" {
+                    let all = flow.header.get_all("collection");
+                    if all.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        all.into_iter().map(str::to_string).collect()
+                    }
+                } else {
+                    vec![flow.header.get(spec.key).unwrap_or_default().to_string()]
+                };
+                values
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, value)| spec.always_shown || !value.is_empty())
+                    .map(|(occurrence, value)| SettingRow {
+                        key: spec.key,
+                        kind: spec.kind,
+                        required: spec.required && occurrence == 0,
+                        occurrence,
+                        value,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -3636,14 +3664,20 @@ impl TuiApp {
         }
         let rows = self.report_setting_rows(idx);
         let Some(row) = rows.get(sel) else { return };
-        let (key, kind) = (row.key, row.kind);
+        let (key, kind, occurrence) = (row.key, row.kind, row.occurrence);
         match kind {
             // The collection picker already exists (`b`), lists exactly the
             // right things and writes the reference in the right form, so Enter
             // here is that same picker rather than a second one beside it.
-            HeaderKind::Collection => self.open_report_bind(),
+            //
+            // Only for the *primary* collection, though: it rebinds the report,
+            // and a helper also needs its `AS alias`, which the picker has no
+            // way to ask for. Helper rows get the raw text prompt, seeded with
+            // the whole `path AS alias` line.
+            HeaderKind::Collection if occurrence == 0 => self.open_report_bind(),
+            HeaderKind::Collection => self.open_setting_text_prompt(idx, sel),
             HeaderKind::Environment | HeaderKind::Format => {
-                self.open_setting_value_menu(idx, key, kind)
+                self.open_setting_value_menu(idx, key, occurrence, kind)
             }
             HeaderKind::Folder | HeaderKind::File => self.open_setting_path_browser(idx, key, kind),
             HeaderKind::Text => self.open_setting_text_prompt(idx, sel),
@@ -3675,9 +3709,14 @@ impl TuiApp {
             row.value.clone()
         };
         let key = row.key;
+        let occurrence = row.occurrence;
         let report_id = self.reports[idx].report.id;
         self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::ReportHeaderValue { report_id, key },
+            kind: PromptKind::ReportHeaderValue {
+                report_id,
+                key,
+                occurrence,
+            },
             editor: Editor::new(&seed, false),
             title: key.to_uppercase(),
             mask: false,
@@ -3696,8 +3735,8 @@ impl TuiApp {
         }
         let rows = self.report_setting_rows(idx);
         let Some(row) = rows.get(sel) else { return };
-        let key = row.key;
-        self.apply_report_setting(idx, key, None);
+        let (key, occurrence) = (row.key, row.occurrence);
+        self.apply_report_setting(idx, key, occurrence, None);
         // Removing an optional directive shortens the list under the cursor.
         let last = self.setting_row_count(idx).saturating_sub(1);
         self.reports[idx].node_setting = Some(sel.min(last));
@@ -3706,13 +3745,19 @@ impl TuiApp {
     /// Write (or, with `None`, remove) a header directive on the report at
     /// `idx`, re-serializing through the same undoable path every structural
     /// node edit uses — so Ctrl+Z takes a settings change back too.
-    pub(crate) fn apply_report_setting(&mut self, idx: usize, key: &str, value: Option<&str>) {
+    pub(crate) fn apply_report_setting(
+        &mut self,
+        idx: usize,
+        key: &str,
+        occurrence: usize,
+        value: Option<&str>,
+    ) {
         {
             let rt = &mut self.reports[idx];
             let Ok(mut flow) = rt.report.flow() else {
                 return;
             };
-            if !crate::report::edit::set_header(&mut flow, key, value) {
+            if !crate::report::edit::set_header_nth(&mut flow, key, occurrence, value) {
                 return;
             }
             let text = flow.to_text();
@@ -3742,7 +3787,12 @@ pub(crate) enum SettingMenuStep {
     /// directive keys.
     AddSetting,
     /// Choosing the value of `key`; the options are the values themselves.
-    PickValue { key: &'static str },
+    PickValue {
+        key: &'static str,
+        /// Which occurrence of `key` the pick writes to — see
+        /// [`SettingRow::occurrence`].
+        occurrence: usize,
+    },
 }
 
 impl SettingMenu {
@@ -3750,7 +3800,7 @@ impl SettingMenu {
     pub(crate) fn title(&self, s: &Strings) -> String {
         match self.step {
             SettingMenuStep::AddSetting => s.report_add_setting.to_string(),
-            SettingMenuStep::PickValue { key } => key.to_uppercase(),
+            SettingMenuStep::PickValue { key, .. } => key.to_uppercase(),
         }
     }
 }
@@ -3760,22 +3810,52 @@ impl TuiApp {
     /// doesn't have yet. A no-op with a status when they are all present —
     /// better than an empty menu that looks broken.
     fn open_add_setting_menu(&mut self, idx: usize) {
+        let s = Strings::for_language(&self.language);
         let missing = self.missing_report_settings(idx);
-        if missing.is_empty() {
-            self.status = Some(Status::ReportSettingsAllSet);
-            return;
-        }
+        // A helper collection is always offerable — `collection:` repeats, so
+        // unlike the one-shot directives it is never "already set".
+        let mut options: Vec<String> = missing.iter().map(|k| k.to_uppercase()).collect();
+        options.push(s.report_add_helper_collection.to_string());
         self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
             step: SettingMenuStep::AddSetting,
-            options: missing.iter().map(|k| k.to_uppercase()).collect(),
+            options,
             selected: 0,
             report_id: self.reports[idx].report.id,
         })));
     }
 
+    /// Add another `# collection:` line — an aliased helper collection, whose
+    /// requests the report can then call as `alias/request`.
+    ///
+    /// Seeded with the placeholder so the row appears immediately, then its
+    /// text prompt is opened on the new row: a helper needs both a path and an
+    /// `AS alias`, and typing the line is the only editor that can express
+    /// both. Validation says so plainly if the alias is left off.
+    fn add_helper_collection(&mut self, idx: usize) {
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let occurrence = flow.header.get_all("collection").len().max(1);
+        self.apply_report_setting(idx, "collection", occurrence, Some(HEADER_PLACEHOLDER));
+        let rows = self.report_setting_rows(idx);
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| r.key == "collection" && r.occurrence == occurrence)
+        {
+            self.reports[idx].node_setting = Some(pos);
+            self.open_setting_text_prompt(idx, pos);
+        }
+    }
+
     /// Enter on a directive whose answers are a closed list: the output formats
     /// PaperTrail can write, or the environments actually loaded.
-    fn open_setting_value_menu(&mut self, idx: usize, key: &'static str, kind: HeaderKind) {
+    fn open_setting_value_menu(
+        &mut self,
+        idx: usize,
+        key: &'static str,
+        occurrence: usize,
+        kind: HeaderKind,
+    ) {
         let options: Vec<String> = match kind {
             HeaderKind::Format => crate::report::writer::OUTPUT_EXTENSIONS
                 .iter()
@@ -3798,7 +3878,7 @@ impl TuiApp {
             .unwrap_or_default();
         let selected = options.iter().position(|o| *o == current).unwrap_or(0);
         self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
-            step: SettingMenuStep::PickValue { key },
+            step: SettingMenuStep::PickValue { key, occurrence },
             options,
             selected,
             report_id: self.reports[idx].report.id,
@@ -3839,7 +3919,7 @@ impl TuiApp {
             .and_then(|base| std::path::Path::new(path).strip_prefix(base).ok())
             .map(|rel| rel.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        self.apply_report_setting(idx, key, Some(&value));
+        self.apply_report_setting(idx, key, 0, Some(&value));
     }
 
     /// Key handling for [`Overlay::ReportSettingMenu`]. ↑/↓ (and `j`/`k`,
@@ -3886,11 +3966,16 @@ impl TuiApp {
                 // Seeded with the placeholder so the row appears at once; an
                 // empty value would be read as "remove this directive" and the
                 // menu would appear to do nothing.
+                let s = Strings::for_language(&self.language);
+                if choice == s.report_add_helper_collection {
+                    self.add_helper_collection(idx);
+                    return;
+                }
                 let key = menu.options[menu.selected].to_ascii_lowercase();
                 let Some(spec) = header_specs().into_iter().find(|s| s.key == key) else {
                     return;
                 };
-                self.apply_report_setting(idx, spec.key, Some(HEADER_PLACEHOLDER));
+                self.apply_report_setting(idx, spec.key, 0, Some(HEADER_PLACEHOLDER));
                 // Put the cursor on the row that just appeared and open its
                 // editor, so adding a setting and filling it in is one gesture.
                 let rows = self.report_setting_rows(idx);
@@ -3899,8 +3984,8 @@ impl TuiApp {
                     self.configure_selected_setting(idx, pos);
                 }
             }
-            SettingMenuStep::PickValue { key } => {
-                self.apply_report_setting(idx, key, Some(&choice))
+            SettingMenuStep::PickValue { key, occurrence } => {
+                self.apply_report_setting(idx, key, occurrence, Some(&choice))
             }
         }
     }

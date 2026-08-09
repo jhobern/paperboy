@@ -221,6 +221,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         let ReportRunInputs {
             flow,
             entries,
+            helpers,
             base_vars,
             named_envs,
             root,
@@ -233,6 +234,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         let skeleton = {
             let dry_ctx = RunContext {
                 entries: &entries,
+                helpers: &helpers,
                 base_vars: base_vars.clone(),
                 named_envs: named_envs.clone(),
                 root: root.clone(),
@@ -264,6 +266,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &helpers,
             base_vars,
             named_envs,
             root,

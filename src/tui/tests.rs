@@ -25701,7 +25701,7 @@ fn adding_a_setting_opens_its_editor_on_the_new_row() {
 #[test]
 fn a_setting_can_be_cleared_from_the_row_or_from_its_prompt() {
     let (mut app, idx) = node_show_app(&["status"]);
-    app.apply_report_setting(idx, "columns", Some("Name"));
+    app.apply_report_setting(idx, "columns", 0, Some("Name"));
     assert!(app.reports[idx].report.text.contains("columns: Name"));
 
     let pos = app
@@ -25718,7 +25718,7 @@ fn a_setting_can_be_cleared_from_the_row_or_from_its_prompt() {
     );
 
     // Again, this time via an empty commit in the prompt.
-    app.apply_report_setting(idx, "columns", Some("Name"));
+    app.apply_report_setting(idx, "columns", 0, Some("Name"));
     let pos = app
         .report_setting_rows(idx)
         .iter()
@@ -25744,7 +25744,7 @@ fn a_setting_can_be_cleared_from_the_row_or_from_its_prompt() {
 fn a_settings_change_can_be_undone() {
     let (mut app, idx) = node_show_app(&["status"]);
     let before = app.reports[idx].report.text.clone();
-    app.apply_report_setting(idx, "output", Some("xlsx"));
+    app.apply_report_setting(idx, "output", 0, Some("xlsx"));
     assert_ne!(app.reports[idx].report.text, before);
 
     app.reports[idx].node_setting = None;
@@ -25762,7 +25762,7 @@ fn the_settings_section_draws_above_the_flow() {
     use ratatui::{Terminal, backend::TestBackend};
     let (mut app, idx) = node_show_app(&["status"]);
     let s = Strings::for_language(&Language::English);
-    app.apply_report_setting(idx, "collection", None);
+    app.apply_report_setting(idx, "collection", 0, None);
 
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
@@ -26027,4 +26027,105 @@ fn a_comment_is_a_row_in_the_outline() {
         .find(|r| r.kind == crate::tui::report_nodes::RowKind::Comment)
         .expect("the comment is a row");
     assert_eq!(comment.label, "# a note about upload");
+}
+
+/// The reported gap: the language allowed extra `# collection: … AS alias`
+/// lines but the node editor showed only one collection, so a helper was
+/// invisible and unreachable from the outline.
+#[test]
+fn the_settings_section_shows_a_row_per_collection() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    let rows = app.report_setting_rows(idx);
+    let cols: Vec<_> = rows.iter().filter(|r| r.key == "collection").collect();
+    assert_eq!(cols.len(), 2, "one row per declared collection");
+    assert_eq!(cols[0].value, "./api.hurl");
+    assert_eq!(cols[0].occurrence, 0);
+    assert_eq!(cols[1].value, "./h.hurl AS h");
+    assert_eq!(cols[1].occurrence, 1);
+    // Only the primary blocks the run, so only it is drawn as required.
+    assert!(cols[0].required);
+    assert!(!cols[1].required);
+}
+
+/// Editing a helper row must write to *that* line, not to the primary.
+#[test]
+fn editing_the_helper_row_does_not_rebind_the_report() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    app.apply_report_setting(idx, "collection", 1, Some("./other.hurl AS o"));
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("# collection: ./api.hurl"), "{text:?}");
+    assert!(text.contains("# collection: ./other.hurl AS o"), "{text:?}");
+}
+
+/// Deleting a helper row removes only that line.
+#[test]
+fn deleting_a_helper_row_keeps_the_primary_collection() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    app.apply_report_setting(idx, "collection", 1, None);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("# collection: ./api.hurl"), "{text:?}");
+    assert!(!text.contains("AS h"), "{text:?}");
+}
+
+/// A request in a helper collection tags as *known* in the outline, rather
+/// than misleadingly amber, and its `[Reports]` fields are offered.
+#[test]
+fn a_helper_request_reads_as_known_in_the_outline() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!(
+        "paperboy_tui_helper_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("h.hurl")).unwrap();
+    write!(f, "# fetch_frame\nGET http://example.test/frame\n\n").unwrap();
+    drop(f);
+
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.path = Some(dir.join("r.trail"));
+    app.reports[idx].report.set_text(
+        "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST h/fetch_frame\n",
+    );
+    app.revalidate_report(idx);
+
+    let rows = app.report_node_rows(idx).expect("rows");
+    let row = rows
+        .iter()
+        .find(|r| r.label.contains("fetch_frame"))
+        .expect("the helper request is a row");
+    assert_eq!(
+        row.req_ok,
+        Some(true),
+        "it resolves through its alias: {:?}",
+        row.label
+    );
+
+    // …and the same name *without* the alias does not, so the tint is really
+    // reading the alias rather than tinting everything green.
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST fetch_frame\n");
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let row = rows
+        .iter()
+        .find(|r| r.label.contains("fetch_frame"))
+        .expect("row");
+    assert_eq!(row.req_ok, Some(false), "{:?}", row.label);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -64,6 +64,12 @@ pub struct ReportEditor {
     /// that line the way the terminal UI does.
     pub parse_error_line: Option<usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The report's aliased helper collections, loaded alongside `diagnostics`.
+    ///
+    /// Behind the same fingerprint gate, because loading them reads files from
+    /// disk and everything that needs them (the chip tints, the request combo,
+    /// the highlighter) runs while drawing — i.e. on every frame.
+    pub helpers: Vec<crate::report::run::HelperCollection>,
     /// The [`context::diagnostics_fingerprint`] the current `diagnostics` were
     /// computed from. Validation is re-run only when this changes, so it happens
     /// on an edit rather than on every frame — see that function for why.
@@ -161,6 +167,7 @@ impl ReportEditor {
             parse_error: None,
             parse_error_line: None,
             diagnostics: Vec::new(),
+            helpers: Vec::new(),
             diag_key: None,
             selection: Vec::new(),
             palette: None,
@@ -390,6 +397,7 @@ impl ReportEditor {
             Ok(inputs) => {
                 let ctx = RunContext {
                     entries: &inputs.entries,
+                    helpers: &inputs.helpers,
                     base_vars: inputs.base_vars.clone(),
                     named_envs: inputs.named_envs.clone(),
                     root: inputs.root.clone(),
@@ -1376,11 +1384,16 @@ enum Act {
     /// the directive (see [`edit::set_header`]).
     SetHeader {
         key: &'static str,
+        /// Which occurrence of `key` to write. Always 0 except for
+        /// `collection:`, which repeats — occurrence 0 is the primary
+        /// collection, each one after it an aliased helper.
+        occurrence: usize,
         value: Option<String>,
     },
     /// Browse for the file a path-valued header directive should point at.
     PickHeaderFile {
         key: &'static str,
+        occurrence: usize,
     },
 }
 
@@ -1442,11 +1455,19 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     ed.report.path.as_deref(),
                     &app.strings,
                 );
+                let (helpers, _) = context::load_helpers(
+                    &app.session.collections,
+                    flow,
+                    ed.report.path.as_deref(),
+                    &app.strings,
+                );
+                ed.helpers = helpers;
                 ed.diag_key = Some(key);
             }
         }
         None => {
             ed.diagnostics.clear();
+            ed.helpers.clear();
             ed.diag_key = None;
         }
     }
@@ -1751,10 +1772,11 @@ fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
             .collect(),
         request_names: bound
             .map(|ci| {
-                app.session.collections[ci]
-                    .entries
-                    .iter()
-                    .map(|e| e.title.clone())
+                // Qualified, so a helper's request reads green in the Source
+                // view rather than misleadingly amber.
+                context::request_choices(&app.session.collections[ci].entries, &ed.helpers)
+                    .into_iter()
+                    .map(|c| c.qualified)
                     .collect()
             })
             .unwrap_or_default(),
@@ -2807,16 +2829,17 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         &flow,
         ed.report.path.as_deref(),
     );
-    let titles: Vec<String> = bound
-        .map(|ci| {
-            app.session.collections[ci]
-                .entries
-                .iter()
-                .map(|e| e.title.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let resolves = |name: &str| titles.iter().any(|t| t == name);
+    let entries = bound
+        .map(|ci| app.session.collections[ci].entries.as_slice())
+        .unwrap_or(&[]);
+    let choices = context::request_choices(entries, &ed.helpers);
+    // Primary collection first (guaranteed by `request_choices`), so a newly
+    // dropped REQUEST block — which seeds itself from the first title — never
+    // defaults to a helper.
+    let titles: Vec<String> = choices.iter().map(|c| c.qualified.clone()).collect();
+    let helpers = ed.helpers.clone();
+    let resolves =
+        move |name: &str| crate::report::run::resolve_qualified(entries, &helpers, name).is_some();
     let rows = flatten(&flow, &resolves);
 
     let mut acts: Vec<Act> = Vec::new();
@@ -4707,7 +4730,13 @@ fn header_strip(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui, acts: &mut V
         ui,
         &th,
         s,
-        &|key| flow.header.get(key).unwrap_or_default().to_string(),
+        &|key| {
+            flow.header
+                .get_all(key)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        },
         &collections,
         &envs,
         &formats,
@@ -4726,7 +4755,7 @@ fn settings_panel(
     ui: &mut egui::Ui,
     th: &GuiTheme,
     s: &crate::i18n::Strings,
-    value_of: &dyn Fn(&str) -> String,
+    value_of: &dyn Fn(&str) -> Vec<String>,
     collections: &dyn Fn() -> Vec<CollectionChoice>,
     envs: &Vec<String>,
     formats: &Vec<String>,
@@ -4740,16 +4769,36 @@ fn settings_panel(
         // wrapped line.
         ui.set_width(settings_width(ui));
         for spec in &specs {
-            let value = value_of(spec.key);
-            if value.is_empty() && !spec.always_shown {
-                continue;
+            // `collection:` repeats — one chip for the primary and one for each
+            // aliased helper — so a helper is visible and editable here rather
+            // than only in the raw source. Every other directive has exactly one.
+            let mut values = value_of(spec.key);
+            if values.is_empty() {
+                values.push(String::new());
             }
-            let choices = match spec.kind {
-                HeaderKind::Environment => Some(envs),
-                HeaderKind::Format => Some(formats),
-                _ => None,
-            };
-            ui.horizontal(|ui| header_chip(ui, th, s, spec, &value, choices, collections, acts));
+            for (occurrence, value) in values.into_iter().enumerate() {
+                if value.is_empty() && !spec.always_shown {
+                    continue;
+                }
+                let choices = match spec.kind {
+                    HeaderKind::Environment => Some(envs),
+                    HeaderKind::Format => Some(formats),
+                    _ => None,
+                };
+                ui.horizontal(|ui| {
+                    header_chip(
+                        ui,
+                        th,
+                        s,
+                        spec,
+                        occurrence,
+                        &value,
+                        choices,
+                        collections,
+                        acts,
+                    )
+                });
+            }
         }
 
         // Optional directives that aren't set yet are offered from the button
@@ -4761,9 +4810,9 @@ fn settings_panel(
             .iter()
             .filter(|sp| !sp.always_shown && value_of(sp.key).is_empty())
             .collect();
-        if !missing.is_empty() {
-            header_add_menu(ui, s, &missing, acts);
-        }
+        // The add menu is always drawn now: a helper collection can always be
+        // added, since `collection:` repeats and so is never "already set".
+        header_add_menu(ui, s, &missing, value_of("collection").len().max(1), acts);
     });
 }
 
@@ -4794,6 +4843,7 @@ fn header_add_menu(
     ui: &mut egui::Ui,
     s: &crate::i18n::Strings,
     missing: &[&HeaderSpec],
+    next_collection: usize,
     acts: &mut Vec<Act>,
 ) {
     let label = format!("{}  {}", super::icons::PLUS, s.report_add_setting);
@@ -4809,10 +4859,25 @@ fn header_add_menu(
                 // would immediately be dropped again by `set_header`.
                 acts.push(Act::SetHeader {
                     key: spec.key,
+                    occurrence: 0,
                     value: Some(HEADER_PLACEHOLDER.to_string()),
                 });
                 ui.close();
             }
+        }
+        // Always offered: unlike the one-shot directives, another collection
+        // can always be added.
+        if ui
+            .button(s.report_add_helper_collection)
+            .on_hover_text(s.report_helper_collection_help)
+            .clicked()
+        {
+            acts.push(Act::SetHeader {
+                key: "collection",
+                occurrence: next_collection,
+                value: Some(HEADER_PLACEHOLDER.to_string()),
+            });
+            ui.close();
         }
     })
     .response
@@ -4825,11 +4890,30 @@ fn header_chip(
     th: &GuiTheme,
     s: &crate::i18n::Strings,
     spec: &HeaderSpec,
+    occurrence: usize,
     value: &str,
     choices: Option<&Vec<String>>,
     collections: &dyn Fn() -> Vec<CollectionChoice>,
     acts: &mut Vec<Act>,
 ) {
+    // A helper collection stores `path AS alias` in one directive, but they are
+    // two different things to edit: the dropdown picks the file, a small text
+    // field beside it names the alias. Splitting here (and rejoining on write)
+    // keeps the chip honest about both without inventing a second directive.
+    let helper = spec.key == "collection" && occurrence > 0;
+    let (value, alias) = if spec.key == "collection" {
+        let (r, a) = crate::report::flow::split_collection_ref(value);
+        (r, a.unwrap_or_default())
+    } else {
+        (value, "")
+    };
+    let rejoin = move |reference: &str| {
+        if helper && !alias.is_empty() {
+            format!("{reference} AS {alias}")
+        } else {
+            reference.to_string()
+        }
+    };
     // An unset required directive is drawn in the error colour: it is the one
     // thing standing between the report and a run, so it should look like it.
     let unset = value.is_empty() || value == "?";
@@ -4907,15 +4991,44 @@ fn header_chip(
                             }
                         });
                     if browse {
-                        acts.push(Act::PickHeaderFile { key });
+                        acts.push(Act::PickHeaderFile { key, occurrence });
                     }
                     if let Some(v) = picked
                         && v != value
                     {
                         acts.push(Act::SetHeader {
                             key,
-                            value: Some(v),
+                            occurrence,
+                            value: Some(rejoin(&v)),
                         });
+                    }
+                    // The alias a helper's requests are addressed through. Only
+                    // on helpers: the primary collection is *the* collection,
+                    // and an alias on it is a validation error.
+                    if helper {
+                        let id = ui.make_persistent_id(("pt_hdr_alias", occurrence));
+                        if let Some(text) = inline_text_edit(
+                            ui,
+                            id,
+                            alias,
+                            s.report_alias_unset,
+                            "AS ",
+                            80.0,
+                            FIELD_MAX_WIDTH,
+                        ) && text != alias
+                        {
+                            let text = text.trim().to_string();
+                            let joined = if text.is_empty() {
+                                value.to_string()
+                            } else {
+                                format!("{value} AS {text}")
+                            };
+                            acts.push(Act::SetHeader {
+                                key,
+                                occurrence,
+                                value: Some(joined),
+                            });
+                        }
                     }
                 }
                 HeaderKind::Folder | HeaderKind::File | HeaderKind::Text => {
@@ -4933,6 +5046,7 @@ fn header_chip(
                     {
                         acts.push(Act::SetHeader {
                             key,
+                            occurrence,
                             value: Some(text),
                         });
                     }
@@ -4942,7 +5056,7 @@ fn header_chip(
                             .on_hover_text(s.gui_report_browse)
                             .clicked()
                     {
-                        acts.push(Act::PickHeaderFile { key });
+                        acts.push(Act::PickHeaderFile { key, occurrence });
                     }
                 }
             }
@@ -4953,8 +5067,14 @@ fn header_chip(
             // An *optional* setting keeps its `×` even while unset: it was put
             // here from the add menu and starts life showing the unset prompt,
             // so without one there would be no way to take it off again.
-            if (!unset || !spec.always_shown) && detach_x(ui, color) {
-                acts.push(Act::SetHeader { key, value: None });
+            // A helper is always removable: it is one of many, so clearing it
+            // takes the whole line out rather than leaving an unset prompt.
+            if (!unset || !spec.always_shown || helper) && detach_x(ui, color) {
+                acts.push(Act::SetHeader {
+                    key,
+                    occurrence,
+                    value: None,
+                });
             }
             let cy = ui.min_rect().center().y;
             ui.painter().galley(
@@ -4973,11 +5093,18 @@ fn header_chip(
 /// should point at, and store it relative to the report when that is shorter —
 /// a report and its data usually travel together, so an absolute path would
 /// break the moment the pair moved.
-fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) {
-    let seed = ed
+fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str, occurrence: usize) {
+    // A helper's stored value is `path AS alias`; only the path part seeds the
+    // browser, and only it is replaced by what comes back.
+    let current = ed
         .flow
         .as_ref()
-        .and_then(|f| f.header.get(key))
+        .and_then(|f| f.header.get_all(key).get(occurrence).copied())
+        .unwrap_or_default()
+        .to_string();
+    let (current_ref, alias) = crate::report::flow::split_collection_ref(&current);
+    let seed = Some(current_ref)
+        .filter(|r| !r.is_empty())
         .and_then(super::filepick::seed_dir)
         .or_else(|| {
             ed.report
@@ -5020,8 +5147,14 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) 
     } else {
         relative_to_report(&path, ed.report.path.as_deref())
     };
+    // The alias is the user's, not the picker's — browsing for a different file
+    // must not silently drop it.
+    let text = match alias {
+        Some(a) if key == "collection" && occurrence > 0 => format!("{text} AS {a}"),
+        _ => text,
+    };
     ed.edit_flow(|flow| {
-        edit::set_header(flow, key, Some(&text));
+        edit::set_header_nth(flow, key, occurrence, Some(&text));
     });
 }
 
@@ -6536,13 +6669,17 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 });
                 ed.selection = path;
             }
-            Act::SetHeader { key, value } => {
+            Act::SetHeader {
+                key,
+                occurrence,
+                value,
+            } => {
                 ed.edit_flow(|flow| {
-                    edit::set_header(flow, key, value.as_deref());
+                    edit::set_header_nth(flow, key, occurrence, value.as_deref());
                 });
             }
-            Act::PickHeaderFile { key } => {
-                pick_header_file(ed, app, key);
+            Act::PickHeaderFile { key, occurrence } => {
+                pick_header_file(ed, app, key, occurrence);
             }
             Act::AddWith { path } => {
                 ed.selection = path.clone();
@@ -7498,7 +7635,7 @@ mod tests {
 
         let out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut acts = Vec::new();
-            header_add_menu(ui, &s, &missing, &mut acts);
+            header_add_menu(ui, &s, &missing, 1, &mut acts);
         });
         let painted: String = out
             .shapes
@@ -7555,6 +7692,7 @@ mod tests {
                                         &th,
                                         &s,
                                         spec,
+                                        0,
                                         "dev",
                                         Some(&choices),
                                         &collection_choices_fixture,
@@ -7812,12 +7950,12 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let value_of = move |key: &str| {
+        let value_of = move |key: &str| -> Vec<String> {
             owned
                 .iter()
-                .find(|(k, _)| k == key)
+                .filter(|(k, _)| k == key)
                 .map(|(_, v)| v.clone())
-                .unwrap_or_default()
+                .collect()
         };
 
         let mut rect = egui::Rect::NOTHING;
@@ -7890,7 +8028,8 @@ mod tests {
             collection.bottom()
         );
 
-        // With nothing left to add there is no button at all.
+        // Even with every one-shot directive set the button stays: another
+        // collection can always be added, because `collection:` repeats.
         let (_, full) = run_settings_panel(
             &ctx,
             &[
@@ -7904,8 +8043,8 @@ mod tests {
             600.0,
         );
         assert!(
-            !full.iter().any(|(t, _)| t.contains(s.report_add_setting)),
-            "nothing is missing, so nothing offers to add it"
+            full.iter().any(|(t, _)| t.contains(s.report_add_setting)),
+            "a helper collection can still be added"
         );
     }
 
@@ -7975,6 +8114,7 @@ mod tests {
                                 &th,
                                 &strings,
                                 spec,
+                                0,
                                 "dev",
                                 Some(&choices),
                                 &collection_choices_fixture,
@@ -8023,6 +8163,7 @@ mod tests {
                     th,
                     s,
                     spec,
+                    0,
                     "dev",
                     Some(&choices),
                     &collection_choices_fixture,
