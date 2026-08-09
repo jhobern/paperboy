@@ -213,16 +213,29 @@ impl ReportWriter for HtmlWriter {
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
              <title>PaperTrail report</title>\n<style>\n\
              body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;color:#222}\n\
-             table{border-collapse:collapse;width:100%;font-size:14px}\n\
-             th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;word-break:break-word}\n\
-             thead th{position:sticky;top:0;background:#333;color:#fff}\n\
+             table{border-collapse:collapse;table-layout:fixed;width:max-content;\
+             min-width:100%;font-size:14px}\n\
+             th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;\
+             white-space:pre-wrap;overflow-wrap:anywhere}\n\
+             thead th{position:sticky;top:0;background:#333;color:#fff;\
+             white-space:nowrap;overflow-wrap:normal}\n\
              tbody tr:nth-child(even){background:#f7f7f7}\n\
              tfoot td{font-weight:bold;background:#ececec;border-top:2px solid #999}\n\
              td.pass{background:#c6efce}\n\
              td.fail{background:#ffc7ce}\n\
              td.warn{background:#ffeb9c}\n\
-             </style>\n</head>\n<body>\n<table>\n<thead>\n<tr>",
+             </style>\n</head>\n<body>\n<table>\n",
         );
+        // Sized columns, so the browser doesn't squeeze a short column to a few
+        // characters and hyphenate its header (see `html_column_widths`). The
+        // table is `table-layout:fixed`, which is what makes these binding
+        // rather than a hint, and `width:max-content` so the sum is honoured and
+        // the page scrolls sideways instead of the columns being squashed back.
+        out.push_str("<colgroup>");
+        for w in html_column_widths(&columns, result) {
+            out.push_str(&format!("<col style=\"width:{w}ch\">"));
+        }
+        out.push_str("</colgroup>\n<thead>\n<tr>");
         for c in &columns {
             out.push_str("<th>");
             push_escaped(&mut out, &c.header);
@@ -616,6 +629,17 @@ fn xlsx_image_boxes(
 /// for us). Kept separate from the writing loop so the sizing can be tested
 /// without unzipping a workbook.
 fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f64> {
+    measured_column_widths(columns, result)
+        .into_iter()
+        .map(clamp_xlsx_width)
+        .collect()
+}
+
+/// How many characters wide each column needs to be to show its content
+/// unwrapped — header, data cells and the appended statistics rows alike, each
+/// with its own padding. Unclamped: every export wants the same measurement but
+/// caps it in its own units.
+fn measured_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<usize> {
     let mut widths: Vec<usize> = columns
         .iter()
         .map(|c| text_display_width(&c.header) + XLSX_HEADER_PADDING)
@@ -639,7 +663,32 @@ fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f6
             }
         }
     }
-    widths.into_iter().map(clamp_xlsx_width).collect()
+    widths
+}
+
+/// The widest a column is sized in the HTML export, in `ch` units. Higher than
+/// the xlsx cap because a browser scrolls a wide table sideways rather than
+/// hiding what runs off the page, but still a cap: one column holding a JSON
+/// body must not push every other column out of the first screenful.
+const HTML_MAX_COL_WIDTH: usize = 70;
+
+/// The narrowest, so a one-character column ("#", a tick) still reads as a
+/// column rather than a sliver.
+const HTML_MIN_COL_WIDTH: usize = 6;
+
+/// Per-column `<colgroup>` widths for the HTML export, in `ch`.
+///
+/// Without them the browser's automatic table layout distributes the width it
+/// is given, which squeezes a narrow column down to a few characters and — with
+/// the wrapping the long cells need — breaks its header mid-word, so an
+/// `Environment` column reads "Enviro / ment" with every value wrapped beneath
+/// it. That is the same failure the xlsx export had before it was sized to its
+/// content, so it is fixed the same way and off the same measurement.
+fn html_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<usize> {
+    measured_column_widths(columns, result)
+        .into_iter()
+        .map(|w| w.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
+        .collect()
 }
 
 /// The colour tint for a cell, or `None` to leave it plain. Recognises the
@@ -1016,6 +1065,63 @@ mod tests {
         );
         // Self-contained: no external stylesheet/script references.
         assert!(!html.contains("http://") && !html.contains("https://"));
+    }
+
+    /// The reported bug: an `Environment` column came out a few characters wide
+    /// with its header broken across two lines ("Enviro"/"ment") and every
+    /// value wrapped under it, because the browser's automatic layout squeezed
+    /// the table to the page. The columns are sized to their content, the same
+    /// as the xlsx export.
+    #[test]
+    fn html_columns_are_sized_to_their_content() {
+        let res = ReportResult {
+            column_order: vec!["Environment".into(), "Body".into()],
+            rows: vec![row(&[
+                ("Environment", "staging_au"),
+                ("Body", &"x".repeat(400)),
+            ])],
+            ..Default::default()
+        };
+        let widths = html_column_widths(&res.resolved_columns(&Header::default()), &res);
+        assert!(
+            widths[0] >= "Environment".len(),
+            "the header fits on one line, got {}ch",
+            widths[0]
+        );
+        assert_eq!(
+            widths[1], HTML_MAX_COL_WIDTH,
+            "a 400-character body is capped, not allowed to push everything else off the page"
+        );
+
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains(&format!("<col style=\"width:{}ch\">", widths[0])),
+            "the widths reach the document: {html}"
+        );
+        // Fixed layout is what makes the widths binding, and `max-content` is
+        // what stops the table being squashed back to the page width.
+        assert!(html.contains("table-layout:fixed"), "{html}");
+        assert!(html.contains("width:max-content"), "{html}");
+        // A header must never be broken inside a word — that is the reported
+        // symptom — while a long body cell still has to break somewhere.
+        assert!(
+            html.contains("white-space:nowrap;overflow-wrap:normal"),
+            "{html}"
+        );
+        assert!(html.contains("overflow-wrap:anywhere"), "{html}");
+    }
+
+    /// A one-character column is still a column: sized to a readable minimum
+    /// rather than to its content.
+    #[test]
+    fn a_tiny_html_column_keeps_a_readable_minimum() {
+        let res = ReportResult {
+            column_order: vec!["#".into()],
+            rows: vec![row(&[("#", "1")])],
+            ..Default::default()
+        };
+        let widths = html_column_widths(&res.resolved_columns(&Header::default()), &res);
+        assert_eq!(widths[0], HTML_MIN_COL_WIDTH);
     }
 
     #[test]
