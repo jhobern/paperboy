@@ -3373,6 +3373,8 @@ fn render_node_row(
         RowKind::LoopHead => (row.label.clone(), th.accent, false),
         RowKind::LoopEnd => ("END".to_string(), th.accent, false),
         RowKind::Leaf => (row.label.clone(), th.text, false),
+        // Dimmed: it is in the file, but it isn't a statement.
+        RowKind::Comment => (row.label.clone(), th.dim, false),
         RowKind::WithField(_) => (row.label.clone(), th.text, false),
         // The affordance that answers "how do I add a column here?" — dimmed
         // like the settings section's own add row, since it isn't source.

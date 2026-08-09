@@ -117,6 +117,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Comments in a report body are no longer deleted.** A `#` line among the
+  statements was treated as whitespace and thrown away when the script was
+  parsed, so the moment you touched the report in either node editor — which
+  re-writes the script from the parsed flow after every edit — the comment was
+  gone. Commenting a block out to disable it therefore destroyed it, with no
+  way to get it back. Comments are now part of the flow, keep their place among
+  the statements, are shown as their own (dimmed) row in the outline so they can
+  be found and uncommented again, and round-trip byte for byte — including the
+  indentation inside a commented-out block. Comments *inside* a `WITH` block are
+  still dropped.
+
 - **The TUI's report node editor can now edit the report's settings.** The
   outline gained a Settings section above the flow, listing every header
   directive the language has — `collection`, `output`, `environment`, `root`,

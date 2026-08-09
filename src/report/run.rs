@@ -541,6 +541,9 @@ impl<'a> Exec<'a> {
 
         for (node_index, node) in nodes.iter().enumerate() {
             match node {
+                // Comments are carried through the AST so edits don't delete
+                // them; they do nothing at run time.
+                FlowNode::Comment(_) => {}
                 FlowNode::Assign { key, value } => {
                     let v = substitute(&unquote(value), &self.vars_for());
                     self.set_var(key, v);

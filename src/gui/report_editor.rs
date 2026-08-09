@@ -981,6 +981,12 @@ fn build_node_chips(
     s: &crate::i18n::Strings,
 ) -> Vec<Chip> {
     match node {
+        // One chip holding the comment verbatim. It has no detachable parts —
+        // a comment is text, not a statement with clauses — but it is a block
+        // like any other, so it can be dragged, moved and deleted.
+        FlowNode::Comment(text) => {
+            vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
+        }
         FlowNode::Request { name } => {
             vec![Chip::request(name, req_col).with_help(s.chip_help_request)]
         }
@@ -3818,7 +3824,7 @@ fn block_row(
                 // field as a chip on the request's own row), so these are
                 // unreachable here — see `flatten_expanded`.
                 RowKind::WithField(_) | RowKind::WithAdd | RowKind::WithEnd => {}
-                RowKind::Leaf | RowKind::LoopHead => {
+                RowKind::Leaf | RowKind::LoopHead | RowKind::Comment => {
                     let mut chips = node
                         .as_ref()
                         .map(|n| node_chips(n, row.req_ok, &th, s))

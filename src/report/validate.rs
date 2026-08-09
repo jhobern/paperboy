@@ -240,6 +240,8 @@ fn walk(
 ) {
     for node in nodes {
         match node {
+            // Nothing to check in a comment.
+            FlowNode::Comment(_) => {}
             FlowNode::Assign { .. } => {}
             FlowNode::ListDecl { name, producer } => {
                 check_producer(producer, ctx, scopes, diags);
@@ -777,6 +779,8 @@ fn check_var_availability(
 ) {
     for node in nodes {
         match node {
+            // A comment defines nothing and uses nothing.
+            FlowNode::Comment(_) => {}
             // An assignment defines the key for all subsequent nodes.
             FlowNode::Assign { key, .. } => {
                 defined.insert(key.clone());

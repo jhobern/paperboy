@@ -208,8 +208,24 @@ where
 // Whitespace / comment trivia between statements
 // ---------------------------------------------------------------------------
 
-/// Skip any run of blank space, newlines and whole-line `#` comments — the gaps
-/// between statements (header comments are consumed separately).
+/// A whole-line `#` comment kept as a node, so that commenting a block out in
+/// the source doesn't destroy it the next time the editors re-serialize the
+/// flow. The text is stored exactly as written after the `#`.
+fn comment_node(i: &str) -> IResult<&str, FlowNode> {
+    map(preceded(char('#'), not_line_ending), |text: &str| {
+        FlowNode::Comment(text.to_string())
+    })(i)
+}
+
+/// A statement or a comment. Bodies parse with this rather than `node` so a
+/// comment keeps its position among the statements around it.
+fn node_or_comment(i: &str) -> IResult<&str, FlowNode> {
+    alt((comment_node, node))(i)
+}
+
+/// Skip any run of blank space, newlines and whole-line `#` comments. Only used
+/// where a comment has nowhere to live (inside a `WITH` block, and by
+/// `opens_block`); statement bodies use `multispace0` + `node_or_comment`.
 fn trivia(i: &str) -> IResult<&str, ()> {
     value(
         (),
@@ -233,14 +249,17 @@ fn parse_headers(i: &str) -> IResult<&str, Header> {
 fn header_line(i: &str) -> IResult<&str, HeaderLine> {
     let (i, _) = multispace0(i)?;
     let (i, _) = char('#')(i)?;
-    let (i, raw) = not_line_ending(i)?;
-    let raw = raw.trim();
+    let (i, verbatim) = not_line_ending(i)?;
+    let raw = verbatim.trim();
     let line = match raw.split_once(':') {
         Some((k, v)) if is_ident(k.trim()) => HeaderLine::Directive {
             key: k.trim().to_string(),
             value: v.trim().to_string(),
         },
-        _ => HeaderLine::Comment(raw.to_string()),
+        // Kept exactly as typed, unlike a directive: a block commented out
+        // above the first statement lands here, and re-spacing it would
+        // quietly destroy its indentation.
+        _ => HeaderLine::Comment(verbatim.to_string()),
     };
     Ok((i, line))
 }
@@ -332,7 +351,7 @@ fn parallel_prefix(i: &str) -> IResult<&str, ParallelSpec> {
 
 /// The statements up to (and consuming) the matching `END`.
 fn block_body(i: &str) -> IResult<&str, Vec<FlowNode>> {
-    let (i, nodes) = many0(preceded(trivia, node))(i)?;
+    let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = preceded(trivia, kw("END"))(i)?;
     Ok((i, nodes))
 }
@@ -527,6 +546,11 @@ fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
 }
 
 /// `WITH <item>* END`.
+///
+/// Known gap: a comment *inside* a `WITH` block is still dropped, because
+/// `WithItem` has no comment variant. Comments elsewhere in the body are kept
+/// (see `comment_node`); commenting out a single field here and re-editing the
+/// request will lose that line.
 fn with_block(i: &str) -> IResult<&str, Vec<WithItem>> {
     let (i, _) = kw("WITH")(i)?;
     let (i, items) = many0(preceded(trivia, with_item))(i)?;
@@ -823,7 +847,7 @@ fn file_ref(i: &str) -> IResult<&str, String> {
 
 fn report_flow(i: &str) -> IResult<&str, ReportFlow> {
     let (i, header) = parse_headers(i)?;
-    let (i, nodes) = many0(preceded(trivia, node))(i)?;
+    let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = trivia(i)?;
     Ok((i, ReportFlow { header, nodes }))
 }
@@ -911,6 +935,64 @@ fn with_block_head(i: &str) -> IResult<&str, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug that motivated `FlowNode::Comment`: a block commented out in the
+    /// body used to vanish, because `trivia` threw comments away and the
+    /// editors re-serialize the flow after every edit.
+    #[test]
+    fn a_commented_out_block_survives_a_round_trip() {
+        let src =
+            "# collection: c\n\nREQUEST b\n# FOR X IN FILES \"*.txt\"\n#     REQUEST a\n# END\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src, "round-trips byte for byte");
+    }
+
+    /// Whatever follows the `#` is kept verbatim — a comment is not re-spaced,
+    /// so indentation inside a commented-out block is preserved.
+    #[test]
+    fn comment_text_is_kept_exactly_as_written() {
+        let src = "# collection: c\n\nREQUEST b\n#no space\n#      wide   gap\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src);
+    }
+
+    /// A comment sits where it was written, not hoisted to the top or sunk to
+    /// the bottom of its block.
+    #[test]
+    fn a_comment_keeps_its_position_in_the_body() {
+        let flow =
+            parse_flow("# collection: c\n\nREQUEST a\n# between\nREQUEST b\n").expect("parses");
+        let kinds: Vec<_> = flow
+            .nodes
+            .iter()
+            .map(|n| matches!(n, FlowNode::Comment(_)))
+            .collect();
+        assert_eq!(kinds, vec![false, true, false]);
+    }
+
+    /// Comments above the first statement belong to the *header* — that is what
+    /// makes `# collection:` a directive, and it holds even across a blank line
+    /// so a directive written below one isn't silently demoted to a comment.
+    #[test]
+    fn leading_comments_still_belong_to_the_header() {
+        let flow = parse_flow("# collection: c\n# a note\nREQUEST b\n").expect("parses");
+        assert!(
+            !flow.nodes.iter().any(|n| matches!(n, FlowNode::Comment(_))),
+            "the note stayed in the header"
+        );
+    }
+
+    /// …and header comments are kept verbatim too, so a block commented out up
+    /// there survives with its indentation, it just sits with the directives.
+    #[test]
+    fn a_header_comment_keeps_its_spacing() {
+        let flow = parse_flow("# collection: c\n#     indented note\nREQUEST b\n").expect("parses");
+        assert!(
+            flow.to_text().contains("#     indented note"),
+            "{:?}",
+            flow.to_text()
+        );
+    }
     use crate::report::flow::{
         Binder, Element, EnvClause, FlowNode, ParallelSpec, Producer, ReportStmt, RoleRef, WithItem,
     };

@@ -61,6 +61,9 @@ pub(crate) enum RowKind {
     LoopHead,
     /// The synthetic `END` closing a loop.
     LoopEnd,
+    /// A `# …` comment line. A node like any other — it can be selected, moved
+    /// and deleted — but it is drawn dimmed, because it isn't a statement.
+    Comment,
     /// One field of an expanded `REPORT REQUEST … WITH … END` block, at this
     /// index into the request's `with` list. `path` addresses the *request*, not
     /// the field, so anything acting on a `WITH` row must branch on this kind
@@ -177,7 +180,10 @@ fn push_nodes(
                     Some(_) => format!("{} WITH", node.header_line()),
                     None => node.label(),
                 },
-                kind: RowKind::Leaf,
+                kind: match node {
+                    FlowNode::Comment(_) => RowKind::Comment,
+                    _ => RowKind::Leaf,
+                },
                 path: prefix.clone(),
                 req_ok,
             });
@@ -247,6 +253,7 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
         // still has to land *somewhere* sensible: after the request that owns
         // the block, which is where the whole `WITH … END` ends on screen.
         RowKind::Leaf
+        | RowKind::Comment
         | RowKind::LoopEnd
         | RowKind::WithField(_)
         | RowKind::WithAdd

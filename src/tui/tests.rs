@@ -25987,3 +25987,44 @@ fn the_add_row_opens_an_empty_with_field_editor() {
         _ => panic!("expected the WITH field editor"),
     }
 }
+
+/// The reported bug: comment a loop out, make any structural edit, and the
+/// commented-out block was gone — every node-editor edit re-serializes the
+/// flow, and the AST had nowhere to keep a comment.
+#[test]
+fn a_structural_edit_no_longer_eats_commented_out_code() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n\nREQUEST upload\n# FOR T IN FILES \"*.txt\"\n#     REQUEST upload\n# END\nREPORT REQUEST upload\n",
+    );
+    app.revalidate_report(idx);
+
+    // Any structural edit will do; deleting the last node is the simplest.
+    let rows = app.report_node_rows(idx).expect("rows");
+    app.reports[idx].node_selected = rows.len() - 1;
+    press(&mut app, KeyCode::Delete);
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("# FOR T IN FILES \"*.txt\"")
+            && text.contains("#     REQUEST upload")
+            && text.contains("# END"),
+        "the commented-out block survived, indentation and all: {text:?}"
+    );
+}
+
+/// And it is visible in the outline, so it can be found again to uncomment.
+#[test]
+fn a_comment_is_a_row_in_the_outline() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\n\nREQUEST upload\n# a note about upload\n");
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let comment = rows
+        .iter()
+        .find(|r| r.kind == crate::tui::report_nodes::RowKind::Comment)
+        .expect("the comment is a row");
+    assert_eq!(comment.label, "# a note about upload");
+}

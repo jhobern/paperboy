@@ -90,6 +90,16 @@ pub enum FlowNode {
     Assign { key: String, value: String },
     /// `LIST NAME = <producer>` — declare a named, iteration-only list.
     ListDecl { name: String, producer: Producer },
+    /// A whole-line `# …` comment in the body.
+    ///
+    /// Comments are kept in the AST, not skipped as trivia, because every
+    /// structural edit re-serializes the flow — so anything the AST can't hold
+    /// is deleted the moment you touch the report in the node editor. Commenting
+    /// a block out and losing it is the case that made this non-negotiable.
+    ///
+    /// Holds the text *after* the `#`, verbatim (leading space included), so a
+    /// comment round-trips byte for byte.
+    Comment(String),
     /// `REQUEST <name>` — send a request, emit no column.
     Request { name: String },
     /// `REPORT …` — send/compute and emit column(s) into the current row.
@@ -407,8 +417,10 @@ impl ReportFlow {
                 HeaderLine::Directive { key, value } => {
                     let _ = writeln!(out, "# {key}: {value}");
                 }
+                // Verbatim: the text already holds whatever spacing followed
+                // the `#` (see the parser), so it must not be re-padded here.
                 HeaderLine::Comment(c) => {
-                    let _ = writeln!(out, "# {c}");
+                    let _ = writeln!(out, "#{c}");
                 }
             }
         }
@@ -535,6 +547,9 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         }
         FlowNode::ListDecl { name, producer } => {
             let _ = writeln!(out, "LIST {name} = {}", producer_text(producer));
+        }
+        FlowNode::Comment(text) => {
+            let _ = writeln!(out, "#{text}");
         }
         FlowNode::Request { name } => {
             let _ = writeln!(out, "REQUEST {}", name_text(name));
@@ -863,6 +878,7 @@ impl FlowNode {
             FlowNode::ListDecl { name, producer } => {
                 format!("LIST {name} = {}", producer_text(producer))
             }
+            FlowNode::Comment(text) => format!("#{text}"),
             FlowNode::Request { name } => format!("REQUEST {name}"),
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {
