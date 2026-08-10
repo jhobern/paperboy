@@ -585,6 +585,11 @@ strings! {
     report_status_rows => "rows", "lignes", "rækker";
     report_status_errors => "errors", "erreurs", "fejl";
     report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
+    report_opened_prefix => "Opened", "Ouvert", "Åbnede";
+    // Ctrl+O on a run that hasn't been written anywhere: there is no file for
+    // the desktop to open, and saying so is more use than doing nothing.
+    report_open_no_export => "Export the run first (Ctrl+S), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+S), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+S); derefter åbner Ctrl+O filen.";
+    help_report_open_export => "open the exported file in the desktop's default application", "ouvrir le fichier exporté dans l'application par défaut du bureau", "åbn den eksporterede fil i skrivebordets standardprogram";
     report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
     // "Nothing to save" is true but unhelpful for an export: the reader knows
     // there is a report, so the message has to say what is missing. A run in
@@ -1067,6 +1072,7 @@ strings! {
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
+    gui_report_open_export => "Open", "Ouvrir", "Åbn";
     gui_report_export_go => "Export", "Exporter", "Eksportér";
     gui_report_export_format => "Format:", "Format :", "Format:";
     gui_report_save_baseline => "Baseline…", "Référence…", "Basislinje…";
@@ -1476,6 +1482,8 @@ pub enum Status {
     ReportExported(String),
     /// A report's last run was saved as a `.baseline` snapshot; holds its path.
     ReportBaselineSaved(String),
+    /// An exported report was handed to the desktop's opener; holds its path.
+    ReportOpened(String),
     /// The column picker was opened without a prior run (columns unknown).
     ReportColumnsNeedRun,
     /// The column picker was applied with nothing selected.
@@ -1534,6 +1542,7 @@ impl Status {
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
                     | Status::ReportExported(_)
+                    | Status::ReportOpened(_)
                     | Status::ReportBaselineSaved(_)
                     | Status::ReportColumnsApplied
                     | Status::ReportBound(_)
@@ -1658,6 +1667,7 @@ impl Status {
             }
             Status::ReportSettingNoChoices => s.report_setting_no_choices.to_string(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
+            Status::ReportOpened(path) => format!("{} {path}", s.report_opened_prefix),
             Status::ReportBaselineSaved(path) => {
                 format!("{} {path}", s.report_baseline_saved_prefix)
             }

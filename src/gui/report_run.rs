@@ -101,6 +101,7 @@ pub struct ParkedRun {
     pub progress: Option<RunProgress>,
     pub run: Option<RunHandle>,
     pub results_exported: bool,
+    pub last_export: Option<String>,
 }
 
 impl ParkedRun {

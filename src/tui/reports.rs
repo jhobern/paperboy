@@ -215,6 +215,12 @@ pub(crate) struct ReportTab {
     /// warn before it discards results the user hasn't saved anywhere. A result
     /// that's only ever been viewed on screen counts as unexported.
     pub(crate) results_exported: bool,
+    /// The file the last successful export of this tab's result wrote, so
+    /// Ctrl+O can hand it to the desktop without asking where it went. Cleared
+    /// whenever a fresh run replaces the result, because the file on disk then
+    /// describes a run that is no longer on screen. Not persisted: it belongs
+    /// to a result that doesn't outlive the session either.
+    pub(crate) last_export: Option<std::path::PathBuf>,
     /// Live streaming state while a background run is in flight: which of the
     /// pre-built skeleton rows have been filled yet (so the grid greys the
     /// pending ones) and the path→row-index lookup that routes each streamed row
@@ -404,6 +410,7 @@ impl ReportTab {
             result: None,
             dry_run: None,
             results_exported: false,
+            last_export: None,
             run_progress: None,
             results_panel,
             cell_cursor: None,
@@ -1348,6 +1355,7 @@ impl TuiApp {
                 // A fresh run's output starts life unexported, so a later rerun
                 // can warn before discarding it (#2).
                 rt.results_exported = false;
+                rt.last_export = None;
                 rt.run_progress = Some(RunProgress {
                     states: vec![RowState::Scheduled; n],
                     index,
@@ -1449,6 +1457,7 @@ impl TuiApp {
                 // The finalized result supersedes the skeleton and is likewise
                 // unexported until the user saves it somewhere (#2).
                 rt.results_exported = false;
+                rt.last_export = None;
                 // The finalized grid may have different columns/rows than the
                 // streamed skeleton — reset cursor so it starts fresh.
                 rt.cell_cursor = None;
@@ -1494,6 +1503,7 @@ impl TuiApp {
                 // A real run supersedes the projection it was previewing.
                 rt.dry_run = None;
                 rt.results_exported = false;
+                rt.last_export = None;
                 rt.cell_cursor = None;
                 rt.results_col_offset = 0;
                 // The rows a filter selected belong to the run that is being
@@ -1624,6 +1634,7 @@ impl TuiApp {
                 // The result now lives on disk, so a rerun needn't warn about
                 // discarding it (#2).
                 self.reports[idx].results_exported = true;
+                self.reports[idx].last_export = Some(path.to_path_buf());
                 self.status = Some(Status::ReportExported(path.display().to_string()));
             }
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
@@ -1683,6 +1694,32 @@ impl TuiApp {
                 self.reports[idx].results_exported = true;
                 self.status = Some(Status::ReportBaselineSaved(path.display().to_string()));
             }
+            Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// Hand the active report's last exported file to the desktop's default
+    /// application (a browser for the interactive HTML, a spreadsheet for the
+    /// xlsx). Bound to Ctrl+O.
+    ///
+    /// Only ever opens a file *this* tab exported, and only while it still
+    /// describes the run on screen — a rerun clears it — because "open the
+    /// report" silently showing a previous run's numbers is worse than not
+    /// opening anything. Without one, says how to make one rather than
+    /// doing nothing.
+    pub(crate) fn open_exported_report(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        let Some(path) = self.reports[idx].last_export.clone() else {
+            self.status = Some(Status::ReportRunBlocked(
+                s.report_open_no_export.to_string(),
+            ));
+            return;
+        };
+        match crate::shared_utils::open_in_desktop(&path) {
+            Ok(()) => self.status = Some(Status::ReportOpened(path.display().to_string())),
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
         }
     }
@@ -2430,6 +2467,9 @@ impl TuiApp {
             // HTML export writes buttons for, so "show me only the wrong rows"
             // selects the same rows in all three.
             KeyCode::Char('f') if ctrl => self.cycle_report_row_filter(),
+            // Ctrl+O opens what Ctrl+S wrote, so an exported HTML report is one
+            // keystroke from the browser it was written for.
+            KeyCode::Char('o') if ctrl => self.open_exported_report(),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
             KeyCode::Char('s') if !ctrl => self.overlay = Some(Overlay::Options(0)),
             KeyCode::Char('?') | KeyCode::F(1) => {

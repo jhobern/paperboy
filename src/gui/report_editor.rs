@@ -91,6 +91,11 @@ pub struct ReportEditor {
     pub run: Option<RunHandle>,
     /// Whether the current `result` has been exported since it was produced.
     pub results_exported: bool,
+    /// The file the last successful export wrote, so "Open" can hand it to the
+    /// desktop without asking where it went. Cleared when a fresh run replaces
+    /// the result, because the file then describes a run that is no longer on
+    /// screen.
+    pub last_export: Option<String>,
     /// Which of the results view's row filters is selected, as an index into
     /// [`crate::report::filter::RowFilter::available`] for the current result.
     ///
@@ -168,12 +173,14 @@ pub struct ReportEditor {
 /// simply dropped), and Save wrote the old text. Deferring to the end of the
 /// frame lets the field commit first, so a button always acts on what is on
 /// screen.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum ToolbarAct {
     Run,
     DryRun,
     Save,
     Close,
+    /// Hand the named file (the last export) to the desktop's opener.
+    OpenExport(String),
 }
 
 /// One results cell opened in the inspector window: the column header (title)
@@ -215,6 +222,7 @@ impl ReportEditor {
             progress: None,
             run: None,
             results_exported: false,
+            last_export: None,
             results_filter: 0,
             results_find: String::new(),
             results_detail: None,
@@ -248,6 +256,7 @@ impl ReportEditor {
             progress: self.progress.take(),
             run: self.run.take(),
             results_exported: self.results_exported,
+            last_export: self.last_export.clone(),
         }
     }
 
@@ -259,6 +268,7 @@ impl ReportEditor {
         self.progress = parked.progress;
         self.run = parked.run;
         self.results_exported = parked.results_exported;
+        self.last_export = parked.last_export;
         if self.result.is_some() {
             self.view = EditorView::Results;
         }
@@ -394,6 +404,7 @@ impl ReportEditor {
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
+                self.last_export = None;
                 // The old result's filters and panels described the old rows.
                 self.results_filter = 0;
                 self.results_find.clear();
@@ -1731,6 +1742,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if export.clicked() {
                     open_export_dialog(app);
                 }
+                // Appears only once there is a file to open, and disappears
+                // again when a rerun makes that file describe a different run:
+                // an "Open" that shows yesterday's numbers is worse than no
+                // button at all.
+                if let Some(exported) = ed.last_export.clone() {
+                    let open = ui
+                        .add(egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::OPEN_EXTERNAL,
+                            app.strings.gui_report_open_export
+                        )))
+                        .on_hover_text(exported.clone());
+                    if open.clicked() {
+                        ed.pending_toolbar = Some(ToolbarAct::OpenExport(exported));
+                    }
+                }
                 // Saving the run as a snapshot is a different thing from
                 // exporting it for reading, so it gets its own button rather
                 // than hiding as a format in the export dialog: the file it
@@ -1844,6 +1871,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         Some(ToolbarAct::DryRun) => ed.start_dry_run(app),
         Some(ToolbarAct::Save) => save_report(&mut ed, app),
         Some(ToolbarAct::Close) => close = true,
+        Some(ToolbarAct::OpenExport(path)) => {
+            app.session.status = Some(match crate::shared_utils::open_in_desktop(&path) {
+                Ok(()) => Status::ReportOpened(path),
+                Err(e) => Status::Error(format!("{path}: {e}")),
+            });
+        }
         None => {}
     }
 

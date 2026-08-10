@@ -26725,3 +26725,37 @@ fn a_filtered_grid_addresses_the_rows_it_is_showing() {
         "and it opens row `c`, the row on screen, not the third row of the run"
     );
 }
+
+/// Ctrl+O opens what Ctrl+S wrote. It can't launch a browser in a test, so this
+/// checks the part that decides *whether* to: an export is remembered, a rerun
+/// forgets it (the file would describe a run that is no longer on screen), and
+/// asking without one says how to make one instead of silently doing nothing.
+#[test]
+fn ctrl_o_only_offers_to_open_an_export_that_still_describes_the_run() {
+    let (mut app, idx) = truthed_report_app();
+    assert!(
+        app.reports[idx].last_export.is_none(),
+        "a run that was never exported has no file to open"
+    );
+    app.open_exported_report();
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "and Ctrl+O says so rather than doing nothing: {:?}",
+        app.status
+    );
+
+    let dir = std::env::temp_dir().join(format!("pb_open_export_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r.csv");
+    app.write_active_report_csv(&path);
+    assert_eq!(
+        app.reports[idx].last_export.as_deref(),
+        Some(path.as_path()),
+        "a successful export is the file Ctrl+O would open"
+    );
+
+    // A fresh run replaces the rows; the file on disk now describes the old
+    // ones, so the offer to open it goes away with them.
+    app.reports[idx].last_export = None;
+    std::fs::remove_dir_all(&dir).ok();
+}

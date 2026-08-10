@@ -66,6 +66,9 @@ pub const TRASH: &str = p::TRASH;
 pub const STOP: &str = p::STOP;
 /// Export a report's results to a file.
 pub const EXPORT: &str = p::EXPORT;
+/// Hand an exported file to the desktop's default application (it leaves the
+/// app, hence the arrow out of a box rather than a second export glyph).
+pub const OPEN_EXTERNAL: &str = p::ARROW_SQUARE_OUT;
 /// A row queued in the streaming results grid (formerly `·`).
 pub const ROW_SCHEDULED: &str = p::DOT_OUTLINE;
 /// Preview a report's projected rows without sending anything (the dry run).

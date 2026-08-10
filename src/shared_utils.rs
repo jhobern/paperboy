@@ -158,9 +158,63 @@ fn is_object_key(chars: &[char], after: usize) -> bool {
     chars[after..].iter().find(|c| **c != ' ' && **c != '\t') == Some(&':')
 }
 
+/// The command that hands `path` to whatever the desktop thinks should open it.
+///
+/// Split out from [`open_in_desktop`] so the choice can be tested without
+/// actually launching a browser: the test asserts the platform's opener and
+/// that the path is passed as one argument (never interpolated into a shell
+/// string, which would break on a space and would be an injection hole for a
+/// filename the user didn't type).
+fn desktop_open_command(path: &Path) -> (&'static str, Vec<String>) {
+    let arg = path.to_string_lossy().into_owned();
+    if cfg!(target_os = "macos") {
+        ("open", vec![arg])
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin, not a program, and its first quoted
+        // argument is taken as the *window title* — hence the empty one.
+        ("cmd", vec!["/C".into(), "start".into(), String::new(), arg])
+    } else {
+        ("xdg-open", vec![arg])
+    }
+}
+
+/// Open `path` in the desktop's default application for it (a browser for an
+/// exported HTML report, a spreadsheet for an `.xlsx`, …).
+///
+/// Detached deliberately: the opener usually returns immediately, but some
+/// (`xdg-open` delegating to a not-yet-running browser) linger for the life of
+/// the app they start, and waiting for that would freeze the UI until the user
+/// closed their browser. Stdio is silenced for the same reason a TUI can't
+/// afford stray output on its screen.
+pub(crate) fn open_in_desktop(path: impl AsRef<Path>) -> Result<(), String> {
+    let path = path.as_ref();
+    let (program, args) = desktop_open_command(path);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{program}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compact_long_strings;
+    use super::{compact_long_strings, desktop_open_command};
+
+    /// A path with a space in it must survive as a single argument — the whole
+    /// point of not building a shell string.
+    #[test]
+    fn the_desktop_opener_passes_the_path_as_one_argument() {
+        let (program, args) =
+            desktop_open_command(std::path::Path::new("/tmp/a report/out file.html"));
+        assert!(!program.is_empty(), "every platform has an opener to name");
+        assert!(
+            args.iter().any(|a| a == "/tmp/a report/out file.html"),
+            "the path is one whole argument, not split or quoted: {args:?}"
+        );
+    }
 
     #[test]
     fn long_values_are_shortened_but_keys_and_short_values_are_not() {

@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Open an exported report where it belongs.** The interactive HTML export is
+  written to be read in a browser and the xlsx in a spreadsheet, but both
+  front-ends stopped at naming the file, leaving you to go and find it. After a
+  successful export the terminal UI opens it with **Ctrl+O** and the GUI grows
+  an **Open** button beside Export, each handing the file to the desktop's
+  default application. The offer only stands while the file still describes the
+  run on screen — a rerun withdraws it, because an "open" that shows the
+  previous run's numbers is worse than none.
+
 - **The terminal results view states the score and filters the rows.** It drew
   the grid and nothing else, so a ground-truthed run had to be exported to find
   out how it did, and there was no way to ask for just the rows that were wrong.

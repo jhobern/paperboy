@@ -1436,6 +1436,10 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
     if let Some(ed) = app.report_editor.as_mut() {
         ed.results_exported = true;
+        // Remembered so the toolbar can offer to open it: an HTML export is
+        // written to be read in a browser, and hunting for the file you just
+        // named is the only step between the two.
+        ed.last_export = Some(path.to_string());
     }
     app.session.status = Some(crate::i18n::Status::ReportExported(path.to_string()));
     Ok(())
@@ -1683,6 +1687,48 @@ mod tests {
 
     fn app() -> GuiApp {
         GuiApp::for_test(Session::default())
+    }
+
+    /// An export is remembered so the toolbar can offer to open it: the file an
+    /// HTML export writes is meant to be read in a browser, and the path is the
+    /// only thing standing between the two.
+    #[test]
+    fn an_export_remembers_the_file_it_wrote_so_it_can_be_opened() {
+        use crate::report::model::{ReportResult, ReportRow};
+
+        let mut app = app();
+        let mut ed = crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        );
+        let mut result = ReportResult::default();
+        result.column_order = vec!["Time".to_string()];
+        result.rows.push(ReportRow {
+            cells: [("Time".to_string(), "100".to_string())]
+                .into_iter()
+                .collect(),
+            key: vec!["a".to_string()],
+            ..Default::default()
+        });
+        ed.result = Some(result);
+        assert!(
+            ed.last_export.is_none(),
+            "nothing exported, nothing to open"
+        );
+        app.report_editor = Some(ed);
+
+        let dir = std::env::temp_dir().join(format!("pb_gui_export_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.csv");
+        let done = export_report_results(&mut app, &path.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(done.is_ok(), "the export should succeed: {done:?}");
+        assert_eq!(
+            app.report_editor.as_ref().unwrap().last_export.as_deref(),
+            Some(path.to_string_lossy().as_ref()),
+            "and the file it wrote is the one Open would hand to the desktop"
+        );
     }
 
     /// Saving a baseline writes a snapshot the report engine can load straight
