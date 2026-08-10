@@ -2931,7 +2931,7 @@ fn confusion_matrix(
                                     })
                                 })
                                 .flatten();
-                            let resp = egui::Frame::NONE
+                            let framed = egui::Frame::NONE
                                 .fill(egui::Color32::from_rgb(r, g, b))
                                 .inner_margin(egui::Margin::symmetric(6, 6))
                                 .show(ui, |ui| {
@@ -2943,19 +2943,27 @@ fn confusion_matrix(
                                                     .color(fg)
                                                     .size(cell_font),
                                             )
-                                            .selectable(false)
-                                            .sense(if pick.is_some() {
-                                                egui::Sense::click()
-                                            } else {
-                                                egui::Sense::hover()
-                                            }),
-                                        )
-                                    })
-                                    .inner
-                                })
-                                .inner;
+                                            .selectable(false),
+                                        );
+                                    });
+                                });
+                            // The *cell* is the target, not the digits in it. A
+                            // sense on the label alone made the clickable area
+                            // the width of the number -- so a "7" was a few
+                            // pixels wide in the middle of a large block of
+                            // colour that looked like a button and wasn't.
+                            // Interacted after the frame is drawn, so it sits
+                            // over the whole painted cell; there is nothing
+                            // interactive inside for it to steal a click from.
+                            let cell = framed.response.rect;
                             if let Some(i) = pick {
+                                let resp = ui.interact(
+                                    cell,
+                                    ui.id().with(("pb_matrix_cell", column, t, p)),
+                                    egui::Sense::click(),
+                                );
                                 if resp
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .on_hover_text(app.strings.help_report_matrix_cell)
                                     .clicked()
                                 {

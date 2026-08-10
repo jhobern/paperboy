@@ -97,6 +97,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and the height is saved with the rest of the GUI's geometry, so a reader who
   wants a big picture pane keeps it between runs and between sessions.
 
+- **A confusion-matrix cell is clickable across the whole cell.** The click
+  sense sat on the digits rather than on the block of colour around them, so
+  selecting the rows a cell counted meant hitting a target the width of the
+  number — a "7" was a few pixels wide in the middle of something that looked
+  like a button. The whole cell now takes the click, and shows the pointing-hand
+  cursor to say so.
+
 - **The in-app confusion matrix is drawn large enough to read.** The counts and
   their axis labels were set at the small text style, so the matrix — a thing
   read by comparing one cell against another at a glance — came out as a grid of
