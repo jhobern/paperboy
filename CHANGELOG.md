@@ -10,6 +10,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.8.0] - 2026-08-08
 
+### Changed
+
+- **The GUI asks for an export filename itself.** Exporting a report's results
+  used the desktop's own save dialog, whose format dropdown — tucked in the far
+  bottom corner — only *filtered* the listing: picking "Excel" left the name
+  ending `.csv`, and since PaperBoy chooses its writer by extension, the file
+  came out a CSV. Export now opens PaperBoy's own dialog, with the format
+  sitting next to the filename and changing it rewriting the extension, the way
+  the terminal UI has always worked. `Browse…` still opens the desktop picker
+  for anyone who wants to go looking for a folder.
+
 ### Fixed
 
 - **A whole results row opens its details, not just the words in it.** The click

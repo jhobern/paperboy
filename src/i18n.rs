@@ -1067,6 +1067,8 @@ strings! {
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
+    gui_report_export_go => "Export", "Exporter", "Eksportér";
+    gui_report_export_format => "Format:", "Format :", "Format:";
     gui_report_save_baseline => "Baseline…", "Référence…", "Basislinje…";
     gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
     gui_report_running => "Running…", "Exécution…", "Kører…";

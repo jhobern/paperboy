@@ -63,6 +63,15 @@ pub enum Dialog {
         name: String,
         count: usize,
     },
+    /// Exporting a report's results: a filename, and the format to write it in.
+    ///
+    /// Its own dialog rather than the native save picker's filter dropdown,
+    /// because that dropdown only *filters* — picking "Excel" in it left the
+    /// name ending `.csv` and the format is chosen by the extension, so the
+    /// dropdown appeared to do nothing. Here the format and the name are the
+    /// same decision, sat next to each other, and changing one rewrites the
+    /// other. The native picker is still a Browse… away.
+    ExportResults { path: String },
     /// A restored Workspace tab's downloaded folder has vanished since the
     /// last session (typically `/tmp` swept between restarts). Offers to
     /// redownload it, pinned to the exact commit it recorded.

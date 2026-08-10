@@ -3734,7 +3734,20 @@ fn truncate_cell(value: &str) -> String {
 /// defaulting to a `.csv` beside the report (or in the current dir for a scratch
 /// report).
 fn open_export_dialog(app: &mut GuiApp) {
-    super::menu::save_via_picker(app, super::app::SaveKind::ReportResults);
+    // Seeded with the name the report's own `# output:` directive asks for, so
+    // the common case is press-Export-and-done.
+    let path = app
+        .report_editor
+        .as_ref()
+        .map(|e| {
+            crate::report::writer::export_path(
+                &e.report,
+                &crate::report::writer::report_output_extension(&e.report),
+            )
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "results.csv".to_string());
+    app.dialog = Some(super::app::Dialog::ExportResults { path });
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.

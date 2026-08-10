@@ -564,7 +564,130 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             unsaved_close_tab_dialog(app, ctx, ci, name, count)
         }
         Dialog::WorkspaceReload { ci, reload } => workspace_reload_dialog(app, ctx, ci, *reload),
+        Dialog::ExportResults { path } => export_results_dialog(app, ctx, path),
     }
+}
+
+/// Pick the file *and* the format a report's results are exported as.
+///
+/// The format lives beside the name because it *is* the name: every writer is
+/// chosen by extension (see [`crate::report::writer::writer_for_extension`]),
+/// so choosing Excel has to make the file end `.xlsx` or the choice is a lie.
+/// The native picker's filter dropdown could not do that — it filters what the
+/// dialog lists and nothing more — so it sat in the far corner appearing to do
+/// nothing. Browse… still hands off to the native picker for people who want to
+/// go looking for a folder.
+fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String) {
+    let title = app.strings.gui_save_results_title;
+    let (lbl_export, lbl_cancel, lbl_browse, lbl_format) = (
+        app.strings.gui_report_export_go,
+        app.strings.gui_cancel,
+        app.strings.gui_browse,
+        app.strings.gui_report_export_format,
+    );
+    let mut act = ExportChoice::Keep;
+    let answered = modal(ctx, title, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(lbl_format);
+            let current = std::path::Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            egui::ComboBox::from_id_salt("pb_export_format")
+                .selected_text(format_label(&current))
+                .show_ui(ui, |ui| {
+                    for ext in crate::report::writer::OUTPUT_EXTENSIONS {
+                        if ui
+                            .selectable_label(ext == current, format_label(ext))
+                            .clicked()
+                            && ext != current
+                        {
+                            path = retarget_extension(&path, ext);
+                        }
+                    }
+                });
+        });
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut path)
+                .desired_width(420.0)
+                .hint_text(".csv / .json / .html / .xlsx"),
+        );
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.horizontal(|ui| {
+            if ui.button(lbl_browse).clicked() {
+                act = ExportChoice::Browse;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(lbl_cancel).clicked() {
+                    act = ExportChoice::Cancel;
+                }
+                if ui.button(lbl_export).clicked() || entered {
+                    act = ExportChoice::Write;
+                }
+            });
+        });
+    })
+    .is_some();
+    // A frame egui never drew is not an answer: keep the dialog armed.
+    if !answered {
+        act = ExportChoice::Keep;
+    }
+    match act {
+        ExportChoice::Keep => app.dialog = Some(Dialog::ExportResults { path }),
+        ExportChoice::Cancel => {}
+        ExportChoice::Browse => save_via_picker(app, SaveKind::ReportResults),
+        ExportChoice::Write => {
+            match export_report_results(app, &path) {
+                Ok(()) => {
+                    app.session.status = Some(crate::i18n::Status::Saved);
+                }
+                // A failed export leaves the dialog open with the name still in
+                // it: the fix is nearly always a word in that name.
+                Err(e) => {
+                    app.session.status = Some(crate::i18n::Status::Error(e));
+                    app.dialog = Some(Dialog::ExportResults { path });
+                }
+            }
+        }
+    }
+}
+
+/// What [`export_results_dialog`] decided this frame.
+enum ExportChoice {
+    /// No answer yet — re-arm the dialog unchanged.
+    Keep,
+    Cancel,
+    /// Hand over to the native save picker.
+    Browse,
+    Write,
+}
+
+/// The display name for an export format, from its extension.
+fn format_label(ext: &str) -> &'static str {
+    match ext {
+        "json" => "JSON",
+        "html" | "htm" => "HTML",
+        "xlsx" => "Excel",
+        "csv" => "CSV",
+        // An unknown extension is shown as itself rather than silently
+        // corrected: the name in the box is the user's, and the Export button
+        // is what tells them the format isn't one PaperBoy writes.
+        _ => "—",
+    }
+}
+
+/// Rewrite `path`'s extension to `ext`, keeping everything else.
+///
+/// A path with no extension gains one rather than being left alone — a name
+/// typed as `results` still has to become `results.csv` for a writer to be
+/// found for it.
+fn retarget_extension(path: &str, ext: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.as_os_str().is_empty() {
+        return format!("results.{ext}");
+    }
+    p.with_extension(ext).to_string_lossy().into_owned()
 }
 
 /// Last chance before quitting throws away request edits that were never
@@ -1673,6 +1796,25 @@ mod tests {
             app.pending_pick.is_none(),
             "saving in place must not open a file dialog"
         );
+    }
+
+    #[test]
+    fn choosing_an_export_format_renames_the_file() {
+        // The writer is chosen by extension, so a format dropdown that leaves
+        // the name ending `.csv` has not chosen anything.
+        assert_eq!(
+            super::retarget_extension("/tmp/report results.csv", "xlsx"),
+            "/tmp/report results.xlsx"
+        );
+        // A name with dots in it keeps them: only the last segment is the
+        // format.
+        assert_eq!(
+            super::retarget_extension("/tmp/run_v4.3.csv", "html"),
+            "/tmp/run_v4.3.html"
+        );
+        // A bare name gains an extension rather than staying unwritable.
+        assert_eq!(super::retarget_extension("results", "json"), "results.json");
+        assert_eq!(super::retarget_extension("", "csv"), "results.csv");
     }
 
     /// The report editor wins when one is open: it is drawn over the request
