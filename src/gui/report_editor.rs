@@ -3367,6 +3367,19 @@ fn paint_tether_hover(ui: &egui::Ui, th: &GuiTheme, anchor: egui::Rect, hanger: 
     if ui.ctx().dragged_id().is_some() || !ui.rect_contains_pointer(pair) {
         return;
     }
+    // Also suppressed when the pointer is on a chip that a drag would lift on
+    // its own: that chip gets its own outline (see `record_chip_hover`), and
+    // two nested outlines around the same pointer say two different things
+    // about what letting go would do. Resting on the *anchor* still draws the
+    // pair, which is where "what does this belong to?" is actually asked.
+    if ui
+        .ctx()
+        .data(|d| d.get_temp::<Option<egui::Rect>>(chip_hover_id()))
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
     ui.painter().rect_stroke(
         pair.expand(2.0),
         egui::CornerRadius::same(CHIP_RADIUS + 2),
@@ -5083,6 +5096,28 @@ fn hovered_block(rows: &[RowHover]) -> Option<&[usize]> {
 /// ghosts behind — and adding a second, differently-shaped highlight to that
 /// only muddled which of the two to read.
 fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
+    // A chip that a drag would lift on its own outranks the block it sits in:
+    // lighting the whole line while the pointer rests on a `PARALLEL` promised
+    // to move the line, which is not what letting go there would do.
+    // Stored as an `Option` because `remove_temp` needs a `Default`, which
+    // `Rect` has no sensible one of.
+    let chip_rect: Option<egui::Rect> = ui.ctx().data_mut(|d| {
+        let r = d.get_temp::<Option<egui::Rect>>(chip_hover_id()).flatten();
+        d.remove_temp::<Option<egui::Rect>>(chip_hover_id());
+        r
+    });
+    if let Some(rect) = chip_rect {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp::<Option<Vec<usize>>>(hover_group_id(), None);
+        });
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            egui::CornerRadius::same(CHIP_RADIUS + 2),
+            egui::Stroke::new(1.5, th.accent),
+            egui::StrokeKind::Outside,
+        );
+        return;
+    }
     let hovered = (!drag_in_flight(ui.ctx()))
         .then(|| hovered_block(rows))
         .flatten();
@@ -5116,6 +5151,39 @@ fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
             ),
         );
     }
+}
+
+/// The ctx-data key holding the rect of the detachable chip under the pointer.
+///
+/// Unlike the hover *group*, this is a within-frame hand-off: chips are drawn
+/// before [`paint_hover_group`] runs, which reads the value and takes it back
+/// out again, so a frame where the pointer is over no chip at all leaves
+/// nothing behind to go stale.
+fn chip_hover_id() -> egui::Id {
+    egui::Id::new("pt_hoverchip")
+}
+
+/// Note that the pointer is over a chip that a plain drag would pick up *on its
+/// own*, so the hover highlight can outline exactly that chip rather than the
+/// whole block.
+///
+/// The highlight has to answer "what would I be lifting?", and for a detachable
+/// chip the answer is the chip: dragging `PARALLEL` takes the `PARALLEL`, not
+/// the loop it sits on. Holding Ctrl changes the answer — that is what
+/// [`chip_drag_payload`] switches to a whole-row drag — so with Ctrl down
+/// nothing is recorded here and the block highlight stands, matching what the
+/// gesture would actually do.
+fn record_chip_hover(ui: &egui::Ui, chip: &Chip, rect: egui::Rect) {
+    if chip.is_base
+        || chip.detach.is_none()
+        || drag_in_flight(ui.ctx())
+        || ui.input(|i| i.modifiers.command)
+        || !ui.rect_contains_pointer(rect)
+    {
+        return;
+    }
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(chip_hover_id(), Some(rect)));
 }
 
 /// The ctx-data key the hover group is parked under for the next frame.
@@ -6541,6 +6609,17 @@ fn chip_shell<R>(
             rule,
         );
     }
+    // The seam, painted over the two borders that meet at it: a hanger's left
+    // border and its anchor's right one are the same hue as their fills, so
+    // without this the segments of a pill run together.
+    if let Some(seam) = tint.seam {
+        let rect = framed.response.rect;
+        ui.painter().vline(
+            rect.left(),
+            rect.top() + 1.0..=rect.bottom() - 1.0,
+            egui::Stroke::new(1.0, seam),
+        );
+    }
     framed.inner
 }
 
@@ -6597,6 +6676,9 @@ struct ChipTint {
     /// hanger of a tethered pair (whose leading edge is *inside* the pill, where
     /// a bar would read as a divider rather than as a category).
     rule: Option<Color32>,
+    /// The seam divider, drawn down this chip's left edge when it is the hanger
+    /// of a tethered pair. See [`CHIP_SEAM_MIX`] for why a pill needs one.
+    seam: Option<Color32>,
 }
 
 /// The colours for a chip of category colour `color`.
@@ -6611,6 +6693,7 @@ fn chip_tint(th: &GuiTheme, color: Color32) -> ChipTint {
         stroke: egui::Stroke::new(1.0, mix(th.panel, color, CHIP_STROKE_MIX)),
         text: mix(th.text, color, CHIP_TEXT_MIX),
         rule: Some(color),
+        seam: None,
     }
 }
 
@@ -6635,6 +6718,7 @@ fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
             stroke: egui::Stroke::new(1.0, th.select_fg),
             text: th.select_fg,
             rule: None,
+            seam: None,
         }
     } else if chip.hovered {
         ChipTint {
@@ -6646,15 +6730,32 @@ fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
             // as the same chip highlighted.
             text: mix(th.text, chip.color, CHIP_TEXT_MIX),
             rule: Some(chip.color),
+            seam: None,
         }
     } else {
         chip_tint(th, chip.color)
     };
     if chip.join_prev {
+        // The category bar would sit *inside* the pill here, where it reads as
+        // a divider rather than as a category — so it goes, and a proper
+        // divider takes its place (see `CHIP_SEAM_MIX`).
         tint.rule = None;
+        tint.seam = Some(mix(tint.fill, tint.text, CHIP_SEAM_MIX));
     }
     tint
 }
+
+/// How far the seam between two tethered chips is pulled from the fill toward
+/// the label colour.
+///
+/// A tethered pair is drawn as one pill split into segments, and with nothing
+/// but two same-hued borders meeting at the seam the split was invisible: a
+/// column carrying `STATISTICS`, `IMAGE`, `TRUTH` *and* `DETAIL` came out as
+/// one long blob of text, and users read the clauses as having merged into the
+/// thing they qualify. The seam is what makes it a *segmented* pill — the same
+/// device a segmented control uses — so it has to be clearly visible while
+/// still being quieter than the pill's outer border.
+const CHIP_SEAM_MIX: f32 = 0.45;
 
 /// A small frameless `×` button. Returns whether it was clicked. Kept separate
 /// from the chip's drag handle so its click is never stolen by a frame-wide
@@ -6842,6 +6943,7 @@ fn render_chip(
         render_chip_body(ui, th, s, chip, selected, path, titles, env_choices, acts);
     });
     let rect = scope.response.rect;
+    record_chip_hover(ui, chip, rect);
     // A detachable chip also spells out the drag gesture. It is not otherwise
     // discoverable that a plain drag pulls one chip out of a line while Ctrl
     // takes the whole line, and the two are easy to trigger by accident.
@@ -7084,9 +7186,13 @@ fn loop_chip(
     let tint = chip_colors(th, chip, false);
     let text_col = tint.text;
     let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
-        // `FOR` is the drag/select handle, kept apart from the boxes beside it
-        // so a click meant for a field never starts a drag of the row.
-        let handle = ui.add(
+        // Every fixed word on the loop head is a drag/select handle, and the
+        // editable boxes between them are not — a click meant for a field must
+        // never start a drag of the row. `FOR` alone used to be the only handle,
+        // which made a loop the one block in the editor you had to hit a
+        // three-letter target to pick up; the keywords beside it (`IN FILES`,
+        // `MATCH`, the tail) are just as fixed, so they join in.
+        let mut handle = ui.add(
             egui::Label::new(RichText::new("FOR").color(text_col))
                 .selectable(false)
                 .sense(egui::Sense::click_and_drag()),
@@ -7111,10 +7217,10 @@ fn loop_chip(
                 });
             }
         }
-        ui.add(
+        handle |= ui.add(
             egui::Label::new(RichText::new(&l.keyword).color(text_col))
                 .selectable(false)
-                .sense(egui::Sense::hover()),
+                .sense(egui::Sense::click_and_drag()),
         );
         if let Some((dir, is_file)) = &l.dir {
             let id = ui.make_persistent_id(("pt_loop_dir", path));
@@ -7162,12 +7268,13 @@ fn loop_chip(
             // The keyword carries the same explanation as the box beside it:
             // "MATCH" alone says nothing to someone meeting it for the first
             // time, and it is the word their eye lands on first.
-            ui.add(
-                egui::Label::new(RichText::new("MATCH").color(text_col))
-                    .selectable(false)
-                    .sense(egui::Sense::hover()),
-            )
-            .on_hover_text(s.chip_help_loop_glob);
+            handle |= ui
+                .add(
+                    egui::Label::new(RichText::new("MATCH").color(text_col))
+                        .selectable(false)
+                        .sense(egui::Sense::click_and_drag()),
+                )
+                .on_hover_text(s.chip_help_loop_glob);
             let id = ui.make_persistent_id(("pt_loop_glob", path));
             let resp = inline_text_edit(
                 ui,
@@ -7188,10 +7295,10 @@ fn loop_chip(
             }
         }
         if !l.tail.is_empty() {
-            ui.add(
+            handle |= ui.add(
                 egui::Label::new(RichText::new(&l.tail).color(text_col))
                     .selectable(false)
-                    .sense(egui::Sense::hover()),
+                    .sense(egui::Sense::click_and_drag()),
             );
         }
         handle
@@ -7199,6 +7306,14 @@ fn loop_chip(
 
     if handle.dragged() {
         handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
+    }
+    // Selecting and wizard-opening, the same as every other chip's handle. A
+    // loop head was the one chip you could not click to select, so keyboard
+    // actions aimed at "the selected block" could not be pointed at a loop.
+    if handle.double_clicked() {
+        acts.push(Act::OpenWizard(path.to_vec()));
+    } else if handle.clicked() {
+        acts.push(Act::Select(path.to_vec()));
     }
 }
 
@@ -9777,6 +9892,88 @@ mod tests {
             dragged_chip(&ctx),
             None,
             "a whole-line drag must not also lift a chip out of that line"
+        );
+    }
+
+    /// A tethered pair is drawn as one pill *split into segments*. Without a
+    /// visible seam a column carrying `STATISTICS`, `IMAGE`, `TRUTH` and
+    /// `DETAIL` reads as one blob and the clauses look merged into the thing
+    /// they qualify.
+    #[test]
+    fn a_tethered_chip_gets_a_seam_to_be_read_apart_by() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let mut chips = vec![
+            Chip::alias("Result", th.pending, None),
+            Chip::modifier("TRUTH(\"Expected\")".into(), th.subst, DetachWhich::Truth).tether(),
+        ];
+        link_tethers(&mut chips);
+
+        assert!(
+            chip_colors(&th, &chips[0], false).seam.is_none(),
+            "the anchor opens the pill, so nothing is drawn down its leading edge"
+        );
+        let hanger = chip_colors(&th, &chips[1], false);
+        assert!(
+            hanger.seam.is_some(),
+            "the hanger's leading edge is the seam between the two segments"
+        );
+        assert!(
+            hanger.rule.is_none(),
+            "and the category bar goes, since inside a pill it reads as a divider"
+        );
+    }
+
+    /// The hover highlight has to promise exactly what a drag would pick up.
+    /// Resting on a detachable chip outlines that chip; holding Ctrl — which is
+    /// what turns the same gesture into a whole-line drag — hands the highlight
+    /// back to the block.
+    #[test]
+    fn hovering_a_detachable_chip_scopes_the_highlight_to_that_chip() {
+        let modi = Chip::modifier(
+            "PARALLEL(8)".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Parallel,
+        );
+        let base = Chip::base("FOR f IN FILES".into(), egui::Color32::WHITE);
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(80.0, 20.0));
+        let over = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(rect.center())],
+            ..Default::default()
+        };
+        let ctrl_over = egui::RawInput {
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            events: vec![egui::Event::PointerMoved(rect.center())],
+            ..Default::default()
+        };
+        let recorded = |input: egui::RawInput, chip: &Chip| {
+            let ctx = egui::Context::default();
+            // Two passes: the first delivers the pointer event, the second runs
+            // with the pointer already where it was put.
+            let _ = ctx.run_ui(input.clone(), |ui| record_chip_hover(ui, chip, rect));
+            ctx.data_mut(|d| d.remove_temp::<Option<egui::Rect>>(chip_hover_id()));
+            let _ = ctx.run_ui(input, |ui| record_chip_hover(ui, chip, rect));
+            ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chip_hover_id()))
+                .flatten()
+        };
+
+        assert_eq!(
+            recorded(over.clone(), &modi),
+            Some(rect),
+            "a plain drag would lift this chip alone, so it is what lights up"
+        );
+        assert_eq!(
+            recorded(ctrl_over, &modi),
+            None,
+            "with Ctrl the drag takes the whole line, so the block highlight stands"
+        );
+        assert_eq!(
+            recorded(over, &base),
+            None,
+            "a base chip moves its line either way, so it never scopes the highlight"
         );
     }
 

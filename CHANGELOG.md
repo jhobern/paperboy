@@ -12,6 +12,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A `FOR` loop can be picked up and dragged.** The loop head's only drag
+  handle was the word `FOR` itself, making a loop the one block in the editor
+  you had to hit a three-letter target to move. Every fixed word on the head —
+  `FOR`, `IN FILES`/`IN FOLDERS`/`IN ENVS`, `MATCH` and the tail — is now a
+  handle, while the boxes between them are not, so a click meant for a field
+  still never starts a drag. Clicking a loop head also selects it (and
+  double-clicking opens its wizard), which it never did before.
+
+- **A column's clauses no longer look merged into the column.** `STATISTICS`,
+  `IMAGE`, `TRUTH` and `DETAIL` are drawn tethered to the column they belong to,
+  as one pill split into segments — but with nothing marking the splits, a
+  column carrying all four came out as a single long blob of text. Each segment
+  now has a visible seam down its leading edge, so the pill reads as the
+  segmented control it is meant to be.
+
+- **Hovering a chip highlights what a drag would actually pick up.** Resting the
+  pointer anywhere on a line lit the whole block, including when the pointer was
+  on a clause that a plain drag would pull out on its own — the highlight
+  promised to move the line and letting go would have detached one chip. A
+  detachable chip now outlines itself, and holding Ctrl (which is what turns the
+  same gesture into a whole-line drag) hands the highlight back to the block.
+
 - **A Workspace tab comes back to the report it was on.** A report opened from
   a Workspace folder tree belongs to that tab, so it is closed when you leave —
   but nothing reopened it when you came back, and the tab returned showing
