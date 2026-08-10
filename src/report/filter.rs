@@ -173,8 +173,10 @@ impl RowFilter {
 /// offer a filtered view that is mostly blank skeleton.
 // Consumed by the in-app interactive views, which unlike the HTML export
 // filter in Rust rather than in the browser; kept beside the predicates it
-// applies so the two renderings can never disagree about what they hide.
-#[allow(dead_code)]
+// applies so the two renderings can never disagree about what they hide. Only
+// the GUI results view calls it so far, so the non-GUI build still needs the
+// allow; drop it once the TUI results view filters too.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn visible_rows(
     result: &ReportResult,
     columns: &[OutputColumn],

@@ -56,6 +56,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI results view has metric cards, row filters and a find box.** The
+  figures and filters that made the interactive HTML export worth exporting are
+  now drawn natively above the results grid, so a ground-truthed run can be
+  judged and picked through without exporting it first. The filters offered are
+  the ones the run has something to select (differences, incorrect rows,
+  regressions), the find box narrows whatever the filter chose, and the count
+  reports how many of the run's rows survive both. Both are computed from the
+  same `metrics`/`filter` core the HTML writer uses, so the two views can never
+  disagree. A run that is still streaming is shown unfiltered, since filtering
+  hides pending rows.
+
 - **`TRUTH`, `IMAGE` and `DETAIL` are editable in both structured editors.**
   The three trailing clauses attach identically to a `WITH` field, a
   `REPORT <var> AS` column and a computed column, so all three forms in the TUI

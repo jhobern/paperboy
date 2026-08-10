@@ -19,6 +19,7 @@ use crate::report::edit::{
     header_specs, insert_node, insert_pos_after, move_node, node_at, remove_node, replace_node,
     report_assignment, request_node, set_request_name, transfer_modifier,
 };
+use crate::report::filter::RowFilter;
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
 use crate::report::indent::{
     INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
@@ -90,6 +91,17 @@ pub struct ReportEditor {
     pub run: Option<RunHandle>,
     /// Whether the current `result` has been exported since it was produced.
     pub results_exported: bool,
+    /// Which of the results view's row filters is selected, as an index into
+    /// [`crate::report::filter::RowFilter::available`] for the current result.
+    ///
+    /// Held as an index rather than the filter itself because the set of
+    /// filters worth offering is derived from the result: a stored `Regressed`
+    /// would have to be validated against every new result anyway, and an index
+    /// only has to be clamped. Reset with the result.
+    pub results_filter: usize,
+    /// The results view's find box: a case-insensitive substring the shown
+    /// columns are searched for, narrowing the rows the filter already chose.
+    pub results_find: String,
     /// When `Some`, a node-configure wizard (request / envs / files) is open as
     /// a modal over the blocks view.
     pub wizard: Option<super::report_wizard::Wizard>,
@@ -176,6 +188,8 @@ impl ReportEditor {
             progress: None,
             run: None,
             results_exported: false,
+            results_filter: 0,
+            results_find: String::new(),
             wizard: None,
             diag_h: 132.0,
             palette_w: 168.0,
@@ -349,6 +363,9 @@ impl ReportEditor {
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
+                // The old result's filters described the old rows.
+                self.results_filter = 0;
+                self.results_find.clear();
                 // A real run supersedes any preview of it.
                 self.dry_run = None;
                 self.view = EditorView::Results;
@@ -1771,7 +1788,7 @@ fn dry_run_body(
     }
     // `None` states: a dry run has no streaming progress, so the grid draws
     // without status icons, exactly like a finished run.
-    if let Some(ins) = results_grid(&th, ui, &preview.result, &columns, None) {
+    if let Some(ins) = results_grid(&th, ui, &preview.result, &columns, None, None) {
         opened = Some(ins);
     }
     opened
@@ -2314,10 +2331,190 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     let states = ed.progress.as_ref().map(|p| p.states.as_slice());
+
+    // The metric cards and the filter bar, the two things the interactive HTML
+    // export offers that reading the grid alone doesn't. Both are skipped while
+    // a run is streaming: the figures would be computed over a half-filled
+    // table and would tick misleadingly as rows land, and `visible_rows` drops
+    // pending rows, so filtering a live run would empty the very view you are
+    // watching.
+    let live = states.is_some();
+    if let Some(visible) = visible_for_view(
+        result,
+        &columns,
+        &header,
+        live,
+        &mut ed.results_filter,
+        &ed.results_find,
+    ) {
+        if let Some(metrics) = result.metrics(&columns, &header) {
+            metric_cards(&th, ui, app, &metrics);
+        }
+        let filters = RowFilter::available(result);
+        filter_bar(
+            &th,
+            ui,
+            app,
+            &filters,
+            &mut ed.results_filter,
+            &mut ed.results_find,
+            visible.len(),
+            result.rows.len(),
+        );
+        ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
+        ui.add_space(2.0);
+        if let Some(ins) = results_grid(&th, ui, result, &columns, states, Some(&visible)) {
+            ed.inspector = Some(ins);
+        }
+        return;
+    }
     ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
     ui.add_space(2.0);
-    if let Some(ins) = results_grid(&th, ui, result, &columns, states) {
+    if let Some(ins) = results_grid(&th, ui, result, &columns, states, None) {
         ed.inspector = Some(ins);
+    }
+}
+
+/// The rows the results view should show, or `None` to show every row
+/// unfiltered.
+///
+/// `None` while a run is `live`, deliberately: `visible_rows` drops pending
+/// rows, so filtering a streaming run would empty the very view being watched,
+/// and the metric figures would be computed over a half-filled table and tick
+/// misleadingly as rows land.
+///
+/// `selected` is clamped rather than validated: the set of filters worth
+/// offering comes from the result, so a selection made against an earlier
+/// result can point past the end of the current one.
+fn visible_for_view(
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+    header: &crate::report::flow::Header,
+    live: bool,
+    selected: &mut usize,
+    find: &str,
+) -> Option<Vec<usize>> {
+    if live {
+        return None;
+    }
+    let filters = RowFilter::available(result);
+    *selected = (*selected).min(filters.len().saturating_sub(1));
+    let labels = crate::report::labels::LabelMap::parse(&header.labels());
+    Some(crate::report::filter::visible_rows(
+        result,
+        columns,
+        &labels,
+        filters.get(*selected).unwrap_or(&RowFilter::All),
+        find,
+    ))
+}
+
+/// The results view's metric cards: the same figures the interactive HTML
+/// export leads with, drawn natively so a ground-truthed run can be judged
+/// without exporting it first.
+///
+/// The *labels* are translated here even though the exported document's are
+/// not: this is application chrome, and the reason the export stays English is
+/// that a shared file has no reader whose language is known.
+fn metric_cards(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    metrics: &crate::report::metrics::Metrics,
+) {
+    let card = |ui: &mut egui::Ui, k: &str, v: &str| {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(k).size(11.0).color(th.dim));
+                    ui.label(RichText::new(v).strong().color(th.text));
+                });
+            });
+    };
+    // The roll-up first when there is one -- it answers "did this run pass?",
+    // and the per-column breakdown is the follow-up question.
+    for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+        ui.horizontal_wrapped(|ui| {
+            card(
+                ui,
+                &format!("{} — {}", m.header, app.strings.report_metric_compared),
+                &format!("{} / {}", m.compared, m.total),
+            );
+            card(
+                ui,
+                app.strings.report_metric_incorrect,
+                &m.incorrect.to_string(),
+            );
+            card(
+                ui,
+                app.strings.report_metric_accuracy,
+                m.accuracy_text().as_deref().unwrap_or("\u{2014}"),
+            );
+        });
+        ui.add_space(2.0);
+    }
+}
+
+/// The row-filter buttons, the find box and the row count.
+///
+/// The buttons are drawn only when there is more than one -- `available` always
+/// offers `All`, and a lone `All` is a control whose only possible effect is the
+/// state it is already in (the HTML export hides it for the same reason). The
+/// find box and count are always drawn: those help in any report.
+#[allow(clippy::too_many_arguments)]
+fn filter_bar(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    filters: &[RowFilter],
+    selected: &mut usize,
+    find: &mut String,
+    shown: usize,
+    total: usize,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if filters.len() > 1 {
+            for (i, f) in filters.iter().enumerate() {
+                if ui
+                    .selectable_label(i == *selected, filter_label(&app.strings, f))
+                    .on_hover_text(app.strings.help_report_filter)
+                    .clicked()
+                {
+                    *selected = i;
+                }
+            }
+            ui.separator();
+        }
+        ui.add(
+            egui::TextEdit::singleline(find)
+                .desired_width(180.0)
+                .hint_text(app.strings.report_find_placeholder),
+        );
+        ui.colored_label(
+            th.dim,
+            app.strings
+                .report_rows_shown
+                .replace("{shown}", &shown.to_string())
+                .replace("{total}", &total.to_string()),
+        );
+    });
+    ui.add_space(2.0);
+}
+
+/// A filter's button text in the user's language.
+///
+/// [`RowFilter::label`] is deliberately English -- it names buttons in an
+/// exported document that is read by whoever it is sent to -- so the in-app bar
+/// translates the fixed filters here and falls back to that label for a matrix
+/// cell, whose text is the report's own data and so is not translatable.
+fn filter_label(s: &crate::i18n::Strings, f: &RowFilter) -> String {
+    match f {
+        RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Differ => s.report_filter_differences.to_string(),
+        RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
+        RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::MatrixCell { .. } => f.label(),
     }
 }
 
@@ -2391,6 +2588,7 @@ fn results_grid(
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     states: Option<&[RowState]>,
+    visible: Option<&[usize]>,
 ) -> Option<CellInspector> {
     let show_icons = states.is_some();
     let mut opened: Option<CellInspector> = None;
@@ -2422,8 +2620,18 @@ fn results_grid(
                     }
                     ui.end_row();
 
-                    // Data rows.
-                    for (i, row) in result.rows.iter().enumerate() {
+                    // Data rows. `visible` is the filtered row order when the
+                    // view is filtering; the column widths are still measured
+                    // over *every* row, so narrowing the rows doesn't make the
+                    // table jump about as the reader types in the find box.
+                    let order: Vec<usize> = match visible {
+                        Some(v) => v.to_vec(),
+                        None => (0..result.rows.len()).collect(),
+                    };
+                    for i in order {
+                        let Some(row) = result.rows.get(i) else {
+                            continue;
+                        };
                         let state = states.and_then(|s| s.get(i)).copied();
                         if show_icons {
                             let (glyph, colour) = match state {
@@ -9917,6 +10125,73 @@ mod results_render_tests {
         (result, columns)
     }
 
+    /// A streaming run must not be filtered: `visible_rows` drops pending rows,
+    /// so a live filter would hide the very rows the reader is watching arrive.
+    #[test]
+    fn a_live_run_is_shown_unfiltered() {
+        let (result, columns) = fixture(&["A"], &["x"], 3);
+        let header = crate::report::flow::Header::default();
+        let mut sel = 0;
+        assert!(
+            super::visible_for_view(&result, &columns, &header, true, &mut sel, "").is_none(),
+            "a live run shows every row it has, filters and all"
+        );
+    }
+
+    /// The find box narrows the rows the filter chose, over the columns that are
+    /// actually shown.
+    #[test]
+    fn the_find_box_narrows_the_rows() {
+        let (mut result, columns) = fixture(&["A"], &["x"], 3);
+        result.rows[1]
+            .cells
+            .insert("A".to_string(), "needle".to_string());
+        let header = crate::report::flow::Header::default();
+        let mut sel = 0;
+        let all = super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
+        assert_eq!(all, vec![0, 1, 2], "no text means no narrowing");
+        let hit =
+            super::visible_for_view(&result, &columns, &header, false, &mut sel, "NEED").unwrap();
+        assert_eq!(hit, vec![1], "and the search is case-insensitive");
+    }
+
+    /// The filter selection is an index into a list derived from the *result*,
+    /// so a selection made against a richer result must not index past the end
+    /// of a plainer one (or silently select the wrong filter).
+    #[test]
+    fn a_stale_filter_selection_is_clamped_rather_than_panicking() {
+        let (result, columns) = fixture(&["A"], &["x"], 2);
+        let header = crate::report::flow::Header::default();
+        // A plain result offers only `All`, so index 3 cannot stand.
+        let mut sel = 3;
+        let rows =
+            super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
+        assert_eq!(sel, 0, "clamped back onto the only filter there is");
+        assert_eq!(rows, vec![0, 1], "which selects everything");
+    }
+
+    /// The in-app bar translates its own buttons; the exported document's stay
+    /// English because it has no reader whose language is known.
+    #[test]
+    fn the_filter_buttons_are_translated_but_a_matrix_cell_is_not() {
+        use crate::report::filter::RowFilter;
+        let s = crate::i18n::Strings::for_language(&Language::French);
+        assert_eq!(
+            super::filter_label(&s, &RowFilter::Incorrect),
+            s.report_filter_incorrect
+        );
+        let cell = RowFilter::MatrixCell {
+            column: "Verdict".to_string(),
+            truth: "pass".to_string(),
+            answer: "fail".to_string(),
+        };
+        assert_eq!(
+            super::filter_label(&s, &cell),
+            cell.label(),
+            "a matrix cell names the report's own data, which is not translatable"
+        );
+    }
+
     /// The source editor asks its layouter for a job on every frame, so the job
     /// is cached — but it has to follow every input the highlighter colours by.
     #[test]
@@ -10245,7 +10520,7 @@ mod results_render_tests {
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_max_width(1.0);
-            results_grid(&th, ui, &result, &columns, None);
+            results_grid(&th, ui, &result, &columns, None, None);
         });
     }
 }

@@ -1065,6 +1065,19 @@ strings! {
     gui_report_running => "Running…", "Exécution…", "Kører…";
     gui_report_cell_hint => "Click a cell to inspect its full value", "Cliquez sur une cellule pour voir sa valeur complète", "Klik på en celle for at se dens fulde værdi";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
+    // The results view's filter bar and metric cards. `RowFilter::label` is
+    // deliberately English -- it names buttons in an exported document that has
+    // no language -- so the in-app bar labels its own buttons from here.
+    report_filter_all => "All", "Tout", "Alle";
+    report_filter_differences => "Differences", "Différences", "Forskelle";
+    report_filter_incorrect => "Incorrect", "Incorrect", "Forkerte";
+    report_filter_regressions => "Regressions", "Régressions", "Regressioner";
+    report_find_placeholder => "Find in rows…", "Rechercher dans les lignes…", "Søg i rækker…";
+    report_rows_shown => "{shown} of {total} rows", "{shown} lignes sur {total}", "{shown} af {total} rækker";
+    report_metric_compared => "Compared", "Comparés", "Sammenlignet";
+    report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
+    report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";
+    help_report_filter => "Show only the rows this filter selects", "N'afficher que les lignes sélectionnées par ce filtre", "Vis kun de rækker, dette filter vælger";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
