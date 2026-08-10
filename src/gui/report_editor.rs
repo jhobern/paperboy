@@ -124,6 +124,13 @@ pub struct ReportEditor {
     /// (the GUI's stand-in for a fixed panel), so a report with many validation
     /// errors can be given as much room as needed.
     pub diag_h: f32,
+    /// Height (px) the results view's summary block (metric cards, filter bar
+    /// and confusion matrices) is allowed before it starts scrolling within
+    /// itself. Adjustable by dragging the splitter under it: a matrix per
+    /// ground-truthed column can fill most of the pane, which leaves the grid
+    /// it is describing with nothing — but a reader comparing cells wants the
+    /// opposite, so the split is theirs to make.
+    pub summary_h: f32,
     /// Height (px) reserved for the row drill-down panel under the results
     /// grid, adjustable by dragging the splitter above it. A drill-down holds
     /// full-size pictures and whole response bodies, so how much of the view it
@@ -214,6 +221,7 @@ impl ReportEditor {
             results_textures: std::collections::HashMap::new(),
             wizard: None,
             diag_h: 132.0,
+            summary_h: 240.0,
             detail_h: 320.0,
             palette_w: 168.0,
             inspector: None,
@@ -2455,36 +2463,57 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     ) {
         let metrics = result.metrics(&columns, &header);
         let (filters, buttons) = crate::report::filter::all_filters(result, metrics.as_ref());
-        if let Some(metrics) = &metrics {
-            metric_cards(&th, ui, app, metrics);
-        }
-        filter_bar(
-            &th,
-            ui,
-            app,
-            &filters[..buttons],
-            &mut ed.results_filter,
-            &mut ed.results_find,
-            visible.len(),
-            result.rows.len(),
-        );
-        // The matrices sit under the bar they drive: a cell is itself a filter,
-        // and picking one selects exactly the rows that cell counted.
-        if let Some(metrics) = &metrics {
-            for m in &metrics.columns {
-                if let Some(matrix) = &m.matrix {
-                    confusion_matrix(
-                        &th,
-                        ui,
-                        app,
-                        &m.header,
-                        matrix,
-                        &filters,
-                        &mut ed.results_filter,
-                    );
+        // The summary block scrolls inside a height of its own rather than
+        // pushing the grid off the bottom. A report with a matrix per
+        // ground-truthed column can otherwise leave no room at all for the rows
+        // the matrices describe.
+        let summary_h = ed
+            .summary_h
+            .clamp(60.0, (ui.available_height() - 120.0).max(60.0));
+        let mut filter = ed.results_filter;
+        let mut find = std::mem::take(&mut ed.results_find);
+        egui::ScrollArea::vertical()
+            .id_salt("pb_report_summary")
+            .max_height(summary_h)
+            // Vertical auto-shrink is left on so a report with no matrices
+            // doesn't reserve a band of empty space above its grid.
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if let Some(metrics) = &metrics {
+                    metric_cards(&th, ui, app, metrics);
                 }
-            }
-        }
+                filter_bar(
+                    &th,
+                    ui,
+                    app,
+                    &filters[..buttons],
+                    &mut filter,
+                    &mut find,
+                    visible.len(),
+                    result.rows.len(),
+                );
+                // The matrices sit under the bar they drive: a cell is itself a
+                // filter, and picking one selects exactly the rows that cell
+                // counted.
+                if let Some(metrics) = &metrics {
+                    for m in &metrics.columns {
+                        if let Some(matrix) = &m.matrix {
+                            confusion_matrix(
+                                &th,
+                                ui,
+                                app,
+                                &m.header,
+                                matrix,
+                                &filters,
+                                &mut filter,
+                            );
+                        }
+                    }
+                }
+            });
+        ed.results_filter = filter;
+        ed.results_find = find;
+        summary_splitter(&mut ed.summary_h, ui);
         ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
         ui.add_space(2.0);
         // A row whose panel is open still has to be *reachable*, so the grid
@@ -2570,6 +2599,34 @@ fn detail_splitter(height: &mut f32, ui: &mut egui::Ui) {
         // Dragging *up* makes the panel taller, since the panel is below the
         // handle — the same sense as the diagnostics splitter.
         *height = (*height - resp.drag_delta().y).clamp(80.0, 2000.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let w = (rect.width() * 0.25).clamp(40.0, 160.0);
+    let x0 = rect.center().x - w / 2.0;
+    ui.painter()
+        .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
+/// A thin draggable handle under the results view's summary block. Dragging it
+/// down gives the metric cards, filter bar and matrices more room before they
+/// start scrolling; dragging it up gives the room back to the grid.
+///
+/// Same shape as [`detail_splitter`], opposite sense: the pane this one sizes
+/// is *above* the handle, so dragging down grows it.
+fn summary_splitter(height: &mut f32, ui: &mut egui::Ui) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    if resp.dragged() {
+        *height = (*height + resp.drag_delta().y).clamp(60.0, 2000.0);
     }
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);

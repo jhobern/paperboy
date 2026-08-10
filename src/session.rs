@@ -1170,6 +1170,7 @@ mod workspace_tests {
             report_diag_height: Some(96.0),
             report_palette_width: Some(200.0),
             report_detail_height: Some(280.0),
+            report_summary_height: Some(200.0),
             view: crate::persistence::GuiView::Report(2),
             report_source_view: true,
         };

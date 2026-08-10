@@ -97,6 +97,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and the height is saved with the rest of the GUI's geometry, so a reader who
   wants a big picture pane keeps it between runs and between sessions.
 
+- **The results view's summary block can be resized.** The metric cards, the
+  filter bar and the confusion matrices took whatever height they wanted, so a
+  report with a matrix per ground-truthed column left almost nothing for the
+  rows the matrices are describing — and opening a drill-down under it left less
+  still. The block now scrolls within a height of its own, with a splitter under
+  it to set that height, saved with the rest of the GUI's geometry. A report
+  with no matrices still reserves no empty space.
+
 - **A drill-down picture's path is legible.** The caption under a full-size
   photograph was set at the small text style, leaving the one line that says
   *which* file of a thousand this row is as a fine grey thread. It is now body

@@ -498,6 +498,9 @@ impl GuiApp {
         if let Some(h) = self.session.gui.report_detail_height {
             ed.detail_h = h;
         }
+        if let Some(h) = self.session.gui.report_summary_height {
+            ed.summary_h = h;
+        }
         // Whatever was open keeps its run, and this report takes back its own.
         self.close_report_editor();
         if let Some(parked) = self.report_runs.remove(&ed.run_key()) {
@@ -587,6 +590,11 @@ impl GuiApp {
                 &mut dirty,
                 &mut self.session.gui.report_detail_height,
                 ed.detail_h,
+            );
+            Self::record_size(
+                &mut dirty,
+                &mut self.session.gui.report_summary_height,
+                ed.summary_h,
             );
         }
 
