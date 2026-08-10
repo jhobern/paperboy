@@ -3245,6 +3245,28 @@ fn results_grid(
                             continue;
                         };
                         let state = states.and_then(|s| s.get(i)).copied();
+                        // A click anywhere on the row opens its drill-down --
+                        // including the gaps between columns, and the empty
+                        // space inside a column that its text doesn't fill. The
+                        // target is reserved *before* the cells so the cells,
+                        // added after, still win where they overlap it (egui
+                        // hit-tests in favour of the later widget), which keeps
+                        // each cell's own hover text and its inspector click.
+                        // Its size is known up front: the widths were measured
+                        // before the loop.
+                        let row_target = expandable.contains(&i).then(|| {
+                            let w: f32 = widths.iter().sum::<f32>()
+                                + SPACING_X * widths.len() as f32
+                                + if show_expanders { 24.0 } else { 0.0 }
+                                + if show_icons { 18.0 + SPACING_X } else { 0.0 };
+                            let rect =
+                                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
+                            ui.interact(
+                                rect,
+                                ui.id().with(("pb_result_row", i)),
+                                egui::Sense::click(),
+                            )
+                        });
                         if show_expanders {
                             let has = expandable.contains(&i);
                             let open = *open_detail == Some(i);
@@ -3309,6 +3331,9 @@ fn results_grid(
                                     }
                                 }
                             });
+                        }
+                        if row_target.is_some_and(|r| r.clicked()) {
+                            *open_detail = Some(i);
                         }
                         ui.end_row();
                     }

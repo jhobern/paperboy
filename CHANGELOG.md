@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A whole results row opens its details, not just the words in it.** The click
+  target for expanding a row was the *text* of a cell, so the gaps between
+  columns, and the empty space in a short column, did nothing — a row of mostly
+  blank cells was nearly unclickable. The row itself is now the target; the
+  cells still win where they overlap, so each keeps its own hover text and its
+  value inspector.
+
 - **A `FOR` loop can be picked up and dragged.** The loop head's only drag
   handle was the word `FOR` itself, making a loop the one block in the editor
   you had to hit a three-letter target to move. Every fixed word on the head —
