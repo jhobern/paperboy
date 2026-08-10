@@ -762,50 +762,91 @@ fn modal<R>(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui) ->
         .and_then(|r| r.inner)
 }
 
-/// Open a collection / environment / workspace through a native OS picker.
-/// Replaces the old type-a-path modal — a menu click pops the native chooser,
-/// and a successful pick loads immediately; failures show a native error alert.
-pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
-    let title = match kind {
+/// What an open dialog is for, once it answers. See [`PickAction`].
+fn open_title(app: &GuiApp, kind: OpenKind) -> &'static str {
+    match kind {
         OpenKind::Collection => app.strings.gui_open_collection_title,
         OpenKind::Environment => app.strings.gui_open_environment_title,
         OpenKind::Workspace => app.strings.gui_open_workspace_title,
         OpenKind::Report => app.strings.gui_open_report_title,
-    };
-    let picker_kind = match kind {
+    }
+}
+
+fn open_picker_kind(kind: OpenKind) -> PickerKind {
+    match kind {
         OpenKind::Environment => PickerKind::Environment,
         _ => PickerKind::Other,
-    };
-    let dir = app.session.picker_dir(picker_kind).map(|p| p.to_path_buf());
-    let picked = match kind {
-        OpenKind::Workspace => super::filepick::pick_folder(title, dir.as_deref()),
-        OpenKind::Collection => super::filepick::pick_file(
-            title,
-            dir.as_deref(),
-            &[
+    }
+}
+
+/// Open a collection / environment / workspace through a native OS picker.
+/// Replaces the old type-a-path modal — a menu click pops the native chooser,
+/// and a successful pick loads immediately; failures show a native error alert.
+///
+/// The dialog runs on a worker thread and is collected by
+/// [`poll_pending_pick`] some frames later, so this returns straight away.
+pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
+    let title = open_title(app, kind);
+    let dir = app
+        .session
+        .picker_dir(open_picker_kind(kind))
+        .map(|p| p.to_path_buf());
+    let filters = |f: &[super::filepick::Filter]| super::filepick::owned_filters(f);
+    let pick_kind = match kind {
+        OpenKind::Workspace => super::filepick::PickKind::Folder,
+        OpenKind::Collection => super::filepick::PickKind::File {
+            filters: filters(&[
                 (app.strings.gui_filter_collections, &["hurl", "json"]),
                 (app.strings.gui_filter_all, &["*"]),
-            ],
-        ),
-        OpenKind::Environment => super::filepick::pick_file(
-            title,
-            dir.as_deref(),
-            &[
+            ]),
+        },
+        OpenKind::Environment => super::filepick::PickKind::File {
+            filters: filters(&[
                 (
                     app.strings.gui_filter_environments,
                     &["vars", "env", "json"],
                 ),
                 (app.strings.gui_filter_all, &["*"]),
-            ],
-        ),
-        OpenKind::Report => super::filepick::pick_file(
-            title,
-            dir.as_deref(),
-            &[
+            ]),
+        },
+        OpenKind::Report => super::filepick::PickKind::File {
+            filters: filters(&[
                 (app.strings.gui_filter_reports, &["trail"]),
                 (app.strings.gui_filter_all, &["*"]),
-            ],
-        ),
+            ]),
+        },
+    };
+    app.pending_pick = Some(super::filepick::spawn(
+        pick_kind,
+        title,
+        dir.as_deref(),
+        PickAction::Open(kind),
+    ));
+}
+
+/// What to do with a path once its dialog answers.
+///
+/// The click that opened the dialog knows what it was for; the frame that
+/// collects the path, many frames later, does not — so the intent travels with
+/// the request.
+pub enum PickAction {
+    Open(OpenKind),
+    Save(SaveKind),
+}
+
+/// Collect a finished file dialog, if one has finished, and act on it. Called
+/// once per frame from [`super::app::GuiApp::draw`].
+pub fn poll_pending_pick(app: &mut GuiApp) {
+    let Some(pending) = app.pending_pick.as_mut() else {
+        return;
+    };
+    let Some((action, picked)) = pending.take() else {
+        return; // still open — the usual case
+    };
+    app.pending_pick = None;
+    let (title, picker_kind) = match action {
+        PickAction::Open(kind) => (open_title(app, kind), open_picker_kind(kind)),
+        PickAction::Save(kind) => (save_title(app, kind), save_picker_kind(kind)),
     };
     let Some(path) = picked else {
         return; // cancelled
@@ -813,7 +854,11 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
     // Remembered even when the load fails: the user still browsed there, and
     // sending the next picker back to square one would be the bigger annoyance.
     app.session.remember_picker_dir(picker_kind, &path);
-    if let Err(msg) = apply_open(app, kind, &path) {
+    let outcome = match action {
+        PickAction::Open(kind) => apply_open(app, kind, &path),
+        PickAction::Save(kind) => apply_save(app, kind, &path),
+    };
+    if let Err(msg) = outcome {
         super::filepick::error_alert(title, &msg);
     }
     app.session.save();
@@ -917,15 +962,26 @@ fn report_result_filters(ext: &str) -> Vec<super::filepick::Filter<'static>> {
 
 /// Save the active collection / environment / response / report results through
 /// a native OS save picker.
-pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
-    let title = match kind {
+fn save_title(app: &GuiApp, kind: SaveKind) -> &'static str {
+    match kind {
         SaveKind::Collection => app.strings.gui_save_collection_title,
         SaveKind::Environment(_) => app.strings.gui_save_environment_title,
         SaveKind::Response => app.strings.gui_save_response_title,
         SaveKind::ReportResults => app.strings.gui_save_results_title,
         SaveKind::ReportBaseline => app.strings.gui_save_baseline_title,
         SaveKind::Report => app.strings.gui_save_report_title,
-    };
+    }
+}
+
+fn save_picker_kind(kind: SaveKind) -> PickerKind {
+    match kind {
+        SaveKind::Environment(_) => PickerKind::Environment,
+        _ => PickerKind::Other,
+    }
+}
+
+pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
+    let title = save_title(app, kind);
     // Seed the dialog from any remembered path (collections/environments) and a
     // sensible default filename.
     let current = match kind {
@@ -980,10 +1036,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
             }),
         SaveKind::Response => String::new(),
     };
-    let picker_kind = match kind {
-        SaveKind::Environment(_) => PickerKind::Environment,
-        _ => PickerKind::Other,
-    };
+    let picker_kind = save_picker_kind(kind);
     // The file's own folder wins (a re-save belongs where it already lives);
     // an unsaved item falls back to wherever the user last browsed.
     let dir = super::filepick::seed_dir(&current)
@@ -1013,15 +1066,15 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Report => &[("PaperTrail", &["trail"]), ("All files", &["*"])],
         SaveKind::Response => &[("All files", &["*"])],
     };
-    let Some(path) = super::filepick::save_file(title, dir.as_deref(), &default_name, filters)
-    else {
-        return; // cancelled
-    };
-    app.session.remember_picker_dir(picker_kind, &path);
-    if let Err(msg) = apply_save(app, kind, &path) {
-        super::filepick::error_alert(title, &msg);
-    }
-    app.session.save();
+    app.pending_pick = Some(super::filepick::spawn(
+        super::filepick::PickKind::Save {
+            default_name,
+            filters: super::filepick::owned_filters(filters),
+        },
+        title,
+        dir.as_deref(),
+        PickAction::Save(kind),
+    ));
 }
 
 /// Write the given kind to `path`, returning a user-facing error on failure.

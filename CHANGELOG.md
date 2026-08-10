@@ -10,6 +10,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.8.0] - 2026-08-08
 
+### Fixed
+
+- **The Open and Save dialogs no longer freeze the window.** Every native file
+  picker was called straight from the frame loop and blocked it until the user
+  chose a file, so the window stopped repainting and the desktop offered to
+  force-quit the "not responding" application. It also stalled every other
+  per-frame poll — including the one that collects a finished report run, which
+  is why exporting results could report there was nothing to export.
+
+  The dialog now runs on a worker thread and is collected when it answers.
+  (Open/Save from the menu; the remaining path-field "Browse" buttons still
+  block and are being converted.)
+
 ### Changed
 
 - **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used

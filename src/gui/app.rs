@@ -148,6 +148,12 @@ pub struct GuiApp {
     /// Display-only: the Copy button always yields the full body.
     pub response_compact: bool,
     pub dialog: Option<Dialog>,
+    /// A native file/folder dialog currently open on a worker thread, with the
+    /// note of what to do once it answers. See [`super::filepick`] for why a
+    /// picker can't simply be called and awaited: doing so froze the window for
+    /// as long as the dialog was up, and stalled every other per-frame poll
+    /// with it.
+    pub pending_pick: Option<super::filepick::PendingPick<super::menu::PickAction>>,
     /// Recomputed each frame from the active theme spec.
     pub theme: GuiTheme,
     /// Recomputed each frame from the active language.
@@ -270,6 +276,7 @@ impl GuiApp {
             reveal_env: None,
             env_query: String::new(),
             dialog: None,
+            pending_pick: None,
             theme,
             strings,
             show_hurl: session_view_is_hurl,
@@ -306,6 +313,7 @@ impl GuiApp {
             reveal_env: None,
             env_query: String::new(),
             dialog: None,
+            pending_pick: None,
             theme,
             strings,
             show_hurl: false,
@@ -959,6 +967,7 @@ impl GuiApp {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
+        super::menu::poll_pending_pick(self);
         self.poll_parked_runs(&ctx);
         self.handle_global_keys(&ctx);
         self.intercept_close(&ctx);
