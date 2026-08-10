@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The block editor draws a column's `IMAGE`, `TRUTH` and `DETAIL` clauses.**
+  Only `STATISTICS` was rendered, so a ground-truthed or picture-bearing column
+  looked identical to a plain one and the clauses could be edited but never
+  seen. Named columns now carry a chip per clause (detachable, like the
+  statistics chip), and a `WITH` field shows its clauses in its own row, where
+  its `STATISTICS(…)` already was.
+
 - **A plain HTML report no longer shows a lone "All" filter button.** The row
   filters are offered only when a report actually has something to filter by (a
   baseline to differ from, a ground truth to be wrong against, or a trend to
@@ -55,6 +62,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   was: unshrinkable must never mean unusable.
 
 ### Added
+
+- **The GUI results view has confusion matrices and per-row drill-down.** Each
+  ground-truthed column's matrix is drawn under the metric cards, shaded off the
+  same ramp the HTML export uses, and every non-empty count is a button that
+  selects the rows it counted. A row with pictures or `DETAIL` columns gets an
+  expander that opens a panel holding its pictures at full size, its detail
+  columns in full, and a field-by-field diff against the baseline where there is
+  one. `DETAIL` columns now leave the in-app grid for that panel, exactly as they
+  leave the exported table.
 
 - **The GUI results view has metric cards, row filters and a find box.** The
   figures and filters that made the interactive HTML export worth exporting are

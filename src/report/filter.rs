@@ -12,6 +12,7 @@
 //! that quietly drops a row is worse than no filter at all.
 
 use super::labels::LabelMap;
+use super::metrics::Metrics;
 use super::model::{OutputColumn, ReportResult, Trend, Verdict};
 
 /// What is true of one row, read off the reserved columns the run already
@@ -162,6 +163,39 @@ impl RowFilter {
             }
         }
     }
+}
+
+/// Every filter a report offers, and how many of them are toolbar buttons.
+///
+/// The buttons come first (see [`RowFilter::available`]), then one
+/// [`RowFilter::MatrixCell`] per non-empty confusion-matrix cell — "which seven
+/// rows are those?" is the first question anyone asks of an off-diagonal count,
+/// so every count is a way into the rows it counted.
+///
+/// One list rather than two because the HTML export indexes into it: rows carry
+/// the filter indices they pass, so the browser only ever compares numbers.
+/// Built here rather than in either renderer so the in-app views and the export
+/// cannot end up offering different sets.
+pub fn all_filters(result: &ReportResult, metrics: Option<&Metrics>) -> (Vec<RowFilter>, usize) {
+    let mut filters = RowFilter::available(result);
+    let buttons = filters.len();
+    if let Some(metrics) = metrics {
+        for m in &metrics.columns {
+            let Some(matrix) = &m.matrix else { continue };
+            for (t, truth) in matrix.axis.iter().enumerate() {
+                for (p, answer) in matrix.axis.iter().enumerate() {
+                    if matrix.counts[t][p] > 0 {
+                        filters.push(RowFilter::MatrixCell {
+                            column: m.header.clone(),
+                            truth: truth.clone(),
+                            answer: answer.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (filters, buttons)
 }
 
 /// The rows to show: those passing `filter` and containing `text` (a

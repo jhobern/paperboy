@@ -102,6 +102,20 @@ pub struct ReportEditor {
     /// The results view's find box: a case-insensitive substring the shown
     /// columns are searched for, narrowing the rows the filter already chose.
     pub results_find: String,
+    /// The row whose drill-down panel is open, if any.
+    ///
+    /// One at a time, unlike the HTML export's independently-expanding rows: a
+    /// panel holds full-size pictures and whole response bodies, and several
+    /// open at once in a fixed-height pane would leave the grid a sliver.
+    pub results_detail: Option<usize>,
+    /// Decoded textures for the pictures the drill-down has shown, keyed by row
+    /// and column.
+    ///
+    /// Uploading a picture to the GPU is not something to do sixty times a
+    /// second, so each one is decoded once and kept. Cleared with the result
+    /// that produced it — the keys are row indices, which mean nothing once the
+    /// rows change.
+    results_textures: std::collections::HashMap<(usize, String), egui::TextureHandle>,
     /// When `Some`, a node-configure wizard (request / envs / files) is open as
     /// a modal over the blocks view.
     pub wizard: Option<super::report_wizard::Wizard>,
@@ -190,6 +204,8 @@ impl ReportEditor {
             results_exported: false,
             results_filter: 0,
             results_find: String::new(),
+            results_detail: None,
+            results_textures: std::collections::HashMap::new(),
             wizard: None,
             diag_h: 132.0,
             palette_w: 168.0,
@@ -363,9 +379,11 @@ impl ReportEditor {
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
-                // The old result's filters described the old rows.
+                // The old result's filters and panels described the old rows.
                 self.results_filter = 0;
                 self.results_find.clear();
+                self.results_detail = None;
+                self.results_textures.clear();
                 // A real run supersedes any preview of it.
                 self.dry_run = None;
                 self.view = EditorView::Results;
@@ -1107,7 +1125,12 @@ fn build_node_chips(
             ]
         }
         FlowNode::Report(ReportStmt::VarAs {
-            var, name, stats, ..
+            var,
+            name,
+            stats,
+            image,
+            truth,
+            detail,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -1116,13 +1139,22 @@ fn build_node_chips(
                 Chip::alias(name, th.pending, Some(DetachWhich::As)).with_help(s.chip_help_alias),
             ];
             chips.extend(stats_chip(stats, th, s));
+            chips.extend(clause_chips(
+                image.as_ref(),
+                truth.as_deref(),
+                *detail,
+                th,
+                s,
+            ));
             chips
         }
         FlowNode::Report(ReportStmt::Computed {
             template,
             name,
             stats,
-            ..
+            image,
+            truth,
+            detail,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -1133,6 +1165,13 @@ fn build_node_chips(
                 Chip::alias(name, th.pending, None).with_help(s.chip_help_alias_required),
             ];
             chips.extend(stats_chip(stats, th, s));
+            chips.extend(clause_chips(
+                image.as_ref(),
+                truth.as_deref(),
+                *detail,
+                th,
+                s,
+            ));
             chips
         }
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
@@ -1268,6 +1307,51 @@ fn stats_chip(
         .with_help(s.chip_help_statistics)
         .tether(),
     )
+}
+
+/// The `IMAGE` / `TRUTH` / `DETAIL` chips for one column, in the order they are
+/// written. Tethered, like [`stats_chip`]: all four clauses belong to the
+/// column named immediately before them rather than to the statement, so they
+/// read as one segmented pill.
+///
+fn clause_chips(
+    image: Option<&crate::report::flow::ImageSpec>,
+    truth: Option<&str>,
+    detail: bool,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Vec<Chip> {
+    let mut out = Vec::new();
+    if image.is_some() {
+        out.push(
+            Chip::modifier(
+                crate::report::flow::image_text(image).trim().to_string(),
+                th.subst,
+                DetachWhich::Image,
+            )
+            .with_help(s.chip_help_image)
+            .tether(),
+        );
+    }
+    if truth.is_some() {
+        out.push(
+            Chip::modifier(
+                crate::report::flow::truth_text(truth).trim().to_string(),
+                th.subst,
+                DetachWhich::Truth,
+            )
+            .with_help(s.chip_help_truth)
+            .tether(),
+        );
+    }
+    if detail {
+        out.push(
+            Chip::modifier("DETAIL".to_string(), th.subst, DetachWhich::Detail)
+                .with_help(s.chip_help_detail)
+                .tether(),
+        );
+    }
+    out
 }
 
 /// Render a list of environment role refs for a BASELINE/COMPARISON chip: a
@@ -1788,7 +1872,18 @@ fn dry_run_body(
     }
     // `None` states: a dry run has no streaming progress, so the grid draws
     // without status icons, exactly like a finished run.
-    if let Some(ins) = results_grid(&th, ui, &preview.result, &columns, None, None) {
+    let (preview_grid_cols, preview_detail_cols) = crate::report::detail::split_columns(&columns);
+    let mut none = None;
+    if let Some(ins) = results_grid(
+        &th,
+        ui,
+        &preview.result,
+        &preview_grid_cols,
+        None,
+        None,
+        &preview_detail_cols,
+        &mut none,
+    ) {
         opened = Some(ins);
     }
     opened
@@ -2316,6 +2411,10 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         .map(|f| f.header.clone())
         .unwrap_or_default();
     let columns = result.resolved_columns(&header);
+    // `DETAIL` columns leave the grid for the drill-down, exactly as they do in
+    // the export -- a column that vanished from one and not the other would
+    // look like a bug in whichever you noticed second.
+    let (grid_columns, detail_columns) = crate::report::detail::split_columns(&columns);
     if columns.is_empty() {
         ui.add_space(8.0);
         ui.colored_label(th.dim, app.strings.gui_report_no_results);
@@ -2347,32 +2446,245 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         &mut ed.results_filter,
         &ed.results_find,
     ) {
-        if let Some(metrics) = result.metrics(&columns, &header) {
-            metric_cards(&th, ui, app, &metrics);
+        let metrics = result.metrics(&columns, &header);
+        let (filters, buttons) = crate::report::filter::all_filters(result, metrics.as_ref());
+        if let Some(metrics) = &metrics {
+            metric_cards(&th, ui, app, metrics);
         }
-        let filters = RowFilter::available(result);
         filter_bar(
             &th,
             ui,
             app,
-            &filters,
+            &filters[..buttons],
             &mut ed.results_filter,
             &mut ed.results_find,
             visible.len(),
             result.rows.len(),
         );
+        // The matrices sit under the bar they drive: a cell is itself a filter,
+        // and picking one selects exactly the rows that cell counted.
+        if let Some(metrics) = &metrics {
+            for m in &metrics.columns {
+                if let Some(matrix) = &m.matrix {
+                    confusion_matrix(
+                        &th,
+                        ui,
+                        app,
+                        &m.header,
+                        matrix,
+                        &filters,
+                        &mut ed.results_filter,
+                    );
+                }
+            }
+        }
         ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
         ui.add_space(2.0);
-        if let Some(ins) = results_grid(&th, ui, result, &columns, states, Some(&visible)) {
+        // A row whose panel is open still has to be *reachable*, so the grid
+        // gives up half its height rather than the panel appearing off-screen
+        // below it.
+        let grid_h = if ed.results_detail.is_some() {
+            (ui.available_height() * 0.5).max(80.0)
+        } else {
+            ui.available_height()
+        };
+        let mut open_detail = ed.results_detail;
+        let mut inspector = None;
+        ui.allocate_ui(egui::vec2(ui.available_width(), grid_h), |ui| {
+            inspector = results_grid(
+                &th,
+                ui,
+                result,
+                &grid_columns,
+                states,
+                Some(&visible),
+                &detail_columns,
+                &mut open_detail,
+            );
+        });
+        if let Some(ins) = inspector {
             ed.inspector = Some(ins);
+        }
+        // A filtered-away row must not keep its panel open: the panel is the
+        // row's, and the row is no longer on screen to close it.
+        if open_detail.is_some_and(|r| !visible.contains(&r)) {
+            open_detail = None;
+        }
+        ed.results_detail = open_detail;
+        if let Some(r) = ed.results_detail {
+            ui.separator();
+            detail_panel(
+                &th,
+                ui,
+                app,
+                result,
+                r,
+                &columns,
+                &detail_columns,
+                &mut ed.results_textures,
+                &mut ed.results_detail,
+            );
         }
         return;
     }
     ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
     ui.add_space(2.0);
-    if let Some(ins) = results_grid(&th, ui, result, &columns, states, None) {
+    let mut none = None;
+    if let Some(ins) = results_grid(
+        &th,
+        ui,
+        result,
+        &grid_columns,
+        states,
+        None,
+        &detail_columns,
+        &mut none,
+    ) {
         ed.inspector = Some(ins);
     }
+}
+
+/// One row's drill-down: its pictures at full size, its `DETAIL` columns in
+/// full, and a field-by-field diff against the baseline where there is one.
+///
+/// What goes in it is decided by [`crate::report::detail::sections`], the same
+/// call the HTML export makes, so the two panels can never show different
+/// things about the same row.
+#[allow(clippy::too_many_arguments)]
+fn detail_panel(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    result: &ReportResult,
+    r: usize,
+    all_columns: &[crate::report::model::OutputColumn],
+    detail_columns: &[&crate::report::model::OutputColumn],
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+    open: &mut Option<usize>,
+) {
+    use crate::report::detail::DetailSection;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(
+                app.strings
+                    .report_detail_title
+                    .replace("{n}", &(r + 1).to_string()),
+            )
+            .strong()
+            .color(th.accent),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(super::icons::CLOSE).frame(false))
+                .on_hover_text(app.strings.report_detail_close)
+                .clicked()
+            {
+                *open = None;
+            }
+        });
+    });
+    egui::ScrollArea::vertical()
+        .id_salt("pb_report_detail")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for section in crate::report::detail::sections(result, r, all_columns, detail_columns) {
+                match section {
+                    DetailSection::Image {
+                        header,
+                        image,
+                        value,
+                    } => {
+                        ui.label(RichText::new(header).strong());
+                        detail_image(ui, textures, r, header, image, &value, app);
+                    }
+                    DetailSection::Text { header, value } => {
+                        ui.label(RichText::new(header).strong());
+                        // Monospace and selectable: a detail column is usually a
+                        // response body, which is read by picking bits out of it.
+                        ui.add(
+                            egui::TextEdit::multiline(&mut value.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                    DetailSection::Diff { header, fields } => {
+                        ui.label(
+                            RichText::new(app.strings.report_detail_changed.replace("{c}", header))
+                                .strong(),
+                        );
+                        egui::Grid::new(("pb_detail_diff", header))
+                            .striped(true)
+                            .num_columns(3)
+                            .show(ui, |ui| {
+                                for f in &fields {
+                                    // Unchanged fields are kept and the changed
+                                    // ones highlighted, so the reader can find
+                                    // the field they care about either way.
+                                    let col = if f.differs() { th.err } else { th.dim };
+                                    ui.colored_label(col, &f.path);
+                                    ui.colored_label(
+                                        col,
+                                        f.baseline.as_deref().unwrap_or("\u{2014}"),
+                                    );
+                                    ui.colored_label(
+                                        col,
+                                        f.candidate.as_deref().unwrap_or("\u{2014}"),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+                ui.add_space(6.0);
+            }
+        });
+}
+
+/// Draw one of a row's pictures, decoding and uploading it on first sight.
+///
+/// The decode is cached because the panel is redrawn on every frame it is open,
+/// and a report picture is a photograph -- decoding one sixty times a second is
+/// not a thing to do by accident.
+fn detail_image(
+    ui: &mut egui::Ui,
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+    r: usize,
+    header: &str,
+    image: &crate::report::model::ImageData,
+    value: &str,
+    app: &GuiApp,
+) {
+    let key = (r, header.to_string());
+    let tex = textures.entry(key).or_insert_with(|| {
+        let colour = ::image::load_from_memory(&image.bytes)
+            .map(|i| {
+                let rgba = i.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+            })
+            // A picture PaperBoy embedded but egui cannot decode is a 1x1
+            // placeholder rather than a panic: the rest of the panel is still
+            // worth reading, and the cell text below says where it came from.
+            .unwrap_or_else(|_| egui::ColorImage::new([1, 1], vec![egui::Color32::TRANSPARENT]));
+        ui.ctx().load_texture(
+            format!("pb_detail_{r}_{header}"),
+            colour,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    // Shown as large as the panel allows, up to the picture's own size: this is
+    // the view the grid thumbnail cannot give, so shrinking it further would
+    // defeat the point of opening the row.
+    let natural = egui::vec2(tex.size()[0] as f32, tex.size()[1] as f32);
+    let scale = (ui.available_width() / natural.x).min(1.0);
+    ui.add(egui::Image::new((tex.id(), natural * scale)))
+        .on_hover_text(value);
+    ui.label(
+        RichText::new(value)
+            .small()
+            .color(ui.visuals().weak_text_color()),
+    );
+    let _ = app;
 }
 
 /// The rows the results view should show, or `None` to show every row
@@ -2397,7 +2709,11 @@ fn visible_for_view(
     if live {
         return None;
     }
-    let filters = RowFilter::available(result);
+    // The *full* list, matrix cells included: a matrix cell is picked by index
+    // exactly as a button is, so clamping against the buttons alone would throw
+    // away every selection made by clicking the matrix.
+    let (filters, _) =
+        crate::report::filter::all_filters(result, result.metrics(columns, header).as_ref());
     *selected = (*selected).min(filters.len().saturating_sub(1));
     let labels = crate::report::labels::LabelMap::parse(&header.labels());
     Some(crate::report::filter::visible_rows(
@@ -2454,6 +2770,111 @@ fn metric_cards(
         });
         ui.add_space(2.0);
     }
+}
+
+/// One column's confusion matrix as a heatmap: truth down the side, the value
+/// the run produced across the top.
+///
+/// Every non-empty cell is a button that selects the rows it counted — "which
+/// seven rows are those?" is the first question anyone asks of an off-diagonal
+/// count, and the alternative is reading the grid looking for them by hand.
+///
+/// The shading comes from [`crate::report::metrics::heat_rgb`], the same ramp
+/// the HTML export uses, so one matrix cannot come out looking like two.
+#[allow(clippy::too_many_arguments)]
+fn confusion_matrix(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    column: &str,
+    matrix: &crate::report::metrics::ConfusionMatrix,
+    filters: &[RowFilter],
+    selected: &mut usize,
+) {
+    let max = matrix.max();
+    egui::CollapsingHeader::new(RichText::new(column).strong())
+        .id_salt(("pb_matrix", column))
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new(("pb_matrix_grid", column))
+                .spacing(egui::vec2(2.0, 2.0))
+                .show(ui, |ui| {
+                    ui.label("");
+                    for label in &matrix.axis {
+                        ui.label(RichText::new(label).color(th.dim).small());
+                    }
+                    ui.end_row();
+                    for (t, truth) in matrix.axis.iter().enumerate() {
+                        ui.label(RichText::new(truth).color(th.dim).small());
+                        for (p, answer) in matrix.axis.iter().enumerate() {
+                            let n = matrix.counts[t][p];
+                            let ([r, g, b], hot) =
+                                crate::report::metrics::heat_rgb(n, max);
+                            let fg = if hot {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::from_rgb(0x12, 0x30, 0x5a)
+                            };
+                            // An empty cell counted nothing, so there is
+                            // nothing for it to show -- it stays a plain
+                            // number rather than a button that selects no rows.
+                            let pick = (n > 0)
+                                .then(|| {
+                                    filters.iter().position(|f| {
+                                        matches!(
+                                            f,
+                                            RowFilter::MatrixCell { column: c, truth: tr, answer: a }
+                                            if c == column && tr == truth && a == answer
+                                        )
+                                    })
+                                })
+                                .flatten();
+                            let resp = egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(r, g, b))
+                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(n.to_string()).color(fg),
+                                        )
+                                        .selectable(false)
+                                        .sense(if pick.is_some() {
+                                            egui::Sense::click()
+                                        } else {
+                                            egui::Sense::hover()
+                                        }),
+                                    )
+                                })
+                                .inner;
+                            if let Some(i) = pick {
+                                if resp
+                                    .on_hover_text(app.strings.help_report_matrix_cell)
+                                    .clicked()
+                                {
+                                    *selected = i;
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            let clean = if matrix.is_diagonal() {
+                app.strings.report_matrix_all_matched
+            } else {
+                ""
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} {clean}",
+                    app.strings
+                        .report_matrix_caption
+                        .replace("{n}", &matrix.total().to_string())
+                ))
+                .color(th.dim)
+                .small(),
+            );
+        });
+    ui.add_space(2.0);
 }
 
 /// The row-filter buttons, the find box and the row count.
@@ -2589,8 +3010,19 @@ fn results_grid(
     columns: &[crate::report::model::OutputColumn],
     states: Option<&[RowState]>,
     visible: Option<&[usize]>,
+    detail_columns: &[&crate::report::model::OutputColumn],
+    open_detail: &mut Option<usize>,
 ) -> Option<CellInspector> {
     let show_icons = states.is_some();
+    // The expander column is offered only when *some* row has something to
+    // drill into: on a run with no pictures and no `DETAIL` columns it would be
+    // a column of blanks.
+    let expandable: std::collections::HashSet<usize> = (0..result.rows.len())
+        .filter(|&r| {
+            !crate::report::detail::sections(result, r, columns, detail_columns).is_empty()
+        })
+        .collect();
+    let show_expanders = !expandable.is_empty();
     let mut opened: Option<CellInspector> = None;
     let widths = fitted_column_widths(ui, result, columns, show_icons);
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
@@ -2602,7 +3034,11 @@ fn results_grid(
                 .striped(true)
                 .spacing(egui::vec2(SPACING_X, 3.0))
                 .show(ui, |ui| {
-                    // Header row.
+                    // Header row. The expander column comes first, where a
+                    // tree control's twisty lives.
+                    if show_expanders {
+                        ui.label(" ");
+                    }
                     if show_icons {
                         ui.label(" ");
                     }
@@ -2633,6 +3069,37 @@ fn results_grid(
                             continue;
                         };
                         let state = states.and_then(|s| s.get(i)).copied();
+                        if show_expanders {
+                            let has = expandable.contains(&i);
+                            let open = *open_detail == Some(i);
+                            // A row with nothing to drill into gets a blank
+                            // rather than a caret that opens an empty panel.
+                            if has {
+                                let glyph = if open {
+                                    super::icons::CARET_DOWN
+                                } else {
+                                    super::icons::CARET_RIGHT
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(glyph).color(if open {
+                                            th.accent
+                                        } else {
+                                            th.dim
+                                        }))
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    // Clicking the open row's caret closes it,
+                                    // so the panel can be got rid of the same
+                                    // way it was opened.
+                                    *open_detail = (!open).then_some(i);
+                                }
+                            } else {
+                                ui.label(" ");
+                            }
+                        }
                         if show_icons {
                             let (glyph, colour) = match state {
                                 Some(RowState::Running) => (super::icons::RUNNING, th.pending),
@@ -2660,6 +3127,9 @@ fn results_grid(
 
                     // STATISTICS summary rows (a footer, distinguished by italic accent).
                     for srow in result.summary_rows(columns) {
+                        if show_expanders {
+                            ui.label(" ");
+                        }
                         if show_icons {
                             ui.label(" ");
                         }
@@ -4574,11 +5044,19 @@ fn with_block(
             ui.horizontal(|ui| {
                 ui.add_space(field_indent);
                 let text = match item {
-                    // The field's own STATISTICS(…) belongs on its row: leaving
-                    // it out made a clause that is plainly there in the source
-                    // invisible in the block editor.
+                    // A field's own clauses belong on its row: leaving them out
+                    // made clauses that are plainly there in the source
+                    // invisible in the block editor. They are written into the
+                    // row's text rather than drawn as detachable chips because
+                    // the row *is* one chip -- a field is edited through its
+                    // wizard, which is where all four clauses are set.
                     WithItem::Field {
-                        name, query, stats, ..
+                        name,
+                        query,
+                        stats,
+                        image,
+                        truth,
+                        detail,
                     } => {
                         let mut t = format!("{name}: {query}");
                         if !stats.is_empty() {
@@ -4591,6 +5069,9 @@ fn with_block(
                                     .join(", ")
                             ));
                         }
+                        t.push_str(&crate::report::flow::image_text(image.as_ref()));
+                        t.push_str(&crate::report::flow::truth_text(truth.as_deref()));
+                        t.push_str(&crate::report::flow::detail_text(*detail));
                         t
                     }
                     WithItem::ResponseFmt(fmt) => format!(
@@ -8980,6 +9461,81 @@ mod tests {
         );
     }
 
+    /// `TRUTH`, `IMAGE` and `DETAIL` are as much a part of a column as its
+    /// `STATISTICS`, and were the only clauses the block editor left invisible
+    /// -- a ground-truthed column looked identical to an ordinary one.
+    #[test]
+    fn a_named_column_shows_all_four_of_its_clauses() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow = crate::report::parse_flow(
+            "REPORT SHOT AS Frame STATISTICS(COUNT) IMAGE(HEIGHT 110) TRUTH \"pass\" DETAIL\n",
+        )
+        .expect("fixture parses");
+        let chips = node_chips(&flow.nodes[0], None, &th, s);
+        let texts: Vec<&String> = chips.iter().map(|c| &c.text).collect();
+        for want in [
+            "STATISTICS(COUNT)",
+            "IMAGE(HEIGHT 110)",
+            "TRUTH \"pass\"",
+            "DETAIL",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.as_str() == want),
+                "{want} is drawn: {texts:?}"
+            );
+        }
+    }
+
+    /// Detaching a clause chip takes that clause off and leaves the column --
+    /// and the other three clauses -- alone.
+    #[test]
+    fn detaching_one_clause_leaves_the_column_and_its_other_clauses() {
+        let mut flow = crate::report::parse_flow(
+            "REPORT SHOT AS Frame IMAGE(HEIGHT 110) TRUTH \"pass\" DETAIL\n",
+        )
+        .expect("fixture parses");
+        crate::report::edit::detach_modifier(&mut flow, &[0], DetachWhich::Truth);
+        let text = flow.to_text();
+        assert!(!text.contains("TRUTH"), "the truth is gone: {text}");
+        assert!(
+            text.contains("AS Frame")
+                && text.contains("IMAGE(HEIGHT 110)")
+                && text.contains("DETAIL"),
+            "and nothing else is: {text}"
+        );
+    }
+
+    /// A `WITH` field's clauses are written into its row, since the row is one
+    /// chip rather than a line of them.
+    #[test]
+    fn a_with_field_shows_its_clauses_in_its_row() {
+        let flow = crate::report::parse_flow(
+            "REPORT REQUEST svc WITH\n    Frame: jsonpath \"$.f\" IMAGE TRUTH \"ok\" DETAIL\nEND\n",
+        )
+        .expect("fixture parses");
+        let crate::report::flow::FlowNode::Report(crate::report::flow::ReportStmt::Request {
+            with,
+            ..
+        }) = &flow.nodes[0]
+        else {
+            panic!("fixture is a report request");
+        };
+        let crate::report::flow::WithItem::Field {
+            image,
+            truth,
+            detail,
+            ..
+        } = &with[0]
+        else {
+            panic!("fixture's first item is a field");
+        };
+        assert!(
+            image.is_some() && truth.is_some() && *detail,
+            "parsed: {with:?}"
+        );
+    }
+
     /// The drop preview is computed by rehearsing the drop, so the ghost has to
     /// be the very chip that appears — same text, same slot — once it lands.
     #[test]
@@ -10192,6 +10748,42 @@ mod results_render_tests {
         );
     }
 
+    /// The GUI grid and the export must agree about which columns are where:
+    /// a column that vanished from one and not the other reads as a bug in
+    /// whichever you noticed second.
+    #[test]
+    fn the_grid_drops_the_same_detail_columns_the_export_does() {
+        let (_, mut columns) = fixture(&["Name", "Body"], &["a", "{}"], 1);
+        columns[1].detail = true;
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        assert_eq!(
+            grid.iter().map(|c| &c.header).collect::<Vec<_>>(),
+            vec!["Name"],
+            "the detail column is not in the grid"
+        );
+        assert_eq!(detail.len(), 1, "it is in the panel instead");
+    }
+
+    /// A row with nothing to drill into gets no expander, so the caret is never
+    /// an invitation to open an empty panel.
+    #[test]
+    fn only_rows_with_something_to_show_are_expandable() {
+        let (mut result, mut columns) = fixture(&["Name", "Body"], &["a", ""], 2);
+        columns[1].detail = true;
+        result.rows[1]
+            .cells
+            .insert("Body".to_string(), "{\"a\":1}".to_string());
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        assert!(
+            crate::report::detail::sections(&result, 0, &grid, &detail).is_empty(),
+            "the row with a blank body has nothing to show"
+        );
+        assert!(
+            !crate::report::detail::sections(&result, 1, &grid, &detail).is_empty(),
+            "the row with a body does"
+        );
+    }
+
     /// The source editor asks its layouter for a job on every frame, so the job
     /// is cached — but it has to follow every input the highlighter colours by.
     #[test]
@@ -10520,7 +11112,8 @@ mod results_render_tests {
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_max_width(1.0);
-            results_grid(&th, ui, &result, &columns, None, None);
+            let mut none = None;
+            results_grid(&th, ui, &result, &columns, None, None, &[], &mut none);
         });
     }
 }

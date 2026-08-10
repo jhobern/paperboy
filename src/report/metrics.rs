@@ -94,6 +94,30 @@ impl ConfusionMatrix {
     }
 }
 
+/// The heatmap shade for a cell holding `n` of a maximum `max`: its `(r, g, b)`
+/// and whether the text on it has to flip to white to stay readable.
+///
+/// A blue ramp, deliberately: colour-blind safe, and — more importantly — it
+/// does not pre-judge which cells are the bad ones. The diagonal is not "good"
+/// in every matrix; for a rare-event detector the interesting cells are off it,
+/// and a green-to-red scheme would mislead on exactly those reports.
+///
+/// Shared by every renderer rather than being the HTML writer's private detail,
+/// so the same matrix cannot come out shaded two different ways depending on
+/// where it is being read.
+pub fn heat_rgb(n: usize, max: usize) -> ([u8; 3], bool) {
+    if n == 0 || max == 0 {
+        return ([0xff, 0xff, 0xff], false);
+    }
+    let f = n as f64 / max as f64;
+    // Interpolate from a very pale blue to a deep one.
+    let lerp = |from: f64, to: f64| (from + (to - from) * f).round() as u8;
+    (
+        [lerp(234.0, 8.0), lerp(242.0, 48.0), lerp(252.0, 107.0)],
+        f > 0.55,
+    )
+}
+
 /// The metrics of a whole run: one entry per ground-truthed column, plus the
 /// row roll-up carried by the reserved `Correct` column.
 #[derive(Debug, Clone, PartialEq, Eq)]

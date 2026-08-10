@@ -744,6 +744,18 @@ pub(crate) enum DetachWhich {
     WithBlock,
     /// The `STATISTICS(…)` clause of a named report column.
     Statistics,
+    /// The `IMAGE[(…)]` clause of a named report column.
+    ///
+    /// The three column clauses attach to a *column*, so these target the
+    /// statement's own (`REPORT <var> AS …`, `REPORT "…" AS …`). A `WITH`
+    /// field's clauses are written into its row's text alongside its
+    /// `STATISTICS(…)` and are edited through the field's own wizard, exactly
+    /// as that one is.
+    Image,
+    /// The `TRUTH "…"` clause of a named report column.
+    Truth,
+    /// The `DETAIL` flag of a named report column.
+    Detail,
 }
 
 /// Every variable name in scope at `path` — the candidates a `REPORT <var>`
@@ -2092,6 +2104,47 @@ fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
             }
             false
         }
+        // The three column clauses are cleared through one helper each, since
+        // every one of them has to reach both the statement's own column and a
+        // `WITH` field, and the only difference between them is the field.
+        DetachWhich::Image => {
+            clear_clause(node, |image, _, _| *image = None);
+            false
+        }
+        DetachWhich::Truth => {
+            clear_clause(node, |_, truth, _| *truth = None);
+            false
+        }
+        DetachWhich::Detail => {
+            clear_clause(node, |_, _, detail| *detail = false);
+            false
+        }
+    }
+}
+
+/// Apply `f` to a named report column's `(image, truth, detail)`, if `node` is
+/// one. The lookup is the same for all three clauses, so it lives here rather
+/// than three times over.
+fn clear_clause(
+    node: &mut FlowNode,
+    f: impl FnOnce(&mut Option<ImageSpec>, &mut Option<String>, &mut bool),
+) {
+    if let FlowNode::Report(
+        ReportStmt::VarAs {
+            image,
+            truth,
+            detail,
+            ..
+        }
+        | ReportStmt::Computed {
+            image,
+            truth,
+            detail,
+            ..
+        },
+    ) = node
+    {
+        f(image, truth, detail);
     }
 }
 

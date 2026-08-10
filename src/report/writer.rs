@@ -255,15 +255,9 @@ pub struct HtmlWriter;
 impl ReportWriter for HtmlWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         let all_columns = result.resolved_columns(header);
-        // `DETAIL` columns leave the grid for the drill-down. If *every* column
-        // is a detail column the grid would be empty, which helps nobody, so
-        // the flag is ignored rather than obeyed into an unreadable file.
-        let columns: Vec<OutputColumn> = if all_columns.iter().all(|c| c.detail) {
-            all_columns.clone()
-        } else {
-            all_columns.iter().filter(|c| !c.detail).cloned().collect()
-        };
-        let detail_columns: Vec<&OutputColumn> = all_columns.iter().filter(|c| c.detail).collect();
+        // `DETAIL` columns leave the grid for the drill-down (see
+        // `detail::split_columns` for the all-detail escape hatch).
+        let (columns, detail_columns) = super::detail::split_columns(&all_columns);
         let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
         out.push_str(
@@ -339,27 +333,9 @@ impl ReportWriter for HtmlWriter {
         // Every filter the file offers, in one list: the toolbar's buttons
         // first, then one per non-empty confusion-matrix cell. Rows carry the
         // indices they pass, so the browser only ever compares numbers -- the
-        // decisions themselves are made here, by the same `RowFilter` the
-        // in-app views use, and the two can't drift.
-        let mut filters = super::filter::RowFilter::available(result);
-        let buttons = filters.len();
-        if let Some(metrics) = &metrics {
-            for m in &metrics.columns {
-                if let Some(matrix) = &m.matrix {
-                    for (t, truth) in matrix.axis.iter().enumerate() {
-                        for (p, answer) in matrix.axis.iter().enumerate() {
-                            if matrix.counts[t][p] > 0 {
-                                filters.push(super::filter::RowFilter::MatrixCell {
-                                    column: m.header.clone(),
-                                    truth: truth.clone(),
-                                    answer: answer.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // decisions themselves are made by the same `RowFilter` the in-app
+        // views use, and the two can't drift.
+        let (filters, buttons) = super::filter::all_filters(result, metrics.as_ref());
         push_filter_toolbar(&mut out, &filters[..buttons]);
         if let Some(metrics) = &metrics {
             push_metric_cards(&mut out, metrics);
@@ -517,91 +493,67 @@ fn push_detail_row(
     summary_columns: &[&OutputColumn],
     span: usize,
 ) {
-    let Some(row) = result.rows.get(r) else {
-        return;
-    };
-    let images: Vec<&OutputColumn> = all_columns
-        .iter()
-        .filter(|c| result.images.contains_key(&(r, c.header.clone())))
-        .collect();
-    let details: Vec<(&OutputColumn, String)> = detail_columns
-        .iter()
-        .map(|c| (*c, c.value(row, &result.no_match_marker)))
-        .filter(|(_, v)| !v.trim().is_empty())
-        .collect();
-    let baseline = result.baseline_rows.get(&r);
-    let diffs: Vec<(&OutputColumn, Vec<super::jsondiff::FieldDiff>)> = baseline
-        .map(|b| {
-            detail_columns
-                .iter()
-                .filter_map(|c| {
-                    let was = c.value(b, &result.no_match_marker);
-                    let now = c.value(row, &result.no_match_marker);
-                    let d = super::jsondiff::diff_texts(&was, &now)?;
-                    d.iter().any(|f| f.differs()).then_some((*c, d))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if images.is_empty() && details.is_empty() && diffs.is_empty() {
+    use super::detail::DetailSection;
+    let sections = super::detail::sections(result, r, all_columns, detail_columns);
+    if sections.is_empty() {
         return;
     }
     out.push_str(&format!(
         "<tr class=\"det\"><td colspan=\"{span}\"><div class=\"panel\">"
     ));
-    for c in images {
-        let img = &result.images[&(r, c.header.clone())];
-        out.push_str("<section><h3>");
-        push_escaped(out, &c.header);
-        out.push_str("</h3>");
-        // Where this column sits in the grid, if it is in the grid at all: a
-        // `DETAIL` picture has no cell, so it has nothing to borrow from.
-        let cell = summary_columns.iter().position(|s| s.header == c.header);
-        push_panel_image(out, img, &c.value(row, &result.no_match_marker), cell);
-        out.push_str("</section>");
-    }
-    for (c, value) in &details {
-        out.push_str("<section><h3>");
-        push_escaped(out, &c.header);
-        out.push_str("</h3><pre>");
-        push_escaped(out, &pretty_json(value));
-        out.push_str("</pre></section>");
-    }
-    for (c, d) in &diffs {
-        out.push_str("<section><h3>");
-        push_escaped(out, &format!("{} \u{2014} changed fields", c.header));
-        out.push_str(
-            "</h3><table class=\"fdiff\"><thead><tr><th>Field</th><th>Baseline</th>\
+    for section in &sections {
+        match section {
+            DetailSection::Image {
+                header,
+                image,
+                value,
+            } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, header);
+                out.push_str("</h3>");
+                // Where this column sits in the grid, if it is in the grid at
+                // all: a `DETAIL` picture has no cell, so it has nothing to
+                // borrow from.
+                let cell = summary_columns.iter().position(|s| &s.header == header);
+                push_panel_image(out, image, value, cell);
+                out.push_str("</section>");
+            }
+            DetailSection::Text { header, value } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, header);
+                out.push_str("</h3><pre>");
+                push_escaped(out, value);
+                out.push_str("</pre></section>");
+            }
+            DetailSection::Diff { header, fields } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, &format!("{header} \u{2014} changed fields"));
+                out.push_str(
+                    "</h3><table class=\"fdiff\"><thead><tr><th>Field</th><th>Baseline</th>\
                       <th>This run</th></tr></thead><tbody>",
-        );
-        for f in d {
-            // Unchanged fields are kept, so the reader can see the field they
-            // care about whether or not it moved -- the highlight, not the
-            // omission, is what points at the difference.
-            out.push_str(if f.differs() {
-                "<tr class=\"chg\"><td>"
-            } else {
-                "<tr><td>"
-            });
-            push_escaped(out, &f.path);
-            out.push_str("</td><td>");
-            push_escaped(out, f.baseline.as_deref().unwrap_or("\u{2014}"));
-            out.push_str("</td><td>");
-            push_escaped(out, f.candidate.as_deref().unwrap_or("\u{2014}"));
-            out.push_str("</td></tr>");
+                );
+                for f in fields {
+                    // Unchanged fields are kept, so the reader can see the
+                    // field they care about whether or not it moved -- the
+                    // highlight, not the omission, is what points at the
+                    // difference.
+                    out.push_str(if f.differs() {
+                        "<tr class=\"chg\"><td>"
+                    } else {
+                        "<tr><td>"
+                    });
+                    push_escaped(out, &f.path);
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td></tr>");
+                }
+                out.push_str("</tbody></table></section>");
+            }
         }
-        out.push_str("</tbody></table></section>");
     }
     out.push_str("</div></td></tr>\n");
-}
-
-/// `text` pretty-printed if it is JSON, and unchanged if it isn't. A detail
-/// column is very often a whole response body, which arrives on one line.
-fn pretty_json(text: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(text.trim())
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-        .unwrap_or_else(|| text.to_string())
 }
 
 /// The export's only script: row expansion and filtering, inline and
@@ -815,14 +767,8 @@ fn push_confusion_matrix(
 /// safe at both ends, and distinct from the green/amber/red the *data* cells
 /// use for pass/changed/fail, so nobody reads a busy matrix cell as a failure.
 fn heat_shade(n: usize, max: usize) -> (String, bool) {
-    if n == 0 || max == 0 {
-        return ("#ffffff".to_string(), false);
-    }
-    let f = n as f64 / max as f64;
-    // Interpolate from a very pale blue to a deep one.
-    let lerp = |from: f64, to: f64| (from + (to - from) * f).round() as u32;
-    let (r, g, b) = (lerp(234.0, 8.0), lerp(242.0, 48.0), lerp(252.0, 107.0));
-    (format!("#{r:02x}{g:02x}{b:02x}"), f > 0.55)
+    let ([r, g, b], hot) = super::metrics::heat_rgb(n, max);
+    (format!("#{r:02x}{g:02x}{b:02x}"), hot)
 }
 
 /// Append an `<img>` for a resolved picture, sized per the column's `IMAGE`
