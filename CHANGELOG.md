@@ -12,6 +12,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The terminal results view states the score and filters the rows.** It drew
+  the grid and nothing else, so a ground-truthed run had to be exported to find
+  out how it did, and there was no way to ask for just the rows that were wrong.
+  A summary is now pinned above the grid — compared, incorrect and accuracy per
+  scored column — and **Ctrl+F** cycles the same filters the GUI's bar and the
+  interactive HTML export offer (All, Differences, Incorrect, Regressions),
+  showing how many rows of how many are on screen. Both read from the shared
+  metrics and filter modules, so all three views quote the same accuracy and
+  hide the same rows. A report with no ground truth and nothing to filter is
+  drawn exactly as before.
+
 - **`TRUTH`, `DETAIL`, `STATISTICS` and `IMAGE` are syntax highlighted.** The
   per-column clauses were the only part of PaperTrail the source view treated as
   plain data, so `TRUTH "pass" DETAIL` read as a column name and a string. They

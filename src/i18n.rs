@@ -1086,6 +1086,10 @@ strings! {
     report_filter_regressions => "Regressions", "Régressions", "Regressioner";
     report_find_placeholder => "Find in rows…", "Rechercher dans les lignes…", "Søg i rækker…";
     report_rows_shown => "{shown} of {total} rows", "{shown} lignes sur {total}", "{shown} af {total} rækker";
+    // The terminal results view's pinned summary: one metric line per scored
+    // column, and the filter line `f` cycles. The GUI says the same things in
+    // cards and buttons; a terminal has one line to say them in.
+    report_filter_line => "Filter: {f} \u{2014} {r} \u{2014} Ctrl+F cycles", "Filtre\u{a0}: {f} \u{2014} {r} \u{2014} Ctrl+F fait défiler", "Filter: {f} \u{2014} {r} \u{2014} Ctrl+F skifter";
     report_metric_compared => "Compared", "Comparés", "Sammenlignet";
     report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
     report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";

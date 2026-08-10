@@ -440,6 +440,46 @@ impl ReportTab {
         }
         self.report.set_text(new_text);
     }
+
+    /// The rows the results grid is showing, as indices into `result.rows`.
+    ///
+    /// Everything that addresses a row by position — the cell cursor, the
+    /// drill-down popup, the mouse hit-test — goes through this list, so a
+    /// filtered grid's "row 3" is the third row *on screen*.
+    ///
+    /// A streaming run is always shown whole, for the reason the GUI shows it
+    /// whole: [`crate::report::filter::visible_rows`] drops pending rows, so
+    /// filtering a live run would empty the very view being watched.
+    pub(crate) fn visible_result_rows(&self) -> Vec<usize> {
+        let Some(result) = &self.result else {
+            return Vec::new();
+        };
+        let n = result.rows.len();
+        if self.run_progress.is_some()
+            || self.results_filter == crate::report::filter::RowFilter::All
+        {
+            return (0..n).collect();
+        }
+        let header = self.report.flow().map(|f| f.header).unwrap_or_default();
+        let columns = result.resolved_columns(&header);
+        let labels = crate::report::labels::LabelMap::parse(&header.labels());
+        crate::report::filter::visible_rows(result, &columns, &labels, &self.results_filter, "")
+    }
+
+    /// The filters this run offers, in the order `f` cycles them.
+    ///
+    /// Only the button filters ([`crate::report::filter::RowFilter::available`]),
+    /// not the per-matrix-cell ones the GUI and the HTML export add: those are
+    /// reached by clicking the cell that counted them, and there is no matrix
+    /// to click in a terminal.
+    pub(crate) fn result_filters(&self) -> Vec<crate::report::filter::RowFilter> {
+        match &self.result {
+            Some(result) if self.run_progress.is_none() => {
+                crate::report::filter::RowFilter::available(result)
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl TuiApp {
@@ -1726,7 +1766,10 @@ impl TuiApp {
             .map(|f| f.header)
             .unwrap_or_default();
         let ncols = result.resolved_columns(&header).len();
-        let nrows = result.rows.len();
+        // Row positions are on-screen positions: with a filter up, the grid has
+        // fewer rows than the run does, and a cursor clamped to the run's count
+        // would walk off the bottom of what is drawn.
+        let nrows = self.reports[idx].visible_result_rows().len();
         if nrows == 0 || ncols == 0 {
             return;
         }
@@ -1734,6 +1777,38 @@ impl TuiApp {
         let new_row = (cur_row as i32 + dr).clamp(0, nrows as i32 - 1) as usize;
         let new_col = (cur_col as i32 + dc).clamp(0, ncols as i32 - 1) as usize;
         self.reports[idx].cell_cursor = Some((new_row, new_col));
+    }
+
+    /// Step the active report's results grid to the next filter it offers,
+    /// wrapping at the end.
+    ///
+    /// Inert unless a finished run is on screen with more than one filter to
+    /// choose between: a report with no comparison and no ground truth offers
+    /// only "All", and a key that silently does nothing is worse than one that
+    /// isn't bound.
+    pub(crate) fn cycle_report_row_filter(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if self.reports[idx].view != ReportView::Results {
+            return;
+        }
+        let filters = self.reports[idx].result_filters();
+        if filters.len() < 2 {
+            return;
+        }
+        let at = filters
+            .iter()
+            .position(|f| *f == self.reports[idx].results_filter)
+            .unwrap_or(0);
+        let next = filters[(at + 1) % filters.len()].clone();
+        self.reports[idx].results_filter = next;
+        // Every row position on screen has just changed meaning, so the cursor
+        // and the scroll start again at the top rather than pointing at
+        // whichever row happens to have taken that slot.
+        self.reports[idx].cell_cursor = None;
+        self.reports[idx].results_scrolled_to = None;
+        self.reports[idx].results_panel.set_scroll(0);
     }
 
     /// Move the cell cursor by a whole page (Ctrl+Up / Ctrl+Down). The page
@@ -1753,11 +1828,7 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        if self.reports[idx]
-            .result
-            .as_ref()
-            .is_some_and(|r| !r.rows.is_empty())
-        {
+        if !self.reports[idx].visible_result_rows().is_empty() {
             let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
             self.reports[idx].cell_cursor = Some((0, col));
         }
@@ -1769,11 +1840,7 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        let nrows = self.reports[idx]
-            .result
-            .as_ref()
-            .map(|r| r.rows.len())
-            .unwrap_or(0);
+        let nrows = self.reports[idx].visible_result_rows().len();
         if nrows > 0 {
             let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
             self.reports[idx].cell_cursor = Some((nrows - 1, col));
@@ -1793,6 +1860,7 @@ impl TuiApp {
             self.result_cursor_move(0, 0); // lands at (0, 0)
             return;
         };
+        let visible = self.reports[idx].visible_result_rows();
         let Some(result) = &self.reports[idx].result else {
             return;
         };
@@ -1805,7 +1873,9 @@ impl TuiApp {
         let Some(col_def) = columns.get(col) else {
             return;
         };
-        let Some(data_row) = result.rows.get(row) else {
+        // `row` counts rows on screen; with a filter up that is not the run's
+        // own numbering, so it is mapped back before the row is read.
+        let Some(data_row) = visible.get(row).and_then(|&r| result.rows.get(r)) else {
             return;
         };
         let title = col_def.header.clone();
@@ -2355,6 +2425,11 @@ impl TuiApp {
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // Global menus, unchanged from the collection view.
+            // Ctrl+F cycles the results filter (a bare `f` opens the File
+            // menu). The same filters the GUI's bar offers and the interactive
+            // HTML export writes buttons for, so "show me only the wrong rows"
+            // selects the same rows in all three.
+            KeyCode::Char('f') if ctrl => self.cycle_report_row_filter(),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
             KeyCode::Char('s') if !ctrl => self.overlay = Some(Overlay::Options(0)),
             KeyCode::Char('?') | KeyCode::F(1) => {
@@ -3028,6 +3103,9 @@ impl DryRunReport {
         } else {
             // Pass `None` for states (no streaming progress in a dry run) so
             // the grid renders without status icons, exactly like a finished run.
+            // A projection has nothing to filter by (no run, no verdicts), so
+            // every row of it is shown.
+            let visible: Vec<usize> = (0..self.result.rows.len()).collect();
             grid.extend(report_grid_lines(
                 &self.result,
                 &self.header,
@@ -3035,6 +3113,7 @@ impl DryRunReport {
                 th,
                 None,
                 col_offset,
+                &visible,
             ));
         }
 
@@ -3413,7 +3492,7 @@ fn draw_report_results(
     if let Some(result) = &app.reports[idx].result {
         let rt = &app.reports[idx];
         let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
-        let widths = result_column_widths(result, &header);
+        let widths = result_column_widths(result, &header, &rt.visible_result_rows());
         let show_icons = rt.run_progress.is_some();
         let avail =
             (area.width.saturating_sub(2) as usize).saturating_sub(if show_icons { 2 } else { 0 });
@@ -3422,7 +3501,7 @@ fn draw_report_results(
             follow_col_offset(&widths, cursor_col, avail, rt.results_col_offset);
     }
 
-    let (lines, title) = {
+    let (lines, head, title) = {
         let rt = &app.reports[idx];
         match &rt.result {
             None => (
@@ -3430,10 +3509,12 @@ fn draw_report_results(
                     s.report_results_empty.to_string(),
                     Style::default().fg(th.dim),
                 ))],
+                Vec::new(),
                 s.report_results_heading.to_string(),
             ),
             Some(result) => {
                 let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
+                let visible = rt.visible_result_rows();
                 // While a run streams, each row carries a live `RowState`: the
                 // grid greys unfinished rows and shows a status icon per row so
                 // it doubles as a live progress indicator.
@@ -3445,6 +3526,7 @@ fn draw_report_results(
                     th,
                     rt.cell_cursor,
                     rt.results_col_offset,
+                    &visible,
                 );
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
@@ -3460,7 +3542,8 @@ fn draw_report_results(
                     "{} ({}) — {}",
                     s.report_results_heading, count, s.report_hint_results
                 );
-                (lines, title)
+                let head = results_head_lines(rt, result, &header, visible.len(), s, th);
+                (lines, head, title)
             }
         }
     };
@@ -3469,7 +3552,20 @@ fn draw_report_results(
     // at the top of the pane and only the data rows below it scroll. This keeps
     // the column titles visible while scrolling a long report. `lines[0]` is the
     // header; `lines[1..]` are the data rows fed to the scrolling body panel.
+    // The metric/filter summary is pinned above the header for the same reason
+    // the header is pinned: it describes the rows being scrolled past, so it
+    // has to stay on screen while they move. It is dropped entirely when the
+    // pane is too short to show it *and* a few rows -- a summary that leaves no
+    // room for the table it summarises is worse than no summary.
+    let head: Vec<Line<'static>> = if inner_h >= head.len() + 3 {
+        head
+    } else {
+        Vec::new()
+    };
     let sticky = app.reports[idx].result.is_some() && lines.len() > 1 && inner_h >= 2;
+    // How many lines are pinned in total: the summary, plus the grid's header
+    // row when it is being pinned.
+    let pinned = head.len() + usize::from(sticky);
 
     // Auto-scroll the results panel to keep the cell cursor visible — but only
     // when the cursor *moved* since we last scrolled to it (i.e. keyboard
@@ -3484,8 +3580,8 @@ fn draw_report_results(
         if sticky {
             // With the sticky header the panel scroll is a DATA-ROW offset (0 ==
             // first data row shown just under the fixed header). Keep the cursor
-            // row inside the body window of `inner_h - 1` rows.
-            let body_h = inner_h.saturating_sub(1);
+            // row inside the body window left under everything pinned.
+            let body_h = inner_h.saturating_sub(pinned);
             if body_h > 0 {
                 if cursor_row < scroll {
                     app.reports[idx].results_panel.set_scroll(cursor_row as u16);
@@ -3518,23 +3614,26 @@ fn draw_report_results(
     let (inner, bar) = if sticky {
         let inner = block.inner(area);
         f.render_widget(block, area);
-        // Pin the header row at the top of the inner rect.
+        // Pin the summary lines and then the header row at the top of the inner
+        // rect.
+        let mut pinned_lines = head.clone();
+        pinned_lines.push(lines[0].clone());
         let header_area = Rect {
             x: inner.x,
             y: inner.y,
             width: inner.width,
-            height: 1,
+            height: pinned as u16,
         };
         f.render_widget(
-            Paragraph::new(lines[0].clone()).style(Style::default().fg(th.text)),
+            Paragraph::new(pinned_lines).style(Style::default().fg(th.text)),
             header_area,
         );
-        // Scroll only the data rows in the area below the pinned header.
+        // Scroll only the data rows in the area below everything pinned.
         let body_area = Rect {
             x: inner.x,
-            y: inner.y + 1,
+            y: inner.y + pinned as u16,
             width: inner.width,
-            height: inner.height - 1,
+            height: inner.height - pinned as u16,
         };
         let bar = render_panel_lines(
             f,
@@ -3570,6 +3669,114 @@ fn draw_report_results(
     app.push_mouse_hit(MouseLayer::Base, inner, MouseHitTarget::ReportResultsCell);
 }
 
+/// The lines pinned above the results grid: one metric line per ground-truthed
+/// column, then the filter line when the run offers a filter.
+///
+/// The GUI says these things in cards and a button bar; a terminal has a line
+/// each, but the figures and the filter set come from the same two shared
+/// modules ([`crate::report::metrics`], [`crate::report::filter`]) so the two
+/// front-ends and the HTML export cannot quote different accuracies or offer
+/// different filters.
+///
+/// Empty for a report with no ground truth and nothing to filter — which is
+/// most reports, and they must not pay a line for a summary of nothing.
+fn results_head_lines(
+    rt: &ReportTab,
+    result: &ReportResult,
+    header: &crate::report::flow::Header,
+    visible: usize,
+    s: &Strings,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let columns = result.resolved_columns(header);
+    if let Some(metrics) = result.metrics(&columns, header) {
+        let label = Style::default().fg(th.dim);
+        let value = Style::default().fg(th.text).add_modifier(Modifier::BOLD);
+        // The roll-up first when there is one: it answers "did this run pass?",
+        // and the per-column breakdown is the follow-up question.
+        for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+            out.push(Line::from(vec![
+                Span::styled(format!("{} ", m.header), value),
+                Span::styled(format!("{} ", s.report_metric_compared), label),
+                Span::styled(format!("{}/{}  ", m.compared, m.total), value),
+                Span::styled(format!("{} ", s.report_metric_incorrect), label),
+                Span::styled(format!("{}  ", m.incorrect), value),
+                Span::styled(format!("{} ", s.report_metric_accuracy), label),
+                Span::styled(
+                    m.accuracy_text().unwrap_or_else(|| "\u{2014}".to_string()),
+                    // A run with nothing scored is neither good nor bad news,
+                    // so it stays plain rather than borrowing either colour.
+                    match m.accuracy() {
+                        Some(a) if a >= 1.0 => Style::default().fg(th.ok),
+                        Some(_) => Style::default().fg(th.pending),
+                        None => value,
+                    },
+                ),
+            ]));
+        }
+    }
+    let filters = rt.result_filters();
+    if filters.len() > 1 {
+        let rows = s
+            .report_rows_shown
+            .replace("{shown}", &visible.to_string())
+            .replace("{total}", &result.rows.len().to_string());
+        let text = s
+            .report_filter_line
+            .replace("{f}", &filter_label(s, &rt.results_filter))
+            .replace("{r}", &rows);
+        // The active filter is called out in the accent: a grid showing a
+        // subset of its rows must never look like the whole run.
+        let style = if rt.results_filter == crate::report::filter::RowFilter::All {
+            Style::default().fg(th.dim)
+        } else {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        };
+        out.push(Line::from(Span::styled(text, style)));
+    }
+    out
+}
+
+/// [`results_head_lines`] as plain strings — the summary the results view
+/// pins, without its styling. Test-only: it is what a test can assert on,
+/// since a `Line`'s spans carry the text in pieces.
+#[cfg(test)]
+pub(crate) fn results_head_text(rt: &ReportTab, s: &Strings) -> Vec<String> {
+    let Some(result) = &rt.result else {
+        return Vec::new();
+    };
+    let header = rt.report.flow().map(|f| f.header).unwrap_or_default();
+    let visible = rt.visible_result_rows().len();
+    let th = crate::tui::theme::theme(&crate::i18n::Language::English);
+    results_head_lines(rt, result, &header, visible, s, &th)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// A filter's name in the user's language.
+///
+/// [`crate::report::filter::RowFilter::label`] is deliberately English — it
+/// names buttons in an exported document read by whoever it is sent to — so the
+/// in-app views translate the fixed filters themselves, exactly as the GUI's
+/// filter bar does.
+fn filter_label(s: &Strings, f: &crate::report::filter::RowFilter) -> String {
+    use crate::report::filter::RowFilter;
+    match f {
+        RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Differ => s.report_filter_differences.to_string(),
+        RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
+        RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::MatrixCell { .. } => f.label(),
+    }
+}
+
 /// Build the grid's styled lines: a bold header row of the resolved column
 /// headers followed by one line per data row, each cell padded to its column's
 /// width (capped) so the columns line up under [`WrapMode::Clip`]. Newlines in
@@ -3588,8 +3795,9 @@ fn report_grid_lines(
     header: &crate::report::flow::Header,
     states: Option<&[RowState]>,
     th: &Theme,
-    cursor: Option<(usize, usize)>, // (data_row, col) 0-indexed
+    cursor: Option<(usize, usize)>, // (visible_row, col) 0-indexed
     col_offset: usize,
+    visible: &[usize],
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
     if columns.is_empty() {
@@ -3601,9 +3809,12 @@ fn report_grid_lines(
 
     // Materialise every cell so column widths can be measured once.
     let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
-    let body: Vec<Vec<String>> = result
-        .rows
+    // Only the rows the filter selected are materialised: the widths are
+    // measured off what is drawn, so a filtered grid is as narrow as the rows
+    // it is showing rather than carrying columns sized for hidden ones.
+    let body: Vec<Vec<String>> = visible
         .iter()
+        .filter_map(|&r| result.rows.get(r))
         .map(|row| {
             columns
                 .iter()
@@ -3641,7 +3852,11 @@ fn report_grid_lines(
     ));
     lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
-        let state = states.and_then(|s| s.get(i)).copied();
+        // The status icons are per *result* row, so they are looked up by the
+        // original index rather than the on-screen one.
+        let state = states
+            .and_then(|s| visible.get(i).and_then(|&r| s.get(r)))
+            .copied();
         // A running row is highlighted in pending colour and bold so it stands out
         // from queued/finished rows; scheduled rows stay dim, finished stay normal.
         let text_style = match state {
@@ -3748,19 +3963,21 @@ fn grid_column_widths(
         .collect()
 }
 
-/// Return the display column widths for `result`'s resolved grid — the same
+/// Return the display column widths for the `visible` rows of `result`'s
+/// resolved grid — the same
 /// widths [`report_grid_lines`] uses — so the mouse hit-test in
 /// [`crate::tui::input`] can map a click's x offset to a column index without
 /// duplicating the width computation.
 pub(crate) fn result_column_widths(
     result: &ReportResult,
     header: &crate::report::flow::Header,
+    visible: &[usize],
 ) -> Vec<usize> {
     let columns = result.resolved_columns(header);
     let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
-    let body: Vec<Vec<String>> = result
-        .rows
+    let body: Vec<Vec<String>> = visible
         .iter()
+        .filter_map(|&r| result.rows.get(r))
         .map(|row| {
             columns
                 .iter()

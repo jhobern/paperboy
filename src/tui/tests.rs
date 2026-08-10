@@ -26594,3 +26594,134 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
         app.reports[idx].report.text
     );
 }
+
+/// A report tab holding a finished, ground-truthed run: three scored rows (one
+/// of them wrong and a regression) and one nobody labelled.
+fn truthed_report_app() -> (TuiApp, usize) {
+    use crate::report::model::{ReportResult, ReportRow, Trend, Verdict};
+    use crate::tui::reports::ReportView;
+    let row = |cells: &[(&str, &str)]| ReportRow {
+        cells: cells
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let mut res = ReportResult {
+        column_order: vec!["Name".into(), "Verdict".into(), "Correct".into()],
+        rows: vec![
+            row(&[("Name", "a"), ("Verdict", "pass"), ("Correct", "correct")]),
+            row(&[("Name", "b"), ("Verdict", "fail"), ("Correct", "correct")]),
+            row(&[("Name", "c"), ("Verdict", "pass"), ("Correct", "incorrect")]),
+            row(&[("Name", "d"), ("Verdict", "pass")]),
+        ],
+        ..Default::default()
+    };
+    res.column_truths
+        .insert("Verdict".into(), "{{ expected }}".into());
+    for (r, (v, t)) in [
+        (Verdict::Correct, "pass"),
+        (Verdict::Correct, "fail"),
+        (Verdict::Incorrect, "fail"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        res.verdicts.insert((r, "Verdict".into()), v);
+        res.truths.insert((r, "Verdict".into()), t.into());
+    }
+    res.trends.insert((2, "Verdict".into()), Trend::Regressed);
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# labels: Pass = pass\n# labels: Fail = fail\nREPORT REQUEST r\n",
+    );
+    app.reports[idx].result = Some(res);
+    app.reports[idx].view = ReportView::Results;
+    (app, idx)
+}
+
+/// The terminal results view states the run's score, from the same shared
+/// module the GUI's cards and the HTML export's read it from.
+#[test]
+fn the_results_view_states_the_ground_truth_score() {
+    let (app, idx) = truthed_report_app();
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &Strings::english());
+    assert!(
+        text.iter()
+            .any(|l| l.contains("3/4") && l.contains("66.7%")),
+        "the compared count and accuracy are on screen: {text:?}"
+    );
+    // And a report with no ground truth pays no lines for a summary of nothing.
+    let mut plain = TuiApp::default();
+    plain.new_report_tab();
+    let i = plain.active_report_index().unwrap();
+    plain.reports[i].result = Some(crate::report::model::ReportResult::default());
+    assert!(
+        crate::tui::reports::results_head_text(&plain.reports[i], &Strings::english()).is_empty()
+    );
+}
+
+/// Ctrl+F walks the filters the run offers, and the grid follows it.
+#[test]
+fn ctrl_f_cycles_the_results_filter_and_narrows_the_grid() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    assert_eq!(app.reports[idx].results_filter, RowFilter::All);
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 1, 2, 3]);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].results_filter,
+        RowFilter::Incorrect,
+        "no row differs from a baseline here, so Incorrect is the next filter"
+    );
+    assert_eq!(
+        app.reports[idx].visible_result_rows(),
+        vec![2],
+        "and the grid is down to the one wrong row"
+    );
+    assert!(
+        app.overlay.is_none(),
+        "Ctrl+F must not also open the File menu a bare `f` opens"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert_eq!(app.reports[idx].results_filter, RowFilter::Regressed);
+    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].results_filter,
+        RowFilter::All,
+        "and it wraps back round to the whole table"
+    );
+}
+
+/// With a filter up, "row 3" means the third row *on screen* — everything that
+/// addresses a row by position has to agree, or the drill-down opens a row the
+/// reader can't see.
+#[test]
+fn a_filtered_grid_addresses_the_rows_it_is_showing() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    app.reports[idx].results_filter = RowFilter::Incorrect;
+    // Down from nothing lands on the first *visible* row and stays there:
+    // there is only one.
+    app.result_cursor_move(1, 0);
+    assert_eq!(app.reports[idx].cell_cursor.map(|(r, _)| r), Some(0));
+    app.result_cursor_move(5, 0);
+    assert_eq!(
+        app.reports[idx].cell_cursor.map(|(r, _)| r),
+        Some(0),
+        "the cursor cannot walk past the last row being shown"
+    );
+    app.open_result_cell_popup();
+    let Some(Overlay::ReportCellPopup { content, .. }) = app.overlay.as_ref() else {
+        panic!("Enter opens the drill-down");
+    };
+    assert_eq!(
+        content, "c",
+        "and it opens row `c`, the row on screen, not the third row of the run"
+    );
+}
