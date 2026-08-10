@@ -872,6 +872,10 @@ strings! {
     gui_menu_open => "Open", "Ouvrir", "Åbn";
     gui_menu_open_git => "Open from Git", "Ouvrir depuis Git", "Åbn fra Git";
     gui_menu_save => "Save", "Enregistrer", "Gem";
+    gui_menu_save_as => "Save As…", "Enregistrer sous…", "Gem som…";
+    gui_shortcut_save => "Ctrl+S", "Ctrl+S", "Ctrl+S";
+    help_menu_save => "Write this straight back to the file it came from", "Réécrire directement dans le fichier d'origine", "Skriv direkte tilbage til filen, den kom fra";
+    help_menu_save_unsaved => "This has never been saved, so you will be asked where to put it", "Ceci n'a jamais été enregistré\u{a0}; l'emplacement vous sera demandé", "Dette er aldrig blevet gemt, så du bliver spurgt om hvor";
     gui_menu_save_git => "Save to Git", "Enregistrer sur Git", "Gem til Git";
     gui_menu_item_collection => "Collection…", "Collection…", "Samling…";
     gui_menu_item_environment => "Environment…", "Environnement…", "Miljø…";

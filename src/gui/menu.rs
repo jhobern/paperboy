@@ -287,7 +287,28 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.separator();
 
-        ui.menu_button(app.strings.gui_menu_save, |ui| {
+        // Save writes straight to the file the thing came from; Save As always
+        // asks. Keeping them apart is the point: the menu used to offer only
+        // the asking kind, so saving a report you had just edited meant walking
+        // through a file dialog to name the file it already had.
+        let save_hint = if save_active_has_path(app) {
+            app.strings.help_menu_save
+        } else {
+            app.strings.help_menu_save_unsaved
+        };
+        if ui
+            .button(format!(
+                "{}\t{}",
+                app.strings.gui_menu_save, app.strings.gui_shortcut_save
+            ))
+            .on_hover_text(save_hint)
+            .clicked()
+        {
+            save_active(app);
+            close_menu = true;
+            ui.close();
+        }
+        ui.menu_button(app.strings.gui_menu_save_as, |ui| {
             if ui.button(app.strings.gui_menu_item_collection).clicked() {
                 save_via_picker(app, SaveKind::Collection);
                 close_menu = true;
@@ -1039,6 +1060,78 @@ fn save_picker_kind(kind: SaveKind) -> PickerKind {
     }
 }
 
+/// What "Save" (the File menu entry and Ctrl+S) writes: whatever is in front of
+/// the user.
+///
+/// The open report editor wins when there is one, since it is drawn over the
+/// request view and is the thing being edited; otherwise it is the active
+/// collection tab. Reported as a `SaveKind` so the fallback to a picker, when
+/// the target has never been written anywhere, needs no second decision about
+/// what is being saved.
+pub fn active_save_kind(app: &GuiApp) -> SaveKind {
+    if app.report_editor.is_some() {
+        SaveKind::Report
+    } else {
+        SaveKind::Collection
+    }
+}
+
+/// Save what is in front of the user, straight to the file it came from.
+///
+/// Falls back to the Save As picker when that thing has never been written
+/// anywhere -- there is no path to save to, and refusing outright would leave
+/// Ctrl+S doing nothing on exactly the documents most likely to need saving.
+/// An item that *does* know its file is written without a dialog: a save
+/// shortcut that always asks where is no shortcut.
+pub fn save_active(app: &mut GuiApp) {
+    match active_save_kind(app) {
+        SaveKind::Report => match app.report_editor.as_mut() {
+            Some(ed) if ed.report.path.is_some() => {
+                super::report_editor::request_save(ed);
+            }
+            _ => save_via_picker(app, SaveKind::Report),
+        },
+        _ => {
+            let ci = app.active_ci();
+            let Some(path) = app.session.collections.get(ci).and_then(|c| c.path.clone()) else {
+                save_via_picker(app, SaveKind::Collection);
+                return;
+            };
+            let text = app.session.collections[ci].to_hurl();
+            match std::fs::write(&path, text) {
+                Ok(()) => {
+                    app.session.collections[ci].mark_saved();
+                    app.session.save();
+                    app.session.status = Some(crate::i18n::Status::Saved);
+                }
+                Err(e) => {
+                    app.session.status = Some(crate::i18n::Status::Error(format!(
+                        "{} {e}",
+                        app.strings.gui_could_not_write
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Whether [`save_active`] would write without asking -- i.e. whether the thing
+/// in front of the user already has a file. Drives the Save entry's hint, so
+/// the menu can say which of the two it is about to do.
+pub fn save_active_has_path(app: &GuiApp) -> bool {
+    match active_save_kind(app) {
+        SaveKind::Report => app
+            .report_editor
+            .as_ref()
+            .is_some_and(|e| e.report.path.is_some()),
+        _ => app
+            .session
+            .collections
+            .get(app.active_ci())
+            .is_some_and(|c| c.path.is_some()),
+    }
+}
+
 pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
     let title = save_title(app, kind);
     // Seed the dialog from any remembered path (collections/environments) and a
@@ -1534,6 +1627,68 @@ mod tests {
         assert_eq!(
             app.session.reports[0].path.as_deref(),
             Some(path.to_string_lossy().as_ref())
+        );
+    }
+
+    /// Ctrl+S on a collection that already has a file writes it there and
+    /// clears the unsaved marker -- no dialog, and nothing left to warn about.
+    #[test]
+    fn saving_a_collection_in_place_writes_it_and_clears_the_marker() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("pb_save_active_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(
+            &path,
+            "GET https://example.test
+",
+        )
+        .unwrap();
+        let ci = app.active_ci();
+        app.session.collections[ci].path = Some(path.clone());
+
+        assert!(
+            save_active_has_path(&app),
+            "a collection with a file saves without asking"
+        );
+        save_active(&mut app);
+        // The fixture collection holds no requests, so what matters is that the
+        // file was rewritten from it -- the seeded contents are gone.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !on_disk.contains("example.test"),
+            "the file was rewritten from the collection: {on_disk:?}"
+        );
+        assert!(
+            matches!(app.session.status, Some(crate::i18n::Status::Saved)),
+            "and it reported success rather than an error"
+        );
+        assert!(
+            !app.session.collections[ci].has_unsaved_edits(),
+            "and the collection no longer counts as edited"
+        );
+        assert!(
+            app.pending_pick.is_none(),
+            "saving in place must not open a file dialog"
+        );
+    }
+
+    /// The report editor wins when one is open: it is drawn over the request
+    /// view, so it is what "save" is about.
+    #[test]
+    fn the_open_report_is_what_save_saves() {
+        let mut app = app();
+        assert_eq!(active_save_kind(&app), SaveKind::Collection);
+        app.report_editor = Some(crate::gui::report_editor::ReportEditor::new(
+            crate::gui::report_editor::ReportOrigin::Session(0),
+            crate::report::Report::scratch("r"),
+        ));
+        assert_eq!(active_save_kind(&app), SaveKind::Report);
+        assert!(
+            !save_active_has_path(&app),
+            "a scratch report has no file, so Save has to ask where"
         );
     }
 

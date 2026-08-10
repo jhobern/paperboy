@@ -83,7 +83,7 @@ pub enum OpenKind {
     Workspace,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SaveKind {
     Collection,
     /// Write the open report editor's `.trail` source to a chosen file.
@@ -742,38 +742,16 @@ impl GuiApp {
         if send {
             self.run_active();
         }
-        // Ctrl+S saves whatever is in front of the user: the open report,
-        // otherwise the active collection. An item that already knows its file
-        // is written straight there (a save shortcut that always opens a dialog
-        // is no shortcut); an unsaved one falls through to the save picker.
+        // Ctrl+S saves whatever is in front of the user, by exactly the code
+        // the File > Save entry runs -- the shortcut and the menu item must not
+        // be able to disagree about what "save" means.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
-            match self.report_editor.as_mut() {
-                Some(ed) if ed.report.path.is_some() => {
-                    super::report_editor::request_save(ed);
-                }
-                Some(_) => super::menu::save_via_picker(self, SaveKind::Report),
-                None => {
-                    let ci = self.active_ci();
-                    match self.session.collections[ci].path.clone() {
-                        Some(path) => {
-                            let text = self.session.collections[ci].to_hurl();
-                            match std::fs::write(&path, text) {
-                                Ok(()) => {
-                                    self.session.collections[ci].mark_saved();
-                                    self.session.save();
-                                    self.session.status = Some(crate::i18n::Status::Saved);
-                                }
-                                Err(e) => {
-                                    self.session.status = Some(crate::i18n::Status::Error(
-                                        format!("{} {e}", self.strings.gui_could_not_write),
-                                    ));
-                                }
-                            }
-                        }
-                        None => super::menu::save_via_picker(self, SaveKind::Collection),
-                    }
-                }
-            }
+            super::menu::save_active(self);
+        }
+        // Ctrl+Shift+S is Save As: the same target, but always asking where.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+            let kind = super::menu::active_save_kind(self);
+            super::menu::save_via_picker(self, kind);
         }
         // Ctrl+W closes the active tab.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {

@@ -12,6 +12,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **File > Save writes straight to the file, and Save As asks.** The File menu
+  offered only the asking kind, so saving a report you had just edited meant
+  walking through a file dialog to name the file it already had. There is now a
+  top-level **Save** (Ctrl+S) that writes whatever is in front of you — the open
+  report, otherwise the active collection — back where it came from, and a
+  **Save As…** submenu (Ctrl+Shift+S) holding the pickers that were there
+  before. Something that has never been saved still falls through to the picker,
+  since there is no file to write to. Ctrl+S and the menu entry now run the same
+  code, so they cannot disagree about what "save" means.
+
 - **The block editor draws a column's `IMAGE`, `TRUTH` and `DETAIL` clauses.**
   Only `STATISTICS` was rendered, so a ground-truthed or picture-bearing column
   looked identical to a plain one and the clauses could be edited but never
