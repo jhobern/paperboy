@@ -307,16 +307,16 @@ impl ReportWriter for HtmlWriter {
              letter-spacing:.04em}\n\
              .card .v{display:block;font-size:20px;font-weight:600}\n\
              .matrix{margin:0 0 1.25rem}\n\
-             .matrix h2{font-size:14px;font-weight:600;margin:0 0 .35rem}\n\
-             .matrix table{width:auto;min-width:0;font-size:13px}\n\
-             .matrix th,.matrix td{text-align:center;white-space:nowrap}\n\
+             .matrix h2{font-size:17px;font-weight:600;margin:0 0 .45rem}\n\
+             .matrix table{width:auto;min-width:0;font-size:20px}\n\
+             .matrix th,.matrix td{text-align:center;white-space:nowrap;padding:12px 18px}\n\
              .matrix thead th{position:static;background:#fafafa;color:#222;font-weight:600}\n\
              .matrix th.axis{background:#fafafa;color:#222;text-align:right;font-weight:600}\n\
              .matrix td.cell{color:#12305a}\n\
              .matrix td.pick{cursor:pointer}\n\
              .matrix td.pick:hover{outline:2px solid #12305a;outline-offset:-2px}\n\
              .matrix td.hot{color:#fff}\n\
-             .matrix caption{caption-side:bottom;font-size:12px;color:#666;padding-top:.3rem;\
+             .matrix caption{caption-side:bottom;font-size:13px;color:#666;padding-top:.4rem;\
              text-align:left}\n\
              </style>\n\
              <noscript><style>tr.det{display:table-row}.toolbar{display:none}</style></noscript>\n\
@@ -703,6 +703,10 @@ fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
 /// The count is always printed, so the shading only ever ranks what the reader
 /// can already read (and the report stays legible in greyscale, to a
 /// colour-blind reader, and on a printout).
+/// The matrix is drawn at roughly twice the table's type size, with matching
+/// padding: it is a handful of numbers people read *across* and *down* to find
+/// the one cell that is wrong, and at the grid's own 13px they had to lean in.
+/// Its cells are also click targets, and the padding is most of the target.
 fn push_confusion_matrix(
     out: &mut String,
     column: &str,
@@ -2096,6 +2100,22 @@ mod tests {
         // Truth down, prediction across: the one wrong row is a Fail read as a Pass.
         assert_eq!(col["confusion"]["counts"][1][0], 1);
         assert_eq!(doc["metrics"]["overall"]["correct"], 2);
+    }
+
+    /// The matrix is drawn larger than the grid it sits above: it is read cell
+    /// by cell, and its cells are click targets.
+    #[test]
+    fn the_confusion_matrix_is_drawn_larger_than_the_table() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            out.contains(".matrix table{width:auto;min-width:0;font-size:20px}"),
+            "the matrix has its own, larger type size: {out}"
+        );
+        assert!(
+            out.contains("padding:12px 18px"),
+            "and cells big enough to aim at: {out}"
+        );
     }
 
     /// A matrix only exists where a vocabulary was declared: without one there

@@ -22,6 +22,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The confusion matrix in an HTML export is drawn at readable size.** It was
+  set at the grid's own type size, so the handful of numbers a reader scans
+  across and down to find the one wrong cell were the smallest thing on the
+  page. The matrix now has roughly twice the type size and matching cell
+  padding — which is also most of the click target, since every cell filters the
+  table below it.
+
 - **The GUI asks for an export filename itself.** Exporting a report's results
   used the desktop's own save dialog, whose format dropdown — tucked in the far
   bottom corner — only *filtered* the listing: picking "Excel" left the name
