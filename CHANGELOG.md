@@ -33,6 +33,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A results row shows the pointing hand across its whole width.** The row was
+  clickable end to end but only looked it over the words in a cell, because the
+  cells take the hover from the row target wherever they overlap it. The cursor
+  now follows the row, not its text.
+
+- **An export offers the report's name from the folder the report works in.** A
+  saved report already exported beside itself; an unsaved one offered a bare
+  filename, which would have landed wherever PaperBoy was started from rather
+  than in the report's `# root:` directory the terminal UI's picker opens in.
+
 - **A whole results row opens its details, not just the words in it.** The click
   target for expanding a row was the *text* of a cell, so the gaps between
   columns, and the empty space in a short column, did nothing — a row of mostly

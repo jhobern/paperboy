@@ -3261,11 +3261,23 @@ fn results_grid(
                                 + if show_icons { 18.0 + SPACING_X } else { 0.0 };
                             let rect =
                                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
-                            ui.interact(
+                            let r = ui.interact(
                                 rect,
                                 ui.id().with(("pb_result_row", i)),
                                 egui::Sense::click(),
-                            )
+                            );
+                            // The pointing hand has to cover the whole row, not
+                            // just the words in it. `hovered()` is no use here:
+                            // the cells are drawn after this target and take the
+                            // hover from it wherever they overlap -- over their
+                            // own text, which is exactly the part that most
+                            // looks clickable. `contains_pointer` doesn't care
+                            // who is on top, so the cursor stays a hand all the
+                            // way across.
+                            if r.contains_pointer() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            r
                         });
                         if show_expanders {
                             let has = expandable.contains(&i);
@@ -3740,10 +3752,25 @@ fn open_export_dialog(app: &mut GuiApp) {
         .report_editor
         .as_ref()
         .map(|e| {
-            crate::report::writer::export_path(
+            let p = crate::report::writer::export_path(
                 &e.report,
                 &crate::report::writer::report_output_extension(&e.report),
-            )
+            );
+            // A saved report exports beside itself, so `export_path` already
+            // gives an absolute name. A scratch report gives a bare filename,
+            // which would land wherever PaperBoy happens to have been started
+            // from -- anchor it to the report's own base directory, the folder
+            // the terminal UI's picker opens in.
+            if p.is_absolute() {
+                p
+            } else {
+                crate::report::context::report_base_dir(
+                    &e.flow.clone().unwrap_or_default(),
+                    e.report.path.as_deref(),
+                )
+                .0
+                .join(p)
+            }
         })
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "results.csv".to_string());
@@ -11697,6 +11724,55 @@ mod toolbar_commit_tests {
         report.set_text(text.to_string());
         app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(0), report));
         app
+    }
+
+    #[test]
+    fn export_offers_the_report_s_own_name_the_way_the_tui_does() {
+        // The terminal UI seeds its export picker with the report's name and
+        // its `# output:` format; the GUI dialog has to agree, or the same
+        // report exports under two different names depending on the front-end.
+        let mut app = app_with_report("# output: xlsx\n# collection: api\n");
+        let dir = std::env::temp_dir().join(format!("pb_exp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let trail = dir.join("Face FR tickets.trail");
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.report.path = Some(trail.clone());
+            ed.flow = ed.report.flow().ok();
+        }
+        super::open_export_dialog(&mut app);
+        let path = match app.dialog {
+            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            _ => panic!("Export opens PaperBoy's own dialog"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            path,
+            trail.with_extension("xlsx").to_string_lossy(),
+            "the file is named for the report, in the format it declares, beside it"
+        );
+    }
+
+    #[test]
+    fn a_scratch_report_exports_into_its_own_base_directory() {
+        // With no file of its own a report's export name is bare, and would
+        // land wherever PaperBoy was started from; `# root:` says where the
+        // report's world is, so that is where its results go.
+        let dir = std::env::temp_dir().join(format!("pb_exp_root_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let mut app = app_with_report(&format!("# root: {}\n# collection: api\n", dir.display()));
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.flow = ed.report.flow().ok();
+        }
+        super::open_export_dialog(&mut app);
+        let path = match app.dialog {
+            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            _ => panic!("Export opens PaperBoy's own dialog"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            std::path::Path::new(&path).starts_with(&dir),
+            "an unsaved report's results are offered in its base directory: {path}"
+        );
     }
 
     /// The same collision inside the Blocks view, where the button queues a
