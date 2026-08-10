@@ -57,6 +57,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The row drill-down uses the width it has, opens on a click, and resizes.**
+  The in-app panel stacked its sections down the pane, so a full-height
+  photograph buried the response body a screen below it; it now lays them across
+  the pane in readable-width columns, the same layout the interactive HTML
+  export's flex row produces. Clicking anywhere in a row that has a drill-down
+  now opens it, rather than only the caret doing so — a row with nothing to
+  drill into keeps the cell inspector, which is otherwise the only way to read a
+  truncated value. The divider between the grid and the panel can be dragged,
+  and the height is saved with the rest of the GUI's geometry, so a reader who
+  wants a big picture pane keeps it between runs and between sessions.
+
 - **The in-app confusion matrix is drawn large enough to read.** The counts and
   their axis labels were set at the small text style, so the matrix — a thing
   read by comparing one cell against another at a glance — came out as a grid of

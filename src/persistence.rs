@@ -465,6 +465,9 @@ pub struct GuiLayout {
     /// Width of the report editor's block palette column.
     #[serde(default)]
     pub report_palette_width: Option<f32>,
+    /// Height of the row drill-down panel under the results grid.
+    #[serde(default)]
+    pub report_detail_height: Option<f32>,
     /// Which centre-column view was open.
     #[serde(default)]
     pub view: GuiView,

@@ -124,6 +124,12 @@ pub struct ReportEditor {
     /// (the GUI's stand-in for a fixed panel), so a report with many validation
     /// errors can be given as much room as needed.
     pub diag_h: f32,
+    /// Height (px) reserved for the row drill-down panel under the results
+    /// grid, adjustable by dragging the splitter above it. A drill-down holds
+    /// full-size pictures and whole response bodies, so how much of the view it
+    /// should take is a matter of what the reader is doing — reading rows or
+    /// reading one row — rather than something the app can pick for them.
+    pub detail_h: f32,
     /// Width (px) of the palette column in the Blocks view. User-adjustable by
     /// dragging the divider between the palette and the block stack.
     pub palette_w: f32,
@@ -208,6 +214,7 @@ impl ReportEditor {
             results_textures: std::collections::HashMap::new(),
             wizard: None,
             diag_h: 132.0,
+            detail_h: 320.0,
             palette_w: 168.0,
             inspector: None,
             dry_run: None,
@@ -2481,12 +2488,15 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
         ui.add_space(2.0);
         // A row whose panel is open still has to be *reachable*, so the grid
-        // gives up half its height rather than the panel appearing off-screen
-        // below it.
+        // gives up the height the reader dragged the panel to (defaulting to
+        // something a picture fits in) rather than the panel appearing
+        // off-screen below it.
+        let avail = ui.available_height();
         let grid_h = if ed.results_detail.is_some() {
-            (ui.available_height() * 0.5).max(80.0)
+            let panel = ed.detail_h.clamp(80.0, (avail - 120.0).max(80.0));
+            (avail - panel - 10.0).max(80.0)
         } else {
-            ui.available_height()
+            avail
         };
         let mut open_detail = ed.results_detail;
         let mut inspector = None;
@@ -2512,7 +2522,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ed.results_detail = open_detail;
         if let Some(r) = ed.results_detail {
-            ui.separator();
+            detail_splitter(&mut ed.detail_h, ui);
             detail_panel(
                 &th,
                 ui,
@@ -2544,6 +2554,58 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 }
 
+/// A thin draggable handle between the results grid and an open drill-down.
+/// Dragging it up or down grows or shrinks the panel (`ed.detail_h`), which is
+/// saved with the rest of the GUI's geometry so a reader who wants a big
+/// picture pane keeps it between runs and between sessions.
+///
+/// Deliberately a copy of [`diag_splitter`]'s look rather than a shared widget:
+/// the two hold different fields with different clamps, and the drawing is four
+/// lines. Keep them in step by eye.
+fn detail_splitter(height: &mut f32, ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    if resp.dragged() {
+        // Dragging *up* makes the panel taller, since the panel is below the
+        // handle — the same sense as the diagnostics splitter.
+        *height = (*height - resp.drag_delta().y).clamp(80.0, 2000.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let w = (rect.width() * 0.25).clamp(40.0, 160.0);
+    let x0 = rect.center().x - w / 2.0;
+    ui.painter()
+        .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
+/// How many side-by-side columns a drill-down's sections should be laid out in.
+///
+/// Mirrors the interactive HTML export's `flex: 1 1 22rem; min-width: min(100%,
+/// 22rem)`: sections sit beside each other while each still gets a readable
+/// width, and fall back to a single column when the pane is narrow. Never more
+/// columns than there are sections, so two sections never leave a third of the
+/// pane empty.
+fn detail_layout_columns(avail: f32, min_w: f32, sections: usize) -> usize {
+    if sections == 0 {
+        return 1;
+    }
+    let fits = (avail / min_w).floor().max(1.0) as usize;
+    fits.min(sections).max(1)
+}
+
+/// The width a drill-down section wants before it is willing to share a row,
+/// the pixel equivalent of the HTML export's `22rem`.
+const DETAIL_MIN_SECTION_W: f32 = 340.0;
+
 /// One row's drill-down: its pictures at full size, its `DETAIL` columns in
 /// full, and a field-by-field diff against the baseline where there is one.
 ///
@@ -2562,7 +2624,6 @@ fn detail_panel(
     textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
     open: &mut Option<usize>,
 ) {
-    use crate::report::detail::DetailSection;
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(
@@ -2587,57 +2648,77 @@ fn detail_panel(
         .id_salt("pb_report_detail")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for section in crate::report::detail::sections(result, r, all_columns, detail_columns) {
-                match section {
-                    DetailSection::Image {
-                        header,
-                        image,
-                        value,
-                    } => {
-                        ui.label(RichText::new(header).strong());
-                        detail_image(ui, textures, r, header, image, &value, app);
-                    }
-                    DetailSection::Text { header, value } => {
-                        ui.label(RichText::new(header).strong());
-                        // Monospace and selectable: a detail column is usually a
-                        // response body, which is read by picking bits out of it.
-                        ui.add(
-                            egui::TextEdit::multiline(&mut value.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
-                        );
-                    }
-                    DetailSection::Diff { header, fields } => {
-                        ui.label(
-                            RichText::new(app.strings.report_detail_changed.replace("{c}", header))
-                                .strong(),
-                        );
-                        egui::Grid::new(("pb_detail_diff", header))
-                            .striped(true)
-                            .num_columns(3)
-                            .show(ui, |ui| {
-                                for f in &fields {
-                                    // Unchanged fields are kept and the changed
-                                    // ones highlighted, so the reader can find
-                                    // the field they care about either way.
-                                    let col = if f.differs() { th.err } else { th.dim };
-                                    ui.colored_label(col, &f.path);
-                                    ui.colored_label(
-                                        col,
-                                        f.baseline.as_deref().unwrap_or("\u{2014}"),
-                                    );
-                                    ui.colored_label(
-                                        col,
-                                        f.candidate.as_deref().unwrap_or("\u{2014}"),
-                                    );
-                                    ui.end_row();
-                                }
-                            });
-                    }
+            let sections = crate::report::detail::sections(result, r, all_columns, detail_columns);
+            // Laid out across the pane rather than down it, exactly as the
+            // interactive HTML export does: a picture beside its response body
+            // is how the row is actually read, and stacking them buried the
+            // JSON a screen below a full-height photograph.
+            let n =
+                detail_layout_columns(ui.available_width(), DETAIL_MIN_SECTION_W, sections.len());
+            ui.columns(n, |cols| {
+                for (i, section) in sections.into_iter().enumerate() {
+                    // Round-robin, which for the first row of sections is the
+                    // same order the HTML's `flex-wrap` produces.
+                    let ui = &mut cols[i % n];
+                    detail_section(th, ui, app, r, section, textures);
+                    ui.add_space(6.0);
                 }
-                ui.add_space(6.0);
-            }
+            });
         });
+}
+
+/// Draw one section of a row's drill-down into whichever column it landed in.
+fn detail_section(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    r: usize,
+    section: crate::report::detail::DetailSection<'_>,
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+) {
+    use crate::report::detail::DetailSection;
+    match section {
+        DetailSection::Image {
+            header,
+            image,
+            value,
+        } => {
+            ui.label(RichText::new(header).strong().color(th.accent));
+            detail_image(ui, textures, r, header, image, &value, app);
+        }
+        DetailSection::Text { header, value } => {
+            ui.label(RichText::new(header).strong().color(th.accent));
+            // Monospace and selectable: a detail column is usually a
+            // response body, which is read by picking bits out of it.
+            ui.add(
+                egui::TextEdit::multiline(&mut value.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        DetailSection::Diff { header, fields } => {
+            ui.label(
+                RichText::new(app.strings.report_detail_changed.replace("{c}", header))
+                    .strong()
+                    .color(th.accent),
+            );
+            egui::Grid::new(("pb_detail_diff", header))
+                .striped(true)
+                .num_columns(3)
+                .show(ui, |ui| {
+                    for f in &fields {
+                        // Unchanged fields are kept and the changed
+                        // ones highlighted, so the reader can find
+                        // the field they care about either way.
+                        let col = if f.differs() { th.err } else { th.dim };
+                        ui.colored_label(col, &f.path);
+                        ui.colored_label(col, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                        ui.colored_label(col, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                        ui.end_row();
+                    }
+                });
+        }
+    }
 }
 
 /// Draw one of a row's pictures, decoding and uploading it on first sight.
@@ -3145,7 +3226,19 @@ fn results_grid(
                             let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
                             cell_slot(ui, w, row_h, |ui| {
                                 if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
-                                    opened = Some(ins);
+                                    // Clicking anywhere in a row that has a
+                                    // drill-down opens it: the panel is the
+                                    // fuller answer to "what is this row?" than
+                                    // one cell's text, and it is what the
+                                    // interactive HTML export does too. A row
+                                    // with nothing to drill into keeps the cell
+                                    // inspector, which is otherwise the only
+                                    // way to read a truncated value.
+                                    if expandable.contains(&i) {
+                                        *open_detail = Some(i);
+                                    } else {
+                                        opened = Some(ins);
+                                    }
                                 }
                             });
                         }
@@ -10808,6 +10901,35 @@ mod results_render_tests {
         assert!(
             !crate::report::detail::sections(&result, 1, &grid, &detail).is_empty(),
             "the row with a body does"
+        );
+    }
+
+    /// The drill-down's sections are laid across the pane the way the HTML
+    /// export's flex row does: side by side while each still gets a readable
+    /// width, one column when the pane is narrow, and never more columns than
+    /// there are sections to fill them.
+    #[test]
+    fn detail_sections_share_the_width_they_have() {
+        let w = super::DETAIL_MIN_SECTION_W;
+        assert_eq!(
+            super::detail_layout_columns(w * 2.5, w, 4),
+            2,
+            "two whole sections fit, so two columns"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 0.5, w, 4),
+            1,
+            "a pane narrower than one section still gets one column, not zero"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 4.0, w, 2),
+            2,
+            "four would fit but there are only two sections to put in them"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 4.0, w, 0),
+            1,
+            "an empty panel never asks for zero columns"
         );
     }
 

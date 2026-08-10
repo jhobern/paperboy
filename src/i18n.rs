@@ -1070,7 +1070,7 @@ strings! {
     gui_report_save_baseline => "Baseline…", "Référence…", "Basislinje…";
     gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
     gui_report_running => "Running…", "Exécution…", "Kører…";
-    gui_report_cell_hint => "Click a cell to inspect its full value", "Cliquez sur une cellule pour voir sa valeur complète", "Klik på en celle for at se dens fulde værdi";
+    gui_report_cell_hint => "Click a row marked \u{25b8} to open its details, or any other cell to inspect its full value", "Cliquez sur une ligne marquée \u{25b8} pour ouvrir ses détails, ou sur toute autre cellule pour voir sa valeur complète", "Klik på en række markeret med \u{25b8} for at åbne dens detaljer, eller på en anden celle for at se dens fulde værdi";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
     // The results view's filter bar and metric cards. `RowFilter::label` is
     // deliberately English -- it names buttons in an exported document that has
