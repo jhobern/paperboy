@@ -342,35 +342,77 @@ impl GuiApp {
     /// closes that gap; the path was already checked to still exist when the
     /// state was loaded.
     fn restore_workspace_selection(&mut self) {
-        let ci = self.active_ci();
-        let Some(selected) = self
-            .session
-            .collections
-            .get(ci)
-            .filter(|c| c.workspace_root.is_some())
-            .and_then(|c| c.workspace_selected.clone())
-        else {
+        let Some(selected) = self.workspace_selection() else {
             return;
         };
         if crate::workspace::is_report_file(&selected) {
-            // A report *tab* being restored by `restore_view` outranks this:
-            // that is what the centre column was actually showing.
-            if self.report_editor.is_some() {
-                return;
-            }
-            match crate::report::Report::load_local(&selected) {
-                Ok(report) => {
-                    self.open_report_editor(ReportOrigin::Workspace, report);
-                    self.show_reports = false;
-                    self.focus = Focus::Main;
-                }
-                // A report that has since become unreadable is not worth
-                // interrupting the launch over — the tree still shows it.
-                Err(_) => {}
-            }
+            self.reopen_workspace_report(&selected);
         } else if crate::workspace::is_env_file(&selected) {
             self.session.open_workspace_environment(&selected);
         }
+    }
+
+    /// The path the active tab's tree has selected, if it is a Workspace tab.
+    fn workspace_selection(&self) -> Option<std::path::PathBuf> {
+        self.session
+            .collections
+            .get(self.active_ci())
+            .filter(|c| c.workspace_root.is_some())
+            .and_then(|c| c.workspace_selected.clone())
+    }
+
+    /// Open the Workspace-tree report at `path` in the centre column.
+    fn reopen_workspace_report(&mut self, path: &std::path::Path) {
+        // A report *tab* being restored by `restore_view` outranks this: that
+        // is what the centre column was actually showing.
+        if self.report_editor.is_some() {
+            return;
+        }
+        match crate::report::Report::load_local(path) {
+            Ok(report) => {
+                self.open_report_editor(ReportOrigin::Workspace, report);
+                self.show_reports = false;
+                self.focus = Focus::Main;
+            }
+            // A report that has since become unreadable is not worth
+            // interrupting the launch over — the tree still shows it.
+            Err(_) => {}
+        }
+    }
+
+    /// Switch to tab `idx`, leaving the tab being left as it was found and
+    /// putting the one arrived at back the way it was.
+    ///
+    /// A report opened from a Workspace tree belongs to that tab, so it is
+    /// closed on the way out (a standalone session report is the centre
+    /// column's own and stays). Coming *back* then has to reopen it, or leaving
+    /// a tab for a moment silently swapped the report you were editing for
+    /// whichever collection the tree happened to load last — which is what the
+    /// tab-switching path did before: it closed the editor and never reopened
+    /// one. The tree already records what was selected (`workspace_selected`),
+    /// the same field a restart restores from, so a tab switch is just a
+    /// restore of the tab being arrived at.
+    pub fn switch_to_tab(&mut self, idx: usize) {
+        self.session.activate_tab(idx);
+        if self
+            .report_editor
+            .as_ref()
+            .is_some_and(|e| e.is_workspace())
+        {
+            self.close_report_editor();
+        }
+        // Only the *report* half of the tab's selection is restored here, not
+        // the environment half: `open_workspace_environment` loads a fresh copy
+        // every time it is called, so replaying it on each tab switch would
+        // pile up "staging (2)", "staging (3)" globals. At launch there is
+        // nothing loaded yet, so restoring both is right there and only there.
+        if let Some(selected) = self.workspace_selection()
+            && crate::workspace::is_report_file(&selected)
+        {
+            self.reopen_workspace_report(&selected);
+        }
+        self.focus = Focus::Tabs;
+        self.session.save();
     }
 
     /// Reopen the centre column on whatever it was showing last time.
@@ -816,18 +858,7 @@ impl GuiApp {
                 }
                 let resp = super::widgets::selectable(ui, selected, text);
                 if resp.clicked() {
-                    self.session.activate_tab(i);
-                    self.focus = Focus::Tabs;
-                    // Close a Workspace-opened report editor when leaving its
-                    // tab; a standalone (session) report stays open.
-                    if self
-                        .report_editor
-                        .as_ref()
-                        .is_some_and(|e| e.is_workspace())
-                    {
-                        self.close_report_editor();
-                    }
-                    self.session.save();
+                    self.switch_to_tab(i);
                 }
                 // Middle-click closes a tab (not the built-in Request tab).
                 if i != 0 && resp.middle_clicked() {
@@ -1459,6 +1490,53 @@ mod report_run_persistence_tests {
             "the worker keeps going: dropping the handle is what cancels it"
         );
         assert_eq!(parked.result.as_ref().expect("rows kept").rows.len(), 1);
+    }
+
+    /// A Workspace tab's report is the tab's, so leaving the tab and coming
+    /// back has to land on it again. It used to be closed on the way out and
+    /// never reopened, so the tab came back showing whichever collection the
+    /// tree had loaded — a report you glanced away from was silently swapped
+    /// for something else.
+    #[test]
+    fn a_workspace_tab_comes_back_to_the_report_it_was_on() {
+        super::super::requests::tests::redirect_saved_state();
+        let dir = std::env::temp_dir().join(format!("pb-tab-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trail = dir.join("nightly.trail");
+        std::fs::write(&trail, "REPORT REQUEST login AS Login\n").unwrap();
+
+        let mut session = Session::default();
+        let mut col = crate::collection::Collection::new("ws".to_string(), Vec::new());
+        col.workspace_root = Some(dir.clone());
+        col.workspace_selected = Some(trail.clone());
+        session.collections.push(col);
+        let ws = session.collections.len() - 1;
+
+        let mut app = GuiApp::for_test(session);
+        app.switch_to_tab(ws);
+        assert!(
+            app.report_editor.is_some(),
+            "arriving at the tab opens what its tree had selected"
+        );
+
+        app.switch_to_tab(0);
+        assert!(
+            app.report_editor.is_none(),
+            "leaving it closes the editor, since the report belongs to that tab"
+        );
+
+        app.switch_to_tab(ws);
+        let ed = app
+            .report_editor
+            .as_ref()
+            .expect("and coming back reopens it");
+        assert_eq!(
+            ed.path(),
+            Some(trail.as_path()),
+            "the same report, not another file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// …and coming back to the report picks it up where it got to, rather than

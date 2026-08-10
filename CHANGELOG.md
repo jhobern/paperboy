@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A Workspace tab comes back to the report it was on.** A report opened from
+  a Workspace folder tree belongs to that tab, so it is closed when you leave —
+  but nothing reopened it when you came back, and the tab returned showing
+  whichever collection its tree had loaded last. Switching tabs now restores the
+  tab you arrive at from the same selection a restart restores from, so a report
+  you glance away from is still there when you look back.
+
 - **File > Save writes straight to the file, and Save As asks.** The File menu
   offered only the asking kind, so saving a report you had just edited meant
   walking through a file dialog to name the file it already had. There is now a
