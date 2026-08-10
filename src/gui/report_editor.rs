@@ -2760,11 +2760,11 @@ fn detail_image(
     let scale = (ui.available_width() / natural.x).min(1.0);
     ui.add(egui::Image::new((tex.id(), natural * scale)))
         .on_hover_text(value);
-    ui.label(
-        RichText::new(value)
-            .small()
-            .color(ui.visuals().weak_text_color()),
-    );
+    // The caption is the picture's path, and it is read -- it says which file
+    // of a thousand this row is. At the small text style it was a grey line too
+    // fine to make out under a full-size photograph, so it is set at body size
+    // and selectable, so a path can be picked up and pasted somewhere useful.
+    ui.add(egui::Label::new(RichText::new(value).color(ui.visuals().weak_text_color())).wrap());
     let _ = app;
 }
 

@@ -97,6 +97,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and the height is saved with the rest of the GUI's geometry, so a reader who
   wants a big picture pane keeps it between runs and between sessions.
 
+- **A drill-down picture's path is legible.** The caption under a full-size
+  photograph was set at the small text style, leaving the one line that says
+  *which* file of a thousand this row is as a fine grey thread. It is now body
+  size and wraps rather than being cut off.
+
 - **A confusion-matrix cell is clickable across the whole cell.** The click
   sense sat on the digits rather than on the block of colour around them, so
   selecting the rows a cell counted meant hitting a target the width of the
