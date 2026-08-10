@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.8.0] - 2026-08-08
+## [0.4.0] - unreleased
 
 ### Added
 
@@ -25,9 +25,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the grid and nothing else, so a ground-truthed run had to be exported to find
   out how it did, and there was no way to ask for just the rows that were wrong.
   A summary is now pinned above the grid — compared, incorrect and accuracy per
-  scored column — and **Ctrl+F** cycles the same filters the GUI's bar and the
-  interactive HTML export offer (All, Differences, Incorrect, Regressions),
-  showing how many rows of how many are on screen. Both read from the shared
+  scored column — and **`/`** cycles the same filters the GUI's bar and the
+  interactive HTML export offer (All, Differences, Incorrect, Regressions). The
+  results panel's own title says which filter is up and how many rows of how
+  many it leaves on screen, so the grid pays no rows for it. Both read from the shared
   metrics and filter modules, so all three views quote the same accuracy and
   hide the same rows. A report with no ground truth and nothing to filter is
   drawn exactly as before.
@@ -39,188 +40,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   (`WIDTH`, `HEIGHT`, `FIT`, `MEAN`, `COUNT`, …) are accented — but only inside
   their own parentheses, so a column honestly called `count` or `width` stays
   plain text.
-
-### Changed
-
-- **A still-failing row's `Trend` reads `unchanged`.** The column answers one
-  question — *did this row move?* — and for a row that was wrong before and is
-  wrong now the answer is no, so `still wrong` was answering a different
-  question in the column's own words. It now reads `unchanged` like the other
-  row that didn't move, with `Correct: incorrect` beside it saying which of the
-  two it is, and the cell still tinted red. Nothing else is lost: the tint and
-  the row filters read the scored cells rather than the column's text, so a
-  still-failing row is never confused with a passing one.
-
-- **The confusion matrix in an HTML export is drawn at readable size.** It was
-  set at the grid's own type size, so the handful of numbers a reader scans
-  across and down to find the one wrong cell were the smallest thing on the
-  page. The matrix now has roughly twice the type size and matching cell
-  padding — which is also most of the click target, since every cell filters the
-  table below it.
-
-- **The GUI asks for an export filename itself.** Exporting a report's results
-  used the desktop's own save dialog, whose format dropdown — tucked in the far
-  bottom corner — only *filtered* the listing: picking "Excel" left the name
-  ending `.csv`, and since PaperBoy chooses its writer by extension, the file
-  came out a CSV. Export now opens PaperBoy's own dialog, with the format
-  sitting next to the filename and changing it rewriting the extension, the way
-  the terminal UI has always worked. `Browse…` still opens the desktop picker
-  for anyone who wants to go looking for a folder.
-
-### Fixed
-
-- **A results row shows the pointing hand across its whole width.** The row was
-  clickable end to end but only looked it over the words in a cell, because the
-  cells take the hover from the row target wherever they overlap it. The cursor
-  now follows the row, not its text.
-
-- **An export offers the report's name from the folder the report works in.** A
-  saved report already exported beside itself; an unsaved one offered a bare
-  filename, which would have landed wherever PaperBoy was started from rather
-  than in the report's `# root:` directory the terminal UI's picker opens in.
-
-- **A whole results row opens its details, not just the words in it.** The click
-  target for expanding a row was the *text* of a cell, so the gaps between
-  columns, and the empty space in a short column, did nothing — a row of mostly
-  blank cells was nearly unclickable. The row itself is now the target; the
-  cells still win where they overlap, so each keeps its own hover text and its
-  value inspector.
-
-- **A `FOR` loop can be picked up and dragged.** The loop head's only drag
-  handle was the word `FOR` itself, making a loop the one block in the editor
-  you had to hit a three-letter target to move. Every fixed word on the head —
-  `FOR`, `IN FILES`/`IN FOLDERS`/`IN ENVS`, `MATCH` and the tail — is now a
-  handle, while the boxes between them are not, so a click meant for a field
-  still never starts a drag. Clicking a loop head also selects it (and
-  double-clicking opens its wizard), which it never did before.
-
-- **A column's clauses no longer look merged into the column.** `STATISTICS`,
-  `IMAGE`, `TRUTH` and `DETAIL` are drawn tethered to the column they belong to,
-  as one pill split into segments — but with nothing marking the splits, a
-  column carrying all four came out as a single long blob of text. Each segment
-  now has a visible seam down its leading edge, so the pill reads as the
-  segmented control it is meant to be.
-
-- **Hovering a chip highlights what a drag would actually pick up.** Resting the
-  pointer anywhere on a line lit the whole block, including when the pointer was
-  on a clause that a plain drag would pull out on its own — the highlight
-  promised to move the line and letting go would have detached one chip. A
-  detachable chip now outlines itself, and holding Ctrl (which is what turns the
-  same gesture into a whole-line drag) hands the highlight back to the block.
-
-- **A Workspace tab comes back to the report it was on.** A report opened from
-  a Workspace folder tree belongs to that tab, so it is closed when you leave —
-  but nothing reopened it when you came back, and the tab returned showing
-  whichever collection its tree had loaded last. Switching tabs now restores the
-  tab you arrive at from the same selection a restart restores from, so a report
-  you glance away from is still there when you look back.
-
-- **File > Save writes straight to the file, and Save As asks.** The File menu
-  offered only the asking kind, so saving a report you had just edited meant
-  walking through a file dialog to name the file it already had. There is now a
-  top-level **Save** (Ctrl+S) that writes whatever is in front of you — the open
-  report, otherwise the active collection — back where it came from, and a
-  **Save As…** submenu (Ctrl+Shift+S) holding the pickers that were there
-  before. Something that has never been saved still falls through to the picker,
-  since there is no file to write to. Ctrl+S and the menu entry now run the same
-  code, so they cannot disagree about what "save" means.
-
-- **The block editor draws a column's `IMAGE`, `TRUTH` and `DETAIL` clauses.**
-  Only `STATISTICS` was rendered, so a ground-truthed or picture-bearing column
-  looked identical to a plain one and the clauses could be edited but never
-  seen. Named columns now carry a chip per clause (detachable, like the
-  statistics chip), and a `WITH` field shows its clauses in its own row, where
-  its `STATISTICS(…)` already was.
-
-- **A plain HTML report no longer shows a lone "All" filter button.** The row
-  filters are offered only when a report actually has something to filter by (a
-  baseline to differ from, a ground truth to be wrong against, or a trend to
-  regress in); without one of those, "All" was a button whose only possible
-  effect was the state it was already in. The Find box and the row count are
-  unaffected — those are useful in every report.
-
-- **The Open and Save dialogs no longer freeze the window.** Every native file
-  picker was called straight from the frame loop and blocked it until the user
-  chose a file, so the window stopped repainting and the desktop offered to
-  force-quit the "not responding" application. It also stalled every other
-  per-frame poll — including the one that collects a finished report run, which
-  is why exporting results could report there was nothing to export.
-
-  Every dialog now runs on a worker thread and is collected when it answers:
-  File > Open and File > Save, the report editor's `root:` / `baseline:` /
-  `collection:` settings and its loop folder pickers, the `FILES`/`FOLDERS`
-  node wizard, Form and Multipart file values, the workspace's New Collection /
-  Report / Environment, the Postman import destination, and the git workspace
-  storage prompt.
-
-  Because the window now stays live while a chooser is open, pressing Browse a
-  second time no longer opens a rival dialog, and a path that arrives for a row
-  which has since been deleted (or a collection that has been closed) is
-  dropped rather than written somewhere it no longer belongs.
-
-### Changed
-
-- **The row drill-down uses the width it has, opens on a click, and resizes.**
-  The in-app panel stacked its sections down the pane, so a full-height
-  photograph buried the response body a screen below it; it now lays them across
-  the pane in readable-width columns, the same layout the interactive HTML
-  export's flex row produces. Clicking anywhere in a row that has a drill-down
-  now opens it, rather than only the caret doing so — a row with nothing to
-  drill into keeps the cell inspector, which is otherwise the only way to read a
-  truncated value. The divider between the grid and the panel can be dragged,
-  and the height is saved with the rest of the GUI's geometry, so a reader who
-  wants a big picture pane keeps it between runs and between sessions.
-
-- **The report editor's header is one row, not three.** The title, the
-  Blocks/Source/Results toggle and (in the results view) a near-empty band
-  holding Baseline and Export were three stacked strips above a table. They are
-  now one line — what the document is, which way you are looking at it, what you
-  can do to it — which hands two rows of the window back to the rows being read.
-  The run's status moved up beside the Run button that started it.
-
-- **The results view's summary block can be resized.** The metric cards, the
-  filter bar and the confusion matrices took whatever height they wanted, so a
-  report with a matrix per ground-truthed column left almost nothing for the
-  rows the matrices are describing — and opening a drill-down under it left less
-  still. The block now scrolls within a height of its own, with a splitter under
-  it to set that height, saved with the rest of the GUI's geometry. A report
-  with no matrices still reserves no empty space.
-
-- **A drill-down picture's path is legible.** The caption under a full-size
-  photograph was set at the small text style, leaving the one line that says
-  *which* file of a thousand this row is as a fine grey thread. It is now body
-  size and wraps rather than being cut off.
-
-- **A confusion-matrix cell is clickable across the whole cell.** The click
-  sense sat on the digits rather than on the block of colour around them, so
-  selecting the rows a cell counted meant hitting a target the width of the
-  number — a "7" was a few pixels wide in the middle of something that looked
-  like a button. The whole cell now takes the click, and shows the pointing-hand
-  cursor to say so.
-
-- **The in-app confusion matrix is drawn large enough to read.** The counts and
-  their axis labels were set at the small text style, so the matrix — a thing
-  read by comparing one cell against another at a glance — came out as a grid of
-  little grey numbers. The cells are now uniformly wide, evenly padded and set
-  above body size, with the counts centred in their block of colour. The sizes
-  are derived from the app's body text height, so the matrix still follows the
-  text scale rather than being pinned to a fixed pixel size.
-
-- **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used
-  to be a sizing *hint* only: the full-resolution source file was embedded
-  regardless, and the interactive HTML export then embedded a second copy of the
-  same bytes for the drill-down panel. A thousand-row report over 2 MB
-  photographs produced a file measured in gigabytes to show pictures 110 pixels
-  tall.
-
-  Pictures are now re-encoded to at most 640 pixels on their longest edge when
-  resolved, which is sized for the drill-down view — the grid scales the same
-  copy down in CSS, and the HTML panel now borrows its picture from the row's
-  own cell instead of carrying a duplicate. A picture already within the cap,
-  or in a format this build has no encoder for, is still embedded exactly as it
-  was: unshrinkable must never mean unusable.
-
-### Added
 
 - **The GUI results view has confusion matrices and per-row drill-down.** Each
   ground-truthed column's matrix is drawn under the metric cards, shaded off the
@@ -470,7 +289,282 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   so unsaved edits are seen; otherwise it is read from disk. A `git:` helper
   must be opened first, since validating a report should not do network I/O.
 
+- **Reports can break a request's `Time` into its parts.** Three new per-request
+  intrinsics sit alongside `Time` and always sum to it: `TimeSetup` (DNS, TCP
+  connect and the TLS handshake), `TimeWait` (request sent → first response
+  byte, the closest thing to "what the server took") and `TimeDownload`
+  (receiving the body). They answer the question `Time` alone can't: when a wide
+  `PARALLEL(…)` run makes response times climb, was that the server, or was it
+  your own machine and uplink getting to it?
+
+  Unlike the other intrinsics these are emitted **only** when a `SHOW(…)` or
+  `columns:` clause names them, so no existing report gains columns; the request
+  form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
+  excluded from a comparison run's compared fields, since they always differ.
+
+- **Reindent a PaperTrail script (`F` in the TUI, *Reindent* in the GUI).** Wrap
+  an existing block in a new outer loop and its whole body is suddenly one level
+  short; this puts every line back at its real block depth, four spaces a level.
+
+  **Only leading whitespace changes** — comments, blank lines and the spacing
+  inside a statement are preserved exactly, so it is safe to run over a file you
+  didn't write. (That rules out the obvious implementation of parsing to a flow
+  and re-serializing it: the AST has nowhere to keep a body comment, so a
+  round-trip through it deletes them.) The result is verified by re-parsing it
+  and comparing against the original, so reindenting can never change what a
+  report does; a script that doesn't parse is left alone rather than guessed at,
+  and it is a single undo step.
+
+- **`WITH` blocks open out in the TUI node editor.** A
+  `REPORT REQUEST … WITH … END` used to collapse to a single `… WITH …` row, so
+  its fields were invisible from the outline and there was no obvious way to add
+  one. Each field is now a row of its own, under the request and above the
+  block's `END`, with an `add a field…` row at the end: Enter edits a field,
+  Delete removes just that field, Shift+↑/↓ reorders the column within its
+  block, and `a` anywhere in the block adds another.
+
+- **Import a whole Postman workspace from inside PaperBoy.** Until now this
+  was CLI-only; both front-ends now have a wizard for it. Give it a Postman API
+  key, pick a workspace from the list it fetches, choose what to bring across
+  and where to put it, and the imported folder opens as a workspace. In the
+  terminal it's **File ▸ Load ▸ Workspace ▸ From Postman…**; in the GUI it's
+  **Open from Git ▸ From Postman…** (beside the other whole-folder sources).
+
+- **The wizard says what an import will cost before it spends anything.**
+  Postman rate-limits its API, so the confirmation step lists what was found,
+  explains that the download is paced deliberately, estimates how long it will
+  take, and warns when the import would eat an uncomfortable share of the
+  account's remaining monthly API budget. Nothing is downloaded until that
+  question is answered, so backing out there is free.
+
+- **A live estimate while it runs.** The progress view counts items, names the
+  one in flight, and shows a remaining time extrapolated from the rate actually
+  being achieved rather than the published one — a throttled account is exactly
+  when an estimate is worth having. When the importer is deliberately idle it
+  says so, rather than looking hung.
+
+- **A workspace id can be given up front to skip the list.** Paste an id or a
+  Postman workspace address into the optional field on the first step and the
+  wizard goes straight to the options — that listing call sits on Postman's
+  tightest rate-limit bucket, so it isn't made when the answer is already
+  known. The workspace's real name is picked up later and used for the folder.
+
+- The wizard offers the same **convert-to-Hurl** option as
+  `--postman-format hurl`, so an import can drop Postman's JSON entirely.
+
+- **A Postman import can now be converted to Hurl on the way in.** Pass
+  `--postman-format hurl` and collections arrive as `.hurl` files and
+  environments as `.vars` files, so the imported folder owes nothing to
+  Postman. The default is unchanged: Postman's own JSON, byte for byte.
+
+- **Anything the conversion can't carry across is written down.** Hurl has no
+  pre-request scripts and no OAuth 2, so a converted import leaves a
+  `CONVERSION-NOTES.md` listing, request by request, exactly what was dropped —
+  and no file at all when nothing was. A collection this build can't read is
+  kept as its original JSON rather than converted into an empty one, so
+  converting can never cost you data.
+
+- **Hovering a block in the visual report editor highlights it — and everything
+  that would move with it.** Pointing at a line lights that block, and pointing
+  at a `FOR` loop also lights its whole body and its `END`, so what a drag is
+  about to pick up is visible before the drag starts rather than only once the
+  block is in mid-air.
+
+- **`STATISTICS` can be dropped onto a `WITH` field.** A request's `WITH` fields
+  are the columns it actually produces, and the grammar has always allowed a
+  summary on one — but the block editor had nowhere to drop it, because a field
+  isn't a block. Each field row is now its own drop target, and the request line
+  above it explains why it refuses (it names no single column of its own).
+
+- **The desktop app can now save Workspaces and Reports to Git, not just
+  collections.** Saving to Git in the desktop app could only ever push a single
+  collection to a single branch. It now offers the same choices the terminal
+  app has always had: push a whole Workspace folder back to where it came from,
+  push an open Report, save the collection's environment alongside it in the
+  same commit, and tag a release instead of committing to a branch. The
+  Workspace and Report entries appear under *Save to Git* and are only
+  selectable when there is something for them to push.
+
+- **Download a whole Postman workspace from the command line.** Moving an
+  account into PaperBoy meant exporting each collection by hand, or writing a
+  script against the Postman API. `paperboy --postman-import` lists the
+  workspaces your API key can see, and
+  `paperboy --postman-import --postman-workspace <ID|URL> -o <FOLDER>`
+  downloads that workspace's collections and environments into a folder you can
+  open as a PaperBoy workspace. The workspace can be named by its id or by its
+  address in Postman, so the browser address bar can simply be pasted.
+
+  The key comes from `--postman-key` or `$POSTMAN_API_KEY`, and may be a
+  `{{ … }}` provider reference — `--postman-key '{{ op://Private/Postman/credential }}'`
+  works exactly as it would in a `.vars` file, so the key need not appear in
+  your shell history. It is never written to disk and is stripped from any error
+  message.
+
+  Postman rate-limits its API, and does so far more tightly for listing than for
+  fetching, so the import paces the two separately and adapts to the limits
+  reported in each response — a sixty-collection workspace takes about fifteen
+  seconds rather than the seventy a single uniform delay would cost. The run
+  says up front how many items it will fetch and roughly how long that will
+  take, and warns if it would consume most of what is left of your plan's
+  monthly API allowance.
+
+  A collection that has been deleted since the listing is reported and skipped
+  rather than ending the run; a rejected key or an exhausted monthly quota stops
+  it immediately, because neither improves by being retried. Everything is
+  written to a staging folder and moved into place in one step, so an
+  interrupted import never leaves a folder that looks like a workspace but is
+  missing half its collections, and an existing destination is left alone unless
+  `--overwrite` is given. `--postman-what` limits the import to just collections
+  or just environments.
+
+- **The Environments panel has a filter box, and shows the open workspace's
+  environments.** With an account's worth of environments loaded, finding the
+  one you want meant scrolling a list of hundreds. The panel now filters by
+  name — `/` in the terminal UI, a box above the list in the GUI — and, when a
+  Workspace tab is open, lists every environment file in that workspace
+  alongside the global ones, marked with a `⌂` (a folder icon in the GUI) so the
+  two can be told apart. Workspace files that haven't been opened yet are listed
+  too, dimmed, and open when you select them, so a folder of environments is
+  browsable without hunting through the tree for each one. In the terminal UI
+  `Esc` clears an applied filter, and Postman `.json` environments are now
+  recognised by the Workspace tree, so they appear as environments rather than
+  as collections.
+
+- **An environment file in a Workspace tree can be made the active environment
+  directly.** Previously it could only be opened, after which it still had to be
+  found again in the Environments panel and activated there. Right-clicking one
+  now offers "Set as active environment" in the GUI, and in the terminal UI both
+  `a` and a right-click on the row do the same — loading the file first if it
+  isn't open yet, reusing it if it is, and leaving the screen where it was.
+
+- **A `FOR` loop's variable, folder and file pattern are now edited on the chip
+  itself.** The loop head used to be one long label, which gave no hint that the
+  folder it reads from or the name it binds were things you could change — both
+  were only ever found by opening the wizard. `FOR` is now followed by a box for
+  the loop variable, the source keyword, a box and a picker button for the
+  folder (or file, for `TUPLES FROM`), and a `FILES` loop's `MATCH` pattern. The
+  picker starts in the folder the loop already names and writes what you choose
+  back relative to the report, so a report stays portable. Parts that no single
+  box could speak for — a destructuring pattern like `FOR (NAME, URL) IN …`, a
+  list literal, a `FOLDERS … WITH` role list — are still shown as text and still
+  edited through the wizard.
+
+- **Workspaces can be organised into folders from the app.** Right-clicking any
+  row in a Workspace tree (or the tree's own `New` menu) now offers "New
+  folder…" alongside the three file kinds, so a workspace can be tidied up
+  without leaving PaperBoy for a file manager. The new folder is revealed and
+  opened ready to have things dragged into it, and its name goes through the
+  same containment checks as a new file, so it can't be created outside the
+  workspace.
+
+- **"Save all changes" on the unsaved-changes warning.** Quitting with edits
+  that really would be lost now offers to write them out rather than only
+  offering to discard them. It saves exactly what the warning counts — every
+  edited file a Workspace tab is holding, including the ones it isn't currently
+  showing — and if a file can't be written the quit is called off and the file
+  that refused is named, so nothing is lost to a failed save.
+
+- **The Environments panel can be narrowed by source.** When a Workspace holds
+  hundreds of imported environments, hand-made global ones were buried in the
+  same list, and switching the name filter back and forth was a poor substitute
+  for saying which source you wanted. Both front-ends now offer a compact
+  Both/Global/Workspace source toggle that composes with the name filter and
+  remembers the choice across restarts.
+
+- **The GUI's top-level menus can be reached from the keyboard.** Pressing `Alt`
+  on its own arms the menu bar and underlines each menu's mnemonic letter, which
+  then opens that menu; `Alt`+letter as a single chord does the same thing in
+  one keystroke. `Esc`, a second `Alt`, or opening a menu puts the underlines
+  away again. The mnemonics are translated alongside the menu titles rather than
+  derived from them, so each language gets letters that suit its own words
+  (`F`/`V`/`S` in English, `F`/`A`/`P` in French, `F`/`V`/`I` in Danish).
+
 ### Changed
+
+- **A still-failing row's `Trend` reads `unchanged`.** The column answers one
+  question — *did this row move?* — and for a row that was wrong before and is
+  wrong now the answer is no, so `still wrong` was answering a different
+  question in the column's own words. It now reads `unchanged` like the other
+  row that didn't move, with `Correct: incorrect` beside it saying which of the
+  two it is, and the cell still tinted red. Nothing else is lost: the tint and
+  the row filters read the scored cells rather than the column's text, so a
+  still-failing row is never confused with a passing one.
+
+- **The confusion matrix in an HTML export is drawn at readable size.** It was
+  set at the grid's own type size, so the handful of numbers a reader scans
+  across and down to find the one wrong cell were the smallest thing on the
+  page. The matrix now has roughly twice the type size and matching cell
+  padding — which is also most of the click target, since every cell filters the
+  table below it.
+
+- **The GUI asks for an export filename itself.** Exporting a report's results
+  used the desktop's own save dialog, whose format dropdown — tucked in the far
+  bottom corner — only *filtered* the listing: picking "Excel" left the name
+  ending `.csv`, and since PaperBoy chooses its writer by extension, the file
+  came out a CSV. Export now opens PaperBoy's own dialog, with the format
+  sitting next to the filename and changing it rewriting the extension, the way
+  the terminal UI has always worked. `Browse…` still opens the desktop picker
+  for anyone who wants to go looking for a folder.
+
+- **The row drill-down uses the width it has, opens on a click, and resizes.**
+  The in-app panel stacked its sections down the pane, so a full-height
+  photograph buried the response body a screen below it; it now lays them across
+  the pane in readable-width columns, the same layout the interactive HTML
+  export's flex row produces. Clicking anywhere in a row that has a drill-down
+  now opens it, rather than only the caret doing so — a row with nothing to
+  drill into keeps the cell inspector, which is otherwise the only way to read a
+  truncated value. The divider between the grid and the panel can be dragged,
+  and the height is saved with the rest of the GUI's geometry, so a reader who
+  wants a big picture pane keeps it between runs and between sessions.
+
+- **The report editor's header is one row, not three.** The title, the
+  Blocks/Source/Results toggle and (in the results view) a near-empty band
+  holding Baseline and Export were three stacked strips above a table. They are
+  now one line — what the document is, which way you are looking at it, what you
+  can do to it — which hands two rows of the window back to the rows being read.
+  The run's status moved up beside the Run button that started it.
+
+- **The results view's summary block can be resized.** The metric cards, the
+  filter bar and the confusion matrices took whatever height they wanted, so a
+  report with a matrix per ground-truthed column left almost nothing for the
+  rows the matrices are describing — and opening a drill-down under it left less
+  still. The block now scrolls within a height of its own, with a splitter under
+  it to set that height, saved with the rest of the GUI's geometry. A report
+  with no matrices still reserves no empty space.
+
+- **A drill-down picture's path is legible.** The caption under a full-size
+  photograph was set at the small text style, leaving the one line that says
+  *which* file of a thousand this row is as a fine grey thread. It is now body
+  size and wraps rather than being cut off.
+
+- **A confusion-matrix cell is clickable across the whole cell.** The click
+  sense sat on the digits rather than on the block of colour around them, so
+  selecting the rows a cell counted meant hitting a target the width of the
+  number — a "7" was a few pixels wide in the middle of something that looked
+  like a button. The whole cell now takes the click, and shows the pointing-hand
+  cursor to say so.
+
+- **The in-app confusion matrix is drawn large enough to read.** The counts and
+  their axis labels were set at the small text style, so the matrix — a thing
+  read by comparing one cell against another at a glance — came out as a grid of
+  little grey numbers. The cells are now uniformly wide, evenly padded and set
+  above body size, with the counts centred in their block of colour. The sizes
+  are derived from the app's body text height, so the matrix still follows the
+  text scale rather than being pinned to a fixed pixel size.
+
+- **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used
+  to be a sizing *hint* only: the full-resolution source file was embedded
+  regardless, and the interactive HTML export then embedded a second copy of the
+  same bytes for the drill-down panel. A thousand-row report over 2 MB
+  photographs produced a file measured in gigabytes to show pictures 110 pixels
+  tall.
+
+  Pictures are now re-encoded to at most 640 pixels on their longest edge when
+  resolved, which is sized for the drill-down view — the grid scales the same
+  copy down in CSS, and the HTML panel now borrows its picture from the row's
+  own cell instead of carrying a duplicate. A picture already within the cap,
+  or in a format this build has no encoder for, is still embedded exactly as it
+  was: unshrinkable must never mean unusable.
 
 - **A label class is edited as two fields in the GUI's report settings.**
   `# labels:` used to be a single text box, so declaring a vocabulary meant
@@ -500,7 +594,258 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   was laid out in a fixed-width box with a wide empty margin to its right, and
   carried no heading to explain what the directives above the report were.
 
+- **The GUI's last hardcoded display strings now come from the translation
+  table**, so French and Danish get them too: the language names in Settings,
+  the Raw Request view's JSON / Hurl toggle, the URL, assertion and file-path
+  field hints, and the name a new report is created with.
+- **A custom HTTP verb's badge follows the theme.** Methods PaperBoy has no
+  colour for fell back to a fixed grey, which was the only colour in the GUI
+  that ignored the active theme; they now use the theme's dim colour.
+
+- **The Postman wizard's destination is now chosen in the file browser**, in
+  the terminal UI, instead of being typed as a path. It was the only place in
+  PaperBoy that asked you to know a folder path before you had seen one; it now
+  opens the same picker as every other "save into a folder", seeded at the
+  suggested destination and offering the folder name back for editing.
+  Cancelling the picker leaves the wizard exactly as it was. (The GUI already
+  used the native folder picker.)
+
+- The Postman import's state machine is now **shared between the terminal UI
+  and the GUI**, joining the git load and save flows. Every decision about what
+  an import does — validation, ordering, pacing, cancellation, what counts as a
+  failure — lives in one place, so the two front-ends cannot drift apart.
+
+- **The visual report editor's Send button is gone from the menu bar.** It ran
+  whatever request was selected in the active collection — the same thing the
+  Send button beside the URL does — but it was drawn on every screen, including
+  ones with no request in sight, so it could fire at something off-screen. The
+  keyboard shortcuts it advertised now appear on the real Send button.
+
+- **Key/value tables give their Description column room to be read.** The key
+  and value columns between them claimed the entire width, leaving the note a
+  sliver a word wouldn't fit in; all three now take a share. The column titles
+  also sit where the fields below them will be even when the table is empty, so
+  adding the first row no longer makes the headings jump apart.
+
+- **The workspace tree and the results grid are no longer rebuilt on every
+  frame.** Drawing the workspace list re-read the whole folder tree off disk —
+  a recursive directory scan sixty times a second, so simply moving the mouse
+  over a workspace was continuous filesystem I/O. Drawing a results grid
+  re-measured every cell in the table to size its columns, and computed the
+  `STATISTICS` summary rows once *per column* while doing it. Both now reuse
+  their last answer until something they depend on actually changes: about 8×
+  less work for the tree and 6× for the grid, and more on a large workspace or
+  a long report.
+
+  The tree is re-read whenever PaperBoy itself creates, moves or deletes a
+  file, and otherwise at most a few times a second, so a change made outside
+  PaperBoy (another editor, a `git pull`) still appears without a refresh.
+
+- **Syntax highlighting is no longer recomputed on every frame.** Both the
+  PaperTrail source editor and the request Code view re-ran their highlighter
+  over the entire buffer each frame — every keyword, `{{ VAR }}` and error line
+  re-classified sixty times a second for text that hadn't changed. Each now
+  keeps its last colouring and rebuilds only when something it depends on
+  moves: the text, the error line, the loaded environments, the request names,
+  the theme, the font size or the wrap width.
+
+  The Code view was additionally running a *second*, complete highlighting pass
+  purely to find out which kinds of substitution appeared in the buffer, so it
+  could label the legend beneath it — and threw the coloured result away. That
+  pass is now a plain scan that only answers that question.
+
+- **Every terminal-UI file picker can be filtered by typing.** Only the three
+  "open an existing collection / environment / report" pickers took a typed
+  filter; the folder pickers did not — including the one that chooses the
+  source folder for a `FOR … IN FILES/FOLDERS` loop, which is browsed against a
+  real corpus tree and is exactly where sifting a crowded directory matters. All
+  of them now narrow as you type, with the same `Filter:` strip showing what is
+  being matched.
+
+  Two keys keep their existing meaning: in a "save to folder" picker typing only
+  filters while the *list* has focus (Tab moves to the filename field, where the
+  same keys type a name), and in the three folder pickers `Space` still confirms
+  the current directory rather than entering a space.
+
+- **Both apps now run the same saving logic.** Loading from Git was unified in
+  the previous release; saving now follows, so a fix or an improvement to
+  saving reaches the terminal and the desktop at the same time instead of one
+  of them drifting behind.
+
+- **Both front-ends now drive one shared "load from a git remote" flow.** The
+  terminal UI and the GUI each had their own copy of the wizard, and the copies
+  had drifted. The steps, the background work and the recorded provenance now
+  live in one place, so a fix or an improvement to the flow reaches both.
+
+- **The report editor has been restyled to look like a working tool.** The
+  drag-and-drop view is the part of PaperBoy used by people who don't otherwise
+  write code, and several of them reported it looked childish enough that they
+  were reluctant to show it to colleagues. Nothing about how it works has
+  changed — no gesture, command or layout is different — but six things about
+  how it looks are:
+
+  - A block's category is now carried by a colour bar down its leading edge
+    rather than by the fill of the whole block. The hues are unchanged and just
+    as easy to tell apart, but a flow of ten blocks is no longer ten filled
+    panels of colour.
+  - Chip and block corners are much less rounded, and spacing and control
+    padding are tighter throughout the GUI, which fits more of a report on
+    screen.
+  - Chip labels are now set as two kinds of word: the editor's own keywords in
+    the interface font, and names you supplied in a monospace one, so
+    `BASELINE(staging)` no longer reads as a single phrase. Inline fields are
+    monospace for the same reason.
+  - Chip label contrast has been fixed. Category-coloured text on a tint of the
+    same colour fell as low as 2.3:1 in places, which is below the accessibility
+    floor for body text; every category on every built-in theme now passes WCAG
+    AA, and there is a test to keep it that way.
+  - Icons throughout the GUI are drawn in a lighter weight so they stop
+    competing with the labels beside them.
+  - The synthetic row at the top of a flow is drawn as a caption rather than in
+    a keyword's colour. It marks where the report starts and, unlike the `END`
+    that closes a loop, is not something that appears in the file — colouring it
+    like syntax implied there was a `BEGIN` keyword to write, and there isn't.
+
+- **PaperBoy now opens on a neutral dark theme.** The three language themes are
+  saturated flag colours with a bright yellow selection, which look striking and
+  read as unserious in an office. A new "Graphite" preset — a near-neutral grey
+  ground with a single restrained blue accent — is what a fresh install starts
+  on. The language themes remain, "Follow language" remains a choice you can
+  make, and an existing install keeps whatever theme it already had.
+
+- **The Workspace filter no longer hides folders.** With the filter on, a folder
+  containing nothing it matched was left out of the tree entirely, which made
+  the tree impossible to organise with: a folder created to tidy files into
+  disappeared the moment it was made, and there was nowhere to drop the first
+  one. The filter still applies to files, which is what it was for.
+
+- **A clause that qualifies another chip is now drawn as one pill with it.** In
+  the report editor's drag-and-drop view, `SHOW(…)` belongs to the `BASELINE`
+  before it, and `STATISTICS(…)` to the column before it, but the thin bracket
+  that said so was drawn beside the chips and read as decoration — it never made
+  clear which of the two owned the other. The pair now sits flush inside a single
+  outline with the meeting corners squared off, the way a segmented control does,
+  and hovering either half outlines both. Each chip keeps the colour its own kind
+  always has, so a `SHOW` still reads as a `SHOW`.
+
+- **The two front-ends now share one copy of the application state.** The
+  terminal UI kept its own duplicate of everything it had in common with the
+  graphical one — the open tabs, the global environments, the themes and every
+  persisted preference: 26 fields, plus a hand-written second copy of the code
+  that reads and writes `state.json`. The two could drift, and had: a default
+  changed in one place stayed unchanged in the other, and the terminal UI
+  carried a field of the GUI's window geometry that nothing there ever read,
+  purely so saving from the terminal didn't wipe it. `TuiApp` now owns a
+  `Session` and reads straight through it, so there is a single copy in the
+  process and a single writer of the state file. Nothing about either front-end
+  behaves differently, with one exception noted below.
+
+- **A Workspace whose folder has vanished now says so in the GUI too.** The
+  explanation ("the folder for this Workspace is gone") was written when the
+  terminal UI restored a session and was lost when the graphical one did, which
+  left an empty tab and no reason for it. Both front-ends now restore state
+  through the same code, so both report it.
+
+- **The GUI is now behind a `gui` Cargo feature, and is no longer built by
+  default.** `cargo install paperboy` builds only the terminal UI and the
+  headless runner; `cargo install paperboy --features gui` adds the graphical
+  one. eframe/winit/wgpu more than doubled the dependency tree (225 crates to
+  482) and dominated the build, which is a poor trade for anyone who only wants
+  PaperBoy in a terminal. Nothing else changes: the saved-state format is
+  identical, so a terminal-only build still round-trips a GUI user's window and
+  panel geometry, and `--gui` on a build without the feature prints the command
+  to install one that has it rather than failing to parse the flag.
+
 ### Fixed
+
+- **A results row shows the pointing hand across its whole width.** The row was
+  clickable end to end but only looked it over the words in a cell, because the
+  cells take the hover from the row target wherever they overlap it. The cursor
+  now follows the row, not its text.
+
+- **An export offers the report's name from the folder the report works in.** A
+  saved report already exported beside itself; an unsaved one offered a bare
+  filename, which would have landed wherever PaperBoy was started from rather
+  than in the report's `# root:` directory the terminal UI's picker opens in.
+
+- **A whole results row opens its details, not just the words in it.** The click
+  target for expanding a row was the *text* of a cell, so the gaps between
+  columns, and the empty space in a short column, did nothing — a row of mostly
+  blank cells was nearly unclickable. The row itself is now the target; the
+  cells still win where they overlap, so each keeps its own hover text and its
+  value inspector.
+
+- **A `FOR` loop can be picked up and dragged.** The loop head's only drag
+  handle was the word `FOR` itself, making a loop the one block in the editor
+  you had to hit a three-letter target to move. Every fixed word on the head —
+  `FOR`, `IN FILES`/`IN FOLDERS`/`IN ENVS`, `MATCH` and the tail — is now a
+  handle, while the boxes between them are not, so a click meant for a field
+  still never starts a drag. Clicking a loop head also selects it (and
+  double-clicking opens its wizard), which it never did before.
+
+- **A column's clauses no longer look merged into the column.** `STATISTICS`,
+  `IMAGE`, `TRUTH` and `DETAIL` are drawn tethered to the column they belong to,
+  as one pill split into segments — but with nothing marking the splits, a
+  column carrying all four came out as a single long blob of text. Each segment
+  now has a visible seam down its leading edge, so the pill reads as the
+  segmented control it is meant to be.
+
+- **Hovering a chip highlights what a drag would actually pick up.** Resting the
+  pointer anywhere on a line lit the whole block, including when the pointer was
+  on a clause that a plain drag would pull out on its own — the highlight
+  promised to move the line and letting go would have detached one chip. A
+  detachable chip now outlines itself, and holding Ctrl (which is what turns the
+  same gesture into a whole-line drag) hands the highlight back to the block.
+
+- **A Workspace tab comes back to the report it was on.** A report opened from
+  a Workspace folder tree belongs to that tab, so it is closed when you leave —
+  but nothing reopened it when you came back, and the tab returned showing
+  whichever collection its tree had loaded last. Switching tabs now restores the
+  tab you arrive at from the same selection a restart restores from, so a report
+  you glance away from is still there when you look back.
+
+- **File > Save writes straight to the file, and Save As asks.** The File menu
+  offered only the asking kind, so saving a report you had just edited meant
+  walking through a file dialog to name the file it already had. There is now a
+  top-level **Save** (Ctrl+S) that writes whatever is in front of you — the open
+  report, otherwise the active collection — back where it came from, and a
+  **Save As…** submenu (Ctrl+Shift+S) holding the pickers that were there
+  before. Something that has never been saved still falls through to the picker,
+  since there is no file to write to. Ctrl+S and the menu entry now run the same
+  code, so they cannot disagree about what "save" means.
+
+- **The block editor draws a column's `IMAGE`, `TRUTH` and `DETAIL` clauses.**
+  Only `STATISTICS` was rendered, so a ground-truthed or picture-bearing column
+  looked identical to a plain one and the clauses could be edited but never
+  seen. Named columns now carry a chip per clause (detachable, like the
+  statistics chip), and a `WITH` field shows its clauses in its own row, where
+  its `STATISTICS(…)` already was.
+
+- **A plain HTML report no longer shows a lone "All" filter button.** The row
+  filters are offered only when a report actually has something to filter by (a
+  baseline to differ from, a ground truth to be wrong against, or a trend to
+  regress in); without one of those, "All" was a button whose only possible
+  effect was the state it was already in. The Find box and the row count are
+  unaffected — those are useful in every report.
+
+- **The Open and Save dialogs no longer freeze the window.** Every native file
+  picker was called straight from the frame loop and blocked it until the user
+  chose a file, so the window stopped repainting and the desktop offered to
+  force-quit the "not responding" application. It also stalled every other
+  per-frame poll — including the one that collects a finished report run, which
+  is why exporting results could report there was nothing to export.
+
+  Every dialog now runs on a worker thread and is collected when it answers:
+  File > Open and File > Save, the report editor's `root:` / `baseline:` /
+  `collection:` settings and its loop folder pickers, the `FILES`/`FOLDERS`
+  node wizard, Form and Multipart file values, the workspace's New Collection /
+  Report / Environment, the Postman import destination, and the git workspace
+  storage prompt.
+
+  Because the window now stays live while a chooser is open, pressing Browse a
+  second time no longer opens a rival dialog, and a path that arrives for a row
+  which has since been deleted (or a collection that has been closed) is
+  dropped rather than written somewhere it no longer belongs.
 
 - **Live summary statistics no longer count rows that haven't run yet.** The
   results grid fills in a skeleton row per pending request, whose `Time` and
@@ -554,47 +899,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   so one enormous JSON body can't push everything else off the page), headers
   are never broken mid-word, and a wide report scrolls sideways instead of
   being crushed.
-
-
-## [0.7.3] - 2026-08-08
-
-### Added
-
-- **Reports can break a request's `Time` into its parts.** Three new per-request
-  intrinsics sit alongside `Time` and always sum to it: `TimeSetup` (DNS, TCP
-  connect and the TLS handshake), `TimeWait` (request sent → first response
-  byte, the closest thing to "what the server took") and `TimeDownload`
-  (receiving the body). They answer the question `Time` alone can't: when a wide
-  `PARALLEL(…)` run makes response times climb, was that the server, or was it
-  your own machine and uplink getting to it?
-
-  Unlike the other intrinsics these are emitted **only** when a `SHOW(…)` or
-  `columns:` clause names them, so no existing report gains columns; the request
-  form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
-  excluded from a comparison run's compared fields, since they always differ.
-
-- **Reindent a PaperTrail script (`F` in the TUI, *Reindent* in the GUI).** Wrap
-  an existing block in a new outer loop and its whole body is suddenly one level
-  short; this puts every line back at its real block depth, four spaces a level.
-
-  **Only leading whitespace changes** — comments, blank lines and the spacing
-  inside a statement are preserved exactly, so it is safe to run over a file you
-  didn't write. (That rules out the obvious implementation of parsing to a flow
-  and re-serializing it: the AST has nowhere to keep a body comment, so a
-  round-trip through it deletes them.) The result is verified by re-parsing it
-  and comparing against the original, so reindenting can never change what a
-  report does; a script that doesn't parse is left alone rather than guessed at,
-  and it is a single undo step.
-
-- **`WITH` blocks open out in the TUI node editor.** A
-  `REPORT REQUEST … WITH … END` used to collapse to a single `… WITH …` row, so
-  its fields were invisible from the outline and there was no obvious way to add
-  one. Each field is now a row of its own, under the request and above the
-  block's `END`, with an `add a field…` row at the end: Enter edits a field,
-  Delete removes just that field, Shift+↑/↓ reorders the column within its
-  block, and `a` anywhere in the block adds another.
-
-### Fixed
 
 - **Comments in a report body are no longer deleted.** A `#` line among the
   statements was treated as whitespace and thrown away when the script was
@@ -650,10 +954,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `SHOW` — whose checklist lives in the ENVS form — did not, leaving no way to
   reach it by clicking the thing it belongs to.
 
-## [0.7.2] - 2026-08-08
-
-### Fixed
-
 - **Saving a workspace or a report to Git said "Save collection to Git"**. The
   dialog had one hardcoded title for all three save targets, so two of the
   three announced themselves as something they weren't. Each target now titles
@@ -663,165 +963,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   which the window wasn't drawn panicked. An undrawn frame is now simply not an
   answer — the dialog stays open and asks again.
 
-### Changed
-
-- **The GUI's last hardcoded display strings now come from the translation
-  table**, so French and Danish get them too: the language names in Settings,
-  the Raw Request view's JSON / Hurl toggle, the URL, assertion and file-path
-  field hints, and the name a new report is created with.
-- **A custom HTTP verb's badge follows the theme.** Methods PaperBoy has no
-  colour for fell back to a fixed grey, which was the only colour in the GUI
-  that ignored the active theme; they now use the theme's dim colour.
-
-
-## [0.7.1] - 2026-08-08
-
-### Changed
-
-- **The Postman wizard's destination is now chosen in the file browser**, in
-  the terminal UI, instead of being typed as a path. It was the only place in
-  PaperBoy that asked you to know a folder path before you had seen one; it now
-  opens the same picker as every other "save into a folder", seeded at the
-  suggested destination and offering the folder name back for editing.
-  Cancelling the picker leaves the wizard exactly as it was. (The GUI already
-  used the native folder picker.)
-
-### Fixed
-
 - **The hint under the Postman import options said "Enter connect"**, which was
   true on none of the rows it appeared over — Enter actually chose a folder,
   flipped a toggle, or started the import depending on where the cursor was.
   The hint now describes the row the cursor is on.
-
-
-## [0.7.0] - 2026-08-09
-
-### Added
-
-- **Import a whole Postman workspace from inside PaperBoy.** Until now this
-  was CLI-only; both front-ends now have a wizard for it. Give it a Postman API
-  key, pick a workspace from the list it fetches, choose what to bring across
-  and where to put it, and the imported folder opens as a workspace. In the
-  terminal it's **File ▸ Load ▸ Workspace ▸ From Postman…**; in the GUI it's
-  **Open from Git ▸ From Postman…** (beside the other whole-folder sources).
-
-- **The wizard says what an import will cost before it spends anything.**
-  Postman rate-limits its API, so the confirmation step lists what was found,
-  explains that the download is paced deliberately, estimates how long it will
-  take, and warns when the import would eat an uncomfortable share of the
-  account's remaining monthly API budget. Nothing is downloaded until that
-  question is answered, so backing out there is free.
-
-- **A live estimate while it runs.** The progress view counts items, names the
-  one in flight, and shows a remaining time extrapolated from the rate actually
-  being achieved rather than the published one — a throttled account is exactly
-  when an estimate is worth having. When the importer is deliberately idle it
-  says so, rather than looking hung.
-
-- **A workspace id can be given up front to skip the list.** Paste an id or a
-  Postman workspace address into the optional field on the first step and the
-  wizard goes straight to the options — that listing call sits on Postman's
-  tightest rate-limit bucket, so it isn't made when the answer is already
-  known. The workspace's real name is picked up later and used for the folder.
-
-- The wizard offers the same **convert-to-Hurl** option as
-  `--postman-format hurl`, so an import can drop Postman's JSON entirely.
-
-### Changed
-
-- The Postman import's state machine is now **shared between the terminal UI
-  and the GUI**, joining the git load and save flows. Every decision about what
-  an import does — validation, ordering, pacing, cancellation, what counts as a
-  failure — lives in one place, so the two front-ends cannot drift apart.
-
-
-## [0.6.0] - 2026-08-08
-
-### Added
-
-- **A Postman import can now be converted to Hurl on the way in.** Pass
-  `--postman-format hurl` and collections arrive as `.hurl` files and
-  environments as `.vars` files, so the imported folder owes nothing to
-  Postman. The default is unchanged: Postman's own JSON, byte for byte.
-
-- **Anything the conversion can't carry across is written down.** Hurl has no
-  pre-request scripts and no OAuth 2, so a converted import leaves a
-  `CONVERSION-NOTES.md` listing, request by request, exactly what was dropped —
-  and no file at all when nothing was. A collection this build can't read is
-  kept as its original JSON rather than converted into an empty one, so
-  converting can never cost you data.
-
-### Added
-
-- **Hovering a block in the visual report editor highlights it — and everything
-  that would move with it.** Pointing at a line lights that block, and pointing
-  at a `FOR` loop also lights its whole body and its `END`, so what a drag is
-  about to pick up is visible before the drag starts rather than only once the
-  block is in mid-air.
-
-- **`STATISTICS` can be dropped onto a `WITH` field.** A request's `WITH` fields
-  are the columns it actually produces, and the grammar has always allowed a
-  summary on one — but the block editor had nowhere to drop it, because a field
-  isn't a block. Each field row is now its own drop target, and the request line
-  above it explains why it refuses (it names no single column of its own).
-
-### Changed
-
-- **The visual report editor's Send button is gone from the menu bar.** It ran
-  whatever request was selected in the active collection — the same thing the
-  Send button beside the URL does — but it was drawn on every screen, including
-  ones with no request in sight, so it could fire at something off-screen. The
-  keyboard shortcuts it advertised now appear on the real Send button.
-
-- **Key/value tables give their Description column room to be read.** The key
-  and value columns between them claimed the entire width, leaving the note a
-  sliver a word wouldn't fit in; all three now take a share. The column titles
-  also sit where the fields below them will be even when the table is empty, so
-  adding the first row no longer makes the headings jump apart.
-
-- **The workspace tree and the results grid are no longer rebuilt on every
-  frame.** Drawing the workspace list re-read the whole folder tree off disk —
-  a recursive directory scan sixty times a second, so simply moving the mouse
-  over a workspace was continuous filesystem I/O. Drawing a results grid
-  re-measured every cell in the table to size its columns, and computed the
-  `STATISTICS` summary rows once *per column* while doing it. Both now reuse
-  their last answer until something they depend on actually changes: about 8×
-  less work for the tree and 6× for the grid, and more on a large workspace or
-  a long report.
-
-  The tree is re-read whenever PaperBoy itself creates, moves or deletes a
-  file, and otherwise at most a few times a second, so a change made outside
-  PaperBoy (another editor, a `git pull`) still appears without a refresh.
-
-- **Syntax highlighting is no longer recomputed on every frame.** Both the
-  PaperTrail source editor and the request Code view re-ran their highlighter
-  over the entire buffer each frame — every keyword, `{{ VAR }}` and error line
-  re-classified sixty times a second for text that hadn't changed. Each now
-  keeps its last colouring and rebuilds only when something it depends on
-  moves: the text, the error line, the loaded environments, the request names,
-  the theme, the font size or the wrap width.
-
-  The Code view was additionally running a *second*, complete highlighting pass
-  purely to find out which kinds of substitution appeared in the buffer, so it
-  could label the legend beneath it — and threw the coloured result away. That
-  pass is now a plain scan that only answers that question.
-
-### Changed
-
-- **Every terminal-UI file picker can be filtered by typing.** Only the three
-  "open an existing collection / environment / report" pickers took a typed
-  filter; the folder pickers did not — including the one that chooses the
-  source folder for a `FOR … IN FILES/FOLDERS` loop, which is browsed against a
-  real corpus tree and is exactly where sifting a crowded directory matters. All
-  of them now narrow as you type, with the same `Filter:` strip showing what is
-  being matched.
-
-  Two keys keep their existing meaning: in a "save to folder" picker typing only
-  filters while the *list* has focus (Tab moves to the filename field, where the
-  same keys type a name), and in the three folder pickers `Space` still confirms
-  the current directory rather than entering a space.
-
-### Fixed
 
 - **A file browser filter no longer makes the folder you open look empty.** The
   typed filter stayed applied when you moved to another directory, so descending
@@ -934,28 +1079,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   directive read meant switching front-ends. A Baseline button now sits beside
   Export in the results view, suggesting the same `<report>.baseline` name.
 
-## [0.5.0] - 2026-08-08
-
-### Added
-
-- **The desktop app can now save Workspaces and Reports to Git, not just
-  collections.** Saving to Git in the desktop app could only ever push a single
-  collection to a single branch. It now offers the same choices the terminal
-  app has always had: push a whole Workspace folder back to where it came from,
-  push an open Report, save the collection's environment alongside it in the
-  same commit, and tag a release instead of committing to a branch. The
-  Workspace and Report entries appear under *Save to Git* and are only
-  selectable when there is something for them to push.
-
-### Changed
-
-- **Both apps now run the same saving logic.** Loading from Git was unified in
-  the previous release; saving now follows, so a fix or an improvement to
-  saving reaches the terminal and the desktop at the same time instead of one
-  of them drifting behind.
-
-### Fixed
-
 - **A rejected file path no longer sends the desktop app back to the start.**
   Entering a path that would write outside the repository now reports the
   problem on the path step itself, so it can be corrected in place.
@@ -986,10 +1109,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   finished. The path is now checked alongside every other reference, once the
   report has been saved somewhere for a relative path to resolve against.
 
-## [0.4.2] - 2026-08-08
-
-### Fixed
-
 - **Copying no longer leaves a trail of unkillable processes behind.** Every
   copy — from the Request, Response and Reports panels alike — stranded a
   clipboard helper that was never cleaned up, so a long session accumulated
@@ -1012,200 +1131,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   whatever you had copied, and spawned a helper process for each one. Copies
   are now disabled while the tests run.
 
-
-## [0.4.1] - 2026-08-07
-
-### Fixed
-
 - **Menus in the terminal UI no longer close the instant they open.** The File
   and Settings menus, and the quit confirmation, disappeared within a fraction
   of a second of being opened, which left no way to reach any of them — or to
   quit PaperBoy from its own interface. The wizard-polling that runs on every
   pass of the event loop took the open overlay before checking whether the
   overlay was the one it was interested in, and dropped whatever it found.
-
-### Changed
-
-- **Both front-ends now drive one shared "load from a git remote" flow.** The
-  terminal UI and the GUI each had their own copy of the wizard, and the copies
-  had drifted. The steps, the background work and the recorded provenance now
-  live in one place, so a fix or an improvement to the flow reaches both.
-
-
-## [0.4.0] - 2026-08-07
-
-### Added
-
-- **Download a whole Postman workspace from the command line.** Moving an
-  account into PaperBoy meant exporting each collection by hand, or writing a
-  script against the Postman API. `paperboy --postman-import` lists the
-  workspaces your API key can see, and
-  `paperboy --postman-import --postman-workspace <ID|URL> -o <FOLDER>`
-  downloads that workspace's collections and environments into a folder you can
-  open as a PaperBoy workspace. The workspace can be named by its id or by its
-  address in Postman, so the browser address bar can simply be pasted.
-
-  The key comes from `--postman-key` or `$POSTMAN_API_KEY`, and may be a
-  `{{ … }}` provider reference — `--postman-key '{{ op://Private/Postman/credential }}'`
-  works exactly as it would in a `.vars` file, so the key need not appear in
-  your shell history. It is never written to disk and is stripped from any error
-  message.
-
-  Postman rate-limits its API, and does so far more tightly for listing than for
-  fetching, so the import paces the two separately and adapts to the limits
-  reported in each response — a sixty-collection workspace takes about fifteen
-  seconds rather than the seventy a single uniform delay would cost. The run
-  says up front how many items it will fetch and roughly how long that will
-  take, and warns if it would consume most of what is left of your plan's
-  monthly API allowance.
-
-  A collection that has been deleted since the listing is reported and skipped
-  rather than ending the run; a rejected key or an exhausted monthly quota stops
-  it immediately, because neither improves by being retried. Everything is
-  written to a staging folder and moved into place in one step, so an
-  interrupted import never leaves a folder that looks like a workspace but is
-  missing half its collections, and an existing destination is left alone unless
-  `--overwrite` is given. `--postman-what` limits the import to just collections
-  or just environments.
-
-
-
-### Added
-
-- **The Environments panel has a filter box, and shows the open workspace's
-  environments.** With an account's worth of environments loaded, finding the
-  one you want meant scrolling a list of hundreds. The panel now filters by
-  name — `/` in the terminal UI, a box above the list in the GUI — and, when a
-  Workspace tab is open, lists every environment file in that workspace
-  alongside the global ones, marked with a `⌂` (a folder icon in the GUI) so the
-  two can be told apart. Workspace files that haven't been opened yet are listed
-  too, dimmed, and open when you select them, so a folder of environments is
-  browsable without hunting through the tree for each one. In the terminal UI
-  `Esc` clears an applied filter, and Postman `.json` environments are now
-  recognised by the Workspace tree, so they appear as environments rather than
-  as collections.
-
-- **An environment file in a Workspace tree can be made the active environment
-  directly.** Previously it could only be opened, after which it still had to be
-  found again in the Environments panel and activated there. Right-clicking one
-  now offers "Set as active environment" in the GUI, and in the terminal UI both
-  `a` and a right-click on the row do the same — loading the file first if it
-  isn't open yet, reusing it if it is, and leaving the screen where it was.
-
-- **A `FOR` loop's variable, folder and file pattern are now edited on the chip
-  itself.** The loop head used to be one long label, which gave no hint that the
-  folder it reads from or the name it binds were things you could change — both
-  were only ever found by opening the wizard. `FOR` is now followed by a box for
-  the loop variable, the source keyword, a box and a picker button for the
-  folder (or file, for `TUPLES FROM`), and a `FILES` loop's `MATCH` pattern. The
-  picker starts in the folder the loop already names and writes what you choose
-  back relative to the report, so a report stays portable. Parts that no single
-  box could speak for — a destructuring pattern like `FOR (NAME, URL) IN …`, a
-  list literal, a `FOLDERS … WITH` role list — are still shown as text and still
-  edited through the wizard.
-
-- **Workspaces can be organised into folders from the app.** Right-clicking any
-  row in a Workspace tree (or the tree's own `New` menu) now offers "New
-  folder…" alongside the three file kinds, so a workspace can be tidied up
-  without leaving PaperBoy for a file manager. The new folder is revealed and
-  opened ready to have things dragged into it, and its name goes through the
-  same containment checks as a new file, so it can't be created outside the
-  workspace.
-
-- **"Save all changes" on the unsaved-changes warning.** Quitting with edits
-  that really would be lost now offers to write them out rather than only
-  offering to discard them. It saves exactly what the warning counts — every
-  edited file a Workspace tab is holding, including the ones it isn't currently
-  showing — and if a file can't be written the quit is called off and the file
-  that refused is named, so nothing is lost to a failed save.
-
-- **The Environments panel can be narrowed by source.** When a Workspace holds
-  hundreds of imported environments, hand-made global ones were buried in the
-  same list, and switching the name filter back and forth was a poor substitute
-  for saying which source you wanted. Both front-ends now offer a compact
-  Both/Global/Workspace source toggle that composes with the name filter and
-  remembers the choice across restarts.
-
-- **The GUI's top-level menus can be reached from the keyboard.** Pressing `Alt`
-  on its own arms the menu bar and underlines each menu's mnemonic letter, which
-  then opens that menu; `Alt`+letter as a single chord does the same thing in
-  one keystroke. `Esc`, a second `Alt`, or opening a menu puts the underlines
-  away again. The mnemonics are translated alongside the menu titles rather than
-  derived from them, so each language gets letters that suit its own words
-  (`F`/`V`/`S` in English, `F`/`A`/`P` in French, `F`/`V`/`I` in Danish).
-
-### Changed
-
-- **The report editor has been restyled to look like a working tool.** The
-  drag-and-drop view is the part of PaperBoy used by people who don't otherwise
-  write code, and several of them reported it looked childish enough that they
-  were reluctant to show it to colleagues. Nothing about how it works has
-  changed — no gesture, command or layout is different — but six things about
-  how it looks are:
-
-  - A block's category is now carried by a colour bar down its leading edge
-    rather than by the fill of the whole block. The hues are unchanged and just
-    as easy to tell apart, but a flow of ten blocks is no longer ten filled
-    panels of colour.
-  - Chip and block corners are much less rounded, and spacing and control
-    padding are tighter throughout the GUI, which fits more of a report on
-    screen.
-  - Chip labels are now set as two kinds of word: the editor's own keywords in
-    the interface font, and names you supplied in a monospace one, so
-    `BASELINE(staging)` no longer reads as a single phrase. Inline fields are
-    monospace for the same reason.
-  - Chip label contrast has been fixed. Category-coloured text on a tint of the
-    same colour fell as low as 2.3:1 in places, which is below the accessibility
-    floor for body text; every category on every built-in theme now passes WCAG
-    AA, and there is a test to keep it that way.
-  - Icons throughout the GUI are drawn in a lighter weight so they stop
-    competing with the labels beside them.
-  - The synthetic row at the top of a flow is drawn as a caption rather than in
-    a keyword's colour. It marks where the report starts and, unlike the `END`
-    that closes a loop, is not something that appears in the file — colouring it
-    like syntax implied there was a `BEGIN` keyword to write, and there isn't.
-
-- **PaperBoy now opens on a neutral dark theme.** The three language themes are
-  saturated flag colours with a bright yellow selection, which look striking and
-  read as unserious in an office. A new "Graphite" preset — a near-neutral grey
-  ground with a single restrained blue accent — is what a fresh install starts
-  on. The language themes remain, "Follow language" remains a choice you can
-  make, and an existing install keeps whatever theme it already had.
-
-- **The Workspace filter no longer hides folders.** With the filter on, a folder
-  containing nothing it matched was left out of the tree entirely, which made
-  the tree impossible to organise with: a folder created to tidy files into
-  disappeared the moment it was made, and there was nowhere to drop the first
-  one. The filter still applies to files, which is what it was for.
-
-- **A clause that qualifies another chip is now drawn as one pill with it.** In
-  the report editor's drag-and-drop view, `SHOW(…)` belongs to the `BASELINE`
-  before it, and `STATISTICS(…)` to the column before it, but the thin bracket
-  that said so was drawn beside the chips and read as decoration — it never made
-  clear which of the two owned the other. The pair now sits flush inside a single
-  outline with the meeting corners squared off, the way a segmented control does,
-  and hovering either half outlines both. Each chip keeps the colour its own kind
-  always has, so a `SHOW` still reads as a `SHOW`.
-
-- **The two front-ends now share one copy of the application state.** The
-  terminal UI kept its own duplicate of everything it had in common with the
-  graphical one — the open tabs, the global environments, the themes and every
-  persisted preference: 26 fields, plus a hand-written second copy of the code
-  that reads and writes `state.json`. The two could drift, and had: a default
-  changed in one place stayed unchanged in the other, and the terminal UI
-  carried a field of the GUI's window geometry that nothing there ever read,
-  purely so saving from the terminal didn't wipe it. `TuiApp` now owns a
-  `Session` and reads straight through it, so there is a single copy in the
-  process and a single writer of the state file. Nothing about either front-end
-  behaves differently, with one exception noted below.
-
-- **A Workspace whose folder has vanished now says so in the GUI too.** The
-  explanation ("the folder for this Workspace is gone") was written when the
-  terminal UI restored a session and was lost when the graphical one did, which
-  left an empty tab and no reason for it. Both front-ends now restore state
-  through the same code, so both report it.
-
-### Fixed
 
 - **The `FOR` loop's inline fields are no longer cramped or cryptic.** Three
   small things made loops harder to use than they needed to be. The boxes were
@@ -1277,22 +1208,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   no matter how many times it was dismissed. Only a Workspace tab genuinely
   loses work on exit, because it is bound to a live folder and re-reads its
   selected file from disk, so only its edits are counted now.
-
-
-## [0.3.1] - 2026-08-06
-
-### Changed
-
-- **The GUI is now behind a `gui` Cargo feature, and is no longer built by
-  default.** `cargo install paperboy` builds only the terminal UI and the
-  headless runner; `cargo install paperboy --features gui` adds the graphical
-  one. eframe/winit/wgpu more than doubled the dependency tree (225 crates to
-  482) and dominated the build, which is a poor trade for anyone who only wants
-  PaperBoy in a terminal. Nothing else changes: the saved-state format is
-  identical, so a terminal-only build still round-trips a GUI user's window and
-  panel geometry, and `--gui` on a build without the feature prints the command
-  to install one that has it rather than failing to parse the flag.
-
 
 ## [0.3.0] - 2026-08-06
 

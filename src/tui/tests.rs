@@ -26664,15 +26664,56 @@ fn the_results_view_states_the_ground_truth_score() {
     );
 }
 
-/// Ctrl+F walks the filters the run offers, and the grid follows it.
+/// The filter is reported in the results panel's *title*, not as a line inside
+/// the grid: it describes the pane rather than the run, and a row of prose
+/// above the table costs a row of the table on every screen. The key that
+/// changes it is named in the title's hint and in the help overlay, not
+/// repeated over the rows.
 #[test]
-fn ctrl_f_cycles_the_results_filter_and_narrows_the_grid() {
+fn the_filter_is_named_in_the_panel_title_and_not_over_the_rows() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    let s = Strings::english();
+    let head = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        !head.iter().any(|l| l.contains("Filter")),
+        "the grid's pinned summary is metrics only: {head:?}"
+    );
+
+    let title = crate::tui::reports::results_title_filter(&app.reports[idx], &s)
+        .expect("this run offers filters, so its title says which one is up");
+    assert!(
+        title.contains("All") && title.contains("4 of 4"),
+        "the title says which rows are on screen: {title}"
+    );
+    app.reports[idx].results_filter = RowFilter::Incorrect;
+    let title = crate::tui::reports::results_title_filter(&app.reports[idx], &s).unwrap();
+    assert!(
+        title.contains("Incorrect") && title.contains("1 of 4"),
+        "and follows the filter: {title}"
+    );
+    assert!(
+        !title.contains("Ctrl+F"),
+        "the key is named in the hint and the help overlay, not here: {title}"
+    );
+
+    // A run with nothing to filter says nothing about filtering.
+    let mut plain = TuiApp::default();
+    plain.new_report_tab();
+    let i = plain.active_report_index().unwrap();
+    plain.reports[i].result = Some(crate::report::model::ReportResult::default());
+    assert!(crate::tui::reports::results_title_filter(&plain.reports[i], &s).is_none());
+}
+
+/// `/` walks the filters the run offers, and the grid follows it.
+#[test]
+fn slash_cycles_the_results_filter_and_narrows_the_grid() {
     use crate::report::filter::RowFilter;
     let (mut app, idx) = truthed_report_app();
     assert_eq!(app.reports[idx].results_filter, RowFilter::All);
     assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 1, 2, 3]);
 
-    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert_eq!(
         app.reports[idx].results_filter,
         RowFilter::Incorrect,
@@ -26683,14 +26724,11 @@ fn ctrl_f_cycles_the_results_filter_and_narrows_the_grid() {
         vec![2],
         "and the grid is down to the one wrong row"
     );
-    assert!(
-        app.overlay.is_none(),
-        "Ctrl+F must not also open the File menu a bare `f` opens"
-    );
+    assert!(app.overlay.is_none(), "and it opens no menu on the way");
 
-    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert_eq!(app.reports[idx].results_filter, RowFilter::Regressed);
-    app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert_eq!(
         app.reports[idx].results_filter,
         RowFilter::All,

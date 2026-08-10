@@ -2461,12 +2461,13 @@ impl TuiApp {
             KeyCode::Left | KeyCode::Right => {}
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
+            // `/` walks the results filters -- the key filters a list in k9s,
+            // lazygit and their neighbours, and nothing in the report view
+            // wanted it. The same filters the GUI's bar offers and the
+            // interactive HTML export writes buttons for, so "show me only the
+            // wrong rows" selects the same rows in all three.
+            KeyCode::Char('/') => self.cycle_report_row_filter(),
             // Global menus, unchanged from the collection view.
-            // Ctrl+F cycles the results filter (a bare `f` opens the File
-            // menu). The same filters the GUI's bar offers and the interactive
-            // HTML export writes buttons for, so "show me only the wrong rows"
-            // selects the same rows in all three.
-            KeyCode::Char('f') if ctrl => self.cycle_report_row_filter(),
             // Ctrl+O opens what Ctrl+S wrote, so an exported HTML report is one
             // keystroke from the browser it was written for.
             KeyCode::Char('o') if ctrl => self.open_exported_report(),
@@ -3578,11 +3579,18 @@ fn draw_report_results(
                         s.report_status_errors
                     )
                 };
+                // The filter belongs in the panel's title, not in a line of
+                // its own inside the grid: it describes the pane rather than
+                // the run, and a row of prose between the summary and the
+                // table costs a row of the table on every screen.
+                let filter = filter_title(rt, result, visible.len(), s)
+                    .map(|f| format!(" — {f}"))
+                    .unwrap_or_default();
                 let title = format!(
-                    "{} ({}) — {}",
-                    s.report_results_heading, count, s.report_hint_results
+                    "{} ({}){} — {}",
+                    s.report_results_heading, count, filter, s.report_hint_results
                 );
-                let head = results_head_lines(rt, result, &header, visible.len(), s, th);
+                let head = results_head_lines(result, &header, s, th);
                 (lines, head, title)
             }
         }
@@ -3721,10 +3729,8 @@ fn draw_report_results(
 /// Empty for a report with no ground truth and nothing to filter — which is
 /// most reports, and they must not pay a line for a summary of nothing.
 fn results_head_lines(
-    rt: &ReportTab,
     result: &ReportResult,
     header: &crate::report::flow::Header,
-    visible: usize,
     s: &Strings,
     th: &Theme,
 ) -> Vec<Line<'static>> {
@@ -3756,26 +3762,34 @@ fn results_head_lines(
             ]));
         }
     }
-    let filters = rt.result_filters();
-    if filters.len() > 1 {
-        let rows = s
-            .report_rows_shown
-            .replace("{shown}", &visible.to_string())
-            .replace("{total}", &result.rows.len().to_string());
-        let text = s
-            .report_filter_line
-            .replace("{f}", &filter_label(s, &rt.results_filter))
-            .replace("{r}", &rows);
-        // The active filter is called out in the accent: a grid showing a
-        // subset of its rows must never look like the whole run.
-        let style = if rt.results_filter == crate::report::filter::RowFilter::All {
-            Style::default().fg(th.dim)
-        } else {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        };
-        out.push(Line::from(Span::styled(text, style)));
-    }
     out
+}
+
+/// How the results panel's title says which rows it is showing — `None` for a
+/// run that offers no filter worth naming (nothing to compare, nothing wrong),
+/// where a title saying "All rows" would be noise.
+///
+/// The row counts are always given, even under `All`: a grid showing a subset
+/// of its run must never be mistakable for the whole of it, and the only place
+/// left to say so is here.
+fn filter_title(
+    rt: &ReportTab,
+    result: &ReportResult,
+    visible: usize,
+    s: &Strings,
+) -> Option<String> {
+    if rt.result_filters().len() < 2 {
+        return None;
+    }
+    let rows = s
+        .report_rows_shown
+        .replace("{shown}", &visible.to_string())
+        .replace("{total}", &result.rows.len().to_string());
+    Some(
+        s.report_filter_title
+            .replace("{f}", &filter_label(s, &rt.results_filter))
+            .replace("{r}", &rows),
+    )
 }
 
 /// [`results_head_lines`] as plain strings — the summary the results view
@@ -3787,9 +3801,8 @@ pub(crate) fn results_head_text(rt: &ReportTab, s: &Strings) -> Vec<String> {
         return Vec::new();
     };
     let header = rt.report.flow().map(|f| f.header).unwrap_or_default();
-    let visible = rt.visible_result_rows().len();
     let th = crate::tui::theme::theme(&crate::i18n::Language::English);
-    results_head_lines(rt, result, &header, visible, s, &th)
+    results_head_lines(result, &header, s, &th)
         .iter()
         .map(|l| {
             l.spans
@@ -3798,6 +3811,15 @@ pub(crate) fn results_head_text(rt: &ReportTab, s: &Strings) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+/// [`filter_title`] for a tab, as the results panel's title bar would show it.
+/// Test-only: the title is assembled inside the draw pass, which a test can't
+/// call, but what it says about the filter is exactly what wants asserting.
+#[cfg(test)]
+pub(crate) fn results_title_filter(rt: &ReportTab, s: &Strings) -> Option<String> {
+    let result = rt.result.as_ref()?;
+    filter_title(rt, result, rt.visible_result_rows().len(), s)
 }
 
 /// A filter's name in the user's language.

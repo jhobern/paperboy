@@ -572,7 +572,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · v source · Ctrl+S export · B baseline", "Entrée exploration · v source · Ctrl+S export · B référence", "Enter udforsk · v kilde · Ctrl+S export · B basislinje";
+    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+S export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+S export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+S export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -1095,7 +1095,10 @@ strings! {
     // The terminal results view's pinned summary: one metric line per scored
     // column, and the filter line `f` cycles. The GUI says the same things in
     // cards and buttons; a terminal has one line to say them in.
-    report_filter_line => "Filter: {f} \u{2014} {r} \u{2014} Ctrl+F cycles", "Filtre\u{a0}: {f} \u{2014} {r} \u{2014} Ctrl+F fait défiler", "Filter: {f} \u{2014} {r} \u{2014} Ctrl+F skifter";
+    // Sits in the results panel's title bar (not in the grid): it describes the
+    // pane, and the key that changes it is named in the title's hint and in the
+    // help overlay rather than repeated here on every screen.
+    report_filter_title => "Filter: {f}, {r}", "Filtre\u{a0}: {f}, {r}", "Filter: {f}, {r}";
     report_metric_compared => "Compared", "Comparés", "Sammenlignet";
     report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
     report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";
