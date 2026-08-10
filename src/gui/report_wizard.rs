@@ -996,6 +996,10 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
         .map(|p| p.to_path_buf());
     let s = &app.strings;
     let mut outcome = Outcome::None;
+    // A folder picker can't be opened from inside the form: it needs `app`,
+    // which the modal closure has already borrowed. The click is recorded here
+    // and acted on once the closure has let go.
+    let mut browse = false;
 
     let modal = egui::Modal::new(egui::Id::new("pt_node_wizard")).show(ctx, |ui| {
         ui.set_min_width(360.0);
@@ -1003,10 +1007,10 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
         match wiz {
             Wizard::Request(f) => request_ui(ui, &th, s, f),
             Wizard::Envs(f) => envs_ui(ui, &th, s, f),
-            Wizard::Files(f) => files_ui(ui, &th, s, f, fallback.as_deref()),
+            Wizard::Files(f) => files_ui(ui, &th, s, f, &mut browse),
             Wizard::Assign(f) => assign_ui(ui, &th, s, f),
             Wizard::List(f) => list_ui(ui, &th, s, f),
-            Wizard::Folders(f) => folders_ui(ui, &th, s, f, fallback.as_deref()),
+            Wizard::Folders(f) => folders_ui(ui, &th, s, f, &mut browse),
             Wizard::Vars(f) => vars_ui(ui, &th, s, f),
             Wizard::Computed(f) => computed_ui(ui, &th, s, f),
             Wizard::Raw(f) => raw_ui(ui, &th, s, f),
@@ -1028,6 +1032,24 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
     });
     if modal.should_close() {
         outcome = Outcome::Cancel;
+    }
+
+    // Now that the closure has released `app`, a Browse click can open its
+    // dialog -- off the frame loop, so the modal keeps painting behind it.
+    if browse {
+        let current = match ed.wizard.as_ref() {
+            Some(Wizard::Files(f)) => f.dir.clone(),
+            Some(Wizard::Folders(f)) => f.dir.clone(),
+            _ => String::new(),
+        };
+        app.request_pick(
+            super::filepick::PickKind::Folder,
+            app.strings.report_node_files_folder_label,
+            super::filepick::seed_dir(&current)
+                .as_deref()
+                .or(fallback.as_deref()),
+            super::menu::PickAction::ReportWizardDir,
+        );
     }
 
     match outcome {
@@ -1247,7 +1269,7 @@ fn files_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FilesForm,
-    fallback: Option<&std::path::Path>,
+    browse: &mut bool,
 ) {
     ui.heading(RichText::new(s.report_node_files_title).color(th.text));
     ui.add_space(4.0);
@@ -1262,12 +1284,7 @@ fn files_ui(
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
                 if ui.button(s.gui_browse).clicked() {
-                    if let Some(p) = super::filepick::pick_folder(
-                        s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
-                    ) {
-                        f.dir = p.to_string_lossy().into_owned();
-                    }
+                    *browse = true;
                 }
             });
             ui.end_row();
@@ -1326,7 +1343,7 @@ fn folders_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FoldersForm,
-    fallback: Option<&std::path::Path>,
+    browse: &mut bool,
 ) {
     ui.heading(RichText::new(s.node_folders_title).color(th.text));
     ui.add_space(4.0);
@@ -1341,12 +1358,7 @@ fn folders_ui(
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
                 if ui.button(s.gui_browse).clicked() {
-                    if let Some(p) = super::filepick::pick_folder(
-                        s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
-                    ) {
-                        f.dir = p.to_string_lossy().into_owned();
-                    }
+                    *browse = true;
                 }
             });
             ui.end_row();
@@ -2034,5 +2046,22 @@ mod tests {
             vec!["login".to_string()],
             "only the reported request is a source of fields"
         );
+    }
+}
+
+/// Write back the folder the wizard's Browse dialog returned, frames later.
+///
+/// The wizard is still open behind the dialog -- it is drawn from `ed.wizard`
+/// every frame -- so this writes straight into whichever form is showing, and
+/// does nothing if the user closed or switched it in the meantime.
+pub(super) fn apply_picked_dir(app: &mut GuiApp, picked: Option<std::path::PathBuf>) {
+    let Some(dir) = picked else {
+        return; // cancelled
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    match app.report_editor.as_mut().and_then(|e| e.wizard.as_mut()) {
+        Some(Wizard::Files(f)) => f.dir = dir,
+        Some(Wizard::Folders(f)) => f.dir = dir,
+        _ => {}
     }
 }

@@ -19,13 +19,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   per-frame poll — including the one that collects a finished report run, which
   is why exporting results could report there was nothing to export.
 
-  The dialog now runs on a worker thread and is collected when it answers.
-  Converted so far: every File > Open and File > Save entry, the report
-  editor's `root:` / `baseline:` / `collection:` settings and its loop
-  folder/file pickers, and the Postman import's destination. The remaining
-  Browse buttons (Form/Multipart file values, the report wizard's loop folders,
-  workspace "new item", and the git workspace storage prompt) still block and
-  are being converted.
+  Every dialog now runs on a worker thread and is collected when it answers:
+  File > Open and File > Save, the report editor's `root:` / `baseline:` /
+  `collection:` settings and its loop folder pickers, the `FILES`/`FOLDERS`
+  node wizard, Form and Multipart file values, the workspace's New Collection /
+  Report / Environment, the Postman import destination, and the git workspace
+  storage prompt.
+
+  Because the window now stays live while a chooser is open, pressing Browse a
+  second time no longer opens a rival dialog, and a path that arrives for a row
+  which has since been deleted (or a collection that has been closed) is
+  dropped rather than written somewhere it no longer belongs.
 
 ### Changed
 

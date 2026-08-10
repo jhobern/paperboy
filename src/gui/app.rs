@@ -933,6 +933,29 @@ impl GuiApp {
     }
 }
 
+impl GuiApp {
+    /// Open a native file dialog on a worker thread, to be collected by
+    /// [`super::menu::poll_pending_pick`] once it answers.
+    ///
+    /// Ignored when a dialog is already open. Before the pickers were moved off
+    /// the frame loop this couldn't arise -- a blocked window accepts no
+    /// further clicks -- but a live window will happily let the user press
+    /// Browse twice, and two native choosers fighting over one destination
+    /// field is worse than the second click doing nothing.
+    pub fn request_pick(
+        &mut self,
+        kind: super::filepick::PickKind,
+        title: &str,
+        dir: Option<&std::path::Path>,
+        action: super::menu::PickAction,
+    ) {
+        if self.pending_pick.is_some() {
+            return;
+        }
+        self.pending_pick = Some(super::filepick::spawn(kind, title, dir, action));
+    }
+}
+
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
@@ -1526,5 +1549,36 @@ mod report_run_persistence_tests {
         app.open_report_editor(ReportOrigin::Workspace, report("idle"));
         app.close_report_editor();
         assert!(app.report_runs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pick_guard_tests {
+    use super::*;
+
+    /// A live window lets the user press Browse again while the first chooser
+    /// is still up; the second press must not open a rival dialog.
+    #[test]
+    fn a_second_request_is_ignored_while_one_is_open() {
+        let mut app = GuiApp::for_test(crate::session::Session::default());
+        app.request_pick(
+            super::super::filepick::PickKind::Folder,
+            "first",
+            None,
+            super::super::menu::PickAction::GitWorkspaceDir,
+        );
+        assert!(app.pending_pick.is_some());
+        app.request_pick(
+            super::super::filepick::PickKind::Folder,
+            "second",
+            None,
+            super::super::menu::PickAction::PostmanDest,
+        );
+        // Still the first: the guard refuses rather than replacing, so the
+        // dialog the user is looking at is the one that will be honoured.
+        assert!(matches!(
+            app.pending_pick.as_ref().and_then(|p| p.action()),
+            Some(super::super::menu::PickAction::GitWorkspaceDir)
+        ));
     }
 }

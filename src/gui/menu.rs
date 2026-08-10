@@ -816,12 +816,7 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
             ]),
         },
     };
-    app.pending_pick = Some(super::filepick::spawn(
-        pick_kind,
-        title,
-        dir.as_deref(),
-        PickAction::Open(kind),
-    ));
+    app.request_pick(pick_kind, title, dir.as_deref(), PickAction::Open(kind));
 }
 
 /// What to do with a path once its dialog answers.
@@ -845,6 +840,21 @@ pub enum PickAction {
     },
     /// Where a Postman import should put the workspace it builds.
     PostmanDest,
+    /// The folder a `FILES`/`FOLDERS` node wizard is being pointed at.
+    ReportWizardDir,
+    /// Naming a new collection / report / environment in a workspace.
+    NewWorkspaceItem {
+        ci: usize,
+        kind: crate::workspace::NewItemKind,
+    },
+    /// A `File`/`Base64File` value in a request's Form or Multipart body.
+    FormFieldFile {
+        ci: usize,
+        entry: usize,
+        field: usize,
+    },
+    /// Where to keep a workspace just downloaded from a git remote.
+    GitWorkspaceDir,
 }
 
 /// Collect a finished file dialog, if one has finished, and act on it. Called
@@ -871,6 +881,22 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
         }
         PickAction::PostmanDest => {
             super::postman::apply_picked_dest(app, picked);
+            return;
+        }
+        PickAction::ReportWizardDir => {
+            super::report_wizard::apply_picked_dir(app, picked);
+            return;
+        }
+        PickAction::NewWorkspaceItem { ci, kind } => {
+            super::requests::apply_new_workspace_item(app, ci, kind, picked);
+            return;
+        }
+        PickAction::FormFieldFile { ci, entry, field } => {
+            super::editor::apply_picked_form_file(app, ci, entry, field, picked);
+            return;
+        }
+        PickAction::GitWorkspaceDir => {
+            super::remote::apply_picked_workspace_dir(app, picked);
             return;
         }
         _ => {}
@@ -1099,7 +1125,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         SaveKind::Report => &[("PaperTrail", &["trail"]), ("All files", &["*"])],
         SaveKind::Response => &[("All files", &["*"])],
     };
-    app.pending_pick = Some(super::filepick::spawn(
+    app.request_pick(
         super::filepick::PickKind::Save {
             default_name,
             filters: super::filepick::owned_filters(filters),
@@ -1107,7 +1133,7 @@ pub fn save_via_picker(app: &mut GuiApp, kind: SaveKind) {
         title,
         dir.as_deref(),
         PickAction::Save(kind),
-    ));
+    );
 }
 
 /// Write the given kind to `path`, returning a user-facing error on failure.

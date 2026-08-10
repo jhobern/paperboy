@@ -689,11 +689,8 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
             }
         }
         UiAction::SaveWorkspacePermanently => {
-            if let Flow::Load(load) = &mut flow
-                && save_workspace_permanently(load, app)
-                && load.finish_workspace(app)
-            {
-                return;
+            if let Flow::Load(load) = &mut flow {
+                ask_where_to_save_workspace(load, app);
             }
         }
         UiAction::Save => {
@@ -1350,7 +1347,50 @@ fn start_workspace_checkout(load: &mut LoadFlow, s: &Strings) {
 /// (leaving the storage step open, with an error where it's the user's to fix)
 /// if the user cancelled the picker or the copy failed — the temp folder is
 /// kept in that case rather than losing the download outright.
-fn save_workspace_permanently(load: &mut LoadFlow, app: &mut GuiApp) -> bool {
+fn ask_where_to_save_workspace(load: &mut LoadFlow, app: &mut GuiApp) {
+    // Both answers are the user's to fix, so they are checked before a dialog
+    // is opened rather than after they have chosen a folder for nothing.
+    if load.ws_root.is_none() {
+        load.local_error = Some(app.strings.gui_git_err_browse_again.to_string());
+        return;
+    }
+    if nonblank(&load.ws_name).is_none() {
+        load.local_error = Some(app.strings.gui_git_err_ws_name_required.to_string());
+        return;
+    }
+    let title = app.strings.git_workspace_storage_choose;
+    let dir = app.session.last_browse_dir.clone();
+    app.request_pick(
+        super::filepick::PickKind::Folder,
+        title,
+        dir.as_deref(),
+        super::menu::PickAction::GitWorkspaceDir,
+    );
+}
+
+/// Copy the downloaded workspace into the folder the dialog named, and finish
+/// the flow if that worked.
+///
+/// A cancel leaves the storage step open with the workspace still temporary:
+/// backing out of the folder chooser is not a decision to throw the download
+/// away.
+pub(super) fn apply_picked_workspace_dir(app: &mut GuiApp, picked: Option<std::path::PathBuf>) {
+    let Some(parent) = picked else {
+        return; // cancelled — stay on the question, keep it temporary
+    };
+    let Some(mut flow) = app.remote.flow.take() else {
+        return; // the dialog outlived its wizard
+    };
+    if let Flow::Load(load) = &mut flow
+        && save_workspace_into(load, app, parent)
+        && load.finish_workspace(app)
+    {
+        return; // finished: the flow is closed, not put back
+    }
+    app.remote.flow = Some(flow);
+}
+
+fn save_workspace_into(load: &mut LoadFlow, app: &mut GuiApp, parent: std::path::PathBuf) -> bool {
     let Some(source) = load.ws_root.clone() else {
         load.local_error = Some(app.strings.gui_git_err_browse_again.to_string());
         return false;
@@ -1358,12 +1398,6 @@ fn save_workspace_permanently(load: &mut LoadFlow, app: &mut GuiApp) -> bool {
     let Some(name) = nonblank(&load.ws_name) else {
         load.local_error = Some(app.strings.gui_git_err_ws_name_required.to_string());
         return false;
-    };
-    let Some(parent) = super::filepick::pick_folder(
-        app.strings.git_workspace_storage_choose,
-        app.session.last_browse_dir.as_deref(),
-    ) else {
-        return false; // cancelled — stay on the question, keep it temporary
     };
 
     // Copy into `<chosen folder>/<name>` rather than straight into the chosen

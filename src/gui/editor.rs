@@ -580,10 +580,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     } else {
         // Resolved up front: the section body borrows the collection mutably,
         // so the session can't be consulted from inside it.
-        let browse_fallback = app
-            .session
-            .picker_dir(crate::session::PickerKind::Other)
-            .map(|p| p.to_path_buf());
+        // Which Form/Multipart file value asked for a picker this frame, if
+        // any. Collected below, once the body has released the collection.
+        let mut browse: Option<usize> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -614,19 +613,41 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry, browse_fallback.as_deref())
-                            {
+                            if draw_section(*sec, ui, &theme, st, entry, &mut browse) {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry, browse_fallback.as_deref()) {
+                        if draw_section(other, ui, &theme, st, entry, &mut browse) {
                             changed = true;
                         }
                     }
                 }
             });
+        if let Some(field) = browse {
+            let seed = app.session.collections[ci].entries[sel]
+                .form_fields
+                .get(field)
+                .and_then(|f| super::filepick::seed_dir(&f.value))
+                .or_else(|| {
+                    app.session
+                        .picker_dir(crate::session::PickerKind::Other)
+                        .map(|p| p.to_path_buf())
+                });
+            app.request_pick(
+                super::filepick::PickKind::File {
+                    filters: Vec::new(),
+                },
+                app.strings.gui_browse,
+                seed.as_deref(),
+                super::menu::PickAction::FormFieldFile {
+                    ci,
+                    entry: sel,
+                    field,
+                },
+            );
+        }
     }
 
     app.show_hurl = code_show_hurl;
@@ -669,7 +690,7 @@ fn draw_section(
     st: &Strings,
     entry: &mut HurlEntry,
     // Where a `[Form]` file picker opens when the field is still blank.
-    browse_fallback: Option<&std::path::Path>,
+    browse: &mut Option<usize>,
 ) -> bool {
     let mut changed = false;
     match section {
@@ -725,7 +746,7 @@ fn draw_section(
             ui.add_space(8.0);
             ui.separator();
             ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
-            if form_editor(ui, theme, st, &mut entry.form_fields, browse_fallback) {
+            if form_editor(ui, theme, st, &mut entry.form_fields, browse) {
                 changed = true;
             }
         }
@@ -877,7 +898,7 @@ fn form_editor(
     theme: &super::theme::GuiTheme,
     s: &Strings,
     fields: &mut Vec<FormField>,
-    browse_fallback: Option<&std::path::Path>,
+    browse: &mut Option<usize>,
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -956,16 +977,10 @@ fn form_editor(
                     if matches!(kind, FormFieldKind::File | FormFieldKind::Base64File)
                         && ui.button(s.gui_browse).clicked()
                     {
-                        if let Some(p) = super::filepick::pick_file(
-                            s.gui_browse,
-                            super::filepick::seed_dir(&fields[i].value)
-                                .as_deref()
-                                .or(browse_fallback),
-                            &[],
-                        ) {
-                            fields[i].value = p.to_string_lossy().into_owned();
-                            changed = true;
-                        }
+                        // Recorded rather than opened: the picker needs `app`,
+                        // which the section body has already borrowed mutably.
+                        // See `super::filepick`.
+                        *browse = Some(i);
                     }
                     if ui
                         .add(
@@ -1304,5 +1319,100 @@ mod highlight_cache_tests {
             sections(two),
             "and the two really do colour differently"
         );
+    }
+}
+
+/// Write back the file a Form/Multipart value's Browse dialog returned.
+///
+/// Every index is re-checked rather than trusted: the user can switch request,
+/// close the collection or delete the row while the dialog is up, and writing a
+/// path into whatever now sits at that index would be worse than dropping it.
+pub(super) fn apply_picked_form_file(
+    app: &mut GuiApp,
+    ci: usize,
+    entry: usize,
+    field: usize,
+    picked: Option<std::path::PathBuf>,
+) {
+    let Some(path) = picked else {
+        return; // cancelled
+    };
+    let Some(col) = app.session.collections.get_mut(ci) else {
+        return;
+    };
+    let Some(e) = col.entries.get_mut(entry) else {
+        return;
+    };
+    let Some(f) = e.form_fields.get_mut(field) else {
+        return;
+    };
+    f.value = path.to_string_lossy().into_owned();
+    e.modified = true;
+    col.invalidate_request_json();
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn app_with_form_field(value: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entry = crate::hurl::HurlEntry {
+            title: "A".into(),
+            url: "http://127.0.0.1:1/".into(),
+            form_fields: vec![crate::hurl::FormField {
+                key: "f".into(),
+                kind: crate::hurl::FormFieldKind::File,
+                value: value.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        GuiApp::for_test(session)
+    }
+
+    #[test]
+    fn a_picked_form_file_lands_in_its_field_and_marks_it_modified() {
+        let mut app = app_with_form_field("");
+        apply_picked_form_file(&mut app, 0, 0, 0, Some("/tmp/face.jpg".into()));
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            "/tmp/face.jpg"
+        );
+        assert!(app.session.collections[0].entries[0].modified);
+    }
+
+    /// Cancelling must leave the value the user already typed alone -- backing
+    /// out of a picker is not a request to clear the field.
+    #[test]
+    fn cancelling_leaves_the_field_untouched() {
+        let mut app = app_with_form_field("kept.jpg");
+        apply_picked_form_file(&mut app, 0, 0, 0, None);
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            "kept.jpg"
+        );
+        assert!(!app.session.collections[0].entries[0].modified);
+    }
+
+    /// The dialog outlives its context: by the time a path arrives the row it
+    /// was opened for may be gone, and the path must be dropped rather than
+    /// written into whatever now sits at that index.
+    #[test]
+    fn a_path_for_a_row_that_no_longer_exists_is_dropped() {
+        let mut app = app_with_form_field("");
+        apply_picked_form_file(&mut app, 0, 0, 7, Some("/tmp/x.jpg".into()));
+        apply_picked_form_file(&mut app, 0, 9, 0, Some("/tmp/x.jpg".into()));
+        apply_picked_form_file(&mut app, 5, 0, 0, Some("/tmp/x.jpg".into()));
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            ""
+        );
+        assert!(!app.session.collections[0].entries[0].modified);
     }
 }

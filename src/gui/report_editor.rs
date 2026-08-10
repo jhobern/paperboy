@@ -5309,12 +5309,12 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str, 
             ]),
         },
     };
-    app.pending_pick = Some(super::filepick::spawn(
+    app.request_pick(
         kind,
         title,
         seed.as_deref(),
         super::menu::PickAction::ReportHeaderFile { key, occurrence },
-    ));
+    );
 }
 
 /// Write back the file a [`pick_header_file`] dialog returned.
@@ -5420,7 +5420,7 @@ fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: 
     } else {
         super::filepick::PickKind::Folder
     };
-    app.pending_pick = Some(super::filepick::spawn(
+    app.request_pick(
         kind,
         title,
         seed.as_deref(),
@@ -5428,7 +5428,7 @@ fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: 
             path: path.to_vec(),
             file,
         },
-    ));
+    );
 }
 
 /// Write back the folder a [`pick_loop_dir`] dialog returned, frames later.

@@ -214,12 +214,12 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         UiAction::BrowseDest => {
             let seed = std::path::PathBuf::from(w.flow.dest.trim());
             let seed = seed.parent().filter(|p| p.exists());
-            app.pending_pick = Some(super::filepick::spawn(
+            app.request_pick(
                 super::filepick::PickKind::Folder,
                 app.strings.postman_dest_label,
                 seed,
                 super::menu::PickAction::PostmanDest,
-            ));
+            );
         }
         UiAction::BackToConnect => w.flow.back_to_connect(),
         UiAction::BackToWorkspaces => w.flow.to_pick_workspace(),

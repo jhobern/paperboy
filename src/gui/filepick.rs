@@ -3,7 +3,7 @@
 //! The terminal UI has its own in-app browser overlay (the right UX for a
 //! terminal), so these helpers are GUI-only. They wrap `rfd`'s **synchronous**
 //! `FileDialog` (its XDG-portal backend blocks on `pollster`, needing no system
-//! GTK libraries).
+//! GTK libraries) -- but never on the thread drawing the window.
 //!
 //! # Why the dialog runs on its own thread
 //!
@@ -57,6 +57,13 @@ pub struct PendingPick<A> {
 }
 
 impl<A> PendingPick<A> {
+    /// The waiting action, for tests that need to tell one pending dialog from
+    /// another without opening either.
+    #[cfg(test)]
+    pub fn action(&self) -> Option<&A> {
+        self.action.as_ref()
+    }
+
     /// Poll the dialog. `None` means "still open" — the common case, since a
     /// user takes many frames to choose.
     ///
@@ -146,44 +153,6 @@ fn base(title: &str, dir: Option<&Path>) -> rfd::FileDialog {
         d = d.set_directory(dir);
     }
     d
-}
-
-fn with_filters(mut d: rfd::FileDialog, filters: &[Filter]) -> rfd::FileDialog {
-    for (name, exts) in filters {
-        if *exts == ["*"] {
-            continue; // "all files" — no restrictive filter
-        }
-        d = d.add_filter(*name, exts);
-    }
-    d
-}
-
-/// Open a native "pick a file" dialog, returning the chosen path (or `None` on
-/// cancel). `filters` narrow the visible file types.
-pub fn pick_file(title: &str, dir: Option<&Path>, filters: &[Filter]) -> Option<PathBuf> {
-    with_filters(base(title, dir), filters).pick_file()
-}
-
-/// Open a native "pick a folder" dialog, returning the chosen directory.
-pub fn pick_folder(title: &str, dir: Option<&Path>) -> Option<PathBuf> {
-    base(title, dir).pick_folder()
-}
-
-/// Open a native "save file" dialog, returning the chosen path. `default_name`
-/// pre-fills the filename field (e.g. `results.csv`).
-pub fn save_file(
-    title: &str,
-    dir: Option<&Path>,
-    default_name: &str,
-    filters: &[Filter],
-) -> Option<PathBuf> {
-    let d = with_filters(base(title, dir), filters);
-    let d = if default_name.is_empty() {
-        d
-    } else {
-        d.set_file_name(default_name)
-    };
-    d.save_file()
 }
 
 /// Show a native error alert (used to report a failed open/save now that the

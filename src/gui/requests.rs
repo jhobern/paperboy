@@ -825,11 +825,12 @@ fn new_workspace_item(
     dir: &std::path::Path,
     kind: crate::workspace::NewItemKind,
 ) {
-    use crate::workspace::{NewItemError, NewItemKind};
+    use crate::workspace::NewItemKind;
 
-    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+    // Nothing to create into, so not even worth opening a dialog.
+    if app.session.collections[ci].workspace_root.is_none() {
         return;
-    };
+    }
     // A folder is asked for by name rather than through the platform's save
     // dialog, which is built around naming a *file* and would append an
     // extension the folder must not have.
@@ -852,7 +853,40 @@ fn new_workspace_item(
         NewItemKind::Folder => return,
     };
     let ext = kind.extension();
-    let Some(chosen) = super::filepick::save_file(title, Some(dir), default, &[(ext, &[ext])])
+    app.request_pick(
+        super::filepick::PickKind::Save {
+            default_name: default.to_string(),
+            filters: super::filepick::owned_filters(&[(ext, &[ext])]),
+        },
+        title,
+        Some(dir),
+        super::menu::PickAction::NewWorkspaceItem { ci, kind },
+    );
+}
+
+/// Create the workspace item the save dialog named, frames later (see
+/// [`super::filepick`] for why the naming and the creating are separate).
+///
+/// The workspace root is re-read here rather than captured with the request:
+/// the collection could have been closed or repointed while the dialog was up,
+/// and creating a file under a root that is no longer open would be worse than
+/// doing nothing.
+pub(super) fn apply_new_workspace_item(
+    app: &mut GuiApp,
+    ci: usize,
+    kind: crate::workspace::NewItemKind,
+    picked: Option<std::path::PathBuf>,
+) {
+    use crate::workspace::{NewItemError, NewItemKind};
+
+    let Some(chosen) = picked else {
+        return; // cancelled
+    };
+    let Some(root) = app
+        .session
+        .collections
+        .get(ci)
+        .and_then(|c| c.workspace_root.clone())
     else {
         return;
     };
