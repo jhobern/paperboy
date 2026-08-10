@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A plain HTML report no longer shows a lone "All" filter button.** The row
+  filters are offered only when a report actually has something to filter by (a
+  baseline to differ from, a ground truth to be wrong against, or a trend to
+  regress in); without one of those, "All" was a button whose only possible
+  effect was the state it was already in. The Find box and the row count are
+  unaffected — those are useful in every report.
+
 - **The Open and Save dialogs no longer freeze the window.** Every native file
   picker was called straight from the frame loop and blocked it until the user
   chose a file, so the window stopped repainting and the desktop offered to

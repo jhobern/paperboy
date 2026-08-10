@@ -475,15 +475,24 @@ impl ReportWriter for HtmlWriter {
 /// with "regressions" reads like it should intersect but people expect it to
 /// union, and a filter whose meaning the reader has to guess is worse than one
 /// fewer filter.
+/// The toolbar above the table: the row filters, then the find box.
+///
+/// The buttons are drawn only when there is a choice to make. `RowFilter`
+/// always offers `All`, so a report with no baseline and no `TRUTH` would
+/// otherwise get a lone "All" button that filters nothing -- a control whose
+/// only possible effect is the state it is already in. The find box is not
+/// conditional: it is useful in every report.
 fn push_filter_toolbar(out: &mut String, filters: &[super::filter::RowFilter]) {
     out.push_str("<div class=\"toolbar\" role=\"group\" aria-label=\"Filter rows\">");
-    for (i, f) in filters.iter().enumerate() {
-        out.push_str(&format!(
-            "<button type=\"button\" data-i=\"{i}\"{}>",
-            if i == 0 { " class=\"on\"" } else { "" }
-        ));
-        push_escaped(out, &f.label());
-        out.push_str("</button>");
+    if filters.len() > 1 {
+        for (i, f) in filters.iter().enumerate() {
+            out.push_str(&format!(
+                "<button type=\"button\" data-i=\"{i}\"{}>",
+                if i == 0 { " class=\"on\"" } else { "" }
+            ));
+            push_escaped(out, &f.label());
+            out.push_str("</button>");
+        }
     }
     out.push_str(
         "<input type=\"search\" id=\"pb-find\" placeholder=\"Find\u{2026}\" \
@@ -2564,6 +2573,50 @@ mod tests {
         };
         let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
         assert!(!html.contains("class=\"det\""), "no panel row: {html}");
+    }
+
+    /// A report with nothing to filter by gets no filter buttons -- but keeps
+    /// its find box, which is useful in any report.
+    #[test]
+    fn a_plain_report_gets_a_find_box_but_no_filter_buttons() {
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[("Name", "a")])],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            !html.contains("data-i=\"0\""),
+            "a lone All button filters nothing, so it is not drawn: {html}"
+        );
+        assert!(html.contains("id=\"pb-find\""), "find box survives: {html}");
+    }
+
+    /// As soon as there is a real choice, the buttons appear -- including the
+    /// All that returns to the unfiltered view.
+    #[test]
+    fn a_report_with_something_to_filter_keeps_its_all_button() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), super::super::compare::CORRECT_COLUMN.into()],
+            rows: vec![
+                row(&[
+                    ("Name", "a"),
+                    (super::super::compare::CORRECT_COLUMN, "incorrect"),
+                ]),
+                row(&[
+                    ("Name", "b"),
+                    (super::super::compare::CORRECT_COLUMN, "correct"),
+                ]),
+            ],
+            ..Default::default()
+        };
+        res.column_details.clear();
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("data-i=\"0\""), "All is back: {html}");
+        assert!(
+            html.contains("data-i=\"1\""),
+            "and the filter that earned it: {html}"
+        );
     }
 
     /// Every column being `DETAIL` would leave an empty grid, which helps
