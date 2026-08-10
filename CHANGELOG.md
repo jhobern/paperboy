@@ -97,6 +97,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and the height is saved with the rest of the GUI's geometry, so a reader who
   wants a big picture pane keeps it between runs and between sessions.
 
+- **The report editor's header is one row, not three.** The title, the
+  Blocks/Source/Results toggle and (in the results view) a near-empty band
+  holding Baseline and Export were three stacked strips above a table. They are
+  now one line — what the document is, which way you are looking at it, what you
+  can do to it — which hands two rows of the window back to the rows being read.
+  The run's status moved up beside the Run button that started it.
+
 - **The results view's summary block can be resized.** The metric cards, the
   filter bar and the confusion matrices took whatever height they wanted, so a
   report with a matrix per ground-truthed column left almost nothing for the

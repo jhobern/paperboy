@@ -1604,7 +1604,15 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
     }
 
-    // ── Header: name, dirty marker, Run / Save / Close ─────────────────────
+    // ── Header: name, view toggle, and every action, all on one line ───────
+    //
+    // These were three stacked strips — title, view toggle, and (in the results
+    // view) a near-empty band holding Baseline/Export. Three lines of chrome
+    // over a table is three rows of that table not being read, and the report
+    // editor is a tool for reading tables. They fold together because they are
+    // all the same kind of thing: what this document is, which way you are
+    // looking at it, and what you can do to it.
+    let mut reindent = false;
     ui.horizontal(|ui| {
         let mut title = RichText::new(&ed.report.name).strong().color(th.text);
         if ed.report.dirty {
@@ -1613,6 +1621,43 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 .color(th.accent);
         }
         ui.label(title);
+        ui.separator();
+        for (view, label) in [
+            (EditorView::Blocks, app.strings.gui_report_view_blocks),
+            (EditorView::Source, app.strings.gui_report_view_source),
+            (EditorView::Results, app.strings.gui_report_view_results),
+        ] {
+            if super::widgets::selectable(ui, ed.view == view, RichText::new(label)).clicked() {
+                ed.view = view;
+            }
+        }
+        // Re-indent the source to its real block depth. Lives beside the view
+        // toggle rather than inside the source view because it is about the
+        // document, not about one way of looking at it.
+        ui.separator();
+        if ui
+            .button(app.strings.gui_report_reindent)
+            .on_hover_text(app.strings.gui_report_reindent_help)
+            .clicked()
+        {
+            reindent = true;
+        }
+        // The run's own status, which used to head the results view. It reads
+        // as well here, beside the Run button that started it.
+        if ed.is_running() {
+            ui.separator();
+            ui.colored_label(
+                th.pending,
+                format!(
+                    "{} {}",
+                    super::icons::RUNNING,
+                    app.strings.gui_report_running
+                ),
+            );
+        }
+        if let Some(prog) = &ed.progress {
+            ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -1669,50 +1714,43 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     ed.pending_toolbar = Some(ToolbarAct::DryRun);
                 }
             }
+            // What you can do with a *result*, shown only where there is one to
+            // do it with. Left of the run controls, and separated from them:
+            // these act on the rows that came back, not on the report.
+            if ed.view == EditorView::Results && ed.dry_run.is_none() {
+                ui.separator();
+                let has_rows = ed.result.as_ref().is_some_and(|r| !r.rows.is_empty());
+                let export = ui.add_enabled(
+                    has_rows,
+                    egui::Button::new(format!(
+                        "{} {}",
+                        super::icons::EXPORT,
+                        app.strings.gui_report_export
+                    )),
+                );
+                if export.clicked() {
+                    open_export_dialog(app);
+                }
+                // Saving the run as a snapshot is a different thing from
+                // exporting it for reading, so it gets its own button rather
+                // than hiding as a format in the export dialog: the file it
+                // writes is an input to a later run, not a report anyone opens.
+                let baseline = ui
+                    .add_enabled(
+                        has_rows,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::SAVE,
+                            app.strings.gui_report_save_baseline
+                        )),
+                    )
+                    .on_hover_text(app.strings.help_report_baseline)
+                    .on_disabled_hover_text(app.strings.report_baseline_no_result);
+                if baseline.clicked() {
+                    super::menu::save_via_picker(app, super::app::SaveKind::ReportBaseline);
+                }
+            }
         });
-    });
-
-    // View toggle (Blocks | Source | Results) plus the reindent button.
-    let mut reindent = false;
-    ui.horizontal(|ui| {
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Blocks,
-            RichText::new(app.strings.gui_report_view_blocks),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Blocks;
-        }
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Source,
-            RichText::new(app.strings.gui_report_view_source),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Source;
-        }
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Results,
-            RichText::new(app.strings.gui_report_view_results),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Results;
-        }
-        // Re-indent the source to its real block depth. Lives beside the view
-        // toggle rather than inside the source view because it is about the
-        // document, not about one way of looking at it.
-        ui.separator();
-        if ui
-            .button(app.strings.gui_report_reindent)
-            .on_hover_text(app.strings.gui_report_reindent_help)
-            .clicked()
-        {
-            reindent = true;
-        }
     });
     ui.separator();
 
@@ -2363,55 +2401,10 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         return;
     }
 
-    ui.horizontal(|ui| {
-        if ed.is_running() {
-            ui.colored_label(
-                th.pending,
-                format!(
-                    "{} {}",
-                    super::icons::RUNNING,
-                    app.strings.gui_report_running
-                ),
-            );
-        }
-        if let Some(prog) = &ed.progress {
-            ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let has_rows = ed.result.as_ref().is_some_and(|r| !r.rows.is_empty());
-            let export = ui.add_enabled(
-                has_rows,
-                egui::Button::new(format!(
-                    "{} {}",
-                    super::icons::EXPORT,
-                    app.strings.gui_report_export
-                )),
-            );
-            if export.clicked() {
-                open_export_dialog(app);
-            }
-            // Saving the run as a snapshot is a different thing from exporting
-            // it for reading, so it gets its own button rather than hiding as a
-            // format in the export dialog: the file it writes is an input to a
-            // later run, not a report anyone opens.
-            let baseline = ui
-                .add_enabled(
-                    has_rows,
-                    egui::Button::new(format!(
-                        "{} {}",
-                        super::icons::SAVE,
-                        app.strings.gui_report_save_baseline
-                    )),
-                )
-                .on_hover_text(app.strings.help_report_baseline)
-                .on_disabled_hover_text(app.strings.report_baseline_no_result);
-            if baseline.clicked() {
-                super::menu::save_via_picker(app, super::app::SaveKind::ReportBaseline);
-            }
-        });
-    });
-    ui.separator();
-
+    // The run's status and its Baseline/Export buttons live in the editor's one
+    // header row (see `report_header`), not in a strip of their own: this view
+    // is a table, and every line spent above it is a row of that table not
+    // being read.
     let Some(result) = ed.result.as_ref() else {
         ui.add_space(8.0);
         ui.colored_label(th.dim, app.strings.gui_report_no_results);
@@ -2514,7 +2507,12 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         ed.results_filter = filter;
         ed.results_find = find;
         summary_splitter(&mut ed.summary_h, ui);
-        ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
+        ui.colored_label(
+            th.dim,
+            app.strings
+                .gui_report_cell_hint
+                .replace("{c}", super::icons::CARET_RIGHT),
+        );
         ui.add_space(2.0);
         // A row whose panel is open still has to be *reachable*, so the grid
         // gives up the height the reader dragged the panel to (defaulting to
@@ -2566,7 +2564,12 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         return;
     }
-    ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
+    ui.colored_label(
+        th.dim,
+        app.strings
+            .gui_report_cell_hint
+            .replace("{c}", super::icons::CARET_RIGHT),
+    );
     ui.add_space(2.0);
     let mut none = None;
     if let Some(ins) = results_grid(
