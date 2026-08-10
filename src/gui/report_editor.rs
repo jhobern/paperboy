@@ -317,7 +317,7 @@ impl ReportEditor {
     }
 
     /// Whether a run is currently in flight.
-    fn is_running(&self) -> bool {
+    pub(super) fn is_running(&self) -> bool {
         self.run.as_ref().is_some_and(|h| !h.finished())
     }
 

@@ -147,12 +147,89 @@ impl ImageResolver {
                 .push(format!("value at {value} is not a recognised image format"));
             return None;
         };
+        let (bytes, mime, natural) = match downscale(&bytes, mime, natural) {
+            Some(smaller) => smaller,
+            None => (bytes, mime.to_string(), natural),
+        };
         Some(ImageData {
             bytes,
-            mime: mime.to_string(),
+            mime,
             natural,
         })
     }
+}
+
+/// The longest edge, in pixels, that a report will embed a picture at.
+///
+/// A report row's picture is an illustration with two jobs: a thumbnail in the
+/// grid (`IMAGE(HEIGHT 110)` and friends), and a larger view in the HTML
+/// drill-down panel. One embedded copy serves both — the grid scales it down in
+/// CSS — so this is sized for the *larger* of the two, with enough detail to be
+/// worth opening and not a byte more.
+///
+/// The alternative, embedding the source file untouched, is what made this
+/// necessary: a thousand-row report over 2 MB camera JPEGs produced a file no
+/// browser would open, to show pictures displayed 110 pixels tall.
+pub const MAX_EMBED_EDGE: u32 = 640;
+
+/// JPEG quality for a re-encoded picture. High enough that the drill-down view
+/// shows no artefacts at a glance, low enough that the whole point of this
+/// exercise survives.
+const JPEG_QUALITY: u8 = 82;
+
+/// Re-encode a picture no larger than [`MAX_EMBED_EDGE`] on its longest edge.
+///
+/// Returns `None` — meaning "embed the original untouched" — whenever shrinking
+/// isn't possible or isn't worth it: a picture already within the cap, a format
+/// this build has no codec for (GIF, BMP), or a decode/encode that fails. A
+/// picture that can't be shrunk is never a reason to lose the picture.
+fn downscale(
+    bytes: &[u8],
+    mime: &str,
+    natural: (u32, u32),
+) -> Option<(Vec<u8>, String, (u32, u32))> {
+    let (w, h) = natural;
+    if w.max(h) <= MAX_EMBED_EDGE || w == 0 || h == 0 {
+        return None;
+    }
+    let format = match mime {
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/png" => image::ImageFormat::Png,
+        _ => return None,
+    };
+    let decoded = image::load_from_memory_with_format(bytes, format).ok()?;
+    // `thumbnail` is a box filter: markedly faster than Lanczos and visually
+    // indistinguishable at these ratios, which matters when a run resolves a
+    // thousand of them.
+    let scale = f64::from(MAX_EMBED_EDGE) / f64::from(w.max(h));
+    let (tw, th) = (
+        (f64::from(w) * scale).round().max(1.0) as u32,
+        (f64::from(h) * scale).round().max(1.0) as u32,
+    );
+    let small = decoded.thumbnail(tw, th);
+    let mut out = std::io::Cursor::new(Vec::new());
+    // A photograph re-encoded as PNG is often *larger* than the JPEG it came
+    // from, so each format keeps its own encoder rather than normalising.
+    let mime = match format {
+        image::ImageFormat::Jpeg => {
+            let rgb = small.to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
+                .encode_image(&rgb)
+                .ok()?;
+            "image/jpeg"
+        }
+        _ => {
+            small.write_to(&mut out, image::ImageFormat::Png).ok()?;
+            "image/png"
+        }
+    };
+    let out = out.into_inner();
+    // Shrinking that didn't shrink anything is just a re-encode: keep the
+    // original, which is at worst the same size and at best better quality.
+    if out.len() >= bytes.len() {
+        return None;
+    }
+    Some((out, mime.to_string(), (small.width(), small.height())))
 }
 
 /// What kind of source a cell value looks like.
@@ -336,6 +413,74 @@ pub(crate) mod tests {
         v.extend_from_slice(&w.to_be_bytes());
         v.extend_from_slice(&[3]);
         v
+    }
+
+    /// Build a JPEG of `size` square carrying enough detail that it doesn't
+    /// compress to nothing — a flat colour would shrink so well that the
+    /// "didn't actually shrink" guard would fire and mask the real behaviour.
+    fn noisy_jpeg(size: u32) -> Vec<u8> {
+        let mut buf = image::RgbImage::new(size, size);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for px in buf.pixels_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let b = seed.to_le_bytes();
+            *px = image::Rgb([b[0], b[1], b[2]]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode_image(&buf)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// The whole point of the exercise: a camera-sized picture must not reach
+    /// the report at camera size, because the report shows it 110 pixels tall.
+    #[test]
+    fn a_large_picture_is_embedded_downscaled() {
+        let big = noisy_jpeg(1600);
+        let mut r = ImageResolver::new();
+        let got = r.build("photo.jpg", big.clone()).unwrap();
+        assert_eq!(
+            got.natural,
+            (MAX_EMBED_EDGE, MAX_EMBED_EDGE),
+            "the recorded size must describe the bytes actually embedded, or \
+             every writer's layout maths is wrong"
+        );
+        assert!(
+            got.bytes.len() < big.len() / 2,
+            "expected a real saving, got {} from {}",
+            got.bytes.len(),
+            big.len()
+        );
+        assert_eq!(got.mime, "image/jpeg");
+        assert!(probe(&got.bytes).is_some(), "and it must still be an image");
+    }
+
+    /// A picture already small enough is embedded untouched: re-encoding it
+    /// would only lose quality to save nothing.
+    #[test]
+    fn a_small_picture_is_left_exactly_as_it_was() {
+        let small = noisy_jpeg(64);
+        let mut r = ImageResolver::new();
+        let got = r.build("thumb.jpg", small.clone()).unwrap();
+        assert_eq!(got.bytes, small);
+        assert_eq!(got.natural, (64, 64));
+    }
+
+    /// A format this build has no encoder for keeps its original bytes rather
+    /// than losing the picture.
+    #[test]
+    fn a_format_without_a_codec_is_still_embedded() {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&2000u16.to_le_bytes());
+        gif.extend_from_slice(&2000u16.to_le_bytes());
+        gif.extend_from_slice(&[0u8; 64]);
+        let mut r = ImageResolver::new();
+        let got = r.build("big.gif", gif.clone()).unwrap();
+        assert_eq!(got.bytes, gif, "unshrinkable is not the same as unusable");
+        assert_eq!(got.natural, (2000, 2000));
     }
 
     #[test]

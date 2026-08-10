@@ -10,6 +10,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.8.0] - 2026-08-08
 
+### Changed
+
+- **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used
+  to be a sizing *hint* only: the full-resolution source file was embedded
+  regardless, and the interactive HTML export then embedded a second copy of the
+  same bytes for the drill-down panel. A thousand-row report over 2 MB
+  photographs produced a file measured in gigabytes to show pictures 110 pixels
+  tall.
+
+  Pictures are now re-encoded to at most 640 pixels on their longest edge when
+  resolved, which is sized for the drill-down view — the grid scales the same
+  copy down in CSS, and the HTML panel now borrows its picture from the row's
+  own cell instead of carrying a duplicate. A picture already within the cap,
+  or in a format this build has no encoder for, is still embedded exactly as it
+  was: unshrinkable must never mean unusable.
+
 ### Added
 
 - **`TRUTH`, `IMAGE` and `DETAIL` are editable in both structured editors.**

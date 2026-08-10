@@ -586,6 +586,11 @@ strings! {
     report_status_errors => "errors", "erreurs", "fejl";
     report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
     report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
+    // "Nothing to save" is true but unhelpful for an export: the reader knows
+    // there is a report, so the message has to say what is missing. A run in
+    // flight is a different problem from a run never started -- one is "wait",
+    // the other is "press Run" (`report_export_no_result`, above).
+    report_export_still_running => "The report is still running. Wait for it to finish, then export.", "Le rapport est toujours en cours d'exécution. Attendez la fin, puis exportez.", "Rapporten kører stadig. Vent, til den er færdig, og eksportér så.";
     report_baseline_no_result => "Run the report before saving a baseline.", "Exécutez le rapport avant d'enregistrer une référence.", "Kør rapporten før du gemmer en basislinje.";
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";

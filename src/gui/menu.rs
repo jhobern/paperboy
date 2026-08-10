@@ -1089,10 +1089,16 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
         .report_editor
         .as_ref()
         .ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
-    let result = ed
-        .result
-        .as_ref()
-        .ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
+    // A run in flight and a run never started both leave `result` empty, but
+    // they are different problems: one is "wait", the other is "press Run".
+    // "Nothing to save" told the reader neither.
+    let result = ed.result.as_ref().ok_or_else(|| {
+        if ed.is_running() {
+            app.strings.report_export_still_running.to_string()
+        } else {
+            app.strings.report_export_no_result.to_string()
+        }
+    })?;
     let header = ed
         .flow
         .as_ref()

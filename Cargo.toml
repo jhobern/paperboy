@@ -23,7 +23,6 @@ gui = [
     "dep:eframe",
     "dep:egui_extras",
     "dep:egui-phosphor",
-    "dep:image",
     "dep:rfd",
 ]
 
@@ -82,12 +81,21 @@ egui_extras = { version = "0.35", optional = true }
 egui-phosphor = { version = "0.13", default-features = false, optional = true, features = [
     "light",
 ] }
-# PNG decoding for the application/window icon and the status-bar logo. Already
-# in the tree transitively (egui image support); declared directly so we can
-# decode `assets/paperboy_logo.png` into an `egui::IconData` / `ColorImage`.
-# Pure-Rust `png` backend only — no C toolchain, matching the rest of the build.
-image = { version = "0.25", default-features = false, optional = true, features = [
+# Image decoding/encoding. Two jobs: decoding `assets/paperboy_logo.png` into an
+# `egui::IconData` / `ColorImage` for the GUI's window icon and status-bar logo,
+# and downscaling an `IMAGE` column's pictures for the report writers.
+#
+# Not GUI-gated, because the writers are core: before this, `IMAGE(HEIGHT 110)`
+# was only a CSS/spreadsheet sizing hint and the *full-resolution* file was
+# embedded in every row, so a thousand-row report over 2 MB photographs
+# produced a file measured in gigabytes.
+#
+# Pure-Rust `png`/`jpeg` backends only — no C toolchain, matching the rest of
+# this self-contained build. (GIF and BMP still embed as-is: they are rare as
+# report inputs and each would add another codec to every install.)
+image = { version = "0.25", default-features = false, features = [
     "png",
+    "jpeg",
 ] }
 # Native OS file/folder picker for the GUI's open/save flows and any path field
 # (collections/workspaces/environments, `FOR … IN FILES/FOLDERS` folders, and

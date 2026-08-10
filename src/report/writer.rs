@@ -413,7 +413,7 @@ impl ReportWriter for HtmlWriter {
             out.push_str("\" data-t=\"");
             push_escaped(&mut out, &searchable);
             out.push_str("\">");
-            for c in &columns {
+            for (ci, c) in columns.iter().enumerate() {
                 let value = c.value(row, &result.no_match_marker);
                 let class = match run_cell_tint(result, r, &c.header, &value) {
                     Some(Tint::Green) => " class=\"pass\"",
@@ -429,7 +429,7 @@ impl ReportWriter for HtmlWriter {
                 // export): a `<img src="http://…">` would break the moment the
                 // pre-signed URL it came from expired.
                 match result.images.get(&(r, c.header.clone())) {
-                    Some(img) => push_html_image(&mut out, img, c.image, &value),
+                    Some(img) => push_html_image(&mut out, img, c.image, &value, Some(ci)),
                     None => push_escaped(&mut out, &value),
                 }
                 out.push_str("</td>");
@@ -441,6 +441,7 @@ impl ReportWriter for HtmlWriter {
                 r,
                 &all_columns,
                 &detail_columns,
+                &columns.iter().collect::<Vec<_>>(),
                 columns.len(),
             );
         }
@@ -504,6 +505,7 @@ fn push_detail_row(
     r: usize,
     all_columns: &[OutputColumn],
     detail_columns: &[&OutputColumn],
+    summary_columns: &[&OutputColumn],
     span: usize,
 ) {
     let Some(row) = result.rows.get(r) else {
@@ -543,10 +545,10 @@ fn push_detail_row(
         out.push_str("<section><h3>");
         push_escaped(out, &c.header);
         out.push_str("</h3>");
-        // Deliberately unsized: the cell above already holds the thumbnail the
-        // `IMAGE` clause asked for, and the whole reason to open the panel is
-        // to see the picture properly.
-        push_html_image(out, img, None, &c.value(row, &result.no_match_marker));
+        // Where this column sits in the grid, if it is in the grid at all: a
+        // `DETAIL` picture has no cell, so it has nothing to borrow from.
+        let cell = summary_columns.iter().position(|s| s.header == c.header);
+        push_panel_image(out, img, &c.value(row, &result.no_match_marker), cell);
         out.push_str("</section>");
     }
     for (c, value) in &details {
@@ -615,8 +617,24 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
     tr.tabIndex = 0;
     tr.setAttribute('role', 'button');
     tr.setAttribute('aria-expanded', 'false');
+    // The panel's pictures carry no `src` of their own -- they borrow the
+    // bytes already in the row's cells, so the file holds each picture once
+    // instead of twice. Done on first expand rather than up front so a report
+    // with a thousand rows doesn't decode a thousand images nobody opened.
+    var hydrate = function () {
+      var pending = p.querySelectorAll('img.full[data-from]');
+      for (var i = 0; i < pending.length; i++) {
+        var want = pending[i].getAttribute('data-from');
+        var src = tr.querySelector('img[data-c="' + want + '"]');
+        if (src) {
+          pending[i].src = src.src;
+          pending[i].removeAttribute('data-from');
+        }
+      }
+    };
     var toggle = function () {
       var open = p.classList.toggle('open');
+      if (open) hydrate();
       tr.setAttribute('aria-expanded', open ? 'true' : 'false');
     };
     tr.addEventListener('click', function (e) {
@@ -801,11 +819,16 @@ fn heat_shade(n: usize, max: usize) -> (String, bool) {
 /// Append an `<img>` for a resolved picture, sized per the column's `IMAGE`
 /// clause. The cell's text becomes the `alt`/`title`, so the source it came
 /// from is still available on hover and to a screen reader.
+///
+/// `cell` is the column's index in the grid, tagged onto the element as
+/// `data-c` so the drill-down panel can find this picture and borrow its bytes
+/// (see [`push_panel_image`]).
 fn push_html_image(
     out: &mut String,
     img: &super::model::ImageData,
     spec: Option<crate::report::flow::ImageSpec>,
     value: &str,
+    cell: Option<usize>,
 ) {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
@@ -817,7 +840,11 @@ fn push_html_image(
     };
     out.push_str("<img style=\"");
     out.push_str(&style);
-    out.push_str("\" alt=\"");
+    out.push_str("\"");
+    if let Some(ci) = cell {
+        out.push_str(&format!(" data-c=\"{ci}\""));
+    }
+    out.push_str(" alt=\"");
     push_escaped(out, value);
     out.push_str("\" title=\"");
     push_escaped(out, value);
@@ -825,6 +852,38 @@ fn push_html_image(
     out.push_str(&img.mime);
     out.push_str(";base64,");
     out.push_str(&b64);
+    out.push_str("\">");
+}
+
+/// Append the drill-down panel's copy of a picture.
+///
+/// When the picture is also in the grid (`cell`), the element is emitted with
+/// **no `src`** and the script copies it from the cell on first expand. The
+/// panel used to base64 the same bytes a second time, which doubled the size of
+/// every report that showed pictures -- a thousand-row run embedded a thousand
+/// full-resolution images twice. Borrowing the cell's URI is the same picture
+/// for none of the bytes.
+///
+/// A picture in a `DETAIL` column has no cell to borrow from, so that one is
+/// still embedded here: it appears in the panel or nowhere.
+fn push_panel_image(
+    out: &mut String,
+    img: &super::model::ImageData,
+    value: &str,
+    cell: Option<usize>,
+) {
+    let Some(ci) = cell else {
+        // Deliberately unsized: the whole reason to open the panel is to see
+        // the picture properly.
+        push_html_image(out, img, None, value, None);
+        return;
+    };
+    out.push_str(&format!(
+        "<img class=\"full\" data-from=\"{ci}\" style=\"max-width:100%;height:auto\" alt=\""
+    ));
+    push_escaped(out, value);
+    out.push_str("\" title=\"");
+    push_escaped(out, value);
     out.push_str("\">");
 }
 
@@ -2207,6 +2266,53 @@ mod tests {
             },
         );
         (res, Header::default())
+    }
+
+    /// A picture in the grid must reach the file **once**. The drill-down panel
+    /// used to base64 the same bytes a second time, which doubled the size of
+    /// every report that showed pictures -- at a thousand rows that is the
+    /// difference between a file you can email and one you cannot open.
+    #[test]
+    fn html_embeds_each_picture_once_and_the_panel_borrows_it() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(
+            html.matches(";base64,").count(),
+            1,
+            "the bytes appear once, not once per view: {html}"
+        );
+        // The panel's copy is an element with no source of its own, pointing at
+        // the grid cell it borrows from.
+        assert!(
+            html.contains("data-c=\"1\""),
+            "the grid cell is tagged with its column index: {html}"
+        );
+        assert!(
+            html.contains("class=\"full\" data-from=\"1\""),
+            "and the panel copy points back at it: {html}"
+        );
+        assert!(
+            html.contains("img.full[data-from]"),
+            "the script hydrates it on expand: {html}"
+        );
+    }
+
+    /// A picture on a `DETAIL` column has no grid cell to borrow from, so it is
+    /// still embedded in the panel: there it appears, or nowhere at all.
+    #[test]
+    fn html_embeds_a_detail_only_picture_in_the_panel_itself() {
+        let (mut res, header) = image_result();
+        res.column_details.insert("Frame".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(
+            html.matches(";base64,").count(),
+            1,
+            "still exactly once -- but this time in the panel: {html}"
+        );
+        assert!(
+            !html.contains("data-from="),
+            "there is no cell to borrow from, so nothing is deferred: {html}"
+        );
     }
 
     /// The picture reaches the workbook as a real media part, and the cell's
