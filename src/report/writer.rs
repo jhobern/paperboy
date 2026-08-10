@@ -252,6 +252,127 @@ fn metrics_json(metrics: &super::metrics::Metrics) -> serde_json::Value {
 /// response body is shown faithfully.
 pub struct HtmlWriter;
 
+/// The report's stylesheet, and with it the document's head.
+///
+/// Every colour is a custom property rather than a literal, so the whole
+/// document has exactly one palette and a second one can be laid over it by
+/// re-declaring the same names. Dark mode is that second declaration, applied
+/// twice: once for a reader whose system asks for it, and once for a reader who
+/// pressed the toggle (`data-pb-theme`), which wins over the system either way.
+/// The two blocks are the only place a dark colour appears -- nothing below
+/// them knows which palette is up.
+const HTML_HEAD: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PaperTrail report</title>
+<style>
+:root{
+  --bg:#fff; --fg:#222; --muted:#666; --faint:#777;
+  --line:#ccc; --line-soft:#ddd;
+  --head-bg:#333; --head-fg:#fff;
+  --alt-bg:#f7f7f7; --hover-bg:#eaf1fb; --det-bg:#fbfbfd; --pre-bg:#fff;
+  --panel-bg:#fafafa; --btn-line:#bbb; --on-bg:#333; --on-fg:#fff;
+  --foot-bg:#ececec; --foot-line:#999; --fdiff-head-bg:#eee;
+  --pass-bg:#c6efce; --fail-bg:#ffc7ce; --warn-bg:#ffeb9c; --tint-fg:#222;
+  --cell-fg:#12305a; --pick-line:#12305a;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-pb-theme="light"]){
+    --bg:#14161a; --fg:#e6e6e6; --muted:#9aa0a6; --faint:#8a9099;
+    --line:#3a3f47; --line-soft:#2b3038;
+    --head-bg:#2a2f37; --head-fg:#f0f0f0;
+    --alt-bg:#1a1d22; --hover-bg:#232a35; --det-bg:#171a1f; --pre-bg:#0f1115;
+    --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
+    --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
+    --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
+    --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+  }
+}
+:root[data-pb-theme="dark"]{
+  --bg:#14161a; --fg:#e6e6e6; --muted:#9aa0a6; --faint:#8a9099;
+  --line:#3a3f47; --line-soft:#2b3038;
+  --head-bg:#2a2f37; --head-fg:#f0f0f0;
+  --alt-bg:#1a1d22; --hover-bg:#232a35; --det-bg:#171a1f; --pre-bg:#0f1115;
+  --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
+  --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
+  --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
+  --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;
+background:var(--bg);color:var(--fg)}
+table{border-collapse:collapse;table-layout:fixed;width:max-content;min-width:100%;font-size:14px}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;
+white-space:pre-wrap;overflow-wrap:anywhere}
+thead th{position:sticky;top:0;background:var(--head-bg);color:var(--head-fg);
+white-space:nowrap;overflow-wrap:normal}
+tbody tr.sum.alt{background:var(--alt-bg)}
+tbody tr.sum.has{cursor:pointer}
+tbody tr.sum.has:hover{background:var(--hover-bg)}
+tbody tr.sum.has>td:first-child::before{content:'\25b8 ';color:var(--faint)}
+tbody tr.sum.has[aria-expanded='true']>td:first-child::before{content:'\25be '}
+tr.det{display:none}
+tr.det.open{display:table-row}
+tr.det>td{background:var(--det-bg);border-top:none}
+.panel{display:flex;flex-wrap:wrap;gap:1.25rem}
+.panel section{min-width:min(100%,22rem);flex:1 1 22rem}
+.panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;
+color:var(--muted);margin:0 0 .35rem;font-weight:600}
+.panel pre{margin:0;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;
+background:var(--pre-bg);border:1px solid var(--line-soft);border-radius:4px;padding:.4rem .5rem;
+max-height:24rem;overflow:auto}
+.panel img{max-width:100%;height:auto;border:1px solid var(--line-soft);border-radius:4px}
+table.fdiff{width:100%;font-size:12px}
+table.fdiff th{background:var(--fdiff-head-bg);color:var(--fg);position:static;font-weight:600}
+table.fdiff tr.chg td{background:var(--warn-bg);color:var(--tint-fg)}
+.toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:0 0 .6rem}
+.toolbar button{font:inherit;font-size:13px;padding:.25rem .7rem;border:1px solid var(--btn-line);
+border-radius:5px;background:var(--panel-bg);color:var(--fg);cursor:pointer}
+.toolbar button.on{background:var(--on-bg);color:var(--on-fg);border-color:var(--on-bg)}
+.toolbar button#pb-theme{margin-left:auto}
+.toolbar input{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid var(--btn-line);
+border-radius:5px;background:var(--pre-bg);color:var(--fg)}
+.toolbar .count{font-size:12px;color:var(--muted)}
+tfoot td{font-weight:bold;background:var(--foot-bg);border-top:2px solid var(--foot-line)}
+td.pass{background:var(--pass-bg);color:var(--tint-fg)}
+td.fail{background:var(--fail-bg);color:var(--tint-fg)}
+td.warn{background:var(--warn-bg);color:var(--tint-fg)}
+.metrics{display:flex;flex-wrap:wrap;gap:.75rem;margin:0 0 1rem}
+.card{border:1px solid var(--line);border-radius:6px;padding:.5rem .9rem;background:var(--panel-bg)}
+.card .k{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;
+letter-spacing:.04em}
+.card .v{display:block;font-size:20px;font-weight:600}
+.matrix{margin:0 0 1.25rem}
+.matrix h2{font-size:17px;font-weight:600;margin:0 0 .45rem}
+.matrix table{width:auto;min-width:0;font-size:20px}
+.matrix th,.matrix td{text-align:center;white-space:nowrap;padding:12px 18px}
+.matrix thead th{position:static;background:var(--panel-bg);color:var(--fg);font-weight:600}
+.matrix th.axis{background:var(--panel-bg);color:var(--fg);text-align:right;font-weight:600}
+.matrix td.cell{color:var(--cell-fg);background:var(--heat,transparent)}
+.matrix td.pick{cursor:pointer}
+.matrix td.pick:hover{outline:2px solid var(--pick-line);outline-offset:-2px}
+.matrix td.hot{color:#fff}
+.matrix caption{caption-side:bottom;font-size:13px;color:var(--muted);padding-top:.4rem;
+text-align:left}
+/* The heat ramp is mixed with white by construction, so on a dark page every
+   cell would be a bright block. Mixing it back toward the page keeps the
+   ramp's shape without the glare. `color-mix` is a progressive enhancement:
+   a browser that doesn't know it keeps the light ramp, which is legible
+   either way because the cell text stays dark on it. */
+@media (prefers-color-scheme: dark){
+  :root:not([data-pb-theme="light"]) .matrix td.cell{
+    background:color-mix(in srgb, var(--heat) 62%, #0b0d10);color:#eaf1ff}
+}
+:root[data-pb-theme="dark"] .matrix td.cell{
+  background:color-mix(in srgb, var(--heat) 62%, #0b0d10);color:#eaf1ff}
+</style>
+<noscript><style>tr.det{display:table-row}.toolbar{display:none}</style></noscript>
+</head>
+<body>
+"##;
+
 impl ReportWriter for HtmlWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         let all_columns = result.resolved_columns(header);
@@ -260,68 +381,7 @@ impl ReportWriter for HtmlWriter {
         let (columns, detail_columns) = super::detail::split_columns(&all_columns);
         let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
-        out.push_str(
-            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-             <title>PaperTrail report</title>\n<style>\n\
-             body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;color:#222}\n\
-             table{border-collapse:collapse;table-layout:fixed;width:max-content;\
-             min-width:100%;font-size:14px}\n\
-             th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;\
-             white-space:pre-wrap;overflow-wrap:anywhere}\n\
-             thead th{position:sticky;top:0;background:#333;color:#fff;\
-             white-space:nowrap;overflow-wrap:normal}\n\
-             tbody tr.sum.alt{background:#f7f7f7}\n\
-             tbody tr.sum.has{cursor:pointer}\n\
-             tbody tr.sum.has:hover{background:#eaf1fb}\n\
-             tbody tr.sum.has>td:first-child::before{content:'\\25b8 ';color:#777}\n\
-             tbody tr.sum.has[aria-expanded='true']>td:first-child::before{content:'\\25be '}\n\
-             tr.det{display:none}\n\
-             tr.det.open{display:table-row}\n\
-             tr.det>td{background:#fbfbfd;border-top:none}\n\
-             .panel{display:flex;flex-wrap:wrap;gap:1.25rem}\n\
-             .panel section{min-width:min(100%,22rem);flex:1 1 22rem}\n\
-             .panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;\
-             color:#666;margin:0 0 .35rem;font-weight:600}\n\
-             .panel pre{margin:0;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;\
-             background:#fff;border:1px solid #ddd;border-radius:4px;padding:.4rem .5rem;\
-             max-height:24rem;overflow:auto}\n\
-             .panel img{max-width:100%;height:auto;border:1px solid #ddd;border-radius:4px}\n\
-             table.fdiff{width:100%;font-size:12px}\n\
-             table.fdiff th{background:#eee;color:#222;position:static;font-weight:600}\n\
-             table.fdiff tr.chg td{background:#ffeb9c}\n\
-             .toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:0 0 .6rem}\n\
-             .toolbar button{font:inherit;font-size:13px;padding:.25rem .7rem;border:1px solid #bbb;\
-             border-radius:5px;background:#fafafa;cursor:pointer}\n\
-             .toolbar button.on{background:#333;color:#fff;border-color:#333}\n\
-             .toolbar input{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid #bbb;\
-             border-radius:5px}\n\
-             .toolbar .count{font-size:12px;color:#666}\n\
-             tfoot td{font-weight:bold;background:#ececec;border-top:2px solid #999}\n\
-             td.pass{background:#c6efce}\n\
-             td.fail{background:#ffc7ce}\n\
-             td.warn{background:#ffeb9c}\n\
-             .metrics{display:flex;flex-wrap:wrap;gap:.75rem;margin:0 0 1rem}\n\
-             .card{border:1px solid #ccc;border-radius:6px;padding:.5rem .9rem;background:#fafafa}\n\
-             .card .k{display:block;font-size:12px;color:#666;text-transform:uppercase;\
-             letter-spacing:.04em}\n\
-             .card .v{display:block;font-size:20px;font-weight:600}\n\
-             .matrix{margin:0 0 1.25rem}\n\
-             .matrix h2{font-size:17px;font-weight:600;margin:0 0 .45rem}\n\
-             .matrix table{width:auto;min-width:0;font-size:20px}\n\
-             .matrix th,.matrix td{text-align:center;white-space:nowrap;padding:12px 18px}\n\
-             .matrix thead th{position:static;background:#fafafa;color:#222;font-weight:600}\n\
-             .matrix th.axis{background:#fafafa;color:#222;text-align:right;font-weight:600}\n\
-             .matrix td.cell{color:#12305a}\n\
-             .matrix td.pick{cursor:pointer}\n\
-             .matrix td.pick:hover{outline:2px solid #12305a;outline-offset:-2px}\n\
-             .matrix td.hot{color:#fff}\n\
-             .matrix caption{caption-side:bottom;font-size:13px;color:#666;padding-top:.4rem;\
-             text-align:left}\n\
-             </style>\n\
-             <noscript><style>tr.det{display:table-row}.toolbar{display:none}</style></noscript>\n\
-             </head>\n<body>\n",
-        );
+        out.push_str(HTML_HEAD);
         // Ground-truth metrics go *above* the table, as cards and a matrix:
         // HTML has a header block, and a reader who wants to know whether the
         // run was any good should not have to scroll 500 rows to find out. The
@@ -470,10 +530,17 @@ fn push_filter_toolbar(out: &mut String, filters: &[super::filter::RowFilter]) {
             out.push_str("</button>");
         }
     }
+    // The theme toggle rides along in the toolbar because it is the same kind
+    // of thing: a control over how the page is read, not over what it says. It
+    // is written by the document rather than assumed, so a browser with
+    // scripting off never shows a button that would do nothing (the toolbar is
+    // hidden outright there) and still gets the system's own light/dark choice.
     out.push_str(
         "<input type=\"search\" id=\"pb-find\" placeholder=\"Find\u{2026}\" \
          aria-label=\"Find in rows\">\
-         <span class=\"count\" id=\"pb-count\" aria-live=\"polite\"></span></div>\n",
+         <span class=\"count\" id=\"pb-count\" aria-live=\"polite\"></span>\
+         <button type=\"button\" id=\"pb-theme\" aria-pressed=\"false\" \
+         title=\"Switch between the light and dark palette\">Dark</button></div>\n",
     );
 }
 
@@ -652,6 +719,50 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
   });
   if (find) find.addEventListener('input', apply);
   apply();
+
+  // Dark mode. The page already follows the reader's system setting on its own
+  // (a `prefers-color-scheme` block in the stylesheet); this is the override
+  // for when the two disagree -- a dark desktop and a report going on a
+  // projector, say. The choice is remembered per file:// origin where the
+  // browser allows it, and simply doesn't stick where it doesn't.
+  var root = document.documentElement;
+  var themeBtn = document.getElementById('pb-theme');
+  var store = function (k, v) {
+    try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {}
+  };
+  var stored = null;
+  try { stored = localStorage.getItem('pb-theme'); } catch (e) {}
+  var systemDark = function () {
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  };
+  var paint = function () {
+    var dark = root.getAttribute('data-pb-theme') === 'dark' ||
+      (!root.hasAttribute('data-pb-theme') && systemDark());
+    if (themeBtn) {
+      // The button names the palette you would get by pressing it, which is
+      // the question someone reaching for it is actually asking.
+      themeBtn.textContent = dark ? 'Light' : 'Dark';
+      themeBtn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    }
+  };
+  if (stored === 'dark' || stored === 'light') root.setAttribute('data-pb-theme', stored);
+  paint();
+  if (themeBtn) {
+    themeBtn.addEventListener('click', function () {
+      var dark = root.getAttribute('data-pb-theme') === 'dark' ||
+        (!root.hasAttribute('data-pb-theme') && systemDark());
+      var next = dark ? 'light' : 'dark';
+      root.setAttribute('data-pb-theme', next);
+      store('pb-theme', next);
+      paint();
+    });
+  }
+  if (window.matchMedia) {
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    var follow = function () { if (!root.hasAttribute('data-pb-theme')) paint(); };
+    if (mq.addEventListener) mq.addEventListener('change', follow);
+    else if (mq.addListener) mq.addListener(follow);
+  }
 })();
 </script>
 "#;
@@ -756,8 +867,11 @@ fn push_confusion_matrix(
                 })
                 .map(|i| format!(" pick\" data-i=\"{i}\" title=\"Show these rows"))
                 .unwrap_or_default();
+            // The shade travels as a custom property rather than a
+            // `background`, so the dark palette can mix it back toward the page
+            // instead of being overruled by an inline style it can't reach.
             out.push_str(&format!(
-                "<td class=\"cell{}{pick}\" style=\"background:{bg}\">{n}</td>",
+                "<td class=\"cell{}{pick}\" style=\"--heat:{bg}\">{n}</td>",
                 if hot { " hot" } else { "" }
             ));
         }
@@ -2242,6 +2356,65 @@ mod tests {
             },
         );
         (res, Header::default())
+    }
+
+    /// The exported report reads on a dark screen as well as a light one.
+    ///
+    /// The thing worth pinning down is not that a dark colour appears
+    /// somewhere, but that there is exactly *one* palette: a literal colour
+    /// left behind in the body of the stylesheet is a patch of light theme
+    /// stranded on a dark page, and that is the failure mode this catches.
+    #[test]
+    fn an_html_report_carries_a_dark_palette_as_well_as_a_light_one() {
+        let mut res = ReportResult::default();
+        res.column_order = vec!["Name".to_string()];
+        res.rows.push(ReportRow {
+            cells: HashMap::from([("Name".to_string(), "a".to_string())]),
+            ..Default::default()
+        });
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+
+        assert!(
+            html.contains("prefers-color-scheme: dark"),
+            "a reader whose system asks for dark gets it without being asked: {html}"
+        );
+        assert!(
+            html.contains("id=\"pb-theme\""),
+            "and a reader who disagrees with their system can say so"
+        );
+        assert!(
+            html.contains("data-pb-theme=\"dark\""),
+            "the override is an attribute on the document, so it beats the media query"
+        );
+
+        // The rules *below* the palette must name no colour of their own. Two
+        // exceptions stand: `#fff` on a hot heatmap cell (which sits on a
+        // saturated blue in either palette) and the mixing colour the dark heat
+        // ramp is folded into.
+        let style = html
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the document has a stylesheet");
+        let body = style
+            .split(":root[data-pb-theme=\"dark\"]{")
+            .nth(1)
+            .and_then(|s| s.split_once('}'))
+            .expect("the explicit dark palette is the last of the palettes")
+            .1;
+        let stray: Vec<&str> = body
+            .match_indices('#')
+            .map(|(i, _)| &body[i..(i + 7).min(body.len())])
+            // A `#` starts a colour only when hex digits follow it; `#pb-theme`
+            // is an id selector, not a shade.
+            .filter(|c| c[1..].starts_with(|ch: char| ch.is_ascii_hexdigit()))
+            .filter(|c| !c.starts_with("#fff") && !c.starts_with("#0b0d10"))
+            .filter(|c| !c.starts_with("#eaf1ff"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "every other colour comes from the palette, not from the rule: {stray:?}"
+        );
     }
 
     /// A picture in the grid must reach the file **once**. The drill-down panel

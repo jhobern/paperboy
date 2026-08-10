@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The exported HTML report has a dark mode.** It was a white page whatever the
+  screen it was opened on, which is a bright thing to hand someone at the end of
+  a long day. It now follows the reader's own system setting, and carries a
+  **Dark**/**Light** toggle at the end of its toolbar for when the two disagree
+  — a dark desktop and a report going on a projector. The choice is remembered
+  between openings where the browser allows it. Every colour in the file now
+  comes from one palette declared in one place, including the confusion matrix's
+  heatmap, which is mixed back toward the page rather than glowing on it.
+
 - **Open an exported report where it belongs.** The interactive HTML export is
   written to be read in a browser and the xlsx in a spreadsheet, but both
   front-ends stopped at naming the file, leaving you to go and find it. After a
