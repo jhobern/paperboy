@@ -57,6 +57,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The in-app confusion matrix is drawn large enough to read.** The counts and
+  their axis labels were set at the small text style, so the matrix — a thing
+  read by comparing one cell against another at a glance — came out as a grid of
+  little grey numbers. The cells are now uniformly wide, evenly padded and set
+  above body size, with the counts centred in their block of colour. The sizes
+  are derived from the app's body text height, so the matrix still follows the
+  text scale rather than being pinned to a fixed pixel size.
+
 - **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used
   to be a sizing *hint* only: the full-resolution source file was embedded
   regardless, and the interactive HTML export then embedded a second copy of the

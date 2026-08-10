@@ -2792,7 +2792,26 @@ fn confusion_matrix(
     selected: &mut usize,
 ) {
     let max = matrix.max();
-    egui::CollapsingHeader::new(RichText::new(column).strong())
+    // A matrix is read by comparing cells, which needs them big enough to scan
+    // at a glance: at body size the counts and their axis labels were a grid of
+    // small grey numbers. Sized off the body height so it still follows the
+    // app's text scale rather than being pinned to a pixel count.
+    let base = ui.text_style_height(&egui::TextStyle::Body);
+    let cell_font = base * 1.15;
+    let axis_font = base * 1.0;
+    // Every cell the same width, so a column of counts lines up and the block
+    // of colour reads as a heatmap rather than as ragged boxes.
+    let cell_w = (base * 3.2).max(
+        matrix
+            .axis
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1) as f32
+            * base
+            * 0.45,
+    );
+    egui::CollapsingHeader::new(RichText::new(column).strong().size(base * 1.1))
         .id_salt(("pb_matrix", column))
         .default_open(true)
         .show(ui, |ui| {
@@ -2801,11 +2820,13 @@ fn confusion_matrix(
                 .show(ui, |ui| {
                     ui.label("");
                     for label in &matrix.axis {
-                        ui.label(RichText::new(label).color(th.dim).small());
+                        cell_slot(ui, cell_w, base, |ui| {
+                            ui.label(RichText::new(label).color(th.dim).size(axis_font));
+                        });
                     }
                     ui.end_row();
                     for (t, truth) in matrix.axis.iter().enumerate() {
-                        ui.label(RichText::new(truth).color(th.dim).small());
+                        ui.label(RichText::new(truth).color(th.dim).size(axis_font));
                         for (p, answer) in matrix.axis.iter().enumerate() {
                             let n = matrix.counts[t][p];
                             let ([r, g, b], hot) =
@@ -2831,19 +2852,25 @@ fn confusion_matrix(
                                 .flatten();
                             let resp = egui::Frame::NONE
                                 .fill(egui::Color32::from_rgb(r, g, b))
-                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                .inner_margin(egui::Margin::symmetric(6, 6))
                                 .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(n.to_string()).color(fg),
+                                    ui.set_min_width(cell_w);
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(n.to_string())
+                                                    .color(fg)
+                                                    .size(cell_font),
+                                            )
+                                            .selectable(false)
+                                            .sense(if pick.is_some() {
+                                                egui::Sense::click()
+                                            } else {
+                                                egui::Sense::hover()
+                                            }),
                                         )
-                                        .selectable(false)
-                                        .sense(if pick.is_some() {
-                                            egui::Sense::click()
-                                        } else {
-                                            egui::Sense::hover()
-                                        }),
-                                    )
+                                    })
+                                    .inner
                                 })
                                 .inner;
                             if let Some(i) = pick {
@@ -2871,7 +2898,7 @@ fn confusion_matrix(
                         .replace("{n}", &matrix.total().to_string())
                 ))
                 .color(th.dim)
-                .small(),
+                .size(axis_font * 0.95),
             );
         });
     ui.add_space(2.0);
