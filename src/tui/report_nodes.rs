@@ -41,7 +41,7 @@ use crate::report::model::StatKind;
 // one implementation. Re-export it under the historical names so this file's
 // TUI-specific rendering / key handling / overlays read unchanged.
 pub(crate) use crate::report::edit::{
-    DetachWhich, HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind,
+    ClauseForm, DetachWhich, HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind,
     detach_modifier, flatten_expanded, header_specs, header_unset, insert_node, insert_pos_after,
     loop_producer_dir, loop_producer_dir_mut, move_node, node_at, node_at_mut, node_with_items,
     parse_one_node, remove_node, replace_node, request_node,
@@ -361,6 +361,9 @@ pub(crate) enum VarsRow {
     Alias,
     /// One `STATISTICS(…)` checkbox — likewise single-variable only.
     Stat(usize),
+    /// One row of the shared trailing-clause block ([`ClauseRow`]) — likewise
+    /// single-variable only, since the clauses attach to a column.
+    Clause(ClauseRow),
 }
 
 /// The `REPORT <var>` configure form ([`Overlay::ReportNodeVars`]): which
@@ -382,14 +385,8 @@ pub(crate) struct VarsForm {
     pub(crate) other: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
-    /// An `IMAGE(…)` render hint the statement already carries. The form
-    /// doesn't expose it, but must not silently drop it when writing back.
-    pub(crate) image: Option<ImageSpec>,
-    /// A `TRUTH "…"` clause the statement already carries, preserved for the
-    /// same reason as [`Self::image`].
-    pub(crate) truth: Option<String>,
-    /// A `DETAIL` placement flag, preserved for the same reason again.
-    pub(crate) detail: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     pub(crate) selected: usize,
 }
 
@@ -415,9 +412,7 @@ impl VarsForm {
             }
         }
         VarsForm {
-            image,
-            truth,
-            detail,
+            clauses: ClauseForm::of(image, truth.as_deref(), detail),
             report_id,
             path,
             vars: names
@@ -460,6 +455,7 @@ impl VarsForm {
         if self.chosen().len() == 1 {
             rows.push(VarsRow::Alias);
             rows.extend((0..self.stats.len()).map(VarsRow::Stat));
+            rows.extend(clause_rows(&self.clauses).into_iter().map(VarsRow::Clause));
         }
         rows
     }
@@ -482,10 +478,18 @@ impl VarsForm {
             .collect();
         // A single variable with a name or statistics is the `VarAs` form;
         // anything else is the plain variable list.
-        if rest.is_empty() && (!alias.is_empty() || !stats.is_empty() || self.image.is_some()) {
+        let image = self.clauses.image();
+        let truth = self.clauses.truth();
+        if rest.is_empty()
+            && (!alias.is_empty()
+                || !stats.is_empty()
+                || image.is_some()
+                || truth.is_some()
+                || self.clauses.detail)
+        {
             return Some(FlowNode::Report(ReportStmt::VarAs {
-                truth: self.truth.clone(),
-                detail: self.detail,
+                truth,
+                detail: self.clauses.detail,
                 var: first.clone(),
                 // `STATISTICS` needs a column to attach to, so an unnamed one
                 // falls back to the variable's own name.
@@ -495,7 +499,7 @@ impl VarsForm {
                     alias.to_string()
                 },
                 stats,
-                image: self.image,
+                image,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -511,6 +515,8 @@ pub(crate) enum ComputedRow {
     Alias,
     /// One `STATISTICS(…)` checkbox.
     Stat(usize),
+    /// One row of the shared trailing-clause block ([`ClauseRow`]).
+    Clause(ClauseRow),
 }
 
 /// The `REPORT "<template>" AS <name>` configure form
@@ -527,13 +533,8 @@ pub(crate) struct ComputedForm {
     pub(crate) template: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
-    /// An `IMAGE(…)` render hint the statement already carries; preserved
-    /// verbatim, as in [`VarsForm`].
-    pub(crate) image: Option<ImageSpec>,
-    /// A `TRUTH "…"` clause, preserved verbatim, as in [`VarsForm`].
-    pub(crate) truth: Option<String>,
-    /// A `DETAIL` placement flag, preserved verbatim, as in [`VarsForm`].
-    pub(crate) detail: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     pub(crate) selected: usize,
 }
 
@@ -541,6 +542,11 @@ impl ComputedForm {
     pub(crate) fn visible_rows(&self) -> Vec<ComputedRow> {
         let mut rows = vec![ComputedRow::Template, ComputedRow::Alias];
         rows.extend((0..self.stats.len()).map(ComputedRow::Stat));
+        rows.extend(
+            clause_rows(&self.clauses)
+                .into_iter()
+                .map(ComputedRow::Clause),
+        );
         rows
     }
 
@@ -558,8 +564,8 @@ impl ComputedForm {
             return None;
         }
         Some(FlowNode::Report(ReportStmt::Computed {
-            truth: self.truth.clone(),
-            detail: self.detail,
+            truth: self.clauses.truth(),
+            detail: self.clauses.detail,
             template: template.to_string(),
             name: alias.to_string(),
             stats: self
@@ -568,7 +574,7 @@ impl ComputedForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
-            image: self.image,
+            image: self.clauses.image(),
         }))
     }
 }
@@ -668,6 +674,101 @@ impl ListForm {
     }
 }
 
+/// One row of the trailing-clause block shared by every named-column form.
+///
+/// `TRUTH`, `IMAGE` and `DETAIL` attach identically to a `REPORT … AS`, a
+/// computed column and a `WITH` field, so all three forms embed this block
+/// rather than growing three near-identical sets of rows (and three chances to
+/// let one of them drift).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ClauseRow {
+    /// The `TRUTH "…"` template, editable inline. A plain text row rather than
+    /// a toggle: it is a value, usually a `{{ … }}` reference to a label the
+    /// loop bound, and blank means the column isn't scored.
+    Truth,
+    /// The `DETAIL` on/off toggle.
+    Detail,
+    /// The `IMAGE` on/off toggle. Like the `STATISTICS` toggle, the sizing rows
+    /// below only exist while it is on -- most columns are not pictures, and
+    /// three permanently-showing size rows would bury the two rows every column
+    /// actually needs.
+    Image,
+    /// `FIT`: size to the cell. Only shown while [`ClauseRow::Image`] is on.
+    Fit,
+    /// `HEIGHT`, typed as digits. Only shown while `IMAGE` is on and `FIT` off,
+    /// since `FIT` is what makes a fixed size meaningless.
+    Height,
+    /// `WIDTH`, likewise.
+    Width,
+}
+
+/// The clause rows to show for `c`, in order.
+pub(crate) fn clause_rows(c: &ClauseForm) -> Vec<ClauseRow> {
+    let mut rows = vec![ClauseRow::Truth, ClauseRow::Detail, ClauseRow::Image];
+    if c.image_on {
+        rows.push(ClauseRow::Fit);
+        if !c.fit {
+            rows.push(ClauseRow::Height);
+            rows.push(ClauseRow::Width);
+        }
+    }
+    rows
+}
+
+/// Apply `key` to the clause block. Returns whether the row consumed it, so a
+/// form can fall through to its own handling for a row this block doesn't own.
+pub(crate) fn clause_key(c: &mut ClauseForm, row: ClauseRow, key: KeyEvent) -> bool {
+    // Sizes take digits only: the clause holds pixels, and letting a stray
+    // letter in would silently drop the whole size when it failed to parse.
+    let digits = |field: &mut String, key: KeyEvent| match key.code {
+        KeyCode::Char(ch) if ch.is_ascii_digit() => {
+            field.push(ch);
+            true
+        }
+        KeyCode::Backspace => {
+            field.pop();
+            true
+        }
+        _ => false,
+    };
+    match row {
+        ClauseRow::Truth => match key.code {
+            KeyCode::Char(ch) => {
+                c.truth.push(ch);
+                true
+            }
+            KeyCode::Backspace => {
+                c.truth.pop();
+                true
+            }
+            _ => false,
+        },
+        ClauseRow::Detail => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.detail = !c.detail;
+                return true;
+            }
+            false
+        }
+        ClauseRow::Image => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.toggle_image();
+                return true;
+            }
+            false
+        }
+        ClauseRow::Fit => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.toggle_fit();
+                return true;
+            }
+            false
+        }
+        ClauseRow::Height => digits(&mut c.height, key),
+        ClauseRow::Width => digits(&mut c.width, key),
+    }
+}
+
 /// One row of the [`WithFieldForm`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WithFieldRow {
@@ -675,10 +776,8 @@ pub(crate) enum WithFieldRow {
     Name,
     /// The Hurl query the column's value comes from, editable inline.
     Query,
-    /// The `TRUTH "…"` ground-truth template, editable inline. A plain text row
-    /// rather than a toggle: it is a value, usually a `{{ … }}` reference to a
-    /// label the loop bound, and blank means the column isn't scored.
-    Truth,
+    /// One row of the shared trailing-clause block ([`ClauseRow`]).
+    Clause(ClauseRow),
     /// The `STATISTICS(…)` on/off toggle. The individual statistic checkboxes
     /// only exist while it is on: most columns want no summary at all, and a
     /// permanently-showing list of six checkboxes buried the two rows that
@@ -720,15 +819,8 @@ pub(crate) struct WithFieldForm {
     /// only sensible thing to return to is the outline itself. Getting this
     /// wrong dumped the user into a request form they never asked for.
     pub(crate) return_to_request: bool,
-    /// An `IMAGE(…)` render hint the field already carries; preserved verbatim
-    /// (the form doesn't expose it, but must not drop it).
-    pub(crate) image: Option<ImageSpec>,
-    /// The `TRUTH "…"` ground-truth template, as edited: empty when the field
-    /// carries no clause.
-    pub(crate) truth: String,
-    /// A `DETAIL` placement flag the field already carries; preserved verbatim,
-    /// like [`Self::image`].
-    pub(crate) detail: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -741,7 +833,7 @@ impl WithFieldForm {
         existing: Option<&WithItem>,
         return_to_request: bool,
     ) -> Self {
-        let (name, query, stats, image, truth, detail) = match existing {
+        let (name, query, stats, clauses) = match existing {
             Some(WithItem::Field {
                 name,
                 query,
@@ -753,18 +845,19 @@ impl WithFieldForm {
                 name.clone(),
                 query.clone(),
                 stats.clone(),
-                *image,
-                truth.clone(),
-                *detail,
+                ClauseForm::of(*image, truth.as_deref(), *detail),
             ),
             // A bare `WITH RESPONSE` isn't a named field, so editing it falls
             // through to a fresh one rather than silently rewriting it.
-            _ => (String::new(), String::new(), Vec::new(), None, None, false),
+            _ => (
+                String::new(),
+                String::new(),
+                Vec::new(),
+                ClauseForm::default(),
+            ),
         };
         WithFieldForm {
-            image,
-            detail,
-            truth: truth.unwrap_or_default(),
+            clauses,
             report_id,
             path,
             index,
@@ -781,12 +874,13 @@ impl WithFieldForm {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<WithFieldRow> {
-        let mut rows = vec![
-            WithFieldRow::Name,
-            WithFieldRow::Query,
-            WithFieldRow::Truth,
-            WithFieldRow::Stats,
-        ];
+        let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query];
+        rows.extend(
+            clause_rows(&self.clauses)
+                .into_iter()
+                .map(WithFieldRow::Clause),
+        );
+        rows.push(WithFieldRow::Stats);
         if self.stats_on {
             rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
         }
@@ -838,11 +932,9 @@ impl WithFieldForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
-            image: self.image,
-            detail: self.detail,
-            // Blank means no clause at all, so clearing the row removes it
-            // rather than writing an empty ground truth nothing can match.
-            truth: Some(self.truth.trim().to_string()).filter(|t| !t.is_empty()),
+            image: self.clauses.image(),
+            detail: self.clauses.detail,
+            truth: self.clauses.truth(),
         })
     }
 }
@@ -1838,6 +1930,13 @@ impl TuiApp {
                 let rows = form.visible_rows();
                 let sel = form.selected.min(rows.len().saturating_sub(1));
                 match rows.get(sel).copied() {
+                    Some(VarsRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
+                        // Toggling IMAGE or FIT adds or removes rows below,
+                        // which can leave the selection past the end.
+                        form.selected = form.selected.min(form.last_row());
+                        keep(self, form);
+                    }
                     Some(VarsRow::Var(vi)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some(row) = form.vars.get_mut(vi)
@@ -1910,9 +2009,7 @@ impl TuiApp {
             path,
             template,
             alias: name,
-            image,
-            detail,
-            truth,
+            clauses: ClauseForm::of(image, truth.as_deref(), detail),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -1958,6 +2055,11 @@ impl TuiApp {
                 let rows = form.visible_rows();
                 let sel = form.selected.min(rows.len().saturating_sub(1));
                 match rows.get(sel).copied() {
+                    Some(ComputedRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
+                        form.selected = form.selected.min(form.last_row());
+                        keep(self, form);
+                    }
                     Some(ComputedRow::Template) => {
                         match key.code {
                             KeyCode::Char(c) => form.template.push(c),
@@ -2259,14 +2361,8 @@ impl TuiApp {
                         }
                         keep(self, form);
                     }
-                    Some(WithFieldRow::Truth) => {
-                        match key.code {
-                            KeyCode::Char(c) => form.truth.push(c),
-                            KeyCode::Backspace => {
-                                form.truth.pop();
-                            }
-                            _ => {}
-                        }
+                    Some(WithFieldRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
                         keep(self, form);
                     }
                     Some(WithFieldRow::Stats) => {

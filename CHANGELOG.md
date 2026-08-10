@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`TRUTH`, `IMAGE` and `DETAIL` are editable in both structured editors.**
+  The three trailing clauses attach identically to a `WITH` field, a
+  `REPORT <var> AS` column and a computed column, so all three forms in the TUI
+  node editor and the GUI block editor now show one shared clause block instead
+  of carrying the clauses invisibly and writing them back untouched.
+
+  `IMAGE` is a toggle that reveals `FIT`, `HEIGHT` and `WIDTH` — most columns
+  are not pictures, and three permanently-visible size rows would bury the two
+  rows every column needs. `FIT` and a pixel size answer the same question, so
+  picking `FIT` clears the sizes rather than emitting a spec a writer would have
+  to arbitrate. A clause on its own is now enough to promote a bare
+  `REPORT <var>` to the named form, falling back to the variable's own name.
+
 - **Columns can be marked as supporting evidence with `DETAIL`.** A bare
   `DETAIL` flag, alongside `STATISTICS(…)`, `IMAGE(…)` and `TRUTH "…"` on any
   named column, says the column is worth keeping but not worth a slot in the
@@ -228,6 +241,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   must be opened first, since validating a report should not do network I/O.
 
 ### Changed
+
+- **A label class is edited as two fields in the GUI's report settings.**
+  `# labels:` used to be a single text box, so declaring a vocabulary meant
+  remembering both the `=` and the comma rules. The class is now split around
+  its `=` — the label on the left, the spellings that mean it on the right —
+  the same way a helper collection is split around its `AS`, with example hints
+  (`Low Risk` / `real, genuine, pass`) rather than descriptions.
+
+- **The GUI's "Report settings" title is a heading**, the same size every
+  wizard panel titles itself with, rather than small caption text.
 
 - **Summary statistics are behind a toggle in the TUI's `WITH` field editor.**
   The six `STATISTICS(…)` choices used to be listed unconditionally, which made

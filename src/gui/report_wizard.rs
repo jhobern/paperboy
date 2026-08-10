@@ -57,13 +57,8 @@ pub struct VarsForm {
     /// emits two columns and so has no one name to give.
     alias: String,
     stats: Vec<(StatKind, bool)>,
-    /// An `IMAGE(…)` render hint the statement already carries. The form
-    /// doesn't expose it, but must not drop it when writing back.
-    image: Option<crate::report::flow::ImageSpec>,
-    /// A `TRUTH "…"` clause, preserved for the same reason as [`Self::image`].
-    truth: Option<String>,
-    /// A `DETAIL` placement flag, preserved for the same reason again.
-    detail: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 impl VarsForm {
@@ -87,21 +82,31 @@ impl VarsForm {
         let chosen = self.chosen();
         let (first, rest) = chosen.split_first()?;
         let alias = self.alias.trim();
+        let image = self.clauses.image();
+        let truth = self.clauses.truth();
         // An alias applies to exactly one column, so a multi-variable pick
-        // ignores it rather than silently dropping the extra variables.
-        if rest.is_empty() && !alias.is_empty() {
+        // ignores it rather than silently dropping the extra variables. A
+        // clause is enough on its own to need the `AS` form, so an unnamed
+        // column falls back to the variable's own name rather than losing it.
+        if rest.is_empty()
+            && (!alias.is_empty() || image.is_some() || truth.is_some() || self.clauses.detail)
+        {
             return Some(FlowNode::Report(ReportStmt::VarAs {
                 var: first.clone(),
-                name: alias.to_string(),
+                name: if alias.is_empty() {
+                    first.clone()
+                } else {
+                    alias.to_string()
+                },
                 stats: self
                     .stats
                     .iter()
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
-                image: self.image,
-                truth: self.truth.clone(),
-                detail: self.detail,
+                image,
+                truth,
+                detail: self.clauses.detail,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -115,12 +120,8 @@ pub struct ComputedForm {
     template: String,
     alias: String,
     stats: Vec<(StatKind, bool)>,
-    /// Preserved verbatim, as in [`VarsForm`].
-    image: Option<crate::report::flow::ImageSpec>,
-    /// Preserved verbatim, as in [`VarsForm`].
-    truth: Option<String>,
-    /// Preserved verbatim, as in [`VarsForm`].
-    detail: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -173,6 +174,8 @@ pub struct WithFieldForm {
     /// The `STATISTICS(…)` checklist: `(stat, on)` over every choosable stat, in
     /// [`StatKind::CHOOSABLE`] order. None ticked ⇒ no clause.
     stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 impl WithFieldForm {
@@ -458,9 +461,7 @@ fn build_vars(
             .iter()
             .map(|k| (*k, stats.contains(k)))
             .collect(),
-        image,
-        truth,
-        detail,
+        clauses: crate::report::edit::ClauseForm::of(image, truth.as_deref(), detail),
     }
 }
 
@@ -535,9 +536,7 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
             path: path.to_vec(),
             template: template.clone(),
             alias: name.clone(),
-            image: *image,
-            truth: truth.clone(),
-            detail: *detail,
+            clauses: crate::report::edit::ClauseForm::of(*image, truth.as_deref(), *detail),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -567,21 +566,37 @@ pub fn open_with_field(ed: &mut ReportEditor, path: &[usize], index: Option<usiz
                 _ => None,
             })
     });
-    // The `IMAGE(…)` hint isn't edited here; `set_with_field` leaves the one
-    // already on the item alone, so the form has no need to carry it.
-    let (index, name, query, stats) = match existing {
+    let (index, name, query, stats, clauses) = match existing {
         Some(WithItem::Field {
-            name, query, stats, ..
-        }) => (index, name, query, stats),
+            name,
+            query,
+            stats,
+            image,
+            truth,
+            detail,
+        }) => (
+            index,
+            name,
+            query,
+            stats,
+            crate::report::edit::ClauseForm::of(image, truth.as_deref(), detail),
+        ),
         // Editing a non-field (bare `WITH RESPONSE`) or a stale index falls
         // through to a fresh append rather than silently doing nothing.
-        _ => (None, String::new(), String::new(), Vec::new()),
+        _ => (
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            crate::report::edit::ClauseForm::default(),
+        ),
     };
     ed.wizard = Some(Wizard::WithField(WithFieldForm {
         path: path.to_vec(),
         index,
         name,
         query,
+        clauses,
         stats: StatKind::CHOOSABLE
             .iter()
             .map(|k| (*k, stats.contains(k)))
@@ -1378,6 +1393,86 @@ fn stats_ui(
     });
 }
 
+/// Draw the `TRUTH`/`IMAGE`/`DETAIL` clause block shared by the `WITH`-field,
+/// reported-variable and computed-column forms.
+///
+/// One helper rather than three copies: the clauses attach identically to all
+/// three column shapes, and three near-identical blocks would be three chances
+/// for one of them to drift.
+fn clauses_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    c: &mut crate::report::edit::ClauseForm,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(s.report_node_clause_truth_label).color(th.dim));
+        ui.add(
+            egui::TextEdit::singleline(&mut c.truth)
+                .hint_text(s.report_node_clause_truth_none)
+                .desired_width(220.0)
+                .font(egui::TextStyle::Monospace),
+        );
+    });
+    ui.checkbox(
+        &mut c.detail,
+        RichText::new(s.report_node_clause_detail_toggle).color(th.text),
+    );
+    // The three sizing questions only matter once a column holds a picture, so
+    // they hide behind the toggle exactly as the statistics checklist does.
+    let mut image_on = c.image_on;
+    if ui
+        .checkbox(
+            &mut image_on,
+            RichText::new(s.report_node_clause_image_toggle).color(th.text),
+        )
+        .changed()
+    {
+        c.toggle_image();
+    }
+    if !c.image_on {
+        return;
+    }
+    ui.indent("pt_clause_image", |ui| {
+        let mut fit = c.fit;
+        if ui
+            .checkbox(
+                &mut fit,
+                RichText::new(s.report_node_clause_fit).color(th.text),
+            )
+            .changed()
+        {
+            c.toggle_fit();
+        }
+        // FIT answers the same question as the sizes, so it replaces them
+        // rather than sitting alongside a value the writers would have to
+        // arbitrate between.
+        if c.fit {
+            return;
+        }
+        for (label, value) in [
+            (s.report_node_clause_height, &mut c.height),
+            (s.report_node_clause_width, &mut c.width),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(th.dim));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(value)
+                            .hint_text(s.report_node_clause_size_auto)
+                            .desired_width(80.0),
+                    )
+                    .changed()
+                {
+                    // Sizes are pixels; a stray letter would drop the whole
+                    // clause when it failed to parse, so it never gets in.
+                    value.retain(|ch| ch.is_ascii_digit());
+                }
+            });
+        }
+    });
+}
+
 fn vars_ui(
     ui: &mut egui::Ui,
     th: &super::theme::GuiTheme,
@@ -1409,6 +1504,8 @@ fn vars_ui(
             ui.add_space(6.0);
             stats_ui(ui, th, s, &mut f.stats);
         }
+        ui.add_space(6.0);
+        clauses_ui(ui, th, s, &mut f.clauses);
     }
 }
 
@@ -1438,6 +1535,8 @@ fn computed_ui(
         });
     ui.add_space(6.0);
     stats_ui(ui, th, s, &mut f.stats);
+    ui.add_space(6.0);
+    clauses_ui(ui, th, s, &mut f.clauses);
 }
 
 fn with_field_ui(
@@ -1468,6 +1567,8 @@ fn with_field_ui(
 
     ui.add_space(6.0);
     stats_ui(ui, th, s, &mut f.stats);
+    ui.add_space(6.0);
+    clauses_ui(ui, th, s, &mut f.clauses);
 }
 
 fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
@@ -1593,9 +1694,9 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
-                image: f.image,
-                truth: f.truth.clone(),
-                detail: f.detail,
+                image: f.clauses.image(),
+                truth: f.clauses.truth(),
+                detail: f.clauses.detail,
             });
             ed.wizard_apply(app, &path, node);
         }
@@ -1616,12 +1717,29 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             }
             let index = f.index;
             let stats = f.stats();
+            let clauses = f.clauses.clone();
             ed.commit_edit(app, |flow| match index {
                 Some(i) => {
-                    crate::report::edit::set_with_field(flow, &path, i, &name, &query, stats);
+                    crate::report::edit::set_with_field(
+                        flow, &path, i, &name, &query, stats, &clauses,
+                    );
                 }
                 None => {
-                    crate::report::edit::add_with_field(flow, &path, &name, &query, stats);
+                    // Appending only takes the name/query/statistics, so the
+                    // clause block is written straight afterwards onto the row
+                    // the append just created -- one code path for the clauses
+                    // rather than two that could drift.
+                    if let Some(i) = crate::report::edit::add_with_field(
+                        flow,
+                        &path,
+                        &name,
+                        &query,
+                        stats.clone(),
+                    ) {
+                        crate::report::edit::set_with_field(
+                            flow, &path, i, &name, &query, stats, &clauses,
+                        );
+                    }
                 }
             });
             ed.selection = path;
@@ -1719,9 +1837,7 @@ mod tests {
             other: String::new(),
             alias: "Plan".into(),
             stats: StatKind::CHOOSABLE.iter().map(|k| (*k, false)).collect(),
-            image: None,
-            truth: None,
-            detail: false,
+            clauses: crate::report::edit::ClauseForm::default(),
         };
         assert!(
             matches!(
@@ -1738,6 +1854,50 @@ mod tests {
         );
     }
 
+    /// A clause is a reason to write the `AS` form even without a name: the
+    /// column has to exist for a ground truth to score, so an unnamed one takes
+    /// the variable's own name rather than losing the clause.
+    #[test]
+    fn a_clause_alone_promotes_a_variable_to_the_named_form() {
+        let mut form = VarsForm {
+            path: vec![0],
+            vars: vec![("FILE".into(), true)],
+            other: String::new(),
+            alias: String::new(),
+            stats: Vec::new(),
+            clauses: crate::report::edit::ClauseForm::default(),
+        };
+        assert!(
+            matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(_)))),
+            "with no name and no clauses it is still a plain column"
+        );
+        form.clauses.truth = "{{ want }}".into();
+        let Some(FlowNode::Report(ReportStmt::VarAs { name, truth, .. })) = form.node() else {
+            panic!("a ground truth needs the named form")
+        };
+        assert_eq!(name, "FILE", "the column falls back to the variable name");
+        assert_eq!(truth.as_deref(), Some("{{ want }}"));
+    }
+
+    /// `FIT` and a pixel size answer the same question, so the form keeps one:
+    /// picking `FIT` clears the sizes rather than emitting a spec the writers
+    /// would have to arbitrate.
+    #[test]
+    fn fit_replaces_a_typed_size_rather_than_joining_it() {
+        let mut c = crate::report::edit::ClauseForm::default();
+        c.toggle_image();
+        c.height = "96".into();
+        let spec = c.image().expect("an image clause");
+        assert_eq!((spec.height, spec.width, spec.fit), (Some(96), None, false));
+        c.toggle_fit();
+        let spec = c.image().expect("still an image clause");
+        assert_eq!((spec.height, spec.width, spec.fit), (None, None, true));
+        assert!(c.height.is_empty(), "the hidden size is cleared, not kept");
+        // And turning the whole clause off leaves nothing behind.
+        c.toggle_image();
+        assert_eq!(c.image(), None);
+    }
+
     /// The free-text row exists for variables the static scan cannot see, so it
     /// has to reach the node even with nothing ticked.
     #[test]
@@ -1748,9 +1908,7 @@ mod tests {
             other: "  RUNTIME_ONLY ".into(),
             alias: String::new(),
             stats: Vec::new(),
-            image: None,
-            truth: None,
-            detail: false,
+            clauses: crate::report::edit::ClauseForm::default(),
         };
         assert!(
             matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["RUNTIME_ONLY".to_string()]),

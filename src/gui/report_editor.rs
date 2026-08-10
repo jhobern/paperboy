@@ -4840,13 +4840,8 @@ fn settings_panel(
     settings_frame(th).show(ui, |ui| {
         // A heading, because the frame alone only said "these are grouped", not
         // what the group *is*. The same words the TUI's panel uses.
-        ui.label(
-            RichText::new(s.report_settings_heading)
-                .color(th.dim)
-                .small()
-                .strong(),
-        )
-        .on_hover_text(s.report_settings_help);
+        ui.heading(RichText::new(s.report_settings_heading).color(th.dim))
+            .on_hover_text(s.report_settings_help);
         // One setting per line, each starting at the same left edge as `BEGIN`
         // below. Laying them out in a row instead left them ragged — a combo
         // chip and a text chip are different widths and sit differently in a
@@ -5135,6 +5130,83 @@ fn header_chip(
                                 value: Some(joined),
                             });
                         }
+                    }
+                }
+                // A label class is one directive but two different things to
+                // edit -- the label a report displays and scores by, and the
+                // other spellings that mean it -- so it is split into two
+                // fields with the `=` drawn between them, exactly as a helper
+                // collection is split around its `AS`. A single text box made
+                // the user remember both the `=` and the comma rules; two
+                // boxes and a keyword show them.
+                HeaderKind::Text if key == "labels" => {
+                    let raw = if value == "?" { "" } else { value };
+                    let (name, synonyms) = crate::report::flow::split_label_class(raw);
+                    // Writing back always keeps the class name, even with no
+                    // synonyms yet: a class that only knows its own label is a
+                    // perfectly good half-finished line, and dropping it would
+                    // delete the row out from under someone mid-edit.
+                    let rejoin = |name: &str, synonyms: &str| {
+                        let name = name.trim();
+                        let synonyms = synonyms.trim();
+                        let name = if name.is_empty() {
+                            HEADER_PLACEHOLDER
+                        } else {
+                            name
+                        };
+                        if synonyms.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{name} = {synonyms}")
+                        }
+                    };
+                    let id = ui.make_persistent_id(("pt_hdr_label", occurrence));
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        name,
+                        s.report_label_class_unset,
+                        "",
+                        90.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != name
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            occurrence,
+                            value: Some(rejoin(&text, synonyms)),
+                        });
+                    }
+                    // The `=` is drawn, unlike the helper collection's `AS`
+                    // just above (which is only hover text): it is the
+                    // directive's own syntax, and seeing it is what tells the
+                    // reader these two boxes are one line of the source.
+                    //
+                    // It does read a little like assignment, which the relation
+                    // isn't -- every spelling here counts as the same answer,
+                    // and matching is symmetric (`LabelMap::same`). But the two
+                    // halves aren't interchangeable either: the left-hand side
+                    // is the label that gets *printed* and the order the
+                    // confusion-matrix axes read in, so a symmetric glyph like
+                    // `≡` would over-claim. Matching the source exactly was
+                    // judged worth more than either shade of imprecision.
+                    ui.label(RichText::new("=").color(color).monospace());
+                    let id = ui.make_persistent_id(("pt_hdr_label_syn", occurrence));
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        synonyms,
+                        s.report_label_synonyms_unset,
+                        s.report_label_synonyms_help,
+                        150.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != synonyms
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            occurrence,
+                            value: Some(rejoin(name, &text)),
+                        });
                     }
                 }
                 HeaderKind::Folder | HeaderKind::File | HeaderKind::Text => {

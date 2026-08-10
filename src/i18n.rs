@@ -717,8 +717,14 @@ strings! {
     report_node_with_stats_label => "STATISTICS", "STATISTICS", "STATISTICS";
     report_node_with_stats_toggle => "Summary statistics", "Statistiques de synthèse", "Opsummerende statistik";
     report_node_with_query_none => "whole response", "réponse entière", "hele svaret";
-    report_node_with_truth_label => "Ground truth", "Vérité terrain", "Grundsandhed";
-    report_node_with_truth_none => "not scored", "non évalué", "ikke vurderet";
+    report_node_clause_truth_label => "Ground truth", "Vérité terrain", "Grundsandhed";
+    report_node_clause_truth_none => "not scored", "non évalué", "ikke vurderet";
+    report_node_clause_detail_toggle => "Detail only (drill-down)", "Détail seulement (volet)", "Kun detalje (udfoldning)";
+    report_node_clause_image_toggle => "Show as a picture", "Afficher comme image", "Vis som billede";
+    report_node_clause_fit => "Fit to the cell", "Ajuster à la cellule", "Tilpas til cellen";
+    report_node_clause_height => "Height (px)", "Hauteur (px)", "Højde (px)";
+    report_node_clause_width => "Width (px)", "Largeur (px)", "Bredde (px)";
+    report_node_clause_size_auto => "auto", "auto", "auto";
     report_node_parallel_degree_label => "Max at once", "Maximum simultané", "Maks. samtidige";
     report_node_parallel_degree_none => "no limit", "sans limite", "ingen grænse";
     report_node_baseline_show_label => "SHOW from baseline", "SHOW depuis la référence", "SHOW fra reference";
@@ -1184,6 +1190,13 @@ strings! {
     diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
     report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
     report_alias_unset => "alias", "alias", "alias";
+    // The two halves of a `# labels:` class. The hints are examples rather than
+    // descriptions: the whole point of splitting the directive into two fields
+    // is to show what goes where, and "Low Risk" teaches that faster than
+    // "canonical label" does.
+    report_label_class_unset => "Low Risk", "Risque faible", "Lav risiko";
+    report_label_synonyms_unset => "real, genuine, pass", "réel, authentique, succès", "ægte, autentisk, bestået";
+    report_label_synonyms_help => "Other spellings that mean this label. A truth of \"real\" and a response of \"Low Risk\" score as a match when both are listed here.", "Autres formulations qui désignent cette étiquette. Une vérité « real » et une réponse « Low Risk » comptent comme identiques si les deux figurent ici.", "Andre stavemåder, der betyder denne etiket. En sandhed \"real\" og et svar \"Low Risk\" tæller som ens, når begge står her.";
     report_helper_collection_help => "Another collection whose requests this report can call, written 'path AS alias'. Its requests are then used as 'alias/request'. Handy for a request that supports the report but isn't part of the API being tested — it stays out of Run All.", "Une autre collection dont ce rapport peut appeler les requêtes, écrite 'chemin AS alias'. Ses requêtes s'utilisent alors comme 'alias/requête'. Pratique pour une requête qui sert au rapport sans faire partie de l'API testée : elle reste hors de « Tout exécuter ».", "En anden samling, hvis forespørgsler denne rapport kan kalde, skrevet 'sti AS alias'. Dens forespørgsler bruges så som 'alias/forespørgsel'. Nyttigt til en forespørgsel, der understøtter rapporten uden at være en del af den API, der testes — den holdes uden for Kør alle.";
     diag_collection_primary_alias => "The first '# collection:' is the report's own collection, so it takes no 'AS' alias. Aliases name the extra helper collections below it.", "La première '# collection:' est la collection du rapport : elle ne prend pas d'alias 'AS'. Les alias nomment les collections d'appoint qui la suivent.", "Den første '# collection:' er rapportens egen samling og tager derfor ikke et 'AS'-alias. Aliasser navngiver de ekstra hjælpesamlinger under den.";
     diag_collection_alias_missing => "Helper collection '{}' needs an alias: write '# collection: {0} AS name'. Its requests are then used as 'name/request'.", "La collection d'appoint '{}' a besoin d'un alias : écrivez '# collection: {0} AS nom'. Ses requêtes s'utilisent alors comme 'nom/requête'.", "Hjælpesamlingen '{}' mangler et alias: skriv '# collection: {0} AS navn'. Dens forespørgsler bruges så som 'navn/forespørgsel'.";

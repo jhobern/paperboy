@@ -19,8 +19,8 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    Binder, EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow,
-    ReportStmt, ResponseFmt, RoleRef, ShowField, WithItem,
+    Binder, EnvClause, FlowNode, HeaderLine, ImageSpec, ParallelSpec, Pattern, Producer,
+    ReportFlow, ReportStmt, ResponseFmt, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 use crate::report::parse_flow;
@@ -1506,9 +1506,105 @@ pub(crate) fn add_with_field(
     }
 }
 
+/// The editable state of a column's three trailing clauses — `TRUTH "…"`,
+/// `IMAGE[(…)]` and `DETAIL`.
+///
+/// They attach to every named column form (`REPORT … AS`, a computed column and
+/// a `WITH` field) in exactly the same way, so both front-ends' six forms share
+/// this one model rather than each re-deriving when a blank height means "no
+/// size" and when it means "no clause". Sizes are held as typed *text*, not as
+/// numbers: a half-typed `11` must not momentarily rewrite the flow as a
+/// 11-pixel picture, and a field the user has cleared has to stay cleared while
+/// they think about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClauseForm {
+    /// The ground-truth template. Empty ⇒ no `TRUTH` clause.
+    pub(crate) truth: String,
+    /// The `DETAIL` placement flag.
+    pub(crate) detail: bool,
+    /// Whether the column carries an `IMAGE` clause at all. Held rather than
+    /// derived from the sizes, because a bare `IMAGE` (no options) is a valid
+    /// and common spelling — the sizes being empty cannot mean "off".
+    pub(crate) image_on: bool,
+    /// `FIT`: size to the cell instead of to a box.
+    pub(crate) fit: bool,
+    /// `HEIGHT`, as typed. Empty or unparseable ⇒ absent.
+    pub(crate) height: String,
+    /// `WIDTH`, as typed.
+    pub(crate) width: String,
+}
+
+impl ClauseForm {
+    /// The form state for a column that already carries these clauses.
+    pub(crate) fn of(image: Option<ImageSpec>, truth: Option<&str>, detail: bool) -> Self {
+        let px = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+        ClauseForm {
+            truth: truth.unwrap_or_default().to_string(),
+            detail,
+            image_on: image.is_some(),
+            fit: image.is_some_and(|i| i.fit),
+            height: image.map(|i| px(i.height)).unwrap_or_default(),
+            width: image.map(|i| px(i.width)).unwrap_or_default(),
+        }
+    }
+
+    /// The `TRUTH` clause to write. Blank means *no clause*, so clearing the
+    /// row removes it rather than writing an empty truth nothing can match.
+    pub(crate) fn truth(&self) -> Option<String> {
+        Some(self.truth.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    /// The `IMAGE` clause to write.
+    ///
+    /// `FIT` wins over the sizes rather than being combined with them: the two
+    /// answer the same question ("how big?") and a spec that says both is one
+    /// the writers would have to arbitrate.
+    pub(crate) fn image(&self) -> Option<ImageSpec> {
+        if !self.image_on {
+            return None;
+        }
+        if self.fit {
+            return Some(ImageSpec {
+                fit: true,
+                ..Default::default()
+            });
+        }
+        let px = |s: &String| s.trim().parse::<u32>().ok().filter(|n| *n > 0);
+        Some(ImageSpec {
+            height: px(&self.height),
+            width: px(&self.width),
+            fit: false,
+        })
+    }
+
+    /// Flip the `IMAGE` clause on or off, keeping the size rows in step, the
+    /// same way the `STATISTICS` toggle keeps its checkboxes in step: turning
+    /// it off clears the sizes, so a hidden row can never still be
+    /// contributing to the clause.
+    pub(crate) fn toggle_image(&mut self) {
+        self.image_on = !self.image_on;
+        if !self.image_on {
+            self.fit = false;
+            self.height.clear();
+            self.width.clear();
+        }
+    }
+
+    /// Flip `FIT`, clearing the sizes it overrides so the rows never show a
+    /// height that isn't going to be used.
+    pub(crate) fn toggle_fit(&mut self) {
+        self.fit = !self.fit;
+        if self.fit {
+            self.height.clear();
+            self.width.clear();
+        }
+    }
+}
+
 /// Overwrite the `name`/`query` of the `WITH` *field* at `index` of the
-/// report-request at `path`, preserving any `STATISTICS(…)`. Returns whether it
-/// changed (`false` if the node/index is not a `WITH` field).
+/// report-request at `path`, along with its `STATISTICS(…)` and the three
+/// column clauses. Returns whether it changed (`false` if the node/index is not
+/// a `WITH` field).
 pub(crate) fn set_with_field(
     flow: &mut ReportFlow,
     path: &[usize],
@@ -1516,23 +1612,24 @@ pub(crate) fn set_with_field(
     name: &str,
     query: &str,
     stats: Vec<StatKind>,
+    clauses: &ClauseForm,
 ) -> bool {
     if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path)
         && let Some(WithItem::Field {
             name: n,
             query: q,
             stats: st,
-            // The form doesn't edit the `IMAGE(…)`/`TRUTH`/`DETAIL` clauses, so
-            // they are left alone rather than being cleared by an unrelated
-            // rename.
-            image: _,
-            truth: _,
-            detail: _,
+            image: im,
+            truth: tr,
+            detail: de,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
         *q = query.to_string();
         *st = stats;
+        *im = clauses.image();
+        *tr = clauses.truth();
+        *de = clauses.detail;
         true
     } else {
         false
@@ -3054,6 +3151,7 @@ REQUEST A
             "Code",
             "HttpStatus",
             vec![StatKind::Count, StatKind::Mean],
+            &ClauseForm::default(),
         ));
         match node_at(&f, &[0]) {
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
@@ -3078,14 +3176,23 @@ REQUEST A
             0,
             "Code",
             "HttpStatus",
-            Vec::new()
+            Vec::new(),
+            &ClauseForm::default(),
         ));
         assert!(!f.to_text().contains("STATISTICS"));
 
         // A non-request node has no WITH block to add to.
         let mut g = flow("REPORT userId\n");
         assert_eq!(add_with_field(&mut g, &[0], "X", "Y", Vec::new()), None);
-        assert!(!set_with_field(&mut g, &[0], 0, "X", "Y", Vec::new()));
+        assert!(!set_with_field(
+            &mut g,
+            &[0],
+            0,
+            "X",
+            "Y",
+            Vec::new(),
+            &ClauseForm::default()
+        ));
     }
 }
 

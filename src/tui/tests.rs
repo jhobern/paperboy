@@ -26283,7 +26283,7 @@ fn the_with_field_editor_closes_to_the_outline_when_opened_from_it() {
 /// drop a clause they can see.
 #[test]
 fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
-    use crate::tui::report_nodes::WithFieldRow;
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
     let (mut app, idx) = node_show_app(&["status"]);
     app.reports[idx].report.set_text(
         "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
@@ -26306,7 +26306,7 @@ fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
         };
         form.visible_rows()
             .iter()
-            .position(|r| *r == WithFieldRow::Truth)
+            .position(|r| *r == WithFieldRow::Clause(ClauseRow::Truth))
             .expect("a ground-truth row")
     };
     if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
@@ -26327,7 +26327,7 @@ fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
     let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
         panic!("expected the field editor");
     };
-    assert_eq!(form.truth, "{{ e }}");
+    assert_eq!(form.clauses.truth, "{{ e }}");
     press(&mut app, KeyCode::Enter);
     assert!(app.reports[idx].report.text.contains("TRUTH \"{{ e }}\""));
 
@@ -26336,7 +26336,7 @@ fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
     if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
         form.selected = truth_row;
         for _ in 0.."{{ e }}".len() {
-            form.truth.pop();
+            form.clauses.truth.pop();
         }
     }
     press(&mut app, KeyCode::Enter);
@@ -26347,9 +26347,9 @@ fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
     );
 }
 
-/// `DETAIL` has no widget in the field editor -- it is placement, decided in
-/// the source -- so the editor's job is simply not to eat it when the user
-/// applies an unrelated change.
+/// `DETAIL` is a checkbox in the field editor, but the point of this test is
+/// the round-trip: opening a field that already carries the flag and applying
+/// without touching it must leave the flag exactly where it was.
 #[test]
 fn the_with_field_editor_preserves_a_detail_flag_it_cannot_show() {
     let (mut app, idx) = node_show_app(&["status"]);
@@ -26372,13 +26372,134 @@ fn the_with_field_editor_preserves_a_detail_flag_it_cannot_show() {
     );
 }
 
+/// `IMAGE` is three questions (fit, height, width) that only matter once a
+/// column holds a picture, so -- exactly like the statistics checklist -- it
+/// hides behind a toggle, and `FIT` hides the two sizes it makes meaningless.
+#[test]
+fn the_with_field_editor_folds_the_image_sizes_behind_the_image_toggle() {
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+
+    let image_row = {
+        let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+            panic!("expected the field editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == WithFieldRow::Clause(ClauseRow::Image))
+            .expect("an image row")
+    };
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = image_row;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        form.visible_rows()
+            .contains(&WithFieldRow::Clause(ClauseRow::Height)),
+        "turning IMAGE on reveals the sizes"
+    );
+
+    // Type a height, then a width.
+    let height_row = image_row + 2;
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = height_row;
+    }
+    for c in "96".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("IMAGE(HEIGHT 96)"),
+        "the sizes reach the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // FIT answers the same question as the sizes, so picking it hides them --
+    // and clears them, so nothing invisible can still be writing a clause.
+    press(&mut app, KeyCode::Enter);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = image_row + 1;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        !form
+            .visible_rows()
+            .contains(&WithFieldRow::Clause(ClauseRow::Height)),
+        "FIT hides the sizes"
+    );
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("IMAGE(FIT)") && !text.contains("HEIGHT"),
+        "FIT replaces the height rather than joining it: {text}"
+    );
+}
+
+/// The clause block is shared, so the `REPORT <var> AS` form gets it too -- and
+/// only while a single variable is ticked, since `REPORT (A, B)` has no one
+/// column for a ground truth to belong to.
+#[test]
+fn the_vars_editor_offers_the_clause_block_for_a_single_variable() {
+    use crate::tui::report_nodes::{ClauseRow, VarsRow};
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nTIER=gold\nREPORT TIER AS Tier\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down); // select the REPORT row
+    press(&mut app, KeyCode::Enter);
+
+    let truth_row = {
+        let Some(Overlay::ReportNodeVars(form)) = app.overlay.as_ref() else {
+            panic!("expected the vars editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == VarsRow::Clause(ClauseRow::Truth))
+            .expect("a ground-truth row")
+    };
+    if let Some(Overlay::ReportNodeVars(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+    }
+    for c in "{{ want }}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx]
+            .report
+            .text
+            .contains("TRUTH \"{{ want }}\""),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+}
+
 /// The statistics checklist is six rows that most fields don't want, so it is
 /// folded behind a toggle. Turning it on seeds `COUNT` (the one statistic that
 /// means something for a text column too) and turning it off clears the ticks,
 /// so a collapsed list can never still be writing a clause.
 #[test]
 fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
-    use crate::tui::report_nodes::WithFieldRow;
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
     let (mut app, idx) = node_show_app(&["status"]);
     app.reports[idx].report.set_text(
         "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
@@ -26400,14 +26521,16 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
         vec![
             WithFieldRow::Name,
             WithFieldRow::Query,
-            WithFieldRow::Truth,
+            WithFieldRow::Clause(ClauseRow::Truth),
+            WithFieldRow::Clause(ClauseRow::Detail),
+            WithFieldRow::Clause(ClauseRow::Image),
             WithFieldRow::Stats
         ],
         "a field with no STATISTICS shows the toggle only"
     );
 
     // Space on the toggle reveals the checklist with COUNT seeded.
-    let toggle = 3;
+    let toggle = 5;
     if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
         form.selected = toggle;
     }
@@ -26416,7 +26539,7 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
         panic!("still in the field editor");
     };
     assert!(
-        form.visible_rows().len() > 4,
+        form.visible_rows().len() > 6,
         "the checklist appears while the toggle is on"
     );
     assert_eq!(
@@ -26455,7 +26578,9 @@ fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
         vec![
             WithFieldRow::Name,
             WithFieldRow::Query,
-            WithFieldRow::Truth,
+            WithFieldRow::Clause(ClauseRow::Truth),
+            WithFieldRow::Clause(ClauseRow::Detail),
+            WithFieldRow::Clause(ClauseRow::Image),
             WithFieldRow::Stats
         ],
         "the checklist collapses again"

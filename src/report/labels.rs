@@ -182,6 +182,25 @@ mod tests {
         assert_eq!(canon("   "), "");
     }
 
+    /// The structured editors edit a class as two fields, so the split has to
+    /// survive a line that is still being typed -- a name with no `=` yet is a
+    /// class that simply has no synonyms, not a parse failure.
+    #[test]
+    fn a_label_class_splits_into_its_two_halves_even_half_typed() {
+        use crate::report::flow::split_label_class;
+        assert_eq!(
+            split_label_class("Low Risk = low risk, real, genuine"),
+            ("Low Risk", "low risk, real, genuine")
+        );
+        assert_eq!(split_label_class("  Low Risk  "), ("Low Risk", ""));
+        assert_eq!(split_label_class("Low Risk ="), ("Low Risk", ""));
+        // A canonical label is always a synonym of itself, so the halves
+        // round-trip back into a map that still classifies the label.
+        let (name, syn) = split_label_class("Low Risk");
+        let map = LabelMap::parse(&[&format!("{name} = {syn}")]);
+        assert!(map.same("LOW   risk", "Low Risk"));
+    }
+
     #[test]
     fn declared_synonyms_match_across_vocabularies() {
         let map = LabelMap::parse(&[

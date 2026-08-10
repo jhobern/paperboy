@@ -65,6 +65,24 @@ pub fn split_collection_ref(value: &str) -> (&str, Option<&str>) {
     (value, None)
 }
 
+/// Split a `# labels:` value into its canonical label and its synonym list.
+///
+/// `Pass = ok, low risk` becomes `("Pass", "ok, low risk")`. A line with no `=`
+/// yet is all label and no synonyms, so a half-typed directive still splits --
+/// the structured editors need to show one as it is being written, not refuse
+/// it. Both halves are trimmed; neither is validated here (that is
+/// [`crate::report::labels::LabelMap`]'s job), so what the user typed always
+/// survives a round-trip through a form.
+/// Only the GUI's settings panel splits a class today -- the TUI edits the
+/// directive as one line -- so a non-GUI build has no caller outside the tests.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn split_label_class(value: &str) -> (&str, &str) {
+    match value.split_once('=') {
+        Some((name, synonyms)) => (name.trim(), synonyms.trim()),
+        None => (value.trim(), ""),
+    }
+}
+
 /// One line of the header: either a recognised `# key: value` directive or a
 /// free-form `#` comment (preserved as-is).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -556,6 +556,7 @@ fn draw_report_node_vars_overlay(
         .enumerate()
         .map(|(i, row)| {
             let text = match row {
+                VarsRow::Clause(cr) => clause_text(*cr, &form.clauses, s, i == form.selected),
                 VarsRow::Var(vi) => {
                     let r = &form.vars[*vi];
                     let mark = if r.included {
@@ -623,6 +624,7 @@ fn draw_report_node_computed_overlay(
         .enumerate()
         .map(|(i, row)| {
             let text = match row {
+                ComputedRow::Clause(cr) => clause_text(*cr, &form.clauses, s, i == form.selected),
                 ComputedRow::Template => caretted(
                     format!(
                         "{}: {}",
@@ -842,6 +844,74 @@ fn draw_simple_form_overlay(
 }
 
 /// Draw the `WITH` field overlay ([`Overlay::ReportNodeWithField`]): the column
+/// Render one row of the shared `TRUTH`/`IMAGE`/`DETAIL` clause block.
+///
+/// Lives here rather than in each of the three column forms so the block looks
+/// and behaves the same wherever it appears -- a `WITH` field, a `REPORT … AS`
+/// and a computed column all attach the same clauses.
+fn clause_text(
+    row: super::report_nodes::ClauseRow,
+    c: &crate::report::edit::ClauseForm,
+    s: &Strings,
+    is_sel: bool,
+) -> String {
+    use super::report_nodes::ClauseRow;
+    let check = |on: bool| {
+        if on {
+            s.checkbox_checked
+        } else {
+            s.checkbox_unchecked
+        }
+    };
+    // The sizing rows are children of the IMAGE toggle, so they are indented
+    // under it exactly as the STATISTICS checkboxes are under theirs.
+    let text = match row {
+        // Blank is the normal case -- most columns have nothing to be scored
+        // against -- so an empty row says so rather than showing an
+        // unexplained gap.
+        ClauseRow::Truth => {
+            let shown = if c.truth.trim().is_empty() && !is_sel {
+                s.report_node_clause_truth_none.to_string()
+            } else {
+                c.truth.clone()
+            };
+            let mut t = format!("{}: {shown}", s.report_node_clause_truth_label);
+            if is_sel {
+                t.push('▏');
+            }
+            t
+        }
+        ClauseRow::Detail => format!("{} {}", check(c.detail), s.report_node_clause_detail_toggle),
+        ClauseRow::Image => format!(
+            "{} {}",
+            check(c.image_on),
+            s.report_node_clause_image_toggle
+        ),
+        ClauseRow::Fit => format!("    {} {}", check(c.fit), s.report_node_clause_fit),
+        ClauseRow::Height | ClauseRow::Width => {
+            let (label, value) = if matches!(row, ClauseRow::Height) {
+                (s.report_node_clause_height, &c.height)
+            } else {
+                (s.report_node_clause_width, &c.width)
+            };
+            // A blank size means "leave this dimension to the writer", which
+            // is worth saying out loud: an empty field otherwise looks like a
+            // value that failed to load.
+            let shown = if value.is_empty() && !is_sel {
+                s.report_node_clause_size_auto.to_string()
+            } else {
+                value.clone()
+            };
+            let mut t = format!("    {label}: {shown}");
+            if is_sel {
+                t.push('▏');
+            }
+            t
+        }
+    };
+    text
+}
+
 /// name, the Hurl query behind it and the `STATISTICS(…)` checklist. Opened
 /// from a `WITH` row of the request form and returns there on Enter or Esc.
 fn draw_report_node_with_field_overlay(
@@ -898,21 +968,10 @@ fn draw_report_node_with_field_overlay(
                 }
                 Line::from(Span::styled(text, base))
             }
-            // Blank is the normal case — most columns have nothing to be
-            // scored against — so an empty row says so rather than showing an
-            // unexplained gap.
-            WithFieldRow::Truth => {
-                let shown = if form.truth.trim().is_empty() && !is_sel {
-                    s.report_node_with_truth_none.to_string()
-                } else {
-                    form.truth.clone()
-                };
-                let mut text = format!("{}: {shown}", s.report_node_with_truth_label);
-                if is_sel {
-                    text.push('▏');
-                }
-                Line::from(Span::styled(text, base))
-            }
+            WithFieldRow::Clause(cr) => Line::from(Span::styled(
+                clause_text(cr, &form.clauses, s, is_sel),
+                base,
+            )),
             // The toggle sits flush left and the checkboxes it reveals are
             // indented under it, so the list reads as its contents rather than
             // as six more peers of Column name and Query.
