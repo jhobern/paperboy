@@ -214,16 +214,12 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         UiAction::BrowseDest => {
             let seed = std::path::PathBuf::from(w.flow.dest.trim());
             let seed = seed.parent().filter(|p| p.exists());
-            if let Some(dir) = super::filepick::pick_folder(app.strings.postman_dest_label, seed) {
-                // The picker names an existing *parent*; the import wants its
-                // own folder inside it, or it would scatter Collections/ and
-                // Environments/ into whatever the user happened to pick.
-                w.flow.dest = dir
-                    .join(default_dest_name(w.flow.workspace_name()))
-                    .to_string_lossy()
-                    .into_owned();
-                w.dest_touched = true;
-            }
+            app.pending_pick = Some(super::filepick::spawn(
+                super::filepick::PickKind::Folder,
+                app.strings.postman_dest_label,
+                seed,
+                super::menu::PickAction::PostmanDest,
+            ));
         }
         UiAction::BackToConnect => w.flow.back_to_connect(),
         UiAction::BackToWorkspaces => w.flow.to_pick_workspace(),
@@ -811,4 +807,23 @@ mod tests {
         w.flow.back_to_connect();
         assert!(w.flow.workspaces().is_empty());
     }
+}
+
+/// Write back the folder the destination picker returned, frames later (see
+/// [`super::filepick`] for why it can't be written back at the click).
+pub(super) fn apply_picked_dest(app: &mut GuiApp, picked: Option<std::path::PathBuf>) {
+    let Some(dir) = picked else {
+        return; // cancelled
+    };
+    let Some(w) = app.postman.flow.as_mut() else {
+        return; // the wizard closed while the dialog was open
+    };
+    // The picker names an existing *parent*; the import wants its own folder
+    // inside it, or it would scatter Collections/ and Environments/ into
+    // whatever the user happened to pick.
+    w.flow.dest = dir
+        .join(default_dest_name(w.flow.workspace_name()))
+        .to_string_lossy()
+        .into_owned();
+    w.dest_touched = true;
 }

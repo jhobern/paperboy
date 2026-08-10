@@ -832,6 +832,19 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
 pub enum PickAction {
     Open(OpenKind),
     Save(SaveKind),
+    /// A `root:` / `baseline:` / `collection:` path in the report editor's
+    /// settings panel.
+    ReportHeaderFile {
+        key: &'static str,
+        occurrence: usize,
+    },
+    /// The folder (or file) a `FOR … IN FILES/FOLDERS` loop walks.
+    ReportLoopDir {
+        path: Vec<usize>,
+        file: bool,
+    },
+    /// Where a Postman import should put the workspace it builds.
+    PostmanDest,
 }
 
 /// Collect a finished file dialog, if one has finished, and act on it. Called
@@ -844,9 +857,28 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
         return; // still open — the usual case
     };
     app.pending_pick = None;
+    // The report editor's own pickers write into the open editor rather than
+    // loading a file, so they neither seed the shared picker directory nor have
+    // an error to report.
+    match action {
+        PickAction::ReportHeaderFile { key, occurrence } => {
+            super::report_editor::apply_picked_header_file(app, key, occurrence, picked);
+            return;
+        }
+        PickAction::ReportLoopDir { path, file } => {
+            super::report_editor::apply_picked_loop_dir(app, &path, file, picked);
+            return;
+        }
+        PickAction::PostmanDest => {
+            super::postman::apply_picked_dest(app, picked);
+            return;
+        }
+        _ => {}
+    }
     let (title, picker_kind) = match action {
         PickAction::Open(kind) => (open_title(app, kind), open_picker_kind(kind)),
         PickAction::Save(kind) => (save_title(app, kind), save_picker_kind(kind)),
+        _ => unreachable!("handled above"),
     };
     let Some(path) = picked else {
         return; // cancelled
@@ -857,6 +889,7 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
     let outcome = match action {
         PickAction::Open(kind) => apply_open(app, kind, &path),
         PickAction::Save(kind) => apply_save(app, kind, &path),
+        _ => unreachable!("handled above"),
     };
     if let Err(msg) = outcome {
         super::filepick::error_alert(title, &msg);

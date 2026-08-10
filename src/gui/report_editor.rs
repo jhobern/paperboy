@@ -5280,7 +5280,7 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str, 
         .and_then(|f| f.header.get_all(key).get(occurrence).copied())
         .unwrap_or_default()
         .to_string();
-    let (current_ref, alias) = crate::report::flow::split_collection_ref(&current);
+    let (current_ref, _) = crate::report::flow::split_collection_ref(&current);
     let seed = Some(current_ref)
         .filter(|r| !r.is_empty())
         .and_then(super::filepick::seed_dir)
@@ -5294,36 +5294,76 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str, 
     let title = edit::header_help(key, &app.strings);
     // Only `root:` and `baseline:` are paths — `output:` names a format and is
     // picked from a list, so it never reaches here.
-    let picked = match key {
-        "root" => super::filepick::pick_folder(title, seed.as_deref()),
+    let kind = match key {
+        "root" => super::filepick::PickKind::Folder,
         // `collection:` is normally chosen from the dropdown, but that list can
         // be empty (a report outside a workspace, opened before any collection),
         // so Browse is offered there too and lands here.
-        "collection" => super::filepick::pick_file(
-            title,
-            seed.as_deref(),
-            &[("hurl", &["hurl"]), ("*", &["*"])],
-        ),
-        _ => super::filepick::pick_file(
-            title,
-            seed.as_deref(),
-            &[("baseline", &["baseline", "json"]), ("*", &["*"])],
-        ),
+        "collection" => super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[("hurl", &["hurl"]), ("*", &["*"])]),
+        },
+        _ => super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[
+                ("baseline", &["baseline", "json"]),
+                ("*", &["*"]),
+            ]),
+        },
     };
+    app.pending_pick = Some(super::filepick::spawn(
+        kind,
+        title,
+        seed.as_deref(),
+        super::menu::PickAction::ReportHeaderFile { key, occurrence },
+    ));
+}
+
+/// Write back the file a [`pick_header_file`] dialog returned.
+///
+/// Split from the request because the dialog runs off the frame loop (see
+/// [`super::filepick`]), so this happens frames later with only the app in
+/// hand. The alias is re-read here rather than captured at request time: the
+/// user may have edited it while the dialog was up.
+pub(super) fn apply_picked_header_file(
+    app: &mut GuiApp,
+    key: &'static str,
+    occurrence: usize,
+    picked: Option<std::path::PathBuf>,
+) {
     let Some(path) = picked else {
-        return;
+        return; // cancelled
     };
+    let Some(mut ed) = app.report_editor.take() else {
+        return; // the editor closed while the dialog was open
+    };
+    apply_header_file(&mut ed, app, key, occurrence, &path);
+    app.report_editor = Some(ed);
+}
+
+fn apply_header_file(
+    ed: &mut ReportEditor,
+    app: &mut GuiApp,
+    key: &'static str,
+    occurrence: usize,
+    path: &std::path::Path,
+) {
+    let current = ed
+        .flow
+        .as_ref()
+        .and_then(|f| f.header.get_all(key).get(occurrence).copied())
+        .unwrap_or_default()
+        .to_string();
+    let (_, alias) = crate::report::flow::split_collection_ref(&current);
     // A browsed collection is relativised the same way a picked one is — the
     // dropdown writes a portable `../`-walking ref, and Browse must not quietly
     // bake in an absolute path instead.
     let text = if key == "collection" {
         portable_ref(
-            &path,
+            path,
             ed.report.path.as_deref(),
             report_workspace_root(app, ed).as_deref(),
         )
     } else {
-        relative_to_report(&path, ed.report.path.as_deref())
+        relative_to_report(path, ed.report.path.as_deref())
     };
     // The alias is the user's, not the picker's — browsing for a different file
     // must not silently drop it.
@@ -5373,19 +5413,43 @@ fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: 
     } else {
         app.strings.gui_pick_loop_folder
     };
-    let picked = if file {
-        super::filepick::pick_file(title, seed.as_deref(), &[("*", &["*"])])
+    let kind = if file {
+        super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[("*", &["*"])]),
+        }
     } else {
-        super::filepick::pick_folder(title, seed.as_deref())
+        super::filepick::PickKind::Folder
     };
+    app.pending_pick = Some(super::filepick::spawn(
+        kind,
+        title,
+        seed.as_deref(),
+        super::menu::PickAction::ReportLoopDir {
+            path: path.to_vec(),
+            file,
+        },
+    ));
+}
+
+/// Write back the folder a [`pick_loop_dir`] dialog returned, frames later.
+pub(super) fn apply_picked_loop_dir(
+    app: &mut GuiApp,
+    path: &[usize],
+    _file: bool,
+    picked: Option<std::path::PathBuf>,
+) {
     let Some(picked) = picked else {
-        return;
+        return; // cancelled
+    };
+    let Some(mut ed) = app.report_editor.take() else {
+        return; // the editor closed while the dialog was open
     };
     let text = relative_to_report(&picked, ed.report.path.as_deref());
     ed.edit_flow(|flow| {
         edit::set_loop_dir(flow, path, &text);
     });
     ed.selection = path.to_vec();
+    app.report_editor = Some(ed);
 }
 
 /// `path` expressed relative to the report's own folder when it lives under it,
