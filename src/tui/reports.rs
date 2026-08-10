@@ -239,6 +239,13 @@ pub(crate) struct ReportTab {
     /// without touching the cursor) is *not* immediately yanked back to the
     /// highlighted cell. `None` forces a re-centre on the next draw.
     pub(crate) results_scrolled_to: Option<(usize, usize)>,
+    /// Which rows the results grid is showing. `f` cycles through the filters
+    /// the run actually offers ([`crate::report::filter::RowFilter::available`]),
+    /// the same set the GUI's filter bar and the interactive HTML export draw —
+    /// so "show me only the wrong rows" means the same rows everywhere. Reset
+    /// to `All` whenever a new run starts, because the rows it selected are
+    /// gone. Runtime-only.
+    pub(crate) results_filter: crate::report::filter::RowFilter,
     /// Index of the leftmost grid column drawn in the results pane. A report
     /// can easily have more columns than fit, and the grid clips rather than
     /// wraps, so without this the columns past the right edge were simply
@@ -401,6 +408,7 @@ impl ReportTab {
             results_panel,
             cell_cursor: None,
             results_scrolled_to: None,
+            results_filter: crate::report::filter::RowFilter::All,
             results_col_offset: 0,
             workspace_root: None,
             embedded_active: true,
@@ -1309,6 +1317,10 @@ impl TuiApp {
                 // change) — reset it so the cursor starts fresh on the new grid.
                 rt.cell_cursor = None;
                 rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 // Show the (greyed) grid straight away so the run's shape/size
                 // is visible before any request completes — unless the user is
                 // mid-edit, in which case just stage it (they can flip with Tab).
@@ -1401,6 +1413,10 @@ impl TuiApp {
                 // streamed skeleton — reset cursor so it starts fresh.
                 rt.cell_cursor = None;
                 rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
@@ -1440,6 +1456,10 @@ impl TuiApp {
                 rt.results_exported = false;
                 rt.cell_cursor = None;
                 rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
                 self.status = Some(Status::ReportRunDone { rows, errors });

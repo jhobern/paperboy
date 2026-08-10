@@ -156,19 +156,29 @@ pub enum Trend {
     /// Right before, wrong now — the one every reader is looking for.
     Regressed,
     /// Wrong before, wrong now. Failing, but not *new*: CI cares about the
-    /// difference, and so does anyone deciding whether to ship.
+    /// difference, and so does anyone deciding whether to ship — which is why
+    /// it stays a distinct variant even though it *shows* as `unchanged` (see
+    /// [`Trend::as_str`]).
     StillWrong,
 }
 
 impl Trend {
     /// The reserved `Trend` column's cell text, English and lower-case like
     /// every other reserved value for the same reason: report data, not chrome.
+    ///
+    /// `StillWrong` reads as `unchanged` because that is what the column is
+    /// answering — *did this row move?* — and the answer for a row that was
+    /// wrong before and is wrong now is no. Whether it is right or wrong is the
+    /// `Correct` column's question, and it is sat right beside it, so the pair
+    /// still says everything: `unchanged` + `incorrect` is the still-failing
+    /// row. The distinction survives where it matters — the variant is kept, so
+    /// the cell is still tinted red and JUnit can still tell a known failure
+    /// from a passing row.
     pub fn as_str(self) -> &'static str {
         match self {
-            Trend::Unchanged => "unchanged",
+            Trend::Unchanged | Trend::StillWrong => "unchanged",
             Trend::Fixed => "fixed",
             Trend::Regressed => "regressed",
-            Trend::StillWrong => "still wrong",
         }
     }
 
@@ -366,6 +376,22 @@ impl ReportResult {
     ) -> Option<super::metrics::Metrics> {
         let labels = super::labels::LabelMap::parse(&header.labels());
         super::metrics::Metrics::compute(self, columns, &labels)
+    }
+
+    /// Row `r`'s rolled-up trend, read from the scored cells rather than from
+    /// the `Trend` column's text.
+    ///
+    /// The text can't be parsed back to a variant any more —
+    /// [`Trend::as_str`] shows both `Unchanged` and `StillWrong` as
+    /// `unchanged` — and it was never the better source anyway: this is the
+    /// same roll-up the column itself was written from, favouring the bad news.
+    pub fn row_trend(&self, r: usize) -> Option<Trend> {
+        Trend::rollup(
+            self.trends
+                .iter()
+                .filter(|((row, _), _)| *row == r)
+                .map(|(_, t)| *t),
+        )
     }
 
     pub fn summary_rows(&self, columns: &[OutputColumn]) -> Vec<SummaryRow> {

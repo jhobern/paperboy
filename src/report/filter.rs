@@ -48,12 +48,18 @@ impl RowFacts {
                 v if v == Verdict::Untested.as_str() => Some(Verdict::Untested),
                 _ => None,
             }),
-            trend: cell(super::compare::TREND_COLUMN).and_then(|v| match v {
-                v if v == Trend::Unchanged.as_str() => Some(Trend::Unchanged),
-                v if v == Trend::Fixed.as_str() => Some(Trend::Fixed),
-                v if v == Trend::Regressed.as_str() => Some(Trend::Regressed),
-                v if v == Trend::StillWrong.as_str() => Some(Trend::StillWrong),
-                _ => None,
+            // Taken from the scored cells, not the column's text: `unchanged`
+            // is what both a still-right and a still-wrong row say, and a
+            // filter that confused the two would hide rows it claimed to show.
+            // Rows carried over from a source with no scoring (nothing puts one
+            // there today) fall back to the word, which can still distinguish
+            // the two that matter.
+            trend: result.row_trend(r).or_else(|| {
+                cell(super::compare::TREND_COLUMN).and_then(|v| match v {
+                    v if v == Trend::Fixed.as_str() => Some(Trend::Fixed),
+                    v if v == Trend::Regressed.as_str() => Some(Trend::Regressed),
+                    _ => None,
+                })
             }),
         }
     }
@@ -298,13 +304,38 @@ mod tests {
                 row(&[
                     (RESULT_COLUMN, "Verdict: a≠b"),
                     (CORRECT_COLUMN, "incorrect"),
-                    (TREND_COLUMN, "still wrong"),
+                    // A still-wrong row reads `unchanged` like a still-right
+                    // one; what tells them apart is the scored cell below.
+                    (TREND_COLUMN, "unchanged"),
                     ("Name", "delta"),
                     ("Verdict", "High Risk"),
                 ]),
             ],
+            trends: [
+                ((0, "Verdict".to_string()), Trend::Unchanged),
+                ((1, "Verdict".to_string()), Trend::Fixed),
+                ((2, "Verdict".to_string()), Trend::Regressed),
+                ((3, "Verdict".to_string()), Trend::StillWrong),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         }
+    }
+
+    /// The two rows that didn't move share a word but not a class: a filter
+    /// reading the column's text alone would sweep the still-failing row in
+    /// with the passing ones.
+    #[test]
+    fn a_still_wrong_row_is_told_apart_from_a_still_right_one() {
+        let res = fixture();
+        assert_eq!(RowFacts::of(&res, 0).trend, Some(Trend::Unchanged));
+        assert_eq!(RowFacts::of(&res, 3).trend, Some(Trend::StillWrong));
+        assert_eq!(
+            res.rows[0].cells.get(TREND_COLUMN),
+            res.rows[3].cells.get(TREND_COLUMN),
+            "even though the column says the same thing about both"
+        );
     }
 
     fn columns() -> Vec<OutputColumn> {

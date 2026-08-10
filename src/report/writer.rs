@@ -1358,12 +1358,13 @@ fn run_cell_tint(result: &ReportResult, r: usize, header: &str, value: &str) -> 
     // repeat that colour (a `fixed` cell is correct, a `regressed` one is not).
     // `unchanged` is left plain -- "still right" is the expected case, and
     // colouring it would drown the two rows a reader is actually looking for.
+    // A *still wrong* row also reads `unchanged` (it didn't move either), so
+    // the tint is taken from the roll-up rather than from the word: the colour
+    // is what separates the two on sight.
     if header == TREND_COLUMN {
-        return match value.trim() {
-            v if v == Trend::Fixed.as_str() => Some(Tint::Green),
-            v if v == Trend::Regressed.as_str() || v == Trend::StillWrong.as_str() => {
-                Some(Tint::Red)
-            }
+        return match result.row_trend(r) {
+            Some(Trend::Fixed) => Some(Tint::Green),
+            Some(Trend::Regressed) | Some(Trend::StillWrong) => Some(Tint::Red),
             _ => None,
         };
     }
@@ -2444,12 +2445,24 @@ mod tests {
             run_cell_tint(&res, 1, "Trend", Trend::Regressed.as_str()),
             Some(Tint::Red)
         ));
+        // A still-wrong row and a still-right one both *say* `unchanged`, so
+        // the tint has to come from the roll-up: red is what tells the reader
+        // which of the two they are looking at.
+        let mut wrong = res.clone();
+        wrong
+            .trends
+            .insert((1, "Verdict".into()), Trend::StillWrong);
         assert!(
             matches!(
-                run_cell_tint(&res, 1, "Trend", Trend::StillWrong.as_str()),
+                run_cell_tint(&wrong, 1, "Trend", Trend::StillWrong.as_str()),
                 Some(Tint::Red)
             ),
-            "`still wrong` is not new, but it is still wrong"
+            "still wrong is not new, but it is still wrong"
+        );
+        assert_eq!(
+            Trend::StillWrong.as_str(),
+            Trend::Unchanged.as_str(),
+            "and it says what the column is asking: this row did not move"
         );
         assert!(
             run_cell_tint(&res, 2, "Trend", Trend::Unchanged.as_str()).is_none(),

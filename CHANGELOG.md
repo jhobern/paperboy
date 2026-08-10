@@ -22,6 +22,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **A still-failing row's `Trend` reads `unchanged`.** The column answers one
+  question — *did this row move?* — and for a row that was wrong before and is
+  wrong now the answer is no, so `still wrong` was answering a different
+  question in the column's own words. It now reads `unchanged` like the other
+  row that didn't move, with `Correct: incorrect` beside it saying which of the
+  two it is, and the cell still tinted red. Nothing else is lost: the tint and
+  the row filters read the scored cells rather than the column's text, so a
+  still-failing row is never confused with a passing one.
+
 - **The confusion matrix in an HTML export is drawn at readable size.** It was
   set at the grid's own type size, so the handful of numbers a reader scans
   across and down to find the one wrong cell were the smallest thing on the
