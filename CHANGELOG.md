@@ -10,6 +10,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.8.0] - 2026-08-08
 
+### Added
+
+- **`TRUTH`, `DETAIL`, `STATISTICS` and `IMAGE` are syntax highlighted.** The
+  per-column clauses were the only part of PaperTrail the source view treated as
+  plain data, so `TRUTH "pass" DETAIL` read as a column name and a string. They
+  now take the same colour their editor chips carry, and their arguments
+  (`WIDTH`, `HEIGHT`, `FIT`, `MEAN`, `COUNT`, …) are accented — but only inside
+  their own parentheses, so a column honestly called `count` or `width` stays
+  plain text.
+
 ### Changed
 
 - **The GUI asks for an export filename itself.** Exporting a report's results

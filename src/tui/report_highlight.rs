@@ -80,7 +80,35 @@ const KEYWORDS: &[&str] = &[
     "HIDE",
     "JOIN",
     "ON",
+    // The per-column clauses. They read as part of the column they follow (the
+    // GUI draws them as a segmented pill hanging off it), so they are keywords
+    // here too rather than leaving `TRUTH "pass" DETAIL` looking like data.
+    "IMAGE",
+    "TRUTH",
+    "DETAIL",
+    "STATISTICS",
 ];
+
+/// A clause whose parenthesised arguments are themselves words with meaning,
+/// rather than user data. Tracked while highlighting a line so `WIDTH`/`MEAN`
+/// light up inside `IMAGE(…)`/`STATISTICS(…)` and nowhere else — a column
+/// legitimately called `count` or `width` must stay plain text.
+#[derive(Clone, Copy, PartialEq)]
+enum ClauseArgs {
+    Image,
+    Statistics,
+}
+
+/// Whether `word` is an argument keyword of the clause currently open.
+fn is_clause_arg(word: &str, clause: ClauseArgs) -> bool {
+    match clause {
+        ClauseArgs::Image => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "FIT" | "WIDTH" | "HEIGHT" | "FILE"
+        ),
+        ClauseArgs::Statistics => crate::report::model::StatKind::parse(word).is_some(),
+    }
+}
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -106,6 +134,10 @@ fn keyword_color(upper: &str, th: &Theme) -> Color {
         "HIDE" => th.dim,
         "AS" | "BASELINE" | "COMPARISON" => th.pending,
         "PARALLEL" => th.err,
+        // The column clauses take the substitution hue their GUI chips carry,
+        // which also sets them apart from the structural keywords they sit on
+        // the same line as.
+        "IMAGE" | "TRUTH" | "DETAIL" | "STATISTICS" => th.subst,
         _ => th.accent,
     }
 }
@@ -133,6 +165,9 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
     // resolves against the bound collection. Cleared once that token is seen
     // (or another keyword intervenes).
     let mut expect_request_name = false;
+    // Set while inside `IMAGE(…)` / `STATISTICS(…)`: their arguments are
+    // keywords, but only in there.
+    let mut clause_args: Option<ClauseArgs> = None;
     let mut i = 0;
     while i < n {
         let c = chars[i];
@@ -211,6 +246,11 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
                 // The token after a `REQUEST` keyword is a request name; any
                 // other keyword ends that expectation.
                 expect_request_name = upper == "REQUEST";
+                clause_args = match upper.as_str() {
+                    "IMAGE" => Some(ClauseArgs::Image),
+                    "STATISTICS" => Some(ClauseArgs::Statistics),
+                    _ => None,
+                };
                 Style::default()
                     .fg(keyword_color(&upper, th))
                     .add_modifier(Modifier::BOLD)
@@ -222,6 +262,10 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
                     th.pending
                 };
                 Style::default().fg(colour)
+            } else if clause_args.is_some_and(|c| is_clause_arg(&word, c)) {
+                // `WIDTH`, `MEAN`, … — sub-keywords, in the accent the other
+                // modal keywords (`RAW`, `PRETTY`) already use.
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(th.text)
             };
@@ -239,6 +283,11 @@ pub(crate) fn highlight_line(line: &str, ctx: &HlCtx, th: &Theme) -> Vec<Span<'s
             i += 1;
         }
         let text: String = chars[start..i].iter().collect();
+        // The clause's arguments end with its closing paren; anything after it
+        // is an ordinary word again.
+        if text.contains(')') {
+            clause_args = None;
+        }
         spans.push(Span::styled(text, Style::default().fg(th.text)));
     }
     if spans.is_empty() {
@@ -402,6 +451,56 @@ mod tests {
     fn assert_tiles(line: &str, spans: &[Span<'static>]) {
         let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, line.chars().count(), "spans must tile {line:?}");
+    }
+
+    #[test]
+    fn the_column_clauses_are_keywords_with_their_own_hue() {
+        let th = th();
+        let line = "REPORT SHOT AS Frame STATISTICS(COUNT) IMAGE(HEIGHT 110) TRUTH \"pass\" DETAIL";
+        let spans = highlight_line(line, &ctx(), &th);
+        assert_tiles(line, &spans);
+        for kw in ["STATISTICS", "IMAGE", "TRUTH", "DETAIL"] {
+            let sp = spans.iter().find(|s| s.content == kw).unwrap();
+            assert_eq!(sp.style.fg, Some(th.subst), "{kw} takes the clause hue");
+            assert!(sp.style.add_modifier.contains(Modifier::BOLD), "{kw}");
+        }
+        // Their arguments are sub-keywords, in the accent.
+        for arg in ["COUNT", "HEIGHT"] {
+            let sp = spans.iter().find(|s| s.content == arg).unwrap();
+            assert_eq!(sp.style.fg, Some(th.accent), "{arg} is a clause argument");
+        }
+    }
+
+    #[test]
+    fn a_clause_argument_is_only_a_keyword_inside_its_clause() {
+        // `count` and `width` are perfectly ordinary column names; they must
+        // not light up just because `STATISTICS`/`IMAGE` know those words.
+        let th = th();
+        let line = "SHOW(count, width)";
+        let spans = highlight_line(line, &ctx(), &th);
+        assert_tiles(line, &spans);
+        for name in ["count", "width"] {
+            let sp = spans.iter().find(|s| s.content == name).unwrap();
+            assert_eq!(sp.style.fg, Some(th.text), "{name} is data, not a keyword");
+        }
+        // And the clause closes at its own paren: a field written after
+        // `STATISTICS(MEAN)` is a name again.
+        let line = "SHOW(a STATISTICS(MEAN), count)";
+        let spans = highlight_line(line, &ctx(), &th);
+        assert_tiles(line, &spans);
+        assert_eq!(
+            spans.iter().find(|s| s.content == "MEAN").unwrap().style.fg,
+            Some(th.accent)
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .find(|s| s.content == "count")
+                .unwrap()
+                .style
+                .fg,
+            Some(th.text)
+        );
     }
 
     #[test]
