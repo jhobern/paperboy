@@ -911,6 +911,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A workspace report wouldn't run from the tree.** With a report showing in
+  the right pane, `r` and `d` did nothing unless focus had first been moved
+  into the report body — even though the tree's selection *was* that report.
+  Both keys now run and preview it from either pane. Only those two: every
+  other report key already means something to the tree, and a letter that
+  changes meaning with the right pane's contents is how a key map becomes
+  unlearnable.
+
 - **A spreadsheet's picture column was as wide as a file path.** A column of
   thumbnails was sized to its pictures only when they had a fixed height and
   had all been fetched; a `FIT` column, or one whose pictures failed to load,

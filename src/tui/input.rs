@@ -1535,6 +1535,30 @@ impl TuiApp {
             self.on_key_report_body(key);
             return;
         }
+        // Running the report you can see should not depend on which pane the
+        // cursor happens to be in. With a report in the right pane, the tree's
+        // selection *is* that report -- so the two run keys act on it from the
+        // tree as well, saving a Tab in and a Tab back out for the one thing
+        // anybody does with a report. Only these two: every other report key
+        // (`c`, `b`, `v`, …) already means something to the tree, and quietly
+        // changing what a letter does depending on the right pane's contents is
+        // how a key map becomes unlearnable. `r` and `d` are unbound here, and
+        // F5's "send the selection" reads the same way when the selection is a
+        // report.
+        if self.active_report_index().is_some()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(
+                key.code,
+                KeyCode::Char('r') | KeyCode::Char('d') | KeyCode::F(5)
+            )
+        {
+            match key.code {
+                KeyCode::Char('d') => self.open_report_dry_run(),
+                _ => self.run_active_report(),
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);

@@ -22559,6 +22559,53 @@ fn embedded_report_left_right_do_not_change_active_tab() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The report you can see runs from the tree as well as from the body: with a
+/// report in the right pane, the tree's selection *is* that report, so `r` and
+/// `d` act on it without a trip through Tab.
+#[test]
+fn the_run_keys_reach_an_embedded_report_from_the_tree() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(app.focus, super::app::Pane::List, "focus is on the tree");
+    let idx = app.active_report_index().expect("a report is shown");
+
+    let _ = idx;
+    // The fixture's report names a request its collection doesn't have, so the
+    // preview is refused -- which is exactly the proof wanted here: the key
+    // reached the *report*, rather than falling through to the tree and doing
+    // nothing at all.
+    press(&mut app, KeyCode::Char('d'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "`d` reached the report from the tree: {:?}",
+        app.status
+    );
+    app.status = None;
+    press(&mut app, KeyCode::Char('r'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "`r` reached the report from the tree: {:?}",
+        app.status
+    );
+    assert_eq!(app.focus, super::app::Pane::List, "focus did not move");
+    app.status = None;
+
+    // And the tree keeps every key it already owned: `c` still starts a
+    // workspace copy rather than opening the report's column picker.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        !matches!(app.overlay, Some(super::app::Overlay::ReportColumns(_))),
+        "`c` still belongs to the tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Enter on a report row opens the report's node editor (the report equivalent
 /// of a request's edit wizard) and moves focus into the report body — the
 /// report is already shown by the highlight, so Enter is the "edit it" action.
