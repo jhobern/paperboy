@@ -155,7 +155,7 @@ impl LoadFlow {
             filter: String::new(),
             show_all_files: false,
             selected_path: None,
-            ws_filter: WorkspaceGitFilter::HurlAndJson,
+            ws_filter: WorkspaceGitFilter::PaperboyFiles,
             ws_root: None,
             ws_name: String::new(),
             ws_origin: None,
@@ -2024,7 +2024,7 @@ mod tests {
         pump_until_past(&mut load, &mut app, LoadStep::PickRef);
         assert_eq!(load.step(), LoadStep::PickWorkspaceFilter);
 
-        load.ws_filter = WorkspaceGitFilter::HurlAndJson;
+        load.ws_filter = WorkspaceGitFilter::PaperboyFiles;
         start_workspace_checkout(&mut load, &s);
         pump_until_past(&mut load, &mut app, LoadStep::PickWorkspaceFilter);
 
@@ -2037,8 +2037,12 @@ mod tests {
         assert!(root.join("api.hurl").is_file());
         assert!(root.join("legacy.json").is_file());
         assert!(
-            !root.join("big.bin").exists() && !root.join("dev.vars").exists(),
-            "the chosen filter left everything that isn't a collection behind"
+            root.join("dev.vars").is_file() && root.join("nightly.trail").is_file(),
+            "a workspace arrives with the environments and reports its requests need"
+        );
+        assert!(
+            !root.join("big.bin").exists(),
+            "the chosen filter left behind what PaperBoy cannot open"
         );
 
         assert!(load.finish_workspace(&mut app));

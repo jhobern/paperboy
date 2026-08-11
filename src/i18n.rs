@@ -317,7 +317,7 @@ strings! {
     git_filter_label => "filter: ", "filtre\u{a0}: ", "filter: ";
     git_pick_workspace_filter_title => "Choose which files to download", "Choisissez les fichiers à télécharger", "Vælg hvilke filer der skal hentes";
     git_workspace_filter_hint => "Enter select · Esc cancel", "Entrée choisir · Échap annuler", "Enter vælg · Esc annuller";
-    git_ws_filter_hurl_json => ".hurl and .json files (recommended)", "Fichiers .hurl et .json (recommandé)", ".hurl- og .json-filer (anbefalet)";
+    git_ws_filter_hurl_json => "Files PaperBoy can open (recommended)", "Fichiers lisibles par PaperBoy (recommandé)", "Filer PaperBoy kan åbne (anbefalet)";
     git_ws_filter_hurl => ".hurl files only", "Fichiers .hurl uniquement", "Kun .hurl-filer";
     git_ws_filter_json => ".json files only", "Fichiers .json uniquement", "Kun .json-filer";
     git_ws_filter_all => "All files", "Tous les fichiers", "Alle filer";

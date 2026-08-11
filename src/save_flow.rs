@@ -843,7 +843,7 @@ mod tests {
             commit_sha: "abc123".to_string(),
             ref_kind: RefKind::Branch,
             ref_name: "main".to_string(),
-            filter: WorkspaceGitFilter::HurlAndJson,
+            filter: WorkspaceGitFilter::PaperboyFiles,
         };
         let mut f = SaveFlow::for_workspace(3, &col, &ws_origin);
         assert!(!f.source.chooses_paths());

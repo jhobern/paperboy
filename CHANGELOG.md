@@ -10,6 +10,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.4.0] - unreleased
 
+### Fixed
+
+- **A workspace downloaded from git arrives with its environments and
+  reports.** The recommended file filter took `.hurl` and `.json` only, so a
+  repo holding requests, `.vars` environments and `.trail` reports downloaded
+  the requests and quietly dropped everything they needed to run — the only way
+  to get them was "All files", which also dragged down every unrelated binary in
+  the repo. The recommended filter is now "files PaperBoy can open" and covers
+  all four. Workspaces already pinned to the old filter keep working.
+
 ### Added
 
 - **The GUI File menu names what it opens before where it comes from.** It used

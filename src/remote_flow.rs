@@ -47,7 +47,12 @@ impl RemoteKind {
 /// files that should never be pulled down just to browse its collections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum WorkspaceGitFilter {
-    HurlAndJson,
+    /// Everything PaperBoy itself can open: collections (`.hurl`), Postman
+    /// exports (`.json`), environments (`.vars`) and reports (`.trail`).
+    /// Serialised under its old name so a workspace pinned by an earlier
+    /// version still reloads.
+    #[serde(rename = "HurlAndJson")]
+    PaperboyFiles,
     HurlOnly,
     JsonOnly,
     All,
@@ -55,7 +60,7 @@ pub(crate) enum WorkspaceGitFilter {
 
 impl WorkspaceGitFilter {
     pub(crate) const ALL: [WorkspaceGitFilter; 4] = [
-        WorkspaceGitFilter::HurlAndJson,
+        WorkspaceGitFilter::PaperboyFiles,
         WorkspaceGitFilter::HurlOnly,
         WorkspaceGitFilter::JsonOnly,
         WorkspaceGitFilter::All,
@@ -63,7 +68,7 @@ impl WorkspaceGitFilter {
 
     pub(crate) fn label(self, s: &Strings) -> &'static str {
         match self {
-            WorkspaceGitFilter::HurlAndJson => s.git_ws_filter_hurl_json,
+            WorkspaceGitFilter::PaperboyFiles => s.git_ws_filter_hurl_json,
             WorkspaceGitFilter::HurlOnly => s.git_ws_filter_hurl,
             WorkspaceGitFilter::JsonOnly => s.git_ws_filter_json,
             WorkspaceGitFilter::All => s.git_ws_filter_all,
@@ -77,8 +82,16 @@ impl WorkspaceGitFilter {
         let ext = Path::new(path).extension().and_then(|e| e.to_str());
         match self {
             WorkspaceGitFilter::All => true,
-            WorkspaceGitFilter::HurlAndJson => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
+            // A workspace is not its collections alone: leaving the `.vars`
+            // behind downloads requests with no environments to run them
+            // against, and leaving the `.trail` behind drops the reports that
+            // drive them — which reads as a broken download rather than as a
+            // filter doing its job.
+            WorkspaceGitFilter::PaperboyFiles => {
+                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl")
+                    || e.eq_ignore_ascii_case("json")
+                    || e.eq_ignore_ascii_case("vars")
+                    || e.eq_ignore_ascii_case("trail"))
             }
             WorkspaceGitFilter::HurlOnly => {
                 matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl"))
@@ -915,9 +928,14 @@ mod tests {
 
     #[test]
     fn the_workspace_filter_matches_by_extension_case_insensitively() {
-        assert!(WorkspaceGitFilter::HurlAndJson.matches("a/b/API.HURL"));
-        assert!(WorkspaceGitFilter::HurlAndJson.matches("x.json"));
-        assert!(!WorkspaceGitFilter::HurlAndJson.matches("x.md"));
+        assert!(WorkspaceGitFilter::PaperboyFiles.matches("a/b/API.HURL"));
+        assert!(WorkspaceGitFilter::PaperboyFiles.matches("x.json"));
+        assert!(
+            WorkspaceGitFilter::PaperboyFiles.matches("envs/dev.vars")
+                && WorkspaceGitFilter::PaperboyFiles.matches("nightly.trail"),
+            "a workspace needs its environments and reports, not just its requests"
+        );
+        assert!(!WorkspaceGitFilter::PaperboyFiles.matches("x.md"));
         assert!(WorkspaceGitFilter::HurlOnly.matches("x.hurl"));
         assert!(!WorkspaceGitFilter::HurlOnly.matches("x.json"));
         assert!(WorkspaceGitFilter::All.matches("anything.at.all"));

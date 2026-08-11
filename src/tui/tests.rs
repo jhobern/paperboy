@@ -3488,7 +3488,7 @@ fn spawn_workspace_redownload_fetches_the_exact_pinned_commit_and_applies_the_fi
         commit_sha,
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
 
     let rx = spawn_workspace_redownload(origin);
@@ -3599,7 +3599,7 @@ fn a_full_workspace_git_download_records_the_commit_sha_and_filter_as_the_origin
     );
     assert_eq!(origin.ref_kind, RefKind::Branch);
     assert_eq!(origin.ref_name, "main");
-    assert_eq!(origin.filter, WorkspaceGitFilter::HurlAndJson);
+    assert_eq!(origin.filter, WorkspaceGitFilter::PaperboyFiles);
 
     if let Some(root) = &app.collections[ci].workspace_root {
         assert!(root.join("a.hurl").exists());
@@ -3624,7 +3624,7 @@ fn into_collection_queues_a_pending_reload_only_when_the_vanished_root_came_from
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
 
     let mut col = Collection::new("ghost-repo".to_string(), Vec::new());
@@ -3659,7 +3659,7 @@ fn apply_persisted_queues_pending_reloads_and_opens_the_first_confirm_popup() {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let mut col = Collection::new("ghost-repo".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -3693,7 +3693,7 @@ fn declining_a_workspace_reload_shows_the_folder_missing_status_and_advances_the
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let reload = crate::persistence::PendingWorkspaceReload {
         tab_name: "ghost-repo".into(),
@@ -3726,7 +3726,7 @@ fn accepting_a_workspace_reload_redownloads_and_restores_the_previously_selected
         commit_sha,
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let reload = crate::persistence::PendingWorkspaceReload {
         tab_name: "ghost-repo".into(),
@@ -3848,7 +3848,7 @@ fn multiple_pending_workspace_reloads_are_offered_one_at_a_time() {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let dir_a = std::env::temp_dir().join(format!("paperboy_ws_multi_a_{}", std::process::id()));
     let dir_b = std::env::temp_dir().join(format!("paperboy_ws_multi_b_{}", std::process::id()));
@@ -5541,7 +5541,7 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
         commit_sha: "0000000000000000000000000000000000000000".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let mut col = Collection::new("api-workspace".into(), Vec::new());
     col.workspace_root = Some(ws.clone());
@@ -5595,7 +5595,7 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
         "the origin sha is repinned to the new commit"
     );
     assert_eq!(repinned.ref_name, "main");
-    assert!(matches!(repinned.filter, WorkspaceGitFilter::HurlAndJson));
+    assert!(matches!(repinned.filter, WorkspaceGitFilter::PaperboyFiles));
 
     // The pushed commit carries the edited + new files (and never the `.git`).
     git(&["fetch", "-q", "origin", "main"], &seed);
@@ -5675,7 +5675,7 @@ fn workspace_tab_with_unsaved_edit() -> (TuiApp, usize, std::path::PathBuf) {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     });
 
     let mut app = TuiApp::default();
