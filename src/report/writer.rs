@@ -330,14 +330,18 @@ tbody tr.sum.has[aria-expanded='true']>td:first-child::before{content:'\25be '}
 tr.det{display:none}
 tr.det.open{display:table-row}
 tr.det>td{background:var(--det-bg);border-top:none}
-.panel{display:flex;flex-wrap:wrap;gap:1.25rem}
-.panel section{min-width:min(100%,22rem);flex:1 1 22rem}
+.panel{display:flex;flex-wrap:wrap;align-items:flex-start;gap:.7rem 1rem}
+/* Sections hug their content instead of each claiming an equal share of the
+   row: stretched to a third of a wide screen apiece, a picture and a short
+   JSON blob ended up at opposite ends of the panel with a void between them.
+   They still wrap, and still cannot grow past a comfortable reading width. */
+.panel section{flex:0 1 auto;min-width:0;max-width:min(100%,40rem)}
 .panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;
 color:var(--muted);margin:0 0 .35rem;font-weight:600}
 .panel pre{margin:0;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;
 background:var(--pre-bg);border:1px solid var(--line-soft);border-radius:4px;padding:.4rem .5rem;
 max-height:24rem;overflow:auto}
-.panel img{max-width:100%;height:auto;border:1px solid var(--line-soft);border-radius:4px}
+.panel img{display:block;max-width:100%;height:auto;border:1px solid var(--line-soft);border-radius:4px}
 table.fdiff{width:100%;font-size:12px}
 table.fdiff th{background:var(--fdiff-head-bg);color:var(--fg);position:static;font-weight:600}
 table.fdiff tr.chg td{background:var(--warn-bg);color:var(--tint-fg)}
@@ -2545,6 +2549,23 @@ mod tests {
         assert!(
             html.contains("img.full[data-from]"),
             "the script hydrates it on expand: {html}"
+        );
+    }
+
+    /// The drill-down's sections used to each claim an equal share of the row,
+    /// so on a wide screen a picture and a short JSON blob were pushed to
+    /// opposite ends with a void between them. They size to their content.
+    #[test]
+    fn the_drill_down_sections_hug_their_content() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains(".panel section{flex:0 1 auto;"),
+            "sections do not grow to fill the row: {html}"
+        );
+        assert!(
+            html.contains("align-items:flex-start"),
+            "and a short section is not stretched to the tallest one's height: {html}"
         );
     }
 

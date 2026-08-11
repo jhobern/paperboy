@@ -502,6 +502,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The HTML report's drill-down is no longer mostly gaps.** Each section in an
+  expanded row claimed an equal share of the row's width, so on a wide screen a
+  picture and a short JSON blob were shoved to opposite ends with a void
+  between them, and a short section was stretched to the height of the tallest.
+  Sections now size to their own content, sit next to each other, and wrap when
+  they run out of room — with a reading-width cap so one long block cannot take
+  the whole panel.
+
 - **An import lands next to the last one.** The Postman importer suggested a
   folder inside the app's working directory — which, for anyone starting the
   terminal UI from a project, meant downloaded workspaces landing inside that
