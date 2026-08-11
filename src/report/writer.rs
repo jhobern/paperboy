@@ -1073,21 +1073,7 @@ impl ReportWriter for XlsxWriter {
         // default, every column comes out equally tiny and the wrapped cells
         // become tall thin ribbons — the same run's HTML export looks right
         // only because the browser sizes the table itself.
-        let mut widths = xlsx_column_widths(&columns, result);
-        // An image column is sized to its widest picture, not to the URL or
-        // path text underneath it -- the text is only a fallback there, and
-        // sizing to it would leave every picture clipped.
-        for (col, c) in columns.iter().enumerate() {
-            if c.image.is_none() {
-                continue;
-            }
-            let widest = (0..result.rows.len())
-                .filter_map(|r| boxes.get(&(r, col)))
-                .fold(0.0f64, |acc, (w, _)| acc.max(*w));
-            if widest > 0.0 {
-                widths[col] = clamp_xlsx_width(px_to_char_width(widest));
-            }
-        }
+        let widths = xlsx_column_widths(&columns, result);
         for (col, width) in widths.into_iter().enumerate() {
             sheet
                 .set_column_width(col as u16, width)
@@ -1445,11 +1431,49 @@ fn xlsx_image_boxes(
 /// for us). Kept separate from the writing loop so the sizing can be tested
 /// without unzipping a workbook.
 fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f64> {
-    measured_column_widths(columns, result)
+    let mut widths: Vec<f64> = measured_column_widths(columns, result)
         .into_iter()
         .map(clamp_xlsx_width)
-        .collect()
+        .collect();
+    // A picture column is sized to its pictures, not to the path or URL they
+    // were resolved from: that text is only a fallback for a picture that
+    // couldn't be fetched, and sizing to it gives a column of thumbnails the
+    // width of a file path -- while sizing *below* the picture clips it.
+    for (col, c) in columns.iter().enumerate() {
+        if let Some(w) = xlsx_image_column_width(c, result) {
+            widths[col] = w;
+        }
+    }
+    widths
 }
+
+/// The width to give `column` if it shows pictures, in Excel characters;
+/// `None` for an ordinary column.
+fn xlsx_image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<f64> {
+    let spec = column.image?;
+    let widest = result
+        .images
+        .iter()
+        .filter(|((_, header), _)| header == &column.header)
+        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
+        .fold(0.0_f64, f64::max);
+    if widest > 0.0 {
+        return Some(clamp_xlsx_width(px_to_char_width(widest)));
+    }
+    // A `FIT` column has no fixed box, and a column whose pictures all failed
+    // to fetch has nothing to size to -- but neither wants to be as wide as the
+    // path behind them, which in a real run is a hundred characters of
+    // directory nobody reads.
+    result
+        .images
+        .keys()
+        .any(|(_, header)| header == &column.header)
+        .then_some(XLSX_FIT_IMAGE_WIDTH)
+}
+
+/// How wide a `FIT` picture column is made, in Excel characters. `FIT` sizes
+/// the picture to the cell, so the cell has to get its size from somewhere.
+const XLSX_FIT_IMAGE_WIDTH: f64 = 18.0;
 
 /// How many characters wide each column needs to be to show its content
 /// unwrapped — header, data cells and the appended statistics rows alike, each
@@ -2882,6 +2906,61 @@ mod tests {
         ));
         assert!(cell_tint("Name", "anything.jpg").is_none());
         assert!(cell_tint("Status", "  ").is_none());
+    }
+
+    /// The spreadsheet has the same rule as the HTML: a column of thumbnails is
+    /// as wide as a thumbnail, not as wide as the path each was fetched from.
+    #[test]
+    fn the_spreadsheets_picture_column_is_sized_to_the_picture() {
+        let (mut res, header) = image_result();
+        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+
+        let columns = res.resolved_columns(&header);
+        let widths = xlsx_column_widths(&columns, &res);
+        let ci = columns
+            .iter()
+            .position(|c| c.header == "Frame")
+            .expect("the picture column");
+        assert!(
+            widths[ci] < long.len() as f64 / 2.0,
+            "sized to the thumbnail, not the path: {}",
+            widths[ci]
+        );
+        assert!(
+            widths[ci] >= XLSX_MIN_COL_WIDTH,
+            "and not so narrow the picture is clipped: {}",
+            widths[ci]
+        );
+    }
+
+    /// A `FIT` column has no fixed box to measure, and a picture that couldn't
+    /// be fetched leaves only its path — neither is a reason for a column as
+    /// wide as a directory tree.
+    #[test]
+    fn a_fit_picture_column_is_not_sized_to_its_path() {
+        use crate::report::flow::ImageSpec;
+        let (mut res, header) = image_result();
+        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+        res.column_images.insert(
+            "Frame".to_string(),
+            ImageSpec {
+                fit: true,
+                ..Default::default()
+            },
+        );
+
+        let columns = res.resolved_columns(&header);
+        let ci = columns.iter().position(|c| c.header == "Frame").unwrap();
+        assert_eq!(xlsx_column_widths(&columns, &res)[ci], XLSX_FIT_IMAGE_WIDTH);
+
+        let html = html_column_widths(&columns, &res);
+        assert_eq!(html[ci], HTML_FIT_IMAGE_WIDTH);
     }
 
     /// A picture column is sized by the picture. Its cell value is the path (or

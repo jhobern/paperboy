@@ -897,6 +897,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A spreadsheet's picture column was as wide as a file path.** A column of
+  thumbnails was sized to its pictures only when they had a fixed height and
+  had all been fetched; a `FIT` column, or one whose pictures failed to load,
+  fell back to the text underneath them — which in a real run is a hundred
+  characters of directory nobody reads, leaving the rest of the report pushed
+  off the screen. Such a column now gets a modest fixed width, the same rule
+  the HTML export follows.
+
 - **An import that stopped on a full folder offered to run again unchanged.**
   Nobody presses a key while a download runs, so the failure was blamed on the
   last screen that *had* seen one — the confirmation — and dismissing "already
