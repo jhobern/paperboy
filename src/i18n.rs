@@ -300,6 +300,7 @@ strings! {
     git_token_label => "Token", "Jeton", "Token";
     git_token_hint => "blank for a public repo", "vide pour un dépôt public", "tom for et offentligt repo";
     git_connect_hint => "Enter connect · Esc cancel", "Entrée connecter · Échap annuler", "Enter forbind · Esc annuller";
+    gui_git_recent => "Recent", "Récents", "Seneste";
     git_recent_hint => "↓ recent URLs", "↓ URL récentes", "↓ seneste URL'er";
     git_pick_ref_title => "Select a branch or tag", "Sélectionnez une branche ou une étiquette", "Vælg en gren eller et tag";
     git_pick_file_title => "Select a file", "Sélectionnez un fichier", "Vælg en fil";

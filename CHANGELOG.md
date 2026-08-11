@@ -12,6 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI's git wizard offers the repositories you have already used.** The
+  terminal has kept a list of recent remote URLs for a while and offers it under
+  the URL field; the GUI kept writing to the same list but never showed it, so a
+  git URL had to be typed out (or pasted from somewhere else) every time. Both
+  the load and the save wizard now show a **Recent** menu beside the URL field,
+  backed by that same shared list — a repo opened in one front-end is offered by
+  the other — and both URL and token fields carry their examples inside them.
+
 - **The GUI's Postman importer asks where the key lives, like the terminal
   does.** The connect step wanted an API key and hinted, in prose, that a
   provider reference could be typed instead — which only helps someone who

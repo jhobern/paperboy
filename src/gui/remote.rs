@@ -638,8 +638,9 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     let mut action = UiAction::None;
 
     let strings = &app.strings;
+    let recent = app.session.recent_git_urls.clone();
     let dismissed = super::widgets::dialog(ctx, title, Some(460.0), |ui| {
-        action = draw_flow(ui, &mut flow, colors, strings);
+        action = draw_flow(ui, &mut flow, &recent, colors, strings);
     })
     .dismissed;
     // The ✕ and Escape are the Cancel button by another name.
@@ -783,11 +784,53 @@ impl Flow {
     }
 }
 
-fn draw_flow(ui: &mut egui::Ui, flow: &mut Flow, colors: UiColors, s: &Strings) -> UiAction {
+fn draw_flow(
+    ui: &mut egui::Ui,
+    flow: &mut Flow,
+    recent: &[String],
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
     match flow {
-        Flow::Load(load) => draw_load(ui, load, colors, s),
-        Flow::Save(save) => draw_save(ui, save, colors, s),
+        Flow::Load(load) => draw_load(ui, load, recent, colors, s),
+        Flow::Save(save) => draw_save(ui, save, recent, colors, s),
     }
+}
+
+/// The repository URL field, shared by the load and save wizards: the field
+/// itself plus, when the session has any, a menu of the repositories already
+/// used. Typing a git URL by hand is error-prone and people come back to the
+/// same handful of repos, which is exactly what the terminal's `\u{2193}` dropdown
+/// offers; this is that list in the shape egui has for it.
+fn url_field(
+    ui: &mut egui::Ui,
+    url: &mut String,
+    recent: &[String],
+    busy: bool,
+    colors: UiColors,
+    s: &Strings,
+) {
+    ui.horizontal(|ui| {
+        ui.colored_label(colors.accent, s.gui_git_repo_url);
+        if !recent.is_empty() {
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.menu_button(s.gui_git_recent, |ui| {
+                    for known in recent {
+                        if ui.button(known).clicked() {
+                            *url = known.clone();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+    });
+    ui.add_enabled(
+        !busy,
+        egui::TextEdit::singleline(url)
+            .hint_text(s.git_url_hint)
+            .desired_width(f32::INFINITY),
+    );
 }
 
 fn draw_busy_and_error(
@@ -809,14 +852,20 @@ fn draw_busy_and_error(
     }
 }
 
-fn draw_load(ui: &mut egui::Ui, load: &mut LoadFlow, colors: UiColors, s: &Strings) -> UiAction {
+fn draw_load(
+    ui: &mut egui::Ui,
+    load: &mut LoadFlow,
+    recent: &[String],
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
     let busy = load.is_busy();
     let busy_label = load.busy_label(s);
     let error = load.error().map(str::to_string);
     draw_busy_and_error(ui, busy_label, error.as_deref(), colors);
 
     match load.step() {
-        LoadStep::Connect => draw_load_connect(ui, load, busy, colors, s),
+        LoadStep::Connect => draw_load_connect(ui, load, recent, busy, colors, s),
         LoadStep::PickRef => draw_load_pick_ref(ui, load, busy, colors, s),
         LoadStep::PickFile => draw_load_pick_file(ui, load, busy, colors, s),
         LoadStep::PickWorkspaceFilter => draw_load_workspace_filter(ui, load, busy, colors, s),
@@ -934,22 +983,21 @@ fn draw_load_workspace_storage(
 fn draw_load_connect(
     ui: &mut egui::Ui,
     load: &mut LoadFlow,
+    recent: &[String],
     busy: bool,
     colors: UiColors,
     s: &Strings,
 ) -> UiAction {
     let mut action = UiAction::None;
 
-    ui.colored_label(colors.accent, s.gui_git_repo_url);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut load.flow.url).desired_width(f32::INFINITY),
-    );
+    url_field(ui, &mut load.flow.url, recent, busy, colors, s);
     ui.add_space(4.0);
     ui.colored_label(colors.accent, s.gui_git_token);
     ui.add_enabled(
         !busy,
-        egui::TextEdit::singleline(&mut load.flow.token).desired_width(f32::INFINITY),
+        egui::TextEdit::singleline(&mut load.flow.token)
+            .hint_text(s.git_token_hint)
+            .desired_width(f32::INFINITY),
     );
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1122,7 +1170,13 @@ fn draw_load_pick_file(
     action
 }
 
-fn draw_save(ui: &mut egui::Ui, save: &mut SaveFlow, colors: UiColors, s: &Strings) -> UiAction {
+fn draw_save(
+    ui: &mut egui::Ui,
+    save: &mut SaveFlow,
+    recent: &[String],
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
     let busy = save.is_busy();
     let busy_label = save.busy_label(s);
     let error = save.error().map(str::to_string);
@@ -1145,16 +1199,14 @@ fn draw_save(ui: &mut egui::Ui, save: &mut SaveFlow, colors: UiColors, s: &Strin
 
     match step {
         SaveStep::Connect => {
-            ui.colored_label(colors.accent, s.gui_git_repo_url);
-            ui.add_enabled(
-                !busy,
-                egui::TextEdit::singleline(&mut flow.url).desired_width(f32::INFINITY),
-            );
+            url_field(ui, &mut flow.url, recent, busy, colors, s);
             ui.add_space(4.0);
             ui.colored_label(colors.accent, s.gui_git_token);
             ui.add_enabled(
                 !busy,
-                egui::TextEdit::singleline(&mut flow.token).desired_width(f32::INFINITY),
+                egui::TextEdit::singleline(&mut flow.token)
+                    .hint_text(s.git_token_hint)
+                    .desired_width(f32::INFINITY),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1515,13 +1567,17 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
+/// Record `url` as the most-recently-used git URL. The list is shared with the
+/// terminal (it lives on the session, and is persisted with it), so the cap
+/// matches the terminal's: a longer list here would simply be trimmed the next
+/// time the terminal remembered a URL.
 fn remember_git_url(session: &mut crate::session::Session, url: &str) {
     let Some(url) = nonblank(url) else {
         return;
     };
     session.recent_git_urls.retain(|known| known != &url);
     session.recent_git_urls.insert(0, url);
-    session.recent_git_urls.truncate(12);
+    session.recent_git_urls.truncate(10);
 }
 
 #[cfg(test)]
@@ -1729,6 +1785,42 @@ mod tests {
         start_workspace_checkout(&mut load, &s);
         assert_eq!(load.error(), Some(s.gui_git_err_ws_no_matches));
         assert!(!load.is_busy(), "nothing was fetched");
+    }
+
+    #[test]
+    /// The repositories offered in the connect step are the session's, which
+    /// the terminal writes too — so a repo opened in one front-end is offered
+    /// by the other. Most recent first, with no repeats.
+    #[test]
+    fn a_used_repository_is_remembered_for_both_front_ends() {
+        let mut session = Session::default();
+        remember_git_url(&mut session, "https://example.test/a.git");
+        remember_git_url(&mut session, "https://example.test/b.git");
+        remember_git_url(&mut session, "  https://example.test/a.git  ");
+        assert_eq!(
+            session.recent_git_urls,
+            vec![
+                "https://example.test/a.git".to_string(),
+                "https://example.test/b.git".to_string()
+            ],
+            "revisiting a repo moves it to the front rather than duplicating it"
+        );
+
+        remember_git_url(&mut session, "   ");
+        assert_eq!(
+            session.recent_git_urls.len(),
+            2,
+            "a blank URL is not a repo"
+        );
+
+        for i in 0..12 {
+            remember_git_url(&mut session, &format!("https://example.test/{i}.git"));
+        }
+        assert_eq!(
+            session.recent_git_urls.len(),
+            10,
+            "the list is capped the same way the terminal caps it"
+        );
     }
 
     #[test]
