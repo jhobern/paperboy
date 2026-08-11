@@ -119,7 +119,8 @@ impl TuiApp {
         // the gesture instead.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Right))
             && self.overlay.is_none()
-            && self.right_click_activate_env(point)
+            && (self.right_click_revert_workspace_row(point)
+                || self.right_click_activate_env(point))
         {
             return;
         }
@@ -2572,6 +2573,64 @@ impl TuiApp {
     /// environment file, or a row of the Environments panel — select it and
     /// make it active. Returns whether the click was consumed, so any other
     /// right-click keeps its existing behaviour.
+    /// A right-click on an *edited* workspace tree row offers to throw its
+    /// in-memory changes away and go back to what is on disk — a request row
+    /// reverts that request, a collection file row reverts the whole file.
+    ///
+    /// The GUI hangs this on a context menu; a terminal has nowhere to put one,
+    /// so the gesture triggers the action directly. It is safe to do that here
+    /// because both paths raise the same confirmation dialog `Ctrl+R` does, so
+    /// a stray right-click can't lose an edit.
+    ///
+    /// Returns `false` for a clean row, leaving the click to whatever else
+    /// wants it.
+    fn right_click_revert_workspace_row(&mut self, point: Position) -> bool {
+        let Some(MouseHitTarget::SelectListRow(row)) = self.mouse_hit_at(point) else {
+            return false;
+        };
+        let ci = self.active_tab;
+        let Some(col) = self.collections.get(ci) else {
+            return false;
+        };
+        if !col.is_workspace() {
+            return false;
+        }
+        match col.ws_rows().into_iter().nth(row) {
+            // Only the loaded collection's requests can be reverted one at a
+            // time: another file's edits are parked as a whole, with no on-disk
+            // entry to put back in place of just one of them. Its file row
+            // (below) reverts the lot.
+            Some(crate::collection::WsRow::Request {
+                collection,
+                idx,
+                loaded: true,
+                ..
+            }) if col.path.as_deref() == Some(collection.as_path())
+                // `modified`, not "edited": a request that was *added* in this
+                // session has no saved version to go back to, so reverting it
+                // would have nothing to do. The file row still offers to drop
+                // it along with the rest of the file's edits.
+                && col.entries.get(idx).is_some_and(|e| e.modified) =>
+            {
+                self.select_row_in_pane(Pane::List, row);
+                self.collections[ci].selected_entry = idx;
+                self.begin_revert_request();
+                true
+            }
+            Some(crate::collection::WsRow::Collection { path, .. })
+                if col.workspace_file_edited(&path) =>
+            {
+                self.select_row_in_pane(Pane::List, row);
+                self.overlay = Some(Overlay::Confirm {
+                    action: ConfirmAction::RevertWorkspaceFile(ci, path),
+                    sel: 1,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn right_click_activate_env(&mut self, point: Position) -> bool {
         match self.mouse_hit_at(point) {
             Some(MouseHitTarget::SelectListRow(row)) => {
@@ -3446,6 +3505,19 @@ impl TuiApp {
                 Some(method) => self.status = Some(Status::RequestReverted(method)),
                 None => self.status = Some(Status::NothingToRevert),
             },
+            ConfirmAction::RevertWorkspaceFile(ci, path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match self.collections[ci].revert_workspace_file(&path) {
+                    Ok(()) => {
+                        self.status = Some(Status::FileReverted(name));
+                        self.save_state();
+                    }
+                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                }
+            }
             ConfirmAction::RevertEnv(env_id) => match self.revert_env_to_saved(env_id) {
                 Some(name) => self.status = Some(Status::EnvReverted(name)),
                 None => self.status = Some(Status::NothingToRevert),

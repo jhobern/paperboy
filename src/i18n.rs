@@ -116,6 +116,7 @@ strings! {
     confirm_save_report_q => "This report has unsaved edits. Saving will overwrite the original report file. Proceed?", "Ce rapport a des modifications non enregistrées. L'enregistrement écrasera le fichier de rapport d'origine. Continuer\u{a0}?", "Denne rapport har ugemte ændringer. Gemning vil overskrive den oprindelige rapportfil. Fortsæt?";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
+    confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every in-memory edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications en mémoire seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ændringer i hukommelsen går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
     confirm_yes => "Yes", "Oui", "Ja";
@@ -630,6 +631,7 @@ strings! {
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_stopped => "Run stopped — partial results kept", "Exécution interrompue — résultats partiels conservés", "Kørsel stoppet — delvise resultater beholdt";
     status_request_reverted => "request reverted to last saved", "requête rétablie à la dernière sauvegarde", "anmodning gendannet til sidst gemte";
+    status_file_reverted => "file reverted to last saved:", "fichier rétabli à la dernière sauvegarde :", "fil gendannet til sidst gemte:";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
     status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
@@ -835,6 +837,10 @@ strings! {
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
     gui_env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
     gui_env_open_workspace_tooltip => "In this workspace — click to open and expand it", "Dans cet espace de travail — cliquez pour l'ouvrir et le développer", "I dette arbejdsområde — klik for at åbne og udvide det";
+    gui_ws_revert_request => "Revert request to saved", "Rétablir la requête à la sauvegarde", "Gendan anmodning til gemt";
+    gui_ws_revert_file => "Revert file to saved", "Rétablir le fichier à la sauvegarde", "Gendan fil til gemt";
+    gui_revert_title => "Revert to saved", "Rétablir à la sauvegarde", "Gendan til gemt";
+    gui_revert_go => "Revert", "Rétablir", "Gendan";
     gui_ws_set_active_env => "Set as active environment", "Définir comme environnement actif", "Angiv som aktivt miljø";
     gui_active => "Active", "Actif", "Aktiv";
     gui_active_tooltip => "Use this environment for substitution", "Utiliser cet environnement pour la substitution", "Brug dette miljø til substitution";
@@ -1521,6 +1527,9 @@ pub enum Status {
     /// The selected request was reverted to its last-saved on-disk version,
     /// discarding its in-memory edits. Holds the HTTP method for the message.
     RequestReverted(String),
+    /// A whole workspace collection file was reverted to its on-disk version,
+    /// discarding every in-memory edit to it. Holds the file name.
+    FileReverted(String),
     /// A Global Environment's unsaved edits were discarded, restoring the
     /// last-saved values (added vars dropped, modified ones restored). Names it.
     EnvReverted(String),
@@ -1563,6 +1572,7 @@ impl Status {
                     | Status::ReportBound(_)
                     | Status::ReportNodeUndone(_)
                     | Status::RequestReverted(_)
+                    | Status::FileReverted(_)
                     | Status::EnvReverted(_)
                     | Status::WorkspaceTreeFilter(_)
             ),
@@ -1696,6 +1706,7 @@ impl Status {
                 .replace("{total}", &total.to_string()),
             Status::ReportRunStopped => s.report_run_stopped.to_string(),
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
+            Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
             Status::WorkspaceTreeFilter(on) => {

@@ -2177,11 +2177,23 @@ pub(crate) fn draw_collection_left(
             .fg(th.bg)
             .add_modifier(Modifier::BOLD),
     );
-    let mut st = ListState::default();
+    // Seeded with where the viewport was last frame, not with zero -- see
+    // `TuiApp::list_offset` for why that difference is the whole behaviour of
+    // the list. ratatui adjusts it only when the selection has moved outside
+    // it, so the cursor travels through the visible rows and the tree scrolls
+    // only once the cursor reaches an edge.
+    let carried = if app.list_offset_tab.get() == ci {
+        app.list_offset.get()
+    } else {
+        0
+    };
+    let mut st = ListState::default().with_offset(carried);
     if !view_rows.is_empty() {
         st.select(Some(sel));
     }
     f.render_stateful_widget(list, panes[0], &mut st);
+    app.list_offset.set(st.offset());
+    app.list_offset_tab.set(ci);
     let list_inner = Rect {
         x: panes[0].x.saturating_add(1),
         y: panes[0].y.saturating_add(1),
@@ -3866,6 +3878,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::RevertWorkspaceFile(_, path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    s.confirm_revert_file_q.replace("{f}", &name)
+                }
                 ConfirmAction::RevertRequest(ci, ei) => {
                     let name = app
                         .collections

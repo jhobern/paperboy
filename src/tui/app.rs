@@ -666,7 +666,10 @@ pub(crate) enum Overlay {
 }
 
 /// Which action a confirmation popup is guarding.
-#[derive(Clone, Copy, PartialEq)]
+/// Not `Copy`: [`Self::RevertWorkspaceFile`] names a file, and a path can't be
+/// squeezed into an index the way the other variants' targets can (a workspace
+/// tree row is a file, not a slot in a list).
+#[derive(Clone, PartialEq)]
 pub(crate) enum ConfirmAction {
     Exit,
     Clear,
@@ -688,6 +691,11 @@ pub(crate) enum ConfirmAction {
     /// values. Holds the env id. Raised by `Ctrl+R` in the entries popup only
     /// when the env has unsaved changes.
     RevertEnv(u64),
+    /// Discard every in-memory edit to a workspace collection file, restoring
+    /// it from disk. Holds `(tab index, file path)`. Raised by a right-click on
+    /// an edited file row in the workspace tree (and by the GUI's context
+    /// menu), only when that file actually has unsaved edits.
+    RevertWorkspaceFile(usize, std::path::PathBuf),
     /// Rerun the active report when its current on-screen results haven't been
     /// exported (CSV/JSON/HTML/XLSX or a `.baseline` snapshot) since the run
     /// that produced them — confirming discards the unsaved results. Acts on the
@@ -1163,6 +1171,23 @@ pub struct TuiApp {
     /// recorded during draw so the scroll can be clamped to stop at the name's
     /// end (no scrolling past into blank space).
     pub(crate) list_scroll_w: std::cell::Cell<u16>,
+    /// The request list's vertical scroll offset (its first visible row),
+    /// carried between frames.
+    ///
+    /// This has to persist. A `ListState` built fresh each frame starts at row
+    /// zero, and ratatui then scrolls the *minimum* needed to reveal the
+    /// selection -- which lands the selection on the last visible row every
+    /// time it is below the fold. The list would then follow the cursor rather
+    /// than the cursor moving through the list: walking up a long tree kept the
+    /// selected row pinned to the bottom edge and scrolled the whole tree past
+    /// it. Remembering where the viewport was leaves ratatui with nothing to do
+    /// until the selection actually reaches an edge, which is the behaviour
+    /// every list in every editor has.
+    pub(crate) list_offset: std::cell::Cell<usize>,
+    /// Which tab [`Self::list_offset`] belongs to. Another tab's scroll
+    /// position means nothing here, so switching tabs starts at the top and
+    /// lets the selection pull the viewport down to itself.
+    pub(crate) list_offset_tab: std::cell::Cell<usize>,
     pub(crate) global_env_scroll_w: std::cell::Cell<u16>,
     pub(crate) overlay: Option<Overlay>,
     /// Vertical scroll offset (rows) into the currently-open Help popup's
@@ -1392,6 +1417,8 @@ impl Default for TuiApp {
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
+            list_offset: std::cell::Cell::new(0),
+            list_offset_tab: std::cell::Cell::new(0),
             global_env_scroll_w: std::cell::Cell::new(0),
             overlay: None,
             help_scroll: 0,
@@ -2063,19 +2090,7 @@ impl TuiApp {
     /// file can't be read/parsed, or it holds no entry at that position (e.g. a
     /// never-saved request). The other entries and their edits are untouched.
     pub(crate) fn revert_request_to_saved(&mut self, ci: usize, ei: usize) -> Option<String> {
-        let path = self.collections.get(ci)?.path.clone()?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let mut disk = crate::postman::parse_collection(&content);
-        if ei >= disk.len() {
-            return None;
-        }
-        let entry = disk.swap_remove(ei);
-        let method = entry.method.clone();
-        let col = self.collections.get_mut(ci)?;
-        col.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
-        col.invalidate_request_json();
-        col.sync_folder_to_selected();
-        Some(method)
+        self.collections.get_mut(ci)?.revert_request(ei)
     }
 
     /// Discard a Global Environment's unsaved edits, restoring the last-saved

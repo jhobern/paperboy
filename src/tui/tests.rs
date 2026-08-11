@@ -100,6 +100,92 @@ fn mouse_click_visible_tab_activates_it_and_invalidates_hits() {
     assert!(!app.mouse_hit_valid.get());
 }
 
+/// Walking up a long list moves the cursor through the visible rows; the list
+/// itself only scrolls once the cursor reaches an edge.
+///
+/// The bug this pins: a `ListState` rebuilt each frame starts at row zero, so
+/// ratatui scrolled the minimum needed to reveal the selection and the selected
+/// row sat on the bottom edge the whole way up, the tree sliding past it.
+#[test]
+fn the_list_scrolls_only_when_the_cursor_reaches_an_edge() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://host{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    // Jump to the bottom, which necessarily scrolls the list.
+    app.collections[0].list_cursor = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let bottom = app.list_offset.get();
+    assert!(bottom > 0, "a selection past the fold scrolled the list");
+
+    // Now step up one row. The cursor moves inside the viewport; the viewport
+    // itself must not move.
+    app.collections[0].list_cursor = 58;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_offset.get(),
+        bottom,
+        "stepping up inside the panel does not scroll it"
+    );
+
+    // Keep going until the cursor reaches the top of the viewport -- only then
+    // does the list scroll again.
+    app.collections[0].list_cursor = bottom;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(app.list_offset.get(), bottom, "still at the top row");
+    app.collections[0].list_cursor = bottom - 1;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_offset.get(),
+        bottom - 1,
+        "past the top edge, the list scrolls by one"
+    );
+}
+
+/// Another tab's scroll position means nothing in this one, so a tab switch
+/// starts at the top rather than inheriting a viewport that has no relation to
+/// what is selected here.
+#[test]
+fn a_tab_switch_does_not_inherit_the_other_tabs_scroll() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://host{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    app.collections
+        .push(Collection::new("second".to_string(), Vec::new()));
+    app.collections[1].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://other{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    app.collections[0].list_cursor = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(app.list_offset.get() > 0);
+
+    app.active_tab = 1;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_offset.get(),
+        0,
+        "the second tab's selection is its first row, so it starts at the top"
+    );
+}
+
 #[test]
 fn mouse_selects_request_and_environment_rows() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -24662,6 +24748,133 @@ fn right_clicking_a_non_environment_row_does_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Right-clicking an *edited* request in the workspace tree offers to put it
+/// back the way it is on disk — the GUI hangs this on a context menu, which a
+/// terminal has no room for, so the gesture raises the same confirmation
+/// `Ctrl+R` does.
+#[test]
+fn right_clicking_an_edited_request_offers_to_revert_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_req");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let saved_url = app.collections[ci].entries[0].url.clone();
+    app.collections[ci].entries[0].url = "https://edited.example".to_string();
+    app.collections[ci].entries[0].modified = true;
+    let row = ws_row_pos(&app, ci, "the request", |r| {
+        matches!(r, crate::collection::WsRow::Request { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        matches!(
+            app.overlay,
+            Some(super::app::Overlay::Confirm {
+                action: super::app::ConfirmAction::RevertRequest(_, 0),
+                ..
+            })
+        ),
+        "the click asks before discarding anything"
+    );
+    // Confirm (the default is No, so move to Yes first).
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.collections[ci].entries[0].url, saved_url,
+        "the request is back to what the file holds"
+    );
+    assert!(!app.collections[ci].entries[0].modified);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same gesture on an edited collection *file* row drops every edit in
+/// that file, which is the only thing on offer for a file that isn't the loaded
+/// one (its edits are parked as a whole, with no per-request on-disk entry to
+/// put back).
+#[test]
+fn right_clicking_an_edited_collection_file_offers_to_revert_the_file() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_file");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let saved_url = app.collections[ci].entries[0].url.clone();
+    app.collections[ci].entries[0].url = "https://edited.example".to_string();
+    app.collections[ci].entries[0].modified = true;
+    let row = ws_row_pos(&app, ci, "alpha.hurl", |r| {
+        matches!(r, crate::collection::WsRow::Collection { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        matches!(
+            app.overlay,
+            Some(super::app::Overlay::Confirm {
+                action: super::app::ConfirmAction::RevertWorkspaceFile(..),
+                ..
+            })
+        ),
+        "the file row asks too"
+    );
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.collections[ci].entries[0].url, saved_url);
+    assert!(
+        !app.collections[ci].has_unsaved_edits(),
+        "the whole file is clean again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row with nothing to revert must not raise the dialog: right-click still
+/// belongs to whatever else wants it (an environment row activates, say).
+#[test]
+fn right_clicking_an_unedited_row_offers_no_revert() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_clean");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let row = ws_row_pos(&app, ci, "the request", |r| {
+        matches!(r, crate::collection::WsRow::Request { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        app.overlay.is_none(),
+        "an unedited request has nothing to revert"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── One state, two front-ends ───────────────────────────────────────────────
 
 /// The terminal UI used to keep its own copy of every shared setting, and its
@@ -27216,4 +27429,53 @@ fn ctrl_o_only_offers_to_open_an_export_that_still_describes_the_run() {
     // ones, so the offer to open it goes away with them.
     app.reports[idx].last_export = None;
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Saving an edited request in a Workspace tab leaves the selection on that
+/// request, rather than throwing it to the top of the tree.
+///
+/// The two lists index differently: a Workspace tab's `list_cursor` walks the
+/// file tree, an ordinary tab's walks the requests. Committing the wizard used
+/// to write a requests-list index into the workspace's cursor, so editing the
+/// first request of a file jumped the selection to the workspace's first row.
+#[test]
+fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("save_keeps_selection");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+
+    // Row 2 is alpha.hurl's only request, inlined under the file; the request
+    // is entry 0, so a requests-list index would land on row 0 instead.
+    let request_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Request { .. }))
+        .expect("the open file's request is inlined in the tree");
+    assert_ne!(
+        request_row, 0,
+        "the two indexes have to disagree to prove anything"
+    );
+    app.collections[ci].list_cursor = request_row;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+
+    // Enter opens the edit wizard on it; Ctrl+Enter commits.
+    press(&mut app, KeyCode::Enter);
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert_eq!(
+        app.collections[ci].list_cursor, request_row,
+        "the selection stays on the request that was just saved"
+    );
+    assert!(
+        matches!(
+            app.collections[ci]
+                .ws_rows()
+                .get(app.collections[ci].list_cursor),
+            Some(WsRow::Request { .. })
+        ),
+        "and that row is still a request, not a file or folder"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

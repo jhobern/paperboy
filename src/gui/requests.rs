@@ -354,6 +354,14 @@ enum WsAction {
         dir: PathBuf,
         kind: crate::workspace::NewItemKind,
     },
+    /// Discard a request's in-memory edits, restoring it from the collection's
+    /// on-disk file. Only offered for the loaded file's edited requests.
+    RevertRequest {
+        collection: PathBuf,
+        idx: usize,
+    },
+    /// Discard every in-memory edit to a workspace collection file.
+    RevertFile(PathBuf),
     /// Move a file or folder into another folder of the same workspace.
     MoveItem {
         src: PathBuf,
@@ -475,6 +483,10 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
             s.gui_ws_set_active_env,
         )
     };
+    let (lbl_revert_req, lbl_revert_file) = (
+        app.strings.gui_ws_revert_request,
+        app.strings.gui_ws_revert_file,
+    );
     let s_new = new_item_labels(&app.strings);
 
     let name = app.session.collections[ci].name.clone();
@@ -613,7 +625,25 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 open: *open,
                             });
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        // A file with edits only in memory can be put back to
+                        // what is on disk; a clean one has nothing to offer, so
+                        // the entry isn't shown at all rather than shown greyed.
+                        let edited_file = app.session.collections[ci].workspace_file_edited(path);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                if !edited_file {
+                                    return None;
+                                }
+                                let hit = ui.button(lbl_revert_file).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::RevertFile(path.clone()))
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
                     WsRow::Request {
@@ -702,12 +732,35 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 loaded: *loaded,
                             });
                         }
-                        ws_row_menu(
+                        // Only the loaded file's requests can be reverted one
+                        // at a time: another file's edits are parked as a whole,
+                        // with no on-disk entry to put back in place of a single
+                        // one of them (its file row reverts the lot). An *added*
+                        // request has no saved version either, so `modified` is
+                        // the test, not the pencil.
+                        let revertable = *loaded
+                            && loaded_path.as_deref() == Some(collection.as_path())
+                            && app.session.collections[ci]
+                                .entries
+                                .get(*idx)
+                                .is_some_and(|e| e.modified);
+                        ws_row_menu_with(
                             &resp,
                             sibling_dir(collection),
                             lbl_in_folder,
                             s_new,
                             &mut actions,
+                            |ui| {
+                                if !revertable {
+                                    return None;
+                                }
+                                let hit = ui.button(lbl_revert_req).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::RevertRequest {
+                                    collection: collection.clone(),
+                                    idx: *idx,
+                                })
+                            },
                         );
                     }
                     WsRow::Report { path, name, depth } => {
@@ -1186,9 +1239,43 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         }
         // Opening or closing a folder isn't "working on" anything; a new or
         // moved file records itself once it is actually there.
-        WsAction::ToggleFolder(_) | WsAction::NewItem { .. } | WsAction::MoveItem { .. } => {}
+        // A revert isn't "working on" the file either — it undoes work — and
+        // the dialog it raises names its own target.
+        WsAction::ToggleFolder(_)
+        | WsAction::NewItem { .. }
+        | WsAction::MoveItem { .. }
+        | WsAction::RevertRequest { .. }
+        | WsAction::RevertFile(_) => {}
     }
     match action {
+        WsAction::RevertRequest { collection, idx } => {
+            let name = app.session.collections[ci]
+                .entries
+                .get(idx)
+                .map(|e| {
+                    let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                    if leaf.is_empty() { e.url.clone() } else { leaf }
+                })
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::RevertToSaved {
+                ci,
+                path: collection,
+                entry: Some(idx),
+                name,
+            });
+        }
+        WsAction::RevertFile(path) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::RevertToSaved {
+                ci,
+                path,
+                entry: None,
+                name,
+            });
+        }
         WsAction::ToggleFolder(p) => {
             let col = &mut app.session.collections[ci];
             if col.workspace_expanded.contains(&p) {

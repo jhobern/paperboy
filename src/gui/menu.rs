@@ -565,6 +565,65 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         }
         Dialog::WorkspaceReload { ci, reload } => workspace_reload_dialog(app, ctx, ci, *reload),
         Dialog::ExportResults { path } => export_results_dialog(app, ctx, path),
+        Dialog::RevertToSaved {
+            ci,
+            path,
+            entry,
+            name,
+        } => revert_to_saved_dialog(app, ctx, ci, path, entry, name),
+    }
+}
+
+/// Confirm discarding a request's (or a whole workspace file's) in-memory edits
+/// in favour of what is on disk. Cancelling re-arms the dialog, like every
+/// other destructive confirmation here, so a click outside can't lose an edit.
+fn revert_to_saved_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    path: std::path::PathBuf,
+    entry: Option<usize>,
+    name: String,
+) {
+    let title = app.strings.gui_revert_title;
+    let (go, cancel, question) = (
+        app.strings.gui_revert_go,
+        app.strings.gui_cancel,
+        match entry {
+            Some(_) => app.strings.confirm_revert_request_q.replace("{r}", &name),
+            None => app.strings.confirm_revert_file_q.replace("{f}", &name),
+        },
+    );
+    let mut decided = false;
+    let _ = modal(ctx, title, |ui| {
+        ui.label(question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                match entry {
+                    Some(ei) => {
+                        app.session.collections[ci].revert_request(ei);
+                    }
+                    None => {
+                        let _ = app.session.collections[ci].revert_workspace_file(&path);
+                    }
+                }
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    });
+    if !decided {
+        app.dialog = Some(Dialog::RevertToSaved {
+            ci,
+            path,
+            entry,
+            name,
+        });
+    } else {
+        app.session.save();
     }
 }
 

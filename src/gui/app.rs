@@ -79,6 +79,15 @@ pub enum Dialog {
         ci: usize,
         reload: Box<crate::persistence::PendingWorkspaceReload>,
     },
+    /// Throw away in-memory edits and go back to what is on disk. `entry` is
+    /// `Some(idx)` for one request of the loaded file, `None` for the whole
+    /// file. Confirmed because a revert has no undo.
+    RevertToSaved {
+        ci: usize,
+        path: std::path::PathBuf,
+        entry: Option<usize>,
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

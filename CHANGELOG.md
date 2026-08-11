@@ -909,7 +909,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   panel geometry, and `--gui` on a build without the feature prints the command
   to install one that has it rather than failing to parse the flag.
 
+### Added
+
+- **Revert a workspace file, or one request, from the tree.** Right-clicking a
+  row that carries the "edited" pencil offers to put it back the way it is on
+  disk: a request row reverts that request, a collection file row reverts every
+  edit in the file — including one edited and then switched away from, whose
+  changes were until now only reachable by reopening it. The GUI hangs this on
+  the row's context menu; a terminal has nowhere to put one, so the gesture
+  raises the same confirmation `Ctrl+R` does. A clean row offers nothing rather
+  than a greyed-out entry.
+
 ### Fixed
+
+- **The workspace tree scrolled with the cursor instead of the cursor moving
+  through the tree.** Walking up a long tree kept the selected row pinned to the
+  bottom edge of the panel while everything else slid past it. The list's scroll
+  position now persists between frames, so the cursor travels through the
+  visible rows and the tree only scrolls once the cursor reaches an edge — what
+  every other list does. Switching tabs still starts at the top: another tree's
+  scroll position means nothing in this one.
+
+- **Saving an edited request threw the workspace selection to the top.** The two
+  lists index differently — a Workspace tab's cursor walks the file tree, an
+  ordinary tab's walks the requests — and committing the request wizard wrote a
+  requests-list index into the workspace's cursor. The selection now stays on
+  the request that was just saved.
 
 - **A workspace report wouldn't run from the tree.** With a report showing in
   the right pane, `r` and `d` did nothing unless focus had first been moved

@@ -672,6 +672,55 @@ impl Collection {
         entries.get(idx).is_some_and(|e| e.user_added || e.modified)
     }
 
+    /// Discard request `ei`'s in-memory edits by reloading that single entry,
+    /// from the same position, out of this collection's on-disk file (#19).
+    ///
+    /// Returns the reverted request's HTTP method on success, or `None` when
+    /// there's nothing to revert to — the collection has no file (scratch), the
+    /// file can't be read/parsed, or it holds no entry at that position (e.g. a
+    /// never-saved request). The other entries and their edits are untouched.
+    pub fn revert_request(&mut self, ei: usize) -> Option<String> {
+        let path = self.path.clone()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut disk = crate::postman::parse_collection(&content);
+        if ei >= disk.len() || ei >= self.entries.len() {
+            return None;
+        }
+        let entry = disk.swap_remove(ei);
+        let method = entry.method.clone();
+        self.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        Some(method)
+    }
+
+    /// Throw away every in-memory edit to the workspace collection file at
+    /// `path`, so the tab shows exactly what is on disk again.
+    ///
+    /// Works whether or not `path` is the file this tab currently has loaded:
+    /// an edited file switched away from lives on in `workspace_pending`, and
+    /// its requests are what the tree lists for it, so both places have to be
+    /// dropped or the edits would come back the moment it was reopened. Errors
+    /// if the file can't be re-read, and changes nothing in that case.
+    pub fn revert_workspace_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let entries = crate::postman::parse_collection(&std::fs::read_to_string(path)?);
+        self.workspace_pending.remove(path);
+        if self.path.as_deref() == Some(path) {
+            let sel = self.selected_entry;
+            self.entries = entries;
+            self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
+            self.invalidate_request_json();
+            self.sync_folder_to_selected();
+        } else {
+            // Not loaded: the tree lists it from the title cache, which was
+            // snapshotted off the edited entries. Re-snapshot from disk so the
+            // row names match the file again.
+            let names = entries.iter().map(ws_request_label).collect();
+            self.workspace_titles.insert(path.to_path_buf(), names);
+        }
+        Ok(())
+    }
+
     /// Clear this collection's "new"/"edited" request markers, and drop any
     /// parked edits for its file — called whenever its `.hurl` is written to
     /// disk (local Save or git push) so every save path agrees on what "saved"
@@ -806,7 +855,25 @@ impl Collection {
     /// changed programmatically (as opposed to normal Up/Down/Enter list
     /// navigation, which keeps the two in sync itself) — e.g. after adding,
     /// deleting, or renaming a request, or restoring persisted state.
+    /// A Workspace tab's `list_cursor` indexes the file tree
+    /// ([`Self::ws_rows`]), not the request list, so the row it wants is the
+    /// one [`Self::sync_ws_cursor`] computes. Writing a request-list index
+    /// into it here would point at an unrelated file (usually the top of the
+    /// tree), which is what saving an edited request used to do: commit the
+    /// wizard, and the selection left the request and jumped to the first row
+    /// of the workspace.
     pub fn sync_folder_to_selected(&mut self) {
+        if self.is_workspace() {
+            let idx = self
+                .selected_entry
+                .min(self.entries.len().saturating_sub(1));
+            self.selected_entry = idx;
+            if !self.entries.is_empty() {
+                self.folder = tree::folder_of(&self.entries, idx);
+            }
+            self.sync_ws_cursor();
+            return;
+        }
         if self.entries.is_empty() {
             self.folder = Vec::new();
             self.list_cursor = 0;
@@ -959,6 +1026,100 @@ mod ws_scan_tests {
             "no wait for the scan window: the filter isn't cached"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_revert_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A file edited and then switched away from keeps its edits in
+    /// `workspace_pending`, and the tree lists its requests from the title
+    /// cache snapshotted off those same edited entries. Reverting it has to
+    /// clear both, or reopening the file would bring the edits back and the
+    /// tree would go on showing the edited names in the meantime.
+    #[test]
+    fn reverting_a_file_that_isnt_loaded_drops_its_parked_edits() {
+        let root = tmp_root("parked");
+        let a = root.join("a.hurl");
+        let b = root.join("b.hurl");
+        fs::write(&a, "GET https://example.com/a\n").unwrap();
+        fs::write(&b, "GET https://example.com/b\n").unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+
+        col.load_workspace_file(a.clone()).unwrap();
+        col.entries[0].url = "https://edited.example".into();
+        col.entries[0].modified = true;
+        // Switching away parks the edits and caches the edited row names.
+        col.load_workspace_file(b.clone()).unwrap();
+        assert!(col.workspace_file_edited(&a), "the edits are parked");
+
+        col.revert_workspace_file(&a).unwrap();
+
+        assert!(!col.workspace_file_edited(&a), "and now they are gone");
+        col.load_workspace_file(a.clone()).unwrap();
+        assert_eq!(
+            col.entries[0].url, "https://example.com/a",
+            "reopening the file shows what is on disk, not the discarded edit"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Reverting the loaded file leaves the tab showing it — same file, same
+    /// request selected — with the edits gone.
+    #[test]
+    fn reverting_the_loaded_file_restores_it_in_place() {
+        let root = tmp_root("loaded");
+        let a = root.join("a.hurl");
+        fs::write(
+            &a,
+            "GET https://example.com/a\nGET https://example.com/a2\n",
+        )
+        .unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+        col.load_workspace_file(a.clone()).unwrap();
+        col.selected_entry = 1;
+        col.entries[1].url = "https://edited.example".into();
+        col.entries[1].modified = true;
+
+        col.revert_workspace_file(&a).unwrap();
+
+        assert_eq!(col.path.as_deref(), Some(a.as_path()));
+        assert_eq!(col.selected_entry, 1, "the selection stays where it was");
+        assert_eq!(col.entries[1].url, "https://example.com/a2");
+        assert!(!col.has_unsaved_edits());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A file that has vanished can't be reverted to — and the attempt must
+    /// leave the in-memory edits alone rather than half-clearing them.
+    #[test]
+    fn reverting_an_unreadable_file_changes_nothing() {
+        let root = tmp_root("missing");
+        let a = root.join("a.hurl");
+        fs::write(&a, "GET https://example.com/a\n").unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+        col.load_workspace_file(a.clone()).unwrap();
+        col.entries[0].url = "https://edited.example".into();
+        col.entries[0].modified = true;
+        fs::remove_file(&a).unwrap();
+
+        assert!(col.revert_workspace_file(&a).is_err());
+        assert_eq!(col.entries[0].url, "https://edited.example");
+        assert!(col.has_unsaved_edits());
         let _ = fs::remove_dir_all(&root);
     }
 }
