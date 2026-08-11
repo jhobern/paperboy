@@ -532,6 +532,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   and shifting the list under the cursor. The GUI already carried this in its
   status bar.
 
+- **A picture column in the HTML report is sized to the picture.** It was sized
+  to the text behind the picture — the path (or the base64 blob) the image was
+  resolved from — so a column drawing a 60-pixel thumbnail claimed seventy
+  characters of width and pushed the columns that carry the answers off the
+  screen. It is now measured from the thumbnail the `IMAGE` clause asks for.
+
+- **A wide report is fitted rather than left to sprawl.** Thirty columns each as
+  wide as their longest value make a table that is read by scrolling past a lot
+  of padding. The columns are now fitted to a budget by taking the width back
+  from the widest first, down to a floor a wrapped cell is still readable in;
+  every column that was already narrow keeps exactly the width it measured, and
+  a table that fits is left untouched.
+
+- **"Comparison matched baseline" is no longer green.** A match says the answer
+  did not change, which is neither good nor bad on its own — a row that has been
+  wrong since the first run matches its baseline perfectly, and tinting that
+  green reported a good run where nothing had happened. The `Result` column now
+  tints only its unusual values (no baseline, no candidate, a real difference).
+  Whether an answer is *right* is the `Correct` column's job, and whether it
+  *improved* is `Trend`'s.
+
 - **The HTML report's drill-down is no longer mostly gaps.** Each section in an
   expanded row claimed an equal share of the row's width, so on a wide screen a
   picture and a short JSON blob were shoved to opposite ends with a void

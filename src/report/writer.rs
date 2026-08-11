@@ -1492,6 +1492,27 @@ const HTML_MAX_COL_WIDTH: usize = 70;
 /// column rather than a sliver.
 const HTML_MIN_COL_WIDTH: usize = 6;
 
+/// Roughly how many pixels a `ch` is at the table's font size. Only ever used
+/// to turn a picture's pixel width into the same units the other columns are
+/// measured in, so an approximation is the right kind of answer.
+const HTML_PX_PER_CH: f64 = 8.0;
+
+/// How wide a `FIT` image column is made. `FIT` sizes the picture to the cell,
+/// so the cell has to be given a size from somewhere, and its text (a path, or
+/// a base64 blob) is never shown.
+const HTML_FIT_IMAGE_WIDTH: usize = 24;
+
+/// The width every column together should try to fit into, in `ch`, before the
+/// wide ones start being asked to give some back. Around a wide screen's worth:
+/// a table wider than this is read by scrolling whatever is done, and the
+/// scrolling is much less work when it isn't dragging half a page of padding
+/// behind each column.
+const HTML_TOTAL_WIDTH_BUDGET: usize = 240;
+
+/// No column is squeezed below this while fitting to the budget — narrower and
+/// a wrapped cell turns into a column of single words.
+const HTML_SHRINK_FLOOR: usize = 16;
+
 /// Per-column `<colgroup>` widths for the HTML export, in `ch`.
 ///
 /// Without them the browser's automatic table layout distributes the width it
@@ -1501,10 +1522,77 @@ const HTML_MIN_COL_WIDTH: usize = 6;
 /// it. That is the same failure the xlsx export had before it was sized to its
 /// content, so it is fixed the same way and off the same measurement.
 fn html_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<usize> {
-    measured_column_widths(columns, result)
+    let mut widths: Vec<usize> = measured_column_widths(columns, result)
         .into_iter()
         .map(|w| w.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
-        .collect()
+        .collect();
+    // A picture column is sized by the picture, not by the text behind it: the
+    // cell draws a thumbnail, while the value it was resolved from is a long
+    // path (or a base64 blob), which was buying a 70ch column to hold a 60px
+    // stamp and pushing every other column off the screen.
+    for (ci, c) in columns.iter().enumerate() {
+        if let Some(w) = image_column_width(c, result) {
+            widths[ci] = w;
+        }
+    }
+    fit_to_budget(widths)
+}
+
+/// The width to give `column` if it shows pictures, in `ch`; `None` for an
+/// ordinary column.
+fn image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<usize> {
+    let spec = column.image?;
+    let widest = result
+        .images
+        .iter()
+        .filter(|((_, header), _)| header == &column.header)
+        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
+        .fold(0.0_f64, f64::max);
+    if widest <= 0.0 {
+        // Either a `FIT` column (no fixed box) or one whose pictures all failed
+        // to resolve; both want a modest column rather than one sized to text
+        // that is never drawn.
+        return result
+            .images
+            .keys()
+            .any(|(_, header)| header == &column.header)
+            .then_some(HTML_FIT_IMAGE_WIDTH);
+    }
+    // A little more than the picture: the cell has padding, and a column cut to
+    // the pixel puts a scrollbar's worth of nothing between neighbours.
+    let ch = (widest / HTML_PX_PER_CH).ceil() as usize + 2;
+    Some(ch.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
+}
+
+/// Bring the total width down towards [`HTML_TOTAL_WIDTH_BUDGET`] by taking it
+/// from the widest columns first.
+///
+/// A report with thirty columns is not helped by each of them being as wide as
+/// its longest value: the narrow ones are already right, and it is the two or
+/// three carrying a path or a JSON body that put the rest over the horizon. So
+/// a ceiling is found — the highest one that fits the budget — and only the
+/// columns above it are cut, down to a floor a wrapped cell can still be read
+/// in. Everything narrower keeps exactly the width it measured.
+fn fit_to_budget(mut widths: Vec<usize>) -> Vec<usize> {
+    let total: usize = widths.iter().sum();
+    if total <= HTML_TOTAL_WIDTH_BUDGET || widths.is_empty() {
+        return widths;
+    }
+    let mut low = HTML_SHRINK_FLOOR;
+    let mut high = widths.iter().copied().max().unwrap_or(low).max(low);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let sum: usize = widths.iter().map(|w| (*w).min(mid)).sum();
+        if sum <= HTML_TOTAL_WIDTH_BUDGET {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    for w in widths.iter_mut() {
+        *w = (*w).min(low);
+    }
+    widths
 }
 
 /// The colour tint for a cell of a *run*, which is [`cell_tint`] with ground
@@ -1567,13 +1655,20 @@ fn cell_tint(header: &str, value: &str) -> Option<Tint> {
     }
     // The comparison Result column has known verdicts; anything else non-empty
     // there is a diff listing (a real difference) → amber.
+    //
+    // A match is *not* green. "Comparison matched baseline" says the answer did
+    // not change, which is neither good nor bad on its own: a row that has been
+    // wrong all along matches its baseline perfectly, and painting that green
+    // says the run went well when it went nowhere. Whether an answer is right
+    // is the `Correct` column's business, and whether it improved is `Trend`'s;
+    // this column only reports movement, so only its unusual values are tinted.
     if header == RESULT_COLUMN {
-        return Some(match v {
-            MATCH => Tint::Green,
-            NO_BASELINE => Tint::Amber,
-            NO_CANDIDATE => Tint::Red,
-            _ => Tint::Amber,
-        });
+        return match v {
+            MATCH => None,
+            NO_BASELINE => Some(Tint::Amber),
+            NO_CANDIDATE => Some(Tint::Red),
+            _ => Some(Tint::Amber),
+        };
     }
     let lower = v.to_ascii_lowercase();
     match lower.as_str() {
@@ -2777,7 +2872,9 @@ mod tests {
         assert!(matches!(cell_tint("Status", "changed"), Some(Tint::Amber)));
         assert!(matches!(cell_tint("HttpStatus", "200"), Some(Tint::Green)));
         assert!(matches!(cell_tint("HttpStatus", "503"), Some(Tint::Red)));
-        assert!(matches!(cell_tint("Result", MATCH), Some(Tint::Green)));
+        // A match is plain: "nothing changed" is not an achievement, and a row
+        // that has been wrong since the first run matches its baseline exactly.
+        assert!(cell_tint("Result", MATCH).is_none());
         assert!(matches!(cell_tint("Result", NO_CANDIDATE), Some(Tint::Red)));
         assert!(matches!(
             cell_tint("Result", "status: a≠b"),
@@ -2785,6 +2882,70 @@ mod tests {
         ));
         assert!(cell_tint("Name", "anything.jpg").is_none());
         assert!(cell_tint("Status", "  ").is_none());
+    }
+
+    /// A picture column is sized by the picture. Its cell value is the path (or
+    /// the blob) the picture was resolved from, which was buying a 70ch column
+    /// to hold a 60px stamp and pushing the columns that matter off the screen.
+    #[test]
+    fn a_picture_column_is_sized_to_the_picture_not_to_its_path() {
+        let (mut res, header) = image_result();
+        // A path as long as the ones a real run produces.
+        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+
+        let widths = html_column_widths(&res.resolved_columns(&header), &res);
+        let ci = res
+            .resolved_columns(&header)
+            .iter()
+            .position(|c| c.header == "Frame")
+            .expect("the picture column");
+        assert!(
+            widths[ci] < long.len() / 2,
+            "sized to the thumbnail, not the path: {}ch",
+            widths[ci]
+        );
+    }
+
+    /// Thirty columns each as wide as their longest value is a table read by
+    /// scrolling past a lot of padding. The widest give width back first; the
+    /// narrow ones, which were already right, keep what they measured.
+    #[test]
+    fn many_columns_are_fitted_by_taking_from_the_widest() {
+        let unfitted = vec![
+            8,
+            9,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+        ];
+        let fitted = fit_to_budget(unfitted.clone());
+        assert!(
+            fitted.iter().sum::<usize>() <= HTML_TOTAL_WIDTH_BUDGET,
+            "fitted to the budget: {fitted:?}"
+        );
+        assert_eq!(
+            (fitted[0], fitted[1]),
+            (8, 9),
+            "the narrow columns are untouched: {fitted:?}"
+        );
+        assert!(
+            fitted[2..].iter().all(|w| *w >= HTML_SHRINK_FLOOR),
+            "and nothing that was wide is squeezed into single words: {fitted:?}"
+        );
+    }
+
+    /// A table that already fits is left exactly as measured — the budget is a
+    /// ceiling, not a target to stretch or shrink towards.
+    #[test]
+    fn a_narrow_table_is_left_alone() {
+        let widths = vec![10, 12, 30];
+        assert_eq!(fit_to_budget(widths.clone()), widths);
     }
 
     /// A `DETAIL` column leaves the grid for the drill-down panel -- but only
