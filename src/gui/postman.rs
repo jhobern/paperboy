@@ -77,15 +77,19 @@ impl Wizard {
 
     /// Fill a blank destination in from the chosen workspace's name — a
     /// suggestion, never an override.
-    fn suggest_dest(&mut self) {
+    /// `base` is where the last import landed, if there was one; imports are
+    /// collected somewhere deliberate, so last time's folder beats any default.
+    fn suggest_dest(&mut self, base: Option<&std::path::Path>) {
         if self.dest_touched && !self.flow.dest.trim().is_empty() {
             return;
         }
         // The working directory of a desktop app is wherever the launcher
         // happened to start it, which is rarely somewhere a user wants files;
         // the home directory is at least predictable.
-        let base = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
+        let base = base
+            .filter(|p| p.is_dir())
+            .map(std::path::Path::to_owned)
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         self.flow.dest = base
@@ -113,6 +117,10 @@ impl Wizard {
 fn finish_import(app: &mut GuiApp, summary: ImportSummary) {
     // Only one status line fits, so the more actionable of the two wins:
     // missing data beats a note about data deliberately dropped.
+    if let Some(parent) = summary.dest.parent() {
+        app.session
+            .remember_picker_dir(crate::session::PickerKind::Import, parent);
+    }
     if !summary.failures.is_empty() {
         app.session.status = Some(Status::PostmanSkipped(summary.failures.len()));
     } else if summary.converted_with_notes {
@@ -182,6 +190,10 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         err: app.theme.err,
     };
     let mut action = UiAction::None;
+    let import_base = app
+        .session
+        .picker_dir(crate::session::PickerKind::Import)
+        .map(std::path::Path::to_owned);
     let strings = &app.strings;
     egui::Window::new(strings.postman_title)
         .collapsible(false)
@@ -201,12 +213,12 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         UiAction::Connect => {
             w.flow.submit_connect(&app.strings);
             if matches!(w.flow.step(), Step::Options) {
-                w.suggest_dest();
+                w.suggest_dest(import_base.as_deref());
             }
         }
         UiAction::PickWorkspace => {
             if w.flow.submit_workspace() {
-                w.suggest_dest();
+                w.suggest_dest(import_base.as_deref());
             }
         }
         UiAction::StartPlanning => {
@@ -619,7 +631,7 @@ mod tests {
     fn the_destination_is_suggested_from_the_workspace_until_the_user_says_otherwise() {
         let mut w = wizard();
         w.flow.seed_chosen(a_workspace("Alpha Team", "ws-a"));
-        w.suggest_dest();
+        w.suggest_dest(None);
         assert!(
             w.flow.dest.ends_with("Alpha Team"),
             "the folder is named after the workspace, got {:?}",
@@ -630,7 +642,7 @@ mod tests {
         w.dest_touched = true;
         w.flow.dest = "/somewhere/mine".to_string();
         w.flow.seed_chosen(a_workspace("Beta", "ws-b"));
-        w.suggest_dest();
+        w.suggest_dest(None);
         assert_eq!(w.flow.dest, "/somewhere/mine");
     }
 
@@ -642,7 +654,7 @@ mod tests {
         w.dest_touched = true;
         w.flow.dest = "   ".to_string();
         w.flow.seed_chosen(a_workspace("Gamma", "ws-g"));
-        w.suggest_dest();
+        w.suggest_dest(None);
         assert!(w.flow.dest.ends_with("Gamma"));
     }
 

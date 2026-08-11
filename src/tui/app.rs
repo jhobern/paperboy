@@ -3642,6 +3642,9 @@ impl TuiApp {
     /// [`crate::postman_flow`]; this maps keys onto it and drives the editors.
     pub(crate) fn on_key_postman(&mut self, mut w: Box<PostmanWizard>, key: KeyEvent) {
         let s = Strings::for_language(&self.language);
+        let import_base = self
+            .picker_dir(crate::session::PickerKind::Import)
+            .map(std::path::Path::to_owned);
         w.remember_step();
         match w.stage() {
             PostmanStage::Connect => match key.code {
@@ -3654,7 +3657,7 @@ impl TuiApp {
                     // A typed workspace id skips the listing and lands straight
                     // on the options, which want a suggested destination.
                     if matches!(w.flow.step(), Step::Options) {
-                        w.suggest_dest();
+                        w.suggest_dest(import_base.as_deref());
                     }
                 }
                 _ => {
@@ -3684,7 +3687,7 @@ impl TuiApp {
                     KeyCode::Down if w.flow.selected + 1 < n => w.flow.selected += 1,
                     KeyCode::Enter => {
                         if w.flow.submit_workspace() {
-                            w.suggest_dest();
+                            w.suggest_dest(import_base.as_deref());
                         }
                     }
                     KeyCode::Backspace => {
@@ -3719,6 +3722,12 @@ impl TuiApp {
                     // Space toggles the row under the cursor, but only where a
                     // row *is* a toggle — on the path field it must still type.
                     KeyCode::Char(' ') if !on_dest => toggle_option_row(&mut w),
+                    // Left/Right change the value on the row, as they do
+                    // everywhere else in the app that offers a choice between
+                    // two settings — the format row in particular reads as a
+                    // pair of options laid out side by side, so pointing at
+                    // one of them has to select it.
+                    KeyCode::Left | KeyCode::Right if !on_dest => toggle_option_row(&mut w),
                     KeyCode::Enter => {
                         if w.option_row == OPTION_ROWS - 1 {
                             w.sync_fields();
@@ -3781,7 +3790,8 @@ impl TuiApp {
         let Some(mut w) = self.parked_postman.take() else {
             return;
         };
-        self.last_browse_dir = Some(dir.clone());
+        self.remember_picker_dir(crate::session::PickerKind::Import, &dir);
+        self.save_state();
         // The browser refuses to commit a blank name, so this always names a
         // subfolder of the chosen parent — the import creates it, exactly as
         // the workspace save does.
@@ -3795,6 +3805,12 @@ impl TuiApp {
             return;
         };
         let s = Strings::for_language(&self.language);
+        // Tracked every tick, not just on a keypress: a download runs with
+        // nobody touching the keyboard, so a failure during it used to be
+        // blamed on the *confirmation* — the last screen a key was pressed on —
+        // and dismissing it offered "start the import" again, straight back
+        // into the same wall. The step being interrupted is the one on screen.
+        w.remember_step();
         let event = w.flow.poll(&s);
         self.overlay = Some(Overlay::PostmanImport(w));
         if let Some(PostmanEvent::Imported(summary)) = event {

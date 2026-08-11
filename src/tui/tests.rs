@@ -2653,6 +2653,21 @@ fn last_env_dir_survives_persistence() {
     assert_eq!(restored.last_env_dir, Some(PathBuf::from("/env/dir")));
 }
 
+/// The folder imports are collected in outlives the session — the point is that
+/// workspaces downloaded weeks apart still end up side by side.
+#[test]
+fn last_import_dir_survives_persistence() {
+    let app = app_with(|a| {
+        a.last_import_dir = Some(PathBuf::from("/import/dir"));
+    });
+    let snapshot = app.to_persisted();
+    assert_eq!(snapshot.last_import_dir.as_deref(), Some("/import/dir"));
+
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.last_import_dir, Some(PathBuf::from("/import/dir")));
+}
+
 #[test]
 fn loading_an_env_file_as_a_collection_is_rejected() {
     let dir = temp_dir("wrongcol");
@@ -25146,6 +25161,122 @@ fn dismissing_a_bad_key_returns_to_the_key_prompt() {
         "PMAK-wrong",
         "the key is kept, to be corrected"
     );
+}
+
+/// Imported workspaces are collected somewhere deliberate — a folder of
+/// downloads — so the second import offers the first one's folder rather than
+/// wherever the app happened to be started from (which was landing them inside
+/// whatever repository the terminal was sitting in).
+#[test]
+fn the_next_import_lands_next_to_the_last_one() {
+    let dir = std::env::temp_dir().join("pb-postman-import-home");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+
+    // First import: the folder is chosen in the browser.
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    let w = take_overlay!(app, Overlay::PostmanImport(w) => w).unwrap();
+    app.parked_postman = Some(w);
+    app.finish_postman_dest(dir.clone(), "Alpha".to_string());
+    assert_eq!(app.last_import_dir.as_deref(), Some(dir.as_path()));
+    app.overlay = None;
+
+    // Second import: the destination is suggested there.
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![a_workspace("Beta", "ws-b")]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(postman_wizard(&mut app).dest, dir.join("Beta"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A download that stopped because the folder was already occupied is a folder
+/// mistake, not a wizard mistake: dismissing it lands back on the options, with
+/// the destination still filled in, so the folder can be changed and the import
+/// started again without retyping the key.
+#[test]
+fn a_full_destination_sends_you_back_to_pick_another_one() {
+    let dir = std::env::temp_dir().join("pb-postman-full-dest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.set_dest(dir.join("Alpha"));
+        w.flow.seed_step(PostmanStep::Downloading);
+    }
+    // A tick with the download on screen: this is what records the step the
+    // failure interrupts, since nobody presses a key while it runs.
+    app.poll_postman_updates();
+    postman_wizard(&mut app)
+        .flow
+        .fail(format!("{} already exists and is not empty", dir.display()));
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Error);
+
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(
+        w.dest,
+        dir.join("Alpha"),
+        "the choice is kept, to be edited"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Left/Right change the value on an options row, the way they do on every
+/// other two-way choice in the app. The format row draws its two options side
+/// by side, so an arrow pointed at one of them has to select it.
+#[test]
+fn arrows_change_the_option_under_the_cursor() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.option_row = 3; // the format row
+    }
+    let before = postman_wizard(&mut app).flow.format;
+
+    press(&mut app, KeyCode::Right);
+    let after = postman_wizard(&mut app).flow.format;
+    assert_ne!(after, before, "Right picked the other format");
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        postman_wizard(&mut app).flow.format,
+        before,
+        "Left picked it back"
+    );
+}
+
+/// The destination row is a path being typed into; arrows there move the
+/// cursor, they do not flip a setting.
+#[test]
+fn arrows_on_the_destination_row_do_not_toggle_anything() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.option_row = 0;
+    }
+    let before = postman_wizard(&mut app).flow.include_collections;
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(postman_wizard(&mut app).flow.include_collections, before);
 }
 
 /// The confirmation screen has no fields to move between and no connection left

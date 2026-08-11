@@ -508,6 +508,10 @@ pub struct PersistedState {
     /// picker can reopen there independently of other file loads.
     #[serde(default)]
     pub last_env_dir: Option<String>,
+    /// Last folder a Postman import was written into, so the next import
+    /// suggests the same place and downloaded workspaces stay together.
+    #[serde(default)]
+    pub last_import_dir: Option<String>,
     /// Ask for confirmation before quitting the app.
     #[serde(default = "yes")]
     pub confirm_on_exit: bool,
@@ -590,6 +594,7 @@ impl Default for PersistedState {
             active_tab: 0,
             last_browse_dir: None,
             last_env_dir: None,
+            last_import_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             confirm_on_delete_env: true,

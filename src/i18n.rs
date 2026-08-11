@@ -1161,7 +1161,7 @@ strings! {
     postman_browse => "[Enter to choose…]", "[Entrée pour choisir…]", "[Enter for at vælge…]";
     postman_dest_folder => "Import into", "Importer dans", "Importér til";
     postman_options_hint_dest => "Tab move · Enter choose folder · Esc back", "Tab naviguer · Entrée choisir le dossier · Échap retour", "Tab flyt · Enter vælg mappe · Esc tilbage";
-    postman_options_hint_toggle => "Tab move · Space/Enter toggle · Esc back", "Tab naviguer · Espace/Entrée basculer · Échap retour", "Tab flyt · Mellemrum/Enter skift · Esc tilbage";
+    postman_options_hint_toggle => "Tab move · ←/→/Space change · Esc back", "Tab naviguer · ←/→/Espace changer · Échap retour", "Tab flyt · ←/→/Mellemrum skift · Esc tilbage";
     postman_options_hint_import => "Tab move · Enter import · Esc back", "Tab naviguer · Entrée importer · Échap retour", "Tab flyt · Enter importér · Esc tilbage";
     postman_format_label => "Format", "Format", "Format";
     postman_format_raw => "Postman JSON (keeps everything)", "JSON Postman (conserve tout)", "Postman-JSON (bevarer alt)";
@@ -1170,7 +1170,7 @@ strings! {
     postman_overwrite => "Replace the folder if it already exists", "Remplacer le dossier s'il existe déjà", "Erstat mappen hvis den allerede findes";
     postman_confirm_title => "Ready to import", "Prêt à importer", "Klar til at importere";
     postman_error_hint => "Press Esc to go back and try again", "Appuyez sur Échap pour revenir et réessayer", "Tryk på Esc for at gå tilbage og prøve igen";
-    postman_confirm_hint => "Enter import · Esc cancel", "Entrée importer · Échap annuler", "Enter importér · Esc annuller";
+    postman_confirm_hint => "Press Enter to start the download · Esc cancel", "Appuyez sur Entrée pour lancer le téléchargement · Échap annuler", "Tryk på Enter for at starte overførslen · Esc annuller";
     postman_rate_limit_note => "Postman limits how fast its API may be called, so this is paced deliberately.", "Postman limite la vitesse d'appel de son API : le rythme est donc volontairement mesuré.", "Postman begrænser hvor hurtigt dets API må kaldes, så tempoet er bevidst afmålt.";
     postman_estimate => "About", "Environ", "Cirka";
     postman_budget_warning => "This would use a large share of this account's remaining monthly API budget.", "Cela consommerait une grande partie du budget d'API mensuel restant de ce compte.", "Dette ville bruge en stor del af kontoens resterende månedlige API-budget.";

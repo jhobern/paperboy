@@ -502,6 +502,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **An import lands next to the last one.** The Postman importer suggested a
+  folder inside the app's working directory — which, for anyone starting the
+  terminal UI from a project, meant downloaded workspaces landing inside that
+  repository. It now remembers the folder each import was written into and
+  suggests it for the next one (the GUI too, which was defaulting to the home
+  directory), so a shelf of downloaded workspaces stays a shelf. The choice is
+  kept with the rest of the session state, so it survives a restart.
+
+- **The confirmation screen asks for the key it wants.** "Enter import · Esc
+  cancel" sat in the dim footer style used for status text, so the last screen
+  before a long download read as though the download were already happening.
+  It now says **"Press Enter to start the download"** in the accent, in bold.
+
+- **Left and Right change an option in the Postman importer**, as they do on
+  every other two-way choice in the app — the format row draws Hurl and JSON
+  side by side, so an arrow pointed at one of them now picks it. The
+  destination row still takes arrows as cursor movement, since it is a path
+  being typed.
+
 - **A folder picker takes Space for "here, under this name".** Every
   "save into a folder" picker — exporting a report, saving a collection or a
   workspace, choosing where a Postman import lands — opens with the name already
@@ -818,6 +837,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   to install one that has it rather than failing to parse the flag.
 
 ### Fixed
+
+- **An import that stopped on a full folder offered to run again unchanged.**
+  Nobody presses a key while a download runs, so the failure was blamed on the
+  last screen that *had* seen one — the confirmation — and dismissing "already
+  exists and is not empty" put you back on "start the import", pointed at the
+  same occupied folder. A failure is now attributed to the screen actually on
+  display, so it returns to the options, with the destination still filled in,
+  ready to be pointed somewhere else or told to overwrite.
 
 - **A converted Postman collection could arrive unreadable, and say nothing.**
   Two things Postman exports quite normally came out the other side as Hurl that

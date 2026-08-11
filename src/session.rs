@@ -141,6 +141,11 @@ pub fn active_theme_spec(
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub enum PickerKind {
     Environment,
+    /// Where an imported Postman workspace is written. Kept apart from the
+    /// general last-browsed folder because imports are collected somewhere
+    /// deliberate — a folder of downloaded workspaces — and that choice must
+    /// not be dragged around by every unrelated file the user opens.
+    Import,
     Other,
 }
 
@@ -221,6 +226,10 @@ pub struct Session {
     /// picker reopens here (falling back to `last_browse_dir`), so it isn't
     /// dragged around by loads of unrelated file types.
     pub last_env_dir: Option<PathBuf>,
+    /// Folder the last Postman import was written into; the next import
+    /// suggests the same place, so downloaded workspaces end up together
+    /// instead of wherever the app happened to be started from.
+    pub last_import_dir: Option<PathBuf>,
     /// Window/panel geometry and last-open view for the graphical front-end.
     /// The terminal UI never reads it but still round-trips it, so alternating
     /// between the two front-ends doesn't wipe the GUI's layout.
@@ -277,6 +286,7 @@ impl Default for Session {
             recent_git_urls: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            last_import_dir: None,
             gui: GuiLayout::default(),
             status: None,
             reports: Vec::new(),
@@ -487,6 +497,7 @@ impl Session {
     pub fn picker_dir(&self, kind: PickerKind) -> Option<&std::path::Path> {
         let specific = match kind {
             PickerKind::Environment => self.last_env_dir.as_deref(),
+            PickerKind::Import => self.last_import_dir.as_deref(),
             PickerKind::Other => None,
         };
         specific
@@ -505,8 +516,10 @@ impl Session {
         let Some(dir) = dir.filter(|d| d.is_dir()) else {
             return;
         };
-        if kind == PickerKind::Environment {
-            self.last_env_dir = Some(dir.clone());
+        match kind {
+            PickerKind::Environment => self.last_env_dir = Some(dir.clone()),
+            PickerKind::Import => self.last_import_dir = Some(dir.clone()),
+            PickerKind::Other => {}
         }
         self.last_browse_dir = Some(dir);
     }
@@ -860,6 +873,10 @@ impl Session {
                 .last_env_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            last_import_dir: self
+                .last_import_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
             confirm_on_delete_env: self.confirm_on_delete_env,
@@ -957,6 +974,10 @@ impl Session {
             .map(PathBuf::from);
         self.last_env_dir = state
             .last_env_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        self.last_import_dir = state
+            .last_import_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
         self.gui = state.gui;

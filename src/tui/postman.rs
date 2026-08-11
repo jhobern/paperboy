@@ -122,11 +122,18 @@ impl PostmanWizard {
 
     /// Fill the destination in from the chosen workspace's name, unless one has
     /// already been picked — a suggestion, never an override.
-    pub(crate) fn suggest_dest(&mut self) {
+    /// `base` is where the last import landed, if there was one: workspaces are
+    /// downloaded to be kept together, so the folder the user chose last time
+    /// is a far better guess than the directory the app was started from.
+    pub(crate) fn suggest_dest(&mut self, base: Option<&Path>) {
         if !self.dest.as_os_str().is_empty() {
             return;
         }
-        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let base = base
+            .filter(|p| p.is_dir())
+            .map(Path::to_owned)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         self.set_dest(base.join(default_dest_name(self.flow.workspace_name())));
     }
 
@@ -543,10 +550,13 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         ));
     }
     // Not the connect hint: this screen has no fields to Tab between and no
-    // connection left to make — Enter starts the import.
+    // connection left to make — Enter starts the import. Drawn in the accent,
+    // bold, rather than dim like a footnote: nothing else on this screen is
+    // waiting for a key, and a dim line was being read as a status message,
+    // leaving people parked here wondering why nothing was downloading.
     tail.push(Line::styled(
         s.postman_confirm_hint,
-        Style::default().fg(th.dim),
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
     ));
     f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[4]);
 }
