@@ -267,6 +267,8 @@ strings! {
     env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
+    env_active_label => "Active: ", "Actif : ", "Aktiv: ";
+    env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
     env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
     env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
     env_source_label => "Source: ", "Source : ", "Kilde: ";

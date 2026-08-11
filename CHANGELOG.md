@@ -502,6 +502,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The active environment is always on screen.** The Environments panel is a
+  scrolling list, and importing a Postman workspace can put a few hundred
+  entries in it — so the one carrying the checkmark was almost never visible,
+  and a filter could hide it outright, leaving no way to answer "what am I
+  about to run against?" without going to look for it. The panel now pins the
+  active environment on a line of its own above the list, in green with its
+  checkmark (and its git icon where it came from a remote); clicking that line
+  jumps to its row. With nothing active it says so, rather than disappearing
+  and shifting the list under the cursor. The GUI already carried this in its
+  status bar.
+
 - **The HTML report's drill-down is no longer mostly gaps.** Each section in an
   expanded row claimed an equal share of the row's width, so on a wide screen a
   picture and a short JSON blob were shoved to opposite ends with a void

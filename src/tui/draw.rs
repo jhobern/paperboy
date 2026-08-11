@@ -2231,6 +2231,58 @@ pub(crate) fn draw_collection_left(
     draw_env_panel(f, panes[1], app, s, th);
 }
 
+/// The Environments panel's pinned first line: which environment the next run
+/// will substitute from.
+///
+/// The panel is a scrolling list — with a few hundred environments in it (a
+/// whole Postman workspace imports that many), the one with the checkmark is
+/// almost never on screen, and a filter can hide it outright. The answer to
+/// "what am I running against?" must not depend on scrolling to find it, so it
+/// is pinned above the list and drawn even when nothing is active: "nothing is
+/// active" is the answer people most need to be told, and a line that comes and
+/// goes would shift the list under the cursor.
+fn active_env_line(app: &TuiApp, s: &Strings, th: &Theme, width: u16) -> Line<'static> {
+    let active = app
+        .active_env_id
+        .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
+    let mut spans = vec![Span::styled(
+        s.env_active_label,
+        Style::default().fg(th.dim),
+    )];
+    match active {
+        Some(env) => {
+            let icon = if env.git_origin.is_some() {
+                format!("{GIT_ICON} ")
+            } else {
+                String::new()
+            };
+            // Room for the label, the checkmark and the icon; anything left
+            // over is the name, tail-elided so the start (which is what tells
+            // two environments apart) always survives.
+            let used = s.env_active_label.chars().count() + 2 + icon.chars().count();
+            let avail = (width as usize).saturating_sub(used);
+            spans.push(Span::styled(
+                format!("\u{2713} {icon}{}", elide(&env.name, avail)),
+                Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+            ));
+        }
+        None => spans.push(Span::styled(s.env_active_none, Style::default().fg(th.dim))),
+    }
+    Line::from(spans)
+}
+
+/// Truncate `text` to `max` columns, marking the cut with an ellipsis.
+fn elide(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    text.chars()
+        .take(keep)
+        .chain(std::iter::once('\u{2026}'))
+        .collect()
+}
+
 pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     let focused = app.focus == Pane::GlobalEnv;
     // The activate/deactivate hint lives on this panel's bottom border (same
@@ -2281,6 +2333,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             )
         };
         let p = Paragraph::new(vec![
+            active_env_line(app, s, th, area.width.saturating_sub(2)),
             Line::styled(first, Style::default().fg(th.dim)),
             Line::styled(hint, Style::default().fg(th.dim)),
         ])
@@ -2402,12 +2455,24 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             ListItem::new(Line::from(spans))
         })
         .collect();
+    // The block is rendered here rather than through the list, so the first
+    // row inside the border can be held back for the pinned active line.
+    let inner_all = block.inner(list_area);
+    f.render_widget(block, list_area);
+    let (pin_area, items_area) = if inner_all.height > 1 {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner_all);
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, inner_all)
+    };
+    if let Some(pin) = pin_area {
+        f.render_widget(Paragraph::new(active_env_line(app, s, th, pin.width)), pin);
+    }
     let list = List::new(items)
-        .block(block)
         .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
     let mut st = ListState::default();
     st.select(Some(sel));
-    f.render_stateful_widget(list, list_area, &mut st);
+    f.render_stateful_widget(list, items_area, &mut st);
     if let Some(strip) = filter_area {
         // While typing, a block cursor marks where the next character lands —
         // the strip is the only thing with focus, so without it there is no
@@ -2435,28 +2500,40 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             strip,
         );
     }
-    let inner = Rect {
-        x: list_area.x.saturating_add(1),
-        y: list_area.y.saturating_add(1),
-        width: list_area.width.saturating_sub(2),
-        height: list_area.height.saturating_sub(2),
-    };
     app.push_mouse_hit(
         MouseLayer::Base,
-        inner,
+        inner_all,
         MouseHitTarget::FocusPane(Pane::GlobalEnv),
     );
     app.push_mouse_hit(
         MouseLayer::Base,
-        inner,
+        inner_all,
         MouseHitTarget::Scroll(MouseScrollTarget::GlobalEnv),
     );
+    // Clicking the pinned line goes to the active environment's row — the
+    // reason to look at it is usually to get back to it.
+    if let Some(pin) = pin_area
+        && let Some(row) = rows
+            .iter()
+            .position(|r| r.env_id().is_some() && r.env_id() == app.active_env_id)
+    {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            pin,
+            MouseHitTarget::SelectGlobalEnvRow(row),
+        );
+    }
     let first = st.offset();
-    let visible = inner.height as usize;
+    let visible = items_area.height as usize;
     for row in first..rows.len().min(first + visible) {
         app.push_mouse_hit(
             MouseLayer::Base,
-            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            Rect::new(
+                items_area.x,
+                items_area.y + (row - first) as u16,
+                items_area.width,
+                1,
+            ),
             MouseHitTarget::SelectGlobalEnvRow(row),
         );
     }

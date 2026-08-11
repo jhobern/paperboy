@@ -4892,6 +4892,91 @@ fn git_icon_shown_on_env_heading_independently_of_the_collection_origin() {
     );
 }
 
+/// With a few hundred environments loaded, the one with the checkmark is almost
+/// never on screen — and a filter can hide it outright. "What am I running
+/// against?" must not depend on scrolling, so the answer is pinned above the
+/// list.
+#[test]
+fn the_active_environment_is_pinned_above_the_list() {
+    use crate::environment::Environment;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let mut active_id = 0;
+    for i in 0..40 {
+        let id = add_global_env(
+            &mut app,
+            Environment {
+                id: i + 1,
+                name: format!("env-{i:02}"),
+                vars: Vec::new(),
+                path: None,
+                git_origin: None,
+            },
+        );
+        if i == 39 {
+            active_id = id;
+        }
+    }
+    app.active_env_id = Some(active_id);
+
+    let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("env-39"),
+        "the active environment is named even though its row is far down: {text}"
+    );
+
+    // A filter that excludes it entirely is the harder case: the list is empty,
+    // and the pinned line is the only thing left saying what is in force.
+    app.env_query = "zzz".to_string();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("env-39"),
+        "still named with the list filtered away: {text}"
+    );
+}
+
+/// With nothing active the line stays, saying so: a run with no environment
+/// substitutes nothing, which is worth being told, and a line that came and
+/// went would shift the list under the cursor.
+#[test]
+fn the_pinned_line_says_when_no_environment_is_active() {
+    use crate::environment::Environment;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    add_global_env(
+        &mut app,
+        Environment {
+            id: 0,
+            name: "staging".into(),
+            vars: Vec::new(),
+            path: None,
+            git_origin: None,
+        },
+    );
+    app.active_env_id = None;
+
+    let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(text.contains(s.env_active_none), "got: {text}");
+}
+
 // ── "Save Collection to Git" wizard ─────────────────────────────────────
 
 #[test]
