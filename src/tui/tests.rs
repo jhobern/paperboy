@@ -25121,6 +25121,33 @@ fn space_in_the_destination_picker_takes_the_folder_and_the_suggested_name() {
     assert_eq!(w.dest, dir.join("Alpha"));
 }
 
+/// A rejected API key fails while the workspaces are being listed, so the step
+/// it interrupts is the workspace picker — of a list that was never fetched.
+/// Dismissing the error used to land on that empty picker, with nothing to pick
+/// and no way back. It goes to the key prompt, with the key still there to fix.
+#[test]
+fn dismissing_a_bad_key_returns_to_the_key_prompt() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-wrong", false);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+        w.flow.fail("401 Unauthorized".to_string());
+    }
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Error);
+
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Connect);
+    assert_eq!(
+        w.key.text(),
+        "PMAK-wrong",
+        "the key is kept, to be corrected"
+    );
+}
+
 /// The confirmation screen has no fields to move between and no connection left
 /// to make, so it must not borrow the connect form's "Tab switch field · Enter
 /// connect" hint — Enter starts the import.

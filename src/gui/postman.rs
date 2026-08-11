@@ -55,10 +55,14 @@ impl Wizard {
         }
     }
 
-    /// The step to draw: the last real one when the flow is showing a failure.
+    /// The step to draw: the last real one when the flow is showing a failure —
+    /// or, when that step has nothing to show, the last one that has. A
+    /// rejected API key fails during the workspace listing, so the step it
+    /// interrupted is a picker for a list that was never fetched; the error
+    /// belongs over the key field it came from.
     fn step(&self) -> Step {
         match self.flow.step() {
-            Step::Failed(_) => self.last_step.clone(),
+            Step::Failed(_) => self.flow.recoverable(self.last_step.clone()),
             step => step.clone(),
         }
     }

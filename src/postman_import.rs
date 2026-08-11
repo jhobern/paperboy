@@ -793,9 +793,30 @@ fn render(
                     vars_text(&converted.variables),
                 )
             });
+            // Last line of defence: whatever comes out has to be a file
+            // PaperBoy can open again. A single construct Hurl's parser
+            // rejects — one `{{$guid}}`, one file part with no file — fails
+            // the *whole* file, taking every other request in it with it, and
+            // nothing about the folder on disk says why. Rather than write a
+            // collection that cannot be read, keep the JSON, which always
+            // opens, and say so.
+            let contents = crate::hurl::collection_to_hurl(&converted.entries);
+            if crate::hurl::parse_hurl(&contents).len() != converted.entries.len() {
+                let mut out = raw(taken);
+                out.notes.push(ConversionNote {
+                    item: display.to_string(),
+                    detail: format!(
+                        "the converted Hurl did not read back correctly ({}), so the original \
+                         Postman JSON was kept",
+                        crate::hurl::parse_hurl_error(&contents)
+                            .unwrap_or_else(|| "requests went missing".to_string())
+                    ),
+                });
+                return out;
+            }
             Rendered {
                 name: unique_file_name(&stem, "hurl", taken),
-                contents: crate::hurl::collection_to_hurl(&converted.entries),
+                contents,
                 vars,
                 notes: converted.notes,
             }
@@ -2065,6 +2086,29 @@ mod tests {
             "and so is what it lost: {notes}"
         );
         std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The failure this guard is for is silent: a converted file sits on disk
+    /// looking like a collection and opens as nothing at all. If what came out
+    /// doesn't read back, the JSON — which always opens — is kept instead, and
+    /// the reason is written down.
+    #[test]
+    fn a_conversion_that_would_not_read_back_keeps_the_json() {
+        let mut taken = HashSet::new();
+        // An unclosed `{{` is a template Hurl cannot parse, and Postman is
+        // perfectly happy to export one.
+        let body = r#"{"info":{"name":"x","schema":"s"},"item":[{"name":"a","request":{
+            "method":"POST","url":"https://x/{{unclosed"}}]}"#;
+        let out = render(
+            "x",
+            body,
+            ItemKind::Collection,
+            ImportFormat::Hurl,
+            &mut taken,
+        );
+        assert!(out.name.ends_with(".json"), "kept as JSON: {}", out.name);
+        assert_eq!(out.contents, body, "byte for byte, so it always opens");
+        assert!(!out.notes.is_empty(), "and the reason is recorded");
     }
 
     /// A clean conversion writes no notes file at all: a report that is always

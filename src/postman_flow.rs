@@ -531,10 +531,34 @@ impl PostmanFlow {
     }
 
     /// Clear a failure without losing anything else, putting the user back on
-    /// the step the failure interrupted.
+    /// the step the failure interrupted — or, where that step has nothing to
+    /// show, on the last one that has (see [`Self::recoverable`]).
     pub(crate) fn clear_error(&mut self, back_to: Step) {
         if matches!(self.step, Step::Failed(_)) {
-            self.step = back_to;
+            self.step = self.recoverable(back_to);
+        }
+    }
+
+    /// The step to land on after dismissing an error.
+    ///
+    /// The step a failure interrupted is not always a step that can be drawn:
+    /// a rejected API key fails *during* the workspace listing, so the
+    /// interrupted step is "choose a workspace" — of a list that was never
+    /// fetched. Dismissing the error dropped the user on an empty picker with
+    /// no way forward, when the one thing they needed was the key prompt they
+    /// had just typed into. Each step is therefore checked against what it
+    /// needs to show, and falls back to the last step that has it.
+    pub(crate) fn recoverable(&self, back_to: Step) -> Step {
+        match back_to {
+            Step::PickWorkspace if self.workspaces.is_empty() => Step::Connect,
+            Step::Options | Step::Confirm | Step::Downloading if self.chosen.is_none() => {
+                Step::Connect
+            }
+            // A download that failed cannot be resumed from its progress bar;
+            // the options are where it is started from.
+            Step::Confirm | Step::Downloading if self.plan.is_none() => Step::Options,
+            Step::Downloading => Step::Options,
+            other => other,
         }
     }
 
@@ -1044,6 +1068,46 @@ mod tests {
             eta.as_secs()
         );
         assert!((p.fraction() - 0.2).abs() < 0.001);
+    }
+
+    /// A rejected API key fails during the *listing*, so the step it interrupts
+    /// is "choose a workspace" — of a list that was never fetched. Dismissing
+    /// the error used to drop the user on an empty picker with nothing to pick
+    /// and no way back; it returns them to the key they need to fix.
+    #[test]
+    fn dismissing_a_failed_listing_goes_back_to_the_key() {
+        let mut f = PostmanFlow::new();
+        f.key = "PMAK-wrong".to_string();
+        f.step = Step::PickWorkspace;
+        f.fail("401 Unauthorized".to_string());
+        f.clear_error(Step::PickWorkspace);
+        assert_eq!(*f.step(), Step::Connect);
+        assert_eq!(f.key, "PMAK-wrong", "the key is kept, to be corrected");
+    }
+
+    /// A listing that did arrive is still worth going back to: only an empty
+    /// picker is unusable.
+    #[test]
+    fn dismissing_an_error_keeps_a_workspace_list_that_was_fetched() {
+        let mut f = PostmanFlow::new();
+        f.workspaces = vec![ws("Alpha", "a")];
+        f.step = Step::PickWorkspace;
+        f.fail("something else".to_string());
+        f.clear_error(Step::PickWorkspace);
+        assert_eq!(*f.step(), Step::PickWorkspace);
+    }
+
+    /// A download cannot be resumed from its own progress bar, so a failure
+    /// during it goes back to the options it was started from.
+    #[test]
+    fn a_failed_download_goes_back_to_the_options() {
+        let mut f = PostmanFlow::new();
+        f.chosen = Some(ws("Alpha", "a"));
+        f.plan = Some(plan_with(1, 1));
+        f.step = Step::Downloading;
+        f.fail("connection reset".to_string());
+        f.clear_error(Step::Downloading);
+        assert_eq!(*f.step(), Step::Options);
     }
 
     /// A workspace of a few collections and hundreds of environments spends its

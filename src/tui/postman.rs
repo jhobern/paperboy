@@ -667,8 +667,14 @@ fn draw_error(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: 
             .wrap(Wrap { trim: true }),
         rows[0],
     );
+    // Not "press Esc to close": Esc goes back to the step that can be fixed —
+    // the key prompt for a rejected key — rather than throwing the import away.
     f.render_widget(
-        Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
+        Paragraph::new(Line::styled(
+            s.postman_error_hint,
+            Style::default().fg(th.dim),
+        ))
+        .wrap(Wrap { trim: true }),
         rows[1],
     );
 }

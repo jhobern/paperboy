@@ -192,9 +192,16 @@ impl Param {
                 value: self.src.clone(),
                 kind: FormFieldKind::File,
                 content_type: self.content_type.clone(),
-                base64_prefix: None,
-                enabled: true,
+                // A file part Postman never had a file for (`src` empty — the
+                // user picked the field but not the file, which their export
+                // preserves) serializes to `key: file,;`, which is not valid
+                // Hurl: the file would be written and then refuse to load,
+                // taking the whole collection with it. Kept as a *disabled*
+                // row, which round-trips as a comment — the field is still
+                // there to be filled in, and the file still parses.
+                enabled: !self.src.trim().is_empty(),
                 desc: self.description.clone(),
+                base64_prefix: None,
             }
         } else {
             FormField {
@@ -397,11 +404,75 @@ fn walk_items(
                 format!("{}/{}", path.join("/"), it.name)
             };
             let auth = resolve_auth(req.auth.as_ref(), inherited);
-            let entry = map_request(&title, req, &it.event, auth);
+            let mut entry = map_request(&title, req, &it.event, auth);
             note_losses(&title, req, &it.event, auth, &entry, out);
+            for name in rename_dynamic_variables(&mut entry) {
+                out.notes.push(ConversionNote {
+                    item: title.clone(),
+                    detail: format!(
+                        "Postman generated `{{{{${name}}}}}` for you; Hurl has no equivalent, so it \
+                         became the variable `{{{{{name}}}}}`, which has to be supplied"
+                    ),
+                });
+            }
             out.entries.push(entry);
         }
     }
+}
+
+/// Postman's *dynamic variables* — `{{$guid}}`, `{{$randomInt}}`,
+/// `{{$timestamp}}` — are values it generates at send time. Hurl has no such
+/// thing, and worse, a `$` is not legal in a Hurl template name: one
+/// `{{$guid}}` anywhere in a collection made the whole converted file fail to
+/// parse ("parsing template variable"), so every request in it was lost, not
+/// just the one that used it.
+///
+/// Each is rewritten to an ordinary variable of the same name without the `$`
+/// (`{{$guid}}` → `{{guid}}`), which parses, runs as soon as the value is
+/// supplied, and stays readable as the thing it was. Dotted forms
+/// (`{{$processEnv.HOME}}`) fold their dots into underscores for the same
+/// reason. Returns the names rewritten, so each can be noted.
+fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
+    static DYNAMIC_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\{\{\s*\$([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}").unwrap());
+
+    let mut found: Vec<String> = Vec::new();
+    let mut fix = |text: &mut String| {
+        if !text.contains("{{") {
+            return;
+        }
+        let replaced = DYNAMIC_RE.replace_all(text, |caps: &regex::Captures| {
+            let name = caps[1].replace('.', "_");
+            if !found.contains(&name) {
+                found.push(name.clone());
+            }
+            format!("{{{{{name}}}}}")
+        });
+        if let std::borrow::Cow::Owned(new) = replaced {
+            *text = new;
+        }
+    };
+
+    fix(&mut entry.url);
+    for row in entry
+        .headers
+        .iter_mut()
+        .chain(entry.queries.iter_mut())
+        .chain(entry.cookies.iter_mut())
+    {
+        fix(&mut row.value);
+    }
+    for f in &mut entry.form_fields {
+        fix(&mut f.value);
+    }
+    if let Some(body) = entry.body.as_mut() {
+        fix(body);
+    }
+    if let Some((user, pass)) = entry.basic_auth.as_mut() {
+        fix(user);
+        fix(pass);
+    }
+    found
 }
 
 /// Which auth applies at this level: its own if it declares any, otherwise
@@ -450,6 +521,14 @@ fn note_losses(
         && !matches!(b.mode.as_str(), "" | "raw" | "urlencoded" | "formdata")
     {
         note(format!("body mode `{}` was dropped", b.mode));
+    }
+    for f in &entry.form_fields {
+        if f.kind == FormFieldKind::File && !f.enabled {
+            note(format!(
+                "the file part `{}` had no file chosen in Postman, so it is switched off until one is",
+                f.key
+            ));
+        }
     }
     if events
         .iter()
@@ -1102,6 +1181,89 @@ mod inheritance_tests {
         );
         assert!(for_item("gql")[0].contains("graphql"));
         assert!(for_item("scripted")[0].contains("pre-request"));
+    }
+
+    /// The bug this whole guard exists for: one Postman dynamic variable
+    /// anywhere in a collection produced a `.hurl` that would not parse
+    /// ("parsing template variable"), so *every* request in the file was lost
+    /// — silently, because the file itself looked fine on disk.
+    #[test]
+    fn a_generated_variable_is_renamed_so_the_file_still_parses() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/{{$guid}}",
+            "header": [ { "key": "X-Run", "value": "{{$timestamp}}" } ],
+            "body": { "mode": "raw", "raw": "{\"id\": \"{{$processEnv.HOME}}\"}" } } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        assert!(!hurl.contains("{{$"), "a `$` is not a legal name: {hurl}");
+        assert!(hurl.contains("{{guid}}"), "{hurl}");
+        assert!(hurl.contains("{{timestamp}}"), "{hurl}");
+        assert!(hurl.contains("{{processEnv_HOME}}"), "{hurl}");
+        assert_eq!(
+            crate::hurl::parse_hurl(&hurl).len(),
+            1,
+            "the converted file must read back: {:?}",
+            crate::hurl::parse_hurl_error(&hurl)
+        );
+        // Each rename is reported: the value Postman used to make up now has
+        // to come from somewhere.
+        assert_eq!(converted.notes.len(), 3);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("{{guid}}"))
+        );
+    }
+
+    /// Postman keeps a file part that never had a file chosen. It serialized to
+    /// `key: file,;`, which is not valid Hurl — and again took the whole
+    /// collection down with it.
+    #[test]
+    fn a_file_part_with_no_file_is_switched_off_rather_than_written_broken() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "upload", "request": { "method": "POST", "url": "https://x",
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "document_id", "value": "1", "type": "text" },
+              { "key": "front_side_file", "type": "file", "src": "" }
+            ] } } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        // The row survives as a comment (which parses); what must not appear
+        // is a live `file,;` line, which does not.
+        assert!(
+            !hurl
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("file,;")),
+            "{hurl}"
+        );
+        assert_eq!(
+            crate::hurl::parse_hurl(&hurl).len(),
+            1,
+            "the converted file must read back: {:?}",
+            crate::hurl::parse_hurl_error(&hurl)
+        );
+        // The field is still there, switched off, so it can be filled in.
+        let back = &crate::hurl::parse_hurl(&hurl)[0];
+        let part = back
+            .form_fields
+            .iter()
+            .find(|f| f.key == "front_side_file")
+            .expect("the part survives as a disabled row");
+        assert!(!part.enabled);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("front_side_file")),
+            "the switched-off part is reported: {:?}",
+            converted.notes
+        );
     }
 
     /// A collection that converts cleanly must produce an empty report, so an

@@ -1169,6 +1169,7 @@ strings! {
     postman_format_hurl_note => "Hurl does not cover everything Postman does; anything dropped is listed in CONVERSION-NOTES.md.", "Hurl ne couvre pas tout ce que fait Postman ; ce qui est perdu est listé dans CONVERSION-NOTES.md.", "Hurl dækker ikke alt hvad Postman gør; alt der udelades, listes i CONVERSION-NOTES.md.";
     postman_overwrite => "Replace the folder if it already exists", "Remplacer le dossier s'il existe déjà", "Erstat mappen hvis den allerede findes";
     postman_confirm_title => "Ready to import", "Prêt à importer", "Klar til at importere";
+    postman_error_hint => "Press Esc to go back and try again", "Appuyez sur Échap pour revenir et réessayer", "Tryk på Esc for at gå tilbage og prøve igen";
     postman_confirm_hint => "Enter import · Esc cancel", "Entrée importer · Échap annuler", "Enter importér · Esc annuller";
     postman_rate_limit_note => "Postman limits how fast its API may be called, so this is paced deliberately.", "Postman limite la vitesse d'appel de son API : le rythme est donc volontairement mesuré.", "Postman begrænser hvor hurtigt dets API må kaldes, så tempoet er bevidst afmålt.";
     postman_estimate => "About", "Environ", "Cirka";

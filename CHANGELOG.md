@@ -819,6 +819,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A converted Postman collection could arrive unreadable, and say nothing.**
+  Two things Postman exports quite normally came out the other side as Hurl that
+  Hurl cannot parse: its **dynamic variables** (`{{$guid}}`, `{{$timestamp}}` —
+  a `$` is not a legal template name) and a **file part with no file chosen**
+  (`key: file,;`). Either one failed the *whole* file, so a collection of sixty
+  requests opened as none, with nothing on disk to suggest why — the same
+  workspace imported as raw JSON was fine. Dynamic variables are now renamed to
+  ordinary ones (`{{$guid}}` → `{{guid}}`, so the value has to be supplied, and
+  the conversion notes say so), a file part with no file is written switched off
+  so it can be filled in later, and — as a backstop for anything else — a
+  conversion whose output does not read back keeps the original JSON, which
+  always opens, and records the parse error against the collection's name.
+
+- **Dismissing a Postman import error goes back to what can be fixed.** A
+  rejected API key fails while the workspaces are being listed, so the step it
+  interrupted was "choose a workspace" — of a list that was never fetched.
+  Pressing Esc dropped the user on an empty picker with nothing to pick, no way
+  forward and no way back. It now returns to the key prompt, with the key still
+  in the field to correct; a failure with no workspace chosen goes back the same
+  way, and a failed download returns to the options it was started from rather
+  than a progress bar that cannot be resumed.
+
 - **A results row shows the pointing hand across its whole width.** The row was
   clickable end to end but only looked it over the words in a cell, because the
   cells take the hover from the row target wherever they overlap it. The cursor
