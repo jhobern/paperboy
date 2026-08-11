@@ -15,7 +15,6 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::environment::{CliResolver, parse_vars_with};
 use crate::postman_api::{ApiError, PostmanClient, WorkspaceKind};
 use crate::postman_import::{
     ImportError, ImportFormat, ImportOptions, ImportPlan, Importer, ItemKind, parse_workspace_ref,
@@ -147,20 +146,14 @@ fn resolve_key(flag: Option<&str>) -> Result<String, String> {
         },
     };
 
-    if !raw.contains("{{") {
-        return Ok(raw);
-    }
-
-    // Reuse the app's own resolver so a reference behaves exactly as it would
-    // in a `.vars` file — including 1Password prompting only once.
-    let env = parse_vars_with("postman".to_string(), &format!("KEY={raw}"), &CliResolver);
-    match env.vars.first() {
-        Some(v) if v.resolved && !v.value.trim().is_empty() => Ok(v.value.clone()),
-        _ => Err(format!(
+    // The app's own resolver, so a reference behaves exactly as it would in a
+    // `.vars` file — including 1Password prompting only once.
+    crate::environment::resolve_reference(&raw).ok_or_else(|| {
+        format!(
             "could not resolve the API key reference {raw}.\n\
              Check the reference, and that the provider's CLI (`op` or `aws`) is installed and signed in."
-        )),
-    }
+        )
+    })
 }
 
 /// Print every workspace the key can see, so the user can pick an id.

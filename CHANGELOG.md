@@ -12,6 +12,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The Postman importer takes a key reference, not just a key.** The wizard's
+  API key field now accepts the same `{{ … }}` provider references a `.vars`
+  file does — `{{ op://Private/Postman/credential }}`, `{{ ssm:/path }}`,
+  `{{ env:NAME }}` — resolved when you press Enter, so nobody has to fetch a
+  live credential out of 1Password and paste it into a form (the headless
+  `--postman-key` has accepted these all along; now the front-ends match). An
+  import lists, plans and downloads with a client apiece, so the resolved value
+  is held for the run rather than prompting three times, and — like every
+  resolved secret — it is never written to disk. A reference the provider won't
+  answer is reported as such instead of being sent as a key.
+
 - **A report says what moved, not just how it scored.** Two runs that both score
   98% are not the same run if one of them fixed three rows and broke three
   others, and the accuracy figures cannot tell them apart. The metrics header —

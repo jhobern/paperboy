@@ -15,9 +15,9 @@
 //! importer once they say go.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -223,6 +223,47 @@ pub(crate) struct PostmanFlow {
     /// is how a cancel at the confirmation step tells the worker to give up.
     go: Option<Sender<()>>,
     cancel: Arc<AtomicBool>,
+    /// The last `{{ … }}` reference resolved, with what it resolved to.
+    ///
+    /// Resolving asks 1Password, which can put a fingerprint prompt on the
+    /// screen; the listing, the plan and the download each build their own
+    /// client, so without this one import would prompt three times. Keyed by
+    /// the raw text so editing the field re-resolves rather than reusing the
+    /// answer to a question that was since changed. Lives only as long as the
+    /// wizard: the resolved secret is never persisted, exactly as an
+    /// environment's resolved secret isn't.
+    resolved_key: Arc<Mutex<Option<(String, String)>>>,
+}
+
+/// Turn whatever is in the key field into a key to send.
+///
+/// The field takes a `{{ … }}` provider reference — `{{ op://Private/Postman/
+/// credential }}`, `{{ ssm:/path }}`, `{{ env:NAME }}` — exactly as a `.vars`
+/// file does, so nobody has to fetch their key out of 1Password and paste a
+/// live credential into a form to import a workspace. Anything else is already
+/// a key and is used as typed.
+///
+/// Called on a worker thread, never on one that draws: resolving shells out to
+/// `op`/`aws`, which can take seconds and put a fingerprint prompt on screen.
+/// The answer is cached against the text it came from so an import asks once
+/// rather than once per API phase.
+fn resolve_key(raw: &str, cache: &Mutex<Option<(String, String)>>) -> Option<String> {
+    let raw = raw.trim();
+    // Nothing to ask anyone, and so nothing worth remembering.
+    if !raw.contains("{{") {
+        return (!raw.is_empty()).then(|| raw.to_string());
+    }
+    if let Ok(guard) = cache.lock()
+        && let Some((cached_raw, value)) = guard.as_ref()
+        && cached_raw == raw
+    {
+        return Some(value.clone());
+    }
+    let value = crate::environment::resolve_reference(raw)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((raw.to_string(), value.clone()));
+    }
+    Some(value)
 }
 
 impl Default for PostmanFlow {
@@ -255,6 +296,7 @@ impl PostmanFlow {
             progress_rx: None,
             go: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            resolved_key: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -370,14 +412,23 @@ impl PostmanFlow {
             self.step = Step::Options;
             return;
         }
-        self.start_listing();
+        self.start_listing(s);
     }
 
-    fn start_listing(&mut self) {
+    fn start_listing(&mut self, s: &Strings) {
         let (tx, rx) = mpsc::channel();
-        let key = self.key.trim().to_string();
+        let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
+        let cache = Arc::clone(&self.resolved_key);
+        let bad_ref = s.postman_err_key_ref;
         thread::spawn(move || {
+            let key = match resolve_key(&raw, &cache) {
+                Some(k) => k,
+                None => {
+                    let _ = tx.send(Msg::Workspaces(Err(bad_ref.to_string())));
+                    return;
+                }
+            };
             let client = PostmanClient::new(key, base);
             let kinds = WorkspaceKind::default_selection();
             let msg = match client.list_workspaces(&kinds) {
@@ -424,14 +475,23 @@ impl PostmanFlow {
         let (tx, rx) = mpsc::channel();
         let (progress_tx, progress_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
-        let key = self.key.trim().to_string();
+        let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
+        let cache = Arc::clone(&self.resolved_key);
+        let bad_ref = s.postman_err_key_ref;
         let options = self.options();
         let dest = self.dest_path();
         let cancel = Arc::clone(&self.cancel);
         cancel.store(false, Ordering::Relaxed);
 
         thread::spawn(move || {
+            let key = match resolve_key(&raw, &cache) {
+                Some(k) => k,
+                None => {
+                    let _ = tx.send(Msg::Failed(bad_ref.to_string()));
+                    return;
+                }
+            };
             let client = PostmanClient::new(key, base);
             // One importer for the whole run: the pacer learns this account's
             // real budget from the listing calls, and starting over for the
@@ -780,6 +840,49 @@ mod tests {
         f.key = "PMAK-test".to_string();
         f.dest = "/tmp/pb-import-test".to_string();
         f
+    }
+
+    /// A key that is already a key is sent as typed — no provider, no prompt.
+    #[test]
+    fn a_typed_key_is_used_as_it_stands() {
+        let cache = Mutex::new(None);
+        assert_eq!(
+            resolve_key("  PMAK-abcdef  ", &cache),
+            Some("PMAK-abcdef".to_string())
+        );
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "nothing to remember: no provider was asked"
+        );
+    }
+
+    /// An import lists, plans and downloads, each building its own client. The
+    /// provider must be asked once for all three: 1Password puts a fingerprint
+    /// prompt on the screen, and three of them for one import is an interrogation.
+    #[test]
+    fn a_resolved_key_is_remembered_for_the_rest_of_the_import() {
+        let raw = "{{ op://Private/Postman/credential }}";
+        let cache = Mutex::new(Some((raw.to_string(), "PMAK-from-1password".to_string())));
+        // Nothing here can reach `op`; an answer proves it came from the cache.
+        assert_eq!(
+            resolve_key(raw, &cache),
+            Some("PMAK-from-1password".to_string())
+        );
+    }
+
+    /// Edited text is a different question, so the remembered answer to the old
+    /// one must not be handed back — that would import with a key the field no
+    /// longer shows.
+    #[test]
+    fn editing_the_key_does_not_reuse_the_previous_answer() {
+        let cache = Mutex::new(Some((
+            "{{ op://Private/Postman/credential }}".to_string(),
+            "PMAK-old".to_string(),
+        )));
+        assert_eq!(
+            resolve_key("PMAK-typed-instead", &cache),
+            Some("PMAK-typed-instead".to_string())
+        );
     }
 
     fn ws(name: &str, id: &str) -> WorkspaceSummary {

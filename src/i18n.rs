@@ -1135,6 +1135,7 @@ strings! {
     postman_busy_planning => "Checking what that workspace holds…", "Vérification du contenu de cet espace de travail…", "Undersøger hvad dette workspace indeholder…";
     postman_busy_downloading => "Downloading from Postman…", "Téléchargement depuis Postman…", "Henter fra Postman…";
     postman_err_key_required => "A Postman API key is needed.", "Une clé d'API Postman est nécessaire.", "Der kræves en Postman-API-nøgle.";
+    postman_err_key_ref => "Could not resolve that key reference. Check it, and that the provider's CLI (op / aws) is installed and signed in.", "Impossible de résoudre cette référence de clé. Vérifiez-la, ainsi que l'installation et la connexion de l'outil du fournisseur (op / aws).", "Kunne ikke slå den nøglereference op. Tjek den, og at udbyderens CLI (op / aws) er installeret og logget ind.";
     postman_err_bad_workspace => "That is not a workspace id or a Postman workspace address.", "Ce n'est ni un identifiant d'espace de travail ni une adresse d'espace de travail Postman.", "Det er hverken et workspace-id eller en Postman-workspace-adresse.";
     postman_err_dest_required => "Choose a folder to import into.", "Choisissez un dossier de destination.", "Vælg en mappe at importere til.";
     postman_err_nothing_selected => "Choose collections, environments, or both.", "Choisissez les collections, les environnements, ou les deux.", "Vælg samlinger, miljøer eller begge dele.";
@@ -1149,7 +1150,7 @@ strings! {
     postman_unit_minutes => "minutes", "minutes", "minutter";
     postman_title => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
     postman_key_label => "Postman API key", "Clé d'API Postman", "Postman-API-nøgle";
-    postman_key_hint => "Create one at https://go.postman.co/settings/me/api-keys — it is never written to disk.", "Créez-en une sur https://go.postman.co/settings/me/api-keys — elle n'est jamais écrite sur le disque.", "Opret en på https://go.postman.co/settings/me/api-keys — den skrives aldrig til disken.";
+    postman_key_hint => "Create one at https://go.postman.co/settings/me/api-keys — it is never written to disk. A reference works too: {{ op://Vault/Item/credential }}", "Créez-en une sur https://go.postman.co/settings/me/api-keys — elle n'est jamais écrite sur le disque. Une référence fonctionne aussi\u{a0}: {{ op://Coffre/Élément/credential }}", "Opret en på https://go.postman.co/settings/me/api-keys — den skrives aldrig til disken. En reference virker også: {{ op://Boks/Element/credential }}";
     postman_workspace_label => "Workspace id or address (optional)", "Identifiant ou adresse de l'espace de travail (facultatif)", "Workspace-id eller -adresse (valgfrit)";
     postman_workspace_hint => "Leave blank to choose from a list.", "Laissez vide pour choisir dans une liste.", "Lad stå tomt for at vælge fra en liste.";
     postman_base_url_label => "API host (optional)", "Hôte de l'API (facultatif)", "API-vært (valgfrit)";

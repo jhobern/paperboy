@@ -428,6 +428,37 @@ pub fn parse_vars(name: String, content: &str) -> Environment {
     parse_vars_with(name, content, &CliResolver)
 }
 
+/// Resolve one value that may be a `{{ … }}` provider reference — an API key, a
+/// token, anything held somewhere other than in the clear — to its literal.
+///
+/// A value with no reference in it is returned as-is (trimmed), so a caller can
+/// pass whatever the user typed without deciding first what kind of thing it is.
+/// `None` means the reference was recognised but the provider would not answer:
+/// a wrong path, or a CLI that is missing or not signed in.
+///
+/// The reference goes through the same parser a `.vars` file does, so it
+/// behaves identically here and there — the same syntax, the same providers,
+/// and (like everything resolved this way) never written to disk.
+///
+/// **Blocking**: it shells out to `op`/`aws`, which can take seconds and may
+/// prompt for a fingerprint. Never call it on a thread that is drawing.
+pub fn resolve_reference(raw: &str) -> Option<String> {
+    resolve_reference_with(raw, &CliResolver)
+}
+
+/// [`resolve_reference`] against a caller-supplied resolver, for tests.
+pub fn resolve_reference_with(raw: &str, resolver: &dyn SecretResolver) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.contains("{{") {
+        return (!raw.is_empty()).then(|| raw.to_string());
+    }
+    let env = parse_vars_with("secret".to_string(), &format!("VALUE={raw}"), resolver);
+    match env.vars.first() {
+        Some(v) if v.resolved && !v.value.trim().is_empty() => Some(v.value.clone()),
+        _ => None,
+    }
+}
+
 /// Parse a `.vars` file using a caller-supplied `resolver`, resolving every
 /// provider reference synchronously (used by the headless CLI and tests).
 pub fn parse_vars_with(name: String, content: &str, resolver: &dyn SecretResolver) -> Environment {
@@ -825,6 +856,41 @@ mod tests {
         fn resolve_ssm(&self, name: &str) -> Option<String> {
             (name == "/demo/api/password").then(|| "ssm-secret-xyz".to_string())
         }
+    }
+
+    /// A one-off secret — an API key typed into a wizard — resolves through the
+    /// same syntax and the same providers a `.vars` file does.
+    #[test]
+    fn a_single_value_resolves_the_same_way_a_vars_line_does() {
+        assert_eq!(
+            resolve_reference_with("{{ op://Engineering/demo-api/token }}", &MockResolver),
+            Some("op-secret-123".to_string())
+        );
+        assert_eq!(
+            resolve_reference_with("{{ ssm:/demo/api/password }}", &MockResolver),
+            Some("ssm-secret-xyz".to_string())
+        );
+    }
+
+    /// Anything that isn't a reference is already the value: a caller can hand
+    /// over whatever was typed without deciding first what kind of thing it is.
+    #[test]
+    fn a_plain_value_passes_straight_through() {
+        assert_eq!(
+            resolve_reference_with("  PMAK-abcdef  ", &MockResolver),
+            Some("PMAK-abcdef".to_string())
+        );
+        assert_eq!(resolve_reference_with("   ", &MockResolver), None);
+    }
+
+    /// A reference the provider won't answer is not a key: reporting it as one
+    /// would send the literal `{{ … }}` text to the server as a credential.
+    #[test]
+    fn an_unresolvable_reference_is_not_mistaken_for_a_value() {
+        assert_eq!(
+            resolve_reference_with("{{ op://Nope/nothing/here }}", &MockResolver),
+            None
+        );
     }
 
     fn one(content: &str) -> EnvVar {
