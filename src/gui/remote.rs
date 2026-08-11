@@ -63,6 +63,10 @@ enum SaveTarget {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadTarget {
     File,
+    /// A PaperTrail `.trail` document, opened into the report editor. It is
+    /// fetched exactly the way a collection is — one file out of one ref — but
+    /// the picker narrows to `.trail` and the content becomes a report tab.
+    Report,
     Workspace,
 }
 
@@ -141,6 +145,7 @@ impl LoadFlow {
             // own file narrowing below.
             flow: RemoteFlow::new(match target {
                 LoadTarget::File => RemoteKind::Collection,
+                LoadTarget::Report => RemoteKind::Report,
                 LoadTarget::Workspace => RemoteKind::Workspace,
             }),
             target,
@@ -225,7 +230,7 @@ impl LoadFlow {
             self.flow
                 .all_files()
                 .iter()
-                .filter(|path| self.show_all_files || is_default_load_file(path))
+                .filter(|path| self.show_all_files || is_default_load_file(self.target, path))
                 .filter(|path| filter.is_empty() || path.to_lowercase().contains(&filter))
                 .cloned()
                 .collect(),
@@ -303,6 +308,9 @@ impl LoadFlow {
         let name = name_from_repo_path(&path);
 
         remember_git_url(&mut app.session, &self.flow.url);
+        if self.target == LoadTarget::Report {
+            return finish_loaded_report(app, name, content, origin);
+        }
         // `.json` covers both a Postman collection and a Postman environment,
         // so the extension alone can't say which this is — ask the content.
         if is_vars_file(&path) || crate::postman::postman_env_values(&content).is_some() {
@@ -583,6 +591,11 @@ impl RemoteUi {
         self.flow = Some(Flow::Load(LoadFlow::new(LoadTarget::File)));
     }
 
+    /// Begin loading a PaperTrail report from a git remote.
+    pub fn open_load_report(&mut self) {
+        self.flow = Some(Flow::Load(LoadFlow::new(LoadTarget::Report)));
+    }
+
     /// Begin loading a whole Workspace (every file matching a chosen type
     /// filter) from a git remote.
     pub fn open_load_workspace(&mut self) {
@@ -759,6 +772,7 @@ impl Flow {
         match self {
             Flow::Load(load) => match load.target {
                 LoadTarget::File => s.gui_git_load_title,
+                LoadTarget::Report => s.gui_git_load_report_title,
                 LoadTarget::Workspace => s.gui_git_load_workspace_title,
             },
             Flow::Save(save) => match save.target {
@@ -1524,12 +1538,18 @@ fn nonblank(s: &str) -> Option<String> {
     }
 }
 
-fn is_default_load_file(path: &str) -> bool {
+/// Whether `path` is worth offering by default for this kind of load. A repo
+/// holds plenty of files that are not what the user came for, and the "show
+/// all" checkbox is there for the repo that names its files unusually.
+fn is_default_load_file(target: LoadTarget, path: &str) -> bool {
     let ext = Path::new(path).extension().and_then(|e| e.to_str());
-    matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl")
-        || e.eq_ignore_ascii_case("vars")
-        // Postman exports both collections and environments as JSON.
-        || e.eq_ignore_ascii_case("json"))
+    match target {
+        LoadTarget::Report => matches!(ext, Some(e) if e.eq_ignore_ascii_case("trail")),
+        _ => matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl")
+            || e.eq_ignore_ascii_case("vars")
+            // Postman exports both collections and environments as JSON.
+            || e.eq_ignore_ascii_case("json")),
+    }
 }
 
 fn is_vars_file(path: &str) -> bool {
@@ -1561,6 +1581,38 @@ fn file_stem_from_url(url: &str) -> String {
     } else {
         stem.to_string()
     }
+}
+
+/// Open a `.trail` fetched from git as a report tab, keeping its provenance so
+/// a later "Save to Git" pushes straight back to the file it came from. The
+/// report is added to the session's reports (rather than held only by the
+/// editor) so it survives a restart the way a locally opened report does.
+fn finish_loaded_report(
+    app: &mut GuiApp,
+    fallback_name: String,
+    content: String,
+    origin: GitOrigin,
+) -> bool {
+    let mut report = crate::report::Report::from_text(fallback_name, content);
+    report.git_origin = Some(origin.clone());
+    app.session
+        .reports
+        .push(crate::persistence::PersistedReport {
+            name: report.name.clone(),
+            text: report.text.clone(),
+            path: None,
+            git_origin: Some(origin),
+            workspace_root: None,
+            embedded_active: true,
+        });
+    let idx = app.session.reports.len() - 1;
+    app.open_report_editor(
+        crate::gui::report_editor::ReportOrigin::Session(idx),
+        report,
+    );
+    app.focus = super::Focus::Main;
+    app.session.save();
+    true
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -1622,6 +1674,11 @@ mod tests {
         std::fs::write(work.join("legacy.json"), "{}").unwrap();
         std::fs::write(work.join("dev.vars"), "HOST=example.com\n").unwrap();
         std::fs::write(work.join("big.bin"), "x".repeat(512)).unwrap();
+        std::fs::write(
+            work.join("nightly.trail"),
+            "# name: Nightly\nREQUEST Health\n",
+        )
+        .unwrap();
         git(&["add", "-A"], &work);
         git(&["commit", "-q", "-m", "seed"], &work);
         git(&["remote", "add", "origin", bare.to_str().unwrap()], &work);
@@ -1787,7 +1844,6 @@ mod tests {
         assert!(!load.is_busy(), "nothing was fetched");
     }
 
-    #[test]
     /// The repositories offered in the connect step are the session's, which
     /// the terminal writes too — so a repo opened in one front-end is offered
     /// by the other. Most recent first, with no repeats.
@@ -1902,6 +1958,51 @@ mod tests {
         assert!(
             !app.session.collections.is_empty(),
             "the fetched collection reached the session"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A PaperTrail report loads from git the way a collection does — one file
+    /// out of one ref — and lands in the report editor with its provenance, so
+    /// "Save to Git" can push straight back to the file it came from.
+    #[test]
+    fn a_report_can_be_loaded_from_a_real_repository_end_to_end() {
+        let (repo_url, base) = seed_bare_repo();
+        let mut app = GuiApp::for_test(Session::default());
+        let s = Strings::for_language(&Language::English);
+        let mut load = LoadFlow::new(LoadTarget::Report);
+        load.flow.url = repo_url.clone();
+
+        start_list_refs(&mut load, &s);
+        pump_until_past(&mut load, &mut app, LoadStep::Connect);
+        load.selected_branch = main_branch_index(&load);
+        start_list_files(&mut load, &s);
+        pump_until_past(&mut load, &mut app, LoadStep::PickRef);
+
+        let offered = load.visible_files();
+        assert!(offered.contains(&"nightly.trail".to_string()));
+        assert!(
+            !offered.contains(&"api.hurl".to_string()),
+            "a report load offers reports, not collections"
+        );
+
+        load.selected_path = Some("nightly.trail".to_string());
+        start_checkout(&mut load, &s);
+        assert!(
+            pump_until_past(&mut load, &mut app, LoadStep::PickFile),
+            "the wizard closes itself once the report is loaded"
+        );
+
+        let editor = app.report_editor.as_ref().expect("the report tab opened");
+        assert_eq!(editor.report.name, "Nightly", "the header names the tab");
+        assert!(
+            editor.report.git_origin.is_some(),
+            "the report remembers where it came from, so it can be pushed back"
+        );
+        assert_eq!(
+            app.session.reports.len(),
+            1,
+            "it is carried in the session, so it survives a restart"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

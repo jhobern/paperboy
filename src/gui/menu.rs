@@ -225,9 +225,12 @@ fn top_menu<R>(
 /// than one flat list, because the local and Git variants of each had grown to
 /// a dozen sibling entries where "open" and "save" items were interleaved.
 ///
-/// There is deliberately no separate "Import Postman" entry: Open ▸ Collection
-/// sniffs Postman JSON and Hurl alike, so a second command pointing at exactly
-/// the same loader only made the menu longer.
+/// The File menu, shaped the way the terminal's is: **what** first, **where**
+/// second. "Open ▸ Workspace ▸ From Postman…" says what a Postman import
+/// produces, where a bare "From Postman…" sitting among the open commands left
+/// the user to guess; and the same submenu is where "Local folder…" and "From
+/// Git…" live, so the sources for a thing are listed together instead of being
+/// spread over three top-level entries.
 fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
     let (title, mnemonic) = (app.strings.gui_menu_file, app.strings.gui_menu_file_key);
     top_menu(app, ui, title, mnemonic, |app, ui| {
@@ -240,51 +243,68 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.separator();
 
+        // Submenus close only themselves, leaving the File menu hanging open
+        // over the app; every leaf sets this so the whole menu goes with it.
         let mut close_menu = false;
         ui.menu_button(app.strings.gui_menu_open, |ui| {
-            if ui.button(app.strings.gui_menu_item_collection).clicked() {
-                open_via_picker(app, OpenKind::Collection);
-                close_menu = true;
-                ui.close();
-            }
-            if ui.button(app.strings.gui_menu_item_environment).clicked() {
-                open_via_picker(app, OpenKind::Environment);
-                close_menu = true;
-                ui.close();
-            }
-            if ui.button(app.strings.gui_menu_item_workspace).clicked() {
-                open_via_picker(app, OpenKind::Workspace);
-                close_menu = true;
-                ui.close();
-            }
-            if ui.button(app.strings.file_kind_report).clicked() {
-                open_via_picker(app, OpenKind::Report);
-                close_menu = true;
-                ui.close();
-            }
+            ui.menu_button(app.strings.file_kind_collection, |ui| {
+                if ui.button(app.strings.gui_menu_from_file).clicked() {
+                    open_via_picker(app, OpenKind::Collection);
+                    close_menu = true;
+                    ui.close();
+                }
+                if ui.button(app.strings.gui_menu_from_git).clicked() {
+                    app.remote.open_load();
+                    close_menu = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button(app.strings.file_kind_environment, |ui| {
+                if ui.button(app.strings.gui_menu_from_file).clicked() {
+                    open_via_picker(app, OpenKind::Environment);
+                    close_menu = true;
+                    ui.close();
+                }
+                // The same flow as a collection: which of the two arrived is
+                // read off the file that was picked, not asked up front.
+                if ui.button(app.strings.gui_menu_from_git).clicked() {
+                    app.remote.open_load();
+                    close_menu = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button(app.strings.file_kind_report, |ui| {
+                if ui.button(app.strings.gui_menu_from_file).clicked() {
+                    open_via_picker(app, OpenKind::Report);
+                    close_menu = true;
+                    ui.close();
+                }
+                if ui.button(app.strings.gui_menu_from_git).clicked() {
+                    app.remote.open_load_report();
+                    close_menu = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button(app.strings.file_kind_workspace, |ui| {
+                if ui.button(app.strings.gui_menu_from_folder).clicked() {
+                    open_via_picker(app, OpenKind::Workspace);
+                    close_menu = true;
+                    ui.close();
+                }
+                if ui.button(app.strings.gui_menu_from_git).clicked() {
+                    app.remote.open_load_workspace();
+                    close_menu = true;
+                    ui.close();
+                }
+                // A Postman import produces a whole folder of collections and
+                // environments — a workspace — so this is where it belongs.
+                if ui.button(app.strings.gui_menu_from_postman).clicked() {
+                    app.postman.open();
+                    close_menu = true;
+                    ui.close();
+                }
+            });
         });
-        ui.menu_button(app.strings.gui_menu_open_git, |ui| {
-            if ui
-                .button(app.strings.gui_menu_item_collection_or_env)
-                .clicked()
-            {
-                app.remote.open_load();
-                close_menu = true;
-                ui.close();
-            }
-            if ui.button(app.strings.gui_menu_item_workspace).clicked() {
-                app.remote.open_load_workspace();
-                close_menu = true;
-                ui.close();
-            }
-        });
-        // A Postman import produces a whole folder of collections and
-        // environments, so it belongs beside the other Workspace sources.
-        if ui.button(app.strings.postman_menu_item).clicked() {
-            app.postman.open();
-            close_menu = true;
-            ui.close();
-        }
         ui.separator();
 
         // Save writes straight to the file the thing came from; Save As always
@@ -309,66 +329,62 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             ui.close();
         }
         ui.menu_button(app.strings.gui_menu_save_as, |ui| {
-            if ui.button(app.strings.gui_menu_item_collection).clicked() {
-                save_via_picker(app, SaveKind::Collection);
-                close_menu = true;
-                ui.close();
-            }
-            if ui.button(app.strings.gui_menu_item_response).clicked() {
-                save_via_picker(app, SaveKind::Response);
-                close_menu = true;
-                ui.close();
-            }
-            // Only saveable while a report is open in the editor -- the same
-            // condition the "Save to git > Report" entry uses.
-            if ui
-                .add_enabled(
-                    app.report_editor.is_some(),
-                    egui::Button::new(app.strings.file_kind_report),
-                )
-                .clicked()
-            {
-                save_via_picker(app, SaveKind::Report);
-                close_menu = true;
-                ui.close();
-            }
-        });
-        ui.menu_button(app.strings.gui_menu_save_git, |ui| {
-            if ui.button(app.strings.gui_menu_item_collection).clicked() {
-                app.remote.open_save_collection(app.active_ci());
-                close_menu = true;
-                ui.close();
-            }
-            // Only offered where it can work: a workspace push needs a tab that
-            // came from git, and a report push needs a report to be open.
+            ui.menu_button(app.strings.file_kind_collection, |ui| {
+                if ui.button(app.strings.gui_menu_to_file).clicked() {
+                    save_via_picker(app, SaveKind::Collection);
+                    close_menu = true;
+                    ui.close();
+                }
+                if ui.button(app.strings.gui_menu_to_git).clicked() {
+                    app.remote.open_save_collection(app.active_ci());
+                    close_menu = true;
+                    ui.close();
+                }
+            });
+            // Only offered where they can work: a report save needs a report in
+            // the editor, and a workspace push needs a tab that came from git.
+            let has_report = app.report_editor.is_some();
+            ui.menu_button(app.strings.file_kind_report, |ui| {
+                if ui
+                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_file))
+                    .clicked()
+                {
+                    save_via_picker(app, SaveKind::Report);
+                    close_menu = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_git))
+                    .clicked()
+                {
+                    app.remote.open_save_report();
+                    close_menu = true;
+                    ui.close();
+                }
+            });
             let ci = app.active_ci();
             let is_ws = app
                 .session
                 .collections
                 .get(ci)
                 .is_some_and(|c| c.workspace_git_origin.is_some());
-            if ui
-                .add_enabled(
-                    is_ws,
-                    egui::Button::new(app.strings.gui_menu_item_workspace),
-                )
-                .clicked()
-            {
-                app.remote.open_save_workspace(ci);
-                close_menu = true;
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    app.report_editor.is_some(),
-                    egui::Button::new(app.strings.file_kind_report),
-                )
-                .clicked()
-            {
-                app.remote.open_save_report();
-                close_menu = true;
-                ui.close();
-            }
+            ui.menu_button(app.strings.file_kind_workspace, |ui| {
+                if ui
+                    .add_enabled(is_ws, egui::Button::new(app.strings.gui_menu_to_git))
+                    .clicked()
+                {
+                    app.remote.open_save_workspace(ci);
+                    close_menu = true;
+                    ui.close();
+                }
+            });
+            ui.menu_button(app.strings.gui_menu_kind_response, |ui| {
+                if ui.button(app.strings.gui_menu_to_file).clicked() {
+                    save_via_picker(app, SaveKind::Response);
+                    close_menu = true;
+                    ui.close();
+                }
+            });
         });
         ui.separator();
 
@@ -389,8 +405,6 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // Closing a submenu leaves the parent File menu open; dismiss it too so
-        // picking an item doesn't strand a half-open menu over the app.
         if close_menu {
             ui.close();
         }

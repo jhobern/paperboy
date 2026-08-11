@@ -12,6 +12,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI File menu names what it opens before where it comes from.** It used
+  to lead with the source — "Open", "Open from Git", and a bare "From
+  Postman…" that never said what a Postman import produces. It now follows the
+  terminal's shape: **Open ▸ Workspace ▸ From Postman…**, with every source for
+  a thing listed together (a file, a folder, Git, Postman), and **Save As ▸
+  Collection ▸ To Git…** the same way round. Entries that cannot work — pushing
+  a workspace that never came from git, saving a report with none open — stay
+  visible but disabled rather than being hidden or silently failing.
+- **Reports load from Git in the GUI.** The terminal has always offered it; the
+  GUI's git wizard only knew about collections, environments and workspaces, so
+  a `.trail` living in a repo had to be cloned by hand first. Open ▸ Report ▸
+  From Git… now lists the repo's `.trail` files, opens the chosen one in the
+  report editor, and remembers where it came from so Save As ▸ Report ▸ To Git…
+  pushes straight back to it.
+
 - **The GUI's git wizard offers the repositories you have already used.** The
   terminal has kept a list of recent remote URLs for a while and offers it under
   the URL field; the GUI kept writing to the same list but never showed it, so a
