@@ -10,6 +10,7 @@ mod editor;
 mod git_save;
 mod input;
 mod line_editor;
+mod listscroll;
 mod new_request;
 mod postman;
 pub(crate) mod remote;

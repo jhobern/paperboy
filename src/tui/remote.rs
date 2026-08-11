@@ -1,3 +1,4 @@
+use super::listscroll::ListScroll;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -56,6 +57,10 @@ pub(crate) struct RemoteWizard {
     /// reset whenever the step changes.
     pub(crate) filter: String,
     pub(crate) sel: usize,
+    /// Where the ref/file list is scrolled to, carried between frames (see
+    /// [`ListScroll`]). Shared by both pickers for the same reason `filter`
+    /// and `sel` are: only one is ever on screen at a time.
+    pub(crate) list_scroll: ListScroll,
 }
 
 impl RemoteWizard {
@@ -69,6 +74,7 @@ impl RemoteWizard {
             recent_sel: None,
             filter: String::new(),
             sel: 0,
+            list_scroll: ListScroll::default(),
         }
     }
 
@@ -118,7 +124,8 @@ pub(crate) fn draw_filter_list(
     items: &[String],
     sel: usize,
     th: &Theme,
-) {
+    scroll: &ListScroll,
+) -> usize {
     let w = (f.area().width * 7 / 10).max(50);
     let h = (f.area().height * 7 / 10).max(10);
     let area = centered_rect(w, h, f.area());
@@ -155,16 +162,14 @@ pub(crate) fn draw_filter_list(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{203a} ");
-    let mut st = ListState::default();
-    if !vis.is_empty() {
-        st.select(Some(sel.min(vis.len() - 1)));
-    }
-    f.render_stateful_widget(list, rows[1], &mut st);
+    let sel = (!vis.is_empty()).then(|| sel.min(vis.len() - 1));
+    let offset = scroll.render(f, rows[1], list, sel, vis.len());
 
     f.render_widget(
         Paragraph::new(Line::styled(s.git_filter_hint, Style::default().fg(th.dim))),
         rows[2],
     );
+    offset
 }
 
 /// A small fixed-choice popup (used by the Workspace git-load file-type
@@ -360,13 +365,31 @@ pub(crate) fn draw_remote_wizard_with_hits(
         }
         RemoteStage::PickRef => {
             let labels: Vec<String> = w.flow.ref_choices(s).into_iter().map(|r| r.label).collect();
-            draw_filter_list(f, s, s.git_pick_ref_title, &w.filter, &labels, w.sel, th);
-            register_remote_filter_hits(f, app, &w.filter, &labels, w.sel);
+            let first = draw_filter_list(
+                f,
+                s,
+                s.git_pick_ref_title,
+                &w.filter,
+                &labels,
+                w.sel,
+                th,
+                &w.list_scroll,
+            );
+            register_remote_filter_hits(f, app, &w.filter, &labels, first);
         }
         RemoteStage::PickFile => {
             let files = w.flow.pickable_files();
-            draw_filter_list(f, s, s.git_pick_file_title, &w.filter, &files, w.sel, th);
-            register_remote_filter_hits(f, app, &w.filter, &files, w.sel);
+            let first = draw_filter_list(
+                f,
+                s,
+                s.git_pick_file_title,
+                &w.filter,
+                &files,
+                w.sel,
+                th,
+                &w.list_scroll,
+            );
+            register_remote_filter_hits(f, app, &w.filter, &files, first);
         }
         RemoteStage::PickWorkspaceFilter => {
             let labels: Vec<&str> = WorkspaceGitFilter::ALL.iter().map(|f| f.label(s)).collect();
@@ -425,12 +448,15 @@ pub(crate) fn draw_remote_wizard_with_hits(
         }
     }
 
+    /// `first` is the scroll offset the list was actually drawn with — taken
+    /// from the draw call rather than recomputed here, because the viewport is
+    /// carried between frames now and only the render knows where it ended up.
     fn register_remote_filter_hits(
         f: &Frame,
         app: Option<&TuiApp>,
         filter: &str,
         items: &[String],
-        sel: usize,
+        first: usize,
     ) {
         let Some(app) = app else {
             return;
@@ -455,12 +481,6 @@ pub(crate) fn draw_remote_wizard_with_hits(
             return;
         }
         let visible = rows[1].height as usize;
-        let selected = sel.min(vis.len() - 1);
-        let first = if selected >= visible {
-            selected + 1 - visible
-        } else {
-            0
-        };
         app.push_mouse_hit(
             MouseLayer::Overlay,
             rows[1],

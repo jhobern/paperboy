@@ -18,6 +18,7 @@ use crate::request::{self, build_request_json};
 
 use super::editor::*;
 use super::git_save::*;
+use super::listscroll::ListScroll;
 use super::new_request::*;
 use super::postman::*;
 use super::remote::*;
@@ -1171,23 +1172,21 @@ pub struct TuiApp {
     /// recorded during draw so the scroll can be clamped to stop at the name's
     /// end (no scrolling past into blank space).
     pub(crate) list_scroll_w: std::cell::Cell<u16>,
-    /// The request list's vertical scroll offset (its first visible row),
-    /// carried between frames.
-    ///
-    /// This has to persist. A `ListState` built fresh each frame starts at row
-    /// zero, and ratatui then scrolls the *minimum* needed to reveal the
-    /// selection -- which lands the selection on the last visible row every
-    /// time it is below the fold. The list would then follow the cursor rather
-    /// than the cursor moving through the list: walking up a long tree kept the
-    /// selected row pinned to the bottom edge and scrolled the whole tree past
-    /// it. Remembering where the viewport was leaves ratatui with nothing to do
-    /// until the selection actually reaches an edge, which is the behaviour
-    /// every list in every editor has.
-    pub(crate) list_offset: std::cell::Cell<usize>,
-    /// Which tab [`Self::list_offset`] belongs to. Another tab's scroll
-    /// position means nothing here, so switching tabs starts at the top and
-    /// lets the selection pull the viewport down to itself.
-    pub(crate) list_offset_tab: std::cell::Cell<usize>,
+    /// The request/workspace tree's vertical scroll offset, carried between
+    /// frames and tagged with the tab it belongs to (another tab's scroll
+    /// position means nothing in this one). See [`ListScroll`] for why a list
+    /// that forgets where it was scrolled to follows the cursor instead of
+    /// letting the cursor move through it.
+    pub(crate) list_scroll: ListScroll,
+    /// Scroll position of the Global Environments panel.
+    pub(crate) env_list_scroll: ListScroll,
+    /// Scroll position of the variables list inside the environment popup,
+    /// tagged with the environment on show so opening a different one starts
+    /// at the top.
+    pub(crate) env_var_scroll: ListScroll,
+    /// Scroll position of the workspace file picker, tagged with the folder it
+    /// is listing.
+    pub(crate) ws_picker_scroll: ListScroll,
     pub(crate) global_env_scroll_w: std::cell::Cell<u16>,
     pub(crate) overlay: Option<Overlay>,
     /// Vertical scroll offset (rows) into the currently-open Help popup's
@@ -1417,8 +1416,10 @@ impl Default for TuiApp {
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
-            list_offset: std::cell::Cell::new(0),
-            list_offset_tab: std::cell::Cell::new(0),
+            list_scroll: ListScroll::default(),
+            env_list_scroll: ListScroll::default(),
+            env_var_scroll: ListScroll::default(),
+            ws_picker_scroll: ListScroll::default(),
             global_env_scroll_w: std::cell::Cell::new(0),
             overlay: None,
             help_scroll: 0,

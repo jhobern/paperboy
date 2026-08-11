@@ -122,7 +122,7 @@ fn the_list_scrolls_only_when_the_cursor_reaches_an_edge() {
     // Jump to the bottom, which necessarily scrolls the list.
     app.collections[0].list_cursor = 59;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let bottom = app.list_offset.get();
+    let bottom = app.list_scroll.offset();
     assert!(bottom > 0, "a selection past the fold scrolled the list");
 
     // Now step up one row. The cursor moves inside the viewport; the viewport
@@ -130,7 +130,7 @@ fn the_list_scrolls_only_when_the_cursor_reaches_an_edge() {
     app.collections[0].list_cursor = 58;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     assert_eq!(
-        app.list_offset.get(),
+        app.list_scroll.offset(),
         bottom,
         "stepping up inside the panel does not scroll it"
     );
@@ -139,13 +139,40 @@ fn the_list_scrolls_only_when_the_cursor_reaches_an_edge() {
     // does the list scroll again.
     app.collections[0].list_cursor = bottom;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    assert_eq!(app.list_offset.get(), bottom, "still at the top row");
+    assert_eq!(app.list_scroll.offset(), bottom, "still at the top row");
     app.collections[0].list_cursor = bottom - 1;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     assert_eq!(
-        app.list_offset.get(),
+        app.list_scroll.offset(),
         bottom - 1,
         "past the top edge, the list scrolls by one"
+    );
+}
+
+/// The same defect the tree had, in the panel below it: the Global
+/// Environments list is drawn from its own `ListState`, and a fresh one every
+/// frame would drag the list along under the cursor.
+#[test]
+fn the_environments_panel_scrolls_the_same_way_the_tree_does() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.global_envs = (0..60)
+        .map(|i| crate::environment::parse_vars(format!("env{i}"), ""))
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    app.global_env_idx = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let bottom = app.env_list_scroll.offset();
+    assert!(bottom > 0, "a selection past the fold scrolled the panel");
+
+    app.global_env_idx = 58;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.env_list_scroll.offset(),
+        bottom,
+        "stepping up inside the panel does not scroll it"
     );
 }
 
@@ -175,12 +202,12 @@ fn a_tab_switch_does_not_inherit_the_other_tabs_scroll() {
 
     app.collections[0].list_cursor = 59;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    assert!(app.list_offset.get() > 0);
+    assert!(app.list_scroll.offset() > 0);
 
     app.active_tab = 1;
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     assert_eq!(
-        app.list_offset.get(),
+        app.list_scroll.offset(),
         0,
         "the second tab's selection is its first row, so it starts at the top"
     );

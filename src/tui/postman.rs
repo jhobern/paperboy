@@ -5,13 +5,14 @@
 //! the terminal's presentation of it: which step is on screen, the text editors
 //! with their cursors, and the highlighted row.
 
+use super::listscroll::ListScroll;
 use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::i18n::Strings;
 use crate::postman_flow::{
@@ -63,6 +64,9 @@ pub(crate) struct PostmanWizard {
     /// The step a failure interrupted, so dismissing the error returns there
     /// rather than throwing the whole wizard back to the key prompt.
     pub(crate) before_error: Step,
+    /// Where the workspace list is scrolled to, carried between frames (see
+    /// [`ListScroll`]).
+    pub(crate) list_scroll: ListScroll,
 }
 
 impl PostmanWizard {
@@ -79,6 +83,7 @@ impl PostmanWizard {
             field: 0,
             option_row: 0,
             before_error: Step::Connect,
+            list_scroll: ListScroll::default(),
         }
     }
 
@@ -376,11 +381,8 @@ fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{203a} ");
-    let mut st = ListState::default();
-    if !items.is_empty() {
-        st.select(Some(w.flow.selected.min(items.len() - 1)));
-    }
-    f.render_stateful_widget(list, rows[1], &mut st);
+    let sel = (!items.is_empty()).then(|| w.flow.selected.min(items.len() - 1));
+    w.list_scroll.render(f, rows[1], list, sel, items.len());
     f.render_widget(
         Paragraph::new(Line::styled(s.git_filter_hint, Style::default().fg(th.dim))),
         rows[2],

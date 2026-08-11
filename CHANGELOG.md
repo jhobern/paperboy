@@ -922,6 +922,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Every other long list scrolled the way the workspace tree used to.** The
+  tree was fixed to let the cursor travel through the visible rows; the same
+  defect (a list rebuilt from scratch each frame, so it always scrolled the
+  minimum needed to reveal the selection and pinned it to the bottom edge) was
+  in nine more lists: the Global Environments panel, the environment popup's
+  variables, the workspace file picker, the git branch/tag and file pickers,
+  the Postman workspace picker, the theme list and the new-theme base list, and
+  the wizard's header-name and content-type dropdowns. All ten now share one
+  remembered scroll position, which also keeps their mouse hit-testing honest —
+  a click lands on the row it was drawn on rather than on where the old
+  formula assumed the list had scrolled to. Lists that can't overflow their
+  popup (a three-row dropdown, a menu sized to its own items) are unchanged.
+
 - **Three panels stopped redoing the same work on every frame.** The Global
   Environments panel rescanned the whole workspace folder from disk several
   times a frame; it now reads the workspace scan cache both front-ends already

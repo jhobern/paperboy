@@ -16,6 +16,7 @@ use crate::tree;
 use super::app::*;
 use super::editor::*;
 use super::git_save::*;
+use super::listscroll::ListScroll;
 use super::new_request::*;
 use super::postman::*;
 use super::remote::*;
@@ -2177,23 +2178,16 @@ pub(crate) fn draw_collection_left(
             .fg(th.bg)
             .add_modifier(Modifier::BOLD),
     );
-    // Seeded with where the viewport was last frame, not with zero -- see
-    // `TuiApp::list_offset` for why that difference is the whole behaviour of
-    // the list. ratatui adjusts it only when the selection has moved outside
-    // it, so the cursor travels through the visible rows and the tree scrolls
-    // only once the cursor reaches an edge.
-    let carried = if app.list_offset_tab.get() == ci {
-        app.list_offset.get()
+    // The viewport is carried across frames (see `ListScroll`), tagged with
+    // this tab so another tree's scroll position doesn't leak into it.
+    let sel = if view_rows.is_empty() {
+        None
     } else {
-        0
+        Some(sel)
     };
-    let mut st = ListState::default().with_offset(carried);
-    if !view_rows.is_empty() {
-        st.select(Some(sel));
-    }
-    f.render_stateful_widget(list, panes[0], &mut st);
-    app.list_offset.set(st.offset());
-    app.list_offset_tab.set(ci);
+    let list_offset =
+        app.list_scroll
+            .render_ctx(f, panes[0], list, sel, view_rows.len(), ci as u64);
     let list_inner = Rect {
         x: panes[0].x.saturating_add(1),
         y: panes[0].y.saturating_add(1),
@@ -2210,7 +2204,7 @@ pub(crate) fn draw_collection_left(
         list_inner,
         MouseHitTarget::Scroll(MouseScrollTarget::List),
     );
-    let first = st.offset();
+    let first = list_offset;
     let visible = list_inner.height as usize;
     for row in first..view_rows.len().min(first + visible) {
         app.push_mouse_hit(
@@ -2482,9 +2476,9 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     }
     let list = List::new(items)
         .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
-    let mut st = ListState::default();
-    st.select(Some(sel));
-    f.render_stateful_widget(list, items_area, &mut st);
+    let env_offset = app
+        .env_list_scroll
+        .render(f, items_area, list, Some(sel), rows.len());
     if let Some(strip) = filter_area {
         // While typing, a block cursor marks where the next character lands —
         // the strip is the only thing with focus, so without it there is no
@@ -2535,7 +2529,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             MouseHitTarget::SelectGlobalEnvRow(row),
         );
     }
-    let first = st.offset();
+    let first = env_offset;
     let visible = items_area.height as usize;
     for row in first..rows.len().min(first + visible) {
         app.push_mouse_hit(
@@ -2678,9 +2672,11 @@ pub(crate) fn draw_env_popup(
         // status dot's colour, which must remain visible when selected.
         .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("› ");
-    let mut st = ListState::default();
-    st.select(Some(sel));
-    f.render_stateful_widget(list, area, &mut st);
+    // Tagged with the environment: opening a different one shows it from the
+    // top rather than wherever the last one happened to be scrolled to.
+    let var_offset =
+        app.env_var_scroll
+            .render_ctx(f, area, list, Some(sel), env.vars.len(), popup.env_id);
     app.set_mouse_layer(MouseLayer::Overlay);
     let inner = Rect {
         x: area.x.saturating_add(1),
@@ -2693,7 +2689,7 @@ pub(crate) fn draw_env_popup(
         inner,
         MouseHitTarget::Scroll(MouseScrollTarget::OverlayList),
     );
-    let first = st.offset();
+    let first = var_offset;
     let visible = inner.height as usize;
     for row in first..env.vars.len().min(first + visible) {
         app.push_mouse_hit(
@@ -5035,9 +5031,26 @@ pub(crate) fn draw_workspace_picker(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
-    let mut st = ListState::default();
-    st.select(Some(picker.selected));
-    f.render_stateful_widget(list, rows[0], &mut st);
+    // Tagged with the folder and filter this listing came from, so a picker
+    // reopened somewhere else (or with the filter toggled, which rebuilds the
+    // whole list) starts at the top instead of in the middle of nowhere.
+    let ctx = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        picker.root.hash(&mut h);
+        picker.filter_hurl_json.hash(&mut h);
+        h.finish()
+    };
+    let fallback = ListScroll::default();
+    let scroll = app.map_or(&fallback, |a| &a.ws_picker_scroll);
+    let picker_offset = scroll.render_ctx(
+        f,
+        rows[0],
+        list,
+        Some(picker.selected),
+        picker.entries.len(),
+        ctx,
+    );
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Overlay);
         app.push_mouse_hit(
@@ -5045,7 +5058,7 @@ pub(crate) fn draw_workspace_picker(
             rows[0],
             MouseHitTarget::Scroll(MouseScrollTarget::WorkspacePicker),
         );
-        let first = st.offset();
+        let first = picker_offset;
         let visible = rows[0].height as usize;
         for row in first..picker.entries.len().min(first + visible) {
             app.push_mouse_hit(

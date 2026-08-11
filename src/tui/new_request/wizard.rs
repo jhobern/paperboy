@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::tui::listscroll::ListScroll;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -448,6 +449,11 @@ impl WizardTab {
     }
 }
 
+/// `ctx` values for [`NewReq::dropdown_scroll`], so the two dropdowns that
+/// share it don't inherit each other's viewport.
+const KEY_DROPDOWN: u64 = 1;
+const CTYPE_DROPDOWN: u64 = 2;
+
 /// In-progress New Request / Edit Request form (an overlay while open).
 pub(crate) struct NewReq {
     pub(crate) name: Editor,
@@ -480,6 +486,10 @@ pub(crate) struct NewReq {
     /// True once the user has dismissed the dropdown with Esc; reset when they
     /// type or move to a different field.
     pub(crate) suggest_hidden: bool,
+    /// Where the key-suggestion and content-type dropdowns are scrolled to,
+    /// carried between frames (see [`ListScroll`]); both cap at eight rows and
+    /// scroll beyond that, and only one is ever open at a time.
+    pub(crate) dropdown_scroll: ListScroll,
     /// True once the user has dismissed the Form Kind (Text/File) dropdown
     /// with Esc; reset whenever focus moves to a different field, so it
     /// reopens (like `suggest_hidden`) the next time Kind is focused.
@@ -571,6 +581,7 @@ impl NewReq {
             base_url,
             suggest_hi: None,
             suggest_hidden: false,
+            dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
             ctype_hi: None,
@@ -710,6 +721,7 @@ impl NewReq {
             base_url,
             suggest_hi: None,
             suggest_hidden: false,
+            dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
             ctype_hi: None,
@@ -2516,9 +2528,9 @@ pub(crate) fn draw_content_type_dropdown(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{203a} ");
-    let mut st = ListState::default();
-    st.select(selected);
-    f.render_stateful_widget(list, popup, &mut st);
+    let offset =
+        form.dropdown_scroll
+            .render_ctx(f, popup, list, selected, labels.len(), CTYPE_DROPDOWN);
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Popup);
         let inner = Rect {
@@ -2527,7 +2539,7 @@ pub(crate) fn draw_content_type_dropdown(
             width: popup.width.saturating_sub(2),
             height: popup.height.saturating_sub(2),
         };
-        let first = st.offset();
+        let first = offset;
         for row in first..labels.len().min(first + inner.height as usize) {
             app.push_mouse_hit(
                 MouseLayer::Popup,
@@ -2602,9 +2614,9 @@ pub(crate) fn draw_key_suggestions(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{203a} ");
-    let mut st = ListState::default();
-    st.select(form.suggest_hi);
-    f.render_stateful_widget(list, popup, &mut st);
+    let offset =
+        form.dropdown_scroll
+            .render_ctx(f, popup, list, form.suggest_hi, sugs.len(), KEY_DROPDOWN);
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Popup);
         let inner = Rect {
@@ -2613,7 +2625,7 @@ pub(crate) fn draw_key_suggestions(
             width: popup.width.saturating_sub(2),
             height: popup.height.saturating_sub(2),
         };
-        let first = st.offset();
+        let first = offset;
         for row in first..sugs.len().min(first + inner.height as usize) {
             app.push_mouse_hit(
                 MouseLayer::Popup,
