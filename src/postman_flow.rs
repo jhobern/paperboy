@@ -235,6 +235,105 @@ pub(crate) struct PostmanFlow {
     resolved_key: Arc<Mutex<Option<(String, String)>>>,
 }
 
+/// Where the Postman API key comes from.
+///
+/// The key field accepts a `{{ … }}` provider reference exactly as a `.vars`
+/// file does, but knowing to type `{{ op://Vault/Item/credential }}` is a lot
+/// to ask of someone whose job today is "import our Postman workspace". So the
+/// front-ends ask *where the key lives* first, and then ask for the one piece
+/// only the user knows — the item path, the parameter name, the variable name
+/// — and assemble the reference themselves.
+///
+/// The wrapping is all this type does; resolving the finished reference is
+/// still [`resolve_key`]'s job, so nothing downstream has to know the wizard
+/// offered a choice at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum KeySource {
+    /// The key itself, pasted in. The default: it is what someone with the key
+    /// on their clipboard expects, and what `$POSTMAN_API_KEY` seeds.
+    #[default]
+    Paste,
+    OnePassword,
+    Ssm,
+    Env,
+}
+
+impl KeySource {
+    /// Every source, in the order the front-ends cycle through them.
+    pub(crate) const ALL: [KeySource; 4] = [
+        KeySource::Paste,
+        KeySource::OnePassword,
+        KeySource::Ssm,
+        KeySource::Env,
+    ];
+
+    /// The next/previous source, wrapping — for a left/right selector.
+    pub(crate) fn cycled(self, forward: bool) -> Self {
+        let i = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        let n = Self::ALL.len();
+        Self::ALL[if forward { i + 1 } else { i + n - 1 } % n]
+    }
+
+    /// Whether what the user types is the credential itself (and so should be
+    /// masked on screen). A reference is a *path* to a credential: masking it
+    /// would only stop the user checking they typed it right.
+    pub(crate) fn is_secret(self) -> bool {
+        matches!(self, KeySource::Paste)
+    }
+
+    /// Wrap what the user typed into the reference the resolver understands.
+    ///
+    /// Tolerant of a user who already knows the syntax: an entry that is
+    /// already a `{{ … }}` reference, or already carries its provider's
+    /// prefix, is passed through rather than wrapped twice.
+    pub(crate) fn reference(self, entry: &str) -> String {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.contains("{{") {
+            return entry.to_string();
+        }
+        match self {
+            KeySource::Paste => entry.to_string(),
+            KeySource::OnePassword => {
+                let path = entry.strip_prefix("op://").unwrap_or(entry);
+                format!("{{{{ op://{path} }}}}")
+            }
+            KeySource::Ssm => {
+                let name = entry.strip_prefix("ssm:").unwrap_or(entry);
+                format!("{{{{ ssm:{name} }}}}")
+            }
+            KeySource::Env => {
+                let name = entry.strip_prefix("env:").unwrap_or(entry);
+                format!("{{{{ env:{name} }}}}")
+            }
+        }
+    }
+
+    /// The inverse of [`Self::reference`]: which source a stored key came from,
+    /// and what the user typed to make it. Lets a wizard reopened on an
+    /// existing key show it the way it was entered rather than as raw syntax.
+    pub(crate) fn detect(raw: &str) -> (Self, String) {
+        let raw = raw.trim();
+        let Some(inner) = raw
+            .strip_prefix("{{")
+            .and_then(|r| r.strip_suffix("}}"))
+            .map(str::trim)
+        else {
+            return (KeySource::Paste, raw.to_string());
+        };
+        if let Some(path) = inner.strip_prefix("op://") {
+            (KeySource::OnePassword, path.to_string())
+        } else if let Some(name) = inner.strip_prefix("ssm:") {
+            (KeySource::Ssm, name.to_string())
+        } else if let Some(name) = inner.strip_prefix("env:") {
+            (KeySource::Env, name.to_string())
+        } else {
+            // Some other reference syntax: leave it exactly as typed rather
+            // than mangling it into a source that doesn't fit.
+            (KeySource::Paste, raw.to_string())
+        }
+    }
+}
+
 /// Turn whatever is in the key field into a key to send.
 ///
 /// The field takes a `{{ … }}` provider reference — `{{ op://Private/Postman/
@@ -833,6 +932,59 @@ mod tests {
 
     fn s() -> Strings {
         Strings::for_language(&Language::English)
+    }
+
+    #[test]
+    fn a_key_source_wraps_what_the_user_typed_and_reads_it_back() {
+        for src in KeySource::ALL {
+            let (back, entry) = KeySource::detect(&src.reference("secret/thing"));
+            assert_eq!(back, src, "{src:?} must survive the round trip");
+            assert_eq!(entry, "secret/thing");
+        }
+        assert_eq!(
+            KeySource::OnePassword.reference("Private/Postman/cred"),
+            "{{ op://Private/Postman/cred }}"
+        );
+        assert_eq!(
+            KeySource::Ssm.reference("/paperboy/postman"),
+            "{{ ssm:/paperboy/postman }}"
+        );
+        assert_eq!(
+            KeySource::Env.reference("POSTMAN_API_KEY"),
+            "{{ env:POSTMAN_API_KEY }}"
+        );
+    }
+
+    #[test]
+    fn a_key_source_leaves_a_user_who_already_knows_the_syntax_alone() {
+        // Already wrapped, or already prefixed: wrapping twice would break it.
+        assert_eq!(
+            KeySource::OnePassword.reference("{{ op://a/b/c }}"),
+            "{{ op://a/b/c }}"
+        );
+        assert_eq!(
+            KeySource::OnePassword.reference("op://a/b/c"),
+            "{{ op://a/b/c }}"
+        );
+        assert_eq!(KeySource::Paste.reference(""), "");
+
+        // A pasted key is not a reference, and an unfamiliar reference syntax
+        // is kept verbatim rather than forced into a source that doesn't fit.
+        assert_eq!(
+            KeySource::detect("PMAK-abc"),
+            (KeySource::Paste, "PMAK-abc".to_string())
+        );
+        assert_eq!(
+            KeySource::detect("{{ vault:x }}"),
+            (KeySource::Paste, "{{ vault:x }}".to_string())
+        );
+    }
+
+    #[test]
+    fn the_key_sources_cycle_both_ways_without_falling_off_the_end() {
+        assert_eq!(KeySource::default(), KeySource::Paste);
+        assert_eq!(KeySource::Paste.cycled(false), KeySource::Env);
+        assert_eq!(KeySource::Env.cycled(true), KeySource::Paste);
     }
 
     fn flow() -> PostmanFlow {

@@ -3661,8 +3661,19 @@ impl TuiApp {
         match w.stage() {
             PostmanStage::Connect => match key.code {
                 KeyCode::Esc => return,
-                KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % 3,
-                KeyCode::BackTab | KeyCode::Up => w.field = (w.field + 2) % 3,
+                KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS,
+                KeyCode::BackTab | KeyCode::Up => {
+                    w.field = (w.field + POSTMAN_CONNECT_FIELDS - 1) % POSTMAN_CONNECT_FIELDS;
+                }
+                // The key-source row is a choice, so Left/Right change it —
+                // the same gesture that changes the import format two steps
+                // later. On a text field they stay the editor's own.
+                KeyCode::Left if w.field == 0 => {
+                    w.key_source = w.key_source.cycled(false);
+                }
+                KeyCode::Right if w.field == 0 => {
+                    w.key_source = w.key_source.cycled(true);
+                }
                 KeyCode::Enter => {
                     w.sync_fields();
                     w.flow.submit_connect(&s);
@@ -3672,14 +3683,17 @@ impl TuiApp {
                         w.suggest_dest(import_base.as_deref());
                     }
                 }
-                _ => {
+                // The source row is a choice, not an editor: there is nothing
+                // for a keystroke to type into.
+                _ if w.field > 0 => {
                     let ed = match w.field {
-                        0 => &mut w.key,
-                        1 => &mut w.workspace_ref,
+                        1 => &mut w.key,
+                        2 => &mut w.workspace_ref,
                         _ => &mut w.base_url,
                     };
                     apply_edit_key(ed, key);
                 }
+                _ => {}
             },
             // Esc during a background call cancels the whole wizard: there is
             // nothing partial to keep, and the worker cleans up after itself.

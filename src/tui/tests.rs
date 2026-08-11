@@ -25180,19 +25180,25 @@ fn the_workspace_load_menu_opens_the_postman_wizard() {
 }
 
 #[test]
-fn the_connect_step_cycles_its_three_fields_and_types_into_the_focused_one() {
+fn the_connect_step_cycles_its_four_fields_and_types_into_the_focused_one() {
     let mut app = TuiApp::default();
     app.open_postman_wizard();
     // Start from a known state: an API key may have been picked up from the
     // environment, which would otherwise leak into the assertion below.
     postman_wizard(&mut app).key = Editor::blank();
 
+    // The first row is the key-source choice, which has nothing to type into.
+    press(&mut app, KeyCode::Char('Z'));
+    press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Char('K'));
     press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Char('W'));
     press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Char('U'));
-    // A third Tab wraps back to the key rather than falling off the end.
+    // Tabbing off the end wraps to the source row (nothing to type) and then
+    // back to the key, rather than falling off the end.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('9'));
     press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Char('2'));
 
@@ -25200,6 +25206,44 @@ fn the_connect_step_cycles_its_three_fields_and_types_into_the_focused_one() {
     assert_eq!(w.key.text(), "K2");
     assert_eq!(w.workspace_ref.text(), "W");
     assert_eq!(w.base_url.text(), "U");
+}
+
+/// The whole point of the source row: a user who keeps their key in 1Password
+/// types the item path they can read off 1Password's own "Copy Secret
+/// Reference", and the wizard writes the `{{ op://… }}` syntax for them.
+#[test]
+fn choosing_a_key_source_writes_the_reference_syntax_for_the_user() {
+    use crate::postman_flow::KeySource;
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
+
+    // Focus starts on the source row, so Right cycles it.
+    press(&mut app, KeyCode::Right);
+    assert_eq!(postman_wizard(&mut app).key_source, KeySource::OnePassword);
+
+    press(&mut app, KeyCode::Tab);
+    for c in "Private/Postman/credential".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let w = postman_wizard(&mut app);
+    assert!(
+        !w.key_source.is_secret(),
+        "an item path is an address, not the credential, so it is not masked"
+    );
+    w.sync_fields();
+    assert_eq!(
+        w.flow.key, "{{ op://Private/Postman/credential }}",
+        "the wizard assembles the reference the resolver understands"
+    );
+
+    // And Left comes back to a pasted key, which is a credential again.
+    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::Left);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key_source, KeySource::Paste);
+    assert!(w.key_source.is_secret());
 }
 
 #[test]

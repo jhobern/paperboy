@@ -35,7 +35,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   import lists, plans and downloads with a client apiece, so the resolved value
   is held for the run rather than prompting three times, and — like every
   resolved secret — it is never written to disk. A reference the provider won't
-  answer is reported as such instead of being sent as a key.
+  answer is reported as such instead of being sent as a key. The terminal
+  wizard no longer expects you to know that syntax: its first row is a **key
+  source** — Paste, 1Password, AWS SSM or an environment variable — and once
+  you have picked one you type only the part you can read off the provider (the
+  item path 1Password's own "Copy Secret Reference" gives you, the parameter
+  name, the variable name) and the wizard assembles the reference. Only a
+  pasted key is masked on screen; an item path is an address rather than a
+  credential, and hiding it would only stop you checking you typed it right. A
+  wizard reopened on an existing key shows it the way it was entered, and
+  someone who already knows the syntax can still type it in full — it is
+  recognised rather than wrapped a second time.
 
 - **A report says what moved, not just how it scored.** Two runs that both score
   98% are not the same run if one of them fixed three rows and broke three

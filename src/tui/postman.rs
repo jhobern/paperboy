@@ -16,7 +16,7 @@ use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::i18n::Strings;
 use crate::postman_flow::{
-    PostmanFlow, Step, default_dest_name, human_duration, item_kind_label, plan_summary,
+    KeySource, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label, plan_summary,
 };
 use crate::postman_import::ImportFormat;
 
@@ -45,10 +45,19 @@ pub(crate) enum PostmanStage {
 /// the arrow keys can simply add or subtract one.
 pub(crate) const OPTION_ROWS: usize = 6;
 
+/// The Connect step's focusable rows: the key source, the key, the workspace
+/// id and the API host.
+pub(crate) const POSTMAN_CONNECT_FIELDS: u8 = 4;
+
 /// The wizard overlay's own state: the editors, the focused field and the
 /// workspace list's highlighted row.
 pub(crate) struct PostmanWizard {
     pub(crate) flow: PostmanFlow,
+    /// What the key field is asking for — the key itself, or the address of
+    /// the place it is kept. The reference syntax is assembled from this and
+    /// the field's text (see [`KeySource::reference`]) so nobody has to type
+    /// `{{ op://… }}` from memory.
+    pub(crate) key_source: KeySource,
     pub(crate) key: Editor,
     pub(crate) workspace_ref: Editor,
     pub(crate) base_url: Editor,
@@ -56,7 +65,7 @@ pub(crate) struct PostmanWizard {
     /// browser (`FileAction::PostmanDestChooseFolder`) like every other
     /// "save into a folder" in the app, never typed here.
     pub(crate) dest: PathBuf,
-    /// Connect step: 0 = key, 1 = workspace id, 2 = API host.
+    /// Connect step: 0 = key source, 1 = key, 2 = workspace id, 3 = API host.
     pub(crate) field: u8,
     /// Options step: which row is focused (0 = destination, 1 = collections,
     /// 2 = environments, 3 = format, 4 = overwrite, 5 = the Import button).
@@ -74,8 +83,12 @@ impl PostmanWizard {
         // An API key in the environment is the one credential a user is likely
         // to already have to hand, and typing a PMAK by hand is miserable.
         let flow = PostmanFlow::new().with_env_key();
+        // A seeded key is a pasted one; `detect` keeps that honest if the
+        // seeding ever grows to understand references.
+        let (key_source, entry) = KeySource::detect(&flow.key);
         Self {
-            key: Editor::new(&flow.key, false),
+            key_source,
+            key: Editor::new(&entry, false),
             workspace_ref: Editor::blank(),
             base_url: Editor::blank(),
             dest: PathBuf::new(),
@@ -119,7 +132,7 @@ impl PostmanWizard {
     /// Copy the on-screen editors into the flow, so the flow never has to know
     /// what an [`Editor`] is.
     pub(crate) fn sync_fields(&mut self) {
-        self.flow.key = self.key.text();
+        self.flow.key = self.key_source.reference(&self.key.text());
         self.flow.workspace_ref = self.workspace_ref.text();
         self.flow.base_url = self.base_url.text();
         self.flow.dest = self.dest.to_string_lossy().into_owned();
@@ -243,16 +256,52 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
     lines
 }
 
+/// The name of a key source as the selector shows it.
+pub(crate) fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_source_paste,
+        KeySource::OnePassword => s.postman_key_source_op,
+        KeySource::Ssm => s.postman_key_source_ssm,
+        KeySource::Env => s.postman_key_source_env,
+    }
+}
+
+/// What the key field is asking for, and how to find it — both follow the
+/// chosen source, because "Postman API key" is the wrong prompt when the field
+/// wants the name of a 1Password item.
+fn key_field_label(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_label,
+        KeySource::OnePassword => s.postman_key_label_op,
+        KeySource::Ssm => s.postman_key_label_ssm,
+        KeySource::Env => s.postman_key_label_env,
+    }
+}
+
+fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_hint,
+        KeySource::OnePassword => s.postman_key_hint_op,
+        KeySource::Ssm => s.postman_key_hint_ssm,
+        KeySource::Env => s.postman_key_hint_env,
+    }
+}
+
 fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     // Wide enough for the longest hint to read as a sentence, but never wider
     // than the terminal.
     let width = 76.min(f.area().width);
     // Inner width: the panel's borders take a column on each side.
     let text_w = width.saturating_sub(2);
-    let fields: [(&'static str, &'static str, u8); 3] = [
-        (s.postman_key_label, s.postman_key_hint, 0),
-        (s.postman_workspace_label, s.postman_workspace_hint, 1),
-        (s.postman_base_url_label, s.postman_base_url_hint, 2),
+    let fields: [(&'static str, &'static str, u8); 4] = [
+        (s.postman_key_source_label, s.postman_key_source_hint, 0),
+        (
+            key_field_label(w.key_source, s),
+            key_field_hint(w.key_source, s),
+            1,
+        ),
+        (s.postman_workspace_label, s.postman_workspace_hint, 2),
+        (s.postman_base_url_label, s.postman_base_url_hint, 3),
     ];
     // label + field + however many lines the hint wraps to, per group. No
     // blank rows between them: the accented label is what starts a group, and
@@ -290,13 +339,32 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             )),
             rows[base],
         );
-        // The key is a credential, so it is masked like the git token field.
-        let (ed, mask) = match idx {
-            0 => (&w.key, true),
-            1 => (&w.workspace_ref, false),
-            _ => (&w.base_url, false),
-        };
-        render_line_field(f, rows[base + 1], ed, w.field == *idx, mask, th);
+        if *idx == 0 {
+            // A cycled value, written the way every other one-of-several
+            // choice in the app is, and lit when it holds focus.
+            let style = if w.field == 0 {
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.text)
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("‹{}›", key_source_label(w.key_source, s)),
+                    style,
+                )),
+                rows[base + 1],
+            );
+        } else {
+            // Only a pasted key is itself a credential; a reference is the
+            // *address* of one, and masking that would only stop the user
+            // checking they typed it correctly.
+            let (ed, mask) = match idx {
+                1 => (&w.key, w.key_source.is_secret()),
+                2 => (&w.workspace_ref, false),
+                _ => (&w.base_url, false),
+            };
+            render_line_field(f, rows[base + 1], ed, w.field == *idx, mask, th);
+        }
         f.render_widget(
             Paragraph::new(Line::styled(*hint, Style::default().fg(th.dim)))
                 .wrap(Wrap { trim: true }),
