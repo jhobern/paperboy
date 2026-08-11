@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use eframe::egui::{self, Align2, RichText};
+use eframe::egui::{self, RichText};
 
 use crate::i18n::{Language, Strings};
 use crate::request::RequestView;
@@ -595,7 +595,7 @@ fn revert_to_saved_dialog(
         },
     );
     let mut decided = false;
-    let _ = modal(ctx, title, |ui| {
+    let dismissed = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -614,7 +614,9 @@ fn revert_to_saved_dialog(
                 decided = true;
             }
         });
-    });
+    })
+    .dismissed;
+    decided |= dismissed;
     if !decided {
         app.dialog = Some(Dialog::RevertToSaved {
             ci,
@@ -686,11 +688,13 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
                 }
             });
         });
-    })
-    .is_some();
+    });
     // A frame egui never drew is not an answer: keep the dialog armed.
-    if !answered {
+    if answered.inner.is_none() {
         act = ExportChoice::Keep;
+    }
+    if answered.dismissed {
+        act = ExportChoice::Cancel;
     }
     match act {
         ExportChoice::Keep => app.dialog = Some(Dialog::ExportResults { path }),
@@ -771,7 +775,7 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
     let save_all = app.strings.gui_save_all_and_quit;
     let mut decided = false;
     let mut save_then_quit = false;
-    let _ = modal(ctx, title, |ui| {
+    let decided = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -790,7 +794,9 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
                 decided = true;
             }
         });
-    });
+    })
+    .dismissed
+        || decided;
     if save_then_quit {
         // A save that fails must not take the app down with it -- the dialog
         // comes back reporting the file that refused, so the work is still
@@ -831,7 +837,7 @@ fn unsaved_close_tab_dialog(
             .replace("{t}", &name),
     );
     let mut decided = false;
-    let _ = modal(ctx, title, |ui| {
+    let dismissed = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -843,7 +849,9 @@ fn unsaved_close_tab_dialog(
                 decided = true;
             }
         });
-    });
+    })
+    .dismissed;
+    decided |= dismissed;
     if !decided {
         app.dialog = Some(Dialog::UnsavedCloseTab { ci, name, count });
     } else {
@@ -869,7 +877,7 @@ fn close_git_workspace_dialog(
             .replace("{p}", &root.display().to_string()),
     );
     let mut decided = false;
-    let _ = modal(ctx, title, |ui| {
+    let dismissed = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -885,7 +893,9 @@ fn close_git_workspace_dialog(
                 decided = true;
             }
         });
-    });
+    })
+    .dismissed;
+    decided |= dismissed;
     if !decided {
         app.dialog = Some(Dialog::CloseGitWorkspace { ci, root });
     } else {
@@ -923,7 +933,7 @@ fn workspace_reload_dialog(
         app.strings.workspace_reload_save_hint,
     );
     let mut answer: Option<bool> = None;
-    let _ = modal(ctx, title, |ui| {
+    let dismissed = modal(ctx, title, |ui| {
         ui.label(question);
         ui.add_space(4.0);
         ui.label(hint);
@@ -936,7 +946,13 @@ fn workspace_reload_dialog(
                 answer = Some(false);
             }
         });
-    });
+    })
+    .dismissed;
+    // Dismissing is declining: the offer is recorded on the tab, so it comes
+    // back next launch rather than being lost.
+    if dismissed {
+        answer = Some(false);
+    }
     match answer {
         Some(true) => app.start_workspace_redownload(ci, reload),
         Some(false) => {}
@@ -952,18 +968,17 @@ fn workspace_reload_dialog(
 
 /// A centred modal window shell shared by every dialog.
 ///
-/// Returns `None` when egui declined to show the window at all (it is opened
-/// non-collapsible, so in practice this only happens if the viewport is in a
-/// state where nothing can be drawn). Callers treat that as "no answer this
-/// frame" and leave the dialog armed rather than deciding for the user — a
-/// render path must never panic, and an unanswered dialog simply reappears.
-fn modal<R>(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
-    egui::Window::new(title)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, add)
-        .and_then(|r| r.inner)
+/// [`DialogFrame::inner`] is `None` when egui declined to show the window at
+/// all. Callers treat that as "no answer this frame" and leave the dialog
+/// armed rather than deciding for the user — a render path must never panic,
+/// and an unanswered dialog simply reappears. `dismissed` is the ✕ or Escape,
+/// which every dialog runs as its Cancel.
+fn modal<R>(
+    ctx: &egui::Context,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> super::widgets::DialogFrame<R> {
+    super::widgets::dialog(ctx, title, None, add)
 }
 
 /// What an open dialog is for, once it answers. See [`PickAction`].
@@ -1535,7 +1550,7 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
     let lbl_name = app.strings.gui_name;
     let lbl_rename = app.strings.gui_rename;
     let lbl_cancel = app.strings.gui_cancel;
-    let (keep, submit) = modal(ctx, title, |ui| {
+    let frame = modal(ctx, title, |ui| {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut text)
                 .desired_width(320.0)
@@ -1553,9 +1568,12 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
             }
         });
         (keep, go)
-    })
-    // A frame egui never drew is not an answer: keep the dialog open.
-    .unwrap_or((true, false));
+    });
+    // A frame egui never drew is not an answer: keep the dialog open;
+    // dismissing it is the Cancel button.
+    let dismissed = frame.dismissed;
+    let (keep, submit) = frame.inner_or((true, false));
+    let keep = keep && !dismissed;
     if !keep {
         return;
     }
@@ -1593,7 +1611,7 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
     };
     let lbl_ok = app.strings.gui_ok;
     let lbl_cancel = app.strings.gui_cancel;
-    let (keep, submit) = modal(ctx, title, |ui| {
+    let frame = modal(ctx, title, |ui| {
         let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(360.0));
         let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let mut keep = true;
@@ -1607,9 +1625,12 @@ fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut te
             }
         });
         (keep, go)
-    })
-    // A frame egui never drew is not an answer: keep the dialog open.
-    .unwrap_or((true, false));
+    });
+    // A frame egui never drew is not an answer: keep the dialog open;
+    // dismissing it is the Cancel button.
+    let dismissed = frame.dismissed;
+    let (keep, submit) = frame.inner_or((true, false));
+    let keep = keep && !dismissed;
     if !keep {
         return;
     }
@@ -1657,7 +1678,7 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
     let lbl_name = app.strings.gui_name;
     let lbl_apply = app.strings.gui_apply;
     let lbl_cancel = app.strings.gui_cancel;
-    let action = modal(ctx, title, |ui| {
+    let frame = modal(ctx, title, |ui| {
         ui.horizontal(|ui| {
             ui.label(lbl_name);
             ui.text_edit_singleline(&mut state.spec.name);
@@ -1688,9 +1709,14 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
             }
         });
         action
-    })
-    // A frame egui never drew is not an answer: keep the dialog open.
-    .unwrap_or(Action::Keep);
+    });
+    // A frame egui never drew is not an answer: keep the dialog open;
+    // dismissing it is the Cancel button.
+    let action = if frame.dismissed {
+        Action::Cancel
+    } else {
+        frame.inner_or(Action::Keep)
+    };
 
     match action {
         Action::Cancel => {}
@@ -2026,6 +2052,47 @@ mod tests {
                 vec!["CSV", "JSON", "HTML", "Excel", "PDF"]
             );
         }
+    }
+
+    /// Escape is the way out of any dialog. Without it a modal can only be
+    /// left by finding the right button, which on a confirmation that re-arms
+    /// itself (every destructive one here does) means there is no way out at
+    /// all for someone who opened it by accident.
+    #[test]
+    fn escape_closes_a_dialog_the_way_its_cancel_button_would() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+
+        let armed = |a: &mut GuiApp| {
+            a.dialog = Some(Dialog::Rename {
+                target: RenameTarget::Tab { ci: 0 },
+                text: "whatever".to_string(),
+            });
+        };
+        let frame_with = |a: &mut GuiApp, input: egui::RawInput| {
+            let mut input = input;
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 600.0),
+            ));
+            let _ = ctx.run_ui(input, |ui| show_dialog(a, ui.ctx()));
+        };
+
+        // An ordinary frame leaves it open — the dialog re-arms itself.
+        armed(&mut a);
+        frame_with(&mut a, egui::RawInput::default());
+        assert!(a.dialog.is_some(), "a quiet frame leaves the dialog open");
+
+        let mut esc = egui::RawInput::default();
+        esc.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        frame_with(&mut a, esc);
+        assert!(a.dialog.is_none(), "Escape closes it");
     }
 
     /// Draw the menu bar once with the given input, so mnemonics are registered

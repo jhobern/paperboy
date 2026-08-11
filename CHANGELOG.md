@@ -12,6 +12,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Every GUI dialog can be left by Escape or by its corner.** The windows had
+  no ✕ and ignored Escape, so a dialog opened by accident could only be
+  answered — and the destructive confirmations re-arm themselves when they are
+  clicked away, so "wait for it to go" was not an option either. All of them
+  (rename, new name, theme editor, export results, revert to saved, the unsaved
+  quit/close warnings, the workspace reload offer, the Postman importer, the
+  git load wizard and the report node wizard) now carry a close button and
+  treat both it and Escape as their own Cancel, so dismissing does exactly what
+  the Cancel button did — an unanswered reload offer, for instance, is still
+  recorded on the tab and comes back next launch rather than being lost.
+
 - **The wizards say less and show more.** The Postman importer, the git load
   wizard and the git save wizard were each a stack of fields with a sentence of
   explanation underneath every one — a screen of prose to answer two questions.

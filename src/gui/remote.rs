@@ -638,14 +638,14 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     let mut action = UiAction::None;
 
     let strings = &app.strings;
-    egui::Window::new(title)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(460.0);
-            action = draw_flow(ui, &mut flow, colors, strings);
-        });
+    let dismissed = super::widgets::dialog(ctx, title, Some(460.0), |ui| {
+        action = draw_flow(ui, &mut flow, colors, strings);
+    })
+    .dismissed;
+    // The ✕ and Escape are the Cancel button by another name.
+    if dismissed {
+        action = UiAction::Cancel;
+    }
 
     let mut close = false;
     match action {

@@ -195,14 +195,14 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         .picker_dir(crate::session::PickerKind::Import)
         .map(std::path::Path::to_owned);
     let strings = &app.strings;
-    egui::Window::new(strings.postman_title)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(520.0);
-            action = draw(ui, &mut w, colors, strings);
-        });
+    let dismissed = super::widgets::dialog(ctx, strings.postman_title, Some(520.0), |ui| {
+        action = draw(ui, &mut w, colors, strings);
+    })
+    .dismissed;
+    // The ✕ and Escape are the Cancel button by another name.
+    if dismissed {
+        action = UiAction::Cancel;
+    }
 
     match action {
         UiAction::None => {}

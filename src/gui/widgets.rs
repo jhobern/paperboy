@@ -753,3 +753,59 @@ mod tests {
         );
     }
 }
+
+/// What a [`dialog`] frame produced, and whether the user asked to close it.
+///
+/// `inner` is `None` when egui declined to draw the window at all — which is
+/// not an answer, so callers keep the dialog armed rather than deciding for
+/// the user.
+pub(crate) struct DialogFrame<R> {
+    pub inner: Option<R>,
+    /// The user pressed Escape or clicked the window's ✕ this frame. Every
+    /// dialog treats this as its cancel, so there is always a way out that
+    /// doesn't involve finding the right button.
+    pub dismissed: bool,
+}
+
+impl<R> DialogFrame<R> {
+    /// The frame's answer, or `default` when egui drew nothing.
+    pub fn inner_or(self, default: R) -> R {
+        self.inner.unwrap_or(default)
+    }
+}
+
+/// The centred modal window shell shared by every GUI dialog.
+///
+/// Carries the two ways out a windowed dialog is expected to have: a ✕ in the
+/// title bar (egui draws it for an `open`ed window) and the Escape key. Both
+/// come back as [`DialogFrame::dismissed`] so the caller can run the same path
+/// as its own Cancel button — a dialog that can only be answered by finding
+/// the right button is a dialog people get stuck in.
+pub(crate) fn dialog<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    let mut open = true;
+    let inner = egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(w) = min_width {
+                ui.set_min_width(w);
+            }
+            add(ui)
+        })
+        .and_then(|r| r.inner);
+    // Escape is read from the raw input rather than consumed: a dialog is the
+    // top-most thing on screen, so nothing underneath it should be acting on
+    // the same press anyway.
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    DialogFrame {
+        inner,
+        dismissed: !open || esc,
+    }
+}

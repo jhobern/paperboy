@@ -1003,6 +1003,17 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
 
     let modal = egui::Modal::new(egui::Id::new("pt_node_wizard")).show(ctx, |ui| {
         ui.set_min_width(360.0);
+        // A modal has no title bar to hang a close button off, so it gets its
+        // own: every dialog in the app can be left by the corner as well as by
+        // Escape.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            if ui
+                .button(RichText::new(super::icons::CLOSE).color(th.dim))
+                .clicked()
+            {
+                outcome = Outcome::Cancel;
+            }
+        });
         let wiz = ed.wizard.as_mut().expect("wizard is Some");
         match wiz {
             Wizard::Request(f) => request_ui(ui, &th, s, f),
