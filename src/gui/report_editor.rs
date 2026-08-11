@@ -2912,16 +2912,56 @@ fn metric_cards(
     app: &GuiApp,
     metrics: &crate::report::metrics::Metrics,
 ) {
-    let card = |ui: &mut egui::Ui, k: &str, v: &str| {
+    let tinted = |ui: &mut egui::Ui, k: &str, v: &str, colour: egui::Color32| {
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new(k).size(11.0).color(th.dim));
-                    ui.label(RichText::new(v).strong().color(th.text));
+                    ui.label(RichText::new(v).strong().color(colour));
                 });
             });
     };
+    let card = |ui: &mut egui::Ui, k: &str, v: &str| tinted(ui, k, v, th.text);
+
+    // How the run moved comes first when there is a baseline to have moved
+    // from: the accuracy cards below cannot tell a run that fixed three rows
+    // and broke three others from one that touched nothing.
+    if let Some(mv) = &metrics.movement {
+        ui.horizontal_wrapped(|ui| {
+            if mv.is_still() {
+                card(
+                    ui,
+                    app.strings.report_metric_movement,
+                    app.strings.report_metric_nothing_moved,
+                );
+            } else {
+                tinted(
+                    ui,
+                    app.strings.report_metric_fixed,
+                    &mv.fixed.to_string(),
+                    th.ok,
+                );
+                // The regression count is the one figure here anybody is
+                // scanning for, so it is the one that stays plain at zero: red
+                // on a `0` teaches the eye to ignore the colour.
+                tinted(
+                    ui,
+                    app.strings.report_metric_regressed,
+                    &mv.regressed.to_string(),
+                    if mv.regressed > 0 { th.err } else { th.text },
+                );
+            }
+            if mv.still_wrong > 0 {
+                card(
+                    ui,
+                    app.strings.report_metric_still_wrong,
+                    &mv.still_wrong.to_string(),
+                );
+            }
+        });
+        ui.add_space(2.0);
+    }
     // The roll-up first when there is one -- it answers "did this run pass?",
     // and the per-column breakdown is the follow-up question.
     for m in metrics.overall.iter().chain(metrics.columns.iter()) {

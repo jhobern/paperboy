@@ -1102,6 +1102,13 @@ strings! {
     report_metric_compared => "Compared", "Comparés", "Sammenlignet";
     report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
     report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";
+    // How a run moved against its baseline. Accuracy alone can't tell two 98%
+    // runs apart when one of them fixed three rows and broke three others.
+    report_metric_movement => "Movement", "Évolution", "Bevægelse";
+    report_metric_fixed => "Fixed", "Corrigés", "Rettede";
+    report_metric_regressed => "Regressed", "Régressions", "Forværrede";
+    report_metric_still_wrong => "Still wrong", "Toujours faux", "Stadig forkerte";
+    report_metric_nothing_moved => "Nothing moved", "Rien n'a changé", "Intet flyttede sig";
     report_detail_title => "Row {n} details", "Détails de la ligne {n}", "Detaljer for række {n}";
     report_detail_close => "Close this row's details", "Fermer les détails de cette ligne", "Luk denne rækkes detaljer";
     report_detail_changed => "{c} — changed fields", "{c} — champs modifiés", "{c} — ændrede felter";

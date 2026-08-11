@@ -26664,6 +26664,45 @@ fn the_results_view_states_the_ground_truth_score() {
     );
 }
 
+/// The terminal's summary leads with what moved, from the same shared module
+/// the GUI's cards and the exported header block read it from.
+#[test]
+fn the_results_view_says_what_moved_since_the_baseline() {
+    use crate::report::model::Trend;
+    let (mut app, idx) = truthed_report_app();
+    let s = Strings::english();
+    // The fixture has one regression and nothing else moved.
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with("Movement") && l.contains("Regressed 1")),
+        "the regression is the figure being scanned for: {text:?}"
+    );
+
+    // A run where every scored row landed where it did last time says so in
+    // words rather than in a row of zeroes.
+    if let Some(res) = app.reports[idx].result.as_mut() {
+        res.trends.clear();
+        res.trends.insert((0, "Verdict".into()), Trend::Unchanged);
+    }
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        text.iter().any(|l| l.contains("Nothing moved")),
+        "and a still run says so: {text:?}"
+    );
+
+    // A run with no baseline has nothing to have moved from, so it says
+    // nothing at all.
+    if let Some(res) = app.reports[idx].result.as_mut() {
+        res.trends.clear();
+    }
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        !text.iter().any(|l| l.starts_with("Movement")),
+        "no baseline, no movement line: {text:?}"
+    );
+}
+
 /// The filter is reported in the results panel's *title*, not as a line inside
 /// the grid: it describes the pane rather than the run, and a row of prose
 /// above the table costs a row of the table on every screen. The key that

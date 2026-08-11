@@ -3739,6 +3739,50 @@ fn results_head_lines(
     if let Some(metrics) = result.metrics(&columns, header) {
         let label = Style::default().fg(th.dim);
         let value = Style::default().fg(th.text).add_modifier(Modifier::BOLD);
+        // How the run moved comes first when there is a baseline to have moved
+        // from: the accuracy lines below cannot tell a run that fixed three
+        // rows and broke three others from one that touched nothing.
+        if let Some(mv) = &metrics.movement {
+            let mut spans = vec![Span::styled(
+                format!("{} ", s.report_metric_movement),
+                value,
+            )];
+            if mv.is_still() {
+                spans.push(Span::styled(
+                    s.report_metric_nothing_moved.to_string(),
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                spans.push(Span::styled(format!("{} ", s.report_metric_fixed), label));
+                spans.push(Span::styled(
+                    format!("{}  ", mv.fixed),
+                    Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", s.report_metric_regressed),
+                    label,
+                ));
+                spans.push(Span::styled(
+                    format!("{}  ", mv.regressed),
+                    // A regression is the one figure here anybody is scanning
+                    // for, so it is the one that stays plain when it is zero:
+                    // red on a `0` teaches the eye to ignore the colour.
+                    if mv.regressed > 0 {
+                        Style::default().fg(th.err).add_modifier(Modifier::BOLD)
+                    } else {
+                        value
+                    },
+                ));
+            }
+            if mv.still_wrong > 0 {
+                spans.push(Span::styled(
+                    format!("{} ", s.report_metric_still_wrong),
+                    label,
+                ));
+                spans.push(Span::styled(format!("{}", mv.still_wrong), value));
+            }
+            out.push(Line::from(spans));
+        }
         // The roll-up first when there is one: it answers "did this run pass?",
         // and the per-column breakdown is the follow-up question.
         for m in metrics.overall.iter().chain(metrics.columns.iter()) {

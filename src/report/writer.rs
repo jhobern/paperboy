@@ -240,6 +240,20 @@ fn metrics_json(metrics: &super::metrics::Metrics) -> serde_json::Value {
             .unwrap()
             .insert("overall".to_string(), column(overall));
     }
+    // A CI gate's first question of a comparison run is "did anything
+    // regress?", so it is answered as a number rather than left to be counted
+    // out of the rows.
+    if let Some(mv) = &metrics.movement {
+        doc.as_object_mut().unwrap().insert(
+            "movement".to_string(),
+            serde_json::json!({
+                "fixed": mv.fixed,
+                "regressed": mv.regressed,
+                "still_wrong": mv.still_wrong,
+                "unchanged": mv.unchanged,
+            }),
+        );
+    }
     doc
 }
 
@@ -771,13 +785,33 @@ const INTERACTIVE_SCRIPT: &str = r#"<script>
 /// (plus the row roll-up), each stating what was compared, how much of it was
 /// wrong, and the resulting accuracy.
 fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
-    use super::metrics::{ACCURACY_LABEL, COMPARED_LABEL, INCORRECT_LABEL};
+    use super::metrics::{
+        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
+        REGRESSED_LABEL, STILL_WRONG_LABEL,
+    };
     fn card(out: &mut String, k: &str, v: &str) {
         out.push_str("<div class=\"card\"><span class=\"k\">");
         push_escaped(out, k);
         out.push_str("</span><span class=\"v\">");
         push_escaped(out, v);
         out.push_str("</span></div>");
+    }
+    // How the run moved comes first of all, when there is a baseline to have
+    // moved from: two runs that both score 98% are not the same run if one of
+    // them fixed three rows and broke three others, and the accuracy figures
+    // below cannot tell them apart.
+    if let Some(mv) = &metrics.movement {
+        out.push_str("<div class=\"metrics\">");
+        if mv.is_still() {
+            card(out, MOVEMENT_LABEL, "Nothing moved");
+        } else {
+            card(out, FIXED_LABEL, &mv.fixed.to_string());
+            card(out, REGRESSED_LABEL, &mv.regressed.to_string());
+        }
+        if mv.still_wrong > 0 {
+            card(out, STILL_WRONG_LABEL, &mv.still_wrong.to_string());
+        }
+        out.push_str("</div>\n");
     }
     // The roll-up first when there is one: with several truth-bearing columns
     // it is the figure that answers "did this run pass?", and the per-column
@@ -1215,7 +1249,10 @@ fn write_metrics_sheet(
     workbook: &mut rust_xlsxwriter::Workbook,
     metrics: &super::metrics::Metrics,
 ) -> Result<(), String> {
-    use super::metrics::{ACCURACY_LABEL, COMPARED_LABEL, INCORRECT_LABEL};
+    use super::metrics::{
+        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
+        REGRESSED_LABEL, STILL_WRONG_LABEL, UNCHANGED_LABEL,
+    };
     use rust_xlsxwriter::{Color, Format, FormatAlign};
 
     let head = Format::new()
@@ -1267,6 +1304,25 @@ fn write_metrics_sheet(
                 .map_err(|e| e.to_string())?;
         }
         r += 1;
+    }
+
+    // How the run moved, under the accuracy table it can't be read from.
+    if let Some(mv) = &metrics.movement {
+        r += 2;
+        put(sheet, r, 0, MOVEMENT_LABEL, &head)?;
+        r += 1;
+        for (name, n) in [
+            (FIXED_LABEL, mv.fixed),
+            (REGRESSED_LABEL, mv.regressed),
+            (STILL_WRONG_LABEL, mv.still_wrong),
+            (UNCHANGED_LABEL, mv.unchanged),
+        ] {
+            put(sheet, r, 0, name, &label)?;
+            sheet
+                .write_number(r, 1, n as f64)
+                .map_err(|e| e.to_string())?;
+            r += 1;
+        }
     }
 
     for m in &metrics.columns {
@@ -1466,20 +1522,22 @@ fn run_cell_tint(result: &ReportResult, r: usize, header: &str, value: &str) -> 
             Verdict::Untested => None,
         };
     }
-    // The `Trend` column is tinted by the *direction*, which is a different
-    // question from the one the cells answer: a scored cell is already coloured
-    // by whether *this* run got it right, so trending it again would only ever
-    // repeat that colour (a `fixed` cell is correct, a `regressed` one is not).
-    // `unchanged` is left plain -- "still right" is the expected case, and
-    // colouring it would drown the two rows a reader is actually looking for.
-    // A *still wrong* row also reads `unchanged` (it didn't move either), so
-    // the tint is taken from the roll-up rather than from the word: the colour
-    // is what separates the two on sight.
+    // The `Trend` column is tinted by *movement*, which is the only thing it
+    // knows that its neighbour doesn't. Whether the row is right is the
+    // `Correct` column's question, and it is sat immediately to the left,
+    // already coloured -- so tinting a still-wrong row red here would paint the
+    // same fact twice and leave the column's colour carrying nothing of its
+    // own. Green is a row that got better, red a row that got worse, and a row
+    // that didn't move is plain in both directions.
+    //
+    // Taken from the roll-up rather than the text because the text can't tell
+    // the two unchanged cases apart -- but here that no longer matters, since
+    // neither of them is tinted.
     if header == TREND_COLUMN {
         return match result.row_trend(r) {
             Some(Trend::Fixed) => Some(Tint::Green),
-            Some(Trend::Regressed) | Some(Trend::StillWrong) => Some(Tint::Red),
-            _ => None,
+            Some(Trend::Regressed) => Some(Tint::Red),
+            Some(Trend::Unchanged) | Some(Trend::StillWrong) | None => None,
         };
     }
     // The roll-up column holds the verdict as text, so it tints the same way.
@@ -2358,6 +2416,50 @@ mod tests {
         (res, Header::default())
     }
 
+    /// The header block leads with how the run *moved*, because the accuracy
+    /// figures beneath it cannot say: a run that fixed three rows and broke
+    /// three others scores exactly as well as one that touched nothing.
+    #[test]
+    fn the_header_block_says_what_moved_since_the_baseline() {
+        use crate::report::model::Trend;
+        let mut res = ReportResult {
+            column_order: vec!["Correct".into(), "Trend".into(), "Verdict".into()],
+            rows: vec![
+                row(&[("Correct", "correct"), ("Verdict", "pass")]),
+                row(&[("Correct", "incorrect"), ("Verdict", "fail")]),
+            ],
+            ..Default::default()
+        };
+        res.column_truths.insert("Verdict".into(), "{{ e }}".into());
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.trends.insert((0, "Verdict".into()), Trend::Fixed);
+        res.trends.insert((1, "Verdict".into()), Trend::Regressed);
+
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("Fixed") && html.contains("Regressed"),
+            "both directions are stated, not just the bad one: {html}"
+        );
+
+        // A machine reading the export gets them as numbers, since "did
+        // anything regress?" is a CI gate's first question of a comparison.
+        let json = String::from_utf8(JsonWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["metrics"]["movement"]["fixed"], 1);
+        assert_eq!(doc["metrics"]["movement"]["regressed"], 1);
+
+        // And a run with no baseline says nothing about movement at all: it
+        // hasn't stayed still, it has nothing to have moved from.
+        let mut alone = res.clone();
+        alone.trends.clear();
+        let json =
+            String::from_utf8(JsonWriter.write(&alone, &Header::default()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(doc["metrics"]["movement"].is_null());
+    }
+
     /// The exported report reads on a dark screen as well as a light one.
     ///
     /// The thing worth pinning down is not that a dark colour appears
@@ -2588,7 +2690,7 @@ mod tests {
     /// cell keeps the colour of its *own* verdict: a comparison must not repaint
     /// a correct answer just because it was also correct last time.
     #[test]
-    fn the_trend_column_tints_by_direction_and_leaves_scored_cells_alone() {
+    fn the_trend_column_tints_by_whether_the_row_is_right_not_by_its_word() {
         use crate::report::model::Trend;
 
         let mut res = ReportResult::default();
@@ -2618,30 +2720,33 @@ mod tests {
             run_cell_tint(&res, 1, "Trend", Trend::Regressed.as_str()),
             Some(Tint::Red)
         ));
-        // A still-wrong row and a still-right one both *say* `unchanged`, so
-        // the tint has to come from the roll-up: red is what tells the reader
-        // which of the two they are looking at.
+        // Neither unchanged case is tinted. Colouring the still-wrong one red
+        // would repeat what the `Correct` cell immediately to its left already
+        // says in red, which spends the column's colour on a fact the reader
+        // has just read and leaves nothing to mark the rows that actually
+        // moved.
         let mut wrong = res.clone();
         wrong
             .trends
             .insert((1, "Verdict".into()), Trend::StillWrong);
         assert!(
-            matches!(
-                run_cell_tint(&wrong, 1, "Trend", Trend::StillWrong.as_str()),
-                Some(Tint::Red)
-            ),
-            "still wrong is not new, but it is still wrong"
+            run_cell_tint(&wrong, 1, "Trend", Trend::StillWrong.as_str()).is_none(),
+            "a row that didn't move is plain, however it scored"
+        );
+        assert!(
+            run_cell_tint(&res, 2, "Trend", Trend::Unchanged.as_str()).is_none(),
+            "and so is the other one"
         );
         assert_eq!(
             Trend::StillWrong.as_str(),
             Trend::Unchanged.as_str(),
-            "and it says what the column is asking: this row did not move"
+            "both say what the column is asking: this row did not move"
         );
-        assert!(
-            run_cell_tint(&res, 2, "Trend", Trend::Unchanged.as_str()).is_none(),
-            "`unchanged` is the expected case; colouring it would drown the rows \
-             a reader is looking for"
-        );
+        // The `Correct` column is what keeps them apart, and it is right there.
+        assert!(matches!(
+            run_cell_tint(&wrong, 1, CORRECT_COLUMN, Verdict::Incorrect.as_str()),
+            Some(Tint::Red)
+        ));
     }
 
     #[test]

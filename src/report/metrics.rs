@@ -22,6 +22,11 @@ use super::model::{OutputColumn, ReportResult, StatValue, SummaryRow, Verdict};
 pub const COMPARED_LABEL: &str = "Compared";
 pub const INCORRECT_LABEL: &str = "Incorrect";
 pub const ACCURACY_LABEL: &str = "Accuracy";
+pub const FIXED_LABEL: &str = "Fixed";
+pub const REGRESSED_LABEL: &str = "Regressed";
+pub const STILL_WRONG_LABEL: &str = "Still wrong";
+pub const UNCHANGED_LABEL: &str = "Unchanged";
+pub const MOVEMENT_LABEL: &str = "Movement";
 
 /// How one ground-truthed column scored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +123,37 @@ pub fn heat_rgb(n: usize, max: usize) -> ([u8; 3], bool) {
     )
 }
 
+/// How a run moved against the baseline it was compared with: how many rows got
+/// better, how many got worse, and how many were wrong on both sides.
+///
+/// The accuracy figures can't answer this. Two runs that score 98% are not the
+/// same run if one of them fixed three rows and broke three others, and "did
+/// anything move?" is the first thing anyone asks of a comparison — usually
+/// before they have looked at a single row.
+///
+/// Only counts rows that were scored on *both* sides: without a truth there is
+/// no direction to report (see [`super::model::Trend::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Movement {
+    /// Wrong before, right now.
+    pub fixed: usize,
+    /// Right before, wrong now — the reason this summary exists.
+    pub regressed: usize,
+    /// Wrong on both sides: not new, but not fixed either.
+    pub still_wrong: usize,
+    /// Right on both sides. The expected case, counted so the others can be
+    /// read as a proportion of the run rather than as bare numbers.
+    pub unchanged: usize,
+}
+
+impl Movement {
+    /// Whether anything moved at all. A run where every row landed where it did
+    /// last time can say so in one line instead of four zeroes.
+    pub fn is_still(&self) -> bool {
+        self.fixed == 0 && self.regressed == 0
+    }
+}
+
 /// The metrics of a whole run: one entry per ground-truthed column, plus the
 /// row roll-up carried by the reserved `Correct` column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +164,9 @@ pub struct Metrics {
     /// figures, which is why it is separate rather than folded in: with several
     /// it is the only honest per-row count.
     pub overall: Option<ColumnMetrics>,
+    /// How the run moved against its baseline, or `None` when there was nothing
+    /// to compare it with (no baseline, or no row scored on both sides).
+    pub movement: Option<Movement>,
 }
 
 impl Metrics {
@@ -215,6 +254,7 @@ impl Metrics {
         Some(Metrics {
             columns: out,
             overall,
+            movement: movement(result),
         })
     }
 
@@ -287,6 +327,35 @@ impl Metrics {
         }
         out
     }
+}
+
+/// How many rows moved which way, rolled up per row exactly as the `Trend`
+/// column is — a row with one fixed column and one regressed column counts once,
+/// as a regression, because that is what it is and what the column says.
+///
+/// `None` when no row has a trend at all: a run with no baseline hasn't "not
+/// moved", it has nothing to have moved from, and a summary of four zeroes
+/// would say the opposite.
+fn movement(result: &ReportResult) -> Option<Movement> {
+    use super::model::Trend;
+    let mut m = Movement::default();
+    let mut any = false;
+    for r in 0..result.rows.len() {
+        if result.pending.contains(&r) {
+            continue;
+        }
+        let Some(t) = result.row_trend(r) else {
+            continue;
+        };
+        any = true;
+        match t {
+            Trend::Fixed => m.fixed += 1,
+            Trend::Regressed => m.regressed += 1,
+            Trend::StillWrong => m.still_wrong += 1,
+            Trend::Unchanged => m.unchanged += 1,
+        }
+    }
+    any.then_some(m)
 }
 
 /// The per-row roll-up, read back off the reserved `Correct` column rather than
@@ -376,6 +445,52 @@ mod tests {
         ]);
         let cols = res.resolved_columns(&Header::default());
         (res, cols, labels)
+    }
+
+    /// Two runs can score the same and be entirely different runs. The
+    /// movement summary is what tells them apart, and it is rolled up per row
+    /// exactly as the `Trend` column is -- a row that fixed one column and
+    /// broke another counts once, as a regression.
+    #[test]
+    fn movement_counts_the_rows_that_moved_and_which_way() {
+        use crate::report::model::Trend;
+        let (mut res, cols, labels) = fixture();
+        res.trends.insert((0, "Verdict".into()), Trend::Unchanged);
+        res.trends.insert((1, "Verdict".into()), Trend::Fixed);
+        res.trends.insert((2, "Verdict".into()), Trend::StillWrong);
+        res.trends.insert((3, "Verdict".into()), Trend::Regressed);
+        let mv = Metrics::compute(&res, &cols, &labels)
+            .expect("metrics")
+            .movement
+            .expect("a run with trends has moved somehow");
+        assert_eq!(
+            (mv.fixed, mv.regressed, mv.still_wrong, mv.unchanged),
+            (1, 1, 1, 1)
+        );
+        assert!(!mv.is_still(), "one row got better and one got worse");
+
+        // The same figures a reader would get from a run that touched nothing
+        // -- and the one line that says so instead of four zeroes.
+        let mut still = res.clone();
+        still.trends.clear();
+        for r in 0..4 {
+            still.trends.insert((r, "Verdict".into()), Trend::Unchanged);
+        }
+        let mv = Metrics::compute(&still, &cols, &labels)
+            .unwrap()
+            .movement
+            .unwrap();
+        assert!(mv.is_still() && mv.unchanged == 4);
+
+        // A run with no baseline hasn't "not moved" -- it has nothing to have
+        // moved from, and four zeroes would say the opposite.
+        let (res, cols, labels) = fixture();
+        assert!(
+            Metrics::compute(&res, &cols, &labels)
+                .unwrap()
+                .movement
+                .is_none()
+        );
     }
 
     #[test]

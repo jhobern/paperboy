@@ -12,6 +12,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A report says what moved, not just how it scored.** Two runs that both score
+  98% are not the same run if one of them fixed three rows and broke three
+  others, and the accuracy figures cannot tell them apart. The metrics header —
+  in the exported HTML, in the GUI and in the terminal — now leads with how the
+  run moved against its baseline: how many rows were **Fixed**, how many
+  **Regressed**, and how many are **Still wrong**, or a single "Nothing moved"
+  where every scored row landed where it did last time. The xlsx `Metrics` sheet
+  and the JSON export carry the same figures as numbers, so a CI gate can ask
+  "did anything regress?" without counting rows. A run with no baseline says
+  nothing about movement: it hasn't stayed still, it has nothing to have moved
+  from.
+
 - **The exported HTML report has a dark mode.** It was a white page whatever the
   screen it was opened on, which is a bright thing to hand someone at the end of
   a long day. It now follows the reader's own system setting, and carries a
@@ -489,6 +501,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   (`F`/`V`/`S` in English, `F`/`A`/`P` in French, `F`/`V`/`I` in Danish).
 
 ### Changed
+
+- **The `Trend` column is tinted by which way a row moved, and nothing else.**
+  It coloured a still-failing row red, which repeated in red exactly what the
+  `Correct` cell immediately to its left already said — spending the column's
+  colour on a fact the reader had just read, and leaving nothing to mark the
+  rows that actually moved. Green now means a row got better, red that it got
+  worse, and a row that didn't move is plain in both directions, right or
+  wrong.
 
 - **A still-failing row's `Trend` reads `unchanged`.** The column answers one
   question — *did this row move?* — and for a row that was wrong before and is
