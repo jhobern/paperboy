@@ -1198,7 +1198,7 @@ mod tests {
     fn unsupported_output_format_is_an_error() {
         let t = titles();
         assert!(has_err(
-            "# collection: ./c.hurl\n# output: pdf\nREQUEST Oauth\n",
+            "# collection: ./c.hurl\n# output: docx\nREQUEST Oauth\n",
             Some(&t),
             None,
             "unsupported output format"

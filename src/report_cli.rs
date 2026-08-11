@@ -695,7 +695,7 @@ mod tests {
             Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some(dir.join("out.pdf").to_string_lossy().into_owned()),
+            Some(dir.join("out.docx").to_string_lossy().into_owned()),
             true,
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
@@ -727,6 +727,10 @@ mod tests {
             (
                 "xlsx",
                 &(|b: &[u8]| b.starts_with(b"PK")) as &dyn Fn(&[u8]) -> bool,
+            ),
+            (
+                "pdf",
+                &(|b: &[u8]| b.starts_with(b"%PDF-")) as &dyn Fn(&[u8]) -> bool,
             ),
         ] {
             let out = dir.join(format!("out.{ext}"));

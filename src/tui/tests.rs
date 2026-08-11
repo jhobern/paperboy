@@ -17964,9 +17964,11 @@ fn export_format_cycles_through_output_formats() {
     app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.xlsx");
     app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.pdf");
+    app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.csv", "wraps back to csv");
     app.cycle_browser_export_format(false);
-    assert_eq!(app.browser_name.text(), "report.xlsx", "↑ steps backwards");
+    assert_eq!(app.browser_name.text(), "report.pdf", "↑ steps backwards");
     // An unknown extension is treated as csv, so the next format is json.
     app.browser_name = super::editor::Editor::new("data.txt", false);
     app.cycle_browser_export_format(true);

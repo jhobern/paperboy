@@ -28,6 +28,7 @@ pub mod labels;
 pub mod metrics;
 pub mod model;
 pub mod parser;
+pub mod pdf;
 pub mod producers;
 // The `Report` domain type lives in `report::report`; the repeated name trips
 // clippy::module_inception, but renaming the file would obscure that this is

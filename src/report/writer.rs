@@ -1,6 +1,9 @@
-//! Serializing a [`ReportResult`] to an output format. CSV, JSON and `.xlsx`
-//! are supported; the [`ReportWriter`] trait keeps the interpreter/model
-//! independent of the format so more can be added without touching either.
+//! Serializing a [`ReportResult`] to an output format. CSV, JSON, HTML,
+//! `.xlsx` and PDF are supported; the [`ReportWriter`] trait keeps the
+//! interpreter/model independent of the format so more can be added without
+//! touching either. (The PDF writer lives in [`super::pdf`], which is a module
+//! of its own because a hand-built PDF container is a lot of machinery to sit
+//! beside four serializers that only push strings.)
 //!
 //! Output is driven entirely by the resolved columns (the `columns:` header
 //! directive, else the produced columns in first-seen order — see
@@ -23,7 +26,7 @@ pub trait ReportWriter {
 }
 
 /// The set of output formats PaperTrail can write, keyed by lower-case file
-/// extension (`csv`/`json`/`html`/`xlsx`). Returns `None` for anything else so
+/// extension (`csv`/`json`/`html`/`xlsx`/`pdf`). Returns `None` for anything else so
 /// callers can report an unsupported-format error naming the extension.
 pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
     match ext.to_ascii_lowercase().as_str() {
@@ -31,12 +34,13 @@ pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
         "json" => Some(Box::new(JsonWriter)),
         "html" | "htm" => Some(Box::new(HtmlWriter)),
         "xlsx" => Some(Box::new(XlsxWriter)),
+        "pdf" => Some(Box::new(super::pdf::PdfWriter)),
         _ => None,
     }
 }
 
 /// The list of supported output extensions, for help/error text.
-pub const OUTPUT_EXTENSIONS: [&str; 4] = ["csv", "json", "html", "xlsx"];
+pub const OUTPUT_EXTENSIONS: [&str; 5] = ["csv", "json", "html", "xlsx", "pdf"];
 
 /// The preferred output extension for `report`: its `# output:` header format
 /// when that names a supported writer, else `csv`.
@@ -1344,7 +1348,8 @@ fn write_metrics_sheet(
 }
 
 /// A background tint for a colour-coded cell.
-enum Tint {
+#[derive(Clone, Copy)]
+pub(super) enum Tint {
     Green,
     Red,
     Amber,
@@ -1479,7 +1484,10 @@ const XLSX_FIT_IMAGE_WIDTH: f64 = 18.0;
 /// unwrapped — header, data cells and the appended statistics rows alike, each
 /// with its own padding. Unclamped: every export wants the same measurement but
 /// caps it in its own units.
-fn measured_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<usize> {
+pub(super) fn measured_column_widths(
+    columns: &[OutputColumn],
+    result: &ReportResult,
+) -> Vec<usize> {
     let mut widths: Vec<usize> = columns
         .iter()
         .map(|c| text_display_width(&c.header) + XLSX_HEADER_PADDING)
@@ -1630,7 +1638,12 @@ fn fit_to_budget(mut widths: Vec<usize>) -> Vec<usize> {
 ///
 /// `Untested` is left plain, deliberately: a row nobody has labelled must not
 /// borrow the appearance of one that passed.
-fn run_cell_tint(result: &ReportResult, r: usize, header: &str, value: &str) -> Option<Tint> {
+pub(super) fn run_cell_tint(
+    result: &ReportResult,
+    r: usize,
+    header: &str,
+    value: &str,
+) -> Option<Tint> {
     if let Some(v) = result.verdicts.get(&(r, header.to_string())) {
         return match v {
             Verdict::Correct => Some(Tint::Green),
@@ -1870,7 +1883,7 @@ mod tests {
     /// falls back to CSV, so the export button always does something.
     #[test]
     fn an_unwritable_or_absent_output_directive_falls_back_to_csv() {
-        let r = crate::report::Report::from_text("s", "# output: pdf\n# collection: c.hurl\n");
+        let r = crate::report::Report::from_text("s", "# output: docx\n# collection: c.hurl\n");
         assert_eq!(report_output_extension(&r), "csv");
         let r = crate::report::Report::from_text("s", "# collection: c.hurl\n");
         assert_eq!(report_output_extension(&r), "csv");

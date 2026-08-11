@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Reports export as PDF.** `# output: pdf`, or a `.pdf` filename in either
+  front-end's export dialog, writes a printable landscape A4 document: the
+  table sized to its content and fitted to the page, the column headers
+  repeated on every page, cells tinted exactly as the spreadsheet and the HTML
+  tint them, an `IMAGE` column's pictures embedded at the size the clause asked
+  for, and the statistics and ground-truth figures in the footer. `DETAIL`
+  columns are left out of the table — paper has no click, and a drill-down
+  column is usually a whole response body that would crush every other column
+  in a printed grid; the lossless exports still carry them. The file is
+  assembled by hand rather than through a PDF crate, so the format costs no new
+  dependency: text is wrapped here against Helvetica's real glyph widths, a
+  JPEG is embedded byte-for-byte as the DCT stream it already is, and anything
+  else reuses a PNG's own compressed pixel stream.
+
 - **The Postman importer takes a key reference, not just a key.** The wizard's
   API key field now accepts the same `{{ … }}` provider references a `.vars`
   file does — `{{ op://Private/Postman/credential }}`, `{{ ssm:/path }}`,

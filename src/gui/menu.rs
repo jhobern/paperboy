@@ -669,6 +669,7 @@ fn format_label(ext: &str) -> &'static str {
         "json" => "JSON",
         "html" | "htm" => "HTML",
         "xlsx" => "Excel",
+        "pdf" => "PDF",
         "csv" => "CSV",
         // An unknown extension is shown as itself rather than silently
         // corrected: the name in the box is the user's, and the Export button
@@ -1145,11 +1146,12 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
 /// GUI the terminal UI's behaviour, whose export picker is seeded the same way.
 /// An unrecognised extension leaves the order alone, so CSV leads as before.
 fn report_result_filters(ext: &str) -> Vec<super::filepick::Filter<'static>> {
-    const ALL: [super::filepick::Filter<'static>; 4] = [
+    const ALL: [super::filepick::Filter<'static>; 5] = [
         ("CSV", &["csv"]),
         ("JSON", &["json"]),
         ("HTML", &["html"]),
         ("Excel", &["xlsx"]),
+        ("PDF", &["pdf"]),
     ];
     let want = ext.to_ascii_lowercase();
     let mut filters = ALL.to_vec();
@@ -1939,10 +1941,15 @@ mod tests {
     /// default choice is the one the report asked for.
     #[test]
     fn the_reports_own_output_format_leads_the_export_filters() {
-        for (ext, expected) in [("xlsx", "Excel"), ("json", "JSON"), ("html", "HTML")] {
+        for (ext, expected) in [
+            ("xlsx", "Excel"),
+            ("json", "JSON"),
+            ("html", "HTML"),
+            ("pdf", "PDF"),
+        ] {
             let filters = report_result_filters(ext);
             assert_eq!(filters[0].0, expected, "{ext} should lead");
-            assert_eq!(filters.len(), 4, "every format stays available");
+            assert_eq!(filters.len(), 5, "every format stays available");
         }
         // Case is irrelevant: `# output: XLSX` is the same directive.
         assert_eq!(report_result_filters("XLSX")[0].0, "Excel");
@@ -1952,12 +1959,12 @@ mod tests {
     /// order, so CSV remains the default it has always been.
     #[test]
     fn an_unknown_export_format_leaves_csv_leading() {
-        for ext in ["", "csv", "pdf"] {
+        for ext in ["", "csv", "docx"] {
             let filters = report_result_filters(ext);
             assert_eq!(filters[0].0, "CSV", "{ext:?} should leave CSV leading");
             assert_eq!(
                 filters.iter().map(|f| f.0).collect::<Vec<_>>(),
-                vec!["CSV", "JSON", "HTML", "Excel"]
+                vec!["CSV", "JSON", "HTML", "Excel", "PDF"]
             );
         }
     }
