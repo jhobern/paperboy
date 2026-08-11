@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The wizards say less and show more.** The Postman importer, the git load
+  wizard and the git save wizard were each a stack of fields with a sentence of
+  explanation underneath every one — a screen of prose to answer two questions.
+  They now follow the request editor's shape: a label column with the value
+  beside it, and the shortcut keys on the panel's bottom border rather than
+  taking a row of the body. What a field wants is shown as a dim example *in*
+  the field, where the answer is about to be typed ("https://github.com/owner/
+  repo", "Private/Postman/credential", "blank: choose from a list"), so the
+  explanation is read at the moment it is needed and costs nothing when it
+  isn't. The Postman connect step went from twelve rows to four and the git
+  ones from eight to two; the wording that survived is shorter throughout. If
+  it took a paragraph to say what a field was for, the field was not clear
+  enough.
+
 - **Reports export as PDF.** `# output: pdf`, or a `.pdf` filename in either
   front-end's export dialog, writes a printable landscape A4 document: the
   table sized to its content and fitted to the page, the column headers

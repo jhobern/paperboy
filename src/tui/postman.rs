@@ -288,13 +288,13 @@ fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
 }
 
 fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
-    // Wide enough for the longest hint to read as a sentence, but never wider
-    // than the terminal.
-    let width = 76.min(f.area().width);
-    // Inner width: the panel's borders take a column on each side.
-    let text_w = width.saturating_sub(2);
-    let fields: [(&'static str, &'static str, u8); 4] = [
-        (s.postman_key_source_label, s.postman_key_source_hint, 0),
+    // Laid out like the request wizard: a label column on the left, the value
+    // beside it, and the keys on the border. Four short rows say as much as
+    // four fields did with a paragraph of explanation under each — what a
+    // field wants is shown *in* the field, as a dim example, where the answer
+    // is about to be typed.
+    let fields: [(&str, &str, u8); 4] = [
+        (s.postman_key_source_label, "", 0),
         (
             key_field_label(w.key_source, s),
             key_field_hint(w.key_source, s),
@@ -303,41 +303,22 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         (s.postman_workspace_label, s.postman_workspace_hint, 2),
         (s.postman_base_url_label, s.postman_base_url_hint, 3),
     ];
-    // label + field + however many lines the hint wraps to, per group. No
-    // blank rows between them: the accented label is what starts a group, and
-    // padding every group out with an empty line made three fields fill a
-    // screen that the rest of the app would have drawn in eight rows.
-    let hint_rows: Vec<u16> = fields
-        .iter()
-        .map(|(_, hint, _)| wrapped_height(hint, text_w))
-        .collect();
-    let body: u16 = hint_rows.iter().map(|h| h + 2).sum();
-    let hint_h = wrapped_height(s.git_connect_hint, text_w);
-    let area = centered_rect(width, body + hint_h + 2, f.area());
+    let label_w = label_column(fields.iter().map(|(l, _, _)| *l));
+
+    let width = 66.min(f.area().width);
+    let area = centered_rect(width, fields.len() as u16 + 2, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), s.postman_connect_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut constraints: Vec<Constraint> = Vec::new();
-    for h in &hint_rows {
-        constraints.push(Constraint::Length(1)); // label
-        constraints.push(Constraint::Length(1)); // field
-        constraints.push(Constraint::Length(*h)); // hint
-    }
-    constraints.push(Constraint::Min(1)); // key hint for the whole form
-    let rows = Layout::vertical(constraints).split(inner);
-
-    for (g, (label, hint, idx)) in fields.iter().enumerate() {
-        let base = g * 3;
-        // The label carries the group: accent, bold, and immediately above its
-        // own field, which is how every other form in the app reads.
+    let rows = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+    for (row, (label, placeholder, idx)) in rows.iter().zip(fields.iter()) {
+        let cols =
+            Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(*row);
         f.render_widget(
-            Paragraph::new(Span::styled(
-                *label,
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            )),
-            rows[base],
+            Paragraph::new(Span::styled(*label, Style::default().fg(th.accent))),
+            cols[0],
         );
         if *idx == 0 {
             // A cycled value, written the way every other one-of-several
@@ -349,62 +330,40 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             };
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    format!("‹{}›", key_source_label(w.key_source, s)),
+                    format!("\u{2039} {} \u{203a}", key_source_label(w.key_source, s)),
                     style,
                 )),
-                rows[base + 1],
+                cols[1],
             );
-        } else {
-            // Only a pasted key is itself a credential; a reference is the
-            // *address* of one, and masking that would only stop the user
-            // checking they typed it correctly.
-            let (ed, mask) = match idx {
-                1 => (&w.key, w.key_source.is_secret()),
-                2 => (&w.workspace_ref, false),
-                _ => (&w.base_url, false),
-            };
-            render_line_field(f, rows[base + 1], ed, w.field == *idx, mask, th);
+            continue;
         }
-        f.render_widget(
-            Paragraph::new(Line::styled(*hint, Style::default().fg(th.dim)))
-                .wrap(Wrap { trim: true }),
-            rows[base + 2],
-        );
+        // Only a pasted key is itself a credential; a reference is the
+        // *address* of one, and masking that would only stop the user
+        // checking they typed it correctly.
+        let (ed, mask) = match idx {
+            1 => (&w.key, w.key_source.is_secret()),
+            2 => (&w.workspace_ref, false),
+            _ => (&w.base_url, false),
+        };
+        render_line_field_hinted(f, cols[1], ed, w.field == *idx, mask, placeholder, th);
     }
-
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            s.git_connect_hint,
-            Style::default().fg(th.dim),
-        ))
-        .wrap(Wrap { trim: true }),
-        rows[fields.len() * 3],
-    );
 }
 
 fn draw_loading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     let msg = w.flow.busy().map_or(s.postman_busy_listing, |p| p.label(s));
     let width = (msg.chars().count().max(s.git_loading_hint.chars().count()) as u16 + 4)
         .min(f.area().width);
-    let area = centered_rect(width, 4, f.area());
+    let area = centered_rect(width, 3, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
     f.render_widget(
         Paragraph::new(Span::styled(
             msg,
             Style::default().fg(th.text).add_modifier(Modifier::BOLD),
         )),
-        rows[0],
-    );
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            s.git_loading_hint,
-            Style::default().fg(th.dim),
-        )),
-        rows[1],
+        inner,
     );
 }
 
@@ -421,15 +380,10 @@ fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme
         f.area(),
     );
     f.render_widget(Clear, area);
-    let block = panel(s.postman_pick_workspace.to_string(), true, th);
+    let block = panel_hinted(s.postman_pick_workspace.to_string(), s.git_filter_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(s.git_filter_label.to_string(), Style::default().fg(th.dim)),
@@ -451,45 +405,43 @@ fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme
         .highlight_symbol("\u{203a} ");
     let sel = (!items.is_empty()).then(|| w.flow.selected.min(items.len() - 1));
     w.list_scroll.render(f, rows[1], list, sel, items.len());
-    f.render_widget(
-        Paragraph::new(Line::styled(s.git_filter_hint, Style::default().fg(th.dim))),
-        rows[2],
-    );
 }
 
 fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     let labels = option_labels(w, s);
-    let area = centered_rect(78, 14, f.area());
+    // What Enter does here depends on the row, so the border says which: a
+    // single hint could only be wrong on two rows out of three.
+    let hint = match w.option_row {
+        0 => s.postman_options_hint_dest,
+        r if r == OPTION_ROWS - 1 => s.postman_options_hint_import,
+        _ => s.postman_options_hint_toggle,
+    };
+    let note = (w.flow.format == ImportFormat::Hurl).then_some(s.postman_format_hurl_note);
+    let width = 78.min(f.area().width);
+    let note_h = note.map_or(0, |n| wrapped_height(n, width.saturating_sub(2)));
+    let area = centered_rect(width, OPTION_ROWS as u16 + note_h + 3, f.area());
     f.render_widget(Clear, area);
-    let block = panel(
+    let block = panel_hinted(
         format!("{title} \u{2014} {}", w.flow.workspace_name()),
-        true,
+        hint,
         th,
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([
-        Constraint::Length(1),                      // header
         Constraint::Length(1),                      // dest label
         Constraint::Length(1),                      // dest editor
         Constraint::Length(OPTION_ROWS as u16 - 1), // the toggles + button
-        Constraint::Min(1),                         // format note / hint
+        Constraint::Length(note_h),                 // format note
     ])
     .split(inner);
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            s.postman_options_title,
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        )),
-        rows[0],
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
             s.postman_dest_label,
             Style::default().fg(th.accent),
         )),
-        rows[1],
+        rows[0],
     );
     let dest = if w.dest.as_os_str().is_empty() {
         s.postman_dest_unset.to_string()
@@ -508,13 +460,13 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     // width and the path gives way - elided from the LEFT, since the folder
     // name at the end is what distinguishes one destination from another.
     let browse = format!("  {}", s.postman_browse);
-    let room = (rows[2].width as usize).saturating_sub(browse.chars().count());
+    let room = (rows[1].width as usize).saturating_sub(browse.chars().count());
     f.render_widget(
         Paragraph::new(Line::styled(
             format!("{}{browse}", elide_left(&dest, room)),
             dest_style,
         )),
-        rows[2],
+        rows[1],
     );
 
     let list_items: Vec<ListItem> = labels
@@ -533,24 +485,15 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             ListItem::new(Line::styled(l.clone(), style))
         })
         .collect();
-    f.render_widget(List::new(list_items), rows[3]);
+    f.render_widget(List::new(list_items), rows[2]);
 
-    let mut note = String::new();
-    if w.flow.format == ImportFormat::Hurl {
-        note.push_str(s.postman_format_hurl_note);
-        note.push_str("  ·  ");
+    if let Some(note) = note {
+        f.render_widget(
+            Paragraph::new(Line::styled(note, Style::default().fg(th.dim)))
+                .wrap(Wrap { trim: true }),
+            rows[3],
+        );
     }
-    // What Enter does here depends on the row, so say which — a single hint
-    // could only be wrong on two rows out of three.
-    note.push_str(match w.option_row {
-        0 => s.postman_options_hint_dest,
-        r if r == OPTION_ROWS - 1 => s.postman_options_hint_import,
-        _ => s.postman_options_hint_toggle,
-    });
-    f.render_widget(
-        Paragraph::new(Line::styled(note, Style::default().fg(th.dim))).wrap(Wrap { trim: true }),
-        rows[4],
-    );
 }
 
 fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
@@ -559,15 +502,25 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     };
     let width = 78.min(f.area().width);
     let note_h = wrapped_height(s.postman_rate_limit_note, width.saturating_sub(2));
-    let mut tail_h = wrapped_height(s.postman_confirm_hint, width.saturating_sub(2));
-    if plan.strains_monthly_budget() {
-        tail_h += wrapped_height(s.postman_budget_warning, width.saturating_sub(2));
-    }
+    let warn_h = if plan.strains_monthly_budget() {
+        wrapped_height(s.postman_budget_warning, width.saturating_sub(2))
+    } else {
+        0
+    };
     // Sized to its content — no trailing empty rows, which on a four-line
     // screen read as "something failed to draw".
-    let area = centered_rect(width, note_h + tail_h + 5, f.area());
+    let area = centered_rect(width, note_h + warn_h + 5, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    // The hint is on the border like everywhere else, but in the accent rather
+    // than dim: nothing on this screen is waiting for anything else, and a dim
+    // line here was read as a status message, leaving people parked wondering
+    // why nothing was downloading.
+    let block = panel_hinted_styled(
+        title.to_string(),
+        s.postman_confirm_hint,
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        th,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([
@@ -575,7 +528,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         Constraint::Length(1),      // counts
         Constraint::Length(note_h), // rate limit note
         Constraint::Length(1),      // estimate
-        Constraint::Min(1),         // budget warning / hint
+        Constraint::Length(warn_h), // budget warning
     ])
     .split(inner);
 
@@ -612,23 +565,16 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         )),
         rows[3],
     );
-    let mut tail = Vec::new();
     if plan.strains_monthly_budget() {
-        tail.push(Line::styled(
-            s.postman_budget_warning,
-            Style::default().fg(th.err),
-        ));
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                s.postman_budget_warning,
+                Style::default().fg(th.err),
+            ))
+            .wrap(Wrap { trim: true }),
+            rows[4],
+        );
     }
-    // Not the connect hint: this screen has no fields to Tab between and no
-    // connection left to make — Enter starts the import. Drawn in the accent,
-    // bold, rather than dim like a footnote: nothing else on this screen is
-    // waiting for a key, and a dim line was being read as a status message,
-    // leaving people parked here wondering why nothing was downloading.
-    tail.push(Line::styled(
-        s.postman_confirm_hint,
-        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-    ));
-    f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[4]);
 }
 
 fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
@@ -650,10 +596,9 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
     if p.waiting.is_some() {
         constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Length(1)); // hint
     let area = centered_rect(width, constraints.len() as u16 + 2, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical(constraints).split(inner);
@@ -702,19 +647,12 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
             next(),
         );
     }
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            s.git_loading_hint,
-            Style::default().fg(th.dim),
-        )),
-        next(),
-    );
 }
 
 fn draw_done(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme) {
-    let area = centered_rect(74, 9, f.area());
+    let area = centered_rect(74, 5, f.area());
     f.render_widget(Clear, area);
-    let block = panel(s.postman_done_title.to_string(), true, th);
+    let block = panel_hinted(s.postman_done_title.to_string(), s.git_error_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut lines = vec![Line::styled(
@@ -728,34 +666,25 @@ fn draw_done(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme) {
             Style::default().fg(th.pending),
         ));
     }
-    lines.push(Line::styled(s.git_error_hint, Style::default().fg(th.dim)));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn draw_error(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     let e = w.flow.error().unwrap_or_default().to_string();
     let width = (f.area().width * 6 / 10).max(40);
-    let area = centered_rect(width, 9, f.area());
+    let body_h = wrapped_height(&e, width.saturating_sub(2));
+    let area = centered_rect(width, body_h + 2, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    // Not "press Esc to close": Esc goes back to the step that can be fixed —
+    // the key prompt for a rejected key — rather than throwing the import away.
+    let block = panel_hinted(title.to_string(), s.postman_error_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     f.render_widget(
         Paragraph::new(e)
             .style(Style::default().fg(th.err))
             .wrap(Wrap { trim: true }),
-        rows[0],
-    );
-    // Not "press Esc to close": Esc goes back to the step that can be fixed —
-    // the key prompt for a rejected key — rather than throwing the import away.
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            s.postman_error_hint,
-            Style::default().fg(th.dim),
-        ))
-        .wrap(Wrap { trim: true }),
-        rows[1],
+        inner,
     );
 }
 

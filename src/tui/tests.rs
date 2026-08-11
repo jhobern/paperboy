@@ -25755,22 +25755,45 @@ fn the_confirmation_says_enter_imports_not_enter_connects() {
     assert!(!text.contains(s.git_connect_hint));
 }
 
-/// The API key hint is a whole sentence with a URL in it, and it used to be
-/// chopped off at the panel edge ("it is never wri…"). It wraps now, so the
-/// sentence finishes.
+/// The connect form is a label column and a value column with the keys on the
+/// border, like the request editor — not a stack of fields each explained by a
+/// paragraph underneath. What a field wants is a dim example *inside* it.
 #[test]
-fn the_connect_form_shows_the_whole_key_hint() {
+fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields() {
     use ratatui::{Terminal, backend::TestBackend};
 
+    let s = Strings::for_language(&Language::English);
     let mut app = TuiApp::default();
     app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
     let text = buffer_text(term.backend().buffer());
-    assert!(
-        text.contains("written to disk."),
-        "the hint is still cut off: {text}"
-    );
+
+    // Every field's example is on the same row as its label.
+    for (label, example) in [
+        (s.postman_key_label, s.postman_key_hint),
+        (s.postman_workspace_label, s.postman_workspace_hint),
+        (s.postman_base_url_label, s.postman_base_url_hint),
+    ] {
+        let row = text
+            .lines()
+            .find(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("no row for {label}: {text}"));
+        assert!(row.contains(example), "{label} lost its example: {row}");
+    }
+
+    // The keys are on the frame, and the whole dialog is four rows of content
+    // inside its border rather than the dozen the stacked hints took.
+    let hint_row = text
+        .lines()
+        .position(|l| l.contains(s.postman_connect_hint))
+        .expect("the shortcut hint is on the border");
+    let first = text
+        .lines()
+        .position(|l| l.contains(s.postman_key_source_label))
+        .unwrap();
+    assert_eq!(hint_row - first, 4, "four field rows, then the border");
 }
 
 /// The hint under the options has to describe what Enter does on the row the

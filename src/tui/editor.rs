@@ -101,6 +101,29 @@ pub(crate) fn render_line_field(
     super::line_editor::render_line_field(f, area, ed, &editor_theme(th), focused, mask);
 }
 
+/// [`render_line_field`], but an empty field shows `placeholder` dimmed in
+/// place of the text — the example goes where the answer will go, rather than
+/// into a sentence underneath the field.
+pub(crate) fn render_line_field_hinted(
+    f: &mut Frame,
+    area: Rect,
+    ed: &Editor,
+    focused: bool,
+    mask: bool,
+    placeholder: &str,
+    th: &Theme,
+) {
+    super::line_editor::render_line_field_placeholder(
+        f,
+        area,
+        ed,
+        &editor_theme(th),
+        focused,
+        mask,
+        placeholder,
+    );
+}
+
 /// Render a read-only single line of `text` into `area` in `color`, drawing a
 /// dim ellipsis (`…`) in the last column when the text is too wide to fit — so
 /// truncated, unfocused cells still read as "there is more here" rather than

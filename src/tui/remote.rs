@@ -130,14 +130,13 @@ pub(crate) fn draw_filter_list(
     let h = (f.area().height * 7 / 10).max(10);
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), s.git_filter_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::vertical([
         Constraint::Length(1), // filter line
         Constraint::Min(1),    // list
-        Constraint::Length(1), // hint
     ])
     .split(inner);
 
@@ -164,11 +163,6 @@ pub(crate) fn draw_filter_list(
         .highlight_symbol("\u{203a} ");
     let sel = (!vis.is_empty()).then(|| sel.min(vis.len() - 1));
     let offset = scroll.render(f, rows[1], list, sel, vis.len());
-
-    f.render_widget(
-        Paragraph::new(Line::styled(s.git_filter_hint, Style::default().fg(th.dim))),
-        rows[2],
-    );
     offset
 }
 
@@ -191,13 +185,12 @@ pub(crate) fn draw_choice_popup(
         .unwrap_or(20)
         .max(title.chars().count());
     let w = (content_w as u16 + 6).clamp(30, f.area().width.max(1));
-    let h = (items.len() as u16 + 3).min(f.area().height.max(1));
+    let h = (items.len() as u16 + 2).min(f.area().height.max(1));
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
     let list_items: Vec<ListItem> = items
         .iter()
@@ -213,12 +206,7 @@ pub(crate) fn draw_choice_popup(
         .highlight_symbol("\u{203a} ");
     let mut st = ListState::default();
     st.select(Some(sel.min(items.len().saturating_sub(1))));
-    f.render_stateful_widget(list, rows[0], &mut st);
-
-    f.render_widget(
-        Paragraph::new(Line::styled(hint.to_string(), Style::default().fg(th.dim))),
-        rows[1],
-    );
+    f.render_stateful_widget(list, inner, &mut st);
 }
 
 #[cfg(test)]
@@ -245,40 +233,53 @@ pub(crate) fn draw_remote_wizard_with_hits(
     match w.stage() {
         RemoteStage::Connect => {
             let (field, recent_sel) = (w.field, w.recent_sel);
+            // Laid out like the request wizard: label column, value beside it,
+            // keys on the border. What each field wants is shown as a dim
+            // example inside the empty field rather than as a sentence under
+            // it.
+            let fields = [
+                (s.git_url_label, s.git_url_hint, &w.url, false),
+                (s.git_token_label, s.git_token_hint, &w.token, true),
+            ];
+            let label_w = label_column(fields.iter().map(|(l, _, _, _)| *l));
             // Grow the popup to fit the recent-URLs dropdown, if any (capped so
             // it never grows unreasonably tall).
             let recent_rows = w.recent.len().min(5) as u16;
-            let h = 10 + recent_rows;
-            let area = centered_rect(74, h, f.area());
+            let area = centered_rect(74, recent_rows + 4, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let hint = if recent_rows > 0 {
+                format!("{}  \u{b7}  {}", s.git_connect_hint, s.git_recent_hint)
+            } else {
+                s.git_connect_hint.to_string()
+            };
+            let block = panel_hinted(title.to_string(), &hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
             let rows = Layout::vertical([
-                Constraint::Length(1),           // url label
-                Constraint::Length(1),           // url field
+                Constraint::Length(1),           // url
                 Constraint::Length(recent_rows), // recent-urls dropdown
-                Constraint::Length(1),           // spacer
-                Constraint::Length(1),           // token label
-                Constraint::Length(1),           // token field
-                Constraint::Min(1),              // hint
+                Constraint::Length(1),           // token
             ])
             .split(inner);
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_url_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[0],
-            );
-            render_line_field(f, rows[1], &w.url, field == 0, false, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[1],
-                    MouseHitTarget::RemoteWizardRow(0),
+
+            for (i, (label, placeholder, ed, mask)) in fields.iter().enumerate() {
+                let row = if i == 0 { rows[0] } else { rows[2] };
+                let cols = Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)])
+                    .split(row);
+                f.render_widget(
+                    Paragraph::new(Span::styled(*label, Style::default().fg(th.accent))),
+                    cols[0],
                 );
+                render_line_field_hinted(f, cols[1], ed, field == i as u8, *mask, placeholder, th);
+                if let Some(app) = app {
+                    app.push_mouse_hit(
+                        MouseLayer::Overlay,
+                        row,
+                        MouseHitTarget::RemoteWizardRow(i),
+                    );
+                }
             }
+
             if recent_rows > 0 {
                 let items: Vec<ListItem> = w
                     .recent
@@ -294,44 +295,23 @@ pub(crate) fn draw_remote_wizard_with_hits(
                         } else {
                             Style::default().fg(th.dim)
                         };
-                        ListItem::new(Line::styled(u.clone(), style))
+                        ListItem::new(Line::styled(
+                            format!("{:pad$}{u}", "", pad = label_w as usize),
+                            style,
+                        ))
                     })
                     .collect();
-                f.render_widget(List::new(items), rows[2]);
+                f.render_widget(List::new(items), rows[1]);
                 if let Some(app) = app {
                     for i in 0..w.recent.len().min(5) {
                         app.push_mouse_hit(
                             MouseLayer::Overlay,
-                            Rect::new(rows[2].x, rows[2].y + i as u16, rows[2].width, 1),
+                            Rect::new(rows[1].x, rows[1].y + i as u16, rows[1].width, 1),
                             MouseHitTarget::RemoteWizardRow(10 + i),
                         );
                     }
                 }
             }
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_token_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[4],
-            );
-            render_line_field(f, rows[5], &w.token, field == 1, true, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[5],
-                    MouseHitTarget::RemoteWizardRow(1),
-                );
-            }
-            let hint = if recent_rows > 0 {
-                format!("{}  ·  {}", s.git_connect_hint, s.git_recent_hint)
-            } else {
-                s.git_connect_hint.to_string()
-            };
-            f.render_widget(
-                Paragraph::new(Line::styled(hint, Style::default().fg(th.dim))),
-                rows[6],
-            );
         }
         RemoteStage::Loading => {
             let msg = w.flow.busy().map_or(s.git_loading_refs, |p| p.label(s));
@@ -341,26 +321,17 @@ pub(crate) fn draw_remote_wizard_with_hits(
                 .max(title.chars().count()) as u16
                 + 4)
             .min(f.area().width);
-            let area = centered_rect(width, 4, f.area());
+            let area = centered_rect(width, 3, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
             f.render_widget(
                 Paragraph::new(Span::styled(
                     msg,
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 )),
-                rows[0],
-            );
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_loading_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[1],
+                inner,
             );
         }
         RemoteStage::PickRef => {
@@ -409,13 +380,13 @@ pub(crate) fn draw_remote_wizard_with_hits(
                     .unwrap_or(20)
                     .max(s.git_pick_workspace_filter_title.chars().count());
                 let w = (content_w as u16 + 6).clamp(30, f.area().width.max(1));
-                let h = (labels.len() as u16 + 3).min(f.area().height.max(1));
+                let h = (labels.len() as u16 + 2).min(f.area().height.max(1));
                 let area = centered_rect(w, h, f.area());
                 let inner = Rect {
                     x: area.x.saturating_add(1),
                     y: area.y.saturating_add(1),
                     width: area.width.saturating_sub(2),
-                    height: area.height.saturating_sub(3),
+                    height: area.height.saturating_sub(2),
                 };
                 for i in 0..labels.len().min(inner.height as usize) {
                     app.push_mouse_hit(
@@ -429,21 +400,16 @@ pub(crate) fn draw_remote_wizard_with_hits(
         RemoteStage::Error => {
             let e = w.flow.error().unwrap_or_default().to_string();
             let width = (f.area().width * 6 / 10).max(40);
-            let area = centered_rect(width, 8, f.area());
+            let area = centered_rect(width, 7, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_error_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
             f.render_widget(
                 Paragraph::new(e)
                     .style(Style::default().fg(th.err))
                     .wrap(Wrap { trim: true }),
-                rows[0],
-            );
-            f.render_widget(
-                Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
-                rows[1],
+                inner,
             );
         }
     }
@@ -470,12 +436,7 @@ pub(crate) fn draw_remote_wizard_with_hits(
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(2),
         };
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
         let vis = filter_indices(items.iter().map(|s| s.as_str()), filter);
         if vis.is_empty() {
             return;

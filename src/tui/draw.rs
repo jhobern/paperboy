@@ -264,6 +264,40 @@ pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> 
         .style(Style::default().bg(th.panel))
 }
 
+/// The width of a dialog's label column: the longest label plus a gap.
+///
+/// Wizards put the label beside its field rather than above it (the request
+/// editor's shape), which halves the rows a form takes and lines every value
+/// up on one column.
+pub(crate) fn label_column<'a>(labels: impl IntoIterator<Item = &'a str>) -> u16 {
+    labels
+        .into_iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16
+        + 2
+}
+
+/// A focused dialog panel whose shortcut hint sits on the bottom border.
+///
+/// The convention across the app: keys belong on the frame, not in the body,
+/// where they cost no row and never get mistaken for content or for a status
+/// message. Pass `style` to override the dim default (the confirm screens use
+/// the accent, because there the key *is* the next action).
+pub(crate) fn panel_hinted(title: String, hint: &str, th: &Theme) -> Block<'static> {
+    panel_hinted_styled(title, hint, Style::default().fg(th.dim), th)
+}
+
+pub(crate) fn panel_hinted_styled(
+    title: String,
+    hint: &str,
+    style: Style,
+    th: &Theme,
+) -> Block<'static> {
+    panel(title, true, th)
+        .title_bottom(Line::from(Span::styled(format!(" {hint} "), style)).centered())
+}
+
 pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);

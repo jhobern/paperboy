@@ -154,64 +154,43 @@ pub(crate) fn draw_git_save_wizard_with_hits(
     match w.stage() {
         GitSaveStage::Connect => {
             let field = w.field;
-            let area = centered_rect(74, 8, f.area());
+            // Same shape as the load wizard and the request editor: a label
+            // column, the value beside it, the keys on the border.
+            let fields = [
+                (s.git_url_label, s.git_url_hint, &w.url, false),
+                (s.git_token_label, s.git_token_hint, &w.token, true),
+            ];
+            let label_w = label_column(fields.iter().map(|(l, _, _, _)| *l));
+            let area = centered_rect(74, 4, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_connect_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows = Layout::vertical([
-                Constraint::Length(1), // url label
-                Constraint::Length(1), // url field
-                Constraint::Length(1), // spacer
-                Constraint::Length(1), // token label
-                Constraint::Length(1), // token field
-                Constraint::Min(1),    // hint
-            ])
-            .split(inner);
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_url_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[0],
-            );
-            render_line_field(f, rows[1], &w.url, field == 0, false, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[1],
-                    MouseHitTarget::GitSaveWizardRow(0),
+            let rows =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+            for (i, (label, placeholder, ed, mask)) in fields.iter().enumerate() {
+                let cols = Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)])
+                    .split(rows[i]);
+                f.render_widget(
+                    Paragraph::new(Span::styled(*label, Style::default().fg(th.accent))),
+                    cols[0],
                 );
+                render_line_field_hinted(f, cols[1], ed, field == i as u8, *mask, placeholder, th);
+                if let Some(app) = app {
+                    app.push_mouse_hit(
+                        MouseLayer::Overlay,
+                        rows[i],
+                        MouseHitTarget::GitSaveWizardRow(i),
+                    );
+                }
             }
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_token_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[3],
-            );
-            render_line_field(f, rows[4], &w.token, field == 1, true, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[4],
-                    MouseHitTarget::GitSaveWizardRow(1),
-                );
-            }
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_connect_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[5],
-            );
         }
         GitSaveStage::ChoosePaths => {
             let field = w.field;
             let rows_n: u16 = if w.has_env() { 8 } else { 4 };
-            let area = centered_rect(76, rows_n + 4, f.area());
+            let area = centered_rect(76, rows_n + 3, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_save_step_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
             let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)]; // collection path label+field
@@ -223,7 +202,6 @@ pub(crate) fn draw_git_save_wizard_with_hits(
                     constraints.push(Constraint::Length(1)); // env path field
                 }
             }
-            constraints.push(Constraint::Min(1)); // hint
             let rows = Layout::vertical(constraints).split(inner);
             f.render_widget(
                 Paragraph::new(Span::styled(
@@ -286,14 +264,6 @@ pub(crate) fn draw_git_save_wizard_with_hits(
                     }
                 }
             }
-            let hint_row = rows.len() - 1;
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_save_step_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[hint_row],
-            );
         }
         GitSaveStage::ChooseTarget => {
             let sel = w.sel;
@@ -304,9 +274,9 @@ pub(crate) fn draw_git_save_wizard_with_hits(
             } else {
                 0
             };
-            let area = centered_rect(74, 8 + dropdown_rows, f.area());
+            let area = centered_rect(74, 5 + dropdown_rows, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_save_target_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
             let rows = Layout::vertical([
@@ -314,7 +284,6 @@ pub(crate) fn draw_git_save_wizard_with_hits(
                 Constraint::Length(1),             // name label
                 Constraint::Length(1),             // name field
                 Constraint::Length(dropdown_rows), // existing-branches dropdown
-                Constraint::Min(1),                // hint
             ])
             .split(inner);
             let (branch_style, tag_style) = if w.flow.target_kind == SaveTargetKind::Branch {
@@ -386,49 +355,31 @@ pub(crate) fn draw_git_save_wizard_with_hits(
                     }
                 }
             }
-            let hint_row = rows.len() - 1;
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_save_target_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[hint_row],
-            );
         }
         GitSaveStage::CommitMessage => {
-            let area = centered_rect(74, 6, f.area());
+            let area = centered_rect(74, 3, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_save_commit_msg_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ])
-            .split(inner);
+            let label_w = label_column([s.git_save_commit_msg_label]);
+            let cols =
+                Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(inner);
             f.render_widget(
                 Paragraph::new(Span::styled(
                     s.git_save_commit_msg_label,
                     Style::default().fg(th.accent),
                 )),
-                rows[0],
+                cols[0],
             );
-            render_line_field(f, rows[1], &w.commit_msg, true, false, th);
+            render_line_field(f, cols[1], &w.commit_msg, true, false, th);
             if let Some(app) = app {
                 app.push_mouse_hit(
                     MouseLayer::Overlay,
-                    rows[1],
+                    inner,
                     MouseHitTarget::GitSaveWizardRow(0),
                 );
             }
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_save_commit_msg_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[2],
-            );
         }
         GitSaveStage::Pushing => {
             let width = (s.git_save_pushing.len() as u16 + 4).min(f.area().width);
@@ -463,21 +414,16 @@ pub(crate) fn draw_git_save_wizard_with_hits(
         GitSaveStage::Error => {
             let e = w.error_text();
             let width = (f.area().width * 6 / 10).max(40);
-            let area = centered_rect(width, 8, f.area());
+            let area = centered_rect(width, 7, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_error_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
             f.render_widget(
                 Paragraph::new(e.to_string())
                     .style(Style::default().fg(th.err))
                     .wrap(Wrap { trim: true }),
-                rows[0],
-            );
-            f.render_widget(
-                Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
-                rows[1],
+                inner,
             );
         }
     }
