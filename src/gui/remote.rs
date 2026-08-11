@@ -618,7 +618,7 @@ impl RemoteUi {
         self.flow = Some(Flow::Save(SaveFlow::new(SaveTarget::Report)));
     }
 
-    fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         self.flow.is_some()
     }
 }
@@ -652,7 +652,7 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
 
     let strings = &app.strings;
     let recent = app.session.recent_git_urls.clone();
-    let dismissed = super::widgets::dialog(ctx, title, Some(460.0), |ui| {
+    let dismissed = super::widgets::dialog_resizable(ctx, title, [480.0, 460.0], |ui| {
         action = draw_flow(ui, &mut flow, &recent, colors, strings);
     })
     .dismissed;
@@ -1068,7 +1068,7 @@ fn draw_load_pick_ref(
             RefKind::Tag => &load.flow.refs().tags,
         };
         egui::ScrollArea::vertical()
-            .max_height(220.0)
+            .max_height(list_height(ui))
             .show(ui, |ui| {
                 for (idx, name) in choices.iter().enumerate() {
                     let selected = match load.ref_kind {
@@ -1140,7 +1140,7 @@ fn draw_load_pick_file(
             ui.colored_label(colors.dim, s.gui_git_no_files);
         } else {
             egui::ScrollArea::vertical()
-                .max_height(260.0)
+                .max_height(list_height(ui))
                 .show(ui, |ui| {
                     for path in visible.iter() {
                         let selected = load.selected_path.as_deref() == Some(path.as_str());
@@ -1613,6 +1613,13 @@ fn finish_loaded_report(
     app.focus = super::Focus::Main;
     app.session.save();
     true
+}
+
+/// How tall a picker list may be: everything the resized dialog has left over
+/// once its buttons are accounted for. A fixed height would make the dialog
+/// resizable in name only — the window would grow and the list would not.
+fn list_height(ui: &egui::Ui) -> f32 {
+    (ui.available_height() - 64.0).max(120.0)
 }
 
 fn short_sha(sha: &str) -> &str {

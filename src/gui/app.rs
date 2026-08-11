@@ -775,8 +775,16 @@ impl GuiApp {
         resp.inner
     }
 
+    /// Whether a dialog is up. Every one of them covers the app with a sheet
+    /// that swallows clicks, so the keyboard has to stand down to match —
+    /// otherwise Ctrl+S while a git wizard is open saves whatever happens to be
+    /// behind it, which is not what the person typing meant.
+    pub fn dialog_is_open(&self) -> bool {
+        self.dialog.is_some() || self.remote.is_open() || self.postman.is_open()
+    }
+
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() {
+        if self.dialog_is_open() {
             return; // let the modal own the keyboard
         }
         // Tab / Shift+Tab cycle the focused *panel*, exactly like the terminal

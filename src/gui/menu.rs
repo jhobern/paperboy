@@ -2072,6 +2072,29 @@ mod tests {
     /// left by finding the right button, which on a confirmation that re-arms
     /// itself (every destructive one here does) means there is no way out at
     /// all for someone who opened it by accident.
+    /// The sheet a dialog draws over the app swallows clicks, so the keyboard
+    /// has to stand down to match: Ctrl+S with a git wizard open would
+    /// otherwise save whatever tab happens to be behind it.
+    #[test]
+    fn every_dialog_takes_the_keyboard_with_it_not_just_the_mouse() {
+        let mut a = app();
+        assert!(!a.dialog_is_open(), "nothing is open to begin with");
+
+        a.dialog = Some(Dialog::Rename {
+            target: RenameTarget::Tab { ci: 0 },
+            text: String::new(),
+        });
+        assert!(a.dialog_is_open());
+        a.dialog = None;
+
+        a.remote.open_load();
+        assert!(a.dialog_is_open(), "the git wizard counts too");
+        a.remote = Default::default();
+
+        a.postman.open();
+        assert!(a.dialog_is_open(), "and the Postman importer");
+    }
+
     #[test]
     fn escape_closes_a_dialog_the_way_its_cancel_button_would() {
         let ctx = egui::Context::default();

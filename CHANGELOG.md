@@ -12,6 +12,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A GUI dialog now behaves like a dialog.** They were anchored to the middle
+  of the window and fixed in size, so one could not be dragged aside to read
+  what it was covering, and the file/collection pickers inside the git and
+  Postman wizards were stuck at a few visible rows however large the window
+  was. Dialogs now open centred but can be moved, the two wizards can be
+  resized (with their lists growing to fill them), and the app behind is
+  covered by a dimmed sheet that blocks clicks and keyboard shortcuts — so a
+  second wizard can no longer be opened on top of the first, and Ctrl+S no
+  longer saves the tab hidden behind the dialog. The sheet blocks *input*
+  only: the app keeps painting and background work (a git fetch, a running
+  report) keeps finishing while a dialog is up.
+
 - **A workspace downloaded from git arrives with its environments and
   reports.** The recommended file filter took `.hurl` and `.json` only, so a
   repo holding requests, `.vars` environments and `.trail` reports downloaded

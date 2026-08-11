@@ -154,7 +154,7 @@ impl PostmanUi {
         self.flow = Some(Wizard::new());
     }
 
-    fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         self.flow.is_some()
     }
 }
@@ -213,10 +213,11 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         .picker_dir(crate::session::PickerKind::Import)
         .map(std::path::Path::to_owned);
     let strings = &app.strings;
-    let dismissed = super::widgets::dialog(ctx, strings.postman_title, Some(520.0), |ui| {
-        action = draw(ui, &mut w, colors, strings);
-    })
-    .dismissed;
+    let dismissed =
+        super::widgets::dialog_resizable(ctx, strings.postman_title, [540.0, 480.0], |ui| {
+            action = draw(ui, &mut w, colors, strings);
+        })
+        .dismissed;
     // The ✕ and Escape are the Cancel button by another name.
     if dismissed {
         action = UiAction::Cancel;
@@ -368,6 +369,12 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
 }
 
 /// The name of a key source as the picker shows it.
+/// See [`crate::gui::remote::list_height`]: a resizable dialog whose list keeps
+/// a fixed height is not really resizable.
+fn list_height(ui: &egui::Ui) -> f32 {
+    (ui.available_height() - 64.0).max(120.0)
+}
+
 fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
     match src {
         KeySource::Paste => s.postman_key_source_paste,
@@ -424,7 +431,7 @@ fn draw_pick_workspace(
         .collect();
     let mut selected = w.flow.selected;
     egui::ScrollArea::vertical()
-        .max_height(220.0)
+        .max_height(list_height(ui))
         .show(ui, |ui| {
             for (i, name) in names.iter().enumerate() {
                 if ui.selectable_label(selected == i, name).clicked() {

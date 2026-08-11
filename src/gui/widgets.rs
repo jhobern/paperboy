@@ -502,6 +502,123 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
 mod tests {
     use super::*;
 
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0))
+    }
+
+    fn a_frame() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            ..Default::default()
+        }
+    }
+
+    fn click_at(input: &mut egui::RawInput, pos: egui::Pos2) {
+        input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+
+    /// A dialog covers the app with a sheet that eats clicks: the menu bar and
+    /// the panels underneath must not act while a dialog is waiting for an
+    /// answer, or a second wizard ends up opened on top of the first. It is an
+    /// *input* sink only — the frame loop keeps running, so background work
+    /// (a git fetch, a report run) still finishes while the dialog is up.
+    #[test]
+    fn a_dialog_stops_clicks_reaching_the_app_behind_it() {
+        // The button sits in the far corner, well away from the centred dialog.
+        let button_pos = egui::pos2(20.0, 20.0);
+
+        let clicked_behind = |with_dialog: bool| {
+            let ctx = egui::Context::default();
+            let mut clicked = false;
+            // Two passes: egui needs the first to lay the widgets out before a
+            // click can land on them.
+            for pass in 0..2 {
+                let mut input = a_frame();
+                if pass == 1 {
+                    click_at(&mut input, button_pos);
+                }
+                let _ = ctx.run_ui(input, |ui| {
+                    if ui.button("behind").clicked() {
+                        clicked = true;
+                    }
+                    if with_dialog {
+                        let ctx = ui.ctx().clone();
+                        dialog(&ctx, "In the way", None, |ui| {
+                            ui.label("answer me");
+                        });
+                    }
+                });
+            }
+            clicked
+        };
+
+        assert!(
+            clicked_behind(false),
+            "the test's own button is clickable with no dialog up"
+        );
+        assert!(
+            !clicked_behind(true),
+            "the same click must not reach it through an open dialog"
+        );
+    }
+
+    /// The dialog opens centred but is not pinned there: one anchored to the
+    /// middle cannot be dragged off whatever the user opened it to look at.
+    #[test]
+    fn a_dialog_opens_centred_and_can_still_be_dragged_aside() {
+        let ctx = egui::Context::default();
+        let draw = |input: egui::RawInput| {
+            let _ = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                dialog(&ctx, "Draggable", None, |ui| {
+                    ui.label("body");
+                });
+            });
+            // egui derives a window's Area id from its title atoms.
+            egui::AreaState::load(&ctx, egui::Id::new(Some("Draggable")))
+                .expect("the dialog was drawn")
+                .rect()
+        };
+
+        draw(a_frame());
+        let centred = draw(a_frame());
+        assert!(
+            (centred.center().x - screen().center().x).abs() < 2.0
+                && (centred.center().y - screen().center().y).abs() < 2.0,
+            "it opens in the middle: {centred:?}"
+        );
+
+        // Drag the title bar to the left, as a user would.
+        let grab = egui::pos2(centred.center().x, centred.min.y + 6.0);
+        let mut press = a_frame();
+        press.events.push(egui::Event::PointerMoved(grab));
+        press.events.push(egui::Event::PointerButton {
+            pos: grab,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        draw(press);
+
+        let mut drag = a_frame();
+        drag.events
+            .push(egui::Event::PointerMoved(grab - egui::vec2(200.0, 0.0)));
+        let moved = draw(drag);
+
+        assert!(
+            moved.center().x < centred.center().x - 100.0,
+            "dragging the title bar moves it: {moved:?} vs {centred:?}"
+        );
+    }
+
     /// Paint one `tree_header_marked` row and return the fills of every solid
     /// rectangle it drew, so a test can tell a marked row from a plain one.
     fn header_fills(highlight: Option<egui::Color32>) -> Vec<egui::Color32> {
@@ -774,25 +891,61 @@ impl<R> DialogFrame<R> {
     }
 }
 
-/// The centred modal window shell shared by every GUI dialog.
+/// The modal window shell shared by every GUI dialog.
 ///
-/// Carries the two ways out a windowed dialog is expected to have: a ✕ in the
-/// title bar (egui draws it for an `open`ed window) and the Escape key. Both
-/// come back as [`DialogFrame::dismissed`] so the caller can run the same path
-/// as its own Cancel button — a dialog that can only be answered by finding
-/// the right button is a dialog people get stuck in.
+/// Behaves the way a desktop dialog is expected to: it opens centred but can
+/// be dragged aside (an anchored dialog cannot be moved off whatever you
+/// opened it to look at), it carries the two ways out a windowed dialog has —
+/// a ✕ in the title bar and the Escape key, both reported as
+/// [`DialogFrame::dismissed`] so the caller can run its own Cancel — and it
+/// puts a dimmed, click-swallowing sheet over the app behind it.
+///
+/// That sheet blocks *input*, not the frame loop: the app keeps painting and
+/// keeps polling its background work, so a git fetch or a report run started
+/// before the dialog opened still finishes while it is up.
 pub(crate) fn dialog<R>(
     ctx: &egui::Context,
     title: &str,
     min_width: Option<f32>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> DialogFrame<R> {
+    dialog_with(ctx, title, min_width, None, add)
+}
+
+/// A [`dialog`] the user can resize, for the ones whose body is a list: how
+/// much of a repo's files or a workspace's collections fits on screen is the
+/// user's call, not a number picked here.
+pub(crate) fn dialog_resizable<R>(
+    ctx: &egui::Context,
+    title: &str,
+    default_size: [f32; 2],
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    dialog_with(ctx, title, None, Some(default_size), add)
+}
+
+fn dialog_with<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    default_size: Option<[f32; 2]>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    shade(ctx, title);
     let mut open = true;
-    let inner = egui::Window::new(title)
+    let mut window = egui::Window::new(title)
         .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
+        .resizable(default_size.is_some())
+        // Centred on first sight, then wherever the user drags it.
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.input(|i| i.content_rect()).center())
+        // Above the sheet, which is itself above the panels.
+        .order(egui::Order::Foreground)
+        .open(&mut open);
+    if let Some(size) = default_size {
+        window = window.default_size(size);
+    }
+    let inner = window
         .show(ctx, |ui| {
             if let Some(w) = min_width {
                 ui.set_min_width(w);
@@ -808,4 +961,24 @@ pub(crate) fn dialog<R>(
         inner,
         dismissed: !open || esc,
     }
+}
+
+/// The dimmed sheet between a dialog and the app: it darkens what is behind
+/// and swallows every click, drag and scroll aimed at it, so the menu bar and
+/// the panels cannot be driven while a dialog is waiting for an answer (which
+/// is how a second wizard used to end up opened on top of the first).
+///
+/// Deliberately *only* an input sink — nothing here stops the frame loop, so
+/// background work carries on and the app never looks hung.
+fn shade(ctx: &egui::Context, title: &str) {
+    let screen = ctx.input(|i| i.content_rect());
+    egui::Area::new(egui::Id::new(("paperboy-dialog-shade", title)))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
+        });
 }
