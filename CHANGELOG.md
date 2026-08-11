@@ -502,6 +502,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The test suite no longer opens a file chooser.** One GUI test exercises the
+  guard that stops a second Browse click opening a rival dialog — and it did so
+  by opening a real one, which put a native folder chooser in front of whatever
+  its author was doing and took the keyboard with it, with nobody in the test to
+  answer it. Under `cfg(test)` a picker (and a native error alert) now opens
+  nothing and resolves as a cancel, so the polling and unwind paths stay
+  covered without anything reaching the screen.
+
 - **The active environment is always on screen.** The Environments panel is a
   scrolling list, and importing a Postman workspace can put a few hundred
   entries in it — so the one carrying the checkmark was almost never visible,

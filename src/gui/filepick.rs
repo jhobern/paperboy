@@ -25,8 +25,9 @@
 //! window). A macOS build would need `AsyncFileDialog` instead, as AppKit
 //! panels are main-thread-only.
 //!
-//! Every picker is triggered by a button/menu click, never during a headless
-//! test frame, so the tests never open a dialog.
+//! A picker is only ever triggered by a button/menu click — but a test can
+//! click one, so [`spawn`] and [`error_alert`] open nothing under `cfg(test)`:
+//! the suite must not put a window in front of whoever is running it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -81,10 +82,36 @@ impl<A> PendingPick<A> {
 }
 
 /// Open a dialog on a worker thread, to be polled with [`PendingPick::take`].
+///
+/// Under `cfg(test)` no dialog is opened at all. The suite runs while its
+/// author is doing something else, and a native chooser puts a window in front
+/// of whatever that is and takes the keyboard with it; a test has nobody to
+/// answer it either, so it was only ever an interruption. The handle returned
+/// still behaves like a real one — it resolves, as a cancel — so the code that
+/// polls and unwinds a pick stays exercised.
 pub fn spawn<A>(kind: PickKind, title: &str, dir: Option<&Path>, action: A) -> PendingPick<A> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let title = title.to_string();
-    let dir = dir.map(Path::to_path_buf);
+    #[cfg(test)]
+    {
+        let _ = (kind, title, dir);
+        drop(tx);
+    }
+    #[cfg(not(test))]
+    spawn_dialog(kind, title.to_string(), dir.map(Path::to_path_buf), tx);
+    PendingPick {
+        rx,
+        action: Some(action),
+    }
+}
+
+/// The blocking half of [`spawn`], on its own thread.
+#[cfg(not(test))]
+fn spawn_dialog(
+    kind: PickKind,
+    title: String,
+    dir: Option<PathBuf>,
+    tx: std::sync::mpsc::Sender<Option<PathBuf>>,
+) {
     std::thread::spawn(move || {
         let picked = match kind {
             PickKind::File { filters } => {
@@ -108,10 +135,6 @@ pub fn spawn<A>(kind: PickKind, title: &str, dir: Option<&Path>, action: A) -> P
         // there is nothing left to tell, so the error is genuinely ignorable.
         let _ = tx.send(picked);
     });
-    PendingPick {
-        rx,
-        action: Some(action),
-    }
 }
 
 /// Borrowed [`Filter`] rows in the owned form [`PickKind`] needs.
@@ -158,6 +181,14 @@ fn base(title: &str, dir: Option<&Path>) -> rfd::FileDialog {
 /// Show a native error alert (used to report a failed open/save now that the
 /// old in-app text dialog — which showed the error inline — is gone).
 pub fn error_alert(title: &str, message: &str) {
+    // Same reasoning as `spawn`: a test must not put a window on the screen of
+    // whoever is running it, and there is nobody there to dismiss it.
+    #[cfg(test)]
+    {
+        let _ = (title, message);
+        return;
+    }
+    #[cfg(not(test))]
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title(title)
