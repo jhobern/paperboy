@@ -922,6 +922,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A report line that runs off the edge now says so.** The terminal UI's
+  report Source view clips long lines rather than wrapping them (they are code,
+  and wrapping would break the 1:1 relationship between a row on screen and a
+  line in the file), but it clipped them silently — the only way to discover
+  that something had been cut off was to enter edit mode and walk the cursor
+  along the line. A clipped row now ends in the same dim `…` the wizard's
+  truncated cells use. The results grid's rows, header included, are marked the
+  same way when columns run past the right edge; a row of trailing padding
+  doesn't count as something you're missing.
+
 - **Every other long list scrolled the way the workspace tree used to.** The
   tree was fixed to let the cursor travel through the visible rows; the same
   defect (a list rebuilt from scratch each frame, so it always scrolled the

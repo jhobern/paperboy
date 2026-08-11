@@ -176,6 +176,35 @@ fn the_environments_panel_scrolls_the_same_way_the_tree_does() {
     );
 }
 
+/// The report Source view clips long lines rather than wrapping them, so a line
+/// that runs past the right edge has to say so — otherwise the only way to find
+/// out something was cut off is to enter edit mode and walk along it.
+#[test]
+fn a_report_line_that_runs_off_the_edge_says_so() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let long = "x".repeat(400);
+    app.reports[idx]
+        .report
+        .set_text(&format!("# collection: api\n# note: {long}\nshort\n"));
+    app.revalidate_report(idx);
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let inner = app.report_pane_areas[super::reports::ReportPane::Source.idx()];
+    assert!(inner.width > 0, "the source panel was drawn");
+    let buf = term.backend().buffer().clone();
+    let marker_col = inner.x + inner.width - 1;
+    let at = |row: u16| -> String { buf[(marker_col, inner.y + row)].symbol().to_string() };
+    assert_eq!(at(1), "\u{2026}", "the long line is marked as continuing");
+    assert_ne!(at(0), "\u{2026}", "a short line is not");
+    assert_ne!(at(2), "\u{2026}", "nor is the one after it");
+}
+
 /// Another tab's scroll position means nothing in this one, so a tab switch
 /// starts at the top rather than inheriting a viewport that has no relation to
 /// what is selected here.

@@ -3673,9 +3673,13 @@ fn draw_report_results(
             height: pinned as u16,
         };
         f.render_widget(
-            Paragraph::new(pinned_lines).style(Style::default().fg(th.text)),
+            Paragraph::new(pinned_lines.clone()).style(Style::default().fg(th.text)),
             header_area,
         );
+        // The pinned rows clip exactly like the scrolling ones below them, so
+        // they carry the same marker — a header row that stops mid-column
+        // otherwise reads as the last column there is.
+        mark_clipped_rows(f, header_area, &pinned_lines, 0, th);
         // Scroll only the data rows in the area below everything pinned.
         let body_area = Rect {
             x: inner.x,
@@ -4240,6 +4244,9 @@ fn render_panel_lines(
         Paragraph::new(visible).style(Style::default().fg(th.text)),
         area,
     );
+    if panel.wrap_mode() == WrapMode::Clip {
+        mark_clipped_rows(f, area, lines, panel.scroll(), th);
+    }
     let mut bar_area = Rect::default();
     if panel.max_scroll(area.height) > 0 {
         let total = panel.total_rows().min(u16::MAX as u32) as usize;
@@ -4267,6 +4274,52 @@ fn render_panel_lines(
 /// view's panels. Returns the inner text Rect and the scrollbar Rect (the
 /// latter `Rect::default()` when no scrollbar is needed) so the caller can
 /// record them for mouse hit-testing (text selection + scrollbar drag).
+/// The marker painted in the last column of a row whose content runs off the
+/// right edge of a clipping panel.
+///
+/// The report's Source view (and the results grid) clip rather than wrap, so a
+/// long line simply stopped at the panel edge with nothing to say it had been
+/// cut — the only way to find out was to enter edit mode and walk the cursor
+/// along it. The glyph is the ellipsis the wizard's clipped cells already use
+/// (see `editor::render_clipped_line`) rather than the `‹ ›` pair, which this
+/// codebase reserves for text you can actually scroll sideways; drawn dim like
+/// the soft-wrap marker so it never competes with the content.
+const CLIP_MARKER: char = '\u{2026}';
+
+/// Paint [`CLIP_MARKER`] on every visible row whose line is cut off by the
+/// panel's right edge.
+///
+/// Only meaningful for a clipping panel: a wrapping one has nothing off-screen
+/// to point at. Rows are 1:1 with logical lines under `WrapMode::Clip`, so the
+/// line behind visible row `n` is `lines[scroll + n]`.
+///
+/// A row is only marked when there is something other than blanks past the
+/// edge — the results grid pads its cells out to fixed column widths, and a
+/// row of trailing spaces is not something the reader is missing.
+fn mark_clipped_rows(f: &mut Frame, inner: Rect, lines: &[Line<'static>], scroll: u16, th: &Theme) {
+    let width = inner.width as usize;
+    if width == 0 {
+        return;
+    }
+    for row in 0..inner.height {
+        let Some(line) = lines.get(scroll as usize + row as usize) else {
+            break;
+        };
+        let mut chars = line.spans.iter().flat_map(|sp| sp.content.chars());
+        if chars.by_ref().take(width).count() < width {
+            continue;
+        }
+        if !chars.any(|c| c != ' ') {
+            continue;
+        }
+        let pos = ratatui::layout::Position::new(inner.x + inner.width - 1, inner.y + row);
+        if let Some(cell) = f.buffer_mut().cell_mut(pos) {
+            cell.set_char(CLIP_MARKER);
+            cell.set_style(Style::default().fg(th.dim));
+        }
+    }
+}
+
 fn draw_report_panel(
     f: &mut Frame,
     area: Rect,
@@ -4290,6 +4343,9 @@ fn draw_report_panel(
         Paragraph::new(visible).style(Style::default().fg(th.text)),
         inner,
     );
+    if panel.wrap_mode() == WrapMode::Clip {
+        mark_clipped_rows(f, inner, lines, panel.scroll(), th);
+    }
     let mut bar_area = Rect::default();
     if panel.max_scroll(inner.height) > 0 {
         let total = panel.total_rows().min(u16::MAX as u32) as usize;
