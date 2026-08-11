@@ -1176,7 +1176,6 @@ strings! {
     postman_base_url_label => "API host", "Hôte de l’API", "API-vært";
     postman_base_url_hint => "api.getpostman.com · EU: api.eu.postman.com", "api.getpostman.com · UE : api.eu.postman.com", "api.getpostman.com · EU: api.eu.postman.com";
     postman_pick_workspace => "Choose a workspace", "Choisissez un espace de travail", "Vælg et workspace";
-    postman_options_title => "What to import", "Que faut-il importer ?", "Hvad skal importeres";
     postman_include_collections => "Collections", "Collections", "Samlinger";
     postman_include_environments => "Environments", "Environnements", "Miljøer";
     postman_dest_label => "Import into", "Importer dans", "Importér til";

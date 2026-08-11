@@ -14,7 +14,7 @@ use eframe::egui;
 
 use crate::i18n::{Status, Strings};
 use crate::postman_flow::{
-    PostmanEvent, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
+    KeySource, PostmanEvent, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
 };
 use crate::postman_import::{ImportFormat, ImportSummary, WaitReason};
 
@@ -34,6 +34,14 @@ struct Wizard {
     /// The shared state machine — the terminal UI drives the same one, so the
     /// two front-ends cannot disagree about how an import behaves.
     flow: PostmanFlow,
+    /// Where the API key lives. The user picks the provider and types only the
+    /// part they can read off it (an item path, a parameter name); the wizard
+    /// assembles the `{{ … }}` reference the resolver understands, so nobody
+    /// has to learn that syntax to import a workspace.
+    key_source: KeySource,
+    /// What the user typed for the key: the credential itself under
+    /// [`KeySource::Paste`], otherwise the address of one.
+    key_entry: String,
     /// Whether the user has edited the destination. A blank field is filled in
     /// from the workspace name, but only until they say otherwise.
     dest_touched: bool,
@@ -48,11 +56,21 @@ impl Wizard {
     fn new() -> Self {
         // An API key in the environment is the one credential a user is likely
         // to have to hand, and a PMAK is miserable to type.
+        let flow = PostmanFlow::new().with_env_key();
+        let (key_source, key_entry) = KeySource::detect(&flow.key);
         Self {
-            flow: PostmanFlow::new().with_env_key(),
+            flow,
+            key_source,
+            key_entry,
             dest_touched: false,
             last_step: Step::Connect,
         }
+    }
+
+    /// Fold the key source and what was typed under it back into the flow's
+    /// single key field, which is what the worker resolves.
+    fn sync_key(&mut self) {
+        self.flow.key = self.key_source.reference(&self.key_entry);
     }
 
     /// The step to draw: the last real one when the flow is showing a failure —
@@ -280,31 +298,59 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
 
-    ui.colored_label(colors.accent, s.postman_key_label);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut w.flow.key)
-            .password(true)
-            .desired_width(f32::INFINITY),
-    );
-    ui.colored_label(colors.dim, s.postman_key_hint);
-    ui.add_space(8.0);
+    // A label column with the field beside it, and what the field wants shown
+    // as hint text inside it: an example is read where the answer goes, and
+    // costs nothing once the field is filled in.
+    egui::Grid::new("pb_postman_connect")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.colored_label(colors.accent, s.postman_key_source_label);
+            egui::ComboBox::from_id_salt("pb_postman_key_source")
+                .selected_text(key_source_label(w.key_source, s))
+                .show_ui(ui, |ui| {
+                    for src in KeySource::ALL {
+                        if ui
+                            .selectable_label(src == w.key_source, key_source_label(src, s))
+                            .clicked()
+                        {
+                            w.key_source = src;
+                        }
+                    }
+                });
+            ui.end_row();
 
-    ui.colored_label(colors.accent, s.postman_workspace_label);
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::singleline(&mut w.flow.workspace_ref).desired_width(f32::INFINITY),
-    );
-    ui.colored_label(colors.dim, s.postman_workspace_hint);
-    ui.add_space(8.0);
+            ui.colored_label(colors.accent, key_field_label(w.key_source, s));
+            // Only a pasted key is the credential; a reference is the *address*
+            // of one, and masking that would only stop the user checking it.
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut w.key_entry)
+                    .password(w.key_source.is_secret())
+                    .hint_text(key_field_hint(w.key_source, s))
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
 
-    ui.collapsing(s.postman_base_url_label, |ui| {
-        ui.add_enabled(
-            !busy,
-            egui::TextEdit::singleline(&mut w.flow.base_url).desired_width(f32::INFINITY),
-        );
-        ui.colored_label(colors.dim, s.postman_base_url_hint);
-    });
+            ui.colored_label(colors.accent, s.postman_workspace_label);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut w.flow.workspace_ref)
+                    .hint_text(s.postman_workspace_hint)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+
+            ui.colored_label(colors.accent, s.postman_base_url_label);
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut w.flow.base_url)
+                    .hint_text(s.postman_base_url_hint)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+        });
+    w.sync_key();
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -319,6 +365,37 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         }
     });
     action
+}
+
+/// The name of a key source as the picker shows it.
+fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_source_paste,
+        KeySource::OnePassword => s.postman_key_source_op,
+        KeySource::Ssm => s.postman_key_source_ssm,
+        KeySource::Env => s.postman_key_source_env,
+    }
+}
+
+/// What the key field is asking for, and an example of it — both follow the
+/// chosen source, because "API key" is the wrong prompt when the field wants
+/// the name of a 1Password item.
+fn key_field_label(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_label,
+        KeySource::OnePassword => s.postman_key_label_op,
+        KeySource::Ssm => s.postman_key_label_ssm,
+        KeySource::Env => s.postman_key_label_env,
+    }
+}
+
+fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_hint,
+        KeySource::OnePassword => s.postman_key_hint_op,
+        KeySource::Ssm => s.postman_key_hint_ssm,
+        KeySource::Env => s.postman_key_hint_env,
+    }
 }
 
 fn draw_pick_workspace(
@@ -385,8 +462,7 @@ fn draw_options(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
 
-    ui.colored_label(colors.accent, s.postman_options_title);
-    ui.add_space(4.0);
+    // No heading: the window's title bar already says what this dialog is.
     ui.checkbox(
         &mut w.flow.include_collections,
         s.postman_include_collections,
@@ -414,7 +490,9 @@ fn draw_options(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         if ui
             .add_enabled(
                 !busy,
-                egui::TextEdit::singleline(&mut w.flow.dest).desired_width(360.0),
+                egui::TextEdit::singleline(&mut w.flow.dest)
+                    .hint_text(s.postman_dest_unset)
+                    .desired_width(360.0),
             )
             .changed()
         {
@@ -573,6 +651,41 @@ mod tests {
             name: name.to_string(),
             kind: WorkspaceKind::Team,
         }
+    }
+
+    /// The GUI offers the same choice of key source the terminal does, and
+    /// assembles the reference itself: a user who keeps their key in 1Password
+    /// types the item path their password manager shows them, not the
+    /// `{{ op://… }}` syntax around it.
+    #[test]
+    fn the_key_source_choice_writes_the_reference_the_resolver_understands() {
+        let mut w = Wizard::new();
+        w.key_source = KeySource::OnePassword;
+        w.key_entry = "Private/Postman/credential".to_string();
+        w.sync_key();
+        assert_eq!(w.flow.key, "{{ op://Private/Postman/credential }}");
+        assert!(
+            !w.key_source.is_secret(),
+            "an item path is an address, so it is shown rather than masked"
+        );
+
+        // A pasted key is the credential itself: used as typed, and hidden.
+        w.key_source = KeySource::Paste;
+        w.key_entry = "PMAK-abc".to_string();
+        w.sync_key();
+        assert_eq!(w.flow.key, "PMAK-abc");
+        assert!(w.key_source.is_secret());
+    }
+
+    /// A key picked up from the environment arrives as a plain key, and the
+    /// wizard has to open showing it that way round rather than as syntax.
+    #[test]
+    fn a_wizard_opens_on_the_source_its_existing_key_came_from() {
+        let mut w = Wizard::new();
+        w.flow.key = "{{ ssm:/prod/postman/api-key }}".to_string();
+        let (src, entry) = KeySource::detect(&w.flow.key);
+        assert_eq!(src, KeySource::Ssm);
+        assert_eq!(entry, "/prod/postman/api-key");
     }
 
     fn a_plan() -> ImportPlan {

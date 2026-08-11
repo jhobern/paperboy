@@ -12,6 +12,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI's Postman importer asks where the key lives, like the terminal
+  does.** The connect step wanted an API key and hinted, in prose, that a
+  provider reference could be typed instead — which only helps someone who
+  already knows the syntax. It now offers the source (pasted key, 1Password,
+  AWS SSM, environment variable) beside the field and writes the reference
+  itself, so a 1Password user types the item path their password manager shows
+  them. The remaining steps lost their stacked explanations: the fields carry
+  their examples inside them and the window title says what the dialog is, so
+  the options screen no longer repeats it back.
+
 - **Every GUI dialog can be left by Escape or by its corner.** The windows had
   no ✕ and ignored Escape, so a dialog opened by accident could only be
   answered — and the destructive confirmations re-arm themselves when they are
