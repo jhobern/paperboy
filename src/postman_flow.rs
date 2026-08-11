@@ -85,19 +85,81 @@ pub(crate) struct Progress {
     /// can explain itself instead of appearing hung.
     pub(crate) waiting: Option<(WaitReason, u64)>,
     started: Option<Instant>,
+    /// How many of each kind the whole download will fetch, taken from the
+    /// plan. Needed because the queue is not homogeneous: collections come
+    /// first and cost more, so "seconds so far ÷ items so far" over-estimates
+    /// for the whole of the collection run and then under-corrects.
+    totals: [usize; 2],
+    /// Time measured per kind, and how many samples it came from.
+    spent: [Duration; 2],
+    samples: [usize; 2],
+    /// The item currently in flight: its kind, and when it started. Closed off
+    /// into `spent`/`samples` when the next item begins.
+    in_flight: Option<(ItemKind, Instant)>,
+}
+
+/// Index into the per-kind arrays on [`Progress`].
+fn kind_slot(kind: ItemKind) -> usize {
+    match kind {
+        ItemKind::Collection => 0,
+        ItemKind::Environment => 1,
+    }
 }
 
 impl Progress {
+    /// Note that `kind` has started, closing off the timing of whatever was in
+    /// flight before it. Only finished items are measured; the one on screen
+    /// is still running and would drag the average down.
+    fn start_item(&mut self, kind: ItemKind) {
+        let now = Instant::now();
+        if let Some((prev, at)) = self.in_flight.take() {
+            let slot = kind_slot(prev);
+            self.spent[slot] += now.saturating_duration_since(at);
+            self.samples[slot] += 1;
+        }
+        self.in_flight = Some((kind, now));
+    }
+
+    /// Average measured cost of one item of `kind`, falling back to the rate
+    /// achieved over everything so far while that kind has no samples of its
+    /// own (the environments have not started yet, and something is better
+    /// than nothing).
+    fn per_item(&self, kind: ItemKind, overall: Duration) -> Duration {
+        let slot = kind_slot(kind);
+        match self.samples[slot] {
+            0 => overall,
+            n => self.spent[slot] / n as u32,
+        }
+    }
+
     /// Time remaining based on the rate actually achieved so far, rather than
     /// the published one — a throttled account is slower than the estimate, and
     /// that is exactly when an ETA matters.
+    ///
+    /// Extrapolated per kind. A workspace of 23 collections and 500
+    /// environments spends its first minute on the dear half of the queue, so
+    /// a single blended average would quote a time for the cheap half that it
+    /// measured on the dear one.
     pub(crate) fn eta(&self) -> Option<Duration> {
         let started = self.started?;
         if self.done == 0 || self.done >= self.total {
             return None;
         }
         let elapsed = Instant::now().saturating_duration_since(started);
-        Some((elapsed / self.done as u32) * (self.total - self.done) as u32)
+        let overall = elapsed / self.done as u32;
+        if self.totals.iter().sum::<usize>() != self.total {
+            // No per-kind breakdown (an older plan, or a test that set only
+            // the total): fall back to the blended rate.
+            return Some(overall * (self.total - self.done) as u32);
+        }
+        let left = |kind: ItemKind| -> u32 {
+            let slot = kind_slot(kind);
+            self.totals[slot].saturating_sub(self.samples[slot]) as u32
+        };
+        Some(
+            self.per_item(ItemKind::Collection, overall) * left(ItemKind::Collection)
+                + self.per_item(ItemKind::Environment, overall) * left(ItemKind::Environment),
+        )
     }
 
     pub(crate) fn fraction(&self) -> f32 {
@@ -428,6 +490,7 @@ impl PostmanFlow {
         }
         self.progress = Progress {
             total,
+            totals: [plan.collections.len(), plan.environments.len()],
             started: Some(Instant::now()),
             ..Progress::default()
         };
@@ -531,6 +594,7 @@ impl PostmanFlow {
                     self.progress.current = name;
                     self.progress.current_kind = Some(kind);
                     self.progress.waiting = None;
+                    self.progress.start_item(kind);
                 }
                 ImportMsg::Waiting { reason, secs } => {
                     self.progress.waiting = Some((reason, secs));
@@ -980,6 +1044,33 @@ mod tests {
             eta.as_secs()
         );
         assert!((p.fraction() - 0.2).abs() < 0.001);
+    }
+
+    /// A workspace of a few collections and hundreds of environments spends its
+    /// first minute on the dear half of the queue. Extrapolating that rate over
+    /// the cheap half is how "about two minutes" became a quarter of an hour,
+    /// so each kind is extrapolated from its own measured rate.
+    #[test]
+    fn the_eta_extrapolates_each_kind_from_its_own_rate() {
+        // 2 collections done, at 4s each; 200 environments left, measured at
+        // 0.5s each from the one sample there is.
+        let p = Progress {
+            done: 3,
+            total: 202,
+            totals: [2, 200],
+            spent: [Duration::from_secs(8), Duration::from_millis(500)],
+            samples: [2, 1],
+            started: Some(Instant::now() - Duration::from_secs(9)),
+            ..Progress::default()
+        };
+        let eta = p.eta().expect("three done is enough to extrapolate");
+        // 199 environments at 0.5s ≈ 100s. The blended rate (3s an item) would
+        // have said ten minutes.
+        assert!(
+            (90..=110).contains(&eta.as_secs()),
+            "unexpected eta: {}s",
+            eta.as_secs()
+        );
     }
 
     /// Nothing to extrapolate from yet, and nothing left to wait for, both mean

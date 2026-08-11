@@ -201,45 +201,105 @@ pub(crate) fn draw_postman_wizard(f: &mut Frame, w: &PostmanWizard, s: &Strings,
     }
 }
 
+/// How many lines `text` takes when wrapped to `width` columns, the way
+/// [`Paragraph`]'s word wrap does it. Used to size a hint's row before it is
+/// drawn, so a long sentence (or a longer translation of it) grows the dialog
+/// instead of being cut off at the panel edge.
+fn wrapped_height(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let width = width as usize;
+    let mut lines = 1u16;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        if col == 0 {
+            col = len;
+        } else if col + 1 + len <= width {
+            col += 1 + len;
+        } else {
+            lines += 1;
+            col = len;
+        }
+        // A word longer than the line (a URL) spills onto further lines.
+        while col > width {
+            lines += 1;
+            col -= width;
+        }
+    }
+    lines
+}
+
 fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
-    let area = centered_rect(76, 16, f.area());
+    // Wide enough for the longest hint to read as a sentence, but never wider
+    // than the terminal.
+    let width = 76.min(f.area().width);
+    // Inner width: the panel's borders take a column on each side.
+    let text_w = width.saturating_sub(2);
+    let fields: [(&'static str, &'static str, u8); 3] = [
+        (s.postman_key_label, s.postman_key_hint, 0),
+        (s.postman_workspace_label, s.postman_workspace_hint, 1),
+        (s.postman_base_url_label, s.postman_base_url_hint, 2),
+    ];
+    // label + field + however many lines the hint wraps to, per group. No
+    // blank rows between them: the accented label is what starts a group, and
+    // padding every group out with an empty line made three fields fill a
+    // screen that the rest of the app would have drawn in eight rows.
+    let hint_rows: Vec<u16> = fields
+        .iter()
+        .map(|(_, hint, _)| wrapped_height(hint, text_w))
+        .collect();
+    let body: u16 = hint_rows.iter().map(|h| h + 2).sum();
+    let hint_h = wrapped_height(s.git_connect_hint, text_w);
+    let area = centered_rect(width, body + hint_h + 2, f.area());
     f.render_widget(Clear, area);
     let block = panel(title.to_string(), true, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Length(1), // key label
-        Constraint::Length(1), // key field
-        Constraint::Length(1), // key hint
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // workspace label
-        Constraint::Length(1), // workspace field
-        Constraint::Length(1), // workspace hint
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // base url label
-        Constraint::Length(1), // base url field
-        Constraint::Length(1), // base url hint
-        Constraint::Min(1),    // hint
-    ])
-    .split(inner);
 
-    let label = |t: &'static str| Paragraph::new(Span::styled(t, Style::default().fg(th.accent)));
-    let hint = |t: &'static str| Paragraph::new(Line::styled(t, Style::default().fg(th.dim)));
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for h in &hint_rows {
+        constraints.push(Constraint::Length(1)); // label
+        constraints.push(Constraint::Length(1)); // field
+        constraints.push(Constraint::Length(*h)); // hint
+    }
+    constraints.push(Constraint::Min(1)); // key hint for the whole form
+    let rows = Layout::vertical(constraints).split(inner);
 
-    f.render_widget(label(s.postman_key_label), rows[0]);
-    // The key is a credential, so it is masked like the git token field.
-    render_line_field(f, rows[1], &w.key, w.field == 0, true, th);
-    f.render_widget(hint(s.postman_key_hint), rows[2]);
+    for (g, (label, hint, idx)) in fields.iter().enumerate() {
+        let base = g * 3;
+        // The label carries the group: accent, bold, and immediately above its
+        // own field, which is how every other form in the app reads.
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                *label,
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            )),
+            rows[base],
+        );
+        // The key is a credential, so it is masked like the git token field.
+        let (ed, mask) = match idx {
+            0 => (&w.key, true),
+            1 => (&w.workspace_ref, false),
+            _ => (&w.base_url, false),
+        };
+        render_line_field(f, rows[base + 1], ed, w.field == *idx, mask, th);
+        f.render_widget(
+            Paragraph::new(Line::styled(*hint, Style::default().fg(th.dim)))
+                .wrap(Wrap { trim: true }),
+            rows[base + 2],
+        );
+    }
 
-    f.render_widget(label(s.postman_workspace_label), rows[4]);
-    render_line_field(f, rows[5], &w.workspace_ref, w.field == 1, false, th);
-    f.render_widget(hint(s.postman_workspace_hint), rows[6]);
-
-    f.render_widget(label(s.postman_base_url_label), rows[8]);
-    render_line_field(f, rows[9], &w.base_url, w.field == 2, false, th);
-    f.render_widget(hint(s.postman_base_url_hint), rows[10]);
-
-    f.render_widget(hint(s.git_connect_hint), rows[11]);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            s.git_connect_hint,
+            Style::default().fg(th.dim),
+        ))
+        .wrap(Wrap { trim: true }),
+        rows[fields.len() * 3],
+    );
 }
 
 fn draw_loading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
@@ -420,18 +480,25 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let Some(plan) = w.flow.plan() else {
         return;
     };
-    let area = centered_rect(78, 13, f.area());
+    let width = 78.min(f.area().width);
+    let note_h = wrapped_height(s.postman_rate_limit_note, width.saturating_sub(2));
+    let mut tail_h = wrapped_height(s.postman_confirm_hint, width.saturating_sub(2));
+    if plan.strains_monthly_budget() {
+        tail_h += wrapped_height(s.postman_budget_warning, width.saturating_sub(2));
+    }
+    // Sized to its content — no trailing empty rows, which on a four-line
+    // screen read as "something failed to draw".
+    let area = centered_rect(width, note_h + tail_h + 5, f.area());
     f.render_widget(Clear, area);
     let block = panel(title.to_string(), true, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([
-        Constraint::Length(1), // heading
-        Constraint::Length(1), // counts
-        Constraint::Length(1), // spacer
-        Constraint::Length(2), // rate limit note
-        Constraint::Length(1), // estimate
-        Constraint::Min(1),    // budget warning / hint
+        Constraint::Length(1),      // heading
+        Constraint::Length(1),      // counts
+        Constraint::Length(note_h), // rate limit note
+        Constraint::Length(1),      // estimate
+        Constraint::Min(1),         // budget warning / hint
     ])
     .split(inner);
 
@@ -455,7 +522,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             Style::default().fg(th.dim),
         ))
         .wrap(Wrap { trim: true }),
-        rows[3],
+        rows[2],
     );
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -466,7 +533,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             ),
             Style::default().fg(th.text).add_modifier(Modifier::BOLD),
         )),
-        rows[4],
+        rows[3],
     );
     let mut tail = Vec::new();
     if plan.strains_monthly_budget() {
@@ -475,35 +542,53 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             Style::default().fg(th.err),
         ));
     }
+    // Not the connect hint: this screen has no fields to Tab between and no
+    // connection left to make — Enter starts the import.
     tail.push(Line::styled(
-        s.git_connect_hint,
+        s.postman_confirm_hint,
         Style::default().fg(th.dim),
     ));
-    f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[5]);
+    f.render_widget(Paragraph::new(tail).wrap(Wrap { trim: true }), rows[4]);
 }
 
 fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     let p = w.flow.progress();
-    let area = centered_rect(74, 9, f.area());
+    // The bar is the whole point of this screen, so it gets the room: a fixed
+    // 74 columns left it stranded in the middle of a wide terminal, drawing a
+    // half-width bar for a full-width wait.
+    let width = (f.area().width * 9 / 10).max(40.min(f.area().width));
+    let eta = p.eta();
+    // Only the rows that have something in them — an empty row reserved for an
+    // ETA that hasn't been worked out yet is just a hole in the dialog.
+    let mut constraints = vec![
+        Constraint::Length(1), // gauge
+        Constraint::Length(1), // current item
+    ];
+    if eta.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    if p.waiting.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // hint
+    let area = centered_rect(width, constraints.len() as u16 + 2, f.area());
     f.render_widget(Clear, area);
     let block = panel(title.to_string(), true, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Length(1), // gauge
-        Constraint::Length(1), // current item
-        Constraint::Length(1), // eta
-        Constraint::Length(1), // waiting note
-        Constraint::Min(1),    // hint
-    ])
-    .split(inner);
+    let rows = Layout::vertical(constraints).split(inner);
+    let mut row = 0;
+    let mut next = || {
+        row += 1;
+        rows[row - 1]
+    };
 
     f.render_widget(
         Gauge::default()
             .gauge_style(Style::default().fg(th.accent).bg(th.panel))
             .ratio(p.fraction().clamp(0.0, 1.0) as f64)
             .label(format!("{}/{}", p.done, p.total)),
-        rows[0],
+        next(),
     );
     let current = match p.current_kind {
         Some(kind) => format!("{}: {}", item_kind_label(kind, s), p.current),
@@ -511,15 +596,15 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
     };
     f.render_widget(
         Paragraph::new(Line::styled(current, Style::default().fg(th.text))),
-        rows[1],
+        next(),
     );
-    if let Some(eta) = p.eta() {
+    if let Some(eta) = eta {
         f.render_widget(
             Paragraph::new(Line::styled(
                 format!("{} {}", human_duration(eta, s), s.postman_remaining),
                 Style::default().fg(th.dim),
             )),
-            rows[2],
+            next(),
         );
     }
     // A paced import spends most of its life deliberately idle; saying so is
@@ -534,7 +619,7 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
                 format!("{label} ({secs}s)"),
                 Style::default().fg(th.pending),
             )),
-            rows[3],
+            next(),
         );
     }
     f.render_widget(
@@ -542,7 +627,7 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
             s.git_loading_hint,
             Style::default().fg(th.dim),
         )),
-        rows[4],
+        next(),
     );
 }
 
@@ -607,7 +692,20 @@ fn elide_left(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::elide_left;
+    use super::{elide_left, wrapped_height};
+
+    /// The API-key hint is a full sentence with a URL in it, and it is longer
+    /// again in French. Sizing its row from the wrapped height is what stopped
+    /// it being cut off mid-word at the panel edge.
+    #[test]
+    fn a_hint_is_measured_at_the_width_it_will_be_drawn_at() {
+        assert_eq!(wrapped_height("short enough", 40), 1);
+        assert_eq!(wrapped_height("one two three four", 9), 3);
+        // A word longer than the line still fits somewhere rather than
+        // reporting a height that would clip it.
+        assert_eq!(wrapped_height("https://go.postman.co/settings", 10), 3);
+        assert_eq!(wrapped_height("anything", 0), 1);
+    }
 
     #[test]
     fn a_path_that_fits_is_left_alone() {

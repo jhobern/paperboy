@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use crate::postman::ConversionNote;
 use crate::postman_api::{
-    ApiError, GENERAL_MIN_INTERVAL, ItemSummary, PostmanClient, RateInfo, STRICT_MIN_INTERVAL,
-    sanitize_file_name, unique_file_name,
+    ApiError, COLLECTION_FETCH_COST, ENVIRONMENT_FETCH_COST, GENERAL_MIN_INTERVAL, ItemSummary,
+    PostmanClient, RateInfo, STRICT_MIN_INTERVAL, sanitize_file_name, unique_file_name,
 };
 
 /// Subfolder for collections, matching the layout the original backup script
@@ -226,14 +226,20 @@ impl ImportPlan {
         self.item_count()
     }
 
-    /// Roughly how long the download will take at the published rates.
+    /// Roughly how long the download will take.
     ///
-    /// Every fetch is a general-bucket call, so this is simply the item count
-    /// paced at the general interval. It is an estimate, not a promise: a
-    /// throttled account will be slower, which is why the running import
-    /// reports a measured ETA too (see [`Progress::eta`]).
+    /// Counted per kind, because the two do not cost the same: a collection is
+    /// a whole document and a environment is a short list of variables, and the
+    /// round trip — not the pacing interval — is what most of the time is spent
+    /// on. Pacing alone would put a 500-environment import at under two
+    /// minutes; the same import measured itself at over ten.
+    ///
+    /// Still an estimate, not a promise: a throttled account is slower again,
+    /// which is why the running import reports a measured ETA too (see
+    /// `Progress::eta`), and why the wizard says "about".
     pub fn estimated_duration(&self) -> Duration {
-        GENERAL_MIN_INTERVAL * self.item_count() as u32
+        COLLECTION_FETCH_COST * self.collections.len() as u32
+            + ENVIRONMENT_FETCH_COST * self.environments.len() as u32
     }
 
     /// Whether this import would consume an uncomfortable share of the
@@ -1263,16 +1269,26 @@ mod tests {
     fn estimate_scales_with_the_item_count() {
         let plan = plan_of(60, 5);
         assert_eq!(plan.item_count(), 65);
-        assert_eq!(plan.estimated_duration(), GENERAL_MIN_INTERVAL * 65);
+        assert_eq!(
+            plan.estimated_duration(),
+            COLLECTION_FETCH_COST * 60 + ENVIRONMENT_FETCH_COST * 5
+        );
     }
 
     #[test]
-    fn estimate_beats_the_uniform_one_second_approach() {
-        // The regression this whole two-bucket design exists to prevent: the
-        // original script paced every call at the strict rate.
+    fn the_estimate_counts_a_collection_as_dearer_than_an_environment() {
+        // A 500-environment workspace and a 500-collection one are not the
+        // same download, and quoting one figure for both is how "about 2
+        // minutes" became a quarter of an hour.
+        assert!(plan_of(10, 0).estimated_duration() > plan_of(0, 10).estimated_duration());
+    }
+
+    #[test]
+    fn the_estimate_allows_for_the_round_trip_not_just_the_pacing() {
+        // Pacing is the floor, not the cost: an import that only counted the
+        // interval between calls promised a time it could never hit.
         let plan = plan_of(60, 5);
-        let naive = Duration::from_millis(1100) * 65;
-        assert!(plan.estimated_duration() * 4 < naive);
+        assert!(plan.estimated_duration() > GENERAL_MIN_INTERVAL * 65);
     }
 
     #[test]

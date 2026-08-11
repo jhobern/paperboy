@@ -57,6 +57,24 @@ pub const STRICT_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 /// roughly five times longer than it needs to.
 pub const GENERAL_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
+/// What one collection fetch actually costs, end to end: the pacing interval
+/// above *plus* the round trip, which is what really dominates. A collection is
+/// a whole document — every request, script and example in it — so the response
+/// is large and the server takes its time building it.
+///
+/// Calibrated against a real 523-item import whose measured ETA settled around
+/// a second an item, an order of magnitude away from what pacing alone
+/// predicted. Estimating from [`GENERAL_MIN_INTERVAL`] alone told the user "2
+/// minutes" for a download that ran for well over ten, which is worse than no
+/// estimate: it is a promise the import cannot keep.
+pub const COLLECTION_FETCH_COST: Duration = Duration::from_millis(1_000);
+
+/// The same for one environment fetch. An environment is a short list of
+/// key/value pairs, so it comes back markedly faster than a collection — which
+/// is why the estimate counts the two kinds separately rather than averaging
+/// them into a single per-item figure.
+pub const ENVIRONMENT_FETCH_COST: Duration = Duration::from_millis(500);
+
 /// Which rate-limit budget an endpoint draws from. Exposed so the import
 /// engine can pace the two independently rather than applying the strictest
 /// limit to everything.

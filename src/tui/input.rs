@@ -3663,6 +3663,25 @@ impl TuiApp {
         self.browser_name = Editor::new(&format!("{stem}.{}", OUTPUT_EXTENSIONS[next]), false);
     }
 
+    /// Save into the folder the picker is showing, under the name already in
+    /// its inline field — what Space (and Enter on a file row) does in a
+    /// "save to folder" picker.
+    ///
+    /// A blank name leaves the picker open: there is nothing to save under it,
+    /// and closing on a name the user never typed would write a file called
+    /// nothing anywhere they happened to be standing.
+    fn browser_commit_current_folder(&mut self, action: FileAction, ex: &FileExplorer) {
+        let name = self.browser_name.text().trim().to_string();
+        if name.is_empty() {
+            self.browser_name_focused = true;
+            self.overlay = Some(Overlay::Browser(action, Box::new(ex.clone())));
+            return;
+        }
+        let dir = ex.cwd().clone();
+        self.last_browse_dir = Some(dir.clone());
+        self.browser_commit_save(action, dir, name);
+    }
+
     pub(crate) fn browser_commit_save(
         &mut self,
         action: FileAction,
@@ -5499,25 +5518,23 @@ impl TuiApp {
                         None => self.browser_forward_path = None,
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
+                } else if save_folder {
+                    // A file row in a "save to folder" picker: the file itself
+                    // can't be the answer (the answer is a folder plus a name),
+                    // and Enter here used to do nothing at all. It now means
+                    // what Space means -- save into the folder being shown,
+                    // under the name in the field -- because a dead key on the
+                    // row the user is looking at teaches them the picker is
+                    // stuck. Enter on a *folder* row still descends: that is
+                    // how you get anywhere.
+                    self.browser_commit_current_folder(action, &ex);
                 } else if matches!(
                     action,
-                    FileAction::OpenWorkspace
-                        | FileAction::SaveWorkspaceChooseFolder
-                        | FileAction::SaveCollectionChooseFolder
-                        | FileAction::MoveWorkspaceItemChooseFolder
-                        | FileAction::NewReportChooseFolder
-                        | FileAction::PostmanDestChooseFolder
+                    FileAction::OpenWorkspace | FileAction::MoveWorkspaceItemChooseFolder
                 ) {
-                    // A Workspace root/destination (or a collection save
-                    // destination) must be a folder, not a file — Enter on a
-                    // file here is a no-op. For the "save to folder" pickers,
-                    // Tab to the filename field at the bottom and press Enter
-                    // there to save into the current folder; `Space` picks the
-                    // current folder as a Workspace root (OpenWorkspace).
-                    // `NewReportChooseFolder` shows the workspace's own files
-                    // for context but only folders are selectable, so Enter on
-                    // one of those files is likewise inert (the browser stays
-                    // open).
+                    // A Workspace root/move destination must be a folder, not a
+                    // file, and `Space` is how the current one is confirmed —
+                    // so Enter on a file here is a no-op.
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else {
                     // A file is selected — remember its folder so the browser
@@ -5531,6 +5548,12 @@ impl TuiApp {
                     self.do_file_action(action, &path);
                     self.save_state();
                 }
+            }
+            // Space saves into the folder on screen, under the name already in
+            // the inline field — the decision the picker was opened to confirm.
+            // Tab is still there for renaming it first.
+            KeyCode::Char(' ') if save_folder => {
+                self.browser_commit_current_folder(action, &ex);
             }
             KeyCode::Char(' ') if action == FileAction::OpenWorkspace => {
                 // Confirm the CURRENT WORKING DIRECTORY (not necessarily
@@ -6399,13 +6422,20 @@ fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
 /// they took `Space` as "choose this folder"; type-to-filter must therefore
 /// leave it alone in exactly these three, and only these three.
 fn browser_confirms_on_space(action: FileAction) -> bool {
-    matches!(
-        action,
-        FileAction::OpenWorkspace
-            | FileAction::MoveWorkspaceItemChooseFolder
-            | FileAction::PickReportNodeFolder
-            | FileAction::PickReportHeaderFolder
-    )
+    // A "save to folder" picker confirms on Space too, with the name already
+    // sitting in its inline field. That field is seeded with the name the
+    // caller wanted in the first place, so the common case -- "yes, here,
+    // called that" -- was three keystrokes (Tab, Enter, and the Tab back if
+    // you'd changed your mind) for a decision the user had already made.
+    action.is_save_to_folder() || {
+        matches!(
+            action,
+            FileAction::OpenWorkspace
+                | FileAction::MoveWorkspaceItemChooseFolder
+                | FileAction::PickReportNodeFolder
+                | FileAction::PickReportHeaderFolder
+        )
+    }
 }
 
 /// Whether the local load browser filters by extension for this action. The

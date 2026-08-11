@@ -14547,8 +14547,12 @@ fn new_report_picker_shows_folders_and_workspace_files_but_hides_others() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A file row in a folder picker can't be the answer, so Enter there used to do
+/// nothing at all. It now means what Space means — take the folder on screen,
+/// with the name already in the field — because a key that does nothing on the
+/// row the user is looking at reads as a stuck dialog.
 #[test]
-fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
+fn new_report_picker_enter_on_a_workspace_file_saves_into_the_current_folder() {
     let dir = workspace_temp_dir("new_report_enter_file");
     let mut col = Collection::new("ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -14558,9 +14562,7 @@ fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
     app.new_report_seed_dir = Some(dir.clone());
     app.open_browser(FileAction::NewReportChooseFolder);
 
-    // Move the selection onto a shown file (a collection) and press Enter:
-    // files are non-selectable here, so Enter is inert and the folder
-    // browser stays open (rather than closing or opening anything).
+    // Move the selection onto a shown file (a collection) and press Enter.
     if let Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) = &mut app.overlay {
         let idx = ex
             .files()
@@ -14571,13 +14573,16 @@ fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
     } else {
         panic!("expected the new-report folder browser");
     }
+    let name = app.browser_name.text();
+    assert!(!name.is_empty(), "the picker seeds a report name");
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(
-            app.overlay,
-            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
-        ),
-        "Enter on a non-selectable file leaves the new-report browser open"
+        !matches!(app.overlay, Some(Overlay::Browser(..))),
+        "Enter on a file row commits the folder instead of doing nothing"
+    );
+    assert!(
+        app.active_report_index().is_some(),
+        "the report was created in the folder on screen"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -25082,6 +25087,87 @@ fn cancelling_the_destination_picker_restores_the_wizard_unchanged() {
     assert_eq!(w.dest, PathBuf::from("/tmp/Alpha"));
 }
 
+/// The folder picker opens with the name the wizard already worked out, so the
+/// common answer — "yes, here, called that" — should not cost a Tab and an
+/// Enter in a field the user never wanted to visit. Space takes the folder on
+/// screen under that name.
+#[test]
+fn space_in_the_destination_picker_takes_the_folder_and_the_suggested_name() {
+    let dir = temp_dir("postman_dest_space");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(dir.join("Alpha"));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Browser(FileAction::PostmanDestChooseFolder, _))
+    ));
+    assert_eq!(app.browser_name.text(), "Alpha");
+
+    press(&mut app, KeyCode::Char(' '));
+
+    assert!(
+        app.browser_query.is_empty(),
+        "Space confirmed rather than filtering"
+    );
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.dest, dir.join("Alpha"));
+}
+
+/// The confirmation screen has no fields to move between and no connection left
+/// to make, so it must not borrow the connect form's "Tab switch field · Enter
+/// connect" hint — Enter starts the import.
+#[test]
+fn the_confirmation_says_enter_imports_not_enter_connects() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        w.flow.seed_step(PostmanStep::Confirm);
+    }
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(text.contains(s.postman_confirm_hint), "got: {text}");
+    assert!(!text.contains(s.git_connect_hint));
+}
+
+/// The API key hint is a whole sentence with a URL in it, and it used to be
+/// chopped off at the panel edge ("it is never wri…"). It wraps now, so the
+/// sentence finishes.
+#[test]
+fn the_connect_form_shows_the_whole_key_hint() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("written to disk."),
+        "the hint is still cut off: {text}"
+    );
+}
+
 /// The hint under the options has to describe what Enter does on the row the
 /// cursor is actually on — it used to claim "Enter connect" everywhere, which
 /// was wrong on every row.
@@ -25195,14 +25281,17 @@ fn space_still_confirms_in_the_folder_pickers() {
         );
     }
 
-    // A save-to-folder picker has a filename field for that, so Space there is
-    // an ordinary character and does filter.
+    // A save-to-folder picker confirms on Space too, using the name already in
+    // its filename field — so a space never reaches the filter there either.
     let mut app = app_with(|a| {
         a.last_browse_dir = Some(dir.clone());
     });
     app.open_browser(FileAction::SaveWorkspaceChooseFolder);
     press(&mut app, KeyCode::Char(' '));
-    assert_eq!(app.browser_query, " ");
+    assert!(
+        app.browser_query.is_empty(),
+        "Space in a save-to-folder picker confirms rather than filtering"
+    );
 }
 
 /// In a "save to folder" picker the same keys mean different things either side

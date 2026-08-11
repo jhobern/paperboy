@@ -502,6 +502,38 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **A folder picker takes Space for "here, under this name".** Every
+  "save into a folder" picker — exporting a report, saving a collection or a
+  workspace, choosing where a Postman import lands — opens with the name already
+  worked out in its inline field, and then asked you to Tab into that field and
+  press Enter to accept it. **Space** now saves into the folder on screen under
+  the name already there, and **Enter on a file row** — which previously did
+  nothing at all, and so read as a stuck dialog — does the same. Enter on a
+  *folder* row still descends into it, and Tab is still there for renaming
+  first.
+
+- **The Postman importer's estimate counts a collection and an environment
+  separately.** It priced every fetch at the pacing interval alone, which is the
+  floor, not the cost: the round trip is what the time actually goes on, and a
+  collection — a whole document of requests, scripts and examples — takes far
+  longer to come back than an environment's short list of variables. A
+  23-collection, 500-environment workspace was quoted at "about 2 minutes" for a
+  download that ran for well over ten. The running ETA is now extrapolated per
+  kind too, so the minutes-remaining figure measured on the collections at the
+  front of the queue is no longer applied to the environments behind them.
+
+- **The Postman importer reads like the rest of the terminal UI.** Its connect
+  form spaced three fields out over sixteen rows with blank lines between them
+  and clipped the API-key hint mid-word at the panel edge ("it is never wri…").
+  The hints now wrap — in every language, however long the translation — each
+  field's own accented label is what starts its group, and the padding is gone.
+  The confirmation screen no longer borrows the git dialog's "Tab switch field ·
+  Enter connect" hint on a screen with no fields and nothing left to connect to;
+  it says Enter imports. The download screen gives its progress bar the width of
+  the terminal rather than a fixed 74 columns, and draws only the rows it has
+  something to put in, instead of reserving empty ones for an ETA that hasn't
+  been worked out yet.
+
 - **The `Trend` column is tinted by which way a row moved, and nothing else.**
   It coloured a still-failing row red, which repeated in red exactly what the
   `Correct` cell immediately to its left already said — spending the column's
