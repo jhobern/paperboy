@@ -3293,14 +3293,10 @@ impl TuiApp {
     }
 
     pub(crate) fn workspace_env_files(&self) -> Vec<std::path::PathBuf> {
-        match self
-            .collections
+        self.collections
             .get(self.active_tab)
-            .and_then(|c| c.workspace_root.as_deref())
-        {
-            Some(root) => crate::workspace::scan_environments(root),
-            None => Vec::new(),
-        }
+            .map(|c| c.workspace_env_files())
+            .unwrap_or_default()
     }
 
     pub(crate) fn has_workspace_env_source(&self) -> bool {

@@ -75,6 +75,15 @@ pub struct ReportEditor {
     /// computed from. Validation is re-run only when this changes, so it happens
     /// on an edit rather than on every frame — see that function for why.
     diag_key: Option<u64>,
+    /// The last highlighter context built for the Source view, with the
+    /// fingerprint of what it was built from.
+    ///
+    /// Same reasoning as `diag_key`, one step further in: the Source view asks
+    /// for this on every frame, and building it collects the bound collection's
+    /// (and every helper's) request names into a fresh `HashSet` of freshly
+    /// formatted qualified strings — a per-frame allocation per request, to
+    /// answer a question whose answer only changes when a request is renamed.
+    hl_cache: Option<(u64, std::rc::Rc<HlCtx>)>,
     /// The selected node's path (a sequence of indices into nested loop
     /// bodies). Empty = the synthetic `Begin` root.
     pub selection: Vec<usize>,
@@ -215,6 +224,7 @@ impl ReportEditor {
             diagnostics: Vec::new(),
             helpers: Vec::new(),
             diag_key: None,
+            hl_cache: None,
             selection: Vec::new(),
             palette: None,
             undo: Vec::new(),
@@ -1982,11 +1992,17 @@ fn dry_run_body(
 /// `ENVS` name reads green when it binds to something loaded and amber when it
 /// doesn't — so the Source view answers "is this report wired up?" at a glance,
 /// exactly as the terminal UI's does.
-fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
+fn highlight_ctx(ed: &mut ReportEditor, app: &GuiApp) -> std::rc::Rc<HlCtx> {
     let bound = ed.flow.as_ref().and_then(|flow| {
         context::resolve_bound_collection(&app.session.collections, flow, ed.report.path.as_deref())
     });
-    HlCtx {
+    let key = highlight_ctx_key(ed, app, bound);
+    if let Some((cached_key, ctx)) = &ed.hl_cache
+        && *cached_key == key
+    {
+        return ctx.clone();
+    }
+    let ctx = std::rc::Rc::new(HlCtx {
         error_line: ed.parse_error_line,
         collection_resolves: bound.is_some(),
         loaded_envs: app
@@ -2005,7 +2021,40 @@ fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
                     .collect()
             })
             .unwrap_or_default(),
+    });
+    ed.hl_cache = Some((key, ctx.clone()));
+    ctx
+}
+
+/// Everything [`highlight_ctx`] reads, in one number.
+///
+/// Names only, because names are all the context holds: which collection the
+/// report binds to, what its (and its helpers') requests are called, and what
+/// environments are loaded. Hashing those is a pass over a few kilobytes of
+/// title text; building the context is an allocation per request.
+///
+/// **Maintenance:** anything [`highlight_ctx`] starts reading has to be added
+/// here, or the colours will stop following it.
+fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp, bound: Option<usize>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ed.parse_error_line.hash(&mut h);
+    bound.hash(&mut h);
+    for e in &app.session.global_envs {
+        e.name.hash(&mut h);
     }
+    if let Some(ci) = bound {
+        for e in &app.session.collections[ci].entries {
+            e.title.hash(&mut h);
+        }
+    }
+    for helper in &ed.helpers {
+        helper.alias.hash(&mut h);
+        for e in &helper.entries {
+            e.title.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// Lay `text` out as a syntax-highlighted [`egui::text::LayoutJob`], reusing the
@@ -2301,7 +2350,8 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let avail = ui.available_height();
     let diag_h = ed.diag_h.clamp(48.0, (avail - 100.0).max(48.0));
     let edit_h = (avail - diag_h - 8.0).max(80.0);
-    let hl = highlight_ctx(ed, app);
+    let hl_ctx = highlight_ctx(ed, app);
+    let hl = &*hl_ctx;
     let spec = app.session.active_theme_spec();
     let th = app.theme;
     // `TextEdit` asks for a job every frame; re-tokenising the whole document
@@ -11797,6 +11847,54 @@ mod toolbar_commit_tests {
         report.set_text(text.to_string());
         app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(0), report));
         app
+    }
+
+    /// The Source view asks for the highlighter context on every frame, so it
+    /// has to come back from the cache until one of the names in it moves.
+    #[test]
+    fn the_highlighter_context_is_reused_until_a_name_it_shows_changes() {
+        let mut app = app_with_report("# collection: api\nREQUEST A\n");
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.flow = ed.report.flow().ok();
+        }
+
+        let mut ed = app.report_editor.take().expect("editor");
+        let first = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            first.request_names.contains("A"),
+            "the bound collection's request is known: {:?}",
+            first.request_names
+        );
+        let again = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &again),
+            "nothing changed, so the context is not rebuilt"
+        );
+
+        // Renaming a request has to reach the colours.
+        app.session.collections[0].entries[0].title = "B".into();
+        let renamed = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            !std::rc::Rc::ptr_eq(&first, &renamed),
+            "a rename rebuilds the context"
+        );
+        assert!(
+            renamed.request_names.contains("B"),
+            "and the new name is the one highlighted: {:?}",
+            renamed.request_names
+        );
+
+        // So does loading an environment, which the view underlines by name.
+        let before_env = super::highlight_ctx(&mut ed, &app);
+        app.session
+            .global_envs
+            .push(crate::environment::parse_vars("staging".into(), ""));
+        let with_env = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            !std::rc::Rc::ptr_eq(&before_env, &with_env),
+            "a newly loaded environment rebuilds the context"
+        );
+        assert!(with_env.loaded_envs.iter().any(|n| n == "staging"));
     }
 
     #[test]

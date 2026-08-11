@@ -37,15 +37,11 @@ fn has_workspace(app: &GuiApp) -> bool {
 }
 
 fn workspace_files(app: &GuiApp) -> Vec<std::path::PathBuf> {
-    match app
-        .session
+    app.session
         .collections
         .get(app.active_ci())
-        .and_then(|c| c.workspace_root.as_deref())
-    {
-        Some(root) => crate::workspace::scan_environments(root),
-        None => Vec::new(),
-    }
+        .map(|c| c.workspace_env_files())
+        .unwrap_or_default()
 }
 
 fn effective_source(app: &GuiApp) -> crate::env_panel::EnvSource {
@@ -63,11 +59,19 @@ fn effective_source(app: &GuiApp) -> crate::env_panel::EnvSource {
 /// followed by every other loaded environment, narrowed by the filter box.
 /// See [`crate::env_panel`], which both front-ends share so they list the same
 /// things in the same order.
+#[cfg(test)]
 fn env_rows(app: &GuiApp) -> Vec<crate::env_panel::EnvRow> {
-    let files = workspace_files(app);
+    env_rows_from(app, &workspace_files(app))
+}
+
+/// [`env_rows`] against a file list already in hand. The panel needs the same
+/// list three times over — the rows, the unfiltered rows behind the "no
+/// matches" message, and the empty state — and gathering it once is what keeps
+/// those from being three passes over the workspace scan per frame.
+fn env_rows_from(app: &GuiApp, files: &[std::path::PathBuf]) -> Vec<crate::env_panel::EnvRow> {
     crate::env_panel::rows(
         &app.session.global_envs,
-        &files,
+        files,
         &app.env_query,
         effective_source(app),
     )
@@ -153,13 +157,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     }
     ui.separator();
 
-    let rows = env_rows(app);
-    let rows_for_source = crate::env_panel::rows(
-        &app.session.global_envs,
-        &workspace_files(app),
-        "",
-        effective_source(app),
-    );
+    let files = workspace_files(app);
+    let rows = env_rows_from(app, &files);
+    let rows_for_source =
+        crate::env_panel::rows(&app.session.global_envs, &files, "", effective_source(app));
     let active = app.session.active_env_id;
     let linked = app.session.collections[ci].linked_env_id;
 
@@ -184,8 +185,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 ui.add_space(6.0);
                 // "Nothing loaded" and "the filter hid everything" are
                 // different problems with different fixes.
-                let empty = if app.session.global_envs.is_empty() && workspace_files(app).is_empty()
-                {
+                let empty = if app.session.global_envs.is_empty() && files.is_empty() {
                     lbl_no_envs
                 } else if rows_for_source.is_empty() {
                     app.strings.gui_env_source_no_matches

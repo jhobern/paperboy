@@ -467,18 +467,6 @@ fn is_postman_env_json(path: &Path) -> bool {
     answer
 }
 
-/// Every environment file under `root`, depth-first in the same order the
-/// Workspace tree shows them. Used by the Environments panel, which lists a
-/// workspace's environments alongside the loaded global ones whether or not
-/// they have been opened yet.
-pub fn scan_environments(root: &Path) -> Vec<PathBuf> {
-    scan_workspace(root, true)
-        .into_iter()
-        .filter(|e| !e.is_dir && is_env_file(&e.path))
-        .map(|e| e.path)
-        .collect()
-}
-
 /// Whether `path` is any file the Workspace tree surfaces — a collection
 /// (`.hurl`/`.json`), an environment (`.vars`) or a report (`.trail`). Exposed
 /// so the new-report folder chooser can *show* the same files (alongside

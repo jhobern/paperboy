@@ -109,6 +109,27 @@ struct LoadFlow {
     /// An error raised by the GUI itself (a blank URL, nothing picked yet).
     /// Errors from git live on the flow; [`LoadFlow::error`] shows either.
     local_error: Option<String>,
+    /// The last answer [`LoadFlow::visible_files`] gave, with what it was an
+    /// answer to. The picker asks for the list on every frame it is on screen,
+    /// and a repo with a few thousand files made that a full lowercase-and-
+    /// substring pass plus a clone of every matching path per frame — for a
+    /// list that only changes when the user types in the filter box.
+    ///
+    /// Handed out as an `Rc` so serving it costs a refcount rather than the
+    /// clone the cache was added to avoid.
+    visible_cache: std::cell::RefCell<Option<VisibleFiles>>,
+}
+
+/// A memoised [`LoadFlow::visible_files`] result, with the inputs it was
+/// computed from. The listing itself is identified by
+/// [`RemoteFlow::files_generation`] rather than by anything derived from its
+/// contents — two different repos can easily agree on a file count, and on a
+/// missing commit sha.
+struct VisibleFiles {
+    generation: u64,
+    filter: String,
+    show_all: bool,
+    out: std::rc::Rc<Vec<String>>,
 }
 
 impl LoadFlow {
@@ -134,6 +155,7 @@ impl LoadFlow {
             ws_name: String::new(),
             ws_origin: None,
             local_error: None,
+            visible_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -189,25 +211,45 @@ impl LoadFlow {
     /// or an environment, so unlike the terminal UI — which asks which up
     /// front and narrows to that one kind — this shows both, with a "show all"
     /// escape hatch for a repo that names its files unusually.
-    fn visible_files(&self) -> Vec<String> {
+    fn visible_files(&self) -> std::rc::Rc<Vec<String>> {
+        let generation = self.flow.files_generation();
+        if let Some(hit) = self.visible_cache.borrow().as_ref()
+            && hit.generation == generation
+            && hit.filter == self.filter
+            && hit.show_all == self.show_all_files
+        {
+            return hit.out.clone();
+        }
         let filter = self.filter.to_lowercase();
-        self.flow
-            .all_files()
-            .iter()
-            .filter(|path| self.show_all_files || is_default_load_file(path))
-            .filter(|path| filter.is_empty() || path.to_lowercase().contains(&filter))
-            .cloned()
-            .collect()
+        let out: std::rc::Rc<Vec<String>> = std::rc::Rc::new(
+            self.flow
+                .all_files()
+                .iter()
+                .filter(|path| self.show_all_files || is_default_load_file(path))
+                .filter(|path| filter.is_empty() || path.to_lowercase().contains(&filter))
+                .cloned()
+                .collect(),
+        );
+        *self.visible_cache.borrow_mut() = Some(VisibleFiles {
+            generation,
+            filter: self.filter.clone(),
+            show_all: self.show_all_files,
+            out: out.clone(),
+        });
+        out
     }
 
-    /// The repo files the current [`WorkspaceGitFilter`] would download.
-    fn workspace_matches(&self) -> Vec<String> {
+    /// How many repo files the current [`WorkspaceGitFilter`] would download.
+    ///
+    /// A count, not a list: the filter step draws this number on every frame
+    /// and wants nothing else from it, and the download itself re-applies the
+    /// filter on the far side of the flow rather than being handed a list.
+    fn workspace_match_count(&self) -> usize {
         self.flow
             .all_files()
             .iter()
             .filter(|p| self.ws_filter.matches(p))
-            .cloned()
-            .collect()
+            .count()
     }
 
     /// Advance the shared flow, and act on anything it finishes. Returns true
@@ -808,7 +850,7 @@ fn draw_load_workspace_filter(
         }
     });
 
-    let matched = load.workspace_matches().len();
+    let matched = load.workspace_match_count();
     ui.add_space(4.0);
     ui.colored_label(
         colors.dim,
@@ -1038,10 +1080,10 @@ fn draw_load_pick_file(
             egui::ScrollArea::vertical()
                 .max_height(260.0)
                 .show(ui, |ui| {
-                    for path in visible {
+                    for path in visible.iter() {
                         let selected = load.selected_path.as_deref() == Some(path.as_str());
                         if super::widgets::selectable(ui, selected, path.as_str()).clicked() {
-                            load.selected_path = Some(path);
+                            load.selected_path = Some(path.clone());
                         }
                     }
                 });
@@ -1333,7 +1375,7 @@ fn start_save(save: &mut SaveFlow, app: &mut GuiApp) {
 }
 
 fn start_workspace_checkout(load: &mut LoadFlow, s: &Strings) {
-    if load.workspace_matches().is_empty() {
+    if load.workspace_match_count() == 0 {
         load.local_error = Some(s.gui_git_err_ws_no_matches.to_string());
         return;
     }
@@ -1610,11 +1652,53 @@ mod tests {
         assert_eq!(load.visible_files().len(), 2);
     }
 
+    /// The picker asks for its file list on every frame, so the list is
+    /// memoised: the same answer comes back as the same allocation until one of
+    /// the things it was computed from changes.
+    #[test]
+    fn the_file_list_is_reused_until_something_it_depends_on_changes() {
+        let mut load = seeded(LoadTarget::File, &["api/Health.hurl", "api/orders.hurl"]);
+
+        let first = load.visible_files();
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &load.visible_files()),
+            "a second frame is served the list already in hand"
+        );
+
+        load.filter = "health".to_string();
+        let filtered = load.visible_files();
+        assert!(
+            !std::rc::Rc::ptr_eq(&first, &filtered),
+            "typing in the filter box recomputes it"
+        );
+        assert_eq!(*filtered, vec!["api/Health.hurl"]);
+
+        load.show_all_files = true;
+        assert!(
+            !std::rc::Rc::ptr_eq(&filtered, &load.visible_files()),
+            "so does the show-all checkbox"
+        );
+
+        // A different repo, same number of files and the same filter: the cache
+        // must not serve the previous repo's paths.
+        load.filter.clear();
+        load.show_all_files = false;
+        let before = load.visible_files();
+        load.flow = RemoteFlow::seed(
+            load.flow.kind,
+            "https://example.test/other.git",
+            Step::PickFile,
+            vec!["other/a.hurl".to_string(), "other/b.hurl".to_string()],
+            Some(std::env::temp_dir().join("pb-gui-remote-test")),
+        );
+        assert_ne!(*load.visible_files(), *before, "a fetch invalidates it");
+    }
+
     #[test]
     fn the_file_filter_is_case_insensitive() {
         let mut load = seeded(LoadTarget::File, &["api/Health.hurl", "api/orders.hurl"]);
         load.filter = "HEALTH".to_string();
-        assert_eq!(load.visible_files(), vec!["api/Health.hurl"]);
+        assert_eq!(*load.visible_files(), vec!["api/Health.hurl"]);
     }
 
     /// The step shown is derived from the shared flow, so the GUI cannot drift
@@ -1633,7 +1717,7 @@ mod tests {
     fn a_workspace_load_asks_for_a_type_filter_rather_than_a_file() {
         let load = seeded(LoadTarget::Workspace, &["a.hurl", "b.json", "big/blob.bin"]);
         assert_eq!(load.step(), LoadStep::PickWorkspaceFilter);
-        assert_eq!(load.workspace_matches().len(), 2, "the .bin is left behind");
+        assert_eq!(load.workspace_match_count(), 2, "the .bin is left behind");
     }
 
     /// Downloading nothing at all is a mistake worth naming, rather than a

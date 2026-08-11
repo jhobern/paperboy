@@ -495,6 +495,43 @@ impl Collection {
         });
     }
 
+    /// Every `.vars` (or env-shaped `.json`) file in this tab's workspace, for
+    /// the Environments panel to list alongside the loaded environments.
+    ///
+    /// Served out of the same cached tree walk [`Self::ws_rows`] uses rather
+    /// than scanning the disk itself: both front-ends' environment panels ask
+    /// for this list several times per frame — once for the rows, once for the
+    /// unfiltered rows behind the "no matches" message, once for the empty
+    /// state — and each of those used to be a full recursive `read_dir` of the
+    /// workspace. The cached scan holds every non-hidden file whichever way the
+    /// tab's display filter is set (the filter only ever *narrows* to the
+    /// workspace's own file types, and `.vars` is one of them), so it can
+    /// answer this without a second walk.
+    ///
+    /// Empty for a tab that isn't a workspace.
+    pub fn workspace_env_files(&self) -> Vec<PathBuf> {
+        self.workspace_env_files_as_of(Instant::now(), crate::workspace::tree_generation())
+    }
+
+    /// [`Self::workspace_env_files`] as of a given moment and tree generation,
+    /// so the cache can be tested without racing its expiry.
+    pub(crate) fn workspace_env_files_as_of(&self, now: Instant, generation: u64) -> Vec<PathBuf> {
+        let Some(root) = self.workspace_root.clone() else {
+            return Vec::new();
+        };
+        self.refresh_scan(&root, now, generation);
+        let scan = self.workspace_scan.borrow();
+        scan.as_ref()
+            .map(|s| {
+                s.entries
+                    .iter()
+                    .filter(|e| !e.is_dir && crate::workspace::is_env_file(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The request rows shown under an expanded collection at `path`, indented
     /// to `depth`. For the currently-loaded file the rows come straight from
     /// `entries` (full detail, `loaded: true`); for any other expanded
@@ -950,6 +987,63 @@ mod ws_scan_tests {
             "the tree catches up with the filesystem"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The environments panel's file list comes out of the same cached scan the
+    /// tree does, so drawing the panel doesn't walk the workspace again —
+    /// several times per frame, as it used to.
+    #[test]
+    fn the_environment_file_list_is_served_from_the_tree_scan() {
+        let root = tmp_root("envscan");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        fs::write(root.join("dev.vars"), "K=1").unwrap();
+        let c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(
+            c.workspace_env_files_as_of(t0, 7),
+            vec![root.join("dev.vars")],
+            "the workspace's environment files, and only those"
+        );
+
+        // Written behind PaperBoy's back and *not* seen, which is the proof:
+        // a fresh scan would have found it, so this answer came from the cache
+        // the tree filled in above.
+        fs::write(root.join("prod.vars"), "K=2").unwrap();
+        assert_eq!(
+            c.workspace_env_files_as_of(t0 + WS_SCAN_TTL / 2, 7),
+            vec![root.join("dev.vars")],
+            "no second walk of the disk"
+        );
+        // And it does catch up once the window passes, like the tree does.
+        assert_eq!(
+            c.workspace_env_files_as_of(t0 + WS_SCAN_TTL + Duration::from_millis(1), 7),
+            vec![root.join("dev.vars"), root.join("prod.vars")]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tab that isn't a workspace has no files to offer — and must not scan
+    /// anything looking for them.
+    #[test]
+    fn a_non_workspace_tab_lists_no_environment_files() {
+        let c = Collection::new("scratch".into(), Vec::new());
+        assert!(c.workspace_env_files().is_empty());
+    }
+
+    /// The panel lists a workspace's environments whether or not the tab's
+    /// display filter is narrowing the *tree* to collections — the filter
+    /// chooses what the tree shows, not what environments exist.
+    #[test]
+    fn the_display_filter_does_not_hide_environment_files() {
+        let root = tmp_root("envfilter");
+        fs::write(root.join("dev.vars"), "K=1").unwrap();
+        let mut c = workspace_at(&root);
+        c.workspace_filter_hurl_json = true;
+        assert_eq!(c.workspace_env_files(), vec![root.join("dev.vars")]);
+        c.workspace_filter_hurl_json = false;
+        assert_eq!(c.workspace_env_files(), vec![root.join("dev.vars")]);
         let _ = fs::remove_dir_all(&root);
     }
 

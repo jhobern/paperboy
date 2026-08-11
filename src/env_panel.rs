@@ -106,8 +106,8 @@ pub fn matches(name: &str, filter: &str) -> bool {
 /// Build the Environments panel's rows.
 ///
 /// `workspace_files` is every environment file in the open Workspace folder
-/// (see [`crate::workspace::scan_environments`]), or empty when no workspace is
-/// open. Workspace rows come first, in tree order, followed by the loaded
+/// (see [`crate::collection::Collection::workspace_env_files`]), or empty when
+/// no workspace is open. Workspace rows come first, in tree order, followed by the loaded
 /// environments that didn't come from the workspace — so opening a workspace
 /// doesn't reshuffle the environments already in the list.
 ///

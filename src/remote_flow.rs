@@ -261,6 +261,14 @@ pub(crate) struct RemoteFlow {
     /// The full file listing from `list_files`, kept whole so the workspace
     /// filter step can reuse it without a second network fetch.
     files: Vec<String>,
+    /// Which listing `files` currently holds, taken from a process-wide counter
+    /// whenever it is replaced. A front-end that derives something from the
+    /// listing (the GUI's filtered picker) can key a cache on this and know
+    /// exactly when the answer it is holding stopped being true — length and
+    /// commit both compare equal across two different repos often enough to be
+    /// no answer at all. The counter is global rather than per-flow so a whole
+    /// flow being replaced by another one is a change too.
+    files_generation: u64,
     repo: Option<TempRepo>,
     commit_sha: Option<String>,
     chosen_ref: Option<RefChoice>,
@@ -280,6 +288,7 @@ impl RemoteFlow {
             step: Step::Connect,
             refs: RemoteRefs::default(),
             files: Vec::new(),
+            files_generation: 0,
             repo: None,
             commit_sha: None,
             chosen_ref: None,
@@ -360,6 +369,19 @@ impl RemoteFlow {
     /// affordance for a repo that names its files unusually.
     pub(crate) fn all_files(&self) -> &[String] {
         &self.files
+    }
+
+    /// Which listing [`Self::all_files`] is currently serving — see
+    /// [`Self::files_generation`].
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn files_generation(&self) -> u64 {
+        self.files_generation
+    }
+
+    fn set_files(&mut self, files: Vec<String>) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.files = files;
+        self.files_generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn token_opt(&self) -> Option<String> {
@@ -489,7 +511,7 @@ impl RemoteFlow {
             }
             FlowMsg::Files(Ok((files, repo, sha))) => {
                 self.repo = Some(repo);
-                self.files = files;
+                self.set_files(files);
                 self.commit_sha = Some(sha);
                 self.step = if self.kind.is_workspace() {
                     Step::PickWorkspaceFilter
@@ -593,7 +615,7 @@ impl RemoteFlow {
         let mut flow = RemoteFlow::new(kind);
         flow.url = url.to_string();
         flow.step = step;
-        flow.files = files;
+        flow.set_files(files);
         flow.repo = repo.map(TempRepo::new);
         flow
     }

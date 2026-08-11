@@ -922,6 +922,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Three panels stopped redoing the same work on every frame.** The Global
+  Environments panel rescanned the whole workspace folder from disk several
+  times a frame; it now reads the workspace scan cache both front-ends already
+  share (and the terminal UI, which did the same, reads it too). The git load
+  wizard re-filtered and re-lowercased every path in the remote repository on
+  every frame of the file picker; the filtered list is now kept until the
+  filter, the selection or the file list itself changes — keyed on an explicit
+  generation counter rather than on anything derived from the list's contents,
+  because two different repositories can hold the same number of files. And the
+  report editor's Source view rebuilt its highlighter's set of known request
+  names — a formatted string per request, per helper — on every frame; it is
+  now rebuilt only when a name in it actually changes.
+
 - **The workspace tree scrolled with the cursor instead of the cursor moving
   through the tree.** Walking up a long tree kept the selected row pinned to the
   bottom edge of the panel while everything else slid past it. The list's scroll
