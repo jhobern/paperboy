@@ -24,11 +24,11 @@
 // Nothing drives this engine yet — the CLI and the two wizards come next.
 // Remove this once a front-end calls `Importer`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::postman::ConversionNote;
@@ -50,6 +50,15 @@ pub const NOTES_FILE: &str = "CONVERSION-NOTES.md";
 /// Kept low deliberately: with dozens of items, a long retry chain on each is
 /// how an import turns into an apparent hang.
 const MAX_RETRIES: u32 = 3;
+
+/// How many item fetches are allowed to be in flight at once.
+///
+/// Chosen against the general budget rather than the link: at one call every
+/// 200ms, six in flight covers about a second of round-trip latency before the
+/// pacer becomes the limit again, which is the point at which more workers buy
+/// nothing. A burst is never larger than the rate limiter already allows, since
+/// every worker still takes its slot from the pacer.
+const FETCH_CONCURRENCY: usize = 6;
 
 /// Ceiling on a single rate-limit wait. Postman occasionally reports a reset
 /// far in the future; blocking on it silently for minutes looks like a freeze,
@@ -144,12 +153,24 @@ impl Pacer {
     /// Block until a call on `bucket` may be sent, then reserve the following
     /// slot. Returns how long it waited, so the caller can tell the user why
     /// nothing appeared to happen.
+    #[cfg(test)]
     pub fn wait(&mut self, bucket: RateBucket, clock: &dyn Clock) -> Duration {
-        let now = clock.now();
-        let delay = self.delay_before(bucket, now);
+        let delay = self.reserve(bucket, clock.now());
         if !delay.is_zero() {
             clock.sleep(delay);
         }
+        delay
+    }
+
+    /// Claim the next slot on `bucket` and say how long the caller must wait
+    /// before using it — *without* sleeping.
+    ///
+    /// Split out from [`Pacer::wait`] because several fetches now run at once:
+    /// they take their slots one at a time under a lock and then wait for them
+    /// in parallel. Sleeping inside the lock would serialise them again, which
+    /// is the whole thing being fixed.
+    pub fn reserve(&mut self, bucket: RateBucket, now: Instant) -> Duration {
+        let delay = self.delay_before(bucket, now);
         let (next, interval) = self.slot(bucket);
         // Reserve from the moment the call actually goes out, not from the
         // moment it was requested, or a slow response would let the next call
@@ -430,28 +451,51 @@ impl From<ApiError> for ImportError {
 /// Runs one import. Created per import, not reused.
 pub struct Importer<'a> {
     client: &'a PostmanClient,
-    pacer: Pacer,
+    /// Behind a lock because the download runs several fetches at once and they
+    /// all draw on the same rate-limit budget: the pacer is the one place that
+    /// decides when the next call may go out, whoever is asking.
+    pacer: Mutex<Pacer>,
     clock: &'a dyn Clock,
     cancel: Arc<AtomicBool>,
-    progress: Option<Sender<ImportMsg>>,
+    /// How many item fetches may be in flight at once. Settable so a test can
+    /// pin it to one and get a deterministic call order.
+    concurrency: usize,
+    /// A `Sender` is `Send` but not `Sync`, and the fetch workers share one
+    /// `&Importer`; the lock is what makes that legal. It is held only for the
+    /// length of a `send`.
+    progress: Mutex<Option<Sender<ImportMsg>>>,
 }
 
 impl<'a> Importer<'a> {
     pub fn new(client: &'a PostmanClient) -> Self {
         Importer {
             client,
-            pacer: Pacer::new(),
+            pacer: Mutex::new(Pacer::new()),
             clock: &RealClock,
             cancel: Arc::new(AtomicBool::new(false)),
-            progress: None,
+            concurrency: FETCH_CONCURRENCY,
+            progress: Mutex::new(None),
         }
     }
 
     /// Swap in a fake clock so the pacing waits can be asserted without a test
     /// actually sleeping through them.
+    ///
+    /// Also pins the fetches to one at a time: the fake transports answer in
+    /// *call* order, so overlapping fetches would hand a test's second scripted
+    /// response to whichever item won the race. Tests about concurrency itself
+    /// ask for it back with [`Importer::with_concurrency`].
     #[cfg(test)]
     pub fn with_clock(mut self, clock: &'a dyn Clock) -> Self {
         self.clock = clock;
+        self.concurrency = 1;
+        self
+    }
+
+    /// Pin how many fetches overlap.
+    #[cfg(test)]
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
         self
     }
 
@@ -461,12 +505,13 @@ impl<'a> Importer<'a> {
     }
 
     pub fn with_progress(mut self, tx: Sender<ImportMsg>) -> Self {
-        self.progress = Some(tx);
+        self.progress = Mutex::new(Some(tx));
         self
     }
 
     fn send(&self, msg: ImportMsg) {
-        if let Some(tx) = &self.progress {
+        let guard = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = guard.as_ref() {
             // A closed channel means the front-end has gone away; the
             // cancellation flag is the way that is reported, so a send error
             // is not itself a failure.
@@ -488,8 +533,11 @@ impl<'a> Importer<'a> {
 
     /// Pace a call, telling the front-end if the wait is long enough to be
     /// visible. Sub-second pacing is not worth a message.
-    fn pace(&mut self, bucket: RateBucket) {
-        let waited = self.pacer.wait(bucket, self.clock);
+    fn pace(&self, bucket: RateBucket) {
+        let waited = self.locked_pacer().reserve(bucket, self.clock.now());
+        if !waited.is_zero() {
+            self.clock.sleep(waited);
+        }
         if waited >= Duration::from_secs(1) {
             self.send(ImportMsg::Waiting {
                 reason: WaitReason::Pacing,
@@ -500,14 +548,25 @@ impl<'a> Importer<'a> {
 
     /// Fold the server's accounting into the pacer *and* pass it on, so the
     /// user can see the same numbers the pacer is reacting to.
-    fn observe(&mut self, bucket: RateBucket, rate: &RateInfo) {
-        self.pacer.observe(bucket, rate, self.clock.now());
+    fn observe(&self, bucket: RateBucket, rate: &RateInfo) {
+        let interval = {
+            let mut pacer = self.locked_pacer();
+            pacer.observe(bucket, rate, self.clock.now());
+            pacer.interval(bucket)
+        };
         self.send(ImportMsg::Budget {
             remaining: rate.remaining,
             reset_secs: rate.reset_secs,
             remaining_month: rate.remaining_month,
-            interval_secs: self.pacer.interval(bucket).as_secs(),
+            interval_secs: interval.as_secs(),
         });
+    }
+
+    /// The pacer, recovering from a panicked holder rather than propagating it:
+    /// a poisoned schedule is still a usable schedule, and the alternative is
+    /// failing an import over a lock.
+    fn locked_pacer(&self) -> std::sync::MutexGuard<'_, Pacer> {
+        self.pacer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Work out what an import of `workspace_id` would fetch.
@@ -645,11 +704,21 @@ impl<'a> Importer<'a> {
         let mut taken_environments: HashSet<String> = HashSet::new();
         let mut notes: Vec<ConversionNote> = Vec::new();
 
-        for (kind, items) in [
-            (ItemKind::Collection, &plan.collections),
-            (ItemKind::Environment, &plan.environments),
-        ] {
-            for item in items {
+        // The queue, in the order the files must be written: collections first,
+        // then environments. Fetching happens out of order and in parallel;
+        // *processing* follows this order regardless, so the names a workspace
+        // with two "Billing API"s produces don't depend on which reply won the
+        // race.
+        let jobs: Vec<(ItemKind, &ItemSummary)> = plan
+            .collections
+            .iter()
+            .map(|i| (ItemKind::Collection, i))
+            .chain(plan.environments.iter().map(|i| (ItemKind::Environment, i)))
+            .collect();
+
+        self.fetch_each(&jobs, |job_index, fetched| {
+            let (kind, item) = jobs[job_index];
+            {
                 self.check_cancel()?;
                 index += 1;
                 let display = display_name(item, kind);
@@ -658,12 +727,6 @@ impl<'a> Importer<'a> {
                     total,
                     kind,
                     name: display.clone(),
-                });
-
-                self.pace(RateBucket::General);
-                let fetched = self.retrying(RateBucket::General, |c| match kind {
-                    ItemKind::Collection => c.get_collection(item.fetch_id()),
-                    ItemKind::Environment => c.get_environment(item.fetch_id()),
                 });
 
                 let (body, rate) = match fetched {
@@ -677,7 +740,7 @@ impl<'a> Importer<'a> {
                             error: msg.clone(),
                         });
                         failures.push((display, msg));
-                        continue;
+                        return Ok(());
                     }
                     Err(e) => return Err(e),
                 };
@@ -708,7 +771,8 @@ impl<'a> Importer<'a> {
                 }
                 notes.extend(rendered.notes);
             }
-        }
+            Ok(())
+        })?;
 
         if let Some(report) = conversion_report(&plan.workspace_name, &notes) {
             std::fs::write(staging.join(NOTES_FILE), report).map_err(io_err)?;
@@ -725,13 +789,100 @@ impl<'a> Importer<'a> {
         })
     }
 
+    /// Fetch every job, several at a time, handing the results to `on_result`
+    /// **in job order** on this thread.
+    ///
+    /// Pacing alone never explained a slow import: the general limit allows a
+    /// call every 200ms, but each one is a whole collection document fetched
+    /// over a link that may have half a second of latency, so a sequential
+    /// import spends nearly all of its time waiting for replies rather than for
+    /// its own rate limit. Overlapping the round trips fills that dead time;
+    /// the pacer still decides when each call may go out, so the budget is
+    /// respected exactly as before — the calls just no longer queue behind each
+    /// other's latency.
+    ///
+    /// Results are reordered before being handed on, so the files a workspace
+    /// with two "Billing API"s produces don't depend on which reply won.
+    fn fetch_each<F>(
+        &self,
+        jobs: &[(ItemKind, &ItemSummary)],
+        mut on_result: F,
+    ) -> Result<(), ImportError>
+    where
+        F: FnMut(usize, Result<(String, RateInfo), ImportError>) -> Result<(), ImportError>,
+    {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let workers = self.concurrency.min(jobs.len()).max(1);
+        let cursor = AtomicUsize::new(0);
+        // Separate from the user's cancel flag: this only tells the workers to
+        // stop taking new jobs, and must not read back as "the user cancelled".
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let cursor = &cursor;
+                let stop = &stop;
+                scope.spawn(move || {
+                    loop {
+                        if stop.load(Ordering::Relaxed) || self.cancelled() {
+                            break;
+                        }
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some((kind, item)) = jobs.get(i).copied() else {
+                            break;
+                        };
+                        self.pace(RateBucket::General);
+                        let got = self.retrying(RateBucket::General, |c| match kind {
+                            ItemKind::Collection => c.get_collection(item.fetch_id()),
+                            ItemKind::Environment => c.get_environment(item.fetch_id()),
+                        });
+                        if tx.send((i, got)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            // The last live sender, or the loop below would never end.
+            drop(tx);
+
+            let mut pending: HashMap<usize, Result<(String, RateInfo), ImportError>> =
+                HashMap::new();
+            let mut next = 0usize;
+            let mut outcome = Ok(());
+            for (i, got) in rx {
+                pending.insert(i, got);
+                while let Some(got) = pending.remove(&next) {
+                    next += 1;
+                    if let Err(e) = on_result(next - 1, got) {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+                if outcome.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            // A cancelled import leaves jobs unfetched; say so rather than
+            // reporting a short but successful download.
+            if outcome.is_ok() && next < jobs.len() {
+                outcome = Err(ImportError::Cancelled);
+            }
+            outcome
+        })
+    }
+
     /// Run one API call, retrying the failures that a retry can fix.
     ///
     /// A 429 is not a failure so much as an instruction: wait the stated time
     /// and try again. The monthly cap is the exception — it will not clear, so
     /// it propagates immediately rather than burning three retries.
     fn retrying<T>(
-        &mut self,
+        &self,
         bucket: RateBucket,
         mut call: impl FnMut(&PostmanClient) -> Result<T, ApiError>,
     ) -> Result<T, ImportError> {
@@ -748,7 +899,7 @@ impl<'a> Importer<'a> {
                     let now = self.clock.now();
                     let wait = match &e {
                         ApiError::RateLimited { retry_after, .. } => {
-                            let w = self.pacer.back_off(bucket, *retry_after, now);
+                            let w = self.locked_pacer().back_off(bucket, *retry_after, now);
                             self.send(ImportMsg::Waiting {
                                 reason: WaitReason::RateLimited,
                                 secs: w.as_secs().max(1),
@@ -1551,30 +1702,39 @@ mod tests {
     #[test]
     fn a_rejected_key_stops_the_whole_import() {
         // Unlike a missing collection, this will fail identically for every
-        // remaining item, so retrying the other fifty-nine is pure noise.
-        let script = Scripted::new(vec![res(401, "{}")]);
+        // item, so retrying the other fifty-nine is pure noise. Fetches overlap
+        // now, so the calls already in flight when the first 401 lands go out
+        // too — but nothing beyond them: the queue is abandoned, not worked
+        // through.
+        let script = Scripted::new(vec![res(401, "{}"), res(401, "{}"), res(401, "{}")]);
         let c = client(script.clone());
         let clock = FakeClock::new();
-        let mut imp = Importer::new(&c).with_clock(&clock);
+        let mut imp = Importer::new(&c).with_clock(&clock).with_concurrency(3);
         let plan = plan_of(3, 0);
         let dest = tmpdir("unauth");
         let err = imp
             .download(&plan, &dest, &ImportOptions::default())
             .unwrap_err();
         assert_eq!(err, ImportError::Api(ApiError::Unauthorized));
-        assert_eq!(script.urls.lock().unwrap().len(), 1);
+        assert!(
+            script.urls.lock().unwrap().len() <= 3,
+            "at most the calls already in flight, never one per item"
+        );
         assert!(!dest.exists());
     }
 
     #[test]
     fn the_monthly_cap_stops_the_import_without_retrying() {
-        let script = Scripted::new(vec![res(
-            429,
-            r#"{"error":{"name":"serviceLimitExhausted","message":"monthly"}}"#,
-        )]);
+        let monthly = || {
+            res(
+                429,
+                r#"{"error":{"name":"serviceLimitExhausted","message":"monthly"}}"#,
+            )
+        };
+        let script = Scripted::new(vec![monthly(), monthly(), monthly()]);
         let c = client(script.clone());
         let clock = FakeClock::new();
-        let mut imp = Importer::new(&c).with_clock(&clock);
+        let mut imp = Importer::new(&c).with_clock(&clock).with_concurrency(3);
         let plan = plan_of(3, 0);
         let dest = tmpdir("monthly");
         let err = imp
@@ -1584,9 +1744,12 @@ mod tests {
             err,
             ImportError::Api(ApiError::RateLimited { monthly: true, .. })
         ));
-        // No retries: waiting cannot clear a monthly cap.
-        assert_eq!(script.urls.lock().unwrap().len(), 1);
-        assert_eq!(clock.total_slept(), Duration::ZERO);
+        // No retries: waiting cannot clear a monthly cap. One call per item at
+        // most — the three already in flight — and none of them waited out a
+        // back-off, which is the only sleep long enough to show here (pacing
+        // between concurrent fetches is milliseconds).
+        assert_eq!(script.urls.lock().unwrap().len(), 3);
+        assert!(clock.total_slept() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1666,6 +1829,67 @@ mod tests {
         assert_eq!(err, ImportError::Cancelled);
         assert!(!dest.exists());
         assert!(!staging_path(&dest).exists());
+    }
+
+    /// A transport that answers slowly and remembers how many calls were in
+    /// flight at once — the only way to tell an import that overlaps its
+    /// fetches from one that merely looks fast.
+    struct Slow {
+        live: Mutex<usize>,
+        peak: Mutex<usize>,
+    }
+
+    impl Transport for Arc<Slow> {
+        fn get(&self, _url: &str, _key: &str) -> Result<HttpResponse, String> {
+            {
+                let mut live = self.live.lock().unwrap();
+                *live += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*live);
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            *self.live.lock().unwrap() -= 1;
+            Ok(res(200, r#"{"collection":{"n":1}}"#))
+        }
+    }
+
+    /// Pacing was never the reason a big import crawled: the general limit
+    /// allows five calls a second, but each one is a whole collection document
+    /// fetched over a link that may have half a second of latency, so a
+    /// sequential import sits waiting for replies. The fetches overlap now, and
+    /// this is the test that says so — pinned to one at a time, the same
+    /// download takes six times as long and never has two calls in flight.
+    #[test]
+    fn fetches_overlap_instead_of_queueing_behind_each_others_latency() {
+        let slow = Arc::new(Slow {
+            live: Mutex::new(0),
+            peak: Mutex::new(0),
+        });
+        let c = PostmanClient::with_transport("k".into(), None, Box::new(slow.clone()));
+        // A fake clock so the pacer's own waits cost no real time: what is
+        // being measured here is the round trips, not the rate limit.
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c)
+            .with_clock(&clock)
+            .with_concurrency(FETCH_CONCURRENCY);
+        let plan = plan_of(6, 0);
+        let dest = tmpdir("overlap");
+        let started = Instant::now();
+        let summary = imp
+            .download(&plan, &dest, &ImportOptions::default())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(summary.collections, 6);
+        assert!(
+            *slow.peak.lock().unwrap() > 1,
+            "the fetches never overlapped"
+        );
+        assert!(
+            elapsed < Duration::from_millis(40 * 6),
+            "six 40ms fetches took {elapsed:?} — that is one at a time"
+        );
+        std::fs::remove_dir_all(&dest).ok();
     }
 
     #[test]

@@ -12,6 +12,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A Postman import no longer queues behind its own latency.** Items were
+  fetched strictly one at a time, so on a link with high round-trip times the
+  import crawled at one or two items a second even with hundreds of calls still
+  available in the account's allowance. Up to six fetches are now in flight at
+  once. The pacer is still the sole gatekeeper — it hands out slots without
+  holding its lock across the wait, so workers sleep in parallel rather than
+  queueing on each other — and results are put back into request order before
+  anything is written, so the names given to duplicate items don't change from
+  run to run.
+- **The test suite no longer invokes the real `op` or `aws` command.** Running
+  the tests could pop up a 1Password authorisation prompt: the asynchronous
+  secret resolution already swapped in a do-nothing resolver under test, but
+  the synchronous path used when parsing a `.vars` file or resolving a single
+  reference still shelled out for real. Both now go through the same
+  test-aware default.
 - **A slow Postman import now says what it is waiting for, and how much
   allowance is left.** Listing a large workspace draws on Postman's strictest
   rate limit, so the importer paces itself and backs off when told to — but

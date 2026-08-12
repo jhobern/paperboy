@@ -425,7 +425,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
 /// Synchronous (blocks on the CLIs) — used by the headless CLI runner. The
 /// GUIs use [`parse_vars_pending`] + [`spawn_resolution`] to avoid freezing.
 pub fn parse_vars(name: String, content: &str) -> Environment {
-    parse_vars_with(name, content, &CliResolver)
+    parse_vars_with(name, content, &default_resolver())
 }
 
 /// Resolve one value that may be a `{{ … }}` provider reference — an API key, a
@@ -443,7 +443,7 @@ pub fn parse_vars(name: String, content: &str) -> Environment {
 /// **Blocking**: it shells out to `op`/`aws`, which can take seconds and may
 /// prompt for a fingerprint. Never call it on a thread that is drawing.
 pub fn resolve_reference(raw: &str) -> Option<String> {
-    resolve_reference_with(raw, &CliResolver)
+    resolve_reference_with(raw, &default_resolver())
 }
 
 /// [`resolve_reference`] against a caller-supplied resolver, for tests.
@@ -776,10 +776,27 @@ pub fn spawn_resolution(env_id: u64, pending: Vec<PendingSecret>) -> Receiver<En
     rx
 }
 
+/// The resolver the synchronous entry points use.
+///
+/// Under test this is [`NoopResolver`], for the same reason the background
+/// resolvers swap themselves out: a test that reached the real `op` would put a
+/// fingerprint prompt on the developer's screen and resolve against whatever
+/// happens to be in *their* 1Password — which is neither reproducible nor
+/// something a test suite is entitled to do.
+#[cfg(not(test))]
+fn default_resolver() -> CliResolver {
+    CliResolver
+}
+
+#[cfg(test)]
+fn default_resolver() -> NoopResolver {
+    NoopResolver
+}
+
 /// A resolver that never resolves anything, used under `cfg(test)` so the test
 /// suite never invokes the real `op`/`aws` CLIs.
 #[cfg(test)]
-struct NoopResolver;
+pub struct NoopResolver;
 
 #[cfg(test)]
 impl SecretResolver for NoopResolver {
