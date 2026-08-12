@@ -76,10 +76,17 @@ pub(crate) struct PostmanWizard {
     /// Where the workspace list is scrolled to, carried between frames (see
     /// [`ListScroll`]).
     pub(crate) list_scroll: ListScroll,
+    /// Key *references* used before, most recent first, straight from the
+    /// session. Filtered to the chosen source before being shown, so switching
+    /// to SSM doesn't offer 1Password paths.
+    pub(crate) recent: Vec<String>,
+    /// `Some` while the recent-keys dropdown has keyboard focus, indexing into
+    /// [`PostmanWizard::recent_entries`].
+    pub(crate) recent_sel: Option<usize>,
 }
 
 impl PostmanWizard {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(recent: Vec<String>) -> Self {
         // An API key in the environment is the one credential a user is likely
         // to already have to hand, and typing a PMAK by hand is miserable.
         let flow = PostmanFlow::new().with_env_key();
@@ -97,7 +104,21 @@ impl PostmanWizard {
             option_row: 0,
             before_error: Step::Connect,
             list_scroll: ListScroll::default(),
+            recent,
+            recent_sel: None,
         }
+    }
+
+    /// The remembered entries that belong to the source now chosen, as the
+    /// field's own text — the `op://…` path, not the `{{ … }}` wrapper.
+    pub(crate) fn recent_entries(&self) -> Vec<String> {
+        self.recent
+            .iter()
+            .filter_map(|raw| {
+                let (src, entry) = KeySource::detect(raw);
+                (src == self.key_source && !entry.is_empty()).then_some(entry)
+            })
+            .collect()
     }
 
     pub(crate) fn stage(&self) -> PostmanStage {
@@ -314,14 +335,36 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             .chain(KeySource::ALL.iter().map(|src| key_field_label(*src, s))),
     );
 
+    // The references this key has been read from before, offered under the key
+    // field: finding the 1Password item path is the tedious half of setting an
+    // import up, and it is the same path every time.
+    let recent = w.recent_entries();
+    let recent_rows = recent.len().min(5) as u16;
+
     let width = 66.min(f.area().width);
-    let area = centered_rect(width, fields.len() as u16 + 2, f.area());
+    let area = centered_rect(width, fields.len() as u16 + recent_rows + 2, f.area());
     f.render_widget(Clear, area);
-    let block = panel_hinted(title.to_string(), s.postman_connect_hint, th);
+    let hint = if recent_rows > 0 {
+        format!(
+            "{}  \u{b7}  {}",
+            s.postman_connect_hint, s.postman_recent_hint
+        )
+    } else {
+        s.postman_connect_hint.to_string()
+    };
+    let block = panel_hinted(title.to_string(), &hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows = Layout::vertical([Constraint::Length(1); 4]).split(inner);
+    let all_rows = Layout::vertical([
+        Constraint::Length(1),           // key source
+        Constraint::Length(1),           // key
+        Constraint::Length(recent_rows), // remembered references
+        Constraint::Length(1),           // workspace
+        Constraint::Length(1),           // host
+    ])
+    .split(inner);
+    let rows = [all_rows[0], all_rows[1], all_rows[3], all_rows[4]];
     for (row, (label, placeholder, idx)) in rows.iter().zip(fields.iter()) {
         let cols =
             Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(*row);
@@ -355,6 +398,29 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             _ => (&w.base_url, false),
         };
         render_line_field_hinted(f, cols[1], ed, w.field == *idx, mask, placeholder, th);
+    }
+
+    if recent_rows > 0 {
+        let items: Vec<ListItem> = recent
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(i, entry)| {
+                let style = if w.recent_sel == Some(i) {
+                    Style::default()
+                        .bg(th.accent)
+                        .fg(th.bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                ListItem::new(Line::styled(
+                    format!("{:pad$}{entry}", "", pad = label_w as usize),
+                    style,
+                ))
+            })
+            .collect();
+        f.render_widget(List::new(items), all_rows[2]);
     }
 }
 

@@ -1200,6 +1200,7 @@ strings! {
     postman_waiting_paced => "Pausing to stay within Postman's rate limit", "Pause pour respecter la limite de débit de Postman", "Pauser for at holde sig inden for Postmans hastighedsgrænse";
     postman_waiting_limited => "Postman asked us to wait", "Postman nous a demandé d'attendre", "Postman bad os vente";
     postman_remaining => "left", "restant", "tilbage";
+    postman_recent_hint => "↓ saved references", "↓ références enregistrées", "↓ gemte referencer";
     postman_budget_label => "Postman allowance", "Quota Postman", "Postman-kvote";
     postman_budget_window => "calls left before reset", "appels restants avant réinitialisation", "kald tilbage før nulstilling";
     postman_budget_month => "left this month", "restants ce mois-ci", "tilbage denne måned";

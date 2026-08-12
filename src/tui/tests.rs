@@ -25139,6 +25139,74 @@ use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
 use crate::postman_flow::Step as PostmanStep;
 use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary};
 
+/// Finding the 1Password item path is the tedious half of setting an import
+/// up, and it is the same path every time — so the wizard offers back the
+/// references that have worked before, exactly as the git wizard offers repos.
+/// The pasted key is the one thing never kept: that is the credential itself,
+/// and this list is written to `state.json`.
+#[test]
+fn a_working_key_reference_is_offered_back_next_time() {
+    use crate::postman_flow::KeySource;
+
+    let mut app = TuiApp::default();
+    assert!(
+        app.session
+            .remember_key_ref("{{ op://Private/Postman/credential }}")
+    );
+    assert!(app.session.remember_key_ref("{{ ssm:/postman/key }}"));
+    assert!(
+        !app.session.remember_key_ref("PMAK-secret"),
+        "a pasted key is a live credential, not an address"
+    );
+    assert!(
+        !app.session.remember_key_ref("{{ ssm:/postman/key }}"),
+        "already at the front: nothing changed, so nothing is rewritten"
+    );
+
+    app.open_postman_wizard();
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key_source, KeySource::OnePassword);
+    assert_eq!(
+        w.recent_entries(),
+        vec!["Private/Postman/credential".to_string()],
+        "only the references belonging to the chosen source are offered"
+    );
+
+    // Down opens the list, Enter takes the highlighted one into the field.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(postman_wizard(&mut app).recent_sel, Some(0));
+    press(&mut app, KeyCode::Enter);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key.text(), "Private/Postman/credential");
+    assert_eq!(w.recent_sel, None);
+
+    // Switching source switches the list with it.
+    let w = postman_wizard(&mut app);
+    w.key_source = KeySource::Ssm;
+    assert_eq!(
+        postman_wizard(&mut app).recent_entries(),
+        vec!["/postman/key".to_string()]
+    );
+}
+
+/// The list is only written once the key has actually worked: a half-typed
+/// item path must never come back as a suggestion.
+#[test]
+fn a_key_is_only_remembered_once_postman_has_accepted_it() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let w = postman_wizard(&mut app);
+    w.key_source = crate::postman_flow::KeySource::OnePassword;
+    w.key = Editor::new("Private/Half/typed", false);
+    w.sync_fields();
+    app.poll_postman_updates();
+    assert!(
+        app.session.recent_key_refs.is_empty(),
+        "nothing has been sent to Postman yet"
+    );
+}
+
 fn postman_wizard(app: &mut TuiApp) -> &mut PostmanWizard {
     match app.overlay.as_mut() {
         Some(Overlay::PostmanImport(w)) => w,

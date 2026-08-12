@@ -537,6 +537,12 @@ pub struct PersistedState {
     /// first, offered as a pickable list in the "Load from Git" wizard.
     #[serde(default)]
     pub recent_git_urls: Vec<String>,
+    /// Provider *references* the Postman API key has been read from, most
+    /// recent first — `{{ op://… }}`, `{{ ssm:/… }}`, `{{ env:… }}`. Never a
+    /// pasted key: a reference is an address, which is safe to keep, where the
+    /// key itself is the credential and is never written to disk.
+    #[serde(default)]
+    pub recent_key_refs: Vec<String>,
     /// Which of JSON / Hurl text the Main (Request) panel shows by default for
     /// every request (Settings → Preferences → Default Request View).
     #[serde(default)]
@@ -602,6 +608,7 @@ impl Default for PersistedState {
             list_width: default_list_width(),
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),
+            recent_key_refs: Vec::new(),
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
             custom_themes: Vec::new(),

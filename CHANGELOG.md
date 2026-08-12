@@ -54,6 +54,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The Postman importer remembers where your key lives.** A key read from
+  1Password, SSM or the environment is kept as a *reference* — the address, not
+  the credential — and offered back next time, the same way the git wizard
+  offers the repositories you have used: a dropdown under the key field in the
+  terminal (↓ to open), a Recent menu beside it in the GUI. The list is
+  filtered to the source you have chosen, so picking SSM doesn't offer
+  1Password paths, and only references that Postman actually accepted are
+  kept. A pasted key is never written to disk.
+
 - **The Postman importer offers 1Password first.** A pasted API key is a live
   credential sitting in a text field, where a reference is only its address, so
   the wizard now opens on 1Password and lists pasting last. Pasting is still

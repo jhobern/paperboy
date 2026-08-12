@@ -3645,7 +3645,8 @@ impl TuiApp {
 
     /// Open the "import a whole Postman workspace" wizard.
     pub(crate) fn open_postman_wizard(&mut self) {
-        self.overlay = Some(Overlay::PostmanImport(Box::new(PostmanWizard::new())));
+        let recent = self.session.recent_key_refs.clone();
+        self.overlay = Some(Overlay::PostmanImport(Box::new(PostmanWizard::new(recent))));
     }
 
     /// Handle a key while the Postman import wizard is open.
@@ -3660,21 +3661,52 @@ impl TuiApp {
         w.remember_step();
         match w.stage() {
             PostmanStage::Connect => match key.code {
+                // While the recent-keys dropdown has focus, Esc backs out of it
+                // rather than leaving the wizard's connect step.
+                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
                 KeyCode::Esc => return,
-                KeyCode::Tab | KeyCode::Down => w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS,
+                // On the key field, Down opens (or moves down in) the list of
+                // references this key has been read from before, instead of
+                // jumping to the workspace field.
+                KeyCode::Down if w.field == 1 && !w.recent_entries().is_empty() => {
+                    let last = w.recent_entries().len() - 1;
+                    w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
+                }
+                KeyCode::Up if w.recent_sel.is_some() => {
+                    let i = w.recent_sel.unwrap();
+                    w.recent_sel = if i == 0 { None } else { Some(i - 1) };
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS;
+                    w.recent_sel = None;
+                }
                 KeyCode::BackTab | KeyCode::Up => {
                     w.field = (w.field + POSTMAN_CONNECT_FIELDS - 1) % POSTMAN_CONNECT_FIELDS;
+                    w.recent_sel = None;
                 }
                 // The key-source row is a choice, so Left/Right change it —
                 // the same gesture that changes the import format two steps
                 // later. On a text field they stay the editor's own.
                 KeyCode::Left if w.field == 0 => {
                     w.key_source = w.key_source.cycled(false);
+                    // The remembered entries belong to a source; the old
+                    // selection would index into a different list.
+                    w.recent_sel = None;
                 }
                 KeyCode::Right if w.field == 0 => {
                     w.key_source = w.key_source.cycled(true);
+                    w.recent_sel = None;
                 }
                 KeyCode::Enter => {
+                    // Picking a remembered reference fills the field and
+                    // connects, rather than making the user press Enter twice.
+                    if let Some(entry) = w
+                        .recent_sel
+                        .and_then(|i| w.recent_entries().get(i).cloned())
+                    {
+                        w.key = Editor::new(&entry, false);
+                    }
+                    w.recent_sel = None;
                     w.sync_fields();
                     w.flow.submit_connect(&s);
                     // A typed workspace id skips the listing and lands straight
@@ -3686,6 +3718,9 @@ impl TuiApp {
                 // The source row is a choice, not an editor: there is nothing
                 // for a keystroke to type into.
                 _ if w.field > 0 => {
+                    // Typing anything else closes the dropdown and edits the
+                    // field normally.
+                    w.recent_sel = None;
                     let ed = match w.field {
                         1 => &mut w.key,
                         2 => &mut w.workspace_ref,
@@ -3838,6 +3873,16 @@ impl TuiApp {
         // into the same wall. The step being interrupted is the one on screen.
         w.remember_step();
         let event = w.flow.poll(&s);
+        // Once the key has actually worked, keep the reference: finding the
+        // 1Password item path is the tedious half of setting an import up.
+        let learned = w
+            .flow
+            .key_to_remember()
+            .map(str::to_string)
+            .is_some_and(|key| self.session.remember_key_ref(&key));
+        if learned {
+            self.save_state();
+        }
         self.overlay = Some(Overlay::PostmanImport(w));
         if let Some(PostmanEvent::Imported(summary)) = event {
             self.apply_postman_event(*summary);

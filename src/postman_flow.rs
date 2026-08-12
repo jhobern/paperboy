@@ -521,6 +521,18 @@ impl PostmanFlow {
         ))
     }
 
+    /// The key reference worth remembering, or `None`.
+    ///
+    /// Only once the key has actually been *used* — Postman answered with a
+    /// workspace list or a plan — so a half-typed item path is never offered
+    /// back as a suggestion. A pasted key is never returned: it is the
+    /// credential itself, and this ends up in `state.json`.
+    pub(crate) fn key_to_remember(&self) -> Option<&str> {
+        let proven = !self.workspaces.is_empty() || self.chosen.is_some() || self.plan.is_some();
+        let key = self.key.trim();
+        (proven && !key.is_empty() && !KeySource::detect(key).0.is_secret()).then_some(key)
+    }
+
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.is_some()
     }

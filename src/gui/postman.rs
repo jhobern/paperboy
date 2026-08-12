@@ -119,6 +119,13 @@ impl Wizard {
     /// Advance the shared flow and act on a finished import. Returns whether
     /// the dialog should close.
     fn poll(&mut self, app: &mut GuiApp) -> bool {
+        // Once the key has actually worked, keep the reference: finding the
+        // 1Password item path is the tedious half of setting an import up.
+        if let Some(key) = self.flow.key_to_remember().map(str::to_string)
+            && app.session.remember_key_ref(&key)
+        {
+            app.session.save();
+        }
         match self.flow.poll(&app.strings) {
             Some(PostmanEvent::Imported(summary)) => {
                 finish_import(app, *summary);
@@ -212,13 +219,15 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         .session
         .picker_dir(crate::session::PickerKind::Import)
         .map(std::path::Path::to_owned);
+    // Cloned rather than borrowed: the dialog closure needs `app.strings` too.
+    let recent = app.session.recent_key_refs.clone();
     let strings = &app.strings;
     // Fixed width, reserving what the widest step needs: the connect step's
     // label changes with the key source ("API key" vs "1Password item") and a
     // dialog sized to its content grew and shrank around it, dragging the whole
     // form sideways while the user was reading it.
     let dismissed = super::widgets::dialog(ctx, strings.postman_title, Some(CONNECT_WIDTH), |ui| {
-        action = draw(ui, &mut w, colors, strings);
+        action = draw(ui, &mut w, &recent, colors, strings);
     })
     .dismissed;
     // The ✕ and Escape are the Cancel button by another name.
@@ -269,7 +278,13 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     app.postman.flow = Some(w);
 }
 
-fn draw(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
+fn draw(
+    ui: &mut egui::Ui,
+    w: &mut Wizard,
+    recent: &[String],
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
     // The busy spinner is deliberately not shown while downloading: that step
     // has a progress bar, which says the same thing with more information.
     let downloading = matches!(w.flow.step(), Step::Downloading);
@@ -292,7 +307,7 @@ fn draw(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiA
     }
 
     match w.step() {
-        Step::Connect => draw_connect(ui, w, colors, s),
+        Step::Connect => draw_connect(ui, w, recent, colors, s),
         Step::PickWorkspace => draw_pick_workspace(ui, w, colors, s),
         Step::Options => draw_options(ui, w, colors, s),
         Step::Confirm => draw_confirm(ui, w, colors, s),
@@ -310,7 +325,13 @@ fn draw(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiA
 const LABEL_WIDTH: f32 = 130.0;
 const CONNECT_WIDTH: f32 = 540.0;
 
-fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
+fn draw_connect(
+    ui: &mut egui::Ui,
+    w: &mut Wizard,
+    recent: &[String],
+    colors: UiColors,
+    s: &Strings,
+) -> UiAction {
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
 
@@ -341,15 +362,42 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
             ui.end_row();
 
             ui.colored_label(colors.accent, key_field_label(w.key_source, s));
-            // Only a pasted key is the credential; a reference is the *address*
-            // of one, and masking that would only stop the user checking it.
-            ui.add_enabled(
-                !busy,
-                egui::TextEdit::singleline(&mut w.key_entry)
-                    .password(w.key_source.is_secret())
-                    .hint_text(key_field_hint(w.key_source, s))
-                    .desired_width(f32::INFINITY),
-            );
+            // The references this key has been read from before, offered beside
+            // the field: finding the 1Password item path is the tedious half of
+            // setting an import up, and it is the same path every time. Only
+            // the ones belonging to the chosen source — an SSM parameter is no
+            // help to someone who has picked 1Password.
+            let known: Vec<String> = recent
+                .iter()
+                .filter_map(|raw| {
+                    let (src, entry) = KeySource::detect(raw);
+                    (src == w.key_source && !entry.is_empty()).then_some(entry)
+                })
+                .collect();
+            ui.horizontal(|ui| {
+                // Only a pasted key is the credential; a reference is the
+                // *address* of one, and masking that would only stop the user
+                // checking it.
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut w.key_entry)
+                        .password(w.key_source.is_secret())
+                        .hint_text(key_field_hint(w.key_source, s))
+                        .desired_width(if known.is_empty() { 340.0 } else { 250.0 }),
+                );
+                if !known.is_empty() {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.menu_button(s.gui_git_recent, |ui| {
+                            for entry in &known {
+                                if ui.button(entry).clicked() {
+                                    w.key_entry = entry.clone();
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                }
+            });
             ui.end_row();
 
             ui.colored_label(colors.accent, s.postman_workspace_label);

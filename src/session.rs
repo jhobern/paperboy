@@ -220,6 +220,10 @@ pub struct Session {
     /// Git URLs the user has loaded a collection/environment from, most recent
     /// first. Offered as a pickable list in the "Load from Git" wizard.
     pub recent_git_urls: Vec<String>,
+    /// Provider references the Postman API key has been read from, most recent
+    /// first. Offered in the import wizard so the item path only has to be
+    /// found once. Only references are kept — never a pasted key.
+    pub recent_key_refs: Vec<String>,
     /// Folder the file browser last selected a file from; it reopens here.
     pub last_browse_dir: Option<PathBuf>,
     /// Folder the last *environment* file was loaded from; the environment
@@ -284,6 +288,7 @@ impl Default for Session {
             response_pct: 42,
             env_source: EnvSource::Both,
             recent_git_urls: Vec::new(),
+            recent_key_refs: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
             last_import_dir: None,
@@ -522,6 +527,29 @@ impl Session {
             PickerKind::Other => {}
         }
         self.last_browse_dir = Some(dir);
+    }
+
+    /// Record `key` as a most-recently-used Postman key *reference*: moved to
+    /// the front, deduplicated, capped at 10.
+    ///
+    /// A pasted key is refused outright. Finding the 1Password item path is the
+    /// tedious part of setting an import up and worth remembering; the key
+    /// itself is a live credential, and this list is written to disk.
+    ///
+    /// Returns whether anything changed, so a caller polling every frame does
+    /// not rewrite `state.json` sixty times a second.
+    pub fn remember_key_ref(&mut self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() || crate::postman_flow::KeySource::detect(key).0.is_secret() {
+            return false;
+        }
+        if self.recent_key_refs.first().is_some_and(|k| k == key) {
+            return false;
+        }
+        self.recent_key_refs.retain(|known| known != key);
+        self.recent_key_refs.insert(0, key.to_string());
+        self.recent_key_refs.truncate(10);
+        true
     }
 
     /// Close tab `idx` (the built-in Request tab at index 0 is never closed).
@@ -885,6 +913,7 @@ impl Session {
             response_pct: self.response_pct,
             env_source: self.env_source,
             recent_git_urls: self.recent_git_urls.clone(),
+            recent_key_refs: self.recent_key_refs.clone(),
             default_request_view: self.default_request_view,
             run_all_batch_mode: self.run_all_batch_mode,
             custom_themes: self.custom_themes.clone(),
@@ -989,6 +1018,7 @@ impl Session {
         self.response_pct = state.response_pct;
         self.env_source = state.env_source;
         self.recent_git_urls = state.recent_git_urls;
+        self.recent_key_refs = state.recent_key_refs;
         self.default_request_view = state.default_request_view;
         self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
