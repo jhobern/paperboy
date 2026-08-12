@@ -12,6 +12,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A slow Postman import now says what it is waiting for, and how much
+  allowance is left.** Listing a large workspace draws on Postman's strictest
+  rate limit, so the importer paces itself and backs off when told to — but
+  only the *download* screen ever drew that, leaving the listing step sitting
+  on "Checking what that workspace holds…" for minutes with nothing to
+  distinguish it from a hung app. The busy line now names the reason for the
+  wait and how long it has been waiting, and both front-ends show the account's
+  own figures, taken from the rate headers we were already reading and
+  discarding: calls left before the window resets, calls left this month, and
+  the spacing currently being kept between calls. The remaining-time figure is
+  also labelled as the estimate it is — it moves about as paced waits land
+  inside the average.
+
+- **The Postman wizard stops moving under the cursor.** Choosing where the API
+  key lives changes the label beside the key field ("API key" versus
+  "1Password item"), and both front-ends were sized to their contents: in the
+  terminal the value column jumped sideways, and in the GUI the whole dialog
+  grew and shrank. The label column and the dialog width are now reserved for
+  the widest source, so switching between them changes nothing but the label.
+
 - **A GUI dialog now behaves like a dialog.** They were anchored to the middle
   of the window and fixed in size, so one could not be dragged aside to read
   what it was covering, and the file/collection pickers inside the git and
@@ -33,6 +53,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   all four. Workspaces already pinned to the old filter keep working.
 
 ### Added
+
+- **The Postman importer offers 1Password first.** A pasted API key is a live
+  credential sitting in a text field, where a reference is only its address, so
+  the wizard now opens on 1Password and lists pasting last. Pasting is still
+  supported, and an existing key is still recognised for whatever source it
+  came from.
 
 - **The GUI File menu names what it opens before where it comes from.** It used
   to lead with the source — "Open", "Open from Git", and a bare "From

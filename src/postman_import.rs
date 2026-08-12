@@ -186,6 +186,15 @@ impl Pacer {
         }
     }
 
+    /// The interval currently being kept on `bucket` — how far apart calls are
+    /// being spaced after whatever the server's headers last said.
+    pub fn interval(&self, bucket: RateBucket) -> Duration {
+        match bucket {
+            RateBucket::Strict => self.strict_interval,
+            RateBucket::General => self.general_interval,
+        }
+    }
+
     /// Honour an explicit 429: nothing on this bucket may go out for `secs`.
     pub fn back_off(&mut self, bucket: RateBucket, secs: Option<u64>, now: Instant) -> Duration {
         let wait = secs
@@ -329,6 +338,20 @@ pub enum ImportMsg {
     Waiting {
         reason: WaitReason,
         secs: u64,
+    },
+    /// What the server's own rate headers said after the last call, plus the
+    /// spacing they bought. Reported because "how much have we got left?" is
+    /// the first question a slow import raises, and the answer is already in
+    /// every response — it was simply being folded into the pacer and thrown
+    /// away.
+    Budget {
+        /// Calls left in the current window, and how long until it resets.
+        remaining: Option<u64>,
+        reset_secs: Option<u64>,
+        /// Calls left in the account's monthly allowance.
+        remaining_month: Option<u64>,
+        /// Seconds currently being left between calls on this bucket.
+        interval_secs: u64,
     },
     /// One item could not be fetched; the import continued without it.
     ItemFailed {
@@ -475,6 +498,18 @@ impl<'a> Importer<'a> {
         }
     }
 
+    /// Fold the server's accounting into the pacer *and* pass it on, so the
+    /// user can see the same numbers the pacer is reacting to.
+    fn observe(&mut self, bucket: RateBucket, rate: &RateInfo) {
+        self.pacer.observe(bucket, rate, self.clock.now());
+        self.send(ImportMsg::Budget {
+            remaining: rate.remaining,
+            reset_secs: rate.reset_secs,
+            remaining_month: rate.remaining_month,
+            interval_secs: self.pacer.interval(bucket).as_secs(),
+        });
+    }
+
     /// Work out what an import of `workspace_id` would fetch.
     ///
     /// This is the expensive-per-call half: listing collections draws on the
@@ -496,8 +531,7 @@ impl<'a> Importer<'a> {
             let (items, rate) =
                 self.retrying(RateBucket::Strict, |c| c.list_collections(workspace_id))?;
             remaining_month = rate.remaining_month.or(remaining_month);
-            self.pacer
-                .observe(RateBucket::Strict, &rate, self.clock.now());
+            self.observe(RateBucket::Strict, &rate);
             items
         } else {
             Vec::new()
@@ -510,8 +544,7 @@ impl<'a> Importer<'a> {
             let (items, rate) =
                 self.retrying(RateBucket::General, |c| c.list_environments(workspace_id))?;
             remaining_month = rate.remaining_month.or(remaining_month);
-            self.pacer
-                .observe(RateBucket::General, &rate, self.clock.now());
+            self.observe(RateBucket::General, &rate);
             items
         } else {
             Vec::new()
@@ -648,8 +681,7 @@ impl<'a> Importer<'a> {
                     }
                     Err(e) => return Err(e),
                 };
-                self.pacer
-                    .observe(RateBucket::General, &rate, self.clock.now());
+                self.observe(RateBucket::General, &rate);
 
                 let (dir, taken, counter) = match kind {
                     ItemKind::Collection => {

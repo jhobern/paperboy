@@ -25219,8 +25219,7 @@ fn choosing_a_key_source_writes_the_reference_syntax_for_the_user() {
     app.open_postman_wizard();
     postman_wizard(&mut app).key = Editor::blank();
 
-    // Focus starts on the source row, so Right cycles it.
-    press(&mut app, KeyCode::Right);
+    // 1Password is where the wizard opens, so nothing needs cycling.
     assert_eq!(postman_wizard(&mut app).key_source, KeySource::OnePassword);
 
     press(&mut app, KeyCode::Tab);
@@ -25772,7 +25771,7 @@ fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields()
 
     // Every field's example is on the same row as its label.
     for (label, example) in [
-        (s.postman_key_label, s.postman_key_hint),
+        (s.postman_key_label_op, s.postman_key_hint_op),
         (s.postman_workspace_label, s.postman_workspace_hint),
         (s.postman_base_url_label, s.postman_base_url_hint),
     ] {
@@ -25794,6 +25793,44 @@ fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields()
         .position(|l| l.contains(s.postman_key_source_label))
         .unwrap();
     assert_eq!(hint_row - first, 4, "four field rows, then the border");
+}
+
+/// The value column must not move when the key source changes. The key row's
+/// label grows and shrinks with the source ("API key" vs "1Password item"), and
+/// a column sized to whichever label happens to be showing slid every field
+/// sideways as the user arrowed through the four sources.
+#[test]
+fn the_value_column_stays_put_as_the_key_source_changes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+    let mut columns = Vec::new();
+    for src in crate::postman_flow::KeySource::ALL {
+        postman_wizard(&mut app).key_source = src;
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // The workspace row's label never changes, so where its value starts
+        // is exactly where the column is.
+        let row = text
+            .lines()
+            .find(|l| l.contains(s.postman_workspace_label))
+            .unwrap_or_else(|| panic!("no workspace row: {text}"))
+            .to_string();
+        let at = row
+            .find(s.postman_workspace_hint)
+            .expect("the workspace row shows its example");
+        columns.push((src, at));
+    }
+
+    let (_, first) = columns[0];
+    assert!(
+        columns.iter().all(|(_, at)| *at == first),
+        "the value column moved between key sources: {columns:?}"
+    );
 }
 
 /// The hint under the options has to describe what Enter does on the row the

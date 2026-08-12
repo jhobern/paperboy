@@ -208,6 +208,12 @@ pub(crate) struct PostmanFlow {
     // -- Flow state -------------------------------------------------------
     step: Step,
     busy: Option<Phase>,
+    /// When the current [`Self::busy`] phase started, so a long one can say how
+    /// long it has been going. A listing that draws on Postman's strict rate
+    /// limit can genuinely take minutes, and a spinner with no elapsed time (or
+    /// no reason for the wait) is indistinguishable from a hang.
+    busy_since: Option<Instant>,
+    budget: Option<Budget>,
     workspaces: Vec<WorkspaceSummary>,
     chosen: Option<WorkspaceSummary>,
     plan: Option<ImportPlan>,
@@ -249,22 +255,27 @@ pub(crate) struct PostmanFlow {
 /// offered a choice at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum KeySource {
-    /// The key itself, pasted in. The default: it is what someone with the key
-    /// on their clipboard expects, and what `$POSTMAN_API_KEY` seeds.
-    #[default]
+    /// The key itself, pasted in. Supported — it is what someone with the key
+    /// on their clipboard expects, and what `$POSTMAN_API_KEY` seeds — but
+    /// offered last and never the default: a pasted key is a live credential
+    /// sitting in a text field, where a reference is only its address.
     Paste,
+    /// The default. A 1Password item path is the safe answer, so it is the one
+    /// the wizard proposes rather than one the user has to go looking for.
+    #[default]
     OnePassword,
     Ssm,
     Env,
 }
 
 impl KeySource {
-    /// Every source, in the order the front-ends cycle through them.
+    /// Every source, in the order the front-ends offer them: the ones that
+    /// keep the credential out of the app first, the pasted key last.
     pub(crate) const ALL: [KeySource; 4] = [
-        KeySource::Paste,
         KeySource::OnePassword,
         KeySource::Ssm,
         KeySource::Env,
+        KeySource::Paste,
     ];
 
     /// The next/previous source, wrapping — for a left/right selector.
@@ -313,6 +324,10 @@ impl KeySource {
     /// existing key show it the way it was entered rather than as raw syntax.
     pub(crate) fn detect(raw: &str) -> (Self, String) {
         let raw = raw.trim();
+        // Nothing to go on yet: open on the source we would rather people used.
+        if raw.is_empty() {
+            return (KeySource::default(), String::new());
+        }
         let Some(inner) = raw
             .strip_prefix("{{")
             .and_then(|r| r.strip_suffix("}}"))
@@ -386,6 +401,8 @@ impl PostmanFlow {
             selected: 0,
             step: Step::Connect,
             busy: None,
+            busy_since: None,
+            budget: None,
             workspaces: Vec::new(),
             chosen: None,
             plan: None,
@@ -416,8 +433,92 @@ impl PostmanFlow {
         &self.step
     }
 
+    #[cfg(test)]
     pub(crate) fn busy(&self) -> Option<Phase> {
         self.busy
+    }
+
+    fn set_busy(&mut self, phase: Phase) {
+        self.busy = Some(phase);
+        self.busy_since = Some(Instant::now());
+    }
+
+    fn clear_busy(&mut self) {
+        self.busy = None;
+        self.busy_since = None;
+        self.progress.waiting = None;
+    }
+
+    /// What to put beside the spinner: the phase, why it is waiting if it is,
+    /// and how long it has been at it.
+    ///
+    /// The wait itself was already known — the pacer reports it — but only the
+    /// download screen ever drew it, so a *listing* held back by Postman's rate
+    /// limit sat on "Checking what that workspace holds…" for minutes looking
+    /// like a hung app rather than a queue being observed.
+    pub(crate) fn busy_line(&self, s: &Strings) -> Option<String> {
+        let phase = self.busy?;
+        let mut line = phase.label(s).to_string();
+        if let Some((reason, secs)) = self.progress.waiting {
+            let why = match reason {
+                crate::postman_import::WaitReason::Pacing => s.postman_waiting_paced,
+                crate::postman_import::WaitReason::RateLimited => s.postman_waiting_limited,
+            };
+            line.push_str(&format!(
+                " \u{2014} {why} ({})",
+                human_duration(Duration::from_secs(secs), s)
+            ));
+        }
+        // Below a few seconds an elapsed counter is just noise; past that it is
+        // the difference between "working" and "stuck".
+        if let Some(started) = self.busy_since {
+            let elapsed = started.elapsed();
+            if elapsed >= Duration::from_secs(3) {
+                line.push_str(&format!(" \u{b7} {}", human_duration(elapsed, s)));
+            }
+        }
+        Some(line)
+    }
+
+    /// What Postman last said was left, ready to put under the progress bar.
+    ///
+    /// An import that is mostly waiting looks the same whether the account has
+    /// two calls left this month or two hundred, and the estimate swings about
+    /// as paced waits land inside it — so show the budget itself, which is a
+    /// fact rather than an extrapolation.
+    pub(crate) fn budget_line(&self, s: &Strings) -> Option<String> {
+        let b = self.budget?;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(n) = b.remaining {
+            let window = match b.reset_secs {
+                Some(secs) if secs > 0 => format!(
+                    "{} {} ({})",
+                    n,
+                    s.postman_budget_window,
+                    human_duration(Duration::from_secs(secs), s)
+                ),
+                _ => format!("{n} {}", s.postman_budget_window),
+            };
+            parts.push(window);
+        }
+        if let Some(n) = b.remaining_month {
+            parts.push(format!("{n} {}", s.postman_budget_month));
+        }
+        if b.interval_secs > 0 {
+            parts.push(format!(
+                "{} {}",
+                s.postman_budget_pace,
+                human_duration(Duration::from_secs(b.interval_secs), s)
+            ));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}: {}",
+            s.postman_budget_label,
+            parts.join(" \u{b7} ")
+        ))
     }
 
     pub(crate) fn is_busy(&self) -> bool {
@@ -540,7 +641,7 @@ impl PostmanFlow {
             let _ = tx.send(msg);
         });
         self.rx = Some(rx);
-        self.busy = Some(Phase::ListingWorkspaces);
+        self.set_busy(Phase::ListingWorkspaces);
         self.step = Step::PickWorkspace;
     }
 
@@ -629,7 +730,7 @@ impl PostmanFlow {
         self.rx = Some(rx);
         self.progress_rx = Some(progress_rx);
         self.go = Some(go_tx);
-        self.busy = Some(Phase::Planning);
+        self.set_busy(Phase::Planning);
         self.step = Step::Confirm;
         true
     }
@@ -653,7 +754,7 @@ impl PostmanFlow {
             started: Some(Instant::now()),
             ..Progress::default()
         };
-        self.busy = Some(Phase::Downloading);
+        self.set_busy(Phase::Downloading);
         self.step = Step::Downloading;
         true
     }
@@ -680,7 +781,7 @@ impl PostmanFlow {
         self.cancel();
         self.rx = None;
         self.progress_rx = None;
-        self.busy = None;
+        self.clear_busy();
         self.workspaces.clear();
         self.chosen = None;
         self.plan = None;
@@ -722,7 +823,7 @@ impl PostmanFlow {
     }
 
     pub(crate) fn fail(&mut self, message: String) {
-        self.busy = None;
+        self.clear_busy();
         self.rx = None;
         self.progress_rx = None;
         self.go = None;
@@ -747,7 +848,7 @@ impl PostmanFlow {
                 if self.busy.is_some() && !self.cancel.load(Ordering::Relaxed) {
                     self.fail(s.postman_err_worker_ended.to_string());
                 }
-                self.busy = None;
+                self.clear_busy();
                 None
             }
         }
@@ -782,6 +883,19 @@ impl PostmanFlow {
                 ImportMsg::Waiting { reason, secs } => {
                     self.progress.waiting = Some((reason, secs));
                 }
+                ImportMsg::Budget {
+                    remaining,
+                    reset_secs,
+                    remaining_month,
+                    interval_secs,
+                } => {
+                    self.budget = Some(Budget {
+                        remaining,
+                        reset_secs,
+                        remaining_month,
+                        interval_secs,
+                    });
+                }
                 ImportMsg::ItemFailed { name, error } => {
                     self.failures.push((name, error));
                 }
@@ -800,7 +914,7 @@ impl PostmanFlow {
     fn apply(&mut self, msg: Msg, s: &Strings) -> Option<PostmanEvent> {
         match msg {
             Msg::Workspaces(Ok(ws)) => {
-                self.busy = None;
+                self.clear_busy();
                 self.rx = None;
                 if ws.is_empty() {
                     // Not an error the user can fix by retrying: a Postman API
@@ -818,7 +932,7 @@ impl PostmanFlow {
                 None
             }
             Msg::Planned(plan) => {
-                self.busy = None;
+                self.clear_busy();
                 // The plan carries the workspace's real name, which is all the
                 // wizard had an id for when the user typed one in.
                 if let Some(chosen) = self.chosen.as_mut()
@@ -830,7 +944,7 @@ impl PostmanFlow {
                 None
             }
             Msg::Finished(summary) => {
-                self.busy = None;
+                self.clear_busy();
                 self.rx = None;
                 self.progress_rx = None;
                 self.progress.done = self.progress.total;
@@ -906,6 +1020,17 @@ pub(crate) fn plan_summary(plan: &ImportPlan, s: &Strings) -> String {
 
 /// Round a duration to something worth reading aloud. An import is paced in
 /// whole seconds, so sub-second precision would be false precision.
+/// What Postman's rate headers last reported, kept so the front-ends can show
+/// the user how much of their allowance is left rather than only how long the
+/// import thinks it has to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    remaining: Option<u64>,
+    reset_secs: Option<u64>,
+    remaining_month: Option<u64>,
+    interval_secs: u64,
+}
+
 pub(crate) fn human_duration(d: Duration, s: &Strings) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -982,9 +1107,11 @@ mod tests {
 
     #[test]
     fn the_key_sources_cycle_both_ways_without_falling_off_the_end() {
-        assert_eq!(KeySource::default(), KeySource::Paste);
-        assert_eq!(KeySource::Paste.cycled(false), KeySource::Env);
-        assert_eq!(KeySource::Env.cycled(true), KeySource::Paste);
+        // 1Password leads: a reference is the encouraged answer, a pasted key
+        // the supported-but-last one.
+        assert_eq!(KeySource::default(), KeySource::OnePassword);
+        assert_eq!(KeySource::OnePassword.cycled(false), KeySource::Paste);
+        assert_eq!(KeySource::Paste.cycled(true), KeySource::OnePassword);
     }
 
     fn flow() -> PostmanFlow {
@@ -1249,6 +1376,59 @@ mod tests {
         .unwrap();
         f.drain_progress();
         assert_eq!(f.progress().waiting, None);
+    }
+
+    /// A wait during *listing* used to be invisible: the pacer reported it, but
+    /// only the download screen drew it, so a rate-limited listing sat on a
+    /// bare phase label for minutes looking like a hung app.
+    #[test]
+    fn the_busy_line_says_why_it_is_waiting_not_just_what_it_is_doing() {
+        let s = s();
+        let mut f = flow();
+        f.set_busy(Phase::Planning);
+        assert_eq!(f.busy_line(&s).as_deref(), Some(Phase::Planning.label(&s)));
+
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+        tx.send(ImportMsg::Waiting {
+            reason: WaitReason::RateLimited,
+            secs: 12,
+        })
+        .unwrap();
+        f.drain_progress();
+        let line = f.busy_line(&s).expect("still busy");
+        assert!(
+            line.contains(s.postman_waiting_limited),
+            "the reason for the wait belongs on the line: {line}"
+        );
+    }
+
+    /// "How much have we got left?" is the first question a slow import raises,
+    /// and every response already answers it — the numbers were being folded
+    /// into the pacer and then thrown away.
+    #[test]
+    fn the_allowance_postman_reports_is_shown_not_just_used_for_pacing() {
+        let s = s();
+        let mut f = flow();
+        assert_eq!(f.budget_line(&s), None, "nothing to report before a call");
+
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+        tx.send(ImportMsg::Budget {
+            remaining: Some(8),
+            reset_secs: Some(45),
+            remaining_month: Some(812),
+            interval_secs: 12,
+        })
+        .unwrap();
+        f.drain_progress();
+        let line = f.budget_line(&s).expect("a budget was reported");
+        assert!(line.contains('8') && line.contains(s.postman_budget_window));
+        assert!(line.contains("812") && line.contains(s.postman_budget_month));
+        assert!(
+            line.contains(s.postman_budget_pace),
+            "the spacing explains the wait: {line}"
+        );
     }
 
     /// One item failing must not read as the whole import failing: the folder

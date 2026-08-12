@@ -213,11 +213,14 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         .picker_dir(crate::session::PickerKind::Import)
         .map(std::path::Path::to_owned);
     let strings = &app.strings;
-    let dismissed =
-        super::widgets::dialog_resizable(ctx, strings.postman_title, [540.0, 480.0], |ui| {
-            action = draw(ui, &mut w, colors, strings);
-        })
-        .dismissed;
+    // Fixed width, reserving what the widest step needs: the connect step's
+    // label changes with the key source ("API key" vs "1Password item") and a
+    // dialog sized to its content grew and shrank around it, dragging the whole
+    // form sideways while the user was reading it.
+    let dismissed = super::widgets::dialog(ctx, strings.postman_title, Some(CONNECT_WIDTH), |ui| {
+        action = draw(ui, &mut w, colors, strings);
+    })
+    .dismissed;
     // The ✕ and Escape are the Cancel button by another name.
     if dismissed {
         action = UiAction::Cancel;
@@ -270,11 +273,17 @@ fn draw(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiA
     // The busy spinner is deliberately not shown while downloading: that step
     // has a progress bar, which says the same thing with more information.
     let downloading = matches!(w.flow.step(), Step::Downloading);
-    if let Some(phase) = w.flow.busy().filter(|_| !downloading) {
+    if let Some(line) = w.flow.busy_line(s).filter(|_| !downloading) {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.colored_label(colors.dim, phase.label(s));
+            ui.colored_label(colors.dim, line);
         });
+        // The allowance is the fact behind the wait: a listing paced to one
+        // call every twelve seconds is a rate limit being respected, not a
+        // stall, and only the headers can say which.
+        if let Some(budget) = w.flow.budget_line(s) {
+            ui.colored_label(colors.dim, budget);
+        }
         ui.add_space(6.0);
     }
     if let Some(error) = w.flow.error() {
@@ -295,6 +304,12 @@ fn draw(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiA
     }
 }
 
+/// Width reserved for the connect step's label column, and for the dialog as a
+/// whole. Both are fixed so that changing the key source — which changes the
+/// label beside the key field — doesn't move anything else on screen.
+const LABEL_WIDTH: f32 = 130.0;
+const CONNECT_WIDTH: f32 = 540.0;
+
 fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
@@ -305,9 +320,13 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     egui::Grid::new("pb_postman_connect")
         .num_columns(2)
         .spacing([12.0, 6.0])
+        // Wide enough for the longest label any source can put here, so the
+        // value column stays where it is as the source changes.
+        .min_col_width(LABEL_WIDTH)
         .show(ui, |ui| {
             ui.colored_label(colors.accent, s.postman_key_source_label);
             egui::ComboBox::from_id_salt("pb_postman_key_source")
+                .width(200.0)
                 .selected_text(key_source_label(w.key_source, s))
                 .show_ui(ui, |ui| {
                     for src in KeySource::ALL {
@@ -369,12 +388,6 @@ fn draw_connect(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
 }
 
 /// The name of a key source as the picker shows it.
-/// See [`crate::gui::remote::list_height`]: a resizable dialog whose list keeps
-/// a fixed height is not really resizable.
-fn list_height(ui: &egui::Ui) -> f32 {
-    (ui.available_height() - 64.0).max(120.0)
-}
-
 fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
     match src {
         KeySource::Paste => s.postman_key_source_paste,
@@ -431,7 +444,7 @@ fn draw_pick_workspace(
         .collect();
     let mut selected = w.flow.selected;
     egui::ScrollArea::vertical()
-        .max_height(list_height(ui))
+        .max_height(260.0)
         .show(ui, |ui| {
             for (i, name) in names.iter().enumerate() {
                 if ui.selectable_label(selected == i, name).clicked() {
@@ -602,7 +615,12 @@ fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Str
     if let Some(eta) = p.eta() {
         ui.colored_label(
             colors.dim,
-            format!("{} {}", human_duration(eta, s), s.postman_remaining),
+            format!(
+                "{} {} {}",
+                s.postman_estimate,
+                human_duration(eta, s),
+                s.postman_remaining
+            ),
         );
     }
     // A paced import spends most of its life deliberately idle; saying so is
@@ -613,6 +631,9 @@ fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Str
             WaitReason::RateLimited => s.postman_waiting_limited,
         };
         ui.colored_label(colors.accent, format!("{label} ({secs}s)"));
+    }
+    if let Some(line) = w.flow.budget_line(s) {
+        ui.colored_label(colors.dim, line);
     }
 
     ui.add_space(8.0);

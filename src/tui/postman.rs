@@ -303,7 +303,16 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         (s.postman_workspace_label, s.postman_workspace_hint, 2),
         (s.postman_base_url_label, s.postman_base_url_hint, 3),
     ];
-    let label_w = label_column(fields.iter().map(|(l, _, _)| *l));
+    // Width the column against *every* label it could ever hold, not just the
+    // ones showing: the key row's label changes with the chosen source ("API
+    // key" vs "1Password item"), and sizing to the current one made the whole
+    // value column jump sideways as the user arrowed through the sources.
+    let label_w = label_column(
+        fields
+            .iter()
+            .map(|(l, _, _)| *l)
+            .chain(KeySource::ALL.iter().map(|src| key_field_label(*src, s))),
+    );
 
     let width = 66.min(f.area().width);
     let area = centered_rect(width, fields.len() as u16 + 2, f.area());
@@ -350,21 +359,35 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
 }
 
 fn draw_loading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
-    let msg = w.flow.busy().map_or(s.postman_busy_listing, |p| p.label(s));
-    let width = (msg.chars().count().max(s.git_loading_hint.chars().count()) as u16 + 4)
-        .min(f.area().width);
-    let area = centered_rect(width, 3, f.area());
+    // Says why it is waiting and how long it has been, not just what it is
+    // doing: Postman's rate limit can hold a listing for minutes, and a bare
+    // phase label leaves that looking like a hang.
+    let msg = w
+        .flow
+        .busy_line(s)
+        .unwrap_or_else(|| s.postman_busy_listing.to_string());
+    // The allowance is the fact behind the wait: a listing paced to one call
+    // every twelve seconds is a rate limit being respected, not a stall.
+    let budget = w.flow.budget_line(s);
+    let widest = msg
+        .chars()
+        .count()
+        .max(s.git_loading_hint.chars().count())
+        .max(budget.as_ref().map_or(0, |b| b.chars().count()));
+    let width = (widest as u16 + 4).min(f.area().width);
+    let area = centered_rect(width, if budget.is_some() { 4 } else { 3 }, f.area());
     f.render_widget(Clear, area);
     let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            msg,
-            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
-        )),
-        inner,
-    );
+    let mut lines = vec![Line::styled(
+        msg,
+        Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(budget) = budget {
+        lines.push(Line::styled(budget, Style::default().fg(th.dim)));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme) {
@@ -596,6 +619,10 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
     if p.waiting.is_some() {
         constraints.push(Constraint::Length(1));
     }
+    let budget = w.flow.budget_line(s);
+    if budget.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
     let area = centered_rect(width, constraints.len() as u16 + 2, f.area());
     f.render_widget(Clear, area);
     let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
@@ -626,7 +653,12 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
     if let Some(eta) = eta {
         f.render_widget(
             Paragraph::new(Line::styled(
-                format!("{} {}", human_duration(eta, s), s.postman_remaining),
+                format!(
+                    "{} {} {}",
+                    s.postman_estimate,
+                    human_duration(eta, s),
+                    s.postman_remaining
+                ),
                 Style::default().fg(th.dim),
             )),
             next(),
@@ -644,6 +676,12 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
                 format!("{label} ({secs}s)"),
                 Style::default().fg(th.pending),
             )),
+            next(),
+        );
+    }
+    if let Some(budget) = budget {
+        f.render_widget(
+            Paragraph::new(Line::styled(budget, Style::default().fg(th.dim))),
             next(),
         );
     }
