@@ -12,8 +12,9 @@ use nom::{
 };
 
 use crate::report::flow::{
-    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, Pattern,
-    Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
+    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, ParamDecl,
+    ParamKind, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef,
+    ShowField, WithItem,
 };
 use crate::report::model::{ColumnClauses, StatKind};
 
@@ -40,6 +41,7 @@ header-line  := '#' [ key ':' value ]                 # before the first stateme
 
 statement    := assign
               | list-decl
+              | param-decl                             # prelude only
               | request
               | report
               | for-each
@@ -48,6 +50,9 @@ statement    := assign
 
 assign       := IDENT '=' value                       # incl. PRELUDE_* settings
 list-decl    := 'LIST' IDENT '=' producer
+param-decl   := 'PARAM' [ param-kind ] IDENT [ '=' value ] [ 'LABEL' name ]
+param-kind   := 'TEXT' | 'NUMBER' | 'ENV' | 'FOLDER' | 'FILE'
+              | 'CHOICE' '(' [ name (',' name)* ] ')'
 
 request      := 'REQUEST' name
 report       := 'REPORT' report-target
@@ -270,7 +275,7 @@ fn header_line(i: &str) -> IResult<&str, HeaderLine> {
 // ---------------------------------------------------------------------------
 
 fn node(i: &str) -> IResult<&str, FlowNode> {
-    alt((for_stmt, list_decl, request, report, assign))(i)
+    alt((for_stmt, list_decl, param_decl, request, report, assign))(i)
 }
 
 /// `IDENT = <rest of line>` — value is untokenized (may contain `=`, `&`, …).
@@ -289,6 +294,54 @@ fn list_decl(i: &str) -> IResult<&str, FlowNode> {
         preceded(kw("LIST"), separated_pair(ident, sym('='), producer)),
         |(name, producer)| FlowNode::ListDecl { name, producer },
     )(i)
+}
+
+/// `PARAM [<kind>] IDENT [ '=' value ] [ 'LABEL' text ]`.
+///
+/// The kind is optional (omitted = `TEXT`), which needs a lookahead to stay
+/// unambiguous: `PARAM TEXT = "x"` declares a parameter *named* `TEXT`, while
+/// `PARAM TEXT NAME = "x"` is a text parameter named `NAME`. So a leading kind
+/// word is only consumed when an identifier follows it — otherwise the word is
+/// the parameter's own name.
+fn param_decl(i: &str) -> IResult<&str, FlowNode> {
+    let (i, _) = kw("PARAM")(i)?;
+    // `peek(ident)` after the kind is what disambiguates: without a name
+    // following, the word we just read was the name itself.
+    let (i, kind) = opt(map(pair(param_kind, peek(ident)), |(k, _)| k))(i)?;
+    let kind = kind.unwrap_or_default();
+    let (i, name) = ident(i)?;
+    let (i, default) = opt(preceded(sym('='), str_or_word))(i)?;
+    let (i, label) = opt(preceded(kw("LABEL"), str_or_word))(i)?;
+    Ok((
+        i,
+        FlowNode::Param(ParamDecl {
+            kind,
+            name,
+            default,
+            label,
+        }),
+    ))
+}
+
+/// `TEXT | NUMBER | ENV | FOLDER | FILE | CHOICE(a, b, …)`.
+fn param_kind(i: &str) -> IResult<&str, ParamKind> {
+    alt((
+        map(
+            preceded(kw("CHOICE"), paren_list1(str_or_word)),
+            |options| ParamKind::Choice(options),
+        ),
+        // An empty option list is a grammatical `CHOICE` with nothing to
+        // choose from; accepting it here lets validation say so in words
+        // instead of the parser rejecting the whole line as unknown syntax.
+        map(preceded(kw("CHOICE"), pair(sym('('), sym(')'))), |_| {
+            ParamKind::Choice(Vec::new())
+        }),
+        value(ParamKind::Text, kw("TEXT")),
+        value(ParamKind::Number, kw("NUMBER")),
+        value(ParamKind::Env, kw("ENV")),
+        value(ParamKind::Folder, kw("FOLDER")),
+        value(ParamKind::File, kw("FILE")),
+    ))(i)
 }
 
 fn request(i: &str) -> IResult<&str, FlowNode> {
@@ -1212,6 +1265,77 @@ mod tests {
             }
             other => panic!("expected ListDecl, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_parameter_declares_a_type_a_default_and_a_prompt() {
+        let flow = assert_round_trips(
+            "PARAM CHOICE(\"v4.2\", \"v4.3\") VERSION = \"v4.3\" LABEL \"API version\"\nREPORT REQUEST r\n",
+        );
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(
+                    p.kind,
+                    ParamKind::Choice(vec!["v4.2".into(), "v4.3".into()])
+                );
+                assert_eq!(p.name, "VERSION");
+                assert_eq!(p.default.as_deref(), Some("v4.3"));
+                assert_eq!(p.label.as_deref(), Some("API version"));
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_part_of_a_parameter_but_its_name_is_optional() {
+        let flow = parse_flow("PARAM TICKETS\nREPORT REQUEST r\n").unwrap();
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                // No type written means free text, and no default means the
+                // parameter is required rather than empty-by-default.
+                assert_eq!(p.kind, ParamKind::Text);
+                assert_eq!(p.name, "TICKETS");
+                assert_eq!(p.default, None);
+                assert_eq!(p.label, None);
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+        // The canonical form spells the type out, so nobody has to know which
+        // one they got by saying nothing.
+        assert!(flow.to_text().starts_with("PARAM TEXT TICKETS\n"));
+    }
+
+    /// The type is optional, so a parameter *named* after a type keyword has to
+    /// resolve the other way — the word is only a type when a name follows it.
+    #[test]
+    fn a_parameter_named_after_a_type_is_still_its_own_name() {
+        let flow = parse_flow("PARAM ENV = \"staging\"\n").unwrap();
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(p.name, "ENV");
+                assert_eq!(p.kind, ParamKind::Text);
+                assert_eq!(p.default.as_deref(), Some("staging"));
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+        let typed = parse_flow("PARAM ENV TARGET = \"staging\"\n").unwrap();
+        match &typed.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(p.name, "TARGET");
+                assert_eq!(p.kind, ParamKind::Env);
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_declared_parameters_are_readable_without_running_anything() {
+        let flow = parse_flow(
+            "# collection: c\nPARAM ENV TARGET = \"staging\"\nPARAM FOLDER IMAGES = \"./t\"\nREPORT REQUEST r\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = flow.params().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["TARGET", "IMAGES"]);
     }
 
     #[test]

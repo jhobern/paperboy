@@ -1210,6 +1210,12 @@ fn build_node_chips(
             ));
             chips
         }
+        // One chip carrying the whole declaration. Editing it is the run
+        // settings panel's job, not the block editor's — what matters here is
+        // that a parameter is visible as the first thing the report does.
+        FlowNode::Param(_) => {
+            vec![Chip::base(node.label(), th.pending).with_help(s.chip_help_param)]
+        }
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
             let (col, help) = if matches!(node, FlowNode::Assign { .. }) {
                 (th.accent, s.chip_help_assign)

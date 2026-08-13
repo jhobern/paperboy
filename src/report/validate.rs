@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::flow::{
-    EnvClause, FlowNode, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, ShowField,
+    EnvClause, FlowNode, ParamKind, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, ShowField,
 };
 use crate::i18n::{Strings, fill};
 
@@ -253,6 +253,11 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
         diags.push(Diagnostic::warning(s.diag_collection_not_loaded));
     }
 
+    // Parameters are read off the flow without executing it, so they have to
+    // be findable: confined to the prelude, uniquely named, and consistent
+    // with their own declared type.
+    check_params(flow, ctx, &mut diags);
+
     // Walk the tree with a scope stack of declared LIST producers.
     let mut scopes: Vec<HashMap<String, Producer>> = vec![HashMap::new()];
     walk(&flow.nodes, ctx, &mut scopes, &mut diags);
@@ -271,6 +276,111 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     diags
 }
 
+/// Whether a node is one of the "does nothing yet" statements a `PARAM` may
+/// legally follow: another parameter, a plain assignment (`PRELUDE_*` settings
+/// and constants), or a comment.
+fn is_prelude_node(node: &FlowNode) -> bool {
+    matches!(
+        node,
+        FlowNode::Param(_) | FlowNode::Assign { .. } | FlowNode::Comment(_)
+    )
+}
+
+/// Check every `PARAM` in the flow: that it is in the prelude at all (a
+/// parameter buried in a loop can never be offered before the run, so it would
+/// silently be an ordinary assignment), that no two share a name, and that
+/// each default agrees with its declared type.
+fn check_params(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+
+    // Anything after the first statement that acts can't be offered up front.
+    let prelude_end = flow
+        .nodes
+        .iter()
+        .position(|n| !is_prelude_node(n))
+        .unwrap_or(flow.nodes.len());
+    for p in nested_params(&flow.nodes[prelude_end..]) {
+        diags.push(Diagnostic::error(fill(
+            s.diag_param_not_in_prelude,
+            &[&p.name],
+        )));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for p in flow.params() {
+        if !seen.insert(&p.name) {
+            diags.push(Diagnostic::error(fill(s.diag_param_duplicate, &[&p.name])));
+        }
+        check_param_default(p, ctx, diags);
+    }
+}
+
+/// Every `PARAM` anywhere in `nodes`, loop bodies included — used to find the
+/// ones that are past the prelude, wherever they are hiding.
+fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
+    let mut out = Vec::new();
+    for node in nodes {
+        match node {
+            FlowNode::Param(p) => out.push(p),
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                out.extend(nested_params(body));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn check_param_default(p: &super::flow::ParamDecl, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+    let default = p.default.as_deref().map(str::trim);
+    match &p.kind {
+        ParamKind::Choice(options) => {
+            if options.is_empty() {
+                diags.push(Diagnostic::error(fill(s.diag_param_no_choices, &[&p.name])));
+            } else if let Some(d) = default.filter(|d| !d.is_empty())
+                && !options.iter().any(|o| o == d)
+            {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_param_bad_choice,
+                    &[&p.name, d, &options.join(", ")],
+                )));
+            }
+        }
+        // A default that interpolates something is checked at run time, when
+        // there is something to interpolate; refusing `{{PORT}}` here would
+        // reject a perfectly good report.
+        ParamKind::Number => {
+            if let Some(d) = default.filter(|d| !d.is_empty())
+                && !d.contains("{{")
+                && d.parse::<f64>().is_err()
+            {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_param_not_a_number,
+                    &[&p.name, d],
+                )));
+            }
+        }
+        // An environment parameter is *meant* to be changed per run, so a
+        // default naming an environment that isn't loaded right now is a
+        // warning, not an error — unlike the `# environment:` directive, which
+        // is the report's fixed choice.
+        ParamKind::Env => {
+            if let Some(d) = default.filter(|d| !d.is_empty())
+                && !d.contains("{{")
+                && let Some(loaded) = ctx.env_names
+                && !loaded.iter().any(|e| e == d)
+            {
+                diags.push(Diagnostic::warning(fill(
+                    s.diag_param_env_not_loaded,
+                    &[&p.name, d],
+                )));
+            }
+        }
+        ParamKind::Text | ParamKind::Folder | ParamKind::File => {}
+    }
+}
+
 fn walk(
     nodes: &[FlowNode],
     ctx: &Context,
@@ -282,6 +392,8 @@ fn walk(
             // Nothing to check in a comment.
             FlowNode::Comment(_) => {}
             FlowNode::Assign { .. } => {}
+            // Parameters are checked as a set, before this walk.
+            FlowNode::Param(_) => {}
             FlowNode::ListDecl { name, producer } => {
                 check_producer(producer, ctx, scopes, diags);
                 if scopes.iter().any(|s| s.contains_key(name)) {
@@ -931,6 +1043,11 @@ fn check_var_availability(
             FlowNode::Assign { key, .. } => {
                 defined.insert(key.clone());
             }
+            // A parameter always has a value by the time anything runs —
+            // its default, or whatever the run settings supplied instead.
+            FlowNode::Param(p) => {
+                defined.insert(p.name.clone());
+            }
             FlowNode::ListDecl { .. } => {}
             // A bare REQUEST (no report output) — check its vars, then thread
             // its captures forward.
@@ -1005,6 +1122,92 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    fn errors_for(src: &str) -> Vec<String> {
+        diags_for(src, None, None)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// A parameter is only useful if it can be offered *before* the run, which
+    /// means it has to be findable without executing the flow. One written
+    /// after the first real step — or buried in a loop, where it would run
+    /// many times — is an ordinary assignment wearing a parameter's clothes.
+    #[test]
+    fn a_parameter_past_the_prelude_is_refused() {
+        let ok = errors_for(
+            "# collection: c\n# a comment\nPRELUDE_MAX_PARALLEL=2\nPARAM ENV TARGET = \"s\"\nREPORT REQUEST r\n",
+        );
+        assert!(ok.is_empty(), "prelude parameter should be fine: {ok:?}");
+
+        let late = errors_for("# collection: c\nREPORT REQUEST r\nPARAM ENV TARGET = \"s\"\n");
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("TARGET"), "{late:?}");
+
+        let nested = errors_for(
+            "# collection: c\nFOR F IN FILES \"x\"\n    PARAM TEXT NOTE = \"n\"\n    REPORT REQUEST r\nEND\n",
+        );
+        assert_eq!(nested.len(), 1, "{nested:?}");
+        assert!(nested[0].contains("NOTE"), "{nested:?}");
+    }
+
+    #[test]
+    fn a_parameter_must_agree_with_its_own_declared_type() {
+        let choice = errors_for(
+            "# collection: c\nPARAM CHOICE(\"a\", \"b\") PICK = \"c\"\nREPORT REQUEST r\n",
+        );
+        assert_eq!(choice.len(), 1, "{choice:?}");
+        assert!(
+            choice[0].contains("PICK") && choice[0].contains("a, b"),
+            "{choice:?}"
+        );
+
+        let empty = errors_for("# collection: c\nPARAM CHOICE() PICK\nREPORT REQUEST r\n");
+        assert_eq!(empty.len(), 1, "{empty:?}");
+
+        let number =
+            errors_for("# collection: c\nPARAM NUMBER TRIES = \"many\"\nREPORT REQUEST r\n");
+        assert_eq!(number.len(), 1, "{number:?}");
+        assert!(number[0].contains("TRIES"), "{number:?}");
+
+        // A default that has to be interpolated can't be judged until there is
+        // something to interpolate, so it must not be rejected here.
+        let deferred =
+            errors_for("# collection: c\nPARAM NUMBER TRIES = \"{{RETRIES}}\"\nREPORT REQUEST r\n");
+        assert!(deferred.is_empty(), "{deferred:?}");
+
+        let dupes = errors_for(
+            "# collection: c\nPARAM TEXT A = \"1\"\nPARAM NUMBER A = \"2\"\nREPORT REQUEST r\n",
+        );
+        assert_eq!(dupes.len(), 1, "{dupes:?}");
+        assert!(dupes[0].contains('A'), "{dupes:?}");
+    }
+
+    /// An environment parameter exists precisely so the environment can be
+    /// changed per run, so a default naming one that isn't loaded right now
+    /// must not block the report the way the fixed `# environment:` directive
+    /// does.
+    #[test]
+    fn an_unloaded_environment_default_is_only_a_warning() {
+        let loaded = ["staging".to_string()];
+        let diags = diags_for(
+            "# collection: c\nPARAM ENV TARGET = \"prod\"\nREPORT REQUEST r\n",
+            None,
+            Some(&loaded),
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("prod")),
+            "{diags:?}"
+        );
     }
 
     /// The variable-availability warnings come out of a `HashSet`, whose

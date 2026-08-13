@@ -742,6 +742,16 @@ impl<'a> Exec<'a> {
                 FlowNode::ListDecl { name, producer } => {
                     self.lists.insert(name.clone(), producer.clone());
                 }
+                // A parameter binds exactly like an assignment of its default.
+                // The value is already unquoted by the parser, so unlike an
+                // `Assign` (whose value is the raw rest of the line) it only
+                // needs interpolating. Offering the user a different value
+                // before the run is the run-settings layer's job.
+                FlowNode::Param(p) => {
+                    let raw = p.default.clone().unwrap_or_default();
+                    let v = substitute(&raw, &self.vars_for());
+                    self.set_var(&p.name, v);
+                }
                 FlowNode::Request { name } => {
                     self.run_request(name);
                 }

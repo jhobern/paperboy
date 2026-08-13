@@ -184,6 +184,22 @@ impl Header {
 pub enum FlowNode {
     /// `KEY=value` — set `{{KEY}}` in the current scope (includes `PRELUDE_*`).
     Assign { key: String, value: String },
+    /// `PARAM <kind> NAME = "default" [LABEL "…"]` — declare a run parameter.
+    ///
+    /// A parameter behaves exactly like an [`Assign`](FlowNode::Assign) of its
+    /// effective value, so `{{NAME}}` interpolation needs no new concept; what
+    /// it adds is that the value is *offered to the user before the run*, with
+    /// a type the front-ends can put a sensible control behind. It is a
+    /// statement rather than a header directive because it binds a variable
+    /// (and so belongs in the same precedence ladder as everything else), and
+    /// because unknown header lines are silently treated as comments — an
+    /// older PaperBoy would run a parameterised report with nothing bound
+    /// instead of saying it can't.
+    ///
+    /// Validation confines it to the prelude (before the first statement that
+    /// does anything), so the whole parameter set can be read off a flow
+    /// without executing it.
+    Param(ParamDecl),
     /// `LIST NAME = <producer>` — declare a named, iteration-only list.
     ListDecl { name: String, producer: Producer },
     /// A whole-line `# …` comment in the body.
@@ -232,6 +248,59 @@ pub struct ParallelSpec {
     /// An explicit worker cap from `PARALLEL(n)`. `None` means "use the engine
     /// default" (`PRELUDE_MAX_PARALLEL`, itself defaulting to a built-in cap).
     pub degree: Option<u32>,
+}
+
+/// A declared run parameter: what a `PARAM` statement binds.
+///
+/// The `default` is what the checked-in `.trail` file says; a front-end may
+/// offer a different value for a particular run, but never writes the chosen
+/// value back into the file — a report under version control keeps meaning the
+/// same thing to everyone who opens it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamDecl {
+    /// The control to put behind it, and the values it accepts.
+    pub kind: ParamKind,
+    /// The variable it binds; `{{NAME}}` reads it like any other variable.
+    pub name: String,
+    /// The value used when nothing is supplied. `None` = the parameter is
+    /// required and the run settings open with it empty and flagged.
+    pub default: Option<String>,
+    /// A human-friendly prompt for the run settings. `None` → show the name.
+    pub label: Option<String>,
+}
+
+/// The type of a `PARAM` — what the run settings offer and what validation
+/// will accept.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ParamKind {
+    /// Free text (the default when no type is written).
+    #[default]
+    Text,
+    /// A number, offered as a number field and checked as one.
+    Number,
+    /// The name of a loaded environment.
+    Env,
+    /// A directory path, offered with a folder picker.
+    Folder,
+    /// A file path, offered with a file picker.
+    File,
+    /// One of a fixed set, offered as a drop-down. The list is never empty
+    /// (validation rejects `CHOICE()`), and a default must be one of it.
+    Choice(Vec<String>),
+}
+
+impl ParamKind {
+    /// The keyword this kind is written as, without any `CHOICE` options.
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            ParamKind::Text => "TEXT",
+            ParamKind::Number => "NUMBER",
+            ParamKind::Env => "ENV",
+            ParamKind::Folder => "FOLDER",
+            ParamKind::File => "FILE",
+            ParamKind::Choice(_) => "CHOICE",
+        }
+    }
 }
 
 /// The column-emitting `REPORT` statement in its three forms.
@@ -583,6 +652,22 @@ pub enum EnvClause {
 const INDENT: &str = "    ";
 
 impl ReportFlow {
+    /// The parameters this report declares, in the order they are written —
+    /// which is the order the run settings present them in.
+    ///
+    /// Only top-level nodes are looked at: a `PARAM` inside a loop is a
+    /// validation error, and reading a nested one here would let it reach the
+    /// run settings anyway.
+    pub fn params(&self) -> Vec<&ParamDecl> {
+        self.nodes
+            .iter()
+            .filter_map(|n| match n {
+                FlowNode::Param(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Serialize to canonical PaperTrail text (round-trips with `parse_flow`).
     pub fn to_text(&self) -> String {
         let mut out = String::new();
@@ -847,6 +932,9 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         }
         FlowNode::ListDecl { name, producer } => {
             let _ = writeln!(out, "LIST {name} = {}", producer_text(producer));
+        }
+        FlowNode::Param(p) => {
+            let _ = writeln!(out, "{}", param_text(p));
         }
         FlowNode::Comment(text) => {
             let _ = writeln!(out, "#{text}");
@@ -1216,6 +1304,7 @@ impl FlowNode {
             FlowNode::ListDecl { name, producer } => {
                 format!("LIST {name} = {}", producer_text(producer))
             }
+            FlowNode::Param(p) => param_text(p),
             FlowNode::Comment(text) => format!("#{text}"),
             FlowNode::Request { name } => format!("REQUEST {name}"),
             FlowNode::Report(stmt) => report_label(stmt),
@@ -1379,6 +1468,38 @@ fn report_label(stmt: &ReportStmt) -> String {
 }
 
 /// Double-quote a string, escaping `\` and `"`.
+/// One `PARAM` statement as canonical text.
+///
+/// The kind is always written out, even when it is the `TEXT` default that may
+/// have been omitted in the source: the canonical form says what a parameter
+/// is, so nobody has to know which type you get by saying nothing. Values are
+/// always quoted so a default or label containing spaces survives.
+fn param_text(p: &ParamDecl) -> String {
+    let mut out = String::from("PARAM ");
+    out.push_str(p.kind.keyword());
+    if let ParamKind::Choice(options) = &p.kind {
+        out.push('(');
+        for (i, o) in options.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&quote(o));
+        }
+        out.push(')');
+    }
+    out.push(' ');
+    out.push_str(&p.name);
+    if let Some(default) = &p.default {
+        out.push_str(" = ");
+        out.push_str(&quote(default));
+    }
+    if let Some(label) = &p.label {
+        out.push_str(" LABEL ");
+        out.push_str(&quote(label));
+    }
+    out
+}
+
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

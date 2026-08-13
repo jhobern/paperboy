@@ -69,6 +69,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Reports can ask for a value before they run.** A `PARAM` statement declares
+  a variable whose value is offered to the user rather than baked into the
+  file, so a report that differs from run to run only by its environment, its
+  input folder or an API version no longer has to be edited or copied to be
+  re-run:
+
+  ```
+  PARAM ENV    TARGET  = "staging_au"            LABEL "Environment"
+  PARAM CHOICE("v4.2", "v4.3") VERSION = "v4.3"  LABEL "API version"
+  PARAM FOLDER IMAGES  = "./tickets"
+  ```
+
+  A parameter is an assignment the user has a say in — `{{TARGET}}` reads it
+  like any other variable — with a type (`TEXT`, `NUMBER`, `ENV`, `FOLDER`,
+  `FILE` or `CHOICE(…)`) so each front-end can put the right control behind it,
+  and an optional `LABEL` to prompt with. Omitting the default makes the
+  parameter required. Parameters live in the prelude, so the whole set can be
+  read off a report without running it; validation says so when one is written
+  too late or hidden in a loop, when two share a name, or when a default
+  disagrees with its own type. This release adds the language and its checks
+  (a report runs with the declared defaults); the run settings that offer the
+  values are next.
+
 - **The Postman importer remembers where your key lives.** A key read from
   1Password, SSM or the environment is kept as a *reference* — the address, not
   the credential — and offered back next time, the same way the git wizard
