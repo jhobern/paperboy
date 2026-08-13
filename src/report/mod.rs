@@ -27,6 +27,7 @@ pub mod jsondiff;
 pub mod labels;
 pub mod metrics;
 pub mod model;
+pub mod params;
 pub mod parser;
 pub mod pdf;
 pub mod producers;

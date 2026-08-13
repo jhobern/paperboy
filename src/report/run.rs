@@ -182,6 +182,17 @@ pub struct RunContext<'a> {
     pub root: Option<PathBuf>,
     /// How each request is actually sent.
     pub runner: &'a dyn EntryRunner,
+    /// The language run errors are phrased in. They are user-facing text shown
+    /// in the report's error panel, so the ones this module raises come from
+    /// the `i18n` table like any other string. Defaults to English via
+    /// [`Strings::english`] for callers that have no language of their own
+    /// (the tests, a dry run).
+    pub strings: &'a crate::i18n::Strings,
+    /// The values chosen for this run's `PARAM` declarations, keyed by the
+    /// parameter's raw name. A name that isn't supplied falls back to the
+    /// default written in the report; empty for a report with no parameters,
+    /// and for a run that simply accepts every default.
+    pub params: super::params::ParamValues,
     /// Optional per-row streaming hook (see [`RowSink`]). `None` for a plain,
     /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
     /// front-end wants each row as it completes to fill a live grid.
@@ -742,15 +753,26 @@ impl<'a> Exec<'a> {
                 FlowNode::ListDecl { name, producer } => {
                     self.lists.insert(name.clone(), producer.clone());
                 }
-                // A parameter binds exactly like an assignment of its default.
+                // A parameter binds exactly like an assignment of the value
+                // this run chose for it, falling back to the declared default.
                 // The value is already unquoted by the parser, so unlike an
                 // `Assign` (whose value is the raw rest of the line) it only
-                // needs interpolating. Offering the user a different value
-                // before the run is the run-settings layer's job.
+                // needs interpolating.
+                //
+                // A value that can't be used (a required parameter nobody
+                // supplied, a choice that isn't on the list) is recorded as a
+                // run error and the name is left unset rather than bound to an
+                // empty string: a report of plausible-looking rows built from
+                // a URL with a hole in it is worse than one that says why it
+                // couldn't run.
                 FlowNode::Param(p) => {
-                    let raw = p.default.clone().unwrap_or_default();
-                    let v = substitute(&raw, &self.vars_for());
-                    self.set_var(&p.name, v);
+                    match super::params::value_for(p, &self.ctx.params, self.ctx.strings) {
+                        Ok(raw) => {
+                            let v = substitute(&raw, &self.vars_for());
+                            self.set_var(&p.name, v);
+                        }
+                        Err(e) => self.errors.push(e),
+                    }
                 }
                 FlowNode::Request { name } => {
                     self.run_request(name);
@@ -1757,9 +1779,109 @@ mod tests {
                 .collect(),
             root: None,
             runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         run_flow(&flow, &ctx)
+    }
+
+    /// Run `src` with explicit parameter values, as a run settings form or a
+    /// `--param` flag would supply them.
+    fn run_with_params(
+        src: &str,
+        entries: &[HurlEntry],
+        params: &[(&str, &str)],
+        fake: &Fake,
+    ) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    fn param_entries() -> Vec<HurlEntry> {
+        vec![HurlEntry {
+            title: "get".into(),
+            method: "GET".into(),
+            url: "http://x/{{TARGET}}".into(),
+            reports: vec![("Url".into(), "url".into())],
+            ..Default::default()
+        }]
+    }
+
+    /// The whole point of a parameter: the same file runs against a different
+    /// value without being edited.
+    #[test]
+    fn a_chosen_parameter_value_reaches_the_request() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM ENV TARGET = \"staging\"\nREPORT TARGET AS Target\nREPORT REQUEST get\n";
+
+        let on_defaults = run_with_params(src, &entries, &[], &fake);
+        assert!(on_defaults.errors.is_empty(), "{:?}", on_defaults.errors);
+        assert_eq!(on_defaults.rows[0].cells.get("Target").unwrap(), "staging");
+
+        let overridden = run_with_params(src, &entries, &[("TARGET", "prod")], &fake);
+        assert_eq!(overridden.rows[0].cells.get("Target").unwrap(), "prod");
+    }
+
+    /// A required parameter nobody supplied must stop with a reason, not run
+    /// with a hole in every URL. The name is left unset so the requests that
+    /// depend on it are visibly wrong rather than plausibly wrong.
+    #[test]
+    fn a_missing_required_parameter_is_a_run_error() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM TEXT TARGET\nREPORT REQUEST get\n";
+        let result = run_with_params(src, &entries, &[], &fake);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(result.errors[0].contains("TARGET"), "{:?}", result.errors);
+
+        let supplied = run_with_params(src, &entries, &[("TARGET", "au")], &fake);
+        assert!(supplied.errors.is_empty(), "{:?}", supplied.errors);
+    }
+
+    /// A value from outside the file is held to the declaration's own rules —
+    /// otherwise the type is only advice to the form that collected it.
+    #[test]
+    fn a_supplied_value_that_breaks_its_own_rules_stops_the_run() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM CHOICE(\"au\", \"eu\") TARGET = \"au\"\nREPORT REQUEST get\n";
+        let bad = run_with_params(src, &entries, &[("TARGET", "us")], &fake);
+        assert_eq!(bad.errors.len(), 1, "{:?}", bad.errors);
+        assert!(bad.errors[0].contains("us"), "{:?}", bad.errors);
     }
 
     #[test]
@@ -2136,6 +2258,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -2209,6 +2333,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -2282,6 +2408,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -2403,6 +2531,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2493,6 +2623,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(d.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2538,6 +2670,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(d.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2581,6 +2715,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(d.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2715,6 +2851,8 @@ mod tests {
             .collect(),
             root: None,
             runner: &EchoEnv,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2794,6 +2932,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&flow, &ctx);
@@ -2812,6 +2952,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let second = run_flow(&flow2, &ctx2);
@@ -2894,6 +3036,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
@@ -2920,6 +3064,8 @@ mod tests {
             .collect(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
@@ -3001,6 +3147,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&flow, &ctx);
@@ -3036,6 +3184,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(std::env::temp_dir()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -3761,6 +3911,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -3828,6 +3980,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -3929,6 +4083,8 @@ mod tests {
             .collect(),
             root: Some(dir.clone()),
             runner: &EchoEnv,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -3991,6 +4147,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
@@ -4028,6 +4186,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4055,6 +4215,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4088,6 +4250,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4121,6 +4285,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4147,6 +4313,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4169,6 +4337,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4193,6 +4363,8 @@ mod tests {
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -4435,6 +4607,8 @@ mod helper_collection_tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let result = run_flow(&flow, &ctx);
@@ -4515,6 +4689,8 @@ mod timing_column_tests {
             named_envs: HashMap::new(),
             root: None,
             runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         run_flow(&flow, &ctx)

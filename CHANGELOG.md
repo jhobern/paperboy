@@ -91,9 +91,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   disagrees with its own type. Where no `LABEL` is written one is derived from
   the name rather than shouting the identifier at whoever is running the
   report — `TICKET_REF` asks for "Ticket ref" — and two parameters that end up
-  asking the same question are flagged. This release adds the language and its
-  checks (a report runs with the declared defaults); the run settings that
-  offer the values are next.
+  asking the same question are flagged. A run binds whichever values it was
+  given, falling back to the declared defaults, and holds them to the same
+  rules as the defaults — a choice off the list, a number that isn't one, or a
+  required parameter nobody supplied stops the run with a reason instead of
+  producing plausible-looking rows built from a URL with a hole in it. The run
+  settings that offer the values, and the `--param` flag that supplies them
+  headlessly, are next.
 
 - **The Postman importer remembers where your key lives.** A key read from
   1Password, SSM or the environment is kept as a *reference* — the address, not

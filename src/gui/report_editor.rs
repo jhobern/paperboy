@@ -10,7 +10,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::i18n::Status;
+use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
@@ -410,7 +410,10 @@ impl ReportEditor {
             &flow,
             self.report.path.as_deref(),
         ) {
-            Ok(inputs) => {
+            Ok(mut inputs) => {
+                // Only the app knows the chosen language; the run's own errors
+                // are user-facing text like any other.
+                inputs.language = app.session.language.clone();
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
@@ -466,6 +469,7 @@ impl ReportEditor {
             self.report.path.as_deref(),
         ) {
             Ok(inputs) => {
+                let strings = Strings::for_language(&app.session.language);
                 let ctx = RunContext {
                     entries: &inputs.entries,
                     helpers: &inputs.helpers,
@@ -473,6 +477,8 @@ impl ReportEditor {
                     named_envs: inputs.named_envs.clone(),
                     root: inputs.root.clone(),
                     runner: &DryRunner,
+                    strings: &strings,
+                    params: inputs.params.clone(),
                     sink: None,
                 };
                 let result = run_flow_raw(&inputs.flow, &ctx);

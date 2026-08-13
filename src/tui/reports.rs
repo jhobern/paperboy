@@ -1031,6 +1031,7 @@ impl TuiApp {
     /// see them for the differing pre-run checks.
     fn flow_result(&self, idx: usize, runner: &dyn EntryRunner) -> Result<ReportResult, String> {
         let inputs = self.build_report_run_inputs(idx)?;
+        let strings = Strings::for_language(&self.language);
         let ctx = RunContext {
             entries: &inputs.entries,
             helpers: &inputs.helpers,
@@ -1038,6 +1039,8 @@ impl TuiApp {
             named_envs: inputs.named_envs,
             root: inputs.root,
             runner,
+            strings: &strings,
+            params: inputs.params,
             sink: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
@@ -1063,6 +1066,12 @@ impl TuiApp {
             &flow,
             rt.report.path.as_deref(),
         )
+        .map(|mut inputs| {
+            // The core has no language of its own; only the app knows which one
+            // the user picked, so the run's own errors are set to it here.
+            inputs.language = self.language.clone();
+            inputs
+        })
         .map_err(|e| match e {
             crate::report::context::RunInputError::Unbound => s.report_run_unbound.to_string(),
         })
@@ -1194,7 +1203,10 @@ impl TuiApp {
                 named_envs,
                 root,
                 file_root,
+                language,
+                params,
             } = inputs;
+            let strings = crate::i18n::Strings::for_language(&language);
 
             // 1. Skeleton: expand the flow with no HTTP (a `DryRunner`) to get
             //    the full, canonical row set up front. The base layers are
@@ -1210,6 +1222,8 @@ impl TuiApp {
                     named_envs: named_envs.clone(),
                     root: root.clone(),
                     runner: &DryRunner,
+                    strings: &strings,
+                    params: params.clone(),
                     sink: None,
                 };
                 run_flow_raw(&flow, &dry_ctx)
@@ -1258,6 +1272,8 @@ impl TuiApp {
                 named_envs,
                 root,
                 runner: &runner,
+                strings: &strings,
+                params: params.clone(),
                 sink: Some(&sink),
             };
             let mut result = run_flow_raw(&flow, &ctx);

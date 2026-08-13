@@ -281,6 +281,8 @@ pub fn run(
             named_envs,
             root,
             runner: &dry,
+            strings: &cli_strings,
+            params: Default::default(),
             sink: None,
         };
         let mut r = run_flow_raw(&flow, &ctx);
@@ -299,6 +301,8 @@ pub fn run(
                 named_envs: named_envs.clone(),
                 root: root.clone(),
                 runner: &dry,
+                strings: &cli_strings,
+                params: Default::default(),
                 sink: None,
             };
             run_flow_raw(&flow, &ctx).rows.len()
@@ -324,6 +328,8 @@ pub fn run(
             named_envs,
             root,
             runner: &live,
+            strings: &cli_strings,
+            params: Default::default(),
             sink: Some(&sink),
         };
         let mut r = run_flow_raw(&flow, &ctx);

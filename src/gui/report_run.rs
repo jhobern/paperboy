@@ -227,7 +227,10 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             named_envs,
             root,
             file_root,
+            language,
+            params,
         } = inputs;
+        let strings = crate::i18n::Strings::for_language(&language);
 
         // 1. Skeleton: expand with no HTTP to get the full canonical row set up
         //    front. Its rows map 1:1 (by `path`) to the live rows the sink will
@@ -240,6 +243,8 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
                 named_envs: named_envs.clone(),
                 root: root.clone(),
                 runner: &DryRunner,
+                strings: &strings,
+                params: params.clone(),
                 sink: None,
             };
             run_flow_raw(&flow, &dry_ctx)
@@ -272,6 +277,8 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             named_envs,
             root,
             runner: &runner,
+            strings: &strings,
+            params: params.clone(),
             sink: Some(&sink),
         };
         let mut result = run_flow_raw(&flow, &ctx);

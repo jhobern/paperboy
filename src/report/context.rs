@@ -34,6 +34,16 @@ pub struct ReportRunInputs {
     pub named_envs: HashMap<String, HashMap<String, String>>,
     pub root: Option<PathBuf>,
     pub file_root: Option<PathBuf>,
+    /// The language the run's own errors are phrased in. Built English and
+    /// overwritten by the front-end, which is the only layer that knows what
+    /// the user picked; `Language` rather than `Strings` because the inputs
+    /// cross a thread boundary and a language is what the far side needs to
+    /// build its own set from.
+    pub language: crate::i18n::Language,
+    /// The values chosen for the report's `PARAM` declarations. Empty here —
+    /// filled in by the run settings before the run is spawned — so a report
+    /// with no parameters, and one run entirely on its defaults, look the same.
+    pub params: super::params::ParamValues,
 }
 
 /// Flatten an [`Environment`] into a plain `KEY → value` map for the
@@ -466,6 +476,8 @@ pub fn report_run_inputs(
         named_envs,
         root,
         file_root,
+        language: crate::i18n::Language::default(),
+        params: Default::default(),
     })
 }
 
