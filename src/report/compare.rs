@@ -94,11 +94,21 @@ pub struct Roles {
 /// `ENVS` role clause with a baseline (a plain `ENVS` list, or no `ENVS` loop at
 /// all, produces per-env rows with no diff — unchanged behaviour).
 pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
+    comparison_roles_with(flow, &HashMap::new())
+}
+
+/// As [`comparison_roles`], with the run's parameter values in hand so a role
+/// written as `BASELINE("{{TARGET}}")` names the same environment the run
+/// actually visited. Without this the collapse would look for a row whose
+/// target is the literal `{{TARGET}}` and find nothing — every comparison
+/// would come back unmatched.
+pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
     let mut baseline_show = Vec::new();
     collect_roles(
         &flow.nodes,
+        params,
         &mut baseline,
         &mut comparisons,
         &mut baseline_show,
@@ -116,6 +126,7 @@ pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
 /// Walk the flow tree, unioning every `ENVS BASELINE/COMPARISON` clause's names.
 fn collect_roles(
     nodes: &[FlowNode],
+    params: &HashMap<String, String>,
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
     baseline_show: &mut Vec<String>,
@@ -133,10 +144,10 @@ fn collect_roles(
                     // its snapshot path (a `FILE(…)`); either way the produced /
                     // injected rows carry that string as their target.
                     for r in b {
-                        baseline.insert(r.target().to_string());
+                        baseline.insert(crate::environment::substitute(r.target(), params));
                     }
                     for r in c {
-                        let name = r.target().to_string();
+                        let name = crate::environment::substitute(r.target(), params);
                         if !comparisons.contains(&name) {
                             comparisons.push(name);
                         }
@@ -150,10 +161,10 @@ fn collect_roles(
                         }
                     }
                 }
-                collect_roles(body, baseline, comparisons, baseline_show);
+                collect_roles(body, params, baseline, comparisons, baseline_show);
             }
             FlowNode::ForEach { body, .. } => {
-                collect_roles(body, baseline, comparisons, baseline_show)
+                collect_roles(body, params, baseline, comparisons, baseline_show)
             }
             _ => {}
         }

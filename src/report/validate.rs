@@ -258,6 +258,12 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     // with their own declared type.
     check_params(flow, ctx, &mut diags);
 
+    // An `ENVS` clause may name its environments through parameters, which is
+    // how one report compares two stacks this week and two others the next.
+    // Those names are judged here rather than in `check_env_clause`, which sees
+    // one clause at a time and not the declarations they refer to.
+    check_env_refs(flow, ctx, &mut diags);
+
     // Walk the tree with a scope stack of declared LIST producers.
     let mut scopes: Vec<HashMap<String, Producer>> = vec![HashMap::new()];
     walk(&flow.nodes, ctx, &mut scopes, &mut diags);
@@ -338,6 +344,78 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 out.extend(nested_params(body));
             }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Judge the `ENVS` names that are written as `{{PARAM}}` rather than spelled
+/// out. Two things can be said about them without running anything: whether
+/// they name a parameter at all (nothing else is resolvable this early — an
+/// `ENVS` clause is read before the first request has run, so a capture or an
+/// assignment would be a name whose meaning depends on where the run had got
+/// to), and, once the parameters' defaults are filled in, whether what they
+/// currently mean is loaded. The second is only a warning: changing it per run
+/// is the entire point.
+fn check_env_refs(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+    let declared = flow.params();
+    let defaults = super::params::effective(&declared, &Default::default());
+    for name in env_ref_names(&flow.nodes) {
+        for key in crate::environment::referenced_keys(name) {
+            if !declared.iter().any(|p| p.name == key) {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_env_ref_not_a_param,
+                    &[&key, name],
+                )));
+            }
+        }
+        let resolved = crate::environment::substitute(name, &defaults);
+        if resolved.contains("{{") {
+            // Still unresolved: a required parameter with no default. What it
+            // will be is decided in the run settings, so there is nothing to
+            // check here.
+            continue;
+        }
+        if let Some(loaded) = ctx.env_names
+            && !loaded.iter().any(|e| *e == resolved)
+        {
+            diags.push(Diagnostic::warning(fill(
+                s.diag_env_ref_default_not_loaded,
+                &[name, &resolved],
+            )));
+        }
+    }
+}
+
+/// Every live environment name in every `ENVS` clause in the tree that is
+/// written through a `{{…}}` reference (a `FILE(…)` role is a path, not an
+/// environment, and is left to the snapshot checks).
+fn env_ref_names<'a>(nodes: &'a [FlowNode]) -> Vec<&'a String> {
+    let mut out = Vec::new();
+    for node in nodes {
+        match node {
+            FlowNode::ForEnvs { clause, body, .. } => {
+                let names: Vec<&String> = match clause {
+                    EnvClause::Plain(names) => names.iter().collect(),
+                    EnvClause::Roles {
+                        baseline,
+                        comparisons,
+                        ..
+                    } => baseline
+                        .iter()
+                        .chain(comparisons.iter())
+                        .filter_map(|r| match r {
+                            RoleRef::Env(n) => Some(n),
+                            RoleRef::File(_) => None,
+                        })
+                        .collect(),
+                };
+                out.extend(names.into_iter().filter(|n| n.contains("{{")));
+                out.extend(env_ref_names(body));
+            }
+            FlowNode::ForEach { body, .. } => out.extend(env_ref_names(body)),
             _ => {}
         }
     }
@@ -749,6 +827,12 @@ fn check_env_clause(clause: &EnvClause, ctx: &Context, diags: &mut Vec<Diagnosti
     };
     if let Some(loaded) = ctx.env_names {
         for n in names {
+            // A name written through a parameter isn't an environment name yet
+            // — `check_env_refs` judges those against what the parameter can
+            // actually become.
+            if n.contains("{{") {
+                continue;
+            }
             if !loaded.iter().any(|e| e == n) {
                 diags.push(Diagnostic::error(fill(
                     ctx.strings.diag_environment_not_loaded,
@@ -1135,6 +1219,78 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    /// The clause that motivated parameters in the first place: which two
+    /// stacks to compare, chosen per run. The names are references, so the
+    /// "not loaded" check has to look at what they mean rather than at what
+    /// they say.
+    #[test]
+    fn an_environment_named_by_a_parameter_is_not_an_unloaded_environment() {
+        let src = "# collection: c\nPARAM COMPARE_ENV = \"eapi_dev\"\nPARAM BASELINE_ENV = \"eapi_staging\"\n\
+                   PARALLEL(2) FOR TARGET IN ENVS BASELINE(\"{{BASELINE_ENV}}\") SHOW(TimeWait), COMPARISON(\"{{COMPARE_ENV}}\")\n\
+                       REPORT REQUEST r\nEND\n";
+        let envs = ["eapi_dev".to_string(), "eapi_staging".to_string()];
+        let msgs: Vec<String> = diags_for(src, None, Some(&envs))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("is not loaded")),
+            "the parameters resolve to loaded environments: {msgs:?}"
+        );
+    }
+
+    /// What the defaults currently mean is still checked — but only as a
+    /// warning, because being changed per run is the entire point.
+    #[test]
+    fn a_parameter_pointing_at_an_unloaded_environment_is_only_a_warning() {
+        let src = "# collection: c\nPARAM TARGET_ENV = \"gone\"\n\
+                   FOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n";
+        let envs = ["here".to_string()];
+        let diags = diags_for(src, None, Some(&envs));
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("gone")),
+            "not an error: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("gone")),
+            "but it does say so: {diags:?}"
+        );
+    }
+
+    /// An `ENVS` clause is read before anything has run, so a name it reaches
+    /// for has to be a parameter — a capture or an assignment would mean
+    /// something different depending on where the run had got to.
+    #[test]
+    fn an_environment_reference_that_isnt_a_parameter_is_refused() {
+        let errs = errors_for(
+            "# collection: c\nTARGET_ENV = \"staging\"\n\
+             FOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("TARGET_ENV")),
+            "says which name and that it needs declaring: {errs:?}"
+        );
+    }
+
+    /// A required parameter has nothing to check against yet: what it will name
+    /// is decided in the run settings, so validation stays quiet rather than
+    /// guessing.
+    #[test]
+    fn an_environment_named_by_an_unanswered_parameter_is_left_alone() {
+        let src = "# collection: c\nPARAM ENV TARGET_ENV\n\
+                   FOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n";
+        let envs = ["here".to_string()];
+        let diags = diags_for(src, None, Some(&envs));
+        assert!(
+            !diags.iter().any(|d| d.message.contains("TARGET_ENV")),
+            "nothing to say yet: {diags:?}"
+        );
     }
 
     fn errors_for(src: &str) -> Vec<String> {

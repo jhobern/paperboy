@@ -42,6 +42,24 @@ pub fn value_for(decl: &ParamDecl, chosen: &ParamValues, s: &Strings) -> Result<
     Ok(value)
 }
 
+/// The value every declared parameter takes for this run — what was chosen, or
+/// the declaration's own default — as a substitution map.
+///
+/// Used wherever a *name in the script* may be written as `{{PARAM}}` rather
+/// than spelled out (an `ENVS` clause's environments, for one). Only parameters
+/// are in it: an `ENVS` clause is read before anything has run, so resolving it
+/// against captures or assignments would mean a name whose meaning depends on
+/// where the run had got to.
+pub fn effective(decls: &[&ParamDecl], chosen: &ParamValues) -> ParamValues {
+    decls
+        .iter()
+        .filter_map(|d| {
+            let v = chosen.get(&d.name).or(d.default.as_ref())?;
+            Some((d.name.clone(), v.clone()))
+        })
+        .collect()
+}
+
 /// Whether `value` is acceptable for `decl`.
 ///
 /// Shared with the front-ends so a run settings form can say "not a number"

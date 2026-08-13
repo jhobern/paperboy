@@ -69,6 +69,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
+  clause may name an environment (or a `FILE(…)` snapshot) through a parameter
+  — `BASELINE("{{BASELINE_ENV}}"), COMPARISON("{{COMPARE_ENV}}")` — so the
+  report that compares staging against dev this week compares another pair next
+  week without being edited or copied. Both halves of a comparison resolve the
+  same way, so the collapse still finds the rows the loop produced. Validation
+  judges such a name by what it means rather than by what it says: it must name
+  a declared `PARAM` (an `ENVS` clause is read before anything has run, so a
+  capture or an assignment would mean something different depending on where
+  the run had got to), and a default that currently names an unloaded
+  environment is a warning rather than the error a literal name gets.
+
 - **The terminal UI asks for the values a report declares.** A report with
   `PARAM`s opens on a *Run settings* view (`p` from the source, Esc back)
   listing one row per parameter: what it asks for in words, the value this run

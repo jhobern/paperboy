@@ -252,6 +252,14 @@ pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a Hur
     }
 }
 
+/// The value each declared parameter has for this run — what the run was given,
+/// or the declaration's own default. The map an `ENVS` clause's names are
+/// resolved through outside the run itself (see
+/// [`compare::comparison_roles_with`](super::compare::comparison_roles_with)).
+fn effective_params(flow: &ReportFlow, ctx: &RunContext) -> super::params::ParamValues {
+    super::params::effective(&flow.params(), &ctx.params)
+}
+
 /// Run a whole flow and collect its rows, applying the final comparison/baseline
 /// collapse. This is the batch entry point (CSV export, dry run, tests); for a
 /// live streaming run a front-end sets [`RunContext::sink`] and calls
@@ -271,7 +279,7 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
-    ex.baseline_show = super::compare::comparison_roles(flow)
+    ex.baseline_show = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx))
         .map(|r| r.baseline_show)
         .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
@@ -318,7 +326,7 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
         .resolved_columns(&flow.header)
         .iter()
         .any(|c| c.truth.is_some());
-    if let Some(roles) = super::compare::comparison_roles(flow) {
+    if let Some(roles) = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx)) {
         super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
         .header
@@ -1187,8 +1195,19 @@ impl<'a> Exec<'a> {
         // all-live.
         let mut live: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
+        // An environment (or a snapshot path) may be named through a parameter
+        // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
+        // another pair of stacks without being edited. Resolved against the
+        // run's parameters only, and identically in `finalize`, so the rows
+        // this loop produces carry the targets the collapse then looks for.
+        // The parameters are bound in the prelude — validation refuses a
+        // `PARAM` written any later — so by the time a loop is reached they are
+        // ordinary variables, and `finalize` reaches the same names from the
+        // declarations themselves.
+        let vars = self.vars_for();
+        let resolve = |s: &String| crate::environment::substitute(s, &vars);
         match clause {
-            EnvClause::Plain(names) => live = names.clone(),
+            EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
             EnvClause::Roles {
                 baseline,
                 comparisons,
@@ -1196,8 +1215,8 @@ impl<'a> Exec<'a> {
             } => {
                 for r in baseline.iter().chain(comparisons) {
                     match r {
-                        RoleRef::Env(n) => live.push(n.clone()),
-                        RoleRef::File(p) => files.push(p.clone()),
+                        RoleRef::Env(n) => live.push(resolve(n)),
+                        RoleRef::File(p) => files.push(resolve(p)),
                     }
                 }
             }
@@ -1784,6 +1803,93 @@ mod tests {
             sink: None,
         };
         run_flow(&flow, &ctx)
+    }
+
+    /// Run `src` with both named environments and explicit parameter values —
+    /// what a comparison whose stacks are chosen at run time needs.
+    fn run_envs_with_params(
+        src: &str,
+        entries: &[HurlEntry],
+        named_envs: &[(&str, &[(&str, &str)])],
+        params: &[(&str, &str)],
+        fake: &Fake,
+    ) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: named_envs
+                .iter()
+                .map(|(name, kvs)| {
+                    (
+                        name.to_string(),
+                        kvs.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    /// Which two stacks a comparison runs against is the thing most worth
+    /// parameterising, so an `ENVS` clause may name them through parameters.
+    /// Both halves have to agree: the loop visits the resolved environments and
+    /// the finalize-phase collapse looks for those same targets — resolve one
+    /// and not the other and every comparison comes back unmatched.
+    #[test]
+    fn a_comparison_can_be_pointed_at_its_stacks_by_parameter() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let src = "PARAM BASELINE_ENV = \"prod\"\nPARAM COMPARE_ENV = \"staging\"\n\
+                   FOR T IN ENVS BASELINE(\"{{BASELINE_ENV}}\"), COMPARISON(\"{{COMPARE_ENV}}\")\n\
+                       REPORT REQUEST r AS proc\nEND\n";
+        let envs = [
+            ("prod", &[][..]),
+            ("staging", &[][..]),
+            ("prod-eu", &[][..]),
+            ("staging-eu", &[][..]),
+        ];
+
+        // On its declared defaults: one collapsed row, no run errors.
+        let res = run_envs_with_params(src, &entries, &envs, &[], &fake);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].target.as_deref(), Some("staging"));
+
+        // Pointed at another pair without the file being edited.
+        let res = run_envs_with_params(
+            src,
+            &entries,
+            &envs,
+            &[("BASELINE_ENV", "prod-eu"), ("COMPARE_ENV", "staging-eu")],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(
+            res.rows[0].target.as_deref(),
+            Some("staging-eu"),
+            "the collapse kept the candidate row for the chosen comparison env"
+        );
     }
 
     /// Run `src` with explicit parameter values, as a run settings form or a
