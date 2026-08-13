@@ -307,9 +307,22 @@ fn check_params(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     }
 
     let mut seen: HashSet<&str> = HashSet::new();
+    // Two parameters that prompt with the same words make a form nobody can
+    // fill in correctly, whether the clash is between two `LABEL`s or between
+    // two names that read the same once made readable (`TICKET_REF` and
+    // `ticket_ref`). It isn't an error — the report still runs, and the names
+    // are distinct — but it is always a mistake worth saying out loud.
+    let mut prompts: HashSet<String> = HashSet::new();
     for p in flow.params() {
         if !seen.insert(&p.name) {
             diags.push(Diagnostic::error(fill(s.diag_param_duplicate, &[&p.name])));
+        }
+        let prompt = p.prompt();
+        if !prompts.insert(prompt.to_lowercase()) {
+            diags.push(Diagnostic::warning(fill(
+                s.diag_param_prompt_clash,
+                &[&prompt],
+            )));
         }
         check_param_default(p, ctx, diags);
     }
@@ -1184,6 +1197,27 @@ mod tests {
         );
         assert_eq!(dupes.len(), 1, "{dupes:?}");
         assert!(dupes[0].contains('A'), "{dupes:?}");
+    }
+
+    /// Distinct names can still land on the same prompt once they are made
+    /// readable, which produces a form with two identical fields.
+    #[test]
+    fn two_parameters_asking_the_same_question_are_flagged() {
+        let diags = diags_for(
+            "# collection: c\nPARAM TEXT TICKET_REF\nPARAM TEXT ticket_ref LABEL \"Ticket ref\"\nREPORT REQUEST r\n",
+            None,
+            None,
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "distinct names, so the report still runs: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("Ticket ref")),
+            "{diags:?}"
+        );
     }
 
     /// An environment parameter exists precisely so the environment can be

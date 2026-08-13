@@ -265,8 +265,67 @@ pub struct ParamDecl {
     /// The value used when nothing is supplied. `None` = the parameter is
     /// required and the run settings open with it empty and flagged.
     pub default: Option<String>,
-    /// A human-friendly prompt for the run settings. `None` → show the name.
+    /// A human-friendly prompt for the run settings. `None` → one is derived
+    /// from the name (see [`ParamDecl::prompt`]).
     pub label: Option<String>,
+}
+
+impl ParamDecl {
+    /// What to put beside the field in the run settings.
+    ///
+    /// The `LABEL` when one was written, and otherwise a readable rendering of
+    /// the identifier itself. Deriving one matters more than it sounds: most
+    /// parameters will never carry a label, and a form shouting `TICKET_REF`
+    /// at someone who only ever runs the report — never edits it — is the
+    /// difference between a tool and a script someone else wrote. `LABEL` is
+    /// then an override for the cases the derivation can't get right
+    /// (acronyms, wording), not a chore on every declaration.
+    ///
+    /// The raw name stays the identity everywhere it matters — `{{NAME}}`, the
+    /// CLI's `--param`, the remembered values — so renaming a label never
+    /// loses anything.
+    pub fn prompt(&self) -> String {
+        match &self.label {
+            Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+            _ => derive_prompt(&self.name),
+        }
+    }
+}
+
+/// Turn an identifier into something readable: `TICKET_REF` → "Ticket ref",
+/// `api_version` → "Api version", `imageWidth` → "imageWidth".
+///
+/// Underscores become spaces, and a word that is all one case is
+/// sentence-cased. Anything already mixed-case is left exactly as written —
+/// it was deliberate, and second-guessing `iOSBuild` produces worse names than
+/// leaving it alone.
+fn derive_prompt(name: &str) -> String {
+    let words: Vec<String> = name
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mixed = w.chars().any(|c| c.is_ascii_uppercase())
+                && w.chars().any(|c| c.is_ascii_lowercase());
+            if mixed {
+                w.to_string()
+            } else {
+                w.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let mut out = words.join(" ");
+    // Only the first letter is raised: "Ticket ref", not "Ticket Ref". Title
+    // Case reads like a heading; these are field labels in a form.
+    if let Some(first) = out.chars().next()
+        && first.is_ascii_lowercase()
+        && !out
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.chars().any(|c| c.is_ascii_uppercase()))
+    {
+        out.replace_range(0..first.len_utf8(), &first.to_ascii_uppercase().to_string());
+    }
+    out
 }
 
 /// The type of a `PARAM` — what the run settings offer and what validation

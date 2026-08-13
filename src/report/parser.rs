@@ -1328,6 +1328,27 @@ mod tests {
         }
     }
 
+    /// Most parameters will never carry a `LABEL`, and the people who only run
+    /// reports shouldn't be shouted at in identifiers.
+    #[test]
+    fn a_parameter_without_a_label_still_has_a_readable_prompt() {
+        let cases = [
+            ("PARAM TICKET_REF", "Ticket ref"),
+            ("PARAM TEXT api_version", "Api version"),
+            ("PARAM FOLDER IMAGES", "Images"),
+            // Already mixed-case: deliberate, so left exactly as written.
+            ("PARAM TEXT imageWidth", "imageWidth"),
+            ("PARAM TEXT iOS_build", "iOS build"),
+        ];
+        for (src, want) in cases {
+            let flow = parse_flow(&format!("{src}\n")).unwrap();
+            assert_eq!(flow.params()[0].prompt(), want, "for {src}");
+        }
+        // A written LABEL always wins.
+        let flow = parse_flow("PARAM TICKET_REF LABEL \"Ticket\"\n").unwrap();
+        assert_eq!(flow.params()[0].prompt(), "Ticket");
+    }
+
     #[test]
     fn the_declared_parameters_are_readable_without_running_anything() {
         let flow = parse_flow(

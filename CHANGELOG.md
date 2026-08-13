@@ -88,9 +88,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   parameter required. Parameters live in the prelude, so the whole set can be
   read off a report without running it; validation says so when one is written
   too late or hidden in a loop, when two share a name, or when a default
-  disagrees with its own type. This release adds the language and its checks
-  (a report runs with the declared defaults); the run settings that offer the
-  values are next.
+  disagrees with its own type. Where no `LABEL` is written one is derived from
+  the name rather than shouting the identifier at whoever is running the
+  report — `TICKET_REF` asks for "Ticket ref" — and two parameters that end up
+  asking the same question are flagged. This release adds the language and its
+  checks (a report runs with the declared defaults); the run settings that
+  offer the values are next.
 
 - **The Postman importer remembers where your key lives.** A key read from
   1Password, SSM or the environment is kept as a *reference* — the address, not
