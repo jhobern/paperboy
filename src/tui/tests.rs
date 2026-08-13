@@ -9740,52 +9740,7 @@ fn save_prompt_renders_the_dimmed_extension_ghost() {
 }
 
 #[test]
-fn save_confirm_popup_substitutes_the_new_and_modified_counts() {
-    use crate::i18n::{Language, Strings};
-    use ratatui::{Terminal, backend::TestBackend};
-    let th = super::theme::theme(&Language::English);
-    let s = Strings::for_language(&Language::English);
-
-    // 3 user-added requests and 1 hand-added env var (TOKEN is not counted).
-    let mut app = app_with_resolved_secret("s3cr3t");
-    app.add_env_var(0, "TEAM".into(), "crabs".into());
-    for i in 0..3 {
-        let mut e = HurlEntry::from_fields(&format!("r{i}"), "GET", "http://h/x", vec![], "");
-        e.user_added = true;
-        app.collections[0].entries.push(e);
-    }
-    app.overlay = Some(Overlay::Confirm {
-        action: ConfirmAction::Save(FileAction::SaveCollection),
-        sel: 1,
-    });
-
-    let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
-        .unwrap();
-    let out = buffer_text(term.backend().buffer());
-
-    assert!(
-        !out.contains("{r}") && !out.contains("{e}"),
-        "placeholders are substituted:\n{out}"
-    );
-    assert!(out.contains('3'), "the request count is shown:\n{out}");
-    // The collection warning is scoped to requests only (not environment).
-    assert!(
-        out.contains("request"),
-        "the request count is labelled:\n{out}"
-    );
-    assert!(
-        !out.contains("environment"),
-        "the collection warning omits the environment:\n{out}"
-    );
-    assert!(
-        out.contains("Proceed?"),
-        "the confirmation asks to proceed:\n{out}"
-    );
-}
-
-#[test]
-fn save_collection_to_original_confirms_then_saves() {
+fn save_collection_to_original_writes_back_without_asking() {
     let dir = temp_dir("saveorig");
     let path = dir.join("api.hurl");
     std::fs::write(&path, "# seed\nGET http://h/x\nHTTP 200\n").unwrap();
@@ -9808,20 +9763,8 @@ fn save_collection_to_original_confirms_then_saves() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(
-            app.overlay,
-            Some(Overlay::Confirm {
-                action: ConfirmAction::Save(FileAction::SaveCollection),
-                ..
-            })
-        ),
-        "a changed collection confirms before overwriting the original",
-    );
-
-    press(&mut app, KeyCode::Char('y')); // confirm -> saves to the original path
-    assert!(
         app.overlay.is_none(),
-        "saving to the original does not prompt for a name"
+        "saving to the original neither confirms nor prompts for a name",
     );
     assert!(
         !app.collections[1].entries[0].user_added,
@@ -20922,8 +20865,11 @@ fn report_save_writes_back_and_clears_dirty() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// "Save" on a report with unsaved edits writes them straight back: overwriting
+/// the file the edits came from is what the user asked for, so there is nothing
+/// to confirm.
 #[test]
-fn report_save_on_a_dirty_report_confirms_overwrite() {
+fn report_save_on_a_dirty_report_writes_back_without_asking() {
     let dir = p8_temp_dir("saveconfirm");
     let path = dir.join("smoke.trail");
     std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
@@ -20935,15 +20881,16 @@ fn report_save_on_a_dirty_report_confirms_overwrite() {
         .report
         .set_text("# collection: api.hurl\nREQUEST Changed\n");
 
-    // A dirty report asks before overwriting the original file.
     app.begin_save(FileAction::SaveReport);
-    assert!(matches!(
-        app.overlay,
-        Some(Overlay::Confirm {
-            action: ConfirmAction::Save(FileAction::SaveReport),
-            ..
-        })
-    ));
+    assert!(app.overlay.is_none(), "no confirmation stands in the way");
+    assert!(
+        !app.reports[idx].report.dirty,
+        "and it was actually written"
+    );
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("Changed"),
+        "with the edits in it"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

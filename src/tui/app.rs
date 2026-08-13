@@ -691,9 +691,6 @@ pub(crate) enum Overlay {
 pub(crate) enum ConfirmAction {
     Exit,
     Clear,
-    /// Save a collection / environment to its ORIGINAL file (clears the "new"
-    /// and "modified" markers). Only raised when there are unsaved changes.
-    Save(FileAction),
     /// "Save As" to a path that already exists — confirm the overwrite. The
     /// target path is held in [`TuiApp::pending_save_path`].
     Overwrite(FileAction),

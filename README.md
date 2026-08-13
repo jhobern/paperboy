@@ -345,14 +345,11 @@ picked still highlighted.
 
 Notes on saving:
 
-- **Save** (Collection / Environment) writes back to the file the tab
-  was originally loaded from. If there are no new or modified entries, saving
-  is a no-op and no confirmation is shown (there's nothing to warn about).
-  If there *are* unsaved changes, you'll get a confirmation naming how many
-  new/modified requests (for a collection) or variables (for an environment)
-  will be written — the two counts are tracked and reported independently, so
-  saving a collection only ever mentions collection changes, and saving an
-  environment only ever mentions environment changes.
+- **Save** (Collection / Environment / Report) writes back to the file the tab
+  was originally loaded from, straight away and without a confirmation:
+  overwriting that file with your changes is exactly what Save means. Something
+  that has never been saved has no file to write back to, so Save becomes
+  Save As.
 - **Save As…** always prompts for a filename. If the chosen path already
   exists you'll be asked to confirm the overwrite (Yes/No) before anything is
   written.

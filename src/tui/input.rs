@@ -3490,12 +3490,6 @@ impl TuiApp {
                 self.clear_all();
                 self.status = Some(Status::Cleared);
             }
-            // Confirmed a change-overwrite of the ORIGINAL file: write there.
-            ConfirmAction::Save(save) => {
-                if let Some(path) = self.original_save_path(save) {
-                    self.do_file_action(save, &path);
-                }
-            }
             // Confirmed a "Save As" over an existing file.
             ConfirmAction::Overwrite(save) => {
                 if let Some(path) = self.pending_save_path.take() {
@@ -3591,8 +3585,13 @@ impl TuiApp {
     }
 
     /// "Save Collection" / "Save Environment": write to the original file when
-    /// one exists (silently if unchanged, else after a change confirmation);
-    /// otherwise fall back to "Save As".
+    /// one exists, otherwise fall back to "Save As".
+    ///
+    /// No confirmation, even with unsaved changes: "Save" *means* write my
+    /// changes back to the file they came from, so asking again was asking the
+    /// user to confirm the thing they had just asked for. "Save As" still
+    /// confirms before overwriting a *different* file, which is a genuine
+    /// surprise — that one is about the file you didn't choose to change.
     pub(crate) fn begin_save(&mut self, action: FileAction) {
         if action == FileAction::SaveEnv && self.current_env_id().is_none() {
             self.status = Some(Status::NotEnvironment);
@@ -3603,31 +3602,7 @@ impl TuiApp {
             return;
         }
         match self.original_save_path(action) {
-            Some(path) => {
-                let changes = match action {
-                    FileAction::SaveEnv => self
-                        .current_env_id()
-                        .map(|id| self.changed_env_count(id))
-                        .unwrap_or(0),
-                    // A report's "changes" is just its dirty flag (its source is
-                    // a single text buffer, not a set of per-request markers).
-                    FileAction::SaveReport => self
-                        .active_report_index()
-                        .filter(|&i| self.reports[i].report.dirty)
-                        .map(|_| 1)
-                        .unwrap_or(0),
-                    _ => self.changed_request_count(self.active_tab),
-                };
-                if changes == 0 {
-                    // Nothing changed — saving to the original is a no-op; just do it.
-                    self.do_file_action(action, &path);
-                } else {
-                    self.overlay = Some(Overlay::Confirm {
-                        action: ConfirmAction::Save(action),
-                        sel: 1,
-                    });
-                }
-            }
+            Some(path) => self.do_file_action(action, &path),
             None => self.begin_save_as(action),
         }
     }

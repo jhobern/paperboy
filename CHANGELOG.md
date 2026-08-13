@@ -67,6 +67,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the repo. The recommended filter is now "files PaperBoy can open" and covers
   all four. Workspaces already pinned to the old filter keep working.
 
+### Changed
+
+- **Save no longer asks whether you meant it.** Saving a collection,
+  environment or report back to the file it came from used to raise a
+  confirmation counting the changes about to be written. Overwriting that file
+  with those changes is what Save *means*, so the dialog was asking the user to
+  confirm the thing they had just asked for — two keystrokes on the way to
+  every save. It now writes immediately. *Save As* still confirms before
+  overwriting a **different** file, which is a real surprise worth catching.
+
 ### Added
 
 - **A comparison can be pointed at its two stacks by parameter.** An `ENVS`

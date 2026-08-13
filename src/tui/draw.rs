@@ -3881,20 +3881,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     q
                 }
                 ConfirmAction::Clear => s.confirm_clear_q.to_string(),
-                // Scoped to the entity being saved: the collection warning counts
-                // only requests, the environment warning only variables.
-                ConfirmAction::Save(FileAction::SaveEnv) => s.confirm_save_env_q.replace(
-                    "{e}",
-                    &app.current_env_id()
-                        .map(|id| app.changed_env_count(id))
-                        .unwrap_or(0)
-                        .to_string(),
-                ),
-                ConfirmAction::Save(FileAction::SaveReport) => s.confirm_save_report_q.to_string(),
-                ConfirmAction::Save(_) => s.confirm_save_collection_q.replace(
-                    "{r}",
-                    &app.changed_request_count(app.active_tab).to_string(),
-                ),
                 ConfirmAction::Overwrite(_) => {
                     let name = app
                         .pending_save_path
