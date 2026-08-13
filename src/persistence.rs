@@ -387,6 +387,18 @@ fn default_true() -> bool {
     true
 }
 
+/// One report's remembered parameter values (see
+/// [`PersistedState::report_params`]).
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct PersistedReportParams {
+    /// [`crate::report::Report::param_key`] — path, git origin, or name.
+    pub key: String,
+    /// `NAME = value`, keyed by the parameter's raw name so relabelling a
+    /// parameter never orphans what was chosen for it. A pair sorted by name,
+    /// again so the file doesn't churn.
+    pub values: Vec<(String, String)>,
+}
+
 impl PersistedReport {
     /// Snapshot a report's persistable parts.
     pub fn from_report(r: &crate::report::Report) -> Self {
@@ -543,6 +555,18 @@ pub struct PersistedState {
     /// key itself is the credential and is never written to disk.
     #[serde(default)]
     pub recent_key_refs: Vec<String>,
+    /// The parameter values each report was last run with, most recently used
+    /// first. Keyed by the report's file path (or git origin, or name) rather
+    /// than its process-unique id, so reopening tomorrow offers back what you
+    /// chose today.
+    ///
+    /// A list rather than a map so `state.json` is written in a stable order:
+    /// a serialized `HashMap` reshuffles between runs and turns every save
+    /// into a diff. The report file itself is never touched — the default in
+    /// the `.trail` is what the report *says*, this is only what this user
+    /// last *did*.
+    #[serde(default)]
+    pub report_params: Vec<PersistedReportParams>,
     /// Which of JSON / Hurl text the Main (Request) panel shows by default for
     /// every request (Settings → Preferences → Default Request View).
     #[serde(default)]
@@ -609,6 +633,7 @@ impl Default for PersistedState {
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),
             recent_key_refs: Vec::new(),
+            report_params: Vec::new(),
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
             custom_themes: Vec::new(),

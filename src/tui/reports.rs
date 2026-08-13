@@ -21,13 +21,14 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
 use super::app::{
-    ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, TuiApp,
+    ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, PromptKind, TuiApp,
 };
 use super::draw::panel;
 use super::editor::{
     Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
 };
 use super::new_request::draw_scrollbar;
+use super::report_nodes::{SettingMenu, SettingMenuStep};
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
@@ -200,6 +201,18 @@ pub(crate) struct ReportTab {
     /// state exactly — the node editor's counterpart to the source editor's
     /// in-buffer undo. In-memory and per-tab (not persisted), like text undo.
     pub(crate) node_undo: Vec<NodeUndo>,
+    /// The values this report's `PARAM`s will be run with. Seeded when the run
+    /// settings first open — from what this report was last run with, falling
+    /// back to each declaration's own default — and thereafter whatever the
+    /// user has set. Keyed by the parameter's raw name, never its prompt.
+    pub(crate) param_values: crate::report::params::ParamValues,
+    /// Whether [`param_values`](Self::param_values) has been seeded yet. A
+    /// separate flag rather than "is it empty", because a report whose
+    /// parameters are all empty strings has been seeded just as much as one
+    /// with values, and re-seeding would undo the clearing.
+    pub(crate) params_seeded: bool,
+    /// The selected row in the run settings view.
+    pub(crate) param_selected: usize,
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
@@ -328,6 +341,22 @@ pub(crate) struct NodeUndo {
 const NODE_UNDO_LIMIT: usize = 200;
 
 /// Which pane a report tab's body shows.
+/// One row of the run settings view: a declared `PARAM`, the value this run
+/// will use for it, and what (if anything) is wrong with that value. Built on
+/// demand from the flow, never stored, so it can't drift from the source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParamRow {
+    /// The raw name — what `{{NAME}}` reads and what the value is remembered
+    /// under.
+    pub(crate) name: String,
+    /// What the row asks for, in words (the `LABEL`, or derived from the name).
+    pub(crate) prompt: String,
+    pub(crate) kind: crate::report::flow::ParamKind,
+    pub(crate) value: String,
+    /// Why this value wouldn't be accepted, if it wouldn't.
+    pub(crate) problem: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum ReportView {
     /// The PaperTrail flow source (editable) plus its live validation.
@@ -341,6 +370,10 @@ pub(crate) enum ReportView {
     Nodes,
     /// The grid of rows produced by the last run.
     Results,
+    /// The run settings: the values this run will use for the report's
+    /// `PARAM` declarations. A report that declares parameters opens here, so
+    /// what it is about to run against is seen before anything is sent.
+    RunSettings,
 }
 
 impl ReportView {
@@ -392,6 +425,7 @@ impl ReportTab {
         // land on the right lines even when the flow has blank separators.
         let mut source_panel = MultiSelectPanel::new();
         source_panel.set_wrap_mode(WrapMode::Clip);
+        let report_asks_for_values = report.flow().is_ok_and(|f| !f.params().is_empty());
         Self {
             report,
             diagnostics: Vec::new(),
@@ -402,11 +436,22 @@ impl ReportTab {
             edit_cursor: None,
             source_panel,
             validation_panel: MultiSelectPanel::new(),
-            view: ReportView::Source,
+            // A report that asks for something opens on the question rather
+            // than on its source: what it is about to run against is the first
+            // thing worth seeing, and the values are remembered per report so
+            // this is usually a glance and an `r`.
+            view: if report_asks_for_values {
+                ReportView::RunSettings
+            } else {
+                ReportView::Source
+            },
             editor_view: ReportView::Source,
             node_selected: 0,
             node_setting: None,
             node_undo: Vec::new(),
+            param_values: Default::default(),
+            params_seeded: false,
+            param_selected: 0,
             result: None,
             dry_run: None,
             results_exported: false,
@@ -928,6 +973,11 @@ impl TuiApp {
     /// Recompute the diagnostics (and parse-error state) for report tab `idx`
     /// against the currently-loaded collections and environments.
     pub(crate) fn revalidate_report(&mut self, idx: usize) {
+        // Cheap and idempotent: the values a parameterised report will run with
+        // are filled in from what it was last run with the first time anything
+        // touches the tab, so the run settings show real answers rather than
+        // bare defaults however the tab was opened.
+        self.seed_report_params(idx);
         // Compute the parse-error / diagnostics up front so the immutable reads
         // of `self.collections` / `self.global_envs` don't overlap the mutable
         // borrow of `self.reports[idx]` that stores the result.
@@ -1070,6 +1120,11 @@ impl TuiApp {
             // The core has no language of its own; only the app knows which one
             // the user picked, so the run's own errors are set to it here.
             inputs.language = self.language.clone();
+            inputs.params = self
+                .report_param_rows(idx)
+                .into_iter()
+                .map(|r| (r.name, r.value))
+                .collect();
             inputs
         })
         .map_err(|e| match e {
@@ -1167,6 +1222,22 @@ impl TuiApp {
             self.status = Some(Status::ReportRunBlocked(reason));
             return None;
         }
+        // A parameterised report is run with whatever the run settings hold —
+        // seeded here too, so `r` straight from the source view still runs with
+        // the declared defaults and what this report was last run with.
+        self.seed_report_params(idx);
+        if let Some(problem) = self
+            .report_param_rows(idx)
+            .into_iter()
+            .find_map(|r| r.problem.map(|p| format!("{}: {p}", r.prompt)))
+        {
+            // Refuse rather than run: a report that asks for something and is
+            // given nothing produces plausible-looking rows built around a hole.
+            self.status = Some(Status::ReportRunBlocked(problem));
+            self.reports[idx].view = ReportView::RunSettings;
+            return None;
+        }
+        self.remember_active_report_params(idx);
         match self.build_report_run_inputs(idx) {
             Ok(inputs) => Some((report_id, inputs)),
             Err(reason) => {
@@ -1532,6 +1603,243 @@ impl TuiApp {
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
         }
+    }
+
+    /// One row of the run settings view.
+    // Built fresh on every draw and key press from the flow + the tab's chosen
+    // values, so it can never drift from the source the way a cached copy of a
+    // declaration would.
+    pub(crate) fn report_param_rows(&self, idx: usize) -> Vec<ParamRow> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        let s = Strings::for_language(&self.language);
+        flow.params()
+            .into_iter()
+            .map(|p| {
+                let value = rt
+                    .param_values
+                    .get(&p.name)
+                    .cloned()
+                    .or_else(|| p.default.clone())
+                    .unwrap_or_default();
+                ParamRow {
+                    name: p.name.clone(),
+                    prompt: p.prompt(),
+                    kind: p.kind.clone(),
+                    // The same check that would stop the run, shown while
+                    // there is still someone here to fix it.
+                    problem: crate::report::params::check(p, &value, &s)
+                        .err()
+                        .or_else(|| {
+                            (value.trim().is_empty() && p.default.is_none())
+                                .then(|| s.param_row_required.to_string())
+                        }),
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the active report declares any parameters — the question every
+    /// "should the run settings exist here?" decision asks.
+    pub(crate) fn report_has_params(&self, idx: usize) -> bool {
+        self.reports
+            .get(idx)
+            .and_then(|rt| rt.report.flow().ok())
+            .is_some_and(|f| !f.params().is_empty())
+    }
+
+    /// Open the run settings for the active report, seeding the values the
+    /// first time from what this report was last run with (and, failing that,
+    /// from each declaration's own default).
+    pub(crate) fn open_report_run_settings(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if !self.report_has_params(idx) {
+            self.status = Some(Status::ReportRunBlocked(
+                Strings::for_language(&self.language)
+                    .param_none_declared
+                    .to_string(),
+            ));
+            return;
+        }
+        self.seed_report_params(idx);
+        self.reports[idx].view = ReportView::RunSettings;
+    }
+
+    /// Fill in a report's parameter values from what it was last run with,
+    /// once. Anything the remembered set doesn't cover keeps the declared
+    /// default, so adding a parameter to a report someone has already run
+    /// doesn't leave it blank.
+    pub(crate) fn seed_report_params(&mut self, idx: usize) {
+        if self.reports.get(idx).is_none_or(|rt| rt.params_seeded) {
+            return;
+        }
+        let key = self.reports[idx].report.param_key();
+        let remembered = self.remembered_params(&key);
+        let declared: Vec<(String, Option<String>)> = self.reports[idx]
+            .report
+            .flow()
+            .map(|f| {
+                f.params()
+                    .into_iter()
+                    .map(|p| (p.name.clone(), p.default.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rt = &mut self.reports[idx];
+        for (name, default) in declared {
+            // Never over-write what is already there: seeding can happen after
+            // the user has already typed into the run settings (a report opened
+            // straight onto them), and their answer outranks both the
+            // remembered one and the declared default.
+            if rt.param_values.contains_key(&name) {
+                continue;
+            }
+            let value = remembered
+                .get(&name)
+                .cloned()
+                .or(default)
+                .unwrap_or_default();
+            rt.param_values.insert(name, value);
+        }
+        rt.params_seeded = true;
+    }
+
+    /// Move the run settings cursor, clamped to the rows that exist.
+    pub(crate) fn param_cursor_move(&mut self, delta: i32) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let last = self.report_param_rows(idx).len().saturating_sub(1);
+        let rt = &mut self.reports[idx];
+        let next = (rt.param_selected as i32 + delta).clamp(0, last as i32);
+        rt.param_selected = next as usize;
+    }
+
+    /// Enter on a run settings row: open whichever editor suits the parameter's
+    /// declared type — a list for the ones with a closed set of answers, the
+    /// file browser for the two that name paths, a text prompt for the rest.
+    /// The type is what makes a parameter worth declaring rather than
+    /// assigning, so this is where it earns its keep.
+    pub(crate) fn configure_selected_param(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let rows = self.report_param_rows(idx);
+        let sel = self.reports[idx].param_selected.min(rows.len());
+        let Some(row) = rows.get(sel) else { return };
+        let report_id = self.reports[idx].report.id;
+        match &row.kind {
+            crate::report::flow::ParamKind::Choice(options) if !options.is_empty() => {
+                let selected = options.iter().position(|o| *o == row.value).unwrap_or(0);
+                self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+                    step: SettingMenuStep::PickParam {
+                        name: row.name.clone(),
+                    },
+                    options: options.clone(),
+                    selected,
+                    report_id,
+                })));
+            }
+            crate::report::flow::ParamKind::Env => {
+                let options: Vec<String> =
+                    self.global_envs.iter().map(|e| e.name.clone()).collect();
+                if options.is_empty() {
+                    // Nothing is loaded to choose between. Typing a name by
+                    // hand still works, and is the right answer for an
+                    // environment that lives on another machine.
+                    self.status = Some(Status::ReportSettingNoChoices);
+                    self.open_param_text_prompt(report_id, row);
+                    return;
+                }
+                let selected = options.iter().position(|o| *o == row.value).unwrap_or(0);
+                self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+                    step: SettingMenuStep::PickParam {
+                        name: row.name.clone(),
+                    },
+                    options,
+                    selected,
+                    report_id,
+                })));
+            }
+            crate::report::flow::ParamKind::Folder | crate::report::flow::ParamKind::File => {
+                self.pending_param_path = Some((report_id, row.name.clone()));
+                // A parameter's paths almost always live beside the report.
+                if let Some(dir) = self.active_report_base_dir() {
+                    self.last_browse_dir = Some(dir);
+                }
+                self.open_browser(match row.kind {
+                    crate::report::flow::ParamKind::Folder => {
+                        super::app::FileAction::PickReportParamFolder
+                    }
+                    _ => super::app::FileAction::PickReportParamFile,
+                });
+            }
+            _ => self.open_param_text_prompt(report_id, row),
+        }
+    }
+
+    fn open_param_text_prompt(&mut self, report_id: u64, row: &ParamRow) {
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::ReportParamValue {
+                report_id,
+                name: row.name.clone(),
+            },
+            editor: Editor::new(&row.value, false),
+            title: row.prompt.clone(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Set one parameter's value for the next run, by report id so a tab
+    /// reorder while a prompt is open can't misroute it.
+    pub(crate) fn set_report_param(&mut self, report_id: u64, name: &str, value: String) {
+        if let Some(rt) = self.reports.iter_mut().find(|rt| rt.report.id == report_id) {
+            rt.param_values.insert(name.to_string(), value);
+        }
+    }
+
+    /// Remember what this report was just run with, so reopening it offers the
+    /// same answers rather than asking again from scratch.
+    fn remember_active_report_params(&mut self, idx: usize) {
+        let rows = self.report_param_rows(idx);
+        if rows.is_empty() {
+            return;
+        }
+        let key = self.reports[idx].report.param_key();
+        let values: crate::report::params::ParamValues =
+            rows.into_iter().map(|r| (r.name, r.value)).collect();
+        if self.session.remember_params(&key, &values) {
+            self.save_state();
+        }
+    }
+
+    /// Key handling for [`ReportView::RunSettings`]. Returns `true` when it
+    /// consumed the key; anything it doesn't take falls through to the shared
+    /// report shortcuts (so `r`, the tab keys and the menus still work here).
+    fn on_key_report_run_settings(&mut self, key: KeyEvent, idx: usize) -> bool {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.param_cursor_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.param_cursor_move(1),
+            KeyCode::Home => self.param_cursor_move(i32::MIN),
+            KeyCode::End => self.param_cursor_move(i32::MAX),
+            KeyCode::Enter | KeyCode::Char(' ') => self.configure_selected_param(),
+            KeyCode::Esc => {
+                let back = self.reports[idx].editor_view;
+                self.reports[idx].view = back;
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Toggle the active report between its current *editor* view and the
@@ -2358,6 +2666,14 @@ impl TuiApp {
         {
             return;
         }
+        // Same arrangement for the run settings: it owns the cursor keys and
+        // Enter, and lets everything else through.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].view == ReportView::RunSettings
+            && self.on_key_report_run_settings(key, idx)
+        {
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         // A dry-run preview has no cell cursor, but its grid clips just like
@@ -2526,6 +2842,9 @@ impl TuiApp {
             KeyCode::Char('c') => self.open_report_columns(),
             // Bind: (re)point the report at one of the open collections.
             KeyCode::Char('b') => self.open_report_bind(),
+            // The run settings: the values this report's PARAMs will be run
+            // with. `p` because it's what the report asks the user for.
+            KeyCode::Char('p') => self.open_report_run_settings(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
             // Reformat: re-indent the source to its real block depth. Shift+F
@@ -2580,9 +2899,10 @@ impl TuiApp {
             let panel = match rt.view {
                 ReportView::Results => &mut rt.results_panel,
                 ReportView::Source => &mut rt.source_panel,
-                // The node outline scrolls to follow its selection cursor (moved
-                // by Up/Down in the node handler), not a free scroll offset.
-                ReportView::Nodes => return,
+                // The node outline and the run settings both scroll to follow
+                // their selection cursor (moved by Up/Down in their own
+                // handlers), not a free scroll offset.
+                ReportView::Nodes | ReportView::RunSettings => return,
             };
             let next = (panel.scroll() as i32).saturating_add(delta).max(0);
             panel.set_scroll(next.min(u16::MAX as i32) as u16);
@@ -3485,13 +3805,109 @@ pub(crate) fn draw_report_content(
     ])
     .split(area);
 
-    if app.reports[idx].view == ReportView::Nodes {
+    if app.reports[idx].view == ReportView::RunSettings {
+        draw_report_run_settings(f, rows[0], app, idx, s, th);
+    } else if app.reports[idx].view == ReportView::Nodes {
         super::report_nodes::draw_report_nodes(f, rows[0], app, idx, s, th);
     } else {
         draw_report_source(f, rows[0], app, idx, s, th);
     }
     draw_report_binding(f, rows[1], app, idx, s, th);
     draw_report_validation(f, rows[2], app, idx, s, th);
+}
+
+/// Draw the run settings: one row per declared `PARAM` — what it asks for, the
+/// value this run will use, and what is wrong with it, if anything. The raw
+/// name and the declared type are shown dimmed beside the prompt: the prompt is
+/// what the row means, but the name is what `{{…}}` and `--param` say, so
+/// neither can be the only one on screen.
+fn draw_report_run_settings(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
+    let focused = app.report_body_focused();
+    let title = format!("{} — {}", s.param_view_title, s.param_view_hint);
+    let block = panel(title, focused, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // Not a text panel: nothing here is selectable or scrollable with the
+    // mouse, so it claims no hit-test area (as the node outline doesn't).
+    app.report_pane_areas[ReportPane::Source.idx()] = Rect::default();
+    app.report_pane_bars[ReportPane::Source.idx()] = Rect::default();
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let rows = app.report_param_rows(idx);
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                s.param_view_empty.to_string(),
+                Style::default().fg(th.dim),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let sel = app.reports[idx]
+        .param_selected
+        .min(rows.len().saturating_sub(1));
+    app.reports[idx].param_selected = sel;
+
+    let prompt_w = rows
+        .iter()
+        .map(|r| r.prompt.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let selected = i == sel;
+            let mark = if selected { "> " } else { "  " };
+            let mut spans = vec![
+                Span::styled(mark, Style::default().fg(th.accent)),
+                Span::styled(
+                    format!("{:<prompt_w$}  ", row.prompt),
+                    if selected {
+                        Style::default().fg(th.text).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.text)
+                    },
+                ),
+            ];
+            if row.value.is_empty() {
+                spans.push(Span::styled(
+                    s.param_value_unset.to_string(),
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                spans.push(Span::styled(row.value.clone(), Style::default().fg(th.ok)));
+            }
+            spans.push(Span::styled(
+                format!("  {} {}", row.name, row.kind.keyword()),
+                Style::default().fg(th.dim),
+            ));
+            if let Some(problem) = &row.problem {
+                spans.push(Span::styled(
+                    format!("  {problem}"),
+                    Style::default().fg(th.err),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    // One cursor, one list: scroll just enough to keep the selected row on
+    // screen, the same way the node outline follows its own selection.
+    let h = inner.height as usize;
+    let first = sel.saturating_sub(h.saturating_sub(1));
+    let visible: Vec<Line> = lines.into_iter().skip(first).take(h).collect();
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
 /// row. Any run-level errors are surfaced in the panel title so a partly-failed
@@ -4615,6 +5031,12 @@ fn draw_report_source(
         if app.reports[idx].result.is_some() {
             hint.push_str(" · ");
             hint.push_str(s.report_hint_view);
+        }
+        // Only offered by a report that actually asks for something — the key
+        // does nothing on the rest, so advertising it everywhere would be noise.
+        if app.report_has_params(idx) {
+            hint.push_str(" · ");
+            hint.push_str(s.param_open_hint);
         }
         hint
     };

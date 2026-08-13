@@ -224,6 +224,11 @@ pub struct Session {
     /// first. Offered in the import wizard so the item path only has to be
     /// found once. Only references are kept — never a pasted key.
     pub recent_key_refs: Vec<String>,
+    /// The parameter values each report was last run with, keyed by
+    /// [`crate::report::Report::param_key`] and offered back the next time its
+    /// run settings open. Most recently used first, and capped — a value
+    /// nobody has used for fifty reports is not worth carrying forever.
+    pub report_params: Vec<crate::persistence::PersistedReportParams>,
     /// Folder the file browser last selected a file from; it reopens here.
     pub last_browse_dir: Option<PathBuf>,
     /// Folder the last *environment* file was loaded from; the environment
@@ -289,6 +294,7 @@ impl Default for Session {
             env_source: EnvSource::Both,
             recent_git_urls: Vec::new(),
             recent_key_refs: Vec::new(),
+            report_params: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
             last_import_dir: None,
@@ -549,6 +555,56 @@ impl Session {
         self.recent_key_refs.retain(|known| known != key);
         self.recent_key_refs.insert(0, key.to_string());
         self.recent_key_refs.truncate(10);
+        true
+    }
+
+    /// The values report `key` was last run with, as a map ready for a run.
+    /// Empty when this report has never been run with parameters — which is
+    /// also what a report with no parameters looks like, so callers need no
+    /// special case.
+    pub fn remembered_params(&self, key: &str) -> crate::report::params::ParamValues {
+        self.report_params
+            .iter()
+            .find(|r| r.key == key)
+            .map(|r| r.values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remember the values report `key` was just run with, so its run settings
+    /// open on them next time. Returns whether anything actually changed, so a
+    /// caller polling every frame doesn't rewrite `state.json` for nothing.
+    ///
+    /// Values are stored sorted, and the report moves to the front of the
+    /// list: the cap has to evict something, and the report you last ran is
+    /// the one you are least likely to want forgotten.
+    pub fn remember_params(
+        &mut self,
+        key: &str,
+        values: &crate::report::params::ParamValues,
+    ) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let mut pairs: Vec<(String, String)> =
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort();
+        let entry = crate::persistence::PersistedReportParams {
+            key: key.to_string(),
+            values: pairs,
+        };
+        if self.report_params.first().is_some_and(|r| *r == entry) {
+            return false;
+        }
+        let had_key = self.report_params.iter().any(|r| r.key == key);
+        self.report_params.retain(|r| r.key != key);
+        // Nothing to remember: a report run entirely on its defaults shouldn't
+        // hold a slot, and clearing the values should forget them. Only a
+        // report that *had* an entry has changed by losing it.
+        if entry.values.is_empty() {
+            return had_key;
+        }
+        self.report_params.insert(0, entry);
+        self.report_params.truncate(50);
         true
     }
 
@@ -914,6 +970,7 @@ impl Session {
             env_source: self.env_source,
             recent_git_urls: self.recent_git_urls.clone(),
             recent_key_refs: self.recent_key_refs.clone(),
+            report_params: self.report_params.clone(),
             default_request_view: self.default_request_view,
             run_all_batch_mode: self.run_all_batch_mode,
             custom_themes: self.custom_themes.clone(),
@@ -1019,6 +1076,7 @@ impl Session {
         self.env_source = state.env_source;
         self.recent_git_urls = state.recent_git_urls;
         self.recent_key_refs = state.recent_key_refs;
+        self.report_params = state.report_params;
         self.default_request_view = state.default_request_view;
         self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
@@ -1028,6 +1086,73 @@ impl Session {
     /// Persist the current state to disk.
     pub fn save(&self) {
         persistence::save_state(&self.to_persisted());
+    }
+}
+
+#[cfg(test)]
+mod param_memory_tests {
+    use super::*;
+
+    fn values(pairs: &[(&str, &str)]) -> crate::report::params::ParamValues {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_report_is_offered_the_values_it_was_last_run_with() {
+        let mut s = Session::default();
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert_eq!(
+            s.remembered_params("name:Face"),
+            values(&[("TICKET", "42")])
+        );
+        // Another report's answers are its own.
+        assert!(s.remembered_params("name:Other").is_empty());
+    }
+
+    #[test]
+    fn remembering_the_same_values_twice_doesnt_rewrite_the_state_file() {
+        let mut s = Session::default();
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert!(!s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "43")])));
+    }
+
+    #[test]
+    fn clearing_every_value_forgets_the_report_rather_than_keeping_an_empty_slot() {
+        let mut s = Session::default();
+        s.remember_params("name:Face", &values(&[("TICKET", "42")]));
+        assert!(s.remember_params("name:Face", &Default::default()));
+        assert!(s.remembered_params("name:Face").is_empty());
+        // Nothing was remembered, so there is nothing to forget the second time.
+        assert!(!s.remember_params("name:Face", &Default::default()));
+    }
+
+    #[test]
+    fn only_the_fifty_most_recently_run_reports_are_remembered() {
+        let mut s = Session::default();
+        for i in 0..60 {
+            s.remember_params(&format!("name:r{i}"), &values(&[("N", "1")]));
+        }
+        assert_eq!(s.report_params.len(), 50);
+        // The oldest fell off the end; the one just run is at the front.
+        assert!(s.remembered_params("name:r0").is_empty());
+        assert_eq!(s.remembered_params("name:r59"), values(&[("N", "1")]));
+    }
+
+    #[test]
+    fn remembered_values_survive_a_restart() {
+        let mut s = Session::default();
+        s.remember_params("name:Face", &values(&[("TICKET", "42"), ("ENV", "au")]));
+        let persisted = s.to_persisted();
+        let mut restored = Session::default();
+        restored.apply_persisted(persisted);
+        assert_eq!(
+            restored.remembered_params("name:Face"),
+            values(&[("TICKET", "42"), ("ENV", "au")])
+        );
     }
 }
 

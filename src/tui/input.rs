@@ -1129,8 +1129,10 @@ impl TuiApp {
         let whole = match rt.view {
             crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
             crate::tui::reports::ReportView::Source => rt.source_panel.whole_text(),
-            // The node outline isn't a text panel; `y` there is a no-op.
-            crate::tui::reports::ReportView::Nodes => None,
+            // Neither the node outline nor the run settings is a text panel;
+            // `y` in either is a no-op.
+            crate::tui::reports::ReportView::Nodes
+            | crate::tui::reports::ReportView::RunSettings => None,
         };
         if let Some(text) = whole
             && !text.is_empty()
@@ -4321,6 +4323,9 @@ impl TuiApp {
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
             FileAction::PickReportHeaderFolder => s.report_header_root_pick,
             FileAction::PickReportHeaderFile => s.report_header_baseline_pick,
+            FileAction::PickReportParamFolder | FileAction::PickReportParamFile => {
+                s.param_pick_path
+            }
             FileAction::PostmanDestChooseFolder => s.postman_dest_folder,
             _ => s.browser_select_file,
         }
@@ -4333,7 +4338,9 @@ impl TuiApp {
             FileAction::PickReportNodeFolder => s.browser_hint_node_folder,
             // `root:` names a folder (Space confirms the current one);
             // `baseline:` names a file, so it uses the ordinary file hint.
-            FileAction::PickReportHeaderFolder => s.browser_hint_header_folder,
+            FileAction::PickReportHeaderFolder | FileAction::PickReportParamFolder => {
+                s.browser_hint_header_folder
+            }
             FileAction::SaveWorkspaceChooseFolder | FileAction::PostmanDestChooseFolder => {
                 s.browser_hint_workspace_save
             }
@@ -5566,6 +5573,12 @@ impl TuiApp {
                 ) {
                     // Abandon the pick; the directive keeps its current value.
                     self.pending_header_path = None;
+                } else if matches!(
+                    action,
+                    FileAction::PickReportParamFolder | FileAction::PickReportParamFile
+                ) {
+                    // Abandon the pick; the parameter keeps its current value.
+                    self.pending_param_path = None;
                 } else if action == FileAction::PickReportNodeFolder {
                     // Abandon the folder pick; the node keeps its current dir.
                     self.pending_node_folder = None;
@@ -5673,6 +5686,13 @@ impl TuiApp {
                 let dir = ex.cwd().clone();
                 self.last_browse_dir = Some(dir.clone());
                 self.commit_report_header_path(&dir.to_string_lossy());
+                self.save_state();
+            }
+            KeyCode::Char(' ') if action == FileAction::PickReportParamFolder => {
+                // Confirm the current directory as the parameter's value.
+                let dir = ex.cwd().clone();
+                self.last_browse_dir = Some(dir.clone());
+                self.commit_report_param_path(&dir.to_string_lossy());
                 self.save_state();
             }
             KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
@@ -6530,6 +6550,7 @@ fn browser_confirms_on_space(action: FileAction) -> bool {
                 | FileAction::MoveWorkspaceItemChooseFolder
                 | FileAction::PickReportNodeFolder
                 | FileAction::PickReportHeaderFolder
+                | FileAction::PickReportParamFolder
         )
     }
 }

@@ -22849,6 +22849,217 @@ fn file_save_items_hide_request_while_a_report_is_shown() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ---------------------------------------------------------------------------
+// Report run settings (PARAM)
+// ---------------------------------------------------------------------------
+
+/// A report that asks for values, with one of each interaction: a plain text
+/// parameter, a `CHOICE` (picked from a list) and a `NUMBER`.
+const PARAM_TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+PARAM NUMBER RUNS = \"3\"
+REPORT REQUEST x
+";
+
+fn report_app() -> TuiApp {
+    let mut app = TuiApp::default();
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app
+}
+
+/// A report that asks for something shows the question first: the tab opens on
+/// the run settings rather than on the source nobody non-technical reads.
+#[test]
+fn a_report_that_asks_for_values_opens_on_them() {
+    let app = report_app();
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings
+    );
+    let rows = app.report_param_rows(0);
+    assert_eq!(rows.len(), 3);
+    // The LABEL is what the row asks; without one, the name is turned into
+    // words rather than shown as an identifier.
+    assert_eq!(rows[0].prompt, "Ticket number");
+    assert_eq!(rows[1].prompt, "Region");
+    // Declared defaults are what it would run with today.
+    assert_eq!(rows[1].value, "au");
+    assert_eq!(rows[2].value, "3");
+    // A parameter with no default and nothing supplied is called out.
+    assert!(rows[0].problem.is_some(), "an unanswered TICKET is flagged");
+}
+
+/// A report that asks for nothing is unaffected: it opens on its source and `p`
+/// says so rather than showing an empty form.
+#[test]
+fn a_report_that_asks_for_nothing_still_opens_on_its_source() {
+    let mut app = TuiApp::default();
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Plain",
+        "# name: Plain\n# collection: c.hurl\nREPORT REQUEST x\n",
+    ));
+    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::Source,
+        "there is nothing to ask, so `p` doesn't take over the pane"
+    );
+    assert!(app.status.is_some(), "and it says why");
+}
+
+/// Enter on a `CHOICE` row offers exactly its choices, and picking one sets the
+/// value for the run without touching the report's source.
+#[test]
+fn a_choice_parameter_is_picked_from_its_own_choices() {
+    let mut app = report_app();
+    let before = app.reports[0].report.text.clone();
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("a CHOICE opens its list, got {:?}", app.overlay.is_some());
+    };
+    assert_eq!(menu.options, vec!["au".to_string(), "eu".to_string()]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.report_param_rows(0)[1].value, "eu");
+    assert_eq!(
+        app.reports[0].report.text, before,
+        "a parameter's value belongs to the run, not to the report"
+    );
+}
+
+/// Enter on a text parameter opens a prompt; committing it answers the row and
+/// the complaint about it goes away.
+#[test]
+fn typing_a_value_answers_the_row_it_was_opened_from() {
+    let mut app = report_app();
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::ReportParamValue { .. },
+                ..
+            })
+        ),
+        "a TEXT parameter opens a text prompt"
+    );
+    for c in "1234".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    let rows = app.report_param_rows(0);
+    assert_eq!(rows[0].value, "1234");
+    assert!(
+        rows[0].problem.is_none(),
+        "an answered row is no longer flagged"
+    );
+}
+
+/// A value the type wouldn't accept is refused where it was typed, rather than
+/// silently reaching the run.
+#[test]
+fn a_value_that_doesnt_fit_its_type_is_flagged_in_the_form() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "RUNS", "soon".into());
+    let rows = app.report_param_rows(0);
+    assert!(
+        rows[2]
+            .problem
+            .as_deref()
+            .is_some_and(|p| p.contains("soon")),
+        "a NUMBER given words says so: {:?}",
+        rows[2].problem
+    );
+}
+
+/// Running with a required value still unanswered doesn't run: it says what is
+/// missing and puts the user back on the question.
+#[test]
+fn a_run_missing_a_required_value_is_refused_not_guessed() {
+    let mut app = TuiApp::default();
+    // Bound and valid, so the only thing standing between `r` and a run is the
+    // unanswered question. The collection is opened first so the report's own
+    // strip slot lands past it.
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    app.reports[0].view = crate::tui::reports::ReportView::Source;
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.reports[0].result.is_none(), "nothing ran");
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "the user is put back on the row that needs answering"
+    );
+    assert!(
+        matches!(&app.status, Some(crate::i18n::Status::ReportRunBlocked(m)) if m.contains("Ticket number")),
+        "and told which one: {:?}",
+        app.status
+    );
+}
+
+/// The answers a report was run with are offered again the next time it is
+/// opened: someone running the same report every week shouldn't retype them,
+/// and the values survive a restart because they live in the session state.
+#[test]
+fn a_report_is_offered_the_answers_it_was_last_run_with() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+    app.set_report_param(app.reports[0].report.id, "REGION", "eu".into());
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+
+    // A fresh app, same report: the run settings open on last week's answers.
+    let mut next = TuiApp::default();
+    next.session.apply_persisted(app.session.to_persisted());
+    next.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    next.revalidate_report(0);
+    let rows = next.report_param_rows(0);
+    assert_eq!(rows[0].value, "1234");
+    assert_eq!(rows[1].value, "eu");
+    // An answered report has nothing left to complain about.
+    assert!(rows.iter().all(|r| r.problem.is_none()));
+}
+
+/// Esc leaves the run settings for the editor the user was last in, so the view
+/// isn't a trap for someone who does want to read the flow.
+#[test]
+fn esc_leaves_the_run_settings_for_the_source() {
+    let mut app = report_app();
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "`p` brings them back"
+    );
+}
+
 /// A standalone report (File → Load Report, no workspace) still opens as its own
 /// separate strip tab — the embedded-in-workspace path must not have changed it.
 #[test]

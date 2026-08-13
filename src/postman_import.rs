@@ -1747,8 +1747,15 @@ mod tests {
         // No retries: waiting cannot clear a monthly cap. One call per item at
         // most — the three already in flight — and none of them waited out a
         // back-off, which is the only sleep long enough to show here (pacing
-        // between concurrent fetches is milliseconds).
-        assert_eq!(script.urls.lock().unwrap().len(), 3);
+        // between concurrent fetches is milliseconds). A *range* rather than
+        // exactly three: the first worker to see the cap stops the rest, so
+        // how many of its peers had already sent their own request is a race.
+        // What matters is that nobody asked twice.
+        let calls = script.urls.lock().unwrap().len();
+        assert!(
+            (1..=3).contains(&calls),
+            "one call per item at most: {calls}"
+        );
         assert!(clock.total_slept() < Duration::from_secs(1));
     }
 

@@ -4134,6 +4134,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
                             ("b (report)", s.help_report_bind),
+                            ("p (report)", s.help_report_params),
                             ("Esc (report)", s.help_report_leave_edit),
                             ("Ctrl+←/→ (report)", s.help_report_word_move),
                             ("→ (report)", s.help_report_complete),

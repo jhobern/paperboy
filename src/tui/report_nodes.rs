@@ -4085,7 +4085,7 @@ pub(crate) struct SettingMenu {
 }
 
 /// Which job a [`SettingMenu`] is doing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum SettingMenuStep {
     /// Adding one of the not-yet-present optional directives; the options are
     /// directive keys.
@@ -4097,14 +4097,20 @@ pub(crate) enum SettingMenuStep {
         /// [`SettingRow::occurrence`].
         occurrence: usize,
     },
+    /// Choosing the value of a report `PARAM` from the run settings view; the
+    /// options are the parameter's `CHOICE(…)` list or the loaded environment
+    /// names. Unlike the two above this doesn't touch the source: a parameter's
+    /// value belongs to the run, not to the report.
+    PickParam { name: String },
 }
 
 impl SettingMenu {
     /// The overlay title for the current job.
     pub(crate) fn title(&self, s: &Strings) -> String {
-        match self.step {
+        match &self.step {
             SettingMenuStep::AddSetting => s.report_add_setting.to_string(),
             SettingMenuStep::PickValue { key, .. } => key.to_uppercase(),
+            SettingMenuStep::PickParam { name } => name.clone(),
         }
     }
 }
@@ -4242,6 +4248,28 @@ impl TuiApp {
     /// relative to the report when that is shorter — a report and the files it
     /// names usually travel together, so an absolute path would break the
     /// moment the pair moved. Mirrors the GUI's `pick_header_file`.
+    /// A `PARAM … FILE`/`FOLDER` pick came back: store it as the parameter's
+    /// value for the next run. Relative to the report's own folder when it
+    /// lives beneath it, matching what `# root:` does — a report and the files
+    /// it feeds on usually travel together.
+    pub(crate) fn commit_report_param_path(&mut self, path: &str) {
+        let Some((report_id, name)) = self.pending_param_path.take() else {
+            return;
+        };
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let value = self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.path.as_deref())
+            .and_then(|p| p.parent())
+            .and_then(|base| std::path::Path::new(path).strip_prefix(base).ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        self.set_report_param(report_id, &name, value);
+    }
+
     pub(crate) fn commit_report_header_path(&mut self, path: &str) {
         let Some((report_id, key)) = self.pending_header_path.take() else {
             return;
@@ -4299,7 +4327,7 @@ impl TuiApp {
         let Some(choice) = menu.options.get(menu.selected).cloned() else {
             return;
         };
-        match menu.step {
+        match &menu.step {
             SettingMenuStep::AddSetting => {
                 // Seeded with the placeholder so the row appears at once; an
                 // empty value would be read as "remove this directive" and the
@@ -4327,7 +4355,11 @@ impl TuiApp {
                 }
             }
             SettingMenuStep::PickValue { key, occurrence } => {
-                self.apply_report_setting(idx, key, occurrence, Some(&choice))
+                self.apply_report_setting(idx, key, *occurrence, Some(&choice))
+            }
+            SettingMenuStep::PickParam { name } => {
+                let (id, name) = (menu.report_id, name.clone());
+                self.set_report_param(id, &name, choice);
             }
         }
     }

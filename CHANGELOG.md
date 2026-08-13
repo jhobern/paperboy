@@ -69,6 +69,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The terminal UI asks for the values a report declares.** A report with
+  `PARAM`s opens on a *Run settings* view (`p` from the source, Esc back)
+  listing one row per parameter: what it asks for in words, the value this run
+  will use, and its raw name and type dimmed beside it. Enter opens whichever
+  control the type deserves — a list of a `CHOICE`'s own choices or of the
+  loaded environments, the file browser for a `FILE`/`FOLDER` (stored relative
+  to the report, like `# root:`), a text field for the rest — and a value the
+  type wouldn't accept is refused there rather than at the run. Pressing `r`
+  with a required value still unanswered doesn't run: it says which one and
+  puts you back on the row. The answers are remembered per report (and survive
+  a restart), so a report someone runs every week opens on last week's answers
+  and is a glance and an `r`.
+
 - **Reports can ask for a value before they run.** A `PARAM` statement declares
   a variable whose value is offered to the user rather than baked into the
   file, so a report that differs from run to run only by its environment, its

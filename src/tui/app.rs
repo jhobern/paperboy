@@ -118,6 +118,15 @@ pub(crate) enum FileAction {
     /// node editor's settings section — a plain file pick (Enter on the file),
     /// parked the same way as `PickReportHeaderFolder`.
     PickReportHeaderFile,
+    /// Picking the FOLDER for a `PARAM … FOLDER` in a report's run settings.
+    /// Confirms on `Space` (the current directory) like the other folder
+    /// pickers; the target report and parameter are parked in
+    /// [`TuiApp::pending_param_path`].
+    PickReportParamFolder,
+    /// Picking the FILE for a `PARAM … FILE` in a report's run settings — a
+    /// plain file pick (Enter on the file), parked the same way as
+    /// `PickReportParamFolder`.
+    PickReportParamFile,
 }
 
 impl FileAction {
@@ -190,6 +199,14 @@ pub(crate) enum PromptKind {
     /// removes the directive, matching Delete on the row). Addressed by
     /// `report_id` rather than tab index so a tab reorder can't misroute it,
     /// exactly like [`PromptKind::ReportNodeLine`].
+    /// Typing the value of one report `PARAM` in the run settings view.
+    /// Committing sets it for the next run only — the source is untouched,
+    /// because a parameter's value belongs to the run, not to the report.
+    /// Addressed by `report_id` for the same reason as the two above.
+    ReportParamValue {
+        report_id: u64,
+        name: String,
+    },
     ReportHeaderValue {
         report_id: u64,
         key: &'static str,
@@ -1290,6 +1307,10 @@ pub struct TuiApp {
     /// (`FileAction` is `Copy`, so the key can't live in the variant — the same
     /// reason [`TuiApp::pending_node_folder`] exists).
     pub(crate) pending_header_path: Option<(u64, &'static str)>,
+    /// The report and parameter a `PickReportParam*` browser is picking for,
+    /// parked here because `FileAction` has no room for a name. Cleared when
+    /// the pick is committed or abandoned.
+    pub(crate) pending_param_path: Option<(u64, String)>,
     /// The inline filename editor shown at the bottom of a "save to folder"
     /// browser (the two `*ChooseFolder` [`FileAction`]s): the file name for a
     /// collection, or the workspace's own subfolder name. Seeded with a
@@ -1440,6 +1461,7 @@ impl Default for TuiApp {
             postman_dest_seed_dir: None,
             pending_node_folder: None,
             pending_header_path: None,
+            pending_param_path: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             browser_filter_on: true,
@@ -1976,6 +1998,9 @@ impl TuiApp {
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
+            PromptKind::ReportParamValue { report_id, name } => {
+                self.set_report_param(report_id, &name, text);
+            }
             PromptKind::ReportHeaderValue {
                 report_id,
                 key,
@@ -2330,6 +2355,10 @@ impl TuiApp {
             FileAction::PickReportHeaderFolder => {}
             // `baseline:` is a *file* pick, so Enter on the file does land here.
             FileAction::PickReportHeaderFile => self.commit_report_header_path(path),
+            // Same split as the header pickers: the folder is confirmed with
+            // `Space` in `input.rs`, only the file lands here.
+            FileAction::PickReportParamFolder => {}
+            FileAction::PickReportParamFile => self.commit_report_param_path(path),
         }
     }
 
