@@ -1066,6 +1066,10 @@ pub enum PickAction {
         key: &'static str,
         occurrence: usize,
     },
+    /// A `FOLDER`/`FILE` parameter's path, chosen from the run settings.
+    ReportParamPath {
+        name: String,
+    },
     /// The folder (or file) a `FOR … IN FILES/FOLDERS` loop walks.
     ReportLoopDir {
         path: Vec<usize>,
@@ -1104,6 +1108,15 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
     // loading a file, so they neither seed the shared picker directory nor have
     // an error to report.
     match action {
+        PickAction::ReportParamPath { name } => {
+            if let Some(path) = picked.as_ref()
+                && let Some(ed) = app.report_editor.as_mut()
+            {
+                ed.param_values
+                    .insert(name, path.to_string_lossy().into_owned());
+            }
+            return;
+        }
         PickAction::ReportHeaderFile { key, occurrence } => {
             super::report_editor::apply_picked_header_file(app, key, occurrence, picked);
             return;

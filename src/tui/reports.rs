@@ -37,6 +37,7 @@ use crate::report::indent::{
     INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
 };
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
+use crate::report::params::ParamRow;
 use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
@@ -341,22 +342,6 @@ pub(crate) struct NodeUndo {
 const NODE_UNDO_LIMIT: usize = 200;
 
 /// Which pane a report tab's body shows.
-/// One row of the run settings view: a declared `PARAM`, the value this run
-/// will use for it, and what (if anything) is wrong with that value. Built on
-/// demand from the flow, never stored, so it can't drift from the source.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParamRow {
-    /// The raw name — what `{{NAME}}` reads and what the value is remembered
-    /// under.
-    pub(crate) name: String,
-    /// What the row asks for, in words (the `LABEL`, or derived from the name).
-    pub(crate) prompt: String,
-    pub(crate) kind: crate::report::flow::ParamKind,
-    pub(crate) value: String,
-    /// Why this value wouldn't be accepted, if it wouldn't.
-    pub(crate) problem: Option<String>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum ReportView {
     /// The PaperTrail flow source (editable) plus its live validation.
@@ -1656,31 +1641,7 @@ impl TuiApp {
             return Vec::new();
         };
         let s = Strings::for_language(&self.language);
-        flow.params()
-            .into_iter()
-            .map(|p| {
-                let value = rt
-                    .param_values
-                    .get(&p.name)
-                    .cloned()
-                    .or_else(|| p.default.clone())
-                    .unwrap_or_default();
-                ParamRow {
-                    name: p.name.clone(),
-                    prompt: p.prompt(),
-                    kind: p.kind.clone(),
-                    // The same check that would stop the run, shown while
-                    // there is still someone here to fix it.
-                    problem: crate::report::params::check(p, &value, &s)
-                        .err()
-                        .or_else(|| {
-                            (value.trim().is_empty() && p.default.is_none())
-                                .then(|| s.param_row_required.to_string())
-                        }),
-                    value,
-                }
-            })
-            .collect()
+        crate::report::params::rows(&flow.params(), &rt.param_values, &s)
     }
 
     /// Whether the active report declares any parameters — the question every

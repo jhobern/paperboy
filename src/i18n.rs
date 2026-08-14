@@ -970,6 +970,7 @@ strings! {
     gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
     // PaperTrail block editor (report_editor.rs).
     gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
+    gui_report_view_run_settings => "Run settings", "Réglages d'exécution", "Kørselsindstillinger";
     gui_report_view_source => "Source", "Source", "Kilde";
     gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
     gui_report_palette_blocks => "Blocks", "Blocs", "Blokke";

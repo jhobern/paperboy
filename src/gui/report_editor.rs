@@ -42,6 +42,10 @@ pub enum EditorView {
     Source,
     /// The results grid from the last (or in-flight) run.
     Results,
+    /// The values this run will use for the report's `PARAM` declarations. Only
+    /// offered by a report that declares any; such a report *opens* here, so
+    /// what it is about to run against is seen before anything is sent.
+    RunSettings,
 }
 
 /// Where the editor's report is saved back to.
@@ -167,6 +171,14 @@ pub struct ReportEditor {
     /// exported as though it were them). Dismissing the preview brings them
     /// straight back.
     pub dry_run: Option<Box<crate::report::dry_run::DryRunReport>>,
+    /// The values chosen for this report's `PARAM`s, keyed by raw name. Owned
+    /// by the editor rather than the report: a value belongs to the run, not to
+    /// the file (which stays the same for everyone who opens it).
+    pub param_values: crate::report::params::ParamValues,
+    /// Whether [`ReportEditor::seed_params`] has run. The editor is built
+    /// without the session in hand, so the last-used values are filled in on
+    /// the first frame instead — once.
+    params_seeded: bool,
     /// A toolbar button pressed this frame, run *after* the body has been drawn
     /// (see [`ToolbarAct`]).
     pending_toolbar: Option<ToolbarAct>,
@@ -244,9 +256,17 @@ impl ReportEditor {
             palette_w: 168.0,
             inspector: None,
             dry_run: None,
+            param_values: Default::default(),
+            params_seeded: false,
             pending_toolbar: None,
         };
         ed.reparse();
+        // A report that asks for something asks it first: opening on the blocks
+        // of a script its reader never wrote hides the one thing they have to
+        // answer.
+        if ed.has_params() {
+            ed.view = EditorView::RunSettings;
+        }
         ed
     }
 
@@ -267,6 +287,7 @@ impl ReportEditor {
             run: self.run.take(),
             results_exported: self.results_exported,
             last_export: self.last_export.clone(),
+            params: std::mem::take(&mut self.param_values),
         }
     }
 
@@ -279,6 +300,11 @@ impl ReportEditor {
         self.run = parked.run;
         self.results_exported = parked.results_exported;
         self.last_export = parked.last_export;
+        if !parked.params.is_empty() {
+            self.param_values = parked.params;
+            // Already answered: don't overwrite them from the remembered set.
+            self.params_seeded = true;
+        }
         if self.result.is_some() {
             self.view = EditorView::Results;
         }
@@ -397,12 +423,98 @@ impl ReportEditor {
                 .all(|d| d.severity != Severity::Error)
     }
 
+    /// Whether this report declares any `PARAM`s — the question every "should
+    /// the run settings be here?" decision asks.
+    pub fn has_params(&self) -> bool {
+        self.flow.as_ref().is_some_and(|f| !f.params().is_empty())
+    }
+
+    /// The run settings form: one row per declared parameter, built fresh from
+    /// the flow and the chosen values (never cached, so it can't drift from the
+    /// source) by the same shared builder the terminal UI uses.
+    pub fn param_rows(&self, s: &Strings) -> Vec<crate::report::params::ParamRow> {
+        let Some(flow) = self.flow.as_ref() else {
+            return Vec::new();
+        };
+        crate::report::params::rows(&flow.params(), &self.param_values, s)
+    }
+
+    /// Fill in the values this report was last run with, once. Anything the
+    /// remembered set doesn't cover keeps the declared default, so adding a
+    /// parameter to a report someone has already run doesn't leave it blank —
+    /// and nothing already chosen is overwritten, because the user's own answer
+    /// outranks both.
+    pub fn seed_params(&mut self, session: &crate::session::Session) {
+        if self.params_seeded {
+            return;
+        }
+        self.params_seeded = true;
+        let Some(flow) = self.flow.as_ref() else {
+            return;
+        };
+        let remembered = session.remembered_params(&self.report.param_key());
+        let declared: Vec<(String, Option<String>)> = flow
+            .params()
+            .into_iter()
+            .map(|p| (p.name.clone(), p.default.clone()))
+            .collect();
+        for (name, default) in declared {
+            if self.param_values.contains_key(&name) {
+                continue;
+            }
+            let value = remembered
+                .get(&name)
+                .cloned()
+                .or(default)
+                .unwrap_or_default();
+            self.param_values.insert(name, value);
+        }
+    }
+
+    /// Whether Run should open the run settings instead of starting: a report
+    /// that asks for values stops at the questions on the way to its run, and
+    /// Run from the results is how you get back to them.
+    fn run_needs_settings(&self) -> bool {
+        !self.is_running() && self.view != EditorView::RunSettings && self.has_params()
+    }
+
     /// Start a background run of the current flow, switching to the Results view.
     /// A blocked run (unbound / no inputs) reports why in the status line.
     fn start_run(&mut self, app: &mut GuiApp) {
         let Some(flow) = self.flow.clone() else {
             return;
         };
+        // The questions first — see `run_needs_settings`. Showing them discards
+        // nothing, so this happens before any result is cleared below.
+        if self.run_needs_settings() {
+            self.seed_params(&app.session);
+            self.view = EditorView::RunSettings;
+            app.session.status = Some(Status::ReportRunSettingsFirst);
+            return;
+        }
+        let rows = self.param_rows(&app.strings);
+        if let Some(problem) = rows
+            .iter()
+            .find_map(|r| r.problem.as_ref().map(|p| format!("{}: {p}", r.prompt)))
+        {
+            // Refuse rather than run: a report that asks for something and is
+            // given nothing produces plausible-looking rows built around a hole.
+            app.session.status = Some(Status::ReportRunBlocked(problem));
+            self.view = EditorView::RunSettings;
+            return;
+        }
+        // Remember the answers for next time, keyed by the report (path → git
+        // origin → name) rather than by its process-unique id.
+        let chosen: crate::report::params::ParamValues = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        if app
+            .session
+            .remember_params(&self.report.param_key(), &chosen)
+        {
+            app.session.save();
+        }
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -414,6 +526,7 @@ impl ReportEditor {
                 // Only the app knows the chosen language; the run's own errors
                 // are user-facing text like any other.
                 inputs.language = app.session.language.clone();
+                inputs.params = chosen;
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
@@ -461,6 +574,14 @@ impl ReportEditor {
         let Some(flow) = self.flow.clone() else {
             return;
         };
+        // The preview answers the same questions the real run will, so it has
+        // to be given the same values -- a dry run against unset parameters
+        // would describe a flow nobody is going to run.
+        let chosen: crate::report::params::ParamValues = self
+            .param_rows(&app.strings)
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -478,7 +599,7 @@ impl ReportEditor {
                     root: inputs.root.clone(),
                     runner: &DryRunner,
                     strings: &strings,
-                    params: inputs.params.clone(),
+                    params: chosen,
                     sink: None,
                 };
                 let result = run_flow_raw(&inputs.flow, &ctx);
@@ -1584,6 +1705,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
     let th = app.theme;
     let mut close = false;
+    // Fill the form from what this report was last run with, once per editor.
+    ed.seed_params(&app.session);
     // NB: `pending_toolbar` is *not* cleared here. It is always taken at the end
     // of the frame that set it, so there is nothing stale to clear -- but a
     // shortcut or menu entry outside the editor (Ctrl+S, File > Save > Report)
@@ -1655,11 +1778,20 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.label(title);
         ui.separator();
-        for (view, label) in [
+        // The run settings tab is only offered by a report that asks
+        // something: an empty form would be a dead end on every other report.
+        let mut views = vec![
             (EditorView::Blocks, app.strings.gui_report_view_blocks),
             (EditorView::Source, app.strings.gui_report_view_source),
             (EditorView::Results, app.strings.gui_report_view_results),
-        ] {
+        ];
+        if ed.has_params() {
+            views.push((
+                EditorView::RunSettings,
+                app.strings.gui_report_view_run_settings,
+            ));
+        }
+        for (view, label) in views {
             if super::widgets::selectable(ui, ed.view == view, RichText::new(label)).clicked() {
                 ed.view = view;
             }
@@ -1818,6 +1950,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         EditorView::Source => source_view(&mut ed, app, ui),
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
         EditorView::Results => results_view(&mut ed, app, ui),
+        EditorView::RunSettings => run_settings_view(&mut ed, app, ui),
     }
 
     // The node-configure wizard modal (opened by double-clicking a block on the
@@ -2355,6 +2488,163 @@ fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
 }
 
 /// The raw `.trail` source editor + validation panel.
+/// The run settings view: one row per declared `PARAM` — what it asks for, the
+/// value this run will use, and what is wrong with it, if anything.
+///
+/// Deliberately a *form*, not a script: most people who run a report never open
+/// it, so every row is a labelled field with the widget its declared type
+/// deserves (a drop-down for a closed set, a picker for a path). The raw name
+/// and type sit beside it dimmed — the form doubles as the reference for anyone
+/// who does go on to read the source.
+fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
+    use crate::report::flow::ParamKind;
+
+    let th = app.theme;
+    let pick_label = app.strings.param_pick_path;
+    let rows = ed.param_rows(&app.strings);
+    if rows.is_empty() {
+        ui.colored_label(th.dim, app.strings.param_view_empty);
+        return;
+    }
+    // The value a widget changed this frame, and any path the user asked to
+    // browse for — applied after the loop so the rows aren't borrowed while the
+    // app is.
+    let mut set: Option<(String, String)> = None;
+    let mut browse: Option<(String, bool)> = None;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("pt_run_settings")
+                .num_columns(3)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for row in &rows {
+                        ui.label(RichText::new(&row.prompt).strong().color(th.text));
+
+                        let mut value = row.value.clone();
+                        match &row.kind {
+                            ParamKind::Choice(options) if !options.is_empty() => {
+                                if param_combo(ui, th, &row.name, &mut value, options) {
+                                    set = Some((row.name.clone(), value.clone()));
+                                }
+                            }
+                            ParamKind::Env => {
+                                let envs: Vec<String> = app
+                                    .session
+                                    .global_envs
+                                    .iter()
+                                    .map(|e| e.name.clone())
+                                    .collect();
+                                // Nothing loaded to choose between: typing a
+                                // name by hand still works, and is the right
+                                // answer for an environment that lives on
+                                // another machine.
+                                if envs.is_empty() {
+                                    if ui.text_edit_singleline(&mut value).changed() {
+                                        set = Some((row.name.clone(), value.clone()));
+                                    }
+                                } else if param_combo(ui, th, &row.name, &mut value, &envs) {
+                                    set = Some((row.name.clone(), value.clone()));
+                                }
+                            }
+                            ParamKind::Folder | ParamKind::File => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(format!("{} {}", super::icons::FOLDER, pick_label))
+                                        .clicked()
+                                    {
+                                        browse = Some((
+                                            row.name.clone(),
+                                            matches!(row.kind, ParamKind::Folder),
+                                        ));
+                                    }
+                                    // Editable as well as pickable: a path can
+                                    // be pasted, and a report's own folder is
+                                    // often quicker to type than to walk to.
+                                    if ui.text_edit_singleline(&mut value).changed() {
+                                        set = Some((row.name.clone(), value.clone()));
+                                    }
+                                });
+                            }
+                            _ => {
+                                if ui.text_edit_singleline(&mut value).changed() {
+                                    set = Some((row.name.clone(), value.clone()));
+                                }
+                            }
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                th.dim,
+                                format!("{} {}", row.name, row.kind.keyword()),
+                            );
+                            if let Some(problem) = &row.problem {
+                                ui.colored_label(th.err, problem);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+
+    if let Some((name, value)) = set {
+        ed.param_values.insert(name, value);
+    }
+    if let Some((name, folder)) = browse {
+        let seed = ed
+            .report
+            .path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf);
+        let kind = if folder {
+            super::filepick::PickKind::Folder
+        } else {
+            super::filepick::PickKind::File {
+                filters: super::filepick::owned_filters(&[("*", &["*"])]),
+            }
+        };
+        app.request_pick(
+            kind,
+            pick_label,
+            seed.as_deref(),
+            super::menu::PickAction::ReportParamPath { name },
+        );
+    }
+}
+
+/// A parameter's drop-down: the closed set of answers its type allows, plus
+/// whatever it is currently set to if that isn't one of them (a value from a
+/// remembered run, or an environment that isn't loaded today — hiding it would
+/// silently change what the run does). Returns true when the pick changed.
+fn param_combo(
+    ui: &mut egui::Ui,
+    th: super::theme::GuiTheme,
+    name: &str,
+    value: &mut String,
+    options: &[String],
+) -> bool {
+    let mut changed = false;
+    let known = options.iter().any(|o| o == value);
+    egui::ComboBox::from_id_salt(("pt_param", name))
+        .selected_text(RichText::new(value.clone()).color(if known { th.text } else { th.pending }))
+        .show_ui(ui, |ui| {
+            if !known && !value.is_empty() {
+                let cur = value.clone();
+                let _ = ui.selectable_label(true, RichText::new(cur).color(th.pending));
+            }
+            for o in options {
+                if ui.selectable_label(o == value, o).clicked() {
+                    *value = o.clone();
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // Reserve room for the diagnostics panel at the bottom, then let the editor
     // fill the rest. Keeping the editor above avoids nesting egui panels inside
@@ -12059,6 +12349,96 @@ mod toolbar_commit_tests {
             ed.report.text
         );
         assert!(ed.view == EditorView::Results, "and the button still acted");
+    }
+}
+
+#[cfg(test)]
+mod param_view_tests {
+    use super::*;
+    use crate::report::Report;
+    use crate::session::Session;
+
+    const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+
+    fn editor(text: &str) -> (GuiApp, ReportEditor) {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", text));
+        let ed = app.report_editor.take().expect("editor is open");
+        (app, ed)
+    }
+
+    /// A report that asks for something opens on the question, not on the
+    /// source: the people who run reports are not the people who write them.
+    #[test]
+    fn a_report_that_asks_for_values_opens_on_them() {
+        let (_app, ed) = editor(TRAIL);
+        assert!(ed.view == EditorView::RunSettings);
+        let (_app, ed) = editor("# name: Face\n# collection: c.hurl\nREPORT REQUEST x\n");
+        assert!(
+            ed.view == EditorView::Blocks,
+            "a report with nothing to ask still opens where it is built"
+        );
+    }
+
+    /// The form is built from the declarations, defaults included, and the row
+    /// with no default is the one flagged as missing.
+    #[test]
+    fn the_form_asks_one_question_per_parameter() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        let rows = ed.param_rows(&app.strings);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "TICKET");
+        assert_eq!(rows[0].prompt, "Ticket number", "the LABEL is the prompt");
+        assert!(rows[0].problem.is_some(), "nothing given and no default");
+        assert_eq!(rows[1].value, "au", "the declared default fills the row");
+        assert!(rows[1].problem.is_none());
+    }
+
+    /// Run stops at the questions on the way to the run, and only then starts.
+    #[test]
+    fn run_stops_at_the_questions_before_it_starts() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.view = EditorView::Blocks;
+
+        ed.start_run(&mut app);
+        assert!(ed.view == EditorView::RunSettings, "the questions first");
+        assert!(matches!(
+            app.session.status,
+            Some(Status::ReportRunSettingsFirst)
+        ));
+        assert!(!ed.is_running(), "and nothing has been run yet");
+
+        // Still unanswered: pressing Run again refuses rather than running a
+        // report built around a hole.
+        ed.start_run(&mut app);
+        assert!(matches!(
+            app.session.status,
+            Some(Status::ReportRunBlocked(_))
+        ));
+        assert!(!ed.is_running());
+    }
+
+    /// Answers survive a trip to another tab, so nobody types them twice.
+    #[test]
+    fn the_answers_travel_with_a_parked_run() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        let parked = ed.park_run();
+
+        let (_app2, mut fresh) = editor(TRAIL);
+        fresh.adopt_run(parked);
+        assert_eq!(
+            fresh.param_values.get("TICKET").map(String::as_str),
+            Some("FR-12")
+        );
     }
 }
 

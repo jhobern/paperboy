@@ -111,6 +111,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI asks a report's questions too.** A report that declares `PARAM`s
+  now opens on a Run settings form in the desktop app, exactly as it does in
+  the terminal: one labelled row per parameter, with a drop-down for a closed
+  set of answers or for an environment, a Browse button beside a `FOLDER` or
+  `FILE` path, and the raw name and type alongside for anyone who goes on to
+  read the source. Run stops at the form on the way to the run, and refuses to
+  start while a required value is missing rather than building rows around a
+  hole. Answers are remembered per report between runs and survive a trip to
+  another tab, and a dry run now previews with the same values the real run
+  would use. The form itself is built by the shared core, so the two
+  front-ends can't drift apart.
+
 - **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
   clause may name an environment (or a `FILE(…)` snapshot) through a parameter
   — `BASELINE("{{BASELINE_ENV}}"), COMPARISON("{{COMPARE_ENV}}")` — so the

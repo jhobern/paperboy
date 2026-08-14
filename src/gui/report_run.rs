@@ -102,6 +102,10 @@ pub struct ParkedRun {
     pub run: Option<RunHandle>,
     pub results_exported: bool,
     pub last_export: Option<String>,
+    /// The answers typed into the run settings. They travel with the run
+    /// because they are what produced it -- and because retyping them after a
+    /// trip to another tab would be a poor reward for having answered once.
+    pub params: crate::report::params::ParamValues,
 }
 
 impl ParkedRun {

@@ -60,6 +60,54 @@ pub fn effective(decls: &[&ParamDecl], chosen: &ParamValues) -> ParamValues {
         .collect()
 }
 
+/// One row of a run settings form: a declared parameter, the value this run
+/// will use for it, and what (if anything) is wrong with that value.
+///
+/// Lives here rather than in either front-end because both build the same
+/// form from the same declarations, and a question that is worded one way in
+/// the terminal and another in the window is two different reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParamRow {
+    /// The raw name — what `{{NAME}}` reads, what `--param NAME=…` sets and
+    /// what the value is remembered under.
+    pub name: String,
+    /// What the row asks for, in words (the `LABEL`, or derived from the name).
+    pub prompt: String,
+    pub kind: ParamKind,
+    pub value: String,
+    /// Why this value wouldn't be accepted, if it wouldn't.
+    pub problem: Option<String>,
+}
+
+/// Build the run settings form for `decls` against the values chosen so far.
+///
+/// A row's value falls back to the declaration's default, so a form opened
+/// before anything is chosen already shows what the report would run with
+/// today. The complaint is the same check that would stop the run, made while
+/// there is still someone here to fix it.
+pub fn rows(decls: &[&ParamDecl], chosen: &ParamValues, s: &Strings) -> Vec<ParamRow> {
+    decls
+        .iter()
+        .map(|p| {
+            let value = chosen
+                .get(&p.name)
+                .cloned()
+                .or_else(|| p.default.clone())
+                .unwrap_or_default();
+            ParamRow {
+                name: p.name.clone(),
+                prompt: p.prompt(),
+                kind: p.kind.clone(),
+                problem: check(p, &value, s).err().or_else(|| {
+                    (value.trim().is_empty() && p.default.is_none())
+                        .then(|| s.param_row_required.to_string())
+                }),
+                value,
+            }
+        })
+        .collect()
+}
+
 /// Whether `value` is acceptable for `decl`.
 ///
 /// Shared with the front-ends so a run settings form can say "not a number"
