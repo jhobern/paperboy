@@ -77,11 +77,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   knowing that `p` existed. Opening the questions discards nothing, so the
   unexported-results warning is held back until the run actually starts.
 
-- **The run settings say where Esc goes, and `p` closes them again.** A report
-  that asks for values opens on them, so "Esc back" pointed at a step its user
-  never took — it now reads "Esc show the report", and `p` toggles the
-  questions away as readily as it brings them up (the way `v` toggles the
-  results).
+- **Hints no longer explain the arrow keys.** Every list in the app said
+  "↑↓ move", which is the one thing nobody needs telling — it crowded out the
+  keys that *are* worth knowing in the same line. Arrows are still advertised
+  where they don't just move a cursor: `Shift+↑/↓` reorders, `←/→` picks or
+  steps into a folder, `↑/↓` changes an export format or a colour channel.
+
+- **`p` toggles a report's questions, and the hint says so.** A report that
+  asks for values opens on them, so the old "Esc back" pointed at a step its
+  user never took. `p` now closes the questions as readily as it opens them —
+  the way `v` toggles the results grid — and the hint reads "p show the
+  report". Esc still works, unadvertised.
 
 - **Long pick-lists in a report filter as you type.** The environment and
   choice pickers used to treat any letter as "cancel", which made picking one

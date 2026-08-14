@@ -1882,6 +1882,10 @@ impl TuiApp {
             KeyCode::Home => self.param_cursor_move(i32::MIN),
             KeyCode::End => self.param_cursor_move(i32::MAX),
             KeyCode::Enter | KeyCode::Char(' ') => self.configure_selected_param(),
+            // `p` is what the hint advertises — it opened this view, so it
+            // closes it. Esc does the same thing without being advertised: it
+            // is what a hand reaches for, but "back" is the wrong word for a
+            // view the report opened itself on.
             KeyCode::Esc => {
                 let back = self.reports[idx].editor_view;
                 self.reports[idx].view = back;
