@@ -23016,6 +23016,31 @@ fn clicking_a_run_settings_row_selects_then_opens_it() {
     );
 }
 
+/// The run settings are a toggle, not a one-way door. A report that asks for
+/// values opens on them, so its user pressed nothing to get there: `p` has to
+/// take them back to the report as readily as it brought them here.
+#[test]
+fn the_run_settings_key_also_closes_them() {
+    let mut app = report_app();
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "the report opens on its questions"
+    );
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::Source,
+        "`p` again shows the report itself"
+    );
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "and brings the questions back"
+    );
+}
+
 /// An `ENV` parameter is picked from the loaded environments, and typing
 /// narrows that list instead of dismissing it — the whole point of the picker
 /// when a dozen environments are loaded and the wanted one is known by name.

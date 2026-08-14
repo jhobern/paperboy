@@ -77,6 +77,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   knowing that `p` existed. Opening the questions discards nothing, so the
   unexported-results warning is held back until the run actually starts.
 
+- **The run settings say where Esc goes, and `p` closes them again.** A report
+  that asks for values opens on them, so "Esc back" pointed at a step its user
+  never took — it now reads "Esc show the report", and `p` toggles the
+  questions away as readily as it brings them up (the way `v` toggles the
+  results).
+
 - **Long pick-lists in a report filter as you type.** The environment and
   choice pickers used to treat any letter as "cancel", which made picking one
   of a dozen loaded environments a scroll. Typing now narrows the list on a

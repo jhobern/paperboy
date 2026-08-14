@@ -1694,11 +1694,19 @@ impl TuiApp {
 
     /// Open the run settings for the active report, seeding the values the
     /// first time from what this report was last run with (and, failing that,
-    /// from each declaration's own default).
+    /// from each declaration's own default). Pressing the key again on the run
+    /// settings goes back to the report itself: a report that asks for values
+    /// *opens* on them, so its user never pressed anything to get here and
+    /// needs a way out that isn't "undo a step you didn't take" — the same
+    /// toggle `v` gives the results grid.
     pub(crate) fn open_report_run_settings(&mut self) {
         let Some(idx) = self.active_report_index() else {
             return;
         };
+        if self.reports[idx].view == ReportView::RunSettings {
+            self.reports[idx].view = self.reports[idx].editor_view;
+            return;
+        }
         if !self.report_has_params(idx) {
             self.status = Some(Status::ReportRunBlocked(
                 Strings::for_language(&self.language)

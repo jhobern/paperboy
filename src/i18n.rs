@@ -504,7 +504,7 @@ strings! {
     help_report_export => "export the last run (CSV / JSON / HTML / xlsx by extension)", "exporter la dernière exécution (CSV / JSON / HTML / xlsx selon l'extension)", "eksportér den seneste kørsel (CSV / JSON / HTML / xlsx efter filtype)";
     help_report_baseline => "save the last run as a .baseline snapshot — reference it later with BASELINE(FILE) or COMPARISON(FILE)", "enregistrer la dernière exécution comme instantané .baseline — à réutiliser via BASELINE(FILE) ou COMPARISON(FILE)", "gem den seneste kørsel som et .baseline-øjebliksbillede — genbrug det med BASELINE(FILE) eller COMPARISON(FILE)";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
-    help_report_params => "set the values this report asks for before it runs (its PARAMs)", "définir les valeurs que ce rapport demande avant son exécution (ses PARAM)", "angiv de værdier, denne rapport beder om, før den kører (dens PARAM)";
+    help_report_params => "show or hide the values this report asks for before it runs (its PARAMs)", "afficher ou masquer les valeurs que ce rapport demande avant son exécution (ses PARAM)", "vis eller skjul de værdier, denne rapport beder om, før den kører (dens PARAM)";
     help_report_bind => "bind the report to one of the open collections", "lier le rapport à l'une des collections ouvertes", "bind rapporten til en af de åbne samlinger";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
@@ -1278,7 +1278,7 @@ strings! {
     param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
     param_view_empty => "No parameters declared.", "Aucun paramètre déclaré.", "Ingen parametre erklæret.";
-    param_view_hint => "Enter set  ↑↓ move  r run  Esc back", "Entrée définir  ↑↓ déplacer  r exécuter  Échap retour", "Enter angiv  ↑↓ flyt  r kør  Esc tilbage";
+    param_view_hint => "Enter set  ↑↓ move  r run  Esc show the report", "Entrée définir  ↑↓ déplacer  r exécuter  Échap afficher le rapport", "Enter angiv  ↑↓ flyt  r kør  Esc vis rapporten";
     param_value_unset => "(not set)", "(non renseigné)", "(ikke angivet)";
     param_open_hint => "p run settings", "p paramètres d'exécution", "p kørselsindstillinger";
     param_required => "'{}' has no value and no default — set it before running (--param {}=…).", "« {} » n'a ni valeur ni valeur par défaut — renseignez-le avant d'exécuter (--param {}=…).", "'{}' har hverken en værdi eller en standardværdi — angiv den før kørslen (--param {}=…).";
