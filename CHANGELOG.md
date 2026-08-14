@@ -111,20 +111,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
-- **The GUI asks a report's questions too.** A report that declares `PARAM`s
-  now opens on a Run settings form in the desktop app, exactly as it does in
-  the terminal: one labelled row per parameter, with a drop-down for a closed
-  set of answers or for an environment, a Browse button beside a `FOLDER` or
-  `FILE` path, and the raw name and type alongside for anyone who goes on to
-  read the source. Run stops at the form on the way to the run, and refuses to
-  start while a required value is missing rather than building rows around a
-  hole. Answers are remembered per report between runs and survive a trip to
-  another tab, and a dry run now previews with the same values the real run
-  would use. The form itself is built by the shared core, so the two
-  front-ends can't drift apart. The form is drawn as tinted, rounded cards
-  in the same style as the Blocks editor — one card per question, the
-  parameter's name and type on the far side of it, and a fixed field width so
-  a column of answers lines up instead of each box shrinking to fit.
+- **The GUI asks a report's questions on the way to a run.** A report that
+  declares `PARAM`s now stops at a run-settings dialog when Run (or Dry run)
+  is pressed: one tinted card per parameter in the Blocks editor's own idiom,
+  a drop-down for a closed set of answers or for an environment, a Browse
+  button beside a `FOLDER` or `FILE` path, and the raw name and type dimmed
+  alongside for anyone who goes on to read the source. Both Run and Dry run
+  are offered as exits whichever button opened it, and neither will start
+  while a required value is missing. The questions are asked once per editing
+  session — so a preview can be followed straight by the run it previewed —
+  and again only when the report changes what it declares. A `Run settings`
+  button and a summary of the chosen values (`REGION=au · TICKET=FR-12`) sit
+  in the toolbar, so what the next run will use is always on screen and one
+  click away. Answers are remembered per report between runs and survive a
+  trip to another tab, and a dry run previews with the same values the real
+  run would use. The form is built by the shared core, so the two front-ends
+  can't drift apart.
 
 - **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
   clause may name an environment (or a `FILE(…)` snapshot) through a parameter

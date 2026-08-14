@@ -42,10 +42,6 @@ pub enum EditorView {
     Source,
     /// The results grid from the last (or in-flight) run.
     Results,
-    /// The values this run will use for the report's `PARAM` declarations. Only
-    /// offered by a report that declares any; such a report *opens* here, so
-    /// what it is about to run against is seen before anything is sent.
-    RunSettings,
 }
 
 /// Where the editor's report is saved back to.
@@ -179,9 +175,31 @@ pub struct ReportEditor {
     /// without the session in hand, so the last-used values are filled in on
     /// the first frame instead — once.
     params_seeded: bool,
+    /// What the report's `PARAM` declarations looked like when the answers were
+    /// last confirmed. Editing a declaration re-asks the questions; editing
+    /// anything else does not.
+    params_sig: String,
+    /// Whether the questions have been answered for this editing session. Set
+    /// when the dialog is left by Run or Dry run, so a preview can be followed
+    /// straight by the real run without answering twice.
+    params_confirmed: bool,
+    /// The open run-settings dialog, and what pressing its primary button will
+    /// do. `None` when it isn't showing.
+    params_modal: Option<RunIntent>,
     /// A toolbar button pressed this frame, run *after* the body has been drawn
     /// (see [`ToolbarAct`]).
     pending_toolbar: Option<ToolbarAct>,
+}
+
+/// Which button the run-settings dialog was opened on the way to, and so which
+/// of its two exits is the primary one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RunIntent {
+    Run,
+    DryRun,
+    /// Opened deliberately from the toolbar rather than on the way anywhere.
+    /// Both exits are offered; neither is emphasised.
+    Review,
 }
 
 /// A toolbar button press, deferred to the end of the frame that pressed it.
@@ -198,6 +216,8 @@ pub struct ReportEditor {
 enum ToolbarAct {
     Run,
     DryRun,
+    /// Open the run-settings dialog without starting anything.
+    RunSettings,
     Save,
     Close,
     /// Hand the named file (the last export) to the desktop's opener.
@@ -258,15 +278,12 @@ impl ReportEditor {
             dry_run: None,
             param_values: Default::default(),
             params_seeded: false,
+            params_sig: String::new(),
+            params_confirmed: false,
+            params_modal: None,
             pending_toolbar: None,
         };
         ed.reparse();
-        // A report that asks for something asks it first: opening on the blocks
-        // of a script its reader never wrote hides the one thing they have to
-        // answer.
-        if ed.has_params() {
-            ed.view = EditorView::RunSettings;
-        }
         ed
     }
 
@@ -335,6 +352,45 @@ impl ReportEditor {
                 self.parse_error_line = Some(e.line);
             }
         }
+        // Answers are confirmed against the questions that were asked. Change
+        // what the report declares — a new parameter, a different set of
+        // choices — and the next run asks again; change anything else and it
+        // doesn't, so editing a report between runs isn't a interrogation.
+        // Only judged when the text parses: an edit caught mid-keystroke has
+        // no declarations to compare, and re-asking every time a report is
+        // momentarily unparseable would ask on nearly every keystroke.
+        let Some(sig) = self.param_signature() else {
+            return;
+        };
+        if sig != self.params_sig {
+            self.params_sig = sig;
+            self.params_confirmed = false;
+            // A parameter that has just appeared has no value yet.
+            self.params_seeded = false;
+        }
+    }
+
+    /// What this report asks, as one string: every declaration's name, type and
+    /// default. Compared rather than inspected, so it only has to be stable.
+    fn param_signature(&self) -> Option<String> {
+        let flow = self.flow.as_ref()?;
+        Some(
+            flow.params()
+                .iter()
+                .map(|p| {
+                    // The *whole* kind, not just its keyword: adding an option to a
+                    // CHOICE changes what is being asked as much as a new
+                    // parameter does.
+                    format!(
+                        "{}:{:?}:{}",
+                        p.name,
+                        p.kind,
+                        p.default.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     /// Set the report text (marking it dirty) and re-parse.
@@ -471,11 +527,38 @@ impl ReportEditor {
         }
     }
 
-    /// Whether Run should open the run settings instead of starting: a report
-    /// that asks for values stops at the questions on the way to its run, and
-    /// Run from the results is how you get back to them.
+    /// Whether starting should stop at the questions first.
+    ///
+    /// Once per editing session, not once per run: the point of answering is to
+    /// be able to preview, look, and run the same thing — being asked again
+    /// between those two steps would make the preview meaningless as a
+    /// confirmation. [`Self::reparse`] re-arms this when a declaration changes.
     fn run_needs_settings(&self) -> bool {
-        !self.is_running() && self.view != EditorView::RunSettings && self.has_params()
+        !self.is_running() && !self.params_confirmed && self.has_params()
+    }
+
+    /// Open the run-settings dialog, seeded with what the last run used.
+    pub(super) fn open_param_modal(&mut self, app: &GuiApp, intent: RunIntent) {
+        self.seed_params(&app.session);
+        self.params_modal = Some(intent);
+    }
+
+    /// The chosen values in one line — `REGION=au · TICKET=FR-12` — for the
+    /// toolbar, so what the next run will use is on screen without opening
+    /// anything.
+    pub(super) fn param_summary(&self, s: &Strings) -> String {
+        self.param_rows(s)
+            .iter()
+            .map(|r| {
+                let v = if r.value.is_empty() {
+                    s.param_value_unset
+                } else {
+                    r.value.as_str()
+                };
+                format!("{}={}", r.name, v)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// Start a background run of the current flow, switching to the Results view.
@@ -484,12 +567,10 @@ impl ReportEditor {
         let Some(flow) = self.flow.clone() else {
             return;
         };
-        // The questions first — see `run_needs_settings`. Showing them discards
+        // The questions first — see `run_needs_settings`. Asking discards
         // nothing, so this happens before any result is cleared below.
         if self.run_needs_settings() {
-            self.seed_params(&app.session);
-            self.view = EditorView::RunSettings;
-            app.session.status = Some(Status::ReportRunSettingsFirst);
+            self.open_param_modal(app, RunIntent::Run);
             return;
         }
         let rows = self.param_rows(&app.strings);
@@ -500,7 +581,7 @@ impl ReportEditor {
             // Refuse rather than run: a report that asks for something and is
             // given nothing produces plausible-looking rows built around a hole.
             app.session.status = Some(Status::ReportRunBlocked(problem));
-            self.view = EditorView::RunSettings;
+            self.open_param_modal(app, RunIntent::Run);
             return;
         }
         // Remember the answers for next time, keyed by the report (path → git
@@ -574,6 +655,12 @@ impl ReportEditor {
         let Some(flow) = self.flow.clone() else {
             return;
         };
+        // A preview is only worth looking at if it previews the run you mean,
+        // so the questions are asked here too -- once, shared with Run.
+        if self.run_needs_settings() {
+            self.open_param_modal(app, RunIntent::DryRun);
+            return;
+        }
         // The preview answers the same questions the real run will, so it has
         // to be given the same values -- a dry run against unset parameters
         // would describe a flow nobody is going to run.
@@ -1778,20 +1865,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.label(title);
         ui.separator();
-        // The run settings tab is only offered by a report that asks
-        // something: an empty form would be a dead end on every other report.
-        let mut views = vec![
+        for (view, label) in [
             (EditorView::Blocks, app.strings.gui_report_view_blocks),
             (EditorView::Source, app.strings.gui_report_view_source),
             (EditorView::Results, app.strings.gui_report_view_results),
-        ];
-        if ed.has_params() {
-            views.push((
-                EditorView::RunSettings,
-                app.strings.gui_report_view_run_settings,
-            ));
-        }
-        for (view, label) in views {
+        ] {
             if super::widgets::selectable(ui, ed.view == view, RichText::new(label)).clicked() {
                 ed.view = view;
             }
@@ -1878,6 +1956,27 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if dry.clicked() {
                     ed.pending_toolbar = Some(ToolbarAct::DryRun);
                 }
+                // The way back to the questions, and — beside it — the answers
+                // themselves. A report that asks for something should never
+                // leave you guessing what it is about to run with, and the
+                // dialog is only shown unprompted once.
+                if ed.has_params() {
+                    if ui
+                        .button(format!(
+                            "{} {}",
+                            super::icons::ENV,
+                            app.strings.gui_report_run_settings
+                        ))
+                        .on_hover_text(app.strings.gui_report_run_settings_tooltip)
+                        .clicked()
+                    {
+                        ed.pending_toolbar = Some(ToolbarAct::RunSettings);
+                    }
+                    let summary = ed.param_summary(&app.strings);
+                    ui.add(
+                        egui::Label::new(RichText::new(summary).small().color(th.dim)).truncate(),
+                    );
+                }
             }
             // What you can do with a *result*, shown only where there is one to
             // do it with. Left of the run controls, and separated from them:
@@ -1950,8 +2049,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         EditorView::Source => source_view(&mut ed, app, ui),
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
         EditorView::Results => results_view(&mut ed, app, ui),
-        EditorView::RunSettings => run_settings_view(&mut ed, app, ui),
     }
+
+    // The run settings dialog: the report's own questions, asked on the way to
+    // a run rather than occupying a view of their own.
+    show_param_modal(&mut ed, app, ui.ctx());
 
     // The node-configure wizard modal (opened by double-clicking a block on the
     // blocks view) floats above whichever view is showing.
@@ -2024,6 +2126,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     match ed.pending_toolbar.take() {
         Some(ToolbarAct::Run) => ed.start_run(app),
         Some(ToolbarAct::DryRun) => ed.start_dry_run(app),
+        Some(ToolbarAct::RunSettings) => ed.open_param_modal(app, RunIntent::Review),
         Some(ToolbarAct::Save) => save_report(&mut ed, app),
         Some(ToolbarAct::Close) => close = true,
         Some(ToolbarAct::OpenExport(path)) => {
@@ -2488,64 +2591,134 @@ fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
 }
 
 /// The raw `.trail` source editor + validation panel.
-/// The run settings view: one card per declared `PARAM` — what it asks for, the
-/// value this run will use, and what is wrong with it, if anything.
+/// The run settings dialog: one card per declared `PARAM` — what it asks for,
+/// the value this run will use, and what is wrong with it, if anything.
+///
+/// A dialog rather than a view because it is a step on the way to a run, not a
+/// place to be: it is opened by Run (and by Dry run, which needs the same
+/// answers to preview the run you actually mean), and it leaves by starting
+/// one. Both exits are offered whichever button opened it, so changing your
+/// mind about previewing first doesn't mean answering twice.
 ///
 /// Deliberately a *form*, not a script: most people who run a report never open
 /// it, so every parameter is a labelled field with the widget its declared type
 /// deserves (a drop-down for a closed set, a picker for a path). The raw name
 /// and type sit beside it dimmed — the form doubles as the reference for anyone
-/// who does go on to read the source.
-///
-/// Drawn as tinted, rounded cards rather than a bare grid so it reads as part
-/// of the same editor as the Blocks view: same corner radius, same panel-mixed
-/// fill, and the `subst` hue every other `{{substitution}}` in the editor
+/// who does go on to read the source. Drawn as tinted, rounded cards in the
+/// Blocks view's own idiom, in the `subst` hue every other `{{substitution}}`
 /// carries — which is exactly what a parameter is.
-fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
+fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
+    let Some(intent) = ed.params_modal else {
+        return;
+    };
     let th = app.theme;
     // A copy of its own, so the app is free to be borrowed mutably for the file
     // picker at the end without the form's own words going out of scope.
     let s = Strings::for_language(&app.session.language);
     let rows = ed.param_rows(&s);
-    if rows.is_empty() {
-        ui.add_space(8.0);
-        ui.colored_label(th.dim, s.param_none_declared);
-        return;
-    }
-    // Everything the loop wants from the app, taken before the rows borrow it.
     let envs: Vec<String> = app
         .session
         .global_envs
         .iter()
         .map(|e| e.name.clone())
         .collect();
-    // The value a widget changed this frame, and any path the user asked to
-    // browse for — applied after the loop, when the app is free again.
+    // Nothing may be started while a value would send the run at a hole.
+    let ready = rows.iter().all(|r| r.problem.is_none());
+
+    // What the frame decided, applied once the modal closure has let go of
+    // everything it borrowed.
     let mut set: Option<(String, String)> = None;
     let mut browse: Option<(String, bool)> = None;
+    let mut leave: Option<Option<RunIntent>> = None;
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(8.0);
-            // A form is read left to right along each line, so it is capped
-            // rather than stretched: fields spanning a maximised window would
-            // put the label and its value at opposite ends of the screen.
-            ui.set_max_width(FORM_MAX_WIDTH.min(ui.available_width()));
+    let modal = egui::Modal::new(egui::Id::new("pt_run_settings")).show(ctx, |ui| {
+        ui.set_min_width(FORM_MAX_WIDTH);
+        ui.set_max_width(FORM_MAX_WIDTH);
+        ui.horizontal(|ui| {
             ui.label(RichText::new(s.param_view_title).strong().color(th.text));
-            ui.colored_label(th.dim, s.param_view_lead);
-            ui.add_space(8.0);
-
-            for row in &rows {
-                if let Some((name, value)) = param_card(ui, &th, row, &envs, &s) {
-                    match value {
-                        CardEdit::Set(v) => set = Some((name, v)),
-                        CardEdit::Browse(folder) => browse = Some((name, folder)),
-                    }
+            // A modal has no title bar to hang a close button off, so it gets
+            // its own: every dialog in the app can be left by the corner as
+            // well as by Escape.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(RichText::new(super::icons::CLOSE).color(th.dim))
+                    .clicked()
+                {
+                    leave = Some(None);
                 }
-                ui.add_space(6.0);
+            });
+        });
+        ui.colored_label(th.dim, s.param_view_lead);
+        ui.add_space(8.0);
+
+        // Capped so a long form scrolls inside the dialog rather than growing
+        // it past the window it is centred in.
+        egui::ScrollArea::vertical()
+            .max_height(420.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for row in &rows {
+                    if let Some((name, edit)) = param_card(ui, &th, row, &envs, &s) {
+                        match edit {
+                            CardEdit::Set(v) => set = Some((name, v)),
+                            CardEdit::Browse(folder) => browse = Some((name, folder)),
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            // The button that was pressed to get here comes first, so the
+            // dialog reads as the middle of the gesture that opened it rather
+            // than as a fork in it.
+            let run = |ui: &mut egui::Ui, leave: &mut Option<Option<RunIntent>>| {
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(format!("{} {}", super::icons::PLAY, s.gui_report_run)),
+                    )
+                    .clicked()
+                {
+                    *leave = Some(Some(RunIntent::Run));
+                }
+            };
+            let dry = |ui: &mut egui::Ui, leave: &mut Option<Option<RunIntent>>| {
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::PREVIEW,
+                            s.gui_report_dry_run
+                        )),
+                    )
+                    .on_hover_text(s.gui_report_dry_run_tooltip)
+                    .clicked()
+                {
+                    *leave = Some(Some(RunIntent::DryRun));
+                }
+            };
+            if intent == RunIntent::DryRun {
+                dry(ui, &mut leave);
+                run(ui, &mut leave);
+            } else {
+                run(ui, &mut leave);
+                dry(ui, &mut leave);
+            }
+            if ui.button(s.gui_cancel).clicked() {
+                leave = Some(None);
+            }
+            if !ready {
+                ui.colored_label(th.err, s.param_row_required);
             }
         });
+    });
+    if modal.should_close() {
+        leave = Some(None);
+    }
 
     if let Some((name, value)) = set {
         ed.param_values.insert(name, value);
@@ -2570,6 +2743,20 @@ fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui)
             seed.as_deref(),
             super::menu::PickAction::ReportParamPath { name },
         );
+    }
+    if let Some(started) = leave {
+        ed.params_modal = None;
+        // Answered: Run and Dry run both act at once from here on, so a preview
+        // can be followed straight by the run it previewed. `reparse` re-arms
+        // this if the questions themselves change.
+        if let Some(intent) = started {
+            ed.params_confirmed = true;
+            match intent {
+                RunIntent::Run => ed.start_run(app),
+                RunIntent::DryRun => ed.start_dry_run(app),
+                RunIntent::Review => {}
+            }
+        }
     }
 }
 
@@ -12462,17 +12649,90 @@ REPORT REQUEST x
         (app, ed)
     }
 
-    /// A report that asks for something opens on the question, not on the
-    /// source: the people who run reports are not the people who write them.
+    /// Every piece of text painted by one frame of the editor, in `ctx` — which
+    /// the caller owns, because a modal's layer is laid out on the frame after
+    /// the one that asked for it and a fresh context would never get there.
+    fn painted(ctx: &egui::Context, app: &mut GuiApp) -> String {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 760.0),
+        ));
+        let out = ctx.run_ui(input, |ui| super::ui(app, ui));
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        text
+    }
+
+    /// The questions are a step on the way to a run, not a place: the editor
+    /// opens where the report is built, and Run is what asks.
     #[test]
-    fn a_report_that_asks_for_values_opens_on_them() {
-        let (_app, ed) = editor(TRAIL);
-        assert!(ed.view == EditorView::RunSettings);
-        let (_app, ed) = editor("# name: Face\n# collection: c.hurl\nREPORT REQUEST x\n");
+    fn run_asks_the_questions_before_it_starts() {
+        let (mut app, mut ed) = editor(TRAIL);
+        assert!(ed.view == EditorView::Blocks, "opens where it is built");
+        assert!(ed.params_modal.is_none(), "and asks nothing unprompted");
+
+        ed.start_run(&mut app);
+        assert_eq!(ed.params_modal, Some(RunIntent::Run));
+        assert!(!ed.is_running(), "nothing has been run yet");
+    }
+
+    /// A preview is only worth looking at if it previews the run you mean, so
+    /// Dry run asks the same questions — and says so by leading with its own
+    /// button when the dialog opens.
+    #[test]
+    fn a_dry_run_asks_the_same_questions() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.start_dry_run(&mut app);
+        assert_eq!(ed.params_modal, Some(RunIntent::DryRun));
+        assert!(ed.dry_run.is_none(), "and previews nothing yet");
+    }
+
+    /// Answered once, not once per run: the whole point of previewing first is
+    /// to run the same thing afterwards without being asked again.
+    #[test]
+    fn once_answered_the_buttons_act_at_once() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        ed.params_confirmed = true;
+        ed.start_run(&mut app);
+        assert!(ed.params_modal.is_none(), "no second interrogation");
+    }
+
+    /// ...but changing what the report *asks* re-arms the questions: the
+    /// answers were confirmed against the old declarations.
+    #[test]
+    fn changing_a_declaration_asks_again() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.params_confirmed = true;
+        ed.set_text(TRAIL.replace("\"au\", \"eu\"", "\"au\", \"eu\", \"us\""));
         assert!(
-            ed.view == EditorView::Blocks,
-            "a report with nothing to ask still opens where it is built"
+            !ed.params_confirmed,
+            "the choices are not the ones answered"
         );
+
+        // Editing anything else leaves the answers alone.
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        ed.params_confirmed = true;
+        let same_questions = ed.report.text.replace("REQUEST x", "REQUEST y");
+        ed.set_text(same_questions);
+        assert!(ed.params_confirmed);
+        ed.start_run(&mut app);
+        assert!(ed.params_modal.is_none());
     }
 
     /// The form is built from the declarations, defaults included, and the row
@@ -12490,58 +12750,41 @@ REPORT REQUEST x
         assert!(rows[1].problem.is_none());
     }
 
-    /// Run stops at the questions on the way to the run, and only then starts.
+    /// The toolbar says what the next run will use without anything being
+    /// opened — the dialog only shows itself once.
     #[test]
-    fn run_stops_at_the_questions_before_it_starts() {
-        let (mut app, mut ed) = editor(TRAIL);
-        ed.view = EditorView::Blocks;
-
-        ed.start_run(&mut app);
-        assert!(ed.view == EditorView::RunSettings, "the questions first");
-        assert!(matches!(
-            app.session.status,
-            Some(Status::ReportRunSettingsFirst)
-        ));
-        assert!(!ed.is_running(), "and nothing has been run yet");
-
-        // Still unanswered: pressing Run again refuses rather than running a
-        // report built around a hole.
-        ed.start_run(&mut app);
-        assert!(matches!(
-            app.session.status,
-            Some(Status::ReportRunBlocked(_))
-        ));
-        assert!(!ed.is_running());
+    fn the_toolbar_shows_the_answers_it_will_run_with() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        let summary = ed.param_summary(&app.strings);
+        assert!(summary.contains("TICKET=FR-12"), "{summary}");
+        assert!(summary.contains("REGION=au"), "{summary}");
     }
 
-    /// The form has to actually paint: the prompt, the value the run would use,
-    /// and the raw name beside it. A state-correct form that draws nothing is
-    /// the failure mode this guards.
+    /// The dialog has to actually paint: the prompt, the value the run would
+    /// use, and the raw name beside it. A state-correct dialog that draws
+    /// nothing is the failure mode this guards.
     #[test]
-    fn the_form_paints_the_question_the_value_and_the_name() {
+    fn the_dialog_paints_the_question_the_value_and_the_name() {
         let mut app = GuiApp::for_test(Session::default());
         app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", TRAIL));
+        // Nothing of the dialog until it is asked for. (The *source* says
+        // "Ticket number" in either case, so the dialog's own lead line is
+        // what distinguishes the two.)
+        let lead = app.strings.param_view_lead;
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 760.0),
-        ));
-        let out = ctx.run_ui(input, |ui| super::ui(&mut app, ui));
-        let mut text = String::new();
-        fn walk(s: &egui::epaint::Shape, out: &mut String) {
-            match s {
-                egui::epaint::Shape::Text(t) => {
-                    out.push_str(t.galley.text());
-                    out.push('\n');
-                }
-                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                _ => {}
-            }
+        let before = painted(&ctx, &mut app);
+        assert!(!before.contains(lead), "{before}");
+
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.params_modal = Some(RunIntent::Run);
         }
-        for c in &out.shapes {
-            walk(&c.shape, &mut text);
-        }
+        // Twice: a modal's own layer is laid out on the frame after the one
+        // that asked for it.
+        painted(&ctx, &mut app);
+        let text = painted(&ctx, &mut app);
+        assert!(text.contains(lead), "the dialog is up: {text}");
         assert!(text.contains("Ticket number"), "the prompt: {text}");
         assert!(text.contains("TICKET"), "and the name the script uses");
         assert!(

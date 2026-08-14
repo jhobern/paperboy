@@ -969,8 +969,9 @@ strings! {
     gui_new_report => "New report", "Nouveau rapport", "Ny rapport";
     gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
     // PaperTrail block editor (report_editor.rs).
+    gui_report_run_settings => "Run settings", "Réglages d'exécution", "Kørselsindstillinger";
+    gui_report_run_settings_tooltip => "The values this report asks for before it runs.", "Les valeurs que ce rapport demande avant de s'exécuter.", "De værdier denne rapport beder om, før den kører.";
     gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
-    gui_report_view_run_settings => "Run settings", "Réglages d'exécution", "Kørselsindstillinger";
     gui_report_view_source => "Source", "Source", "Kilde";
     gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
     gui_report_palette_blocks => "Blocks", "Blocs", "Blokke";
