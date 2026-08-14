@@ -22944,6 +22944,9 @@ fn a_run_missing_a_required_value_is_refused_not_guessed() {
     app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
     app.revalidate_report(0);
     app.reports[0].view = crate::tui::reports::ReportView::Source;
+    // The first `r` only opens the questions (see the gate below); the second
+    // is the one that tries to run.
+    press(&mut app, KeyCode::Char('r'));
     press(&mut app, KeyCode::Char('r'));
     assert!(app.reports[0].result.is_none(), "nothing ran");
     assert_eq!(
@@ -22955,6 +22958,198 @@ fn a_run_missing_a_required_value_is_refused_not_guessed() {
         matches!(&app.status, Some(crate::i18n::Status::ReportRunBlocked(m)) if m.contains("Ticket number")),
         "and told which one: {:?}",
         app.status
+    );
+}
+
+/// Clicking the results grid selects the report body, the way clicking any
+/// other panel selects it. Before this the click moved the grid's own cell
+/// cursor while focus stayed on the panel beside it, so the next keypress went
+/// somewhere the user wasn't looking.
+#[test]
+fn clicking_the_results_grid_selects_the_report_body() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_multi_row_result();
+    app.focus = Pane::List;
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    assert!(area.width > 0 && area.height > 1, "the grid is on screen");
+    // area.y is the pinned header; the first data row is below it.
+    app.on_mouse(mouse_down(area.x + 1, area.y + 1));
+
+    assert_eq!(app.focus, Pane::Main, "the click selects the report body");
+    assert!(
+        app.reports[idx].cell_cursor.is_some(),
+        "and still does its own job"
+    );
+}
+
+/// The run settings answer the mouse too: a click selects a row, and a second
+/// click on the same row opens its editor — the one-click/two-click gesture the
+/// node outline already uses.
+#[test]
+fn clicking_a_run_settings_row_selects_then_opens_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app();
+    app.focus = Pane::List;
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let rect = hit_rect(&app, MouseHitTarget::ReportParamRow(1));
+    app.on_mouse(mouse_down(rect.x + 1, rect.y));
+    assert_eq!(app.focus, Pane::Main);
+    assert_eq!(
+        app.reports[0].param_selected, 1,
+        "the click selects the row"
+    );
+    assert!(app.overlay.is_none(), "one click doesn't open anything");
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::ReportParamRow(1));
+    app.on_mouse(mouse_down(rect.x + 1, rect.y));
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportSettingMenu(_))),
+        "a second click on the selected row opens its picker"
+    );
+}
+
+/// An `ENV` parameter is picked from the loaded environments, and typing
+/// narrows that list instead of dismissing it — the whole point of the picker
+/// when a dozen environments are loaded and the wanted one is known by name.
+#[test]
+fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
+    let mut app = TuiApp::default();
+    for name in ["eapi_dev", "eapi_staging", "eapi_prod", "local"] {
+        add_empty_global_env(&mut app, name);
+    }
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Face",
+        "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
+    ));
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("an ENV parameter opens the list of loaded environments");
+    };
+    assert_eq!(menu.options.len(), 4);
+
+    // "stag" is nobody's first letter, so a prefix match wouldn't do.
+    for c in "stag".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("typing narrows the list rather than dismissing the overlay");
+    };
+    assert_eq!(
+        menu.visible(),
+        vec![&"eapi_staging".to_string()],
+        "only the matching environment is left"
+    );
+    // …and that is what the overlay actually draws, not just what it knows.
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(term.backend().buffer());
+        assert!(screen.contains("eapi_staging"), "{screen}");
+        assert!(
+            !screen.contains("eapi_dev") && !screen.contains("local"),
+            "the filtered-out rows are off screen: {screen}"
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert_eq!(app.report_param_rows(0)[0].value, "eapi_staging");
+}
+
+/// Backspacing over the filter brings the hidden rows back — the list is
+/// narrowed for display, never thrown away.
+#[test]
+fn backspacing_the_filter_brings_the_other_rows_back() {
+    let mut app = TuiApp::default();
+    for name in ["eapi_dev", "eapi_staging"] {
+        add_empty_global_env(&mut app, name);
+    }
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Face",
+        "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
+    ));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('z'));
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("still open on a filter that matches nothing");
+    };
+    assert!(menu.visible().is_empty());
+    // Enter on nothing picks nothing rather than closing on a silent choice.
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_some(), "there is nothing to choose yet");
+    press(&mut app, KeyCode::Backspace);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("backspace over a non-empty filter stays in the menu");
+    };
+    assert_eq!(menu.visible().len(), 2);
+}
+
+/// Run on a report that asks for values stops at the questions first, and only
+/// the second Run starts it — so the values are always seen before a long run
+/// goes out under them, and there is a way back to them from the results.
+#[test]
+fn run_stops_at_the_questions_before_it_starts() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+    app.reports[0].view = crate::tui::reports::ReportView::Source;
+
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "the first Run opens the questions"
+    );
+    assert!(
+        matches!(
+            &app.status,
+            Some(crate::i18n::Status::ReportRunSettingsFirst)
+        ),
+        "and says so rather than looking like a failed run: {:?}",
+        app.status
+    );
+    assert!(app.reports[0].result.is_none(), "nothing has run yet");
+
+    // The second Run — from the settings — is the one that goes.
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    for _ in 0..200 {
+        app.poll_report_run_updates();
+        if app.running_reports.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.reports[0].result.is_some(),
+        "running from the settings starts the run"
+    );
+
+    // And the way back is the same key: Run from the results returns to the
+    // questions instead of silently re-running with the old answers.
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::RunSettings,
+        "Run from the results reopens the questions"
     );
 }
 

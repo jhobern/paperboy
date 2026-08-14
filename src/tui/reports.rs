@@ -1139,6 +1139,17 @@ impl TuiApp {
     /// validation errors) reports why in the status bar and keeps the source
     /// view; the delivered result is folded in by [`Self::poll_report_run_updates`].
     pub(crate) fn run_active_report(&mut self) {
+        // A report that asks for values stops at the questions on the way to
+        // its run — before the discard guard below, because opening the
+        // questions discards nothing: the results stay exactly where they are
+        // until the *second* Run actually starts.
+        if self.report_run_needs_settings() {
+            let idx = self.active_report_index().expect("checked above");
+            self.seed_report_params(idx);
+            self.reports[idx].view = ReportView::RunSettings;
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return;
+        }
         // Guard against a rerun silently discarding on-screen results the user
         // hasn't saved anywhere: ask first (#2). A run already in flight, or a
         // report with nothing worth keeping, skips straight through.
@@ -1159,6 +1170,22 @@ impl TuiApp {
         if let Some((report_id, inputs)) = self.prepare_report_run() {
             self.spawn_report_run(report_id, inputs, |file_root| LiveRunner { file_root });
         }
+    }
+
+    /// Whether Run on the active report should open its run settings instead of
+    /// starting: true when the report declares parameters and they aren't the
+    /// thing on screen. A run already in flight is exempt — that key is a
+    /// cancel ([`Self::prepare_report_run`]), and a cancel must never be read
+    /// as "show me the questions".
+    pub(crate) fn report_run_needs_settings(&self) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        !self
+            .running_reports
+            .contains_key(&self.reports[idx].report.id)
+            && self.reports[idx].view != ReportView::RunSettings
+            && self.report_has_params(idx)
     }
 
     /// Whether pressing "run" on the active report would throw away results the
@@ -1226,6 +1253,18 @@ impl TuiApp {
         // seeded here too, so `r` straight from the source view still runs with
         // the declared defaults and what this report was last run with.
         self.seed_report_params(idx);
+        // A report that asks for values stops at the run settings on the way to
+        // its run: Run opens them, Run again (from the settings) starts. The
+        // values decide what the run *means*, so they deserve a look before
+        // several minutes of requests go out under them — and this is also the
+        // only reliable way back to them once a run has filled the screen with
+        // results. A run already under way is unaffected: the cancel path above
+        // returns before this.
+        if self.report_has_params(idx) && self.reports[idx].view != ReportView::RunSettings {
+            self.reports[idx].view = ReportView::RunSettings;
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return None;
+        }
         if let Some(problem) = self
             .report_param_rows(idx)
             .into_iter()
@@ -1743,6 +1782,7 @@ impl TuiApp {
                         name: row.name.clone(),
                     },
                     options: options.clone(),
+                    filter: String::new(),
                     selected,
                     report_id,
                 })));
@@ -1764,6 +1804,7 @@ impl TuiApp {
                         name: row.name.clone(),
                     },
                     options,
+                    filter: String::new(),
                     selected,
                     report_id,
                 })));
@@ -3835,9 +3876,15 @@ fn draw_report_run_settings(
     let inner = block.inner(area);
     f.render_widget(block, area);
     // Not a text panel: nothing here is selectable or scrollable with the
-    // mouse, so it claims no hit-test area (as the node outline doesn't).
+    // mouse, so it claims no hit-test area (as the node outline doesn't). Its
+    // *rows* are clickable, though — see the hit targets pushed below.
     app.report_pane_areas[ReportPane::Source.idx()] = Rect::default();
     app.report_pane_bars[ReportPane::Source.idx()] = Rect::default();
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::Main),
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -3907,7 +3954,18 @@ fn draw_report_run_settings(
     let h = inner.height as usize;
     let first = sel.saturating_sub(h.saturating_sub(1));
     let visible: Vec<Line> = lines.into_iter().skip(first).take(h).collect();
+    let shown = visible.len();
     f.render_widget(Paragraph::new(visible), inner);
+    // One hit target per drawn row: a click selects it, a second click on the
+    // same row opens its editor — the same one-click/two-click gesture the node
+    // outline and the settings rows above it use.
+    for i in 0..shown {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            MouseHitTarget::ReportParamRow(first + i),
+        );
+    }
 }
 
 /// row. Any run-level errors are surfaced in the panel title so a partly-failed
@@ -5212,6 +5270,11 @@ fn draw_report_validation(
         MouseLayer::Base,
         bar,
         MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::Main),
     );
     app.push_mouse_hit(
         MouseLayer::Base,

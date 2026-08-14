@@ -1427,8 +1427,16 @@ fn draw_report_setting_menu_overlay(
     th: &Theme,
     app: Option<&TuiApp>,
 ) {
-    let title = format!("{}  ({})", menu.title(s), s.report_setting_menu_hint);
-    let n = menu.options.len().max(1);
+    // The typed filter goes in the title, where it reads as part of the
+    // question ("TARGET_ENV  /stag") rather than as another row of the list.
+    let typed = if menu.filter.is_empty() {
+        String::new()
+    } else {
+        format!("  /{}", menu.filter)
+    };
+    let title = format!("{}{typed}  ({})", menu.title(s), s.report_setting_menu_hint);
+    let visible = menu.visible();
+    let n = visible.len().max(1);
     let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
     let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
     let area = centered_rect(box_w, box_h, f.area());
@@ -1436,7 +1444,15 @@ fn draw_report_setting_menu_overlay(
     let inner_h = area.height.saturating_sub(2) as usize;
     let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
     let mut lines: Vec<Line> = Vec::new();
-    for (i, opt) in menu.options.iter().enumerate().skip(scroll).take(inner_h) {
+    if visible.is_empty() {
+        // Say so rather than drawing an empty box, which reads as "broken"
+        // instead of "nothing is called that".
+        lines.push(Line::from(Span::styled(
+            s.report_setting_menu_no_match.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    for (i, opt) in visible.iter().enumerate().skip(scroll).take(inner_h) {
         let style = if i == menu.selected {
             Style::default()
                 .fg(th.bg)
@@ -1445,7 +1461,7 @@ fn draw_report_setting_menu_overlay(
         } else {
             Style::default().fg(th.text)
         };
-        lines.push(Line::from(Span::styled(opt.clone(), style)));
+        lines.push(Line::from(Span::styled((*opt).clone(), style)));
     }
     f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
     if let Some(app) = app {
@@ -1456,7 +1472,7 @@ fn draw_report_setting_menu_overlay(
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(2),
         };
-        for row in scroll..menu.options.len().min(scroll + inner_h) {
+        for row in scroll..visible.len().min(scroll + inner_h) {
             app.push_mouse_hit(
                 MouseLayer::Overlay,
                 Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),

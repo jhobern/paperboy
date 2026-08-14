@@ -69,6 +69,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Running a report that asks for values now always stops at the questions
+  first.** Run opens the run settings; Run again — from the settings — starts
+  the run. The values decide what the run *means* and a run can take minutes,
+  so they are worth a glance on the way past; more practically, this is the way
+  back to them once results have filled the screen, which previously took
+  knowing that `p` existed. Opening the questions discards nothing, so the
+  unexported-results warning is held back until the run actually starts.
+
+- **Long pick-lists in a report filter as you type.** The environment and
+  choice pickers used to treat any letter as "cancel", which made picking one
+  of a dozen loaded environments a scroll. Typing now narrows the list on a
+  case-insensitive substring, Backspace widens it again, and `j`/`k` no longer
+  move the cursor there — a letter is a letter.
+
+- **Clicking a report's results grid or its questions selects the report.**
+  Both moved their own cursor while keyboard focus stayed on the panel beside
+  them, so the next keypress went somewhere the user wasn't looking. Run
+  settings rows also answer the mouse now: one click selects, a second opens
+  the row's editor.
+
 - **Save no longer asks whether you meant it.** Saving a collection,
   environment or report back to the file it came from used to raise a
   confirmation counting the changes about to be written. Overwriting that file

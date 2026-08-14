@@ -784,6 +784,8 @@ pub(crate) enum MouseHitTarget {
     ReportNodeRow(usize),
     /// A row of the node editor's report-settings section, above the outline.
     ReportSettingRow(usize),
+    /// A row of the run settings view — one declared `PARAM`.
+    ReportParamRow(usize),
     OverlayRow(usize),
     ConfirmChoice(usize),
     HelpTab(usize),
@@ -819,9 +821,11 @@ impl MouseHitTarget {
             MouseHitTarget::ReportResultsCell => Some(MouseScrollTarget::ReportPane(
                 crate::tui::reports::ReportPane::Results,
             )),
-            MouseHitTarget::ReportNodeRow(_) | MouseHitTarget::ReportSettingRow(_) => Some(
-                MouseScrollTarget::ReportPane(crate::tui::reports::ReportPane::Source),
-            ),
+            MouseHitTarget::ReportNodeRow(_)
+            | MouseHitTarget::ReportSettingRow(_)
+            | MouseHitTarget::ReportParamRow(_) => Some(MouseScrollTarget::ReportPane(
+                crate::tui::reports::ReportPane::Source,
+            )),
             MouseHitTarget::OverlayRow(_) | MouseHitTarget::ConfirmChoice(_) => {
                 Some(MouseScrollTarget::OverlayList)
             }

@@ -4077,8 +4077,14 @@ impl TuiApp {
 /// names and something happens to the header.
 pub(crate) struct SettingMenu {
     pub(crate) step: SettingMenuStep,
-    /// What the rows say.
+    /// What the rows say — the *whole* list, never narrowed in place, so
+    /// backspacing over the filter brings the hidden rows straight back.
     pub(crate) options: Vec<String>,
+    /// What has been typed to narrow the list. Empty means "show everything".
+    pub(crate) filter: String,
+    /// The cursor, as an index into the **visible** (filtered) rows — see
+    /// [`SettingMenu::visible`]. Keeping it in filtered space is what makes
+    /// "type two letters, press Enter" work without any bookkeeping.
     pub(crate) selected: usize,
     /// The report being edited (by id so a tab reorder can't misroute it).
     pub(crate) report_id: u64,
@@ -4105,6 +4111,33 @@ pub(crate) enum SettingMenuStep {
 }
 
 impl SettingMenu {
+    /// The rows the filter leaves standing, in declaration order. A
+    /// case-insensitive substring match: the lists these menus show are names
+    /// (environments, formats, directives), and people recall a fragment of a
+    /// name far more reliably than its first letters.
+    pub(crate) fn visible(&self) -> Vec<&String> {
+        if self.filter.is_empty() {
+            return self.options.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.options
+            .iter()
+            .filter(|o| o.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// The row the cursor is on, or `None` when the filter matches nothing.
+    pub(crate) fn choice(&self) -> Option<String> {
+        self.visible().get(self.selected).map(|o| (*o).clone())
+    }
+
+    /// Keep the cursor on a row that exists after the filter changed. It goes
+    /// to the top rather than trying to follow the previously selected row:
+    /// the point of typing is to bring the wanted row *to* the top.
+    fn clamp_selection(&mut self) {
+        self.selected = 0;
+    }
+
     /// The overlay title for the current job.
     pub(crate) fn title(&self, s: &Strings) -> String {
         match &self.step {
@@ -4141,6 +4174,7 @@ impl TuiApp {
         self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
             step: SettingMenuStep::AddSetting,
             options,
+            filter: String::new(),
             selected: 0,
             report_id: self.reports[idx].report.id,
         })));
@@ -4224,6 +4258,7 @@ impl TuiApp {
         self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
             step: SettingMenuStep::PickValue { key, occurrence },
             options,
+            filter: String::new(),
             selected,
             report_id: self.reports[idx].report.id,
         })));
@@ -4296,13 +4331,13 @@ impl TuiApp {
         key: KeyEvent,
         mut menu: Box<SettingMenu>,
     ) {
-        let last = menu.options.len().saturating_sub(1);
+        let last = menu.visible().len().saturating_sub(1);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 menu.selected = menu.selected.saturating_sub(1);
                 self.overlay = Some(Overlay::ReportSettingMenu(menu));
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 menu.selected = (menu.selected + 1).min(last);
                 self.overlay = Some(Overlay::ReportSettingMenu(menu));
             }
@@ -4314,8 +4349,30 @@ impl TuiApp {
                 menu.selected = last;
                 self.overlay = Some(Overlay::ReportSettingMenu(menu));
             }
+            // Typing narrows the list. These menus can be as long as the set of
+            // loaded environments, where scrolling to the one you already know
+            // the name of is the slowest possible way to pick it. This is why
+            // `j`/`k` no longer move the cursor here — a letter is a letter.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                menu.filter.push(c);
+                menu.clamp_selection();
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Backspace => {
+                // Backspace on an empty filter closes the menu, so the key that
+                // undoes typing keeps undoing right out of the overlay.
+                if menu.filter.pop().is_some() {
+                    menu.clamp_selection();
+                    self.overlay = Some(Overlay::ReportSettingMenu(menu));
+                }
+            }
+            // Enter on a filter that matches nothing keeps the menu up: closing
+            // it would look like a pick was made.
+            KeyCode::Enter if menu.choice().is_none() => {
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
             KeyCode::Enter => self.apply_setting_menu(*menu),
-            // Esc / q / anything else: cancel (the overlay was already taken).
+            // Esc / anything else: cancel (the overlay was already taken).
             _ => {}
         }
     }
@@ -4324,7 +4381,9 @@ impl TuiApp {
         let Some(idx) = self.report_index_by_id(menu.report_id) else {
             return;
         };
-        let Some(choice) = menu.options.get(menu.selected).cloned() else {
+        // Nothing matches the filter: there is no choice to apply, and closing
+        // the menu on Enter would look like a silent pick.
+        let Some(choice) = menu.choice() else {
             return;
         };
         match &menu.step {
@@ -4341,7 +4400,7 @@ impl TuiApp {
                     self.add_label_class(idx);
                     return;
                 }
-                let key = menu.options[menu.selected].to_ascii_lowercase();
+                let key = choice.to_ascii_lowercase();
                 let Some(spec) = header_specs().into_iter().find(|s| s.key == key) else {
                     return;
                 };

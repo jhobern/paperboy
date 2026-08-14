@@ -228,7 +228,8 @@ impl TuiApp {
             MouseHitTarget::SelectListRow(_)
             | MouseHitTarget::SelectGlobalEnvRow(_)
             | MouseHitTarget::ReportNodeRow(_)
-            | MouseHitTarget::ReportSettingRow(_) => self.mouse_row_activation(target),
+            | MouseHitTarget::ReportSettingRow(_)
+            | MouseHitTarget::ReportParamRow(_) => self.mouse_row_activation(target),
             _ => {
                 self.last_mouse_row = None;
                 false
@@ -275,7 +276,31 @@ impl TuiApp {
                 self.primary_send();
                 true
             }
-            MouseHitTarget::ReportResultsCell => self.on_mouse_results_cell_click(point.x, point.y),
+            MouseHitTarget::ReportResultsCell => {
+                // Clicking the grid also *selects* the report body, the way
+                // clicking any other panel selects it. Without this an
+                // embedded report's grid moved its own cell cursor while focus
+                // stayed on the workspace tree beside it, so the next keypress
+                // went somewhere the user wasn't looking. The cell click is
+                // still allowed to decline the event (a click on the pinned
+                // header row), which falls through to text selection.
+                self.focus = Pane::Main;
+                self.on_mouse_results_cell_click(point.x, point.y)
+            }
+            MouseHitTarget::ReportParamRow(row) => {
+                self.focus = Pane::Main;
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.param_selected = row;
+                    }
+                    if row_activation {
+                        self.configure_selected_param();
+                    } else {
+                        keep_mouse_hits = true;
+                    }
+                }
+                true
+            }
             MouseHitTarget::ReportSettingRow(row) => {
                 if let Some(idx) = self.active_report_index() {
                     if let Some(rt) = self.reports.get_mut(idx) {
@@ -915,6 +940,12 @@ impl TuiApp {
                     self.clear_report_selections();
                 }
                 if let Some(pane) = pane {
+                    // Clicking a report panel selects the report body, exactly
+                    // as clicking the Main or Response panel does in the normal
+                    // view. For a report embedded in a workspace this is the
+                    // difference between the keyboard following the click and
+                    // it staying on the tree.
+                    self.focus = Pane::Main;
                     let area = self.report_pane_area(pane);
                     if let Some(panel) = self.report_panel_mut(pane) {
                         panel.begin(area, (ev.column, ev.row));

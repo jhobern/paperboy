@@ -692,7 +692,8 @@ strings! {
     report_settings_heading => "Report Settings", "Réglages du rapport", "Rapportindstillinger";
     report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
     report_setting_no_choices => "Nothing to choose from — load an environment first, or press e to type a name", "Rien à choisir — chargez d'abord un environnement, ou appuyez sur e pour saisir un nom", "Intet at vælge imellem — indlæs først et miljø, eller tryk e for at skrive et navn";
-    report_setting_menu_hint => "↑↓ move · Enter choose · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
+    report_setting_menu_hint => "↑↓ move · type to filter · Enter choose · Esc cancel", "↑↓ déplacer · taper pour filtrer · Entrée choisir · Échap annuler", "↑↓ flyt · skriv for at filtrere · Enter vælg · Esc annuller";
+    report_setting_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
     report_node_request_hint => "↑↓ move · Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
@@ -1273,6 +1274,7 @@ strings! {
     diag_env_ref_default_not_loaded => "ENVS names '{}', which currently means '{}' — an environment that isn't loaded.", "ENVS désigne « {} », qui signifie actuellement « {} » — un environnement qui n'est pas chargé.", "ENVS navngiver '{}', som i øjeblikket betyder '{}' — et miljø, der ikke er indlæst.";
     param_pick_path => "Pick a value for this parameter…", "Choisissez une valeur pour ce paramètre…", "Vælg en værdi til denne parameter…";
     param_row_required => "needs a value", "doit être renseigné", "kræver en værdi";
+    param_run_settings_first => "This report asks for some values — check them, then run again to start.", "Ce rapport demande des valeurs : vérifiez-les, puis relancez pour démarrer.", "Denne rapport beder om nogle værdier — tjek dem, og kør igen for at starte.";
     param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
     param_view_empty => "No parameters declared.", "Aucun paramètre déclaré.", "Ingen parametre erklæret.";
@@ -1521,6 +1523,9 @@ pub enum Status {
     /// A report couldn't be run or exported; holds an already-translated reason
     /// (built from [`Strings`] at the call site).
     ReportRunBlocked(String),
+    /// Run was pressed on a report that asks for values: the run settings were
+    /// opened instead, and Run again starts the run.
+    ReportRunSettingsFirst,
     /// A structural node edit was reverted with Ctrl+Z (node-editor undo).
     ReportNodeUndone(String),
     /// Ctrl+Z was pressed in the node editor with an empty undo stack.
@@ -1613,6 +1618,7 @@ impl Status {
                     | Status::FileReverted(_)
                     | Status::EnvReverted(_)
                     | Status::WorkspaceTreeFilter(_)
+                    | Status::ReportRunSettingsFirst
             ),
         }
     }
@@ -1721,6 +1727,7 @@ impl Status {
                 }
             }
             Status::ReportRunBlocked(reason) => reason.clone(),
+            Status::ReportRunSettingsFirst => s.param_run_settings_first.to_string(),
             Status::ReportNodeUndone(msg) => msg.clone(),
             Status::ReportNodeNothingToUndo(msg) => msg.clone(),
             Status::ReportReformatted => s.report_reformatted.to_string(),
