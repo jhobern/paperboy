@@ -3407,8 +3407,30 @@ fn detail_section(
             ui.label(RichText::new(header).strong().color(th.accent));
             detail_image(ui, textures, r, header, image, &value, app);
         }
-        DetailSection::Text { header, value } => {
-            ui.label(RichText::new(header).strong().color(th.accent));
+        DetailSection::Text {
+            header,
+            value,
+            verdict,
+        } => {
+            // A `DETAIL` column carrying a `TRUTH` says whether it is right,
+            // exactly as its grid cell would have. The panel is where the
+            // value is actually read, so a heading that stayed neutral over a
+            // wrong answer would read as one nobody checked.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(header).strong().color(th.accent));
+                if let Some((v, truth)) = &verdict {
+                    let col = if *v == crate::report::model::Verdict::Correct {
+                        th.ok
+                    } else {
+                        th.err
+                    };
+                    ui.label(
+                        RichText::new(crate::report::detail::verdict_label(*v, truth))
+                            .strong()
+                            .color(col),
+                    );
+                }
+            });
             // Monospace and selectable: a detail column is usually a
             // response body, which is read by picking bits out of it.
             ui.add(
@@ -3485,7 +3507,13 @@ fn detail_image(
     // of a thousand this row is. At the small text style it was a grey line too
     // fine to make out under a full-size photograph, so it is set at body size
     // and selectable, so a path can be picked up and pasted somewhere useful.
-    ui.add(egui::Label::new(RichText::new(value).color(ui.visuals().weak_text_color())).wrap());
+    // Laid out explicitly left-to-right rather than in the caller's layout:
+    // the drill-down's columns are *justified*, and a justified wrapped label
+    // spreads its first line's glyphs across the full width — which turned the
+    // path into `/ h o m e / j o n a…`.
+    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+        ui.add(egui::Label::new(RichText::new(value).color(ui.visuals().weak_text_color())).wrap());
+    });
     let _ = app;
 }
 
@@ -12353,6 +12381,82 @@ mod dry_run_view_tests {
             "the preview should be on screen, not waiting in a view nobody is looking at"
         );
         assert!(ed.dry_run.is_some(), "and the preview itself is held");
+    }
+}
+
+#[cfg(test)]
+mod detail_verdict_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+    use crate::report::model::{OutputColumn, ReportResult, ReportRow, StatKind, Verdict};
+    use crate::session::Session;
+
+    /// A `DETAIL` column carrying a `TRUTH` is read in the drill-down, so the
+    /// drill-down has to say whether what it is showing was right — the grid
+    /// cell that would have said so is not on screen.
+    #[test]
+    fn a_ground_truthed_detail_section_shows_its_verdict() {
+        let mut column = OutputColumn {
+            header: "Raw".to_string(),
+            sources: vec!["Raw".to_string()],
+            stats: Vec::<StatKind>::new(),
+            image: None,
+            truth: Some("Low Risk".to_string()),
+            detail: true,
+        };
+        column.detail = true;
+        let mut row = ReportRow::default();
+        row.cells.insert("Raw".to_string(), "High Risk".to_string());
+        let mut result = ReportResult {
+            column_order: vec!["Raw".into()],
+            rows: vec![row],
+            ..Default::default()
+        };
+        result
+            .verdicts
+            .insert((0, "Raw".into()), Verdict::Incorrect);
+        result.truths.insert((0, "Raw".into()), "Low Risk".into());
+        let columns = vec![column];
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        let section = crate::report::detail::sections(&result, 0, &grid, &detail)
+            .into_iter()
+            .next()
+            .expect("the detail column has a section");
+
+        let app = GuiApp::for_test(Session::default());
+        let th = app.theme.clone();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(600.0, 400.0),
+        ));
+        let mut textures = std::collections::HashMap::new();
+        let out = ctx.run_ui(input, |ui| {
+            detail_section(&th, ui, &app, 0, section.clone(), &mut textures);
+        });
+        let mut text = String::new();
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        assert!(
+            text.contains("incorrect"),
+            "the section says it is wrong: {text}"
+        );
+        assert!(
+            text.contains("expected Low Risk"),
+            "and what was wanted instead, which is otherwise only in the script: {text}"
+        );
     }
 }
 

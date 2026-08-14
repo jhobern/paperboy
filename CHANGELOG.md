@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A ground-truthed `DETAIL` column says whether it was right.** A column
+  carrying both `DETAIL` and `TRUTH` leaves the grid for the drill-down, and
+  with it went the green/red that said whether the answer was correct — so the
+  one place the full value is actually read was the one place that stayed
+  silent about it. The section heading now carries the verdict, and a wrong
+  answer says what was expected instead, in the desktop app and the interactive
+  HTML export alike. An unlabelled row still says nothing rather than borrowing
+  the appearance of one that passed.
+
+- **A picture's path in the drill-down is readable again.** The caption under a
+  full-size picture inherited the panel's justified column layout, which spread
+  its first line's letters across the full width (`/ h o m e / j o n a…`). It is
+  laid out plainly now.
+
 - **A Postman import no longer queues behind its own latency.** Items were
   fetched strictly one at a time, so on a link with high round-trip times the
   import crawled at one or two items a second even with hundreds of calls still

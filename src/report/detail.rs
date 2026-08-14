@@ -13,7 +13,7 @@
 //! and two copies of them would drift.
 
 use super::jsondiff::FieldDiff;
-use super::model::{ImageData, OutputColumn, ReportResult};
+use super::model::{ImageData, OutputColumn, ReportResult, Verdict};
 
 /// Split a run's columns into the ones the grid shows and the ones the
 /// drill-down does.
@@ -44,7 +44,18 @@ pub enum DetailSection<'a> {
         value: String,
     },
     /// A `DETAIL` column's full value, pretty-printed when it is JSON.
-    Text { header: &'a str, value: String },
+    Text {
+        header: &'a str,
+        value: String,
+        /// How this cell scored, when its column declares a `TRUTH`, and what
+        /// it was scored against. The grid tints such a cell by whether it is
+        /// *right*; the drill-down is where the same cell is actually read, so
+        /// it has to say the same thing — a full value read out of a panel
+        /// that stayed silent about it would be taken for a value nobody
+        /// checked. [`Verdict::Untested`] is `None`: an unlabelled row must
+        /// never borrow the appearance of one that passed.
+        verdict: Option<(Verdict, String)>,
+    },
     /// A `DETAIL` column's fields against the baseline's. Unchanged fields are
     /// kept: the reader can then find the field they care about whether or not
     /// it moved, and the *highlight* rather than the omission points at the
@@ -88,6 +99,7 @@ pub fn sections<'a>(
             out.push(DetailSection::Text {
                 header: &c.header,
                 value: pretty_json(&value),
+                verdict: verdict_for(result, r, &c.header),
             });
         }
     }
@@ -107,6 +119,28 @@ pub fn sections<'a>(
         }
     }
     out
+}
+
+/// How a ground-truthed cell scored and what it was scored against, or `None`
+/// when its column declares no `TRUTH` or the row wasn't labelled.
+fn verdict_for(result: &ReportResult, r: usize, header: &str) -> Option<(Verdict, String)> {
+    let key = (r, header.to_string());
+    match result.verdicts.get(&key)? {
+        Verdict::Untested => None,
+        v => Some((*v, result.truths.get(&key).cloned().unwrap_or_default())),
+    }
+}
+
+/// What a ground-truthed detail section says beside its heading: the verdict,
+/// and — when it is wrong — what was expected instead, which is otherwise only
+/// findable by going back to the grid or reading the script.
+pub fn verdict_label(v: Verdict, truth: &str) -> String {
+    match (v, truth.trim()) {
+        (Verdict::Incorrect, t) if !t.is_empty() => {
+            format!("{} \u{2014} expected {t}", v.as_str())
+        }
+        _ => v.as_str().to_string(),
+    }
 }
 
 /// `text` pretty-printed if it is JSON, and unchanged if it isn't. A detail
@@ -221,12 +255,78 @@ mod tests {
             "picture first: {got:?}"
         );
         match &got[1] {
-            DetailSection::Text { header, value } => {
+            DetailSection::Text { header, value, .. } => {
                 assert_eq!(*header, "Body");
                 assert!(value.contains('\n'), "JSON is pretty-printed: {value}");
             }
             other => panic!("expected the detail text second, got {other:?}"),
         }
+    }
+
+    /// A `DETAIL` column that declares a `TRUTH` carries its verdict into the
+    /// panel: the grid tints such a cell by whether it is right, and the panel
+    /// is where the value is actually read.
+    #[test]
+    fn a_ground_truthed_detail_column_carries_its_verdict() {
+        let mut c = col("Body");
+        c.detail = true;
+        c.truth = Some("Low Risk".to_string());
+        let cols = vec![c];
+        let mut result = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![row(&[("Body", "High Risk")])],
+            ..Default::default()
+        };
+        result
+            .verdicts
+            .insert((0, "Body".into()), Verdict::Incorrect);
+        result
+            .truths
+            .insert((0, "Body".into()), "Low Risk".to_string());
+        let (_, detail) = split_columns(&cols);
+        let got = sections(&result, 0, &cols, &detail);
+        let DetailSection::Text { verdict, .. } = &got[0] else {
+            panic!("expected the detail text, got {got:?}");
+        };
+        assert_eq!(
+            verdict.as_ref().map(|(v, t)| (*v, t.as_str())),
+            Some((Verdict::Incorrect, "Low Risk")),
+            "the verdict and what it was scored against travel together"
+        );
+        // What the reader is shown: the verdict, and the answer that was
+        // wanted — otherwise the only way to find it is to read the script.
+        assert_eq!(
+            verdict_label(Verdict::Incorrect, "Low Risk"),
+            "incorrect \u{2014} expected Low Risk"
+        );
+        assert_eq!(
+            verdict_label(Verdict::Correct, "Low Risk"),
+            "correct",
+            "a right answer doesn't repeat the answer back"
+        );
+    }
+
+    /// An unlabelled row is not a pass: it carries no verdict at all, so no
+    /// renderer can paint it like one.
+    #[test]
+    fn an_unlabelled_row_carries_no_verdict() {
+        let mut c = col("Body");
+        c.detail = true;
+        let cols = vec![c];
+        let mut result = ReportResult {
+            column_order: vec!["Body".into()],
+            rows: vec![row(&[("Body", "High Risk")])],
+            ..Default::default()
+        };
+        result
+            .verdicts
+            .insert((0, "Body".into()), Verdict::Untested);
+        let (_, detail) = split_columns(&cols);
+        let got = sections(&result, 0, &cols, &detail);
+        assert!(
+            matches!(&got[0], DetailSection::Text { verdict: None, .. }),
+            "an untested cell says nothing: {got:?}"
+        );
     }
 
     /// A picture is worth showing larger whether or not its column is `DETAIL`,

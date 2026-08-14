@@ -349,6 +349,13 @@ max-height:24rem;overflow:auto}
 table.fdiff{width:100%;font-size:12px}
 table.fdiff th{background:var(--fdiff-head-bg);color:var(--fg);position:static;font-weight:600}
 table.fdiff tr.chg td{background:var(--warn-bg);color:var(--tint-fg)}
+/* A DETAIL column carrying a TRUTH says whether it is right, the way its grid
+   cell would have: the panel is where the value is actually read, so a full
+   value shown without its verdict reads as one nobody checked. */
+.panel h3 .verdict{margin-left:.4rem;font-size:11px;padding:.05rem .35rem;border-radius:3px;
+color:var(--tint-fg);text-transform:none;letter-spacing:0}
+.panel h3 .verdict.pass{background:var(--pass-bg)}
+.panel h3 .verdict.fail{background:var(--fail-bg)}
 .toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:0 0 .6rem}
 .toolbar button{font:inherit;font-size:13px;padding:.25rem .7rem;border:1px solid var(--btn-line);
 border-radius:5px;background:var(--panel-bg);color:var(--fg);cursor:pointer}
@@ -607,9 +614,23 @@ fn push_detail_row(
                 push_panel_image(out, image, value, cell);
                 out.push_str("</section>");
             }
-            DetailSection::Text { header, value } => {
+            DetailSection::Text {
+                header,
+                value,
+                verdict,
+            } => {
                 out.push_str("<section><h3>");
                 push_escaped(out, header);
+                if let Some((v, truth)) = verdict {
+                    let cls = if *v == Verdict::Correct {
+                        "pass"
+                    } else {
+                        "fail"
+                    };
+                    out.push_str(&format!("<span class=\"verdict {cls}\">"));
+                    push_escaped(out, &super::detail::verdict_label(*v, truth));
+                    out.push_str("</span>");
+                }
                 out.push_str("</h3><pre>");
                 push_escaped(out, value);
                 out.push_str("</pre></section>");
@@ -3038,6 +3059,31 @@ mod tests {
     fn a_narrow_table_is_left_alone() {
         let widths = vec![10, 12, 30];
         assert_eq!(fit_to_budget(widths.clone()), widths);
+    }
+
+    /// A `DETAIL` column carrying a `TRUTH` says in the panel whether it is
+    /// right, the way its grid cell would have: the panel is where that value
+    /// is actually read, and a full value shown without a verdict reads as one
+    /// nobody checked.
+    #[test]
+    fn a_ground_truthed_detail_section_is_marked_right_or_wrong() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "High Risk")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        res.verdicts.insert((0, "Raw".into()), Verdict::Incorrect);
+        res.truths.insert((0, "Raw".into()), "Low Risk".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("<span class=\"verdict fail\">incorrect \u{2014} expected Low Risk"),
+            "the heading says it is wrong, and what was wanted: {html}"
+        );
+        assert!(
+            html.contains(".panel h3 .verdict.fail{background:var(--fail-bg)}"),
+            "and the badge is painted like the grid's own wrong cells: {html}"
+        );
     }
 
     /// A `DETAIL` column leaves the grid for the drill-down panel -- but only
