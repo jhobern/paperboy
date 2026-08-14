@@ -1160,10 +1160,8 @@ impl TuiApp {
         let whole = match rt.view {
             crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
             crate::tui::reports::ReportView::Source => rt.source_panel.whole_text(),
-            // Neither the node outline nor the run settings is a text panel;
-            // `y` in either is a no-op.
-            crate::tui::reports::ReportView::Nodes
-            | crate::tui::reports::ReportView::RunSettings => None,
+            // The node outline isn't a text panel; `y` there is a no-op.
+            crate::tui::reports::ReportView::Nodes => None,
         };
         if let Some(text) = whole
             && !text.is_empty()

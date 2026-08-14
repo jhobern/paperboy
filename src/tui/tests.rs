@@ -22817,15 +22817,26 @@ fn report_app() -> TuiApp {
     app
 }
 
-/// A report that asks for something shows the question first: the tab opens on
-/// the run settings rather than on the source nobody non-technical reads.
+/// The same report with its questions already up — what every test about the
+/// rows themselves starts from, since the box is now opened rather than landed
+/// on.
+fn report_app_asking() -> TuiApp {
+    let mut app = report_app();
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open);
+    app
+}
+
+/// A report that asks for something asks on the way to a run, not on the way
+/// in: opening it shows the report, and `p` (or Run) is what puts the
+/// questions up.
 #[test]
-fn a_report_that_asks_for_values_opens_on_them() {
-    let app = report_app();
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings
-    );
+fn a_report_that_asks_for_values_is_asked_on_the_way_to_a_run() {
+    let mut app = report_app();
+    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
+    assert!(!app.reports[0].params_open, "nothing is asked unprompted");
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open, "`p` puts the questions up");
     let rows = app.report_param_rows(0);
     assert_eq!(rows.len(), 3);
     // The LABEL is what the row asks; without one, the name is turned into
@@ -22850,10 +22861,9 @@ fn a_report_that_asks_for_nothing_still_opens_on_its_source() {
     ));
     assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
     press(&mut app, KeyCode::Char('p'));
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::Source,
-        "there is nothing to ask, so `p` doesn't take over the pane"
+    assert!(
+        !app.reports[0].params_open,
+        "there is nothing to ask, so `p` puts up no box"
     );
     assert!(app.status.is_some(), "and it says why");
 }
@@ -22862,7 +22872,7 @@ fn a_report_that_asks_for_nothing_still_opens_on_its_source() {
 /// value for the run without touching the report's source.
 #[test]
 fn a_choice_parameter_is_picked_from_its_own_choices() {
-    let mut app = report_app();
+    let mut app = report_app_asking();
     let before = app.reports[0].report.text.clone();
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
@@ -22883,7 +22893,7 @@ fn a_choice_parameter_is_picked_from_its_own_choices() {
 /// the complaint about it goes away.
 #[test]
 fn typing_a_value_answers_the_row_it_was_opened_from() {
-    let mut app = report_app();
+    let mut app = report_app_asking();
     press(&mut app, KeyCode::Enter);
     assert!(
         matches!(
@@ -22943,15 +22953,13 @@ fn a_run_missing_a_required_value_is_refused_not_guessed() {
     ));
     app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
     app.revalidate_report(0);
-    app.reports[0].view = crate::tui::reports::ReportView::Source;
-    // The first `r` only opens the questions (see the gate below); the second
+    // The first `r` only puts the questions up (see the gate below); the second
     // is the one that tries to run.
     press(&mut app, KeyCode::Char('r'));
     press(&mut app, KeyCode::Char('r'));
     assert!(app.reports[0].result.is_none(), "nothing ran");
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
+    assert!(
+        app.reports[0].params_open,
         "the user is put back on the row that needs answering"
     );
     assert!(
@@ -22993,7 +23001,7 @@ fn clicking_the_results_grid_selects_the_report_body() {
 fn clicking_a_run_settings_row_selects_then_opens_it() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let mut app = report_app();
+    let mut app = report_app_asking();
     app.focus = Pane::List;
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
@@ -23021,24 +23029,14 @@ fn clicking_a_run_settings_row_selects_then_opens_it() {
 /// take them back to the report as readily as it brought them here.
 #[test]
 fn the_run_settings_key_also_closes_them() {
-    let mut app = report_app();
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
-        "the report opens on its questions"
+    let mut app = report_app_asking();
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        !app.reports[0].params_open,
+        "`p` again puts the questions away"
     );
     press(&mut app, KeyCode::Char('p'));
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::Source,
-        "`p` again shows the report itself"
-    );
-    press(&mut app, KeyCode::Char('p'));
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
-        "and brings the questions back"
-    );
+    assert!(app.reports[0].params_open, "and brings them back");
 }
 
 /// An `ENV` parameter is picked from the loaded environments, and typing
@@ -23054,6 +23052,7 @@ fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
         "Face",
         "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
     ));
+    press(&mut app, KeyCode::Char('p'));
     press(&mut app, KeyCode::Enter);
     let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
         panic!("an ENV parameter opens the list of loaded environments");
@@ -23101,6 +23100,7 @@ fn backspacing_the_filter_brings_the_other_rows_back() {
         "Face",
         "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
     ));
+    press(&mut app, KeyCode::Char('p'));
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Char('z'));
     let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
@@ -23118,8 +23118,9 @@ fn backspacing_the_filter_brings_the_other_rows_back() {
 }
 
 /// Run on a report that asks for values stops at the questions first, and only
-/// the second Run starts it — so the values are always seen before a long run
-/// goes out under them, and there is a way back to them from the results.
+/// the Run from inside the box starts it — so the values are always seen before
+/// a long run goes out under them. Having been answered, they aren't asked
+/// again: the second run of the same report goes straight out.
 #[test]
 fn run_stops_at_the_questions_before_it_starts() {
     let mut app = TuiApp::default();
@@ -23135,13 +23136,11 @@ fn run_stops_at_the_questions_before_it_starts() {
     app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
     app.revalidate_report(0);
     app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
-    app.reports[0].view = crate::tui::reports::ReportView::Source;
 
     press(&mut app, KeyCode::Char('r'));
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
-        "the first Run opens the questions"
+    assert!(
+        app.reports[0].params_open,
+        "the first Run puts the questions up"
     );
     assert!(
         matches!(
@@ -23153,7 +23152,10 @@ fn run_stops_at_the_questions_before_it_starts() {
     );
     assert!(app.reports[0].result.is_none(), "nothing has run yet");
 
-    // The second Run — from the settings — is the one that goes.
+    // The second Run — from inside the box — is the one that goes. (The fake
+    // runner is started directly, so the answer the `r` key would record is
+    // recorded here.)
+    app.answer_report_params(0);
     let body = "{}".to_string();
     app.start_report_run_faked(move |_| FakeReportRunner { body });
     for _ in 0..200 {
@@ -23167,14 +23169,16 @@ fn run_stops_at_the_questions_before_it_starts() {
         app.reports[0].result.is_some(),
         "running from the settings starts the run"
     );
+    assert!(
+        !app.reports[0].params_open,
+        "and the questions are put away by the answer"
+    );
 
-    // And the way back is the same key: Run from the results returns to the
-    // questions instead of silently re-running with the old answers.
-    press(&mut app, KeyCode::Char('r'));
-    assert_eq!(
-        app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
-        "Run from the results reopens the questions"
+    // Asked once per editing session, not once per run: having answered, Run
+    // runs. `p` is the way back to the answers.
+    assert!(
+        !app.report_run_needs_settings(),
+        "the next Run doesn't ask the same questions again"
     );
 }
 
@@ -23197,6 +23201,7 @@ fn a_report_is_offered_the_answers_it_was_last_run_with() {
     app.revalidate_report(0);
     app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
     app.set_report_param(app.reports[0].report.id, "REGION", "eu".into());
+    app.answer_report_params(0);
     let body = "{}".to_string();
     app.start_report_run_faked(move |_| FakeReportRunner { body });
 
@@ -23216,14 +23221,95 @@ fn a_report_is_offered_the_answers_it_was_last_run_with() {
 /// isn't a trap for someone who does want to read the flow.
 #[test]
 fn esc_leaves_the_run_settings_for_the_source() {
-    let mut app = report_app();
+    let mut app = report_app_asking();
     press(&mut app, KeyCode::Esc);
-    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
-    press(&mut app, KeyCode::Char('p'));
+    assert!(!app.reports[0].params_open);
     assert_eq!(
         app.reports[0].view,
-        crate::tui::reports::ReportView::RunSettings,
-        "`p` brings them back"
+        crate::tui::reports::ReportView::Source,
+        "the report was never left, so Esc has nothing to back out of"
+    );
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open, "`p` brings them back");
+}
+
+/// A preview asks the same questions a run does — a preview of a run you don't
+/// mean is worthless — and the answer counts for both, so previewing and then
+/// running doesn't ask twice.
+#[test]
+fn a_preview_asks_the_same_questions_and_the_answer_counts_for_the_run() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+
+    press(&mut app, KeyCode::Char('d'));
+    assert!(
+        app.reports[0].params_open,
+        "Dry run puts the same questions up"
+    );
+    assert!(
+        app.reports[0].dry_run.is_none(),
+        "and nothing has been previewed yet"
+    );
+
+    // `d` from inside the box is the preview; it counts as the answer.
+    press(&mut app, KeyCode::Char('d'));
+    assert!(!app.reports[0].params_open, "the questions are put away");
+    assert!(
+        !app.report_run_needs_settings(),
+        "and Run afterwards doesn't ask them again"
+    );
+}
+
+/// Changing *what the report asks for* asks again; editing anything else
+/// doesn't — the answer is filed against the declarations, not the text.
+#[test]
+fn changing_what_the_report_asks_for_asks_again() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+    app.answer_report_params(0);
+    assert!(!app.report_run_needs_settings());
+
+    // An unrelated edit: same questions, same answer.
+    app.reports[0].report.text = app.reports[0]
+        .report
+        .text
+        .replace("REPORT REQUEST x", "REPORT REQUEST y");
+    app.revalidate_report(0);
+    assert!(
+        !app.report_run_needs_settings(),
+        "editing the flow doesn't re-ask what it didn't change"
+    );
+
+    // A new declaration: there is something new to answer.
+    app.reports[0].report.text = app.reports[0]
+        .report
+        .text
+        .replace("REPORT REQUEST y", "PARAM TEXT NOTE\nREPORT REQUEST y");
+    app.revalidate_report(0);
+    assert!(
+        app.report_run_needs_settings(),
+        "a report that asks for something new asks for it"
+    );
+}
+
+/// The questions are drawn *over* the report, not instead of it: the point of
+/// asking on the way to a run is that what you're about to run is still there.
+#[test]
+fn the_questions_are_drawn_over_the_report_not_instead_of_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app_asking();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let screen = buffer_text(term.backend().buffer());
+    assert!(screen.contains("Run settings"), "the box is up: {screen}");
+    assert!(
+        screen.contains("# name: Face"),
+        "and the report it is asking about is still on screen: {screen}"
+    );
+    assert!(
+        screen.contains("Values"),
+        "with the chosen values named under it: {screen}"
     );
 }
 

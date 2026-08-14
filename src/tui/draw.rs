@@ -1591,6 +1591,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     // `draw_collection_main`/`draw_response` inside `draw_body` above).
     paint_selection_highlight(f, app, &th);
 
+    // The report's questions are asked *over* the report, not instead of it:
+    // the point of asking on the way to a run is that you can still see what
+    // you're about to run. Drawn before `draw_overlay` so a value editor
+    // opened from a row (an overlay proper) lands on top of the box.
+    if let Some(idx) = app.active_report_index()
+        && app.reports[idx].params_open
+    {
+        super::reports::draw_report_run_settings_overlay(f, app, idx, &s, &th);
+    }
+
     if app.overlay.is_some() {
         draw_overlay(f, app, &s, &th);
     } else {

@@ -1279,9 +1279,10 @@ strings! {
     param_run_settings_first => "This report asks for some values — check them, then run again to start.", "Ce rapport demande des valeurs : vérifiez-les, puis relancez pour démarrer.", "Denne rapport beder om nogle værdier — tjek dem, og kør igen for at starte.";
     param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
-    param_view_lead => "What this report asks for before it runs.", "Ce que ce rapport demande avant de s'exécuter.", "Hvad denne rapport beder om, før den kører.";
-    param_view_empty => "No parameters declared.", "Aucun paramètre déclaré.", "Ingen parametre erklæret.";
-    param_view_hint => "Enter set  r run  p show the report", "Entrée définir  r exécuter  p afficher le rapport", "Enter angiv  r kør  p vis rapporten";
+    param_view_lead => "Set the values this run will use.", "Définissez les valeurs utilisées par cette exécution.", "Angiv de værdier, denne kørsel skal bruge.";
+    param_view_hint => "Enter set  r run  d preview  Esc cancel", "Entrée définir  r exécuter  d aperçu  Échap annuler", "Enter angiv  r kør  d forhåndsvis  Esc annullér";
+    param_summary_prefix => "Values", "Valeurs", "Værdier";
+    param_summary_hint => "p to change", "p pour modifier", "p for at ændre";
     param_value_unset => "(not set)", "(non renseigné)", "(ikke angivet)";
     param_open_hint => "p run settings", "p paramètres d'exécution", "p kørselsindstillinger";
     param_required => "'{}' has no value and no default — set it before running (--param {}=…).", "« {} » n'a ni valeur ni valeur par défaut — renseignez-le avant d'exécuter (--param {}=…).", "'{}' har hverken en værdi eller en standardværdi — angiv den før kørslen (--param {}=…).";

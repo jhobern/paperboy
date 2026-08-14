@@ -128,6 +128,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   run would use. The form is built by the shared core, so the two front-ends
   can't drift apart.
 
+- **The terminal UI asks the same questions the same way.** A report that
+  declares `PARAM`s no longer opens on a run-settings *view* it takes an Esc to
+  leave; the questions come up in a box over the report when Run (`r`) or Dry
+  run (`d`) is pressed, so what you're about to run stays on screen behind
+  them. `r` and `d` inside the box are both exits — either one counts as the
+  answer, so previewing and then running doesn't ask twice — and Esc puts the
+  box away without answering. Like the desktop app, the questions are asked
+  once per editing session and again only when the report changes what it
+  declares; `p` reopens them, and the binding panel names the values the next
+  run will use.
+
 - **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
   clause may name an environment (or a `FILE(…)` snapshot) through a parameter
   — `BASELINE("{{BASELINE_ENV}}"), COMPARISON("{{COMPARE_ENV}}")` — so the

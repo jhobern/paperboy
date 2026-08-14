@@ -17,13 +17,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
 use super::app::{
     ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, PromptKind, TuiApp,
 };
-use super::draw::panel;
+use super::draw::{centered_rect, panel};
 use super::editor::{
     Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
 };
@@ -212,6 +212,13 @@ pub(crate) struct ReportTab {
     /// parameters are all empty strings has been seeded just as much as one
     /// with values, and re-seeding would undo the clearing.
     pub(crate) params_seeded: bool,
+    /// Whether the run-settings overlay is up. A dialog rather than a view: the
+    /// questions are a step on the way to a run, and the report they are about
+    /// stays visible behind them.
+    pub(crate) params_open: bool,
+    /// The declarations these values were confirmed against, if they have been
+    /// (see [`TuiApp::report_params_answered`]).
+    pub(crate) params_answered: Option<String>,
     /// The selected row in the run settings view.
     pub(crate) param_selected: usize,
     /// The last run's output, if the report has been run this session. Rendered
@@ -355,10 +362,6 @@ pub(crate) enum ReportView {
     Nodes,
     /// The grid of rows produced by the last run.
     Results,
-    /// The run settings: the values this run will use for the report's
-    /// `PARAM` declarations. A report that declares parameters opens here, so
-    /// what it is about to run against is seen before anything is sent.
-    RunSettings,
 }
 
 impl ReportView {
@@ -410,7 +413,6 @@ impl ReportTab {
         // land on the right lines even when the flow has blank separators.
         let mut source_panel = MultiSelectPanel::new();
         source_panel.set_wrap_mode(WrapMode::Clip);
-        let report_asks_for_values = report.flow().is_ok_and(|f| !f.params().is_empty());
         Self {
             report,
             diagnostics: Vec::new(),
@@ -421,21 +423,15 @@ impl ReportTab {
             edit_cursor: None,
             source_panel,
             validation_panel: MultiSelectPanel::new(),
-            // A report that asks for something opens on the question rather
-            // than on its source: what it is about to run against is the first
-            // thing worth seeing, and the values are remembered per report so
-            // this is usually a glance and an `r`.
-            view: if report_asks_for_values {
-                ReportView::RunSettings
-            } else {
-                ReportView::Source
-            },
+            view: ReportView::Source,
             editor_view: ReportView::Source,
             node_selected: 0,
             node_setting: None,
             node_undo: Vec::new(),
             param_values: Default::default(),
             params_seeded: false,
+            params_open: false,
+            params_answered: None,
             param_selected: 0,
             result: None,
             dry_run: None,
@@ -1129,9 +1125,7 @@ impl TuiApp {
         // questions discards nothing: the results stay exactly where they are
         // until the *second* Run actually starts.
         if self.report_run_needs_settings() {
-            let idx = self.active_report_index().expect("checked above");
-            self.seed_report_params(idx);
-            self.reports[idx].view = ReportView::RunSettings;
+            self.open_report_run_settings();
             self.status = Some(Status::ReportRunSettingsFirst);
             return;
         }
@@ -1169,7 +1163,8 @@ impl TuiApp {
         !self
             .running_reports
             .contains_key(&self.reports[idx].report.id)
-            && self.reports[idx].view != ReportView::RunSettings
+            && !self.reports[idx].params_open
+            && !self.report_params_answered(idx)
             && self.report_has_params(idx)
     }
 
@@ -1245,8 +1240,8 @@ impl TuiApp {
         // only reliable way back to them once a run has filled the screen with
         // results. A run already under way is unaffected: the cancel path above
         // returns before this.
-        if self.report_has_params(idx) && self.reports[idx].view != ReportView::RunSettings {
-            self.reports[idx].view = ReportView::RunSettings;
+        if self.report_run_needs_settings() {
+            self.reports[idx].params_open = true;
             self.status = Some(Status::ReportRunSettingsFirst);
             return None;
         }
@@ -1258,7 +1253,8 @@ impl TuiApp {
             // Refuse rather than run: a report that asks for something and is
             // given nothing produces plausible-looking rows built around a hole.
             self.status = Some(Status::ReportRunBlocked(problem));
-            self.reports[idx].view = ReportView::RunSettings;
+            self.seed_report_params(idx);
+            self.reports[idx].params_open = true;
             return None;
         }
         self.remember_active_report_params(idx);
@@ -1664,8 +1660,8 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        if self.reports[idx].view == ReportView::RunSettings {
-            self.reports[idx].view = self.reports[idx].editor_view;
+        if self.reports[idx].params_open {
+            self.reports[idx].params_open = false;
             return;
         }
         if !self.report_has_params(idx) {
@@ -1677,7 +1673,71 @@ impl TuiApp {
             return;
         }
         self.seed_report_params(idx);
-        self.reports[idx].view = ReportView::RunSettings;
+        self.reports[idx].params_open = true;
+    }
+
+    /// Whether this report's questions have already been answered for the
+    /// values it currently asks for.
+    ///
+    /// Answered once per sitting, not once per run: the point of previewing a
+    /// report is to run the same thing afterwards, and being asked again in
+    /// between would make the preview worthless as a confirmation. The answer
+    /// is filed against a *signature* of the declarations, so changing what the
+    /// report asks — a new parameter, another choice — asks again, while
+    /// editing anything else doesn't.
+    pub(crate) fn report_params_answered(&self, idx: usize) -> bool {
+        self.reports[idx]
+            .params_answered
+            .as_ref()
+            .is_some_and(|sig| Some(sig) == self.report_param_signature(idx).as_ref())
+    }
+
+    /// What a report asks, as one string: every declaration's name, type and
+    /// default. Compared rather than inspected, so it only has to be stable.
+    /// `None` when the report doesn't currently parse — there is nothing to
+    /// compare, and re-asking on every keystroke of a half-typed edit would be
+    /// worse than trusting the last answer.
+    fn report_param_signature(&self, idx: usize) -> Option<String> {
+        let flow = self.reports[idx].report.flow().ok()?;
+        Some(
+            flow.params()
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{:?}:{}",
+                        p.name,
+                        p.kind,
+                        p.default.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Record that the questions have been answered as they currently stand,
+    /// and close them. Called by Run and Dry run from inside the overlay.
+    pub(crate) fn answer_report_params(&mut self, idx: usize) {
+        self.reports[idx].params_answered = self.report_param_signature(idx);
+        self.reports[idx].params_open = false;
+    }
+
+    /// The chosen values in one line — `REGION=au · TICKET=FR-12` — for the
+    /// binding panel, so what the next run will use is on screen without
+    /// opening anything.
+    pub(crate) fn report_param_summary(&self, idx: usize, s: &Strings) -> String {
+        self.report_param_rows(idx)
+            .iter()
+            .map(|r| {
+                let v = if r.value.is_empty() {
+                    s.param_value_unset
+                } else {
+                    r.value.as_str()
+                };
+                format!("{}={}", r.name, v)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// Fill in a report's parameter values from what it was last run with,
@@ -1833,9 +1893,9 @@ impl TuiApp {
         }
     }
 
-    /// Key handling for [`ReportView::RunSettings`]. Returns `true` when it
-    /// consumed the key; anything it doesn't take falls through to the shared
-    /// report shortcuts (so `r`, the tab keys and the menus still work here).
+    /// Key handling while the run-settings overlay is up. Returns `true` when
+    /// it consumed the key; anything it doesn't take falls through to the
+    /// shared report shortcuts (so the tab keys and the menus still work).
     fn on_key_report_run_settings(&mut self, key: KeyEvent, idx: usize) -> bool {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.param_cursor_move(-1),
@@ -1843,14 +1903,21 @@ impl TuiApp {
             KeyCode::Home => self.param_cursor_move(i32::MIN),
             KeyCode::End => self.param_cursor_move(i32::MAX),
             KeyCode::Enter | KeyCode::Char(' ') => self.configure_selected_param(),
-            // `p` is what the hint advertises — it opened this view, so it
-            // closes it. Esc does the same thing without being advertised: it
-            // is what a hand reaches for, but "back" is the wrong word for a
-            // view the report opened itself on.
-            KeyCode::Esc => {
-                let back = self.reports[idx].editor_view;
-                self.reports[idx].view = back;
+            // The two exits that *do* something. Both count as an answer, so
+            // the next Run (or the run a preview talks you into) doesn't ask
+            // again — see `report_params_answered`.
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                self.answer_report_params(idx);
+                self.run_active_report();
             }
+            KeyCode::Char('d') => {
+                self.answer_report_params(idx);
+                self.open_report_dry_run();
+            }
+            // Esc and `p` both put the questions away without answering them:
+            // `p` because it is what opened them, Esc because it is what a hand
+            // reaches for on a box in the middle of the screen.
+            KeyCode::Esc | KeyCode::Char('p') => self.reports[idx].params_open = false,
             _ => return false,
         }
         true
@@ -2075,6 +2142,15 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
+        // A preview is only worth reading if it previews the run you mean, so
+        // it asks the same questions Run does — and the answer counts for both,
+        // so previewing and then running doesn't ask twice.
+        if self.report_run_needs_settings() {
+            self.open_report_run_settings();
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return;
+        }
+        self.seed_report_params(idx);
         match self.dry_run_report_flow(idx) {
             Ok(result) => {
                 // The flow header is needed to resolve `# columns:` for the
@@ -2683,7 +2759,7 @@ impl TuiApp {
         // Same arrangement for the run settings: it owns the cursor keys and
         // Enter, and lets everything else through.
         if let Some(idx) = self.active_report_index()
-            && self.reports[idx].view == ReportView::RunSettings
+            && self.reports[idx].params_open
             && self.on_key_report_run_settings(key, idx)
         {
             return;
@@ -2916,7 +2992,7 @@ impl TuiApp {
                 // The node outline and the run settings both scroll to follow
                 // their selection cursor (moved by Up/Down in their own
                 // handlers), not a free scroll offset.
-                ReportView::Nodes | ReportView::RunSettings => return,
+                ReportView::Nodes => return,
             };
             let next = (panel.scroll() as i32).saturating_add(delta).max(0);
             panel.set_scroll(next.min(u16::MAX as i32) as u16);
@@ -3799,8 +3875,9 @@ pub(crate) fn draw_report_content(
     // when the user has flipped to it; otherwise the source + binding +
     // validation stack (binding and validation moved to the bottom for stable
     // layout when scrolling past different reports in a workspace).
+    let bind_h = binding_height(app, idx);
     if app.reports[idx].view == ReportView::Results {
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(bind_h)]).split(area);
         draw_report_results(f, rows[0], app, idx, s, th);
         draw_report_binding(f, rows[1], app, idx, s, th);
         return;
@@ -3814,14 +3891,12 @@ pub(crate) fn draw_report_content(
 
     let rows = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(4),
+        Constraint::Length(bind_h),
         Constraint::Length(diag_h),
     ])
     .split(area);
 
-    if app.reports[idx].view == ReportView::RunSettings {
-        draw_report_run_settings(f, rows[0], app, idx, s, th);
-    } else if app.reports[idx].view == ReportView::Nodes {
+    if app.reports[idx].view == ReportView::Nodes {
         super::report_nodes::draw_report_nodes(f, rows[0], app, idx, s, th);
     } else {
         draw_report_source(f, rows[0], app, idx, s, th);
@@ -3835,42 +3910,34 @@ pub(crate) fn draw_report_content(
 /// name and the declared type are shown dimmed beside the prompt: the prompt is
 /// what the row means, but the name is what `{{…}}` and `--param` say, so
 /// neither can be the only one on screen.
-fn draw_report_run_settings(
+pub(crate) fn draw_report_run_settings_overlay(
     f: &mut Frame,
-    area: Rect,
     app: &mut TuiApp,
     idx: usize,
     s: &Strings,
     th: &Theme,
 ) {
-    let focused = app.report_body_focused();
-    let title = format!("{} — {}", s.param_view_title, s.param_view_hint);
-    let block = panel(title, focused, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    // Not a text panel: nothing here is selectable or scrollable with the
-    // mouse, so it claims no hit-test area (as the node outline doesn't). Its
-    // *rows* are clickable, though — see the hit targets pushed below.
-    app.report_pane_areas[ReportPane::Source.idx()] = Rect::default();
-    app.report_pane_bars[ReportPane::Source.idx()] = Rect::default();
-    app.push_mouse_hit(
-        MouseLayer::Base,
-        inner,
-        MouseHitTarget::FocusPane(Pane::Main),
-    );
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let rows = app.report_param_rows(idx);
     if rows.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                s.param_view_empty.to_string(),
-                Style::default().fg(th.dim),
-            ))),
-            inner,
-        );
+        return;
+    }
+    // Sized to what it holds, within what the terminal has: the report stays
+    // visible around it, which is the point of asking here rather than in a
+    // view of its own.
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 100);
+    let box_h = (rows.len() as u16 + 2)
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let title = format!("{} — {}", s.param_view_title, s.param_view_hint);
+    let block = panel(title, true, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // Only the topmost layer's hits are tested, so raising the layer is what
+    // stops a click landing on the report behind acting through the box.
+    app.set_mouse_layer(MouseLayer::Overlay);
+    if inner.width == 0 || inner.height == 0 {
         return;
     }
     let sel = app.reports[idx]
@@ -3934,7 +4001,7 @@ fn draw_report_run_settings(
     // outline and the settings rows above it use.
     for i in 0..shown {
         app.push_mouse_hit(
-            MouseLayer::Base,
+            MouseLayer::Overlay,
             Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
             MouseHitTarget::ReportParamRow(first + i),
         );
@@ -4942,6 +5009,12 @@ pub(crate) fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
     }
 }
 
+/// The binding panel's height: its two standing lines plus, for a report that
+/// declares `PARAM`s, a third naming the values the next run will use.
+fn binding_height(app: &TuiApp, idx: usize) -> u16 {
+    if app.report_has_params(idx) { 5 } else { 4 }
+}
+
 fn draw_report_binding(
     f: &mut Frame,
     area: Rect,
@@ -5016,7 +5089,23 @@ fn draw_report_binding(
             Style::default().fg(th.pending),
         ));
     }
-    let lines = vec![binding, Line::from(dir_spans)];
+    let mut lines = vec![binding, Line::from(dir_spans)];
+    // A report that asks questions says on screen what it was answered with,
+    // and how to change the answers — the questions are asked once per editing
+    // session, so without this the chosen values would be invisible after the
+    // box closes.
+    if app.report_has_params(idx) {
+        lines.push(Line::from(vec![
+            Span::styled(s.param_summary_prefix, Style::default().fg(th.dim)),
+            Span::raw(" "),
+            Span::styled(
+                app.report_param_summary(idx, s),
+                Style::default().fg(th.text),
+            ),
+            Span::styled("  ", Style::default().fg(th.dim)),
+            Span::styled(s.param_summary_hint, Style::default().fg(th.dim)),
+        ]));
+    }
     let title = if app.running_reports.contains_key(&rt.report.id) {
         format!(
             "{} — {}",
