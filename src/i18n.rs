@@ -1278,6 +1278,7 @@ strings! {
     param_run_settings_first => "This report asks for some values — check them, then run again to start.", "Ce rapport demande des valeurs : vérifiez-les, puis relancez pour démarrer.", "Denne rapport beder om nogle værdier — tjek dem, og kør igen for at starte.";
     param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
+    param_view_lead => "What this report asks for before it runs.", "Ce que ce rapport demande avant de s'exécuter.", "Hvad denne rapport beder om, før den kører.";
     param_view_empty => "No parameters declared.", "Aucun paramètre déclaré.", "Ingen parametre erklæret.";
     param_view_hint => "Enter set  r run  p show the report", "Entrée définir  r exécuter  p afficher le rapport", "Enter angiv  r kør  p vis rapporten";
     param_value_unset => "(not set)", "(non renseigné)", "(ikke angivet)";

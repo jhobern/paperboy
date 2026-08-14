@@ -2488,105 +2488,63 @@ fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
 }
 
 /// The raw `.trail` source editor + validation panel.
-/// The run settings view: one row per declared `PARAM` — what it asks for, the
+/// The run settings view: one card per declared `PARAM` — what it asks for, the
 /// value this run will use, and what is wrong with it, if anything.
 ///
 /// Deliberately a *form*, not a script: most people who run a report never open
-/// it, so every row is a labelled field with the widget its declared type
+/// it, so every parameter is a labelled field with the widget its declared type
 /// deserves (a drop-down for a closed set, a picker for a path). The raw name
 /// and type sit beside it dimmed — the form doubles as the reference for anyone
 /// who does go on to read the source.
+///
+/// Drawn as tinted, rounded cards rather than a bare grid so it reads as part
+/// of the same editor as the Blocks view: same corner radius, same panel-mixed
+/// fill, and the `subst` hue every other `{{substitution}}` in the editor
+/// carries — which is exactly what a parameter is.
 fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
-    use crate::report::flow::ParamKind;
-
     let th = app.theme;
-    let pick_label = app.strings.param_pick_path;
-    let rows = ed.param_rows(&app.strings);
+    // A copy of its own, so the app is free to be borrowed mutably for the file
+    // picker at the end without the form's own words going out of scope.
+    let s = Strings::for_language(&app.session.language);
+    let rows = ed.param_rows(&s);
     if rows.is_empty() {
-        ui.colored_label(th.dim, app.strings.param_view_empty);
+        ui.add_space(8.0);
+        ui.colored_label(th.dim, s.param_none_declared);
         return;
     }
+    // Everything the loop wants from the app, taken before the rows borrow it.
+    let envs: Vec<String> = app
+        .session
+        .global_envs
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
     // The value a widget changed this frame, and any path the user asked to
-    // browse for — applied after the loop so the rows aren't borrowed while the
-    // app is.
+    // browse for — applied after the loop, when the app is free again.
     let mut set: Option<(String, String)> = None;
     let mut browse: Option<(String, bool)> = None;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("pt_run_settings")
-                .num_columns(3)
-                .spacing([12.0, 8.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    for row in &rows {
-                        ui.label(RichText::new(&row.prompt).strong().color(th.text));
+            ui.add_space(8.0);
+            // A form is read left to right along each line, so it is capped
+            // rather than stretched: fields spanning a maximised window would
+            // put the label and its value at opposite ends of the screen.
+            ui.set_max_width(FORM_MAX_WIDTH.min(ui.available_width()));
+            ui.label(RichText::new(s.param_view_title).strong().color(th.text));
+            ui.colored_label(th.dim, s.param_view_lead);
+            ui.add_space(8.0);
 
-                        let mut value = row.value.clone();
-                        match &row.kind {
-                            ParamKind::Choice(options) if !options.is_empty() => {
-                                if param_combo(ui, th, &row.name, &mut value, options) {
-                                    set = Some((row.name.clone(), value.clone()));
-                                }
-                            }
-                            ParamKind::Env => {
-                                let envs: Vec<String> = app
-                                    .session
-                                    .global_envs
-                                    .iter()
-                                    .map(|e| e.name.clone())
-                                    .collect();
-                                // Nothing loaded to choose between: typing a
-                                // name by hand still works, and is the right
-                                // answer for an environment that lives on
-                                // another machine.
-                                if envs.is_empty() {
-                                    if ui.text_edit_singleline(&mut value).changed() {
-                                        set = Some((row.name.clone(), value.clone()));
-                                    }
-                                } else if param_combo(ui, th, &row.name, &mut value, &envs) {
-                                    set = Some((row.name.clone(), value.clone()));
-                                }
-                            }
-                            ParamKind::Folder | ParamKind::File => {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .button(format!("{} {}", super::icons::FOLDER, pick_label))
-                                        .clicked()
-                                    {
-                                        browse = Some((
-                                            row.name.clone(),
-                                            matches!(row.kind, ParamKind::Folder),
-                                        ));
-                                    }
-                                    // Editable as well as pickable: a path can
-                                    // be pasted, and a report's own folder is
-                                    // often quicker to type than to walk to.
-                                    if ui.text_edit_singleline(&mut value).changed() {
-                                        set = Some((row.name.clone(), value.clone()));
-                                    }
-                                });
-                            }
-                            _ => {
-                                if ui.text_edit_singleline(&mut value).changed() {
-                                    set = Some((row.name.clone(), value.clone()));
-                                }
-                            }
-                        }
-
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                th.dim,
-                                format!("{} {}", row.name, row.kind.keyword()),
-                            );
-                            if let Some(problem) = &row.problem {
-                                ui.colored_label(th.err, problem);
-                            }
-                        });
-                        ui.end_row();
+            for row in &rows {
+                if let Some((name, value)) = param_card(ui, &th, row, &envs, &s) {
+                    match value {
+                        CardEdit::Set(v) => set = Some((name, v)),
+                        CardEdit::Browse(folder) => browse = Some((name, folder)),
                     }
-                });
+                }
+                ui.add_space(6.0);
+            }
         });
 
     if let Some((name, value)) = set {
@@ -2608,11 +2566,134 @@ fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui)
         };
         app.request_pick(
             kind,
-            pick_label,
+            s.param_pick_path,
             seed.as_deref(),
             super::menu::PickAction::ReportParamPath { name },
         );
     }
+}
+
+/// How wide the run settings form is allowed to grow. Wide enough for a long
+/// path, narrow enough that a label and its field stay in one glance.
+const FORM_MAX_WIDTH: f32 = 620.0;
+/// How wide a parameter's field is. Fixed rather than fitted to the value so a
+/// column of fields lines up — a form of ragged boxes reads as an accident.
+const PARAM_FIELD_WIDTH: f32 = 320.0;
+
+/// What a [`param_card`] asked for this frame.
+enum CardEdit {
+    Set(String),
+    /// Browse for a path; `true` for a folder.
+    Browse(bool),
+}
+
+/// One parameter's card: its question, its field, and its identity.
+///
+/// Returns the parameter's name with whatever the user did to it, so the caller
+/// can apply it once the borrow of the rows is over.
+fn param_card(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    row: &crate::report::params::ParamRow,
+    envs: &[String],
+    s: &Strings,
+) -> Option<(String, CardEdit)> {
+    use crate::report::flow::ParamKind;
+
+    // The hue of a substitution, because that is what a parameter becomes.
+    // Deepened when something is wrong, so an unanswered card is findable in a
+    // column of them without reading a word.
+    let hue = if row.problem.is_some() {
+        th.err
+    } else {
+        th.subst
+    };
+    let mut edit = None;
+    egui::Frame::NONE
+        .fill(mix(th.panel, hue, 0.10))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, hue, 0.45)))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(BLOCK_RADIUS as u8)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            // The question, and — pushed to the far side — what the script
+            // calls it. Someone filling the form in reads the left; someone
+            // cross-referencing the source reads the right.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&row.prompt).strong().color(th.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.colored_label(th.dim, RichText::new(row.kind.keyword()).small());
+                    ui.label(
+                        RichText::new(&row.name)
+                            .monospace()
+                            .small()
+                            .color(mix(th.dim, th.subst, 0.5)),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+
+            let mut value = row.value.clone();
+            let name = row.name.clone();
+            ui.horizontal(|ui| {
+                match &row.kind {
+                    ParamKind::Choice(options) if !options.is_empty() => {
+                        if param_combo(ui, th, &name, &mut value, options) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                    // Nothing loaded to choose between: typing a name by hand
+                    // still works, and is the right answer for an environment
+                    // that lives on another machine.
+                    ParamKind::Env if !envs.is_empty() => {
+                        if param_combo(ui, th, &name, &mut value, envs) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                    ParamKind::Folder | ParamKind::File => {
+                        if param_field(ui, &mut value, s.param_value_unset) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                        if ui
+                            .button(format!("{} {}", super::icons::FOLDER, s.gui_browse))
+                            .on_hover_text(s.param_pick_path)
+                            .clicked()
+                        {
+                            edit = Some((
+                                name.clone(),
+                                CardEdit::Browse(matches!(row.kind, ParamKind::Folder)),
+                            ));
+                        }
+                    }
+                    _ => {
+                        if param_field(ui, &mut value, s.param_value_unset) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                }
+            });
+
+            if let Some(problem) = &row.problem {
+                ui.add_space(4.0);
+                ui.colored_label(th.err, format!("{}  {}", super::icons::WARNING, problem));
+            }
+        });
+    edit
+}
+
+/// A parameter's text field: fixed width, monospace, and hinted with what the
+/// run would use if it were left alone.
+fn param_field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> bool {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            // Monospace for the same reason an inline field in the Blocks view
+            // is: what goes in here is the user's own text, not the editor's
+            // vocabulary, and the two shouldn't look alike.
+            .font(egui::TextStyle::Monospace)
+            .desired_width(PARAM_FIELD_WIDTH),
+    )
+    .changed()
 }
 
 /// A parameter's drop-down: the closed set of answers its type allows, plus
@@ -2621,16 +2702,24 @@ fn run_settings_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui)
 /// silently change what the run does). Returns true when the pick changed.
 fn param_combo(
     ui: &mut egui::Ui,
-    th: super::theme::GuiTheme,
+    th: &GuiTheme,
     name: &str,
     value: &mut String,
     options: &[String],
 ) -> bool {
     let mut changed = false;
     let known = options.iter().any(|o| o == value);
+    let shown = if value.is_empty() {
+        RichText::new("—").color(th.dim)
+    } else {
+        RichText::new(value.clone()).color(if known { th.text } else { th.pending })
+    };
     egui::ComboBox::from_id_salt(("pt_param", name))
-        .selected_text(RichText::new(value.clone()).color(if known { th.text } else { th.pending }))
+        .width(PARAM_FIELD_WIDTH)
+        .selected_text(shown)
         .show_ui(ui, |ui| {
+            // An unrecognised current value is offered back to itself so
+            // opening the list can't quietly discard it.
             if !known && !value.is_empty() {
                 let cur = value.clone();
                 let _ = ui.selectable_label(true, RichText::new(cur).color(th.pending));
@@ -12423,6 +12512,42 @@ REPORT REQUEST x
             Some(Status::ReportRunBlocked(_))
         ));
         assert!(!ed.is_running());
+    }
+
+    /// The form has to actually paint: the prompt, the value the run would use,
+    /// and the raw name beside it. A state-correct form that draws nothing is
+    /// the failure mode this guards.
+    #[test]
+    fn the_form_paints_the_question_the_value_and_the_name() {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", TRAIL));
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 760.0),
+        ));
+        let out = ctx.run_ui(input, |ui| super::ui(&mut app, ui));
+        let mut text = String::new();
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        assert!(text.contains("Ticket number"), "the prompt: {text}");
+        assert!(text.contains("TICKET"), "and the name the script uses");
+        assert!(
+            text.contains("au"),
+            "and the value the run would use: {text}"
+        );
     }
 
     /// Answers survive a trip to another tab, so nobody types them twice.

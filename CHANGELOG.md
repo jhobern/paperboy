@@ -121,7 +121,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   hole. Answers are remembered per report between runs and survive a trip to
   another tab, and a dry run now previews with the same values the real run
   would use. The form itself is built by the shared core, so the two
-  front-ends can't drift apart.
+  front-ends can't drift apart. The form is drawn as tinted, rounded cards
+  in the same style as the Blocks editor — one card per question, the
+  parameter's name and type on the far side of it, and a fixed field width so
+  a column of answers lines up instead of each box shrinking to fit.
 
 - **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
   clause may name an environment (or a `FILE(…)` snapshot) through a parameter
