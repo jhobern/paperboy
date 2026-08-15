@@ -1972,10 +1972,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     {
                         ed.pending_toolbar = Some(ToolbarAct::RunSettings);
                     }
+                    // Body size, not `small`: this is the line that says what
+                    // the next run will use, so it is read rather than
+                    // glanced at, and it was set finer than the source it
+                    // describes. Truncated (the toolbar is a row, not a
+                    // paragraph) with the whole of it on hover.
                     let summary = ed.param_summary(&app.strings);
-                    ui.add(
-                        egui::Label::new(RichText::new(summary).small().color(th.dim)).truncate(),
-                    );
+                    ui.add(egui::Label::new(RichText::new(&summary).color(th.dim)).truncate())
+                        .on_hover_text(&summary);
                 }
             }
             // What you can do with a *result*, shown only where there is one to

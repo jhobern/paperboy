@@ -21,6 +21,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   HTML export alike. An unlabelled row still says nothing rather than borrowing
   the appearance of one that passed.
 
+- **The run-settings summary is legible.** The line naming the values the next
+  run will use sat in the toolbar at the small text style — finer than the
+  report it describes, and it is meant to be read. It is set at body size now,
+  with the whole of it on hover when the toolbar has to truncate it.
+
 - **A picture's path in the drill-down is readable again.** The caption under a
   full-size picture inherited the panel's justified column layout, which spread
   its first line's letters across the full width (`/ h o m e / j o n a…`). It is
