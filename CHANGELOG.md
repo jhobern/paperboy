@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A Postman import no longer stops the desktop app.** Bulk imports are paced
+  around Postman's rate limit and can run for many minutes, and the dialog held
+  the whole app while they did — nothing to answer, and nothing else possible.
+  The download step now sits over a working app rather than in front of one,
+  and *Continue in the background* puts it away entirely: progress carries on
+  in the status bar, clicking there brings it back, and it reappears by itself
+  if the import fails or needs an answer. Opening the importer while one is
+  already running returns to that one instead of discarding its progress.
+
 - **A ground-truthed `DETAIL` column says whether it was right.** A column
   carrying both `DETAIL` and `TRUTH` leaves the grid for the drill-down, and
   with it went the green/red that said whether the answer was correct — so the

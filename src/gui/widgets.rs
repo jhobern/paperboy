@@ -909,7 +909,20 @@ pub(crate) fn dialog<R>(
     min_width: Option<f32>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> DialogFrame<R> {
-    dialog_with(ctx, title, min_width, None, add)
+    dialog_with(ctx, title, min_width, None, true, add)
+}
+
+/// A [`dialog`] without the sheet behind it, for the one case where the dialog
+/// is *reporting* rather than *asking*: a long import that has everything it
+/// needs and now only has to be waited for. The rest of the app stays usable
+/// while it runs, because there is no question standing in the way of it.
+pub(crate) fn dialog_modeless<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    dialog_with(ctx, title, min_width, None, false, add)
 }
 
 /// A [`dialog`] the user can resize, for the ones whose body is a list: how
@@ -921,7 +934,7 @@ pub(crate) fn dialog_resizable<R>(
     default_size: [f32; 2],
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> DialogFrame<R> {
-    dialog_with(ctx, title, None, Some(default_size), add)
+    dialog_with(ctx, title, None, Some(default_size), true, add)
 }
 
 fn dialog_with<R>(
@@ -929,9 +942,12 @@ fn dialog_with<R>(
     title: &str,
     min_width: Option<f32>,
     default_size: Option<[f32; 2]>,
+    modal: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> DialogFrame<R> {
-    shade(ctx, title);
+    if modal {
+        shade(ctx, title);
+    }
     let mut open = true;
     let mut window = egui::Window::new(title)
         .collapsible(false)
@@ -956,7 +972,10 @@ fn dialog_with<R>(
     // Escape is read from the raw input rather than consumed: a dialog is the
     // top-most thing on screen, so nothing underneath it should be acting on
     // the same press anyway.
-    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // Escape closes the ones that are asking something. A modeless dialog is
+    // sitting beside work the user is still doing, and Escape there belongs to
+    // whatever they are actually typing into.
+    let esc = modal && ctx.input(|i| i.key_pressed(egui::Key::Escape));
     DialogFrame {
         inner,
         dismissed: !open || esc,

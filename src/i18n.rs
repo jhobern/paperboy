@@ -1197,6 +1197,10 @@ strings! {
     postman_error_hint => "Esc back", "Échap retour", "Esc tilbage";
     postman_confirm_hint => "Enter import · Esc back", "Entrée importer · Échap retour", "Enter importér · Esc tilbage";
     postman_rate_limit_note => "Paced to stay inside Postman’s rate limit.", "Rythme adapté à la limite de débit de Postman.", "Tempo tilpasset Postmans hastighedsgrænse.";
+    postman_background => "Importing from Postman", "Import depuis Postman", "Importerer fra Postman";
+    postman_background_button => "Continue in the background", "Continuer en arrière-plan", "Fortsæt i baggrunden";
+    postman_background_hint => "Put this away and keep working; the import carries on and reappears when it needs you.", "Masquer et continuer à travailler ; l'import se poursuit et réapparaît s'il a besoin de vous.", "Læg denne væk og arbejd videre; importen fortsætter og dukker op igen, når den har brug for dig.";
+    postman_background_reveal => "Click to show the import", "Cliquez pour afficher l'import", "Klik for at vise importen";
     postman_estimate => "About", "Environ", "Cirka";
     postman_budget_warning => "This would use a large share of this account's remaining monthly API budget.", "Cela consommerait une grande partie du budget d'API mensuel restant de ce compte.", "Dette ville bruge en stor del af kontoens resterende månedlige API-budget.";
     postman_waiting_paced => "Pausing to stay within Postman's rate limit", "Pause pour respecter la limite de débit de Postman", "Pauser for at holde sig inden for Postmans hastighedsgrænse";

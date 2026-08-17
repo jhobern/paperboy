@@ -955,6 +955,25 @@ impl GuiApp {
                 .map(|s| s.text(&self.strings))
                 .unwrap_or_default();
             ui.colored_label(self.theme.dim, msg);
+            // An import that was sent to the background reports from here, and
+            // clicking it is the way back to the dialog. Computed before the
+            // click so `self.postman` isn't borrowed twice.
+            if let Some(line) = self.postman.background_line(&self.strings) {
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} {line}", super::icons::RUNNING))
+                                .color(self.theme.accent),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(self.strings.postman_background_reveal)
+                    .clicked()
+                {
+                    self.postman.reveal();
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let spec = self.session.active_theme_spec();
                 ui.colored_label(

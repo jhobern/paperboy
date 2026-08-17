@@ -45,6 +45,10 @@ struct Wizard {
     /// Whether the user has edited the destination. A blank field is filled in
     /// from the workspace name, but only until they say otherwise.
     dest_touched: bool,
+    /// Put out of the way while it works. An import can take many minutes of
+    /// deliberately paced calls, and there is nothing to answer during them —
+    /// so it can be sent to the status bar and got on without.
+    hidden: bool,
     /// The step a failure interrupted. The core replaces the whole step with
     /// `Step::Failed`, which suits the terminal UI's dedicated error screen but
     /// would throw a GUI user back to the first field over a bad path; keeping
@@ -63,8 +67,19 @@ impl Wizard {
             key_source,
             key_entry,
             dest_touched: false,
+            hidden: false,
             last_step: Step::Connect,
         }
+    }
+
+    /// Whether the wizard is *doing* something rather than *asking* something.
+    /// The download is the only such stretch that lasts — the paced fetches
+    /// can run for many minutes with no question in them — so it is the one
+    /// the rest of the app stays usable through. The earlier steps are busy
+    /// only in bursts, and going modeless under the user mid-burst would move
+    /// the ground while they read.
+    fn working(&self) -> bool {
+        matches!(self.flow.step(), Step::Downloading)
     }
 
     /// Fold the key source and what was typed under it back into the flow's
@@ -156,13 +171,45 @@ fn finish_import(app: &mut GuiApp, summary: ImportSummary) {
 }
 
 impl PostmanUi {
-    /// Begin a bulk import from Postman.
+    /// Begin a bulk import from Postman. An import already under way is left
+    /// alone and brought back into view instead: starting a second one would
+    /// throw away however many paced minutes the first had spent.
     pub fn open(&mut self) {
-        self.flow = Some(Wizard::new());
+        match &mut self.flow {
+            Some(w) => w.hidden = false,
+            None => self.flow = Some(Wizard::new()),
+        }
     }
 
     pub fn is_open(&self) -> bool {
         self.flow.is_some()
+    }
+
+    /// The one-line progress for the status bar, present only while an import
+    /// is running out of sight. `None` means there is nothing to say — either
+    /// no import, or one that is on screen already.
+    pub fn background_line(&self, s: &Strings) -> Option<String> {
+        let w = self.flow.as_ref()?;
+        if !w.hidden {
+            return None;
+        }
+        let p = w.flow.progress();
+        Some(if p.total > 0 {
+            format!("{} {}/{}", s.postman_background, p.done, p.total)
+        } else {
+            format!(
+                "{} {}",
+                s.postman_background,
+                w.flow.busy_line(s).unwrap_or_default()
+            )
+        })
+    }
+
+    /// Bring a backgrounded import back on screen.
+    pub fn reveal(&mut self) {
+        if let Some(w) = &mut self.flow {
+            w.hidden = false;
+        }
     }
 }
 
@@ -174,6 +221,8 @@ enum UiAction {
     #[default]
     None,
     Cancel,
+    /// Put the dialog away and let the import carry on in the background.
+    Hide,
     /// Step 1: take the key and either list the workspaces or, when an id was
     /// supplied, skip straight to the options.
     Connect,
@@ -209,6 +258,17 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         return;
     }
 
+    // Anything that isn't pure waiting wants the user back: a question to
+    // answer, or an error to read. Only the working stretches can stay hidden.
+    if w.hidden && !w.working() {
+        w.hidden = false;
+    }
+    if w.hidden {
+        ctx.request_repaint_after(REPAINT_WHILE_BUSY);
+        app.postman.flow = Some(w);
+        return;
+    }
+
     let colors = UiColors {
         dim: app.theme.dim,
         accent: app.theme.accent,
@@ -226,10 +286,21 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
     // label changes with the key source ("API key" vs "1Password item") and a
     // dialog sized to its content grew and shrank around it, dragging the whole
     // form sideways while the user was reading it.
-    let dismissed = super::widgets::dialog(ctx, strings.postman_title, Some(CONNECT_WIDTH), |ui| {
-        action = draw(ui, &mut w, &recent, colors, strings);
-    })
-    .dismissed;
+    // While it is only working, the dialog stops holding the app hostage: no
+    // sheet behind it, and the rest of PaperBoy stays clickable underneath.
+    let working = w.working();
+    let title = strings.postman_title;
+    let dismissed = if working {
+        super::widgets::dialog_modeless(ctx, title, Some(CONNECT_WIDTH), |ui| {
+            action = draw(ui, &mut w, &recent, colors, strings);
+        })
+        .dismissed
+    } else {
+        super::widgets::dialog(ctx, title, Some(CONNECT_WIDTH), |ui| {
+            action = draw(ui, &mut w, &recent, colors, strings);
+        })
+        .dismissed
+    };
     // The ✕ and Escape are the Cancel button by another name.
     if dismissed {
         action = UiAction::Cancel;
@@ -241,6 +312,7 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
             w.flow.cancel();
             return;
         }
+        UiAction::Hide => w.hidden = true,
         UiAction::Connect => {
             w.flow.submit_connect(&app.strings);
             if matches!(w.flow.step(), Step::Options) {
@@ -685,9 +757,18 @@ fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Str
     }
 
     ui.add_space(8.0);
-    if ui.button(s.gui_cancel).clicked() {
-        action = UiAction::Cancel;
-    }
+    ui.horizontal(|ui| {
+        if ui
+            .button(s.postman_background_button)
+            .on_hover_text(s.postman_background_hint)
+            .clicked()
+        {
+            action = UiAction::Hide;
+        }
+        if ui.button(s.gui_cancel).clicked() {
+            action = UiAction::Cancel;
+        }
+    });
     action
 }
 
@@ -861,6 +942,69 @@ mod tests {
         // Still no worker parked on the go channel, so this is as far as a
         // hand-built flow goes — but the plan is now what gates it.
         assert!(w.flow.plan().is_some());
+    }
+
+    /// An import is minutes of paced waiting with nothing to answer, so it is
+    /// the one stretch the dialog steps out of the way for: no sheet behind
+    /// it, and it can be put away entirely.
+    #[test]
+    fn only_the_download_lets_the_rest_of_the_app_carry_on() {
+        for step in [
+            Step::Connect,
+            Step::PickWorkspace,
+            Step::Options,
+            Step::Confirm,
+        ] {
+            let mut w = wizard();
+            w.flow.seed_step(step.clone());
+            assert!(
+                !w.working(),
+                "{step:?} is asking something, so it must hold the app"
+            );
+        }
+        let mut w = wizard();
+        w.flow.seed_step(Step::Downloading);
+        assert!(w.working());
+    }
+
+    /// The point of hiding it: the status bar keeps saying how far along the
+    /// import is, and clicking that is the way back to it.
+    #[test]
+    fn a_backgrounded_import_still_reports_from_the_status_bar() {
+        let mut ui = PostmanUi::default();
+        assert_eq!(ui.background_line(&s()), None, "nothing running");
+
+        ui.open();
+        ui.flow.as_mut().unwrap().flow.seed_step(Step::Downloading);
+        assert_eq!(
+            ui.background_line(&s()),
+            None,
+            "an import on screen speaks for itself"
+        );
+
+        ui.flow.as_mut().unwrap().hidden = true;
+        let line = ui.background_line(&s()).expect("a hidden import reports");
+        assert!(line.starts_with(s().postman_background), "got {line:?}");
+
+        ui.reveal();
+        assert_eq!(ui.background_line(&s()), None);
+    }
+
+    /// Opening the importer while one is already running must not throw away
+    /// however many paced minutes it has spent — it brings that one back.
+    #[test]
+    fn importing_again_returns_to_the_import_already_running() {
+        let mut ui = PostmanUi::default();
+        ui.open();
+        ui.flow.as_mut().unwrap().flow.key = "PMAK-first".to_string();
+        ui.flow.as_mut().unwrap().flow.seed_step(Step::Downloading);
+        ui.flow.as_mut().unwrap().hidden = true;
+
+        ui.open();
+        let w = ui.flow.as_ref().unwrap();
+        assert_eq!(w.flow.key, "PMAK-first", "the running import is kept");
+        assert_eq!(w.flow.step(), &Step::Downloading);
+        assert!(!w.hidden, "and it is brought back on screen");
     }
 
     /// A finished import is only worth anything if the folder it produced is
