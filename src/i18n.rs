@@ -1230,6 +1230,8 @@ strings! {
     postman_budget_month => "left this month", "restants ce mois-ci", "tilbage denne måned";
     postman_budget_pace => "one call every", "un appel toutes les", "ét kald hver";
     postman_done_title => "Import complete", "Importation terminée", "Import fuldført";
+    postman_done_opened => "It is open in a new workspace tab — choose a collection on the left to see its requests.", "Il est ouvert dans un nouvel onglet d'espace de travail — choisissez une collection à gauche pour voir ses requêtes.", "Den er åben i en ny arbejdsområdefane — vælg en samling til venstre for at se dens forespørgsler.";
+    postman_done_saved_to => "Saved to", "Enregistré dans", "Gemt i";
     postman_skipped => "could not be fetched and were skipped", "n'ont pas pu être récupérés et ont été ignorés", "kunne ikke hentes og blev sprunget over";
     postman_notes_written => "Some things could not be converted to Hurl — see CONVERSION-NOTES.md in the imported folder.", "Certains éléments n'ont pas pu être convertis en Hurl — voir CONVERSION-NOTES.md dans le dossier importé.", "Nogle ting kunne ikke konverteres til Hurl — se CONVERSION-NOTES.md i den importerede mappe.";
     postman_start => "Import", "Importer", "Importér";

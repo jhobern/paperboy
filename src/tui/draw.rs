@@ -174,11 +174,13 @@ enum LeftRow {
         /// workspace requests.
         depth: usize,
     },
-    /// A request of an expanded but *not-loaded* workspace collection: only its
-    /// cached name is known (no entry to draw method/status from), so it renders
-    /// as a dim, name-only leaf. Opening it (Enter/Right) loads its collection.
+    /// A request of an expanded but *not-loaded* workspace collection: its name
+    /// and method are cached, but there is no entry to draw run status or edit
+    /// markers from, so it renders dim apart from the method badge. Opening it
+    /// (Enter/Right) loads its collection.
     WsRequestName {
         name: String,
+        method: String,
         depth: usize,
     },
 }
@@ -225,10 +227,15 @@ impl LeftRow {
                     } => LeftRow::Entry { idx, depth },
                     WsRow::Request {
                         name,
+                        method,
                         depth,
                         loaded: false,
                         ..
-                    } => LeftRow::WsRequestName { name, depth },
+                    } => LeftRow::WsRequestName {
+                        name,
+                        method,
+                        depth,
+                    },
                 })
                 .collect()
         } else {
@@ -2041,15 +2048,29 @@ pub(crate) fn draw_collection_left(
                     Style::default().fg(th.accent),
                 )))
             }
-            // A request of an expanded but not-loaded collection: dim, name only
-            // (its collection isn't loaded, so there's no method/status to show).
-            // The two-space pad lines the name up under the loaded rows' names.
-            LeftRow::WsRequestName { name, depth } => {
+            // A request of an expanded but not-loaded collection. Its name is
+            // dim — the loaded collection is the one in focus — but the method
+            // is coloured like everywhere else: which row is the POST is the
+            // question the badge answers, and it is worth answering before the
+            // file has been opened. The two-space pad and the run-status gap
+            // line the name up under the loaded rows' names.
+            LeftRow::WsRequestName {
+                name,
+                method,
+                depth,
+            } => {
                 let indent = "  ".repeat(*depth);
-                ListItem::new(Line::from(Span::styled(
-                    format!("{indent}  {name}"),
-                    Style::default().fg(th.dim),
-                )))
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{indent}  ")),
+                    Span::styled(
+                        format!("{method:<5}"),
+                        Style::default()
+                            .fg(method_color(method))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(name.clone(), Style::default().fg(th.dim)),
+                ]))
             }
             LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];

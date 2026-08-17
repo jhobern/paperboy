@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A finished Postman import says what it did.** The dialog used to simply
+  vanish on success: a tab quietly switched, the request panel still showed
+  whatever was open before, and nothing said what had landed or where. It now
+  ends on a receipt — the workspace's name, how many collections and
+  environments came with it, the folder they were saved to, anything that had
+  to be skipped, and the fact that the folder is now a tab with its collections
+  listed on the left. An import that finishes while it is running in the
+  background brings the receipt back on screen, because that is exactly the case
+  where nothing else would have told you.
+- **Every request in the workspace tree says what it does.** The `GET`/`POST`
+  badge used to appear only for the requests of the collection currently loaded;
+  every other expanded collection was a list of bare names, so finding the POST
+  meant opening files one at a time. The method is now cached alongside the name
+  and shown for every listed request, in both front-ends.
 - **A report's run settings are easier to find, and easier to trust.** The
   values a report will run with used to be a dim, truncated label sitting beside
   a separate *Run settings* button, and a line you can read but not act on reads

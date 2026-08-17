@@ -16276,6 +16276,52 @@ fn two_expanded_collections_both_list_their_request_names() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every listed request says what it does, whether or not its file is the one
+/// loaded. Which row is the POST is the question the badge answers, and a
+/// reader shouldn't have to open a file to ask it.
+#[test]
+fn a_request_carries_its_method_even_when_its_collection_is_not_loaded() {
+    use crate::collection::WsRow;
+
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_methods_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("one.hurl"),
+        "# Login\nPOST https://example.com/login\n\n# Logout\nGET https://example.com/logout\n",
+    )
+    .unwrap();
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    let methods: Vec<(String, String, bool)> = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .filter_map(|r| match r {
+            WsRow::Request {
+                name,
+                method,
+                loaded,
+                ..
+            } => Some((name, method, loaded)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            ("Login".to_string(), "POST".to_string(), false),
+            ("Logout".to_string(), "GET".to_string(), false),
+        ],
+        "a collection listed from cache still says what each request does"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A collection expanded but never loaded this session lists its request names
 /// straight from disk once `rebuild_expanded_titles` populates the cache — the
 /// path used by persistence restore.
@@ -25823,6 +25869,48 @@ fn a_key_is_only_remembered_once_postman_has_accepted_it() {
     assert!(
         app.session.recent_key_refs.is_empty(),
         "nothing has been sent to Postman yet"
+    );
+}
+
+/// A finished import leaves a receipt saying what landed, where it went, and —
+/// the part nothing else on screen says — that the folder is now a tab.
+#[test]
+fn a_finished_import_leaves_a_receipt_saying_what_landed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let s = Strings::for_language(&app.language);
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_step(crate::postman_flow::Step::Done);
+        w.done = Some(crate::postman_import::ImportSummary {
+            dest: "/tmp/pb/Alpha".into(),
+            workspace_name: "Alpha".into(),
+            collections: 3,
+            environments: 1,
+            failures: Vec::new(),
+            converted_with_notes: false,
+            elapsed: std::time::Duration::from_secs(4),
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = squashed(&buffer_text(term.backend().buffer()));
+
+    assert!(
+        text.contains(&format!("3 {}", s.postman_word_collections)),
+        "the receipt says what landed: {text}"
+    );
+    // Singular where it is one — "1 environments" reads like a machine.
+    assert!(
+        text.contains(&format!("1 {}", s.postman_word_environment)),
+        "counted in the number it really is: {text}"
+    );
+    assert!(
+        text.contains(&squashed(s.postman_done_opened)),
+        "and says the imported folder is now a tab: {text}"
     );
 }
 

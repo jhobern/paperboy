@@ -83,6 +83,9 @@ pub(crate) struct PostmanWizard {
     /// `Some` while the recent-keys dropdown has keyboard focus, indexing into
     /// [`PostmanWizard::recent_entries`].
     pub(crate) recent_sel: Option<usize>,
+    /// What a finished import landed, kept so the receipt can say it rather
+    /// than only naming the folder it wrote.
+    pub(crate) done: Option<crate::postman_import::ImportSummary>,
 }
 
 impl PostmanWizard {
@@ -106,6 +109,7 @@ impl PostmanWizard {
             list_scroll: ListScroll::default(),
             recent,
             recent_sel: None,
+            done: None,
         }
     }
 
@@ -781,15 +785,28 @@ fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, t
 }
 
 fn draw_done(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme) {
-    let area = centered_rect(74, 5, f.area());
-    f.render_widget(Clear, area);
-    let block = panel_hinted(s.postman_done_title.to_string(), s.git_error_hint, th);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let mut lines = vec![Line::styled(
-        w.flow.dest_path().to_string_lossy().into_owned(),
+    let width = 74u16.min(f.area().width);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(d) = &w.done {
+        lines.push(Line::styled(
+            crate::postman_flow::imported_counts(d.collections, d.environments, s),
+            Style::default().fg(th.text),
+        ));
+    }
+    lines.push(Line::styled(
+        format!(
+            "{} {}",
+            s.postman_done_saved_to,
+            w.flow.dest_path().to_string_lossy()
+        ),
+        Style::default().fg(th.dim),
+    ));
+    // What the receipt is really for: the folder has just become a tab, and
+    // nothing else on screen says so.
+    lines.push(Line::styled(
+        s.postman_done_opened,
         Style::default().fg(th.text),
-    )];
+    ));
     let failures = w.flow.failures();
     if !failures.is_empty() {
         lines.push(Line::styled(
@@ -797,6 +814,26 @@ fn draw_done(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme) {
             Style::default().fg(th.pending),
         ));
     }
+    if w.done.as_ref().is_some_and(|d| d.converted_with_notes) {
+        lines.push(Line::styled(
+            s.postman_notes_written,
+            Style::default().fg(th.dim),
+        ));
+    }
+    // Sized to the wrapped text: the receipt grows a line when something was
+    // skipped, and a fixed height would hide exactly that line.
+    let body_h: u16 = lines
+        .iter()
+        .map(|l| {
+            let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            wrapped_height(&text, width.saturating_sub(2))
+        })
+        .sum();
+    let area = centered_rect(width, body_h + 2, f.area());
+    f.render_widget(Clear, area);
+    let block = panel_hinted(s.postman_done_title.to_string(), s.git_error_hint, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 

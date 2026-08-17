@@ -17,6 +17,23 @@ use crate::tree::{self, Row};
 /// its folder-encoded title (e.g. `Auth/Login` → `Login`, since the `Auth`
 /// folder is already its own tree row), falling back to the URL when the
 /// request is untitled.
+/// The cached headline of one request in a collection that isn't loaded: what
+/// it is called and what it does. The method is cached with the name because a
+/// list of bare names makes the reader open a file to find out which row is the
+/// POST — the one thing the badge exists to save them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsTitle {
+    pub name: String,
+    pub method: String,
+}
+
+fn ws_request_title(entry: &HurlEntry) -> WsTitle {
+    WsTitle {
+        name: ws_request_label(entry),
+        method: entry.method.clone(),
+    }
+}
+
 fn ws_request_label(entry: &HurlEntry) -> String {
     let leaf = crate::tree::entry_path(&entry.title)
         .pop()
@@ -32,12 +49,12 @@ fn ws_request_label(entry: &HurlEntry) -> String {
 /// a not-currently-loaded collection's requests in the workspace tree. Returns
 /// an empty vec when the file can't be read or parsed — the collection then
 /// simply shows no requests until it is opened.
-fn read_collection_labels(path: &Path) -> Vec<String> {
+fn read_collection_labels(path: &Path) -> Vec<WsTitle> {
     std::fs::read_to_string(path)
         .map(|content| {
             crate::postman::parse_collection(&content)
                 .iter()
-                .map(ws_request_label)
+                .map(ws_request_title)
                 .collect()
         })
         .unwrap_or_default()
@@ -91,12 +108,15 @@ pub enum WsRow {
     /// `idx` the request's position within it. When `loaded` is true the file
     /// is the tab's currently-loaded collection, so `idx` indexes `entries` and
     /// the row renders in full detail; when false the row is drawn from the
-    /// cached `name` only (see `workspace_titles`) and selecting it previews the
-    /// name — opening it (Enter/Right) loads that collection first.
+    /// cached name and method (see `workspace_titles`) and selecting it previews
+    /// the name — opening it (Enter/Right) loads that collection first.
     Request {
         collection: PathBuf,
         idx: usize,
         name: String,
+        /// The request's HTTP method, known for every listed request whether or
+        /// not its file is the loaded one.
+        method: String,
         depth: usize,
         loaded: bool,
     },
@@ -252,7 +272,7 @@ pub struct Collection {
     /// away from a loaded file (from its live entries) and when restoring an
     /// expanded collection from disk (see [`Self::rebuild_expanded_titles`]).
     /// Derived state — not persisted.
-    pub workspace_titles: HashMap<PathBuf, Vec<String>>,
+    pub workspace_titles: HashMap<PathBuf, Vec<WsTitle>>,
     /// The most recent workspace tree read off disk, reused for [`WS_SCAN_TTL`]
     /// so redrawing the tree isn't a recursive `read_dir` every frame. Purely
     /// derived state: dropping it only costs one extra scan, which is why it is
@@ -535,7 +555,7 @@ impl Collection {
     /// The request rows shown under an expanded collection at `path`, indented
     /// to `depth`. For the currently-loaded file the rows come straight from
     /// `entries` (full detail, `loaded: true`); for any other expanded
-    /// collection they come from the cached names in `workspace_titles`
+    /// collection they come from the cached titles in `workspace_titles`
     /// (`loaded: false`), so several collections' requests can be listed at once
     /// without re-parsing every file each frame. A collection with no cached
     /// names yet contributes no rows.
@@ -548,6 +568,7 @@ impl Collection {
                     collection: path.to_path_buf(),
                     idx,
                     name: ws_request_label(e),
+                    method: e.method.clone(),
                     depth,
                     loaded: true,
                 })
@@ -555,14 +576,15 @@ impl Collection {
         } else {
             self.workspace_titles
                 .get(path)
-                .map(|names| {
-                    names
+                .map(|titles| {
+                    titles
                         .iter()
                         .enumerate()
-                        .map(|(idx, name)| WsRow::Request {
+                        .map(|(idx, t)| WsRow::Request {
                             collection: path.to_path_buf(),
                             idx,
-                            name: name.clone(),
+                            name: t.name.clone(),
+                            method: t.method.clone(),
                             depth,
                             loaded: false,
                         })
@@ -578,8 +600,8 @@ impl Collection {
     /// expanded keeps listing its requests from the cache.
     pub fn snapshot_loaded_titles(&mut self) {
         if let Some(path) = self.path.clone() {
-            let names = self.entries.iter().map(ws_request_label).collect();
-            self.workspace_titles.insert(path, names);
+            let titles = self.entries.iter().map(ws_request_title).collect();
+            self.workspace_titles.insert(path, titles);
         }
     }
 
@@ -752,8 +774,8 @@ impl Collection {
             // Not loaded: the tree lists it from the title cache, which was
             // snapshotted off the edited entries. Re-snapshot from disk so the
             // row names match the file again.
-            let names = entries.iter().map(ws_request_label).collect();
-            self.workspace_titles.insert(path.to_path_buf(), names);
+            let titles = entries.iter().map(ws_request_title).collect();
+            self.workspace_titles.insert(path.to_path_buf(), titles);
         }
         Ok(())
     }
@@ -830,8 +852,8 @@ impl Collection {
             {
                 continue;
             }
-            let names = read_collection_labels(&p);
-            self.workspace_titles.insert(p, names);
+            let titles = read_collection_labels(&p);
+            self.workspace_titles.insert(p, titles);
         }
     }
 

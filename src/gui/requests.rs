@@ -680,22 +680,26 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         collection,
                         idx,
                         name,
+                        method,
                         depth,
                         loaded,
                     } => {
                         let is_sel = *loaded
                             && loaded_path.as_deref() == Some(collection.as_path())
                             && *idx == selected_entry;
-                        // Method badge + run marker only for the loaded file's
-                        // rows (other collections are listed by name only).
-                        let (method, marker) = if *loaded {
+                        // The method is known for every listed request — which row
+                        // is the POST is the question the badge answers, and a
+                        // reader shouldn't have to open a file to ask it. The
+                        // run marker really is loaded-only: nothing else has
+                        // been run this session.
+                        let marker = if *loaded {
                             app.session.collections[ci]
                                 .entries
                                 .get(*idx)
-                                .map(|e| (Some(e.method.clone()), run_marker(e.last_run)))
-                                .unwrap_or((None, ("", true)))
+                                .map(|e| run_marker(e.last_run))
+                                .unwrap_or(("", true))
                         } else {
-                            (None, ("", true))
+                            ("", true)
                         };
                         // Unlike the method badge and the run marker, the edit
                         // pencil is shown for every collection's rows, not just
@@ -704,16 +708,16 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         // see (and save).
                         let edited =
                             app.session.collections[ci].workspace_request_edited(collection, *idx);
-                        // A stable per-request id namespace: the badge and
-                        // run marker only appear for the loaded collection, so
-                        // without it every row's ids shift the moment the tab
-                        // changes which file it holds (see `render_node`).
+                        // A stable per-request id namespace: the run marker
+                        // only appears for the loaded collection, so without it
+                        // every row's ids shift the moment the tab changes which
+                        // file it holds (see `render_node`).
                         let resp = ui
                             .push_id(("ws_req", collection, idx), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.add_space(*depth as f32 * WS_INDENT);
-                                    if let Some(m) = &method {
-                                        super::widgets::method_badge(ui, &theme, m);
+                                    if !method.is_empty() {
+                                        super::widgets::method_badge(ui, &theme, method);
                                     }
                                     let text = if is_sel {
                                         RichText::new(name).strong().color(theme.text)

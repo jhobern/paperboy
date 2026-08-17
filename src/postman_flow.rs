@@ -1030,6 +1030,28 @@ pub(crate) fn plan_summary(plan: &ImportPlan, s: &Strings) -> String {
     )
 }
 
+/// "3 collections · 1 environment" — what an import actually landed, each count
+/// in the number it really is, so a one-collection import doesn't read like a
+/// machine talking.
+pub(crate) fn imported_counts(collections: usize, environments: usize, s: &Strings) -> String {
+    let word = |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+    format!(
+        "{} {} · {} {}",
+        collections,
+        word(
+            collections,
+            s.postman_word_collection,
+            s.postman_word_collections
+        ),
+        environments,
+        word(
+            environments,
+            s.postman_word_environment,
+            s.postman_word_environments
+        )
+    )
+}
+
 /// Round a duration to something worth reading aloud. An import is paced in
 /// whole seconds, so sub-second precision would be false precision.
 /// What Postman's rate headers last reported, kept so the front-ends can show

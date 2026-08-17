@@ -3952,6 +3952,11 @@ impl TuiApp {
         if learned {
             self.save_state();
         }
+        let mut w = w;
+        if let Some(PostmanEvent::Imported(summary)) = &event {
+            // The receipt outlives the worker, so it keeps its own copy.
+            w.done = Some((**summary).clone());
+        }
         self.overlay = Some(Overlay::PostmanImport(w));
         if let Some(PostmanEvent::Imported(summary)) = event {
             self.apply_postman_event(*summary);

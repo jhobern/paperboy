@@ -54,6 +54,11 @@ struct Wizard {
     /// would throw a GUI user back to the first field over a bad path; keeping
     /// the previous step lets the error be shown *in place*.
     last_step: Step,
+    /// What a finished import landed, kept so the receipt can say it. The
+    /// dialog used to simply vanish on success, which left the user looking at
+    /// a newly switched-to tab with no word of what had happened — the one
+    /// moment in the whole flow where something is worth reading.
+    done: Option<ImportSummary>,
 }
 
 impl Wizard {
@@ -69,6 +74,7 @@ impl Wizard {
             dest_touched: false,
             hidden: false,
             last_step: Step::Connect,
+            done: None,
         }
     }
 
@@ -156,8 +162,12 @@ impl Wizard {
         }
         match self.flow.poll(&app.strings) {
             Some(PostmanEvent::Imported(summary)) => {
+                // Stay open on the receipt rather than closing: the import is
+                // the one thing here that can finish while the user is looking
+                // somewhere else entirely.
+                self.done = Some((*summary).clone());
                 finish_import(app, *summary);
-                true
+                false
             }
             None => false,
         }
@@ -222,6 +232,16 @@ impl PostmanUi {
     pub(crate) fn seed_step_for_audit(&mut self, step: Step) {
         if let Some(w) = &mut self.flow {
             w.seed_for_audit(step);
+        }
+    }
+
+    /// Land a finished import, so a test can paint the receipt without running
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn seed_done_for_audit(&mut self, summary: ImportSummary) {
+        if let Some(w) = &mut self.flow {
+            w.flow.seed_step(Step::Done);
+            w.done = Some(summary);
         }
     }
 
@@ -845,11 +865,42 @@ fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Str
 /// screen and no way out.
 fn draw_done(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
     let mut action = UiAction::None;
-    ui.colored_label(colors.ok, s.postman_done_title);
-    ui.label(w.flow.dest_path().to_string_lossy().into_owned());
+    let name = w
+        .done
+        .as_ref()
+        .map(|d| d.workspace_name.clone())
+        .unwrap_or_default();
+    let heading = if name.trim().is_empty() {
+        s.postman_done_title.to_string()
+    } else {
+        format!("{} — {name}", s.postman_done_title)
+    };
+    ui.label(egui::RichText::new(heading).strong().color(colors.ok));
+    if let Some(d) = &w.done {
+        ui.label(crate::postman_flow::imported_counts(
+            d.collections,
+            d.environments,
+            s,
+        ));
+    }
+    ui.add_space(4.0);
+    // Where it went, and — the thing a vanishing dialog never said — that the
+    // folder is now a tab, and which half of the window to look at.
+    ui.colored_label(
+        colors.dim,
+        format!(
+            "{} {}",
+            s.postman_done_saved_to,
+            w.flow.dest_path().to_string_lossy()
+        ),
+    );
+    ui.label(s.postman_done_opened);
     let failures = w.flow.failures().len();
     if failures > 0 {
         ui.colored_label(colors.err, format!("{failures} {}", s.postman_skipped));
+    }
+    if w.done.as_ref().is_some_and(|d| d.converted_with_notes) {
+        ui.colored_label(colors.dim, s.postman_notes_written);
     }
     ui.add_space(8.0);
     // Nothing is left to call off here, so the way out is Close, not Cancel.
@@ -971,6 +1022,87 @@ mod tests {
             let text = painted(&mut app);
             assert!(text.contains(help), "{src:?} went unexplained: {text}");
         }
+    }
+
+    /// An import that finishes leaves a receipt rather than vanishing. It can
+    /// finish while the user is looking somewhere else entirely, and the only
+    /// other sign of it — a tab quietly switching — says nothing about what
+    /// landed or where.
+    #[test]
+    fn a_finished_import_leaves_a_receipt_saying_what_landed() {
+        use eframe::egui;
+
+        fn walk(sh: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match sh {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+
+        let s = s();
+        let mut app = GuiApp::for_test(Session::default());
+        app.postman.open();
+        app.postman.seed_done_for_audit(ImportSummary {
+            dest: "/tmp/pb/Alpha".into(),
+            workspace_name: "Alpha".into(),
+            collections: 3,
+            environments: 1,
+            failures: Vec::new(),
+            converted_with_notes: false,
+            elapsed: Duration::from_secs(4),
+        });
+
+        let ctx = egui::Context::default();
+        app.theme.apply(&ctx);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    super::show(&mut app, &ctx);
+                },
+            );
+            painted.clear();
+            out.shapes
+                .iter()
+                .for_each(|sh| walk(&sh.shape, &mut painted));
+        }
+        let text = painted
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            app.postman.is_open(),
+            "the dialog stays up to be read, rather than vanishing"
+        );
+        assert!(
+            text.contains("Alpha"),
+            "the receipt names the workspace: {text}"
+        );
+        assert!(
+            text.contains(&format!("3 {}", s.postman_word_collections)),
+            "and what came with it: {text}"
+        );
+        // Singular where it is one — a receipt that says "1 environments"
+        // reads like a machine.
+        assert!(
+            text.contains(&format!("1 {}", s.postman_word_environment)),
+            "counted in the number it really is: {text}"
+        );
+        assert!(
+            text.contains(s.postman_done_opened),
+            "and says where the imported folder went: {text}"
+        );
     }
 
     fn a_plan() -> ImportPlan {
