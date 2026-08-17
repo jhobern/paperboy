@@ -10414,13 +10414,13 @@ mod tests {
                 // The same layout `block_row` uses for the chip cluster.
                 ui.horizontal_top(|ui| {
                     let mut acts = Vec::new();
-                    let staging = vec!["eapi_staging".to_string()];
-                    let dev = vec!["eapi_dev".to_string()];
-                    let dfa = vec!["dfa_result".to_string()];
+                    let staging = vec!["api_staging".to_string()];
+                    let dev = vec!["api_dev".to_string()];
+                    let classify = vec!["classify_result".to_string()];
                     let chips: Vec<(Chip, &[String])> = vec![
                         (Chip::base("FOR".into(), th.subst), &[]),
-                        (Chip::env_role(true, 0, "eapi_staging", th.subst), &staging),
-                        (Chip::env_role(false, 1, "eapi_dev", th.subst), &dev),
+                        (Chip::env_role(true, 0, "api_staging", th.subst), &staging),
+                        (Chip::env_role(false, 1, "api_dev", th.subst), &dev),
                         (
                             Chip::modifier(
                                 "RESPONSE PRETTY".into(),
@@ -10429,7 +10429,7 @@ mod tests {
                             ),
                             &[],
                         ),
-                        (Chip::request("dfa_result", th.subst), &dfa),
+                        (Chip::request("classify_result", th.subst), &classify),
                         (
                             Chip::alias("Environment", th.subst, Some(DetachWhich::As)),
                             &[],

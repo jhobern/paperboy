@@ -1120,7 +1120,7 @@ mod tests {
                 ("Name", "a"),
                 (
                     "Frame",
-                    "/home/somebody/Development/dfa/trimmed/Real/image-real-6/Front-39.jpg",
+                    "/home/somebody/Development/sample_images/trimmed/Real/image-real-6/Front-39.jpg",
                 ),
             ])],
             ..Default::default()

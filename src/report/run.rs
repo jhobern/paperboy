@@ -2748,14 +2748,14 @@ mod tests {
     #[test]
     fn recursive_folders_loop_skips_containers_and_binds_roles() {
         let d = tmpdir("folders_rec");
-        for case in ["passports/june/case_1", "licences/case_2"] {
+        for case in ["batch_a/june/case_1", "batch_b/case_2"] {
             let c = d.join(case);
             std::fs::create_dir_all(&c).unwrap();
             std::fs::write(c.join("scan_front.jpg"), "x").unwrap();
         }
         // One case also has a back image; the other doesn't, which is exactly
         // what the optional role is for.
-        std::fs::write(d.join("licences/case_2/scan_back.jpg"), "x").unwrap();
+        std::fs::write(d.join("batch_a/june/case_1/scan_back.jpg"), "x").unwrap();
 
         let fake = Fake::new(&[(
             "up",
@@ -2782,7 +2782,7 @@ mod tests {
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
-        // Sorted by full path, so `licences/case_2` comes first.
+        // Sorted by full path, so `batch_a/june/case_1` comes first.
         assert!(
             res.rows[0]
                 .cells

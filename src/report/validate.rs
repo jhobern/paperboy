@@ -1227,10 +1227,10 @@ mod tests {
     /// they say.
     #[test]
     fn an_environment_named_by_a_parameter_is_not_an_unloaded_environment() {
-        let src = "# collection: c\nPARAM COMPARE_ENV = \"eapi_dev\"\nPARAM BASELINE_ENV = \"eapi_staging\"\n\
+        let src = "# collection: c\nPARAM COMPARE_ENV = \"api_dev\"\nPARAM BASELINE_ENV = \"api_staging\"\n\
                    PARALLEL(2) FOR TARGET IN ENVS BASELINE(\"{{BASELINE_ENV}}\") SHOW(TimeWait), COMPARISON(\"{{COMPARE_ENV}}\")\n\
                        REPORT REQUEST r\nEND\n";
-        let envs = ["eapi_dev".to_string(), "eapi_staging".to_string()];
+        let envs = ["api_dev".to_string(), "api_staging".to_string()];
         let msgs: Vec<String> = diags_for(src, None, Some(&envs))
             .into_iter()
             .map(|d| d.message)

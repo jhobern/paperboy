@@ -2947,7 +2947,7 @@ mod tests {
     #[test]
     fn the_spreadsheets_picture_column_is_sized_to_the_picture() {
         let (mut res, header) = image_result();
-        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
         res.rows[0]
             .cells
             .insert("Frame".to_string(), long.to_string());
@@ -2977,7 +2977,7 @@ mod tests {
     fn a_fit_picture_column_is_not_sized_to_its_path() {
         use crate::report::flow::ImageSpec;
         let (mut res, header) = image_result();
-        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
         res.rows[0]
             .cells
             .insert("Frame".to_string(), long.to_string());
@@ -3004,7 +3004,7 @@ mod tests {
     fn a_picture_column_is_sized_to_the_picture_not_to_its_path() {
         let (mut res, header) = image_result();
         // A path as long as the ones a real run produces.
-        let long = "/home/somebody/Development/dfa_input_files/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
         res.rows[0]
             .cells
             .insert("Frame".to_string(), long.to_string());

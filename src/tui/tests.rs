@@ -23045,7 +23045,7 @@ fn the_run_settings_key_also_closes_them() {
 #[test]
 fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
     let mut app = TuiApp::default();
-    for name in ["eapi_dev", "eapi_staging", "eapi_prod", "local"] {
+    for name in ["api_dev", "api_staging", "api_prod", "local"] {
         add_empty_global_env(&mut app, name);
     }
     app.open_loaded_report(crate::report::Report::from_text(
@@ -23068,7 +23068,7 @@ fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
     };
     assert_eq!(
         menu.visible(),
-        vec![&"eapi_staging".to_string()],
+        vec![&"api_staging".to_string()],
         "only the matching environment is left"
     );
     // …and that is what the overlay actually draws, not just what it knows.
@@ -23077,15 +23077,15 @@ fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
         let screen = buffer_text(term.backend().buffer());
-        assert!(screen.contains("eapi_staging"), "{screen}");
+        assert!(screen.contains("api_staging"), "{screen}");
         assert!(
-            !screen.contains("eapi_dev") && !screen.contains("local"),
+            !screen.contains("api_dev") && !screen.contains("local"),
             "the filtered-out rows are off screen: {screen}"
         );
     }
     press(&mut app, KeyCode::Enter);
     assert!(app.overlay.is_none());
-    assert_eq!(app.report_param_rows(0)[0].value, "eapi_staging");
+    assert_eq!(app.report_param_rows(0)[0].value, "api_staging");
 }
 
 /// Backspacing over the filter brings the hidden rows back — the list is
@@ -23093,7 +23093,7 @@ fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
 #[test]
 fn backspacing_the_filter_brings_the_other_rows_back() {
     let mut app = TuiApp::default();
-    for name in ["eapi_dev", "eapi_staging"] {
+    for name in ["api_dev", "api_staging"] {
         add_empty_global_env(&mut app, name);
     }
     app.open_loaded_report(crate::report::Report::from_text(

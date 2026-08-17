@@ -21,6 +21,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   HTML export alike. An unlabelled row still says nothing rather than borrowing
   the appearance of one that passed.
 
+- **No workplace-specific names in the code.** Test fixtures, sample values and
+  the report editor's block-preview chips used real internal project and
+  environment names. They now use neutral ones (`api_staging`, `api_dev`,
+  `classify_result`, `samples/real`), so nothing about a particular API is
+  carried in the source.
+
 - **The run-settings summary is legible.** The line naming the values the next
   run will use sat in the toolbar at the small text style — finer than the
   report it describes, and it is meant to be read. It is set at body size now,

@@ -559,8 +559,8 @@ mod tests {
         // The nested `<type>/<batch>/<case>` layout the C# generators walk: a
         // bare `**` filters nothing, so every folder at every depth is yielded.
         let d = tmpdir("frec");
-        fs::create_dir_all(d.join("passports/june/case_1")).unwrap();
-        fs::create_dir_all(d.join("licences/case_2")).unwrap();
+        fs::create_dir_all(d.join("batch_a/june/case_1")).unwrap();
+        fs::create_dir_all(d.join("batch_b/case_2")).unwrap();
         let all = list_folders(&d, Some("**")).unwrap();
         assert_eq!(all.len(), 5, "{all:?}");
         // With a name pattern, only the leaf case folders come back — at
@@ -571,7 +571,7 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["case_2", "case_1"]);
+        assert_eq!(names, vec!["case_1", "case_2"]);
         fs::remove_dir_all(&d).ok();
     }
 

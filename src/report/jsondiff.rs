@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 /// One field of a flattened-and-unioned pair of documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDiff {
-    /// The dotted path to the leaf, e.g. `checks.face_match.score`.
+    /// The dotted path to the leaf, e.g. `checks.match.score`.
     pub path: String,
     /// The baseline's value, or `None` where the baseline had no such field.
     pub baseline: Option<String>,
